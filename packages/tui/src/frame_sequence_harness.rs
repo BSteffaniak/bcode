@@ -60,6 +60,7 @@ pub fn assert_no_forbidden_frames(
 }
 
 pub enum TranscriptFrameInput {
+    EphemeralPlain(String),
     Durable(SessionEvent),
     Live(SessionLiveEvent),
     PrependHistory {
@@ -102,6 +103,9 @@ impl TranscriptFrameSequence {
     ) -> Vec<TranscriptFrameSnapshot> {
         for step in steps {
             match step.input {
+                TranscriptFrameInput::EphemeralPlain(text) => {
+                    self.app.push_ephemeral_system_plain(text);
+                }
                 TranscriptFrameInput::Durable(event) => self.app.absorb_session_event(&event),
                 TranscriptFrameInput::Live(event) => self.app.absorb_session_live_event(&event),
                 TranscriptFrameInput::PrependHistory { events, has_more } => {
@@ -198,6 +202,55 @@ mod tests {
         SessionTokenUsage, TextStreamOperation, TextStreamUpdate, ToolInvocationResult, WorkId,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn ephemeral_notice_remains_between_durable_frames_after_resize() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(
+            Some(session_id),
+            &[durable(
+                session_id,
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "before".to_owned(),
+                },
+            )],
+            &[],
+            false,
+        );
+        let frames = TranscriptFrameSequence::new(app, 40, 10).run([
+            TranscriptFrameStep {
+                label: "local issue",
+                input: TranscriptFrameInput::EphemeralPlain("local issue".to_owned()),
+            },
+            TranscriptFrameStep {
+                label: "later durable",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    2,
+                    SessionEventKind::AssistantMessage {
+                        text: "after".to_owned(),
+                    },
+                )),
+            },
+            TranscriptFrameStep {
+                label: "resized",
+                input: TranscriptFrameInput::Resize(24, 8),
+            },
+        ]);
+
+        let final_frame = frames.last().expect("last frame");
+        assert_eq!(
+            final_frame
+                .observation
+                .terminal_items
+                .iter()
+                .filter(|(_, source, _)| source.is_some())
+                .count(),
+            2
+        );
+        assert!(final_frame.observation.terminal_items.len() >= 3);
+    }
 
     fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
         let bundled = [bcode_plugin::StaticBundledPlugin::new(

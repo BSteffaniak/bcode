@@ -726,6 +726,33 @@ fn transcript_selection_scene_reflows_without_changing_logical_source_ranges() {
 
 #[cfg(test)]
 #[test]
+fn ephemeral_markdown_selection_scene_reflows_without_changing_source_ranges() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.push_ephemeral_system_markdown("[alpha beta](https://example.com)".to_owned());
+    let wide_layout = prepare_frame(&mut app, Rect::new(0, 0, 20, 10)).expect("wide layout");
+    let wide = super::root_program::transcript_selection_scene(&app, wide_layout.body());
+    let wide_ranges = wide
+        .fragments()
+        .iter()
+        .map(|fragment| (fragment.content_id.clone(), fragment.source_range.clone()))
+        .collect::<Vec<_>>();
+
+    let narrow_layout = prepare_frame(&mut app, Rect::new(0, 0, 16, 10)).expect("narrow layout");
+    let narrow = super::root_program::transcript_selection_scene(&app, narrow_layout.body());
+    let narrow_ranges = narrow
+        .fragments()
+        .iter()
+        .map(|fragment| (fragment.content_id.clone(), fragment.source_range.clone()))
+        .collect::<Vec<_>>();
+
+    assert!(!wide_ranges.is_empty());
+    assert_eq!(narrow_ranges, wide_ranges);
+    assert!(wide.validate().is_ok());
+    assert!(narrow.validate().is_ok());
+}
+
+#[cfg(test)]
+#[test]
 fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_replacement() {
     let source = "<details><summary>More</summary>Body that wraps across several cells.</details>";
     let item = TranscriptItem::with_format("System", source.to_owned(), TextFormat::Markdown);
@@ -887,6 +914,24 @@ fn streamed_text_integrity_is_visible_without_rewriting_source_bytes() {
         assert!(rendered.contains(body));
         assert_eq!(item.text(), body);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn ephemeral_markdown_link_produces_actionable_hit_region() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.push_ephemeral_system_markdown("[guide](https://example.com)".to_owned());
+    let area = Rect::new(0, 0, 40, 10);
+    let layout = prepare_frame(&mut app, area).expect("frame layout");
+
+    let regions = transcript_markdown_regions(&app, layout.body());
+
+    assert!(regions.iter().any(|region| {
+        matches!(
+            region.contribution_kind,
+            MarkdownContributionKind::Link { .. }
+        ) && !region.rect.is_empty()
+    }));
 }
 
 #[cfg(test)]

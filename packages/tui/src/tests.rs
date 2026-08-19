@@ -5133,6 +5133,52 @@ fn transcript_resident_window_trims_live_bottom_following_turns() {
 }
 
 #[test]
+fn transcript_resident_window_trimming_preserves_ephemeral_notice_chronology() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::AssistantMessage {
+            text: "before trim".to_owned(),
+        },
+    ));
+    app.push_ephemeral_system_plain("local issue".to_owned());
+
+    for turn in 1..600_u64 {
+        let sequence = turn.saturating_mul(2);
+        app.absorb_session_event(&event(
+            session_id,
+            sequence,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: format!("user {turn}"),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            session_id,
+            sequence.saturating_add(1),
+            SessionEventKind::AssistantMessage {
+                text: format!("assistant {turn}"),
+            },
+        ));
+    }
+
+    assert!(
+        app.resident_transcript_oldest_sequence()
+            .is_some_and(|sequence| sequence > 1)
+    );
+    let transcript = app
+        .transcript()
+        .iter()
+        .map(super::transcript::TranscriptItem::text)
+        .collect::<Vec<_>>();
+    assert_eq!(transcript.first().copied(), Some("local issue"));
+    assert_eq!(transcript.last().copied(), Some("assistant 599"));
+}
+
+#[test]
 fn transcript_resident_window_does_not_trim_with_active_tool() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

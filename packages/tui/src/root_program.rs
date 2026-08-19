@@ -2760,6 +2760,7 @@ pub enum BcodeRuntimeScreen {
 #[cfg(test)]
 mod tests {
     use super::{BcodeRuntimeAdmissionError, BcodeRuntimeMessage, OrderedPresentationQueue, admit};
+    use crate::app::BmuxApp;
     use bcode_command::CommandTextFormat;
     use bcode_session_models::SessionId;
     use std::collections::{BTreeMap, VecDeque};
@@ -3660,6 +3661,65 @@ mod tests {
         assert_eq!(
             super::export_plain_transcript_selection(items.iter(), &snapshot).as_deref(),
             Some("first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn mixed_canonical_and_ephemeral_selection_exports_visible_order() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[event(1, "first")], &[], false);
+        app.push_ephemeral_system_plain("local issue".to_owned());
+        app.absorb_session_event(&event(2, "second"));
+        let slices = app
+            .transcript()
+            .iter()
+            .map(|item| bmux_tui::selection::SelectionSlice {
+                content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                    "bcode.transcript.item.{}.plain",
+                    item.id().get()
+                )),
+                source_range: 0..item.text().len(),
+                revision: item.revision(),
+            })
+            .collect::<Vec<_>>();
+        let first = &slices[0];
+        let last = &slices[2];
+        let snapshot = bmux_tui::selection::SelectionSnapshot {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            anchor: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: first.content_id.clone(),
+                offset: 0,
+                order: 0,
+                affinity: bmux_tui::selection::SelectionAffinity::Before,
+                revision: first.revision,
+            },
+            focus: bmux_tui::selection::SelectionEndpoint {
+                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+                content_id: last.content_id.clone(),
+                offset: last.source_range.end,
+                order: 2,
+                affinity: bmux_tui::selection::SelectionAffinity::After,
+                revision: last.revision,
+            },
+            reversed: false,
+            slices,
+            visible_highlights: Vec::new(),
+        };
+
+        assert_eq!(
+            super::export_plain_transcript_selection(app.transcript(), &snapshot).as_deref(),
+            Some("first\n\nlocal issue\n\nsecond")
         );
     }
 

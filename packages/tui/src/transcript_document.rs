@@ -490,7 +490,7 @@ impl TranscriptDocument {
                     .expect("shared transcript item must carry source identity")
                     .clone();
                 if let Some(mut entry) = canonical.remove(&source_item_id) {
-                    entry.item = item;
+                    let _ = entry.item.replace_from_shared(item);
                     entry
                 } else {
                     TranscriptPresentationEntry {

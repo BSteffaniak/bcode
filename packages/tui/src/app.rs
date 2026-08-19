@@ -902,7 +902,6 @@ impl BmuxApp {
                     let item_id = (line.source == VisibleTranscriptSource::Transcript)
                         .then(|| {
                             self.transcript
-                                .items()
                                 .get(line.entry_index)?
                                 .source_view_item_id()
                                 .cloned()
@@ -2023,9 +2022,7 @@ impl BmuxApp {
     }
 
     #[cfg(test)]
-    pub fn stable_transcript_anchor(
-        &self,
-    ) -> Option<(bcode_session_view_models::TranscriptViewItemId, usize)> {
+    pub fn stable_transcript_anchor(&self) -> Option<(TranscriptPresentationEntryId, usize)> {
         let top_row = self.transcript_top_row(self.viewport.height());
         let line = self
             .transcript_layout
@@ -2035,12 +2032,10 @@ impl BmuxApp {
         if line.source != VisibleTranscriptSource::Transcript {
             return None;
         }
-        let id = self
-            .transcript
-            .get(line.entry_index)?
-            .source_view_item_id()?
-            .clone();
-        Some((id, line.row_in_entry))
+        Some((
+            self.transcript.presentation_id(line.entry_index)?,
+            line.row_in_entry,
+        ))
     }
 
     /// Return the transcript row that should render at the top of the viewport.
@@ -4901,6 +4896,46 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_notice_has_deterministic_placement_outside_resident_window() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let mut before =
+            BmuxApp::new_with_history(Some(session_id), &[event(5, "five")], &[], false);
+        before.push_ephemeral_system_plain("local issue".to_owned());
+        before.replace_transcript_window(&[event(8, "eight")], true, true, 8);
+        assert_eq!(
+            before
+                .transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["local issue", "eight"]
+        );
+
+        let mut after =
+            BmuxApp::new_with_history(Some(session_id), &[event(5, "five")], &[], false);
+        after.push_ephemeral_system_plain("local issue".to_owned());
+        after.replace_transcript_window(&[event(2, "two")], true, true, 2);
+        assert_eq!(
+            after
+                .transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["two", "local issue"]
+        );
+    }
+
+    #[test]
     fn ephemeral_notice_uses_sequence_fallback_when_exact_anchor_leaves_window() {
         let session_id = bcode_session_models::SessionId::new();
         let event = |sequence, text: &str| bcode_session_models::SessionEvent {
@@ -5014,6 +5049,44 @@ mod tests {
         reconstructed.take_same_session_transcript_state_from(&source);
 
         assert!(reconstructed.transcript().is_empty());
+    }
+
+    #[test]
+    fn sessionless_draft_notice_does_not_transfer_into_opened_session() {
+        let mut draft = BmuxApp::new_with_history(None, &[], &[], false);
+        draft.push_ephemeral_system_plain("draft issue".to_owned());
+        let mut opened = BmuxApp::new_with_history(
+            Some(bcode_session_models::SessionId::new()),
+            &[],
+            &[],
+            false,
+        );
+
+        opened.take_same_session_transcript_state_from(&draft);
+
+        assert!(opened.transcript().is_empty());
+    }
+
+    #[test]
+    fn reconstructed_canonical_history_does_not_recreate_ephemeral_notice() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "canonical".to_owned(),
+            },
+        }];
+        let mut live = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        live.push_ephemeral_system_plain("local issue".to_owned());
+
+        let reconstructed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+        assert_eq!(reconstructed.transcript().len(), 1);
+        assert_eq!(reconstructed.transcript()[0].text(), "canonical");
     }
 
     #[test]
