@@ -33674,6 +33674,27 @@ async fn dispatch_workflow_prompt_turn(
     }))
 }
 
+/// Report whether the artifact owning one workflow run can still be launched.
+///
+/// Used to distinguish an ordinary ownership deferral from an unrecoverable run whose fenced
+/// artifact no longer has a cached daemon image.
+fn workflow_run_artifact_is_launchable(state: &Arc<ServerState>, run_id: &str) -> bool {
+    let authority = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_authority(run_id);
+    match authority {
+        Ok(Some(authority)) => bcode_daemon_lifecycle::artifact_image_is_available(
+            &bcode_config::default_state_dir(),
+            &authority.target_artifact_id,
+        ),
+        // Without readable authority evidence, assume a recoverable deferral rather than
+        // reporting an unrecoverable run.
+        Ok(None) | Err(_) => true,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
     if let Err(error) = state.require_workflow_store() {
@@ -33700,7 +33721,19 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
                 continue;
             }
             Err(error) => {
-                tracing::debug!(run_id, %error, "workflow recovery deferred without mutation");
+                // Deferral is expected while another live daemon owns the run. A run fenced to an
+                // artifact that can no longer be launched is instead unrecoverable, so surface it
+                // rather than hiding the condition at debug level.
+                if workflow_run_artifact_is_launchable(state, &run_id) {
+                    tracing::debug!(run_id, %error, "workflow recovery deferred without mutation");
+                } else {
+                    tracing::warn!(
+                        run_id,
+                        %error,
+                        "workflow run is fenced to a daemon artifact that is no longer launchable; \
+                         it cannot be recovered or terminalized by this daemon"
+                    );
+                }
                 continue;
             }
         };

@@ -1771,6 +1771,36 @@ if ! grep -F 'session.refusal(session_id.is_some())' packages/tui/src/chat_loop.
   violations=1
 fi
 
+# Durable work is fenced to an exact daemon artifact, so deleting that artifact's last cached image
+# strands the work permanently. Image cleanup must consult artifact retention evidence.
+if ! grep -F 'fn cleanup_stale_daemon_images_retaining_artifacts(' packages/daemon-lifecycle/src/lib.rs >/dev/null \
+  || ! grep -F 'fn register_retained_artifact_provider(' packages/daemon-lifecycle/src/lib.rs >/dev/null \
+  || ! grep -F 'daemon_image_cleanup_retains_images_for_artifacts_owning_durable_work' packages/daemon-lifecycle/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: daemon image retention for artifact-fenced durable work was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'fn active_target_artifact_ids(' packages/workflow-store/src/lib.rs >/dev/null \
+  || ! grep -F 'active_target_artifact_ids_reports_artifacts_owning_resumable_runs' packages/workflow-store/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: workflow artifact-retention evidence or its coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F '    register_workflow_artifact_retention();' packages/cli/src/lib.rs >/dev/null \
+  || ! grep -F '&registered_retained_artifact_ids(),' packages/daemon-lifecycle/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: workflow artifact retention is no longer registered with image cleanup." >&2
+  violations=1
+fi
+
+# daemon-lifecycle must stay free of workflow implementation dependencies; retention arrives
+# through the caller-registered provider hook instead.
+if rg -n 'bcode_workflow' packages/daemon-lifecycle/Cargo.toml packages/daemon-lifecycle/src --glob '*.rs' --glob 'Cargo.toml' \
+  >/tmp/bcode-daemon-lifecycle-workflow-dependency.txt; then
+  echo "Runtime architecture violation: daemon lifecycle must not depend on workflow implementation crates." >&2
+  cat /tmp/bcode-daemon-lifecycle-workflow-dependency.txt >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

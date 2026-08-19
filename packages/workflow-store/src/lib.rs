@@ -7036,6 +7036,31 @@ impl WorkflowStore {
             .map_err(WorkflowStoreError::from)
     }
 
+    /// Return bounded artifact identities that still own resumable workflow runs.
+    ///
+    /// Deleting a daemon image whose artifact still owns `running`/`paused` runs would strand
+    /// them permanently: execution authority is fenced to the artifact, so no other daemon can
+    /// legitimately continue or terminalize the run. Callers use this as retention evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bound or query is invalid.
+    pub fn active_target_artifact_ids(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT target_artifact_id FROM workflow_runs \
+             WHERE status IN ('running', 'paused') AND target_artifact_id IS NOT NULL \
+             ORDER BY target_artifact_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowStoreError::from)
+    }
+
     /// Return bounded receipt-backed attempts that need owner reattachment/observation.
     ///
     /// # Errors
@@ -15068,6 +15093,70 @@ mod tests {
         assert_eq!(
             restored.preparation_descriptor_sha256,
             approval.scope.preparation_descriptor_sha256
+        );
+    }
+
+    #[test]
+    fn active_target_artifact_ids_reports_artifacts_owning_resumable_runs() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "fenced-run".to_string(),
+                definition_id: "mutation-definition".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: Some("fenced-parent-session".to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!({"expected_head": "abc"})),
+                execution_authority: Some(WorkflowExecutionAuthority {
+                    target_artifact_id: "bcode-fenced-artifact".to_string(),
+                    daemon_instance_id: "instance-1".to_string(),
+                    generation: 1,
+                    fencing_token: "token-1".to_string(),
+                }),
+                created_at_ms: 10,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+
+        // A running run keeps its artifact retained so recovery stays possible.
+        assert_eq!(
+            store.active_target_artifact_ids(100).expect("artifacts"),
+            vec!["bcode-fenced-artifact".to_string()]
+        );
+
+        // Terminal runs release their artifact, allowing image collection.
+        assert!(
+            store
+                .request_cancellation("fenced-run", 30)
+                .expect("cancel")
+        );
+        assert_eq!(
+            store
+                .run_summary("fenced-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
+        assert!(
+            store
+                .active_target_artifact_ids(100)
+                .expect("artifacts")
+                .is_empty()
         );
     }
 

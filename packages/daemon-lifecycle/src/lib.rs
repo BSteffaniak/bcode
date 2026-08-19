@@ -1326,6 +1326,27 @@ fn retained_daemon_image_paths(
 ///
 /// Returns an error when reading registry evidence or removing image directories fails.
 pub fn cleanup_stale_daemon_images(state_dir: &Path) -> Result<usize, DaemonLifecycleError> {
+    cleanup_stale_daemon_images_retaining_artifacts(state_dir, &std::collections::BTreeSet::new())
+}
+
+/// Remove cached daemon images, preserving images for artifacts callers still require.
+///
+/// `retained_artifact_ids` names artifact identities that must keep their cached images even
+/// without a live daemon record. Execution authority for durable work is fenced to an exact
+/// artifact identity, so deleting that artifact's image would permanently strand the work: no
+/// other artifact may legitimately claim ownership, and the owning artifact can no longer be
+/// launched. Retaining the image keeps a matching daemon startable so recovery stays possible.
+///
+/// Cleanup fails closed when any registry record is malformed or has an unknown schema because
+/// that record may contain image-retention evidence this build cannot safely interpret.
+///
+/// # Errors
+///
+/// Returns an error when reading registry evidence or removing image directories fails.
+pub fn cleanup_stale_daemon_images_retaining_artifacts(
+    state_dir: &Path,
+    retained_artifact_ids: &std::collections::BTreeSet<String>,
+) -> Result<usize, DaemonLifecycleError> {
     let Some(_cleanup_lock) = try_acquire_daemon_image_cleanup_lock(state_dir)? else {
         return Ok(0);
     };
@@ -1345,6 +1366,16 @@ pub fn cleanup_stale_daemon_images(state_dir: &Path) -> Result<usize, DaemonLife
         if !namespace_entry
             .file_type()
             .is_ok_and(|file_type| file_type.is_dir())
+        {
+            continue;
+        }
+        // The namespace directory name is the artifact identity that owns these images. Durable
+        // work fenced to this artifact keeps every image under it, because recovery requires
+        // launching a daemon of exactly this identity.
+        if namespace_entry
+            .file_name()
+            .to_str()
+            .is_some_and(|artifact_id| retained_artifact_ids.contains(artifact_id))
         {
             continue;
         }
@@ -1500,6 +1531,60 @@ mod tests {
         assert_eq!(cleanup_stale_daemon_images(&state_dir).expect("cleanup"), 1);
         assert!(!stale_image.exists());
         fs::remove_dir_all(state_dir).expect("state cleanup");
+    }
+
+    #[test]
+    fn daemon_image_cleanup_retains_images_for_artifacts_owning_durable_work() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-daemon-image-retention-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().expect("time")
+        ));
+        let fenced_image = stale_image_path(&state_dir, "artifact-with-work", "digest");
+        let unreferenced_image = stale_image_path(&state_dir, "artifact-without-work", "digest");
+        write_test_image(&fenced_image);
+        write_test_image(&unreferenced_image);
+
+        let retained = std::collections::BTreeSet::from(["artifact-with-work".to_owned()]);
+        assert_eq!(
+            cleanup_stale_daemon_images_retaining_artifacts(&state_dir, &retained)
+                .expect("cleanup"),
+            1
+        );
+        // Deleting this image would strand the fenced work permanently.
+        assert!(fenced_image.exists());
+        assert!(!unreferenced_image.exists());
+        assert!(artifact_image_is_available(
+            &state_dir,
+            "artifact-with-work"
+        ));
+        assert!(!artifact_image_is_available(
+            &state_dir,
+            "artifact-without-work"
+        ));
+
+        // Once the work no longer requires the artifact, its image becomes collectable.
+        assert_eq!(
+            cleanup_stale_daemon_images_retaining_artifacts(
+                &state_dir,
+                &std::collections::BTreeSet::new()
+            )
+            .expect("cleanup"),
+            1
+        );
+        assert!(!fenced_image.exists());
+        fs::remove_dir_all(state_dir).expect("state cleanup");
+    }
+
+    #[test]
+    fn registered_retained_artifact_providers_contribute_retention_evidence() {
+        fn provider() -> std::collections::BTreeSet<String> {
+            std::collections::BTreeSet::from(["provider-artifact".to_owned()])
+        }
+
+        register_retained_artifact_provider(provider);
+
+        assert!(registered_retained_artifact_ids().contains("provider-artifact"));
     }
 
     #[test]
@@ -2191,11 +2276,58 @@ where
     drop(image_use_guard);
     let _cleanup_task = tokio::spawn(async {
         let _ = cleanup_stale_daemon_records().await;
-        let _ = cleanup_stale_daemon_images(&bcode_config::default_state_dir());
+        let _ = cleanup_stale_daemon_images_retaining_artifacts(
+            &bcode_config::default_state_dir(),
+            &registered_retained_artifact_ids(),
+        );
     });
     drop(lock);
     print_daemon_status(options, "server started");
     Ok(())
+}
+
+/// Report whether any cached daemon image exists for one artifact identity.
+///
+/// Durable work fenced to an artifact can only be recovered by launching a daemon of exactly that
+/// identity. When no cached image remains, that work is unrecoverable rather than merely deferred.
+#[must_use]
+pub fn artifact_image_is_available(state_dir: &Path, artifact_id: &str) -> bool {
+    let namespace = state_dir.join("daemon-images").join(artifact_id);
+    fs::read_dir(namespace).is_ok_and(|mut entries| entries.any(|entry| entry.is_ok()))
+}
+
+/// Supplies artifact identities whose cached daemon images must be preserved.
+///
+/// Domains that fence durable work to an exact daemon artifact register a provider so background
+/// image cleanup cannot delete the only launchable daemon for still-recoverable work. The hook
+/// keeps this crate free of any dependency on those domains.
+type RetainedArtifactProvider = fn() -> std::collections::BTreeSet<String>;
+
+static RETAINED_ARTIFACT_PROVIDERS: std::sync::Mutex<Vec<RetainedArtifactProvider>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register a provider of artifact identities that must keep their cached daemon images.
+///
+/// Providers are consulted by background image cleanup. Registration is additive and idempotent
+/// only by caller discipline; register each provider once during startup.
+pub fn register_retained_artifact_provider(provider: RetainedArtifactProvider) {
+    RETAINED_ARTIFACT_PROVIDERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(provider);
+}
+
+/// Collect retained artifact identities from every registered provider.
+#[must_use]
+pub fn registered_retained_artifact_ids() -> std::collections::BTreeSet<String> {
+    let providers = RETAINED_ARTIFACT_PROVIDERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    providers
+        .into_iter()
+        .flat_map(|provider| provider())
+        .collect()
 }
 
 fn print_daemon_status(options: &EnsureDaemonOptions, status: &str) {

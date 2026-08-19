@@ -162,6 +162,7 @@ pub async fn run_with_static_bundled(
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
     init_tracing();
+    register_workflow_artifact_retention();
     BUILD_INFO
         .set(artifact_build_info.clone())
         .expect("Bcode CLI build information initialized more than once");
@@ -9358,7 +9359,11 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
             }
         }
     }
-    if let Ok(removed_images) = bcode_daemon_lifecycle::cleanup_stale_daemon_images(&state_dir)
+    if let Ok(removed_images) =
+        bcode_daemon_lifecycle::cleanup_stale_daemon_images_retaining_artifacts(
+            &state_dir,
+            &workflow_owning_artifact_ids(&state_dir),
+        )
         && verbose
         && removed_images > 0
     {
@@ -9367,6 +9372,39 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
             .push(format!("removed {removed_images} stale daemon image(s)"));
     }
     summary
+}
+
+/// Return artifact identities that still own resumable workflow runs.
+///
+/// Image cleanup must not delete the only launchable daemon for an artifact that still owns
+/// `running`/`paused` work, because execution authority is fenced to that exact artifact.
+///
+/// This is best-effort retention evidence: when the workflow store cannot be inspected, the empty
+/// set is returned so an unavailable optional domain never blocks daemon maintenance.
+fn workflow_owning_artifact_ids(state_dir: &Path) -> BTreeSet<String> {
+    let path = bcode_workflow_store::workflow_database_path(state_dir);
+    if !path.exists() {
+        return BTreeSet::new();
+    }
+    bcode_workflow_store::WorkflowStore::open_at_path(&path)
+        .and_then(|store| store.active_target_artifact_ids(1_000))
+        .map(BTreeSet::from_iter)
+        .unwrap_or_default()
+}
+
+/// Retention provider registered with daemon lifecycle image cleanup.
+fn default_state_workflow_owning_artifact_ids() -> BTreeSet<String> {
+    workflow_owning_artifact_ids(&bcode_config::default_state_dir())
+}
+
+/// Register workflow-owned artifact retention with daemon image cleanup.
+///
+/// Keeps background cleanup from stranding durable workflow work whose execution authority is
+/// fenced to an artifact that would otherwise lose its only launchable image.
+pub fn register_workflow_artifact_retention() {
+    bcode_daemon_lifecycle::register_retained_artifact_provider(
+        default_state_workflow_owning_artifact_ids,
+    );
 }
 
 fn daemon_status_matches(
