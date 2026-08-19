@@ -34955,6 +34955,11 @@ struct PendingLiveEvent {
 struct PendingLiveEventBuffer {
     events: BTreeMap<PendingLiveEventKey, PendingLiveEvent>,
     encoded_bytes: usize,
+    /// Serializations performed to size buffered events.
+    ///
+    /// Merge sizing must stay incremental; this lets tests assert the quadratic re-encode
+    /// regression cannot return without depending on wall-clock timing.
+    encode_calls: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34985,6 +34990,25 @@ impl PendingLiveEventBuffer {
         self.encoded_bytes
     }
 
+    /// Serializations performed to size buffered events.
+    #[cfg(test)]
+    const fn encode_calls(&self) -> u64 {
+        self.encode_calls
+    }
+
+    /// Measure `event` for byte accounting, recording that a serialization occurred.
+    fn measure(&mut self, event: &bcode_session_models::SessionLiveEvent) -> Option<usize> {
+        self.encode_calls = self.encode_calls.saturating_add(1);
+        encoded_live_event_bytes(event).ok()
+    }
+
+    /// Return true when `next` must not be merged into the currently buffered event for its key.
+    ///
+    /// Coalescing an unbounded run of appends into one frame defeats the flush interval: the
+    /// merged event keeps growing, so the client sees nothing until the buffer is finally flushed
+    /// or rejected. Both append-merging streams are therefore capped at
+    /// [`MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT`], which keeps frame size and visible latency
+    /// bounded for long assistant responses and large tool-argument drafts alike.
     fn should_flush_before(&self, next: &bcode_session_models::SessionLiveEvent) -> bool {
         if self.is_empty() {
             return false;
@@ -34992,26 +35016,42 @@ impl PendingLiveEventBuffer {
         let Some(key) = pending_live_event_key(next) else {
             return false;
         };
-        self.events.get(&key).is_some_and(|pending| {
-            let SessionLiveEventKind::ToolRequestDraft {
-                event: pending_draft,
-            } = &pending.event.kind
-            else {
-                return false;
-            };
-            let SessionLiveEventKind::ToolRequestDraft { event: next_draft } = &next.kind else {
-                return false;
-            };
-            let next_append_bytes = request_draft_append_bytes(next_draft);
-            matches!(
-                (&pending_draft.operation, &next_draft.operation),
+        self.events
+            .get(&key)
+            .is_some_and(|pending| match (&pending.event.kind, &next.kind) {
                 (
-                    bcode_session_models::ToolRequestDraftOperation::Append { .. },
-                    bcode_session_models::ToolRequestDraftOperation::Append { .. }
-                )
-            ) && request_draft_append_bytes(pending_draft).saturating_add(next_append_bytes)
-                > MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT
-        })
+                    SessionLiveEventKind::ToolRequestDraft {
+                        event: pending_draft,
+                    },
+                    SessionLiveEventKind::ToolRequestDraft { event: next_draft },
+                ) => {
+                    let next_append_bytes = request_draft_append_bytes(next_draft);
+                    matches!(
+                        (&pending_draft.operation, &next_draft.operation),
+                        (
+                            bcode_session_models::ToolRequestDraftOperation::Append { .. },
+                            bcode_session_models::ToolRequestDraftOperation::Append { .. }
+                        )
+                    ) && request_draft_append_bytes(pending_draft).saturating_add(next_append_bytes)
+                        > MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT
+                }
+                (
+                    SessionLiveEventKind::AssistantTextStreamUpdated {
+                        update: pending_update,
+                        ..
+                    },
+                    SessionLiveEventKind::AssistantTextStreamUpdated {
+                        update: next_update,
+                        ..
+                    },
+                ) => text_stream_append_bytes(pending_update)
+                    .zip(text_stream_append_bytes(next_update))
+                    .is_some_and(|(pending_bytes, next_bytes)| {
+                        pending_bytes.saturating_add(next_bytes)
+                            > MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT
+                    }),
+                _ => false,
+            })
     }
 
     fn clear(&mut self) {
@@ -35032,28 +35072,50 @@ impl PendingLiveEventBuffer {
             .collect()
     }
 
+    /// Buffer `event` for its coalescing key, merging it into any pending event for that key.
+    ///
+    /// Sizing is incremental for merges. Re-serializing the merged event on every append made this
+    /// path quadratic in the length of a streamed response: each small delta re-encoded the whole
+    /// accumulated frame, so the per-client fan-out task fell progressively further behind on long
+    /// turns and live text visibly stalled. Merges therefore adjust the recorded size by the
+    /// appended byte count instead of re-encoding.
     fn push(&mut self, event: bcode_session_models::SessionLiveEvent) -> BufferLiveEventResult {
         let Some(key) = pending_live_event_key(&event) else {
             return BufferLiveEventResult::PassThrough(Box::new(event));
-        };
-        let event = if let Some(pending) = self.events.get(&key) {
-            match merge_pending_live_event(&pending.event, &event) {
-                MergePendingLiveEvent::Merged(event) => *event,
-                MergePendingLiveEvent::Replace => event,
-                MergePendingLiveEvent::Gap => {
-                    return BufferLiveEventResult::Rejected(BufferLiveEventError::Gap);
-                }
-            }
-        } else {
-            event
-        };
-        let Ok(encoded_bytes) = serde_json::to_vec(&event).map(|encoded| encoded.len()) else {
-            return BufferLiveEventResult::Rejected(BufferLiveEventError::Encode);
         };
         let replaced_bytes = self
             .events
             .get(&key)
             .map_or(0, |pending| pending.encoded_bytes);
+        let (event, encoded_bytes) = if let Some(pending) = self.events.get(&key) {
+            match merge_pending_live_event(&pending.event, &event) {
+                MergePendingLiveEvent::Merged {
+                    event,
+                    appended_bytes,
+                } => {
+                    // The merged frame differs from the pending one only by the appended text and
+                    // a revision counter, so its size is tracked by adding the appended bytes.
+                    // This is an estimate: JSON escaping can expand some characters. It stays
+                    // within a small factor and only feeds the byte ceiling and a telemetry gauge,
+                    // while the append ceiling in `should_flush_before` provides the real bound.
+                    (*event, replaced_bytes.saturating_add(appended_bytes))
+                }
+                MergePendingLiveEvent::Replace => {
+                    let Some(encoded_bytes) = self.measure(&event) else {
+                        return BufferLiveEventResult::Rejected(BufferLiveEventError::Encode);
+                    };
+                    (event, encoded_bytes)
+                }
+                MergePendingLiveEvent::Gap => {
+                    return BufferLiveEventResult::Rejected(BufferLiveEventError::Gap);
+                }
+            }
+        } else {
+            let Some(encoded_bytes) = self.measure(&event) else {
+                return BufferLiveEventResult::Rejected(BufferLiveEventError::Encode);
+            };
+            (event, encoded_bytes)
+        };
         if !self.events.contains_key(&key) && self.events.len() >= MAX_PENDING_LIVE_KEYS_PER_CLIENT
         {
             return BufferLiveEventResult::Rejected(BufferLiveEventError::KeyLimit);
@@ -35083,11 +35145,35 @@ impl PendingLiveEventBuffer {
     }
 }
 
+/// Return the serialized size of one live event.
+///
+/// # Errors
+///
+/// Returns an error when the event cannot be serialized.
+fn encoded_live_event_bytes(
+    event: &bcode_session_models::SessionLiveEvent,
+) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec(event).map(|encoded| encoded.len())
+}
+
 const fn request_draft_append_bytes(event: &bcode_session_models::ToolRequestDraftEvent) -> usize {
     match &event.operation {
         bcode_session_models::ToolRequestDraftOperation::Append { text, .. } => text.len(),
         bcode_session_models::ToolRequestDraftOperation::Checkpoint { .. }
         | bcode_session_models::ToolRequestDraftOperation::Remove { .. } => 0,
+    }
+}
+
+/// Return the appended byte count for an append-shaped text-stream update.
+///
+/// Returns `None` for non-append operations, which do not accumulate across merges.
+const fn text_stream_append_bytes(
+    update: &bcode_session_models::TextStreamUpdate,
+) -> Option<usize> {
+    match &update.operation {
+        bcode_session_models::TextStreamOperation::Append { text, .. } => Some(text.len()),
+        bcode_session_models::TextStreamOperation::Checkpoint { .. }
+        | bcode_session_models::TextStreamOperation::Terminal { .. } => None,
     }
 }
 
@@ -35158,7 +35244,11 @@ fn pending_live_event_key(
 }
 
 enum MergePendingLiveEvent {
-    Merged(Box<bcode_session_models::SessionLiveEvent>),
+    /// The events were combined into one frame that appends `appended_bytes` of new text.
+    Merged {
+        event: Box<bcode_session_models::SessionLiveEvent>,
+        appended_bytes: usize,
+    },
     Replace,
     Gap,
 }
@@ -35207,7 +35297,10 @@ fn merge_pending_live_event(
             expected_offset: *pending_offset,
             text: format!("{pending_text}{next_text}"),
         };
-        return MergePendingLiveEvent::Merged(Box::new(merged));
+        return MergePendingLiveEvent::Merged {
+            event: Box::new(merged),
+            appended_bytes: next_text.len(),
+        };
     }
 
     let SessionLiveEventKind::ToolRequestDraft {
@@ -35244,7 +35337,10 @@ fn merge_pending_live_event(
         offset: *pending_offset,
         text: format!("{pending_text}{next_text}"),
     };
-    MergePendingLiveEvent::Merged(Box::new(merged))
+    MergePendingLiveEvent::Merged {
+        event: Box::new(merged),
+        appended_bytes: next_text.len(),
+    }
 }
 
 async fn flush_pending_live_events(
@@ -62344,6 +62440,202 @@ event_symbol = "bcode_plugin_handle_event_v1"
             BufferLiveEventResult::Buffered { superseded: false }
         ));
         assert!(pending.encoded_bytes() < MAX_PENDING_LIVE_BYTES_PER_CLIENT);
+    }
+
+    /// Long assistant responses must not coalesce into one unbounded frame.
+    ///
+    /// Without an append ceiling the merged frame grows for the whole turn, so the client sees no
+    /// text until the buffer is flushed or rejected — the streamed response appears to freeze and
+    /// then completes at turn end. This mirrors the tool-request-draft ceiling.
+    #[test]
+    fn pending_live_event_buffer_bounds_merged_assistant_text_appends() {
+        let session_id = SessionId::new();
+        let append =
+            |revision: u64, offset: usize, text: String| bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: offset,
+                            text,
+                        },
+                    },
+                },
+            };
+        let mut pending = PendingLiveEventBuffer::default();
+        let first_text = "a".repeat(MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT);
+        let first = append(1, 0, first_text);
+        assert!(!pending.should_flush_before(&first));
+        assert!(matches!(
+            pending.push(first),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+
+        // Merging this would exceed the append ceiling, so the buffer must flush first.
+        let next = append(2, MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT, "b".to_owned());
+        assert!(
+            pending.should_flush_before(&next),
+            "an append past the ceiling must flush instead of merging"
+        );
+        let flushed = pending.take_events();
+        assert_eq!(flushed.len(), 1);
+        assert!(!pending.should_flush_before(&next));
+        assert!(matches!(
+            pending.push(next),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert!(pending.encoded_bytes() < MAX_PENDING_LIVE_BYTES_PER_CLIENT);
+    }
+
+    /// Incremental merge sizing must stay correct and proportional to appended text.
+    ///
+    /// This pins the *correctness* of incremental accounting: no text is lost, offsets and
+    /// revisions still describe the merged span, and tracked size follows the text rather than
+    /// accumulating quadratically. See
+    /// `merged_assistant_text_appends_do_not_reserialize_the_accumulated_frame` for the cost
+    /// property itself.
+    #[test]
+    fn merged_assistant_text_size_is_tracked_incrementally() {
+        let session_id = SessionId::new();
+        let append =
+            |revision: u64, offset: usize, text: String| bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: offset,
+                            text,
+                        },
+                    },
+                },
+            };
+        let chunk_len = 64_usize;
+        let appends = 400_usize;
+        let mut pending = PendingLiveEventBuffer::default();
+        let mut offset = 0_usize;
+        for revision in 1..=appends {
+            let event = append(
+                u64::try_from(revision).expect("revision fits"),
+                offset,
+                "x".repeat(chunk_len),
+            );
+            // Stay under the append ceiling so every push merges.
+            assert!(!pending.should_flush_before(&event));
+            assert!(matches!(
+                pending.push(event),
+                BufferLiveEventResult::Buffered { .. }
+            ));
+            offset += chunk_len;
+        }
+
+        assert_eq!(pending.len(), 1, "appends collapse into one pending frame");
+        let text_bytes = chunk_len * appends;
+        let tracked = pending.encoded_bytes();
+        assert!(
+            tracked >= text_bytes,
+            "tracked size {tracked} must cover {text_bytes} appended bytes"
+        );
+        // A quadratic accumulation would be orders of magnitude larger than the text itself.
+        assert!(
+            tracked < text_bytes * 2,
+            "tracked size {tracked} must stay proportional to {text_bytes} appended bytes"
+        );
+
+        let flushed = pending.take_events();
+        assert_eq!(flushed.len(), 1);
+        let SessionLiveEventKind::AssistantTextStreamUpdated { update, .. } = &flushed[0].kind
+        else {
+            panic!("expected an assistant text stream update");
+        };
+        let bcode_session_models::TextStreamOperation::Append {
+            expected_offset,
+            text,
+        } = &update.operation
+        else {
+            panic!("expected an append operation");
+        };
+        assert_eq!(*expected_offset, 0, "merged frame keeps the first offset");
+        assert_eq!(text.len(), text_bytes, "no appended text is lost");
+        assert_eq!(update.first_revision, 1);
+        assert_eq!(
+            update.revision,
+            u64::try_from(appends).expect("revision fits")
+        );
+    }
+
+    /// Merging an append must not re-serialize the accumulated frame.
+    ///
+    /// `push` previously re-encoded the whole merged event to measure it, so every small delta
+    /// re-serialized the entire response so far. That is quadratic in turn length and starved the
+    /// per-client fan-out task, which is what made long streamed responses visibly stall.
+    ///
+    /// This counts serialization calls rather than timing them, so it fails deterministically if
+    /// merge sizing goes back to re-encoding.
+    #[test]
+    fn merged_assistant_text_appends_do_not_reserialize_the_accumulated_frame() {
+        let session_id = SessionId::new();
+        let append =
+            |revision: u64, offset: usize, text: String| bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: offset,
+                            text,
+                        },
+                    },
+                },
+            };
+
+        let mut pending = PendingLiveEventBuffer::default();
+        // The first push has no pending event to merge into, so it encodes once.
+        assert!(matches!(
+            pending.push(append(1, 0, "start".to_owned())),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert_eq!(pending.encode_calls(), 1);
+
+        let chunk_len = 64_usize;
+        let merge_appends = 2_000_usize;
+        let mut offset = "start".len();
+        for index in 0..merge_appends {
+            let revision = u64::try_from(index + 2).expect("revision fits");
+            let event = append(revision, offset, "x".repeat(chunk_len));
+            assert!(!pending.should_flush_before(&event));
+            assert!(matches!(
+                pending.push(event),
+                BufferLiveEventResult::Buffered { superseded: true }
+            ));
+            offset += chunk_len;
+        }
+
+        assert_eq!(
+            pending.encode_calls(),
+            1,
+            "merging {merge_appends} appends must not serialize again; \
+             merged frames are sized incrementally rather than re-encoded"
+        );
     }
 
     #[test]
