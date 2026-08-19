@@ -401,9 +401,28 @@ and reports stable blocker categories without cancelling work or detaching clien
 | Bounded history/projection/composer/input reads | None | Read completion |
 | Event/runtime-work subscriptions and attach forwarders | None beyond an actual attached client registration | Receiver/forwarder drop |
 | Background invariant selection | Bounded task/catalog snapshot only | Selector task completion or stale-task cancellation |
+| Cached session database connection | Actor-owned `SessionDb` handle, never handed out as a clone | Explicit backend close during quiescent release or idle timeout, verified terminal before release is reported |
 
 No state envelope or snapshot in this matrix implies durable reconnect/resume. Durable resume would
 require an explicit retention, acknowledgement, replay, and conflict contract.
+
+### Release completeness
+
+Releasing runtime ownership relinquishes the lease and the database connection together. Dropping a
+cached handle is not sufficient: `SessionDb` wraps a shared connection, so a surviving clone would
+keep the backend connection and its process-level file locks alive after the lease record was
+already removed. That produces an orphaned lock with no owner record, which no ownership recovery
+command can resolve because owner resolution starts from lease metadata.
+
+Quiescent release therefore closes the connection through the backend lifecycle and probes it before
+reporting success. When the connection cannot be proven terminal, release reports a blocked outcome
+carrying `database_handle_retained` instead of claiming success, so a retained handle is surfaced
+rather than concealed. Actor database accessors return borrows rather than clones so the compiler
+keeps the actor the sole owner of the handle.
+
+Read-only and diagnostic paths deliberately do not close. Closing checkpoints the WAL and rewrites
+`session.db` and `session.db-wal`, which would make a normal read mutate canonical storage. Those
+paths drop their local handle instead, which releases the connection without mutation.
 
 ## Historical daemon record classification
 
@@ -563,6 +582,12 @@ retained backup before running maintenance.
   server status, close the owning client normally, and wait for ownership to clear. Do not delete
   lease files or terminate a process solely to bypass ownership checks. If ownership remains after
   all owners have exited, run `bcode session doctor <session-id>` before considering repair.
+* **Locked with no reported owner:** A database lock can outlive its lease record, in which case
+  owner resolution reports no verified owner even though the database is locked. Run
+  `bcode session diagnose <session-id>` to identify the holding daemon, then use
+  `release-owner`/`stop-owner` against that daemon. Because Bcode intentionally supports many
+  concurrent build-specific daemons, never stop a daemon that is still serving other clients; a
+  daemon legitimately serving other sessions is not a stale owner.
 * **Backup failure:** Migration does not begin mutation until backup verification succeeds. Check
   the reported filesystem error, free space, destination permissions, and destination conflicts,
   then retry normal open. Keep any retained backup path reported by Bcode. Do not replace the

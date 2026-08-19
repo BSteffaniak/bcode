@@ -6473,6 +6473,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn released_session_database_is_closed_so_a_later_owner_can_open_it() {
+        // Regression: ownership release used to drop its cached `SessionDb` without closing it.
+        // Because `SessionDb` wraps a shared connection, an escaped clone could keep the backend
+        // connection — and its process-level file locks — alive after the lease record was gone,
+        // producing a lock with no owner that no recovery command could resolve.
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("release closes db".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        let client_id = ClientId::new();
+        manager
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        manager
+            .append_event(
+                session.id,
+                bcode_session_models::SessionEventKind::SystemMessage {
+                    text: "durable".to_string(),
+                },
+            )
+            .await
+            .expect("append durable event");
+        assert!(manager.session_is_owned(session.id).await);
+
+        assert!(
+            manager
+                .detach_session(session.id, client_id)
+                .await
+                .expect("session should detach")
+        );
+        assert!(!manager.session_is_owned(session.id).await);
+
+        // The canonical database must be openable and readable immediately after release.
+        let reopened = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("released session database must be openable");
+        assert!(
+            reopened
+                .last_event_sequence()
+                .await
+                .expect("released database must be readable")
+                .is_some(),
+            "canonical history must remain readable after release"
+        );
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn busy_session_does_not_pin_an_unrelated_idle_session_database() {
+        // Bcode intentionally runs long-lived daemons that serve many sessions at once, so an
+        // active session must never keep an unrelated idle session's database held. Otherwise one
+        // long-running tool call would hold locks for every session the daemon ever touched.
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+
+        let busy = manager
+            .create_session(Some("busy".to_string()), test_working_directory())
+            .await
+            .expect("busy session should create");
+        let idle = manager
+            .create_session(Some("idle".to_string()), test_working_directory())
+            .await
+            .expect("idle session should create");
+
+        let busy_client = ClientId::new();
+        let idle_client = ClientId::new();
+        manager
+            .attach_session_recent(busy.id, busy_client, 8)
+            .await
+            .expect("busy attach");
+        manager
+            .attach_session_recent(idle.id, idle_client, 8)
+            .await
+            .expect("idle attach");
+
+        // Keep the busy session genuinely owned by long-lived runtime work.
+        let busy_guard = manager
+            .acquire_session_ownership(busy.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("busy runtime ownership");
+
+        // The unrelated session becomes quiescent while the busy session keeps working.
+        assert!(
+            manager
+                .detach_session(idle.id, idle_client)
+                .await
+                .expect("idle session should detach")
+        );
+
+        assert!(
+            !manager.session_is_owned(idle.id).await,
+            "an idle session must release ownership even while another session is busy"
+        );
+        assert!(
+            manager.session_is_owned(busy.id).await,
+            "the busy session must retain its own ownership"
+        );
+
+        // The idle session's database must be immediately openable by a later owner.
+        db::SessionDb::open_existing_turso_in_root(idle.id, &root)
+            .await
+            .expect("idle session database must be released while another session is busy");
+
+        drop(busy_guard);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn ownership_guard_survives_detach_until_final_clone_drops() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");

@@ -116,6 +116,22 @@ pub struct SessionOwnershipSnapshot {
     pub attached_clients: usize,
     /// Long-lived ownership guards grouped by category.
     pub guards: BTreeMap<SessionOwnershipKind, u64>,
+    /// Whether a session database handle could not be proven closed during release.
+    ///
+    /// This is never a reason to withhold a release attempt; it records that an otherwise
+    /// quiescent release could not complete because the backend connection stayed open.
+    pub database_handle_retained: bool,
+}
+
+/// Outcome of releasing one actor's cached session database handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseRelease {
+    /// The handle was closed, proven terminal, and dropped.
+    Released,
+    /// No cached handle was held.
+    AlreadyReleased,
+    /// The connection could not be proven closed, so the handle is still held.
+    Retained,
 }
 
 /// Result of an atomic quiescent ownership-release attempt.
@@ -709,7 +725,7 @@ impl SessionActor {
                 tokio::select! {
                     release = self.ownership_release_receiver.recv() => {
                         if let Some(release) = release {
-                            self.release_ownership(release.kind, release.lease);
+                            self.release_ownership(release.kind, release.lease).await;
                         }
                         continue;
                     }
@@ -720,7 +736,9 @@ impl SessionActor {
                         if let Ok(command) = result {
                             command
                         } else {
-                            if self.release_database_resources() {
+                            if self.release_database_resources().await
+                                == DatabaseRelease::Released
+                            {
                                 tracing::debug!(
                                     session_id = %self.state.summary.id,
                                     "released idle session database handle"
@@ -734,7 +752,7 @@ impl SessionActor {
                 tokio::select! {
                     release = self.ownership_release_receiver.recv() => {
                         if let Some(release) = release {
-                            self.release_ownership(release.kind, release.lease);
+                            self.release_ownership(release.kind, release.lease).await;
                         }
                         continue;
                     }
@@ -797,12 +815,12 @@ impl SessionActor {
                 let result = self.attach(client_id, mode, queued_at).await;
                 if result.is_err() && self.state.clients.is_empty() && !self.has_ownership_guards()
                 {
-                    let _ = self.release_idle_resources();
+                    let _ = self.release_idle_resources().await;
                 }
                 if let Err(undelivered) = reply.send(result)
                     && undelivered.is_ok()
                 {
-                    let _ = self.detach(client_id);
+                    let _ = self.detach(client_id).await;
                 }
             }
             SessionCommand::SetComposerDraft {
@@ -831,7 +849,7 @@ impl SessionActor {
                 let _ = reply.send(Ok(self.subscribe_events()));
             }
             SessionCommand::Detach { client_id, reply } => {
-                let _ = reply.send(Ok(self.detach(client_id)));
+                let _ = reply.send(Ok(self.detach(client_id).await));
             }
             SessionCommand::Summary(reply) => {
                 let _ = reply.send(self.state.summary());
@@ -941,10 +959,11 @@ impl SessionActor {
                 let _ = reply.send(());
             }
             SessionCommand::ReleaseIdleResources(reply) => {
-                let _ = reply.send(self.release_idle_resources());
+                let _ = reply.send(self.release_idle_resources().await);
             }
             SessionCommand::ReleaseDatabaseResources(reply) => {
-                let _ = reply.send(self.release_database_resources());
+                let released = self.release_database_resources().await == DatabaseRelease::Released;
+                let _ = reply.send(released);
             }
             SessionCommand::AcquireOwnership { kind, reply } => {
                 let _ = reply.send(self.acquire_ownership(kind));
@@ -953,13 +972,13 @@ impl SessionActor {
                 let _ = reply.send(self.ownership_snapshot());
             }
             SessionCommand::ReleaseOwnershipIfQuiescent(reply) => {
-                let _ = reply.send(self.release_ownership_if_quiescent());
+                let _ = reply.send(self.release_ownership_if_quiescent().await);
             }
             SessionCommand::AdoptLease { lease, reply } => {
                 self.lease = Some(lease);
                 self.refresh_snapshot();
                 if self.state.clients.is_empty() && !self.has_ownership_guards() {
-                    let _ = self.release_idle_resources();
+                    let _ = self.release_idle_resources().await;
                 }
                 let _ = reply.send(());
             }
@@ -991,25 +1010,36 @@ impl SessionActor {
             SessionSnapshot::from_state(&self.state, self.lease.is_some());
     }
 
-    fn release_idle_resources(&mut self) -> bool {
+    async fn release_idle_resources(&mut self) -> bool {
         matches!(
-            self.release_ownership_if_quiescent(),
+            self.release_ownership_if_quiescent().await,
             SessionOwnershipRelease::Released
         )
     }
 
-    fn release_ownership_if_quiescent(&mut self) -> SessionOwnershipRelease {
+    async fn release_ownership_if_quiescent(&mut self) -> SessionOwnershipRelease {
         let snapshot = self.ownership_snapshot();
         let outcome = if snapshot.is_quiescent() {
-            let released_database = self.release_database_resources();
-            let released_lease = self.lease.take().is_some();
-            if released_lease {
-                self.refresh_snapshot();
-            }
-            if released_database || released_lease {
-                SessionOwnershipRelease::Released
-            } else {
-                SessionOwnershipRelease::AlreadyUnowned
+            match self.release_database_resources().await {
+                // The connection could not be proven terminal. Report a blocker instead of
+                // claiming release, so a retained handle is loud rather than invisible.
+                DatabaseRelease::Retained => {
+                    let mut blocked = snapshot.clone();
+                    blocked.database_handle_retained = true;
+                    SessionOwnershipRelease::Blocked(blocked)
+                }
+                released => {
+                    let released_database = released == DatabaseRelease::Released;
+                    let released_lease = self.lease.take().is_some();
+                    if released_lease {
+                        self.refresh_snapshot();
+                    }
+                    if released_database || released_lease {
+                        SessionOwnershipRelease::Released
+                    } else {
+                        SessionOwnershipRelease::AlreadyUnowned
+                    }
+                }
             }
         } else {
             SessionOwnershipRelease::Blocked(snapshot)
@@ -1049,17 +1079,60 @@ impl SessionActor {
                     labels,
                 );
             }
+            if snapshot.database_handle_retained {
+                let mut labels = bcode_metrics::MetricLabels::new();
+                labels.insert("blocker".to_owned(), "database_handle_retained".to_owned());
+                metrics.add_counter_with_labels(
+                    "session.ownership.release_blocked_total",
+                    1,
+                    labels,
+                );
+            }
         }
     }
 
-    fn release_database_resources(&mut self) -> bool {
-        if self.db.take().is_none() {
-            return false;
+    /// Close and drop the cached session database handle.
+    ///
+    /// Dropping the handle alone is not sufficient. `SessionDb` wraps a shared connection, so a
+    /// surviving clone would keep the backend connection — and its process-level file locks —
+    /// alive after the lease is gone, producing a lock with no owner record. Release therefore
+    /// closes the connection through the backend lifecycle and then proves it is terminal.
+    async fn release_database_resources(&mut self) -> DatabaseRelease {
+        let Some(db) = self.db.take() else {
+            return DatabaseRelease::AlreadyReleased;
+        };
+        if let Err(error) = db.close().await {
+            tracing::warn!(
+                session_id = %self.state.summary.id,
+                "failed to close session database on release: {error}"
+            );
         }
+        // A close error may still have released the connection, and a successful close must still
+        // be confirmed, so terminality is decided by probing rather than by the close result.
+        match db.is_closed().await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    session_id = %self.state.summary.id,
+                    "session database connection remained open after close; retaining ownership"
+                );
+                self.db = Some(db);
+                return DatabaseRelease::Retained;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.state.summary.id,
+                    "could not verify session database closed; retaining ownership: {error}"
+                );
+                self.db = Some(db);
+                return DatabaseRelease::Retained;
+            }
+        }
+        drop(db);
         self.state.events = None;
         self.state.load_status = SessionLoadStatusKind::SummaryOnly;
         self.refresh_snapshot();
-        true
+        DatabaseRelease::Released
     }
 
     fn ensure_ownership(&mut self) -> Result<(), SessionError> {
@@ -1106,7 +1179,7 @@ impl SessionActor {
         })
     }
 
-    fn release_ownership(
+    async fn release_ownership(
         &mut self,
         kind: SessionOwnershipKind,
         lease: Option<Arc<SessionLeaseGuard>>,
@@ -1120,7 +1193,7 @@ impl SessionActor {
         }
         drop(lease);
         if self.state.clients.is_empty() && !self.has_ownership_guards() {
-            let _ = self.release_idle_resources();
+            let _ = self.release_idle_resources().await;
         }
     }
 
@@ -1128,6 +1201,7 @@ impl SessionActor {
         SessionOwnershipSnapshot {
             attached_clients: self.state.clients.len(),
             guards: self.ownership_guards.clone(),
+            database_handle_retained: false,
         }
     }
 
@@ -1141,15 +1215,16 @@ impl SessionActor {
         updated_at_ms: u64,
     ) -> Result<(), SessionError> {
         self.ensure_ownership()?;
+        let session_id = self.state.summary.id;
+        let root_path = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?
+            .root_path();
         let Some(db) = self.existing_session_db().await? else {
             return Ok(());
         };
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        let _write_guard =
-            crate::lease::acquire_session_write_lock(&store.root_path(), self.state.summary.id)?;
+        let _write_guard = crate::lease::acquire_session_write_lock(&root_path, session_id)?;
         db.set_session_composer_draft(text, updated_at_ms).await?;
         Ok(())
     }
@@ -1168,58 +1243,80 @@ impl SessionActor {
         Ok(())
     }
 
-    async fn session_db_for_write(&mut self) -> Result<SessionDb, SessionError> {
-        if let Some(db) = &self.db {
-            return Ok(db.clone());
+    /// Return the cached write-capable session database, opening or initializing it if needed.
+    ///
+    /// This intentionally returns a borrow rather than a clone. `SessionDb` wraps a shared
+    /// connection, so handing out clones would let a backend connection — and its process-level
+    /// file locks — outlive ownership release. Borrowing keeps the actor the sole owner.
+    async fn session_db_for_write(&mut self) -> Result<&SessionDb, SessionError> {
+        if self.db.is_none() {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or(SessionError::NotFound(self.state.summary.id))?;
+            let db_path = crate::db::session_db_path(&store.root_path(), self.state.summary.id);
+            let db = if db_path.exists() {
+                SessionDb::open_runtime_turso_in_root_observed(
+                    self.state.summary.id,
+                    &store.root_path(),
+                    store.metrics(),
+                )
+                .await?
+            } else {
+                SessionDb::initialize_turso_in_root_observed(
+                    self.state.summary.id,
+                    &store.root_path(),
+                    store.metrics(),
+                )
+                .await?
+            };
+            self.db = Some(db);
         }
-        let store = self
-            .store
+        self.db
             .as_ref()
-            .ok_or(SessionError::NotFound(self.state.summary.id))?;
-        let db_path = crate::db::session_db_path(&store.root_path(), self.state.summary.id);
-        let db = if db_path.exists() {
-            SessionDb::open_runtime_turso_in_root_observed(
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))
+    }
+
+    /// Return the cached session database when canonical storage already exists.
+    ///
+    /// Returns a borrow rather than a clone for the same ownership reason as
+    /// [`Self::session_db_for_write`].
+    async fn existing_session_db(&mut self) -> Result<Option<&SessionDb>, SessionError> {
+        if self.db.is_none() {
+            let Some(store) = &self.store else {
+                return Ok(None);
+            };
+            if !crate::db::session_db_path(&store.root_path(), self.state.summary.id).exists() {
+                return Ok(None);
+            }
+            let db = SessionDb::open_existing_turso_in_root_observed(
                 self.state.summary.id,
                 &store.root_path(),
                 store.metrics(),
             )
-            .await?
-        } else {
-            SessionDb::initialize_turso_in_root_observed(
-                self.state.summary.id,
-                &store.root_path(),
-                store.metrics(),
-            )
-            .await?
-        };
-        self.db = Some(db.clone());
-        Ok(db)
+            .await?;
+            self.db = Some(db);
+        }
+        Ok(self.db.as_ref())
     }
 
-    async fn existing_session_db(&mut self) -> Result<Option<SessionDb>, SessionError> {
-        if self.db.is_some() {
-            return Ok(self.db.clone());
-        }
-        let Some(store) = &self.store else {
-            return Ok(None);
-        };
-        if !crate::db::session_db_path(&store.root_path(), self.state.summary.id).exists() {
-            return Ok(None);
-        }
-        let db = SessionDb::open_existing_turso_in_root_observed(
-            self.state.summary.id,
-            &store.root_path(),
-            store.metrics(),
-        )
-        .await?;
-        self.db = Some(db.clone());
-        Ok(Some(db))
+    /// Ensure the write-capable database is open without holding a borrow across the call.
+    async fn ensure_session_db_for_write(&mut self) -> Result<(), SessionError> {
+        self.session_db_for_write().await.map(|_| ())
     }
 
-    async fn refresh_state_from_db_for_write(
-        &mut self,
-        db: &SessionDb,
-    ) -> Result<(), SessionError> {
+    /// Reconcile in-memory state with durable projections before a write.
+    ///
+    /// This reads every value it needs into owned locals so the database borrow ends before the
+    /// actor mutates itself, keeping the actor the sole owner of the handle.
+    async fn refresh_state_from_db_for_write(&mut self) -> Result<(), SessionError> {
+        let session_id = self.state.summary.id;
+        let next_sequence = self.state.next_sequence;
+        let summary_created_at_ms = self.state.summary.created_at_ms;
+        let summary_updated_at_ms = self.state.summary.updated_at_ms;
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
         let Some(db_state) = db.session_state().await? else {
             return Ok(());
         };
@@ -1229,24 +1326,24 @@ impl SessionActor {
             .unwrap_or(db_state.last_event_seq);
         if db_state.last_event_seq < expected_last_sequence {
             return Err(SessionError::ProjectionStale {
-                session_id: self.state.summary.id,
+                session_id,
                 projection: "session_state",
                 checkpoint: Some(db_state.last_event_seq),
                 expected: expected_last_sequence,
             });
         }
-        if expected_last_sequence.saturating_add(1) == self.state.next_sequence {
+        if expected_last_sequence.saturating_add(1) == next_sequence {
             return Ok(());
         }
         let activity_bounds = db.activity_bounds().await?;
         let created_at_ms = activity_bounds
             .map(|(created_at_ms, _)| created_at_ms)
             .or(db_state.updated_at_ms)
-            .unwrap_or(self.state.summary.created_at_ms);
+            .unwrap_or(summary_created_at_ms);
         let updated_at_ms = db_state
             .updated_at_ms
             .or_else(|| activity_bounds.map(|(_, updated_at_ms)| updated_at_ms))
-            .unwrap_or(self.state.summary.updated_at_ms);
+            .unwrap_or(summary_updated_at_ms);
         let state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
         self.replace_persisted_state(state);
         Ok(())
@@ -1313,11 +1410,15 @@ impl SessionActor {
                 &store.root_path(),
                 self.state.summary.id,
             )?;
-            let db = self.session_db_for_write().await?;
-            self.refresh_state_from_db_for_write(&db).await?;
+            self.ensure_session_db_for_write().await?;
+            self.refresh_state_from_db_for_write().await?;
             let mut event = self.state.build_next_event(kind, event_timestamp_ms);
             event.provenance = provenance;
             let db_append_started_at = Instant::now();
+            let db = self
+                .db
+                .as_ref()
+                .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
             let append_result = db
                 .append_event_with_activity_timestamp(&event, Some(event_timestamp_ms))
                 .await;
@@ -1551,12 +1652,12 @@ impl SessionActor {
         )
     }
 
-    fn detach(&mut self, client_id: ClientId) -> bool {
+    async fn detach(&mut self, client_id: ClientId) -> bool {
         if self.state.clients.remove(&client_id) {
             self.state.summary.client_count = self.state.clients.len();
             self.refresh_snapshot();
             if self.state.clients.is_empty() && !self.has_ownership_guards() {
-                let _ = self.release_idle_resources();
+                let _ = self.release_idle_resources().await;
             }
             return true;
         }
@@ -1754,8 +1855,9 @@ impl SessionActor {
     }
 
     async fn input_history(&mut self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+        let session_id = self.state.summary.id;
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
         if let Some(db) = self.existing_session_db().await? {
-            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
             let checkpoint = db
                 .materialized_projection_checkpoint(MaterializedProjection::InputHistory)
                 .await?;
@@ -1763,7 +1865,7 @@ impl SessionActor {
                 return Ok(db.input_history().await?);
             }
             return Err(SessionError::ProjectionStale {
-                session_id: self.state.summary.id,
+                session_id,
                 projection: "input_history",
                 checkpoint,
                 expected: expected_last_sequence,
@@ -1783,8 +1885,9 @@ impl SessionActor {
         before_sequence: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
+        let session_id = self.state.summary.id;
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
         if let Some(db) = self.existing_session_db().await? {
-            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
             let checkpoint = db
                 .materialized_projection_checkpoint(MaterializedProjection::InputHistory)
                 .await?;
@@ -1792,7 +1895,7 @@ impl SessionActor {
                 return Ok(db.input_history_page(before_sequence, limit).await?);
             }
             return Err(SessionError::ProjectionStale {
-                session_id: self.state.summary.id,
+                session_id,
                 projection: "input_history",
                 checkpoint,
                 expected: expected_last_sequence,
@@ -1810,10 +1913,11 @@ impl SessionActor {
     }
 
     async fn active_tool_runs(&mut self) -> Result<Vec<crate::db::ToolRun>, SessionError> {
+        let session_id = self.state.summary.id;
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
         let Some(db) = self.existing_session_db().await? else {
             return Ok(Vec::new());
         };
-        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
         let checkpoint = db
             .materialized_projection_checkpoint(MaterializedProjection::ToolRuns)
             .await?;
@@ -1821,7 +1925,7 @@ impl SessionActor {
             return Ok(db.active_tool_runs().await?);
         }
         Err(SessionError::ProjectionStale {
-            session_id: self.state.summary.id,
+            session_id,
             projection: "tool_runs",
             checkpoint,
             expected: expected_last_sequence,
@@ -1831,10 +1935,11 @@ impl SessionActor {
     async fn active_runtime_work(
         &mut self,
     ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
+        let session_id = self.state.summary.id;
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
         let Some(db) = self.existing_session_db().await? else {
             return Ok(Vec::new());
         };
-        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
         let checkpoint = db
             .materialized_projection_checkpoint(MaterializedProjection::RuntimeWork)
             .await?;
@@ -1842,7 +1947,7 @@ impl SessionActor {
             return Ok(db.active_runtime_work().await?);
         }
         Err(SessionError::ProjectionStale {
-            session_id: self.state.summary.id,
+            session_id,
             projection: "runtime_work",
             checkpoint,
             expected: expected_last_sequence,

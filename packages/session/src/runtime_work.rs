@@ -36,6 +36,9 @@ impl SessionManager {
             .store
             .as_ref()
             .ok_or(SessionError::DbUnavailable(session_id))?;
+        // Bounded read path: the local handle is dropped at the end of this function, which
+        // releases the backend connection. It must not close, because closing checkpoints the WAL
+        // and would make a normal read mutate canonical storage.
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         let expected_last_sequence = db.last_event_sequence().await?.unwrap_or(0);
         let checkpoint = db

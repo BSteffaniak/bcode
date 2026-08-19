@@ -6679,6 +6679,8 @@ async fn classify_session_compatibility(
     let result = async {
         let owners = bcode_session::lease::active_session_owners(root, summary.id)?;
         let maintenance = bcode_session::lease::session_maintenance_is_active(root, summary.id)?;
+        // Bounded, non-mutating health read. The handle is dropped at the end of this scope, which
+        // releases the backend connection; it must not close, because closing checkpoints the WAL.
         let db =
             bcode_session::db::SessionDb::open_existing_turso_in_root(summary.id, root).await?;
         let compatibility = db.storage_compatibility().await?;
@@ -9847,6 +9849,8 @@ async fn current_writer_with_released_historical_events(
         return source_writer_epoch;
     }
     let root = state.sessions.session_store_root()?;
+    // Non-mutating probe: dropping the local handle releases the connection without the WAL
+    // checkpoint an explicit close would perform.
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root)
         .await
         .ok()?;
@@ -10661,7 +10665,7 @@ fn server_session_error_response(error: &ServerError) -> ErrorResponse {
 }
 
 const fn ownership_recovery_guidance() -> &'static str {
-    "ownership normally releases automatically after the final client disconnects and session work becomes quiescent; `bcode session release-owner <session-id>` requests non-destructive explicit release and reports blockers; `bcode session stop-owner <session-id>` requests verified graceful daemon shutdown; use `bcode session kill-owner <session-id>` only as a reviewed last resort after identity verification"
+    "ownership releases when the final client disconnects and session work becomes quiescent, but a lock can outlive its lease record, in which case no owner is reported; run `bcode session diagnose <session-id>` to identify the holder, then `bcode session release-owner <session-id>` for non-destructive explicit release that reports blockers, or `bcode session stop-owner <session-id>` for verified graceful daemon shutdown; use `bcode session kill-owner <session-id>` only as a reviewed last resort after identity verification, and never stop a daemon that is still serving other clients"
 }
 
 fn session_error_response(error: &bcode_session::SessionError) -> ErrorResponse {
@@ -40161,13 +40165,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
     fn ownership_guidance_distinguishes_automatic_and_escalating_actions() {
         let guidance = ownership_recovery_guidance();
         for expected in [
-            "releases automatically",
+            // Automatic release is described without promising it always happens: a lock can
+            // outlive its lease record, which is why diagnosis is named before escalation.
+            "releases when the final client disconnects",
+            "outlive its lease record",
+            "diagnose",
             "release-owner",
             "non-destructive",
             "stop-owner",
             "graceful",
             "kill-owner",
             "last resort",
+            // Many build-specific daemons run concurrently by design, so a daemon serving other
+            // clients must never be treated as a stale owner.
+            "still serving other clients",
         ] {
             assert!(guidance.contains(expected), "missing guidance: {expected}");
         }

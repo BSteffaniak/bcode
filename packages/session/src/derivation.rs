@@ -707,6 +707,8 @@ impl SessionManager {
         };
         store.write_session_manifest(summary.clone()).await?;
         store.schedule_catalog_summary(summary.clone()).await;
+        // The local handle is dropped when this function returns, releasing the connection without
+        // the WAL checkpoint that an explicit close would perform.
         let state = self
             .load_db_session_state(
                 summary.id,

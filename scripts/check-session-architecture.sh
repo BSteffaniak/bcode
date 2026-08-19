@@ -46,6 +46,31 @@ if ! rg -q 'SessionOwnershipReleaseOutcome' packages/ipc/src/lib.rs \
   violations=1
 fi
 
+# Releasing runtime ownership must relinquish the database connection too, not merely drop the
+# cached handle. `SessionDb` wraps a shared connection, so a surviving clone would keep backend
+# file locks alive after the lease record is gone, producing an orphaned lock with no owner that
+# no recovery command can resolve. Release therefore closes through the backend lifecycle, proves
+# the connection terminal, and reports a typed blocker when it cannot.
+if ! rg -q 'async fn release_database_resources' packages/session/src/actor.rs \
+  || ! rg -q 'db\.close\(\)\.await' packages/session/src/actor.rs \
+  || ! rg -q 'db\.is_closed\(\)\.await' packages/session/src/actor.rs \
+  || ! rg -q 'DatabaseRelease::Retained' packages/session/src/actor.rs \
+  || ! rg -q 'database_handle_retained' packages/session/src/actor.rs \
+  || ! grep -F 'released_session_database_is_closed_so_a_later_owner_can_open_it' packages/session/src/lib.rs >/dev/null; then
+  echo "Session ownership violation: quiescent release must close and prove the session database connection terminal instead of dropping a shared handle." >&2
+  violations=1
+fi
+
+# The actor must remain the sole owner of its cached database handle. Handing out `SessionDb`
+# clones would let a connection outlive ownership release, which is the mechanism behind orphaned
+# session locks. Accessors return borrows so the compiler enforces single ownership.
+if rg -n 'fn (session_db_for_write|existing_session_db)\([^)]*\) -> Result<(Option<)?SessionDb' \
+  packages/session/src/actor.rs >/tmp/bcode-session-db-clone-escape.txt; then
+  echo "Session ownership violation: actor database accessors must return borrows so a cached handle cannot outlive ownership release." >&2
+  cat /tmp/bcode-session-db-clone-escape.txt >&2
+  violations=1
+fi
+
 if ! rg -q 'DaemonRecordClassification' packages/daemon-lifecycle/src/lib.rs \
   || ! rg -q 'classify_daemon_record\(' packages/daemon-lifecycle/src/lib.rs packages/cli/src/lib.rs \
   || ! rg -q 'UnreachableStale' packages/daemon-lifecycle/src/lib.rs packages/cli/src/lib.rs \

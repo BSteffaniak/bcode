@@ -341,6 +341,9 @@ async fn model_context_projection_note(
     root: &Path,
     session_id: SessionId,
 ) -> Result<String, db::SessionDbError> {
+    // Read-only diagnosis must stay byte-for-byte non-mutating, so this must not close the
+    // database: closing checkpoints the WAL and rewrites `session.db`/`session.db-wal`. Dropping
+    // the local handle already releases the backend connection and its process-level file locks.
     let session_db = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
     Ok(match session_db.model_context_projection_status().await? {
         db::ModelContextProjectionStatus::Missing =>
@@ -357,6 +360,7 @@ async fn model_context_projection_note(
 }
 
 async fn validate_session_db(root: &Path, session_id: SessionId) -> Result<(), db::SessionDbError> {
+    // Read-only validation: see `model_context_projection_note` for why this must not close.
     let session_db = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
     let _ = session_db.last_event_sequence().await?;
     let _ = session_db.all_events_strict().await?;

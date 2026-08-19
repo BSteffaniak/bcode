@@ -1366,6 +1366,23 @@ impl SessionDb {
         Ok(())
     }
 
+    /// Probe whether this session database connection is terminally closed.
+    ///
+    /// Ownership release uses this to prove a released session no longer holds process-level
+    /// locks. A shared connection clone that outlives release would otherwise keep backend file
+    /// locks alive after the lease is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the probe fails for a reason other than a terminal close.
+    pub(crate) async fn is_closed(&self) -> SessionDbResult<bool> {
+        match self.db.query_raw("SELECT 1").await {
+            Ok(_) => Ok(false),
+            Err(error) if error.is_connection_error() => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Return the current composer draft, if one is persisted for this session.
     ///
     /// # Errors
