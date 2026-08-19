@@ -2117,6 +2117,7 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
             json,
         } => {
             let payload = read_bounded_json(&payload)?;
+            let client = compatible_interaction_client(&client, &exchange_id).await?;
             let resolved = client
                 .resolve_tool_exchange(
                     exchange_id,
@@ -2126,6 +2127,7 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
             print_interaction_resolution(resolved, json)?;
         }
         InteractionCommand::Cancel { exchange_id, json } => {
+            let client = compatible_interaction_client(&client, &exchange_id).await?;
             let resolved = client
                 .resolve_tool_exchange(
                     exchange_id,
@@ -2136,6 +2138,32 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
         }
     }
     Ok(())
+}
+
+async fn compatible_interaction_client(
+    client: &BcodeClient,
+    exchange_id: &str,
+) -> Result<BcodeClient, CliError> {
+    let exchange = client
+        .list_pending_tool_exchanges()
+        .await?
+        .into_iter()
+        .find(|exchange| exchange.request.exchange_id == exchange_id)
+        .ok_or_else(|| {
+            CliError::InvalidArguments(format!("pending interaction not found: {exchange_id}"))
+        })?;
+    Ok(client.clone().with_interaction_adapter(
+        bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+            producer_id: exchange.request.producer_id,
+            exchange_schema: exchange.request.schema,
+            min_schema_version: exchange.request.schema_version,
+            max_schema_version: exchange.request.schema_version,
+            platform_id: "cli".to_owned(),
+            priority: 0,
+            interaction_kind: "bcode.cli.schema-aware".to_owned(),
+            tui_surface_kind: None,
+        },
+    ))
 }
 
 fn print_interaction_resolution(resolved: bool, json: bool) -> Result<(), CliError> {
