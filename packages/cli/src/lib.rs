@@ -9624,6 +9624,22 @@ fn diagnostic_observations(status: &ServerStatus) -> Vec<DiagnosticObservation> 
         "slow_model_poll",
         "model provider poll_turn_events has exceeded 2s",
     );
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "model.provider.first_output_latency_ms",
+        10_000,
+        "slow_time_to_first_output",
+        "model provider took over 10s to produce first output",
+    );
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "model.provider.poll_idle_wait_duration_ms",
+        5_000,
+        "high_poll_idle_wait",
+        "Bcode spent over 5s of a turn waiting between provider polls",
+    );
     if status
         .metrics
         .counters
@@ -18648,6 +18664,104 @@ mod interaction_cli_tests {
                 }
             }) if exchange_id == "exchange-1"
         ));
+    }
+}
+
+#[cfg(test)]
+mod latency_diagnosis_tests {
+    use super::{DiagnosticSeverity, diagnostic_observations};
+    use bcode_ipc::ServerStatus;
+    use bcode_metrics::{HistogramSnapshot, MetricsSnapshot};
+
+    fn status_with_metrics(metrics: MetricsSnapshot) -> ServerStatus {
+        ServerStatus {
+            connected_client_count: 0,
+            sessions: Vec::new(),
+            session_catalog_loaded: false,
+            session_catalog_status: bcode_ipc::SessionCatalogStatus::default(),
+            session_catalog_sources: Vec::new(),
+            session_catalog_revision: 0,
+            selected_provider_plugin_id: None,
+            selected_model_id: None,
+            plugin_runtime: Vec::new(),
+            daemon: bcode_ipc::DaemonStatus::default(),
+            metrics,
+            metrics_report: Box::default(),
+        }
+    }
+
+    fn status_with_histogram(key: &str, max_ms: u64) -> ServerStatus {
+        let mut metrics = MetricsSnapshot::default();
+        metrics.histograms.insert(
+            key.to_owned(),
+            HistogramSnapshot {
+                count: 1,
+                sum: max_ms,
+                min: Some(max_ms),
+                max: Some(max_ms),
+                buckets: Vec::new(),
+            },
+        );
+        status_with_metrics(metrics)
+    }
+
+    #[test]
+    fn slow_time_to_first_output_is_reported() {
+        let observations = diagnostic_observations(&status_with_histogram(
+            "model.provider.first_output_latency_ms",
+            12_000,
+        ));
+
+        let observation = observations
+            .iter()
+            .find(|observation| observation.code == "slow_time_to_first_output")
+            .expect("slow first output should be diagnosed");
+        assert!(matches!(observation.severity, DiagnosticSeverity::Warning));
+        assert!(observation.message.contains("12000"));
+    }
+
+    #[test]
+    fn fast_time_to_first_output_is_not_reported() {
+        let observations = diagnostic_observations(&status_with_histogram(
+            "model.provider.first_output_latency_ms",
+            250,
+        ));
+
+        assert!(
+            !observations
+                .iter()
+                .any(|observation| observation.code == "slow_time_to_first_output"),
+            "fast first output must not be flagged"
+        );
+    }
+
+    #[test]
+    fn high_poll_idle_wait_is_reported_as_host_owned_latency() {
+        let observations = diagnostic_observations(&status_with_histogram(
+            "model.provider.poll_idle_wait_duration_ms",
+            9_000,
+        ));
+
+        let observation = observations
+            .iter()
+            .find(|observation| observation.code == "high_poll_idle_wait")
+            .expect("host-owned poll wait should be diagnosed");
+        assert!(
+            observation
+                .message
+                .contains("waiting between provider polls")
+        );
+    }
+
+    #[test]
+    fn absent_latency_metrics_produce_no_observations() {
+        let observations =
+            diagnostic_observations(&status_with_metrics(MetricsSnapshot::default()));
+
+        assert!(
+            observations.is_empty(),
+            "a status without metrics must not invent latency findings"
+        );
     }
 }
 

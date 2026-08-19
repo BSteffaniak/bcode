@@ -19766,6 +19766,10 @@ async fn run_model_turn(
         .await;
     let turn_config = state.session_config(session_id).await;
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+    let mut turn_span = state
+        .metrics
+        .span("model.turn")
+        .labels(model_turn_metric_labels(session_id, &turn_id));
     let model_work_id = WorkId::new(format!("model_{turn_id}"));
     let cancel_state =
         supplied_cancel_state.unwrap_or_else(|| Arc::new(TurnCancelState::default()));
@@ -19869,7 +19873,28 @@ async fn run_model_turn(
     if let Some(work) = background_guidance {
         launch_background_invariant_guidance(state, session_id, work).await;
     }
+    turn_span.finish_with_outcome(&model_turn_outcome_metric_label(completion.outcome));
     completion
+}
+
+/// Bounded metric labels identifying one model turn.
+fn model_turn_metric_labels(session_id: SessionId, turn_id: &str) -> MetricLabels {
+    let mut labels = MetricLabels::new();
+    labels.insert("session_id".to_owned(), session_id.to_string());
+    labels.insert("turn_id".to_owned(), turn_id.to_owned());
+    labels
+}
+
+/// Stable low-cardinality outcome label for one model turn.
+const fn model_turn_outcome_metric_label(outcome: ModelTurnOutcome) -> &'static str {
+    match outcome {
+        ModelTurnOutcome::Completed => "completed",
+        ModelTurnOutcome::Cancelled => "cancelled",
+        ModelTurnOutcome::Error => "error",
+        ModelTurnOutcome::ProviderUnavailable => "provider_unavailable",
+        ModelTurnOutcome::IdleTimeout => "idle_timeout",
+        ModelTurnOutcome::ToolRoundLimitReached => "tool_round_limit_reached",
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::large_stack_frames)]
@@ -20292,7 +20317,8 @@ async fn run_model_turn_inner(
                         message,
                     );
                 }
-                if !execute_model_tool_batch(
+                let tool_batch_started_at = Instant::now();
+                let tool_batch_completed = execute_model_tool_batch(
                     state,
                     session_id,
                     outcome.pending_tool_calls,
@@ -20302,8 +20328,13 @@ async fn run_model_turn_inner(
                     &execution,
                     turn_config.tools.execution.runtime_options(),
                 )
-                .await
-                {
+                .await;
+                state.metrics.record_histogram_with_labels(
+                    "model.turn.tool_execution_duration_ms",
+                    elapsed_ms(tool_batch_started_at),
+                    model_turn_metric_labels(session_id, &turn_id),
+                );
+                if !tool_batch_completed {
                     return ModelTurnCompletion::with_message(
                         ModelTurnOutcome::Cancelled,
                         "model turn cancelled",
@@ -21902,6 +21933,9 @@ async fn poll_model_turn_events(
     );
     let mut idle_for = Duration::ZERO;
     let mut no_progress_warned = false;
+    let round_started_at = Instant::now();
+    let mut first_output_recorded = false;
+    let mut idle_wait_total = Duration::ZERO;
     loop {
         service_runtime_priority_commands(state, session_id, command_context).await;
         if cancel_state.is_cancelled() {
@@ -21955,9 +21989,11 @@ async fn poll_model_turn_events(
             }
         };
         if response.events.is_empty() {
-            state
-                .metrics
-                .increment_counter("model.provider.poll_empty_total");
+            state.metrics.add_counter_with_labels(
+                "model.provider.poll_empty_total",
+                1,
+                provider_poll_metric_labels(session_id, provider_plugin_id, turn_id),
+            );
             let Some(next_idle_for) = wait_for_model_progress_or_timeout(
                 state,
                 session_id,
@@ -21973,10 +22009,20 @@ async fn poll_model_turn_events(
             else {
                 break;
             };
+            idle_wait_total =
+                idle_wait_total.saturating_add(next_idle_for.saturating_sub(idle_for));
             idle_for = next_idle_for;
             continue;
         }
         let saw_progress = model_events_include_progress(&response.events);
+        if saw_progress && !first_output_recorded {
+            first_output_recorded = true;
+            state.metrics.record_histogram_with_labels(
+                "model.provider.first_output_latency_ms",
+                elapsed_ms(round_started_at),
+                provider_poll_metric_labels(session_id, provider_plugin_id, turn_id),
+            );
+        }
         state.metrics.record_histogram(
             "model.provider.poll_events_per_response",
             response.events.len() as u64,
@@ -22019,9 +22065,16 @@ async fn poll_model_turn_events(
             else {
                 break;
             };
+            idle_wait_total =
+                idle_wait_total.saturating_add(next_idle_for.saturating_sub(idle_for));
             idle_for = next_idle_for;
         }
     }
+    state.metrics.record_histogram_with_labels(
+        "model.provider.poll_idle_wait_duration_ms",
+        u64::try_from(idle_wait_total.as_millis()).unwrap_or(u64::MAX),
+        provider_poll_metric_labels(session_id, provider_plugin_id, turn_id),
+    );
     finish_all_tool_request_drafts(
         state,
         session_id,
@@ -62108,6 +62161,86 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 "forbidden label: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn model_turn_metric_labels_are_bounded_and_secret_free() {
+        let session_id = SessionId::new();
+        let labels = model_turn_metric_labels(session_id, "session-42");
+
+        assert_eq!(
+            labels.get("session_id").map(String::as_str),
+            Some(session_id.to_string().as_str())
+        );
+        assert_eq!(
+            labels.get("turn_id").map(String::as_str),
+            Some("session-42")
+        );
+        assert_eq!(
+            labels.len(),
+            2,
+            "turn latency labels must stay low-cardinality"
+        );
+        for forbidden in [
+            "prompt",
+            "text",
+            "output",
+            "path",
+            "api_key",
+            "token",
+            "authorization",
+        ] {
+            assert!(
+                !labels.contains_key(forbidden),
+                "forbidden label: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_turn_outcome_metric_labels_are_stable_and_distinct() {
+        let outcomes = [
+            ModelTurnOutcome::Completed,
+            ModelTurnOutcome::Cancelled,
+            ModelTurnOutcome::Error,
+            ModelTurnOutcome::IdleTimeout,
+            ModelTurnOutcome::ToolRoundLimitReached,
+            ModelTurnOutcome::ProviderUnavailable,
+        ];
+        let labels = outcomes
+            .iter()
+            .map(|outcome| model_turn_outcome_metric_label(*outcome))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            labels.len(),
+            outcomes.len(),
+            "every turn outcome needs a distinct metric label"
+        );
+        assert_eq!(
+            model_turn_outcome_metric_label(ModelTurnOutcome::Completed),
+            "completed"
+        );
+        assert_eq!(
+            model_turn_outcome_metric_label(ModelTurnOutcome::ToolRoundLimitReached),
+            "tool_round_limit_reached"
+        );
+    }
+
+    #[test]
+    fn provider_poll_metric_labels_attribute_empty_polls_to_a_turn() {
+        let session_id = SessionId::new();
+        let labels = provider_poll_metric_labels(session_id, Some("bcode.fake-provider"), "turn-7");
+
+        assert_eq!(labels.get("turn_id").map(String::as_str), Some("turn-7"));
+        assert_eq!(
+            labels.get("provider_plugin_id").map(String::as_str),
+            Some("bcode.fake-provider")
+        );
+        assert_eq!(
+            labels.get("session_id").map(String::as_str),
+            Some(session_id.to_string().as_str())
+        );
     }
 
     #[tokio::test]

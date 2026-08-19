@@ -44,6 +44,13 @@ pub const CATALOG_PROVIDER_ID_SETTING: &str = "catalog_provider_id";
 pub const MODEL_PROVIDER_INTERFACE_ID: &str = "bcode.model-provider/v1";
 /// Plugin service interface for positioned provider output events.
 pub const MODEL_PROVIDER_INTERFACE_ID_V2: &str = "bcode.model-provider/v2";
+/// Plugin service interface for push-streamed provider turns.
+///
+/// A `v3` provider serves one turn inside a single long-lived [`OP_RUN_TURN`] streaming service
+/// call, emitting each [`ProviderTurnEvent`] as it is produced. This replaces the
+/// [`OP_START_TURN`] → [`OP_POLL_TURN_EVENTS`] → [`OP_FINISH_TURN`] triple, which cannot push
+/// because a streaming invocation's event channel closes when its service call returns.
+pub const MODEL_PROVIDER_INTERFACE_ID_V3: &str = "bcode.model-provider/v3";
 
 /// Operation for provider capability discovery.
 pub const OP_CAPABILITIES: &str = "capabilities";
@@ -62,6 +69,15 @@ pub const OP_VALIDATE_CONFIG: &str = "validate_config";
 
 /// Operation for starting a model turn.
 pub const OP_START_TURN: &str = "start_turn";
+
+/// Operation for serving one complete model turn over a push event stream.
+///
+/// Available on [`MODEL_PROVIDER_INTERFACE_ID_V3`]. The provider keeps this service call open for
+/// the whole turn, emits each [`ProviderTurnEvent`] as an incremental service event, observes
+/// cancellation through its invocation cancellation handle, and returns when the turn reaches a
+/// terminal state. Turn cleanup happens as the call unwinds, so no separate cancel or finish
+/// operation is required.
+pub const OP_RUN_TURN: &str = "run_turn";
 
 /// Operation for model verification.
 pub const OP_VERIFY_MODEL: &str = "verify_model";
