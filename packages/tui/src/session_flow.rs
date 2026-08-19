@@ -224,6 +224,10 @@ fn start_switch_session_at_sequence(
         BmuxApp::new_with_history(Some(next_session_id), &[], &[], false),
     );
     chat.app.take_cross_session_state_from(&previous_app);
+    // Reopening the session that is already attached is an in-process reconstruction, so its
+    // process-local notices must survive this intermediate app as well as the final one.
+    chat.app
+        .take_same_session_transcript_state_from(&previous_app);
     chat.app
         .take_same_session_reasoning_state_from(&previous_app);
     chat.agents.refresh_app_agent_metadata(&mut chat.app);

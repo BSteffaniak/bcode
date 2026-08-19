@@ -342,6 +342,39 @@ mod tests {
     }
 
     #[test]
+    fn presentation_note_persistence_failure_reports_without_retrying_persistence() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let error = bcode_client::ClientError::RequestTimeout {
+            timeout: std::time::Duration::from_secs(15),
+        };
+
+        report_client_issue(&mut app, "presentation note persistence failed", &error);
+
+        assert_eq!(
+            app.transcript().len(),
+            1,
+            "a failed durable note reports exactly one ephemeral diagnostic"
+        );
+        assert!(
+            app.transcript()[0]
+                .text()
+                .contains("presentation note persistence failed")
+        );
+        assert!(
+            matches!(
+                app.transcript_origin_for_test(0),
+                Some(crate::transcript_document::TranscriptPresentationOrigin::Ephemeral { .. })
+            ),
+            "the failure diagnostic is process-local, so it cannot re-enter the daemon append path"
+        );
+        assert!(
+            app.session_view_snapshot().transcript.items.is_empty(),
+            "the diagnostic never becomes canonical history"
+        );
+    }
+
+    #[test]
     fn connection_timeout_is_recoverable_timeout_not_unavailability() {
         let error = bcode_client::ClientError::ConnectTimeout {
             timeout: Duration::from_secs(5),

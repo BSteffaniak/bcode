@@ -2051,6 +2051,15 @@ fn export_plain_transcript_selection<'a>(
     (!output.is_empty()).then(|| output.join("\n\n"))
 }
 
+/// Export a visible transcript selection through the production selection-export path.
+#[cfg(test)]
+pub fn export_plain_transcript_selection_for_test<'a>(
+    items: impl IntoIterator<Item = &'a super::transcript::TranscriptItem>,
+    snapshot: &bmux_tui::selection::SelectionSnapshot,
+) -> Option<String> {
+    export_plain_transcript_selection(items, snapshot)
+}
+
 fn format_transcript_selection_item(
     item: &super::transcript::TranscriptItem,
     text: &str,

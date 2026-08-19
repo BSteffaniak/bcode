@@ -253,4 +253,174 @@ mod tests {
         );
         assert!(document.items()[0].revision() > item_revision);
     }
+
+    fn notice(text: &str) -> crate::transcript::TranscriptItem {
+        crate::transcript::TranscriptItem::with_format(
+            "System",
+            text.to_owned(),
+            bcode_session_view_models::TextFormat::PlainText,
+        )
+    }
+
+    fn visible_text(document: &TranscriptDocument) -> Vec<&str> {
+        document
+            .iter()
+            .map(crate::transcript::TranscriptItem::text)
+            .collect()
+    }
+
+    fn message_snapshot(items: &[(&str, u64, u64, &str)], thinking: bool) -> SessionViewSnapshot {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.thinking.visible = thinking;
+        snapshot.transcript.items = items
+            .iter()
+            .map(|(id, revision, sequence, text)| TranscriptViewItem {
+                id: TranscriptViewItemId::new(*id),
+                revision: *revision,
+                sequence: Some(*sequence),
+                timestamp_ms: Some(*sequence),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: ChatMessageView::markdown(*text),
+                },
+            })
+            .collect();
+        // The adapter tracks per-item revisions, so the document revision only needs to advance.
+        snapshot.transcript.revision = items
+            .iter()
+            .map(|(_, revision, _, _)| *revision)
+            .sum::<u64>();
+        snapshot
+    }
+
+    #[test]
+    fn reasoning_visibility_toggle_does_not_disturb_interleaved_notices() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.thinking.visible = true;
+        snapshot.transcript.items = vec![
+            TranscriptViewItem {
+                id: TranscriptViewItemId::new("answer-one"),
+                revision: 1,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: ChatMessageView::markdown("first"),
+                },
+            },
+            TranscriptViewItem {
+                id: TranscriptViewItemId::new("reasoning"),
+                revision: 1,
+                sequence: Some(2),
+                timestamp_ms: Some(2),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::ReasoningMessage {
+                    message: ChatMessageView::markdown("private reasoning"),
+                },
+            },
+        ];
+        snapshot.transcript.revision = 1;
+        let mut adapter = SessionViewTerminalAdapter::default();
+        let mut document = TranscriptDocument::default();
+        adapter.apply(&snapshot, &mut document);
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "private reasoning", "local"]
+        );
+
+        snapshot.thinking.visible = false;
+        snapshot.transcript.revision = 2;
+        adapter.apply(&snapshot, &mut document);
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "local"],
+            "hiding reasoning removes only the canonical reasoning entry"
+        );
+
+        snapshot.thinking.visible = true;
+        snapshot.transcript.revision = 3;
+        adapter.apply(&snapshot, &mut document);
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "private reasoning", "local"],
+            "restoring reasoning keeps the notice at its recorded boundary"
+        );
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn canonical_stream_updates_before_and_after_a_notice_keep_its_position() {
+        let mut adapter = SessionViewTerminalAdapter::default();
+        let mut document = TranscriptDocument::default();
+        adapter.apply(
+            &message_snapshot(&[("a", 1, 1, "first")], false),
+            &mut document,
+        );
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        adapter.apply(
+            &message_snapshot(&[("a", 1, 1, "first"), ("b", 1, 2, "second")], false),
+            &mut document,
+        );
+        assert_eq!(visible_text(&document), vec!["first", "local", "second"]);
+
+        adapter.apply(
+            &message_snapshot(&[("a", 2, 1, "first edited"), ("b", 1, 2, "second")], false),
+            &mut document,
+        );
+        assert_eq!(
+            visible_text(&document),
+            vec!["first edited", "local", "second"],
+            "updating the entry before the notice does not move it"
+        );
+
+        adapter.apply(
+            &message_snapshot(
+                &[("a", 2, 1, "first edited"), ("b", 2, 2, "second edited")],
+                false,
+            ),
+            &mut document,
+        );
+        assert_eq!(
+            visible_text(&document),
+            vec!["first edited", "local", "second edited"],
+            "updating the entry after the notice does not move it"
+        );
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn adapter_full_reset_recovery_rebuilds_canonical_entries_around_notices() {
+        let mut adapter = SessionViewTerminalAdapter::default();
+        let mut document = TranscriptDocument::default();
+        adapter.apply(
+            &message_snapshot(&[("a", 1, 1, "first"), ("b", 1, 2, "second")], false),
+            &mut document,
+        );
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        assert_eq!(visible_text(&document), vec!["first", "second", "local"]);
+
+        document.corrupt_source_index_for_test(TranscriptViewItemId::new("a"), 9);
+        assert!(!document.source_index_is_consistent());
+
+        assert_eq!(
+            adapter.apply(
+                &message_snapshot(&[("a", 1, 1, "first"), ("b", 1, 2, "second")], false),
+                &mut document,
+            ),
+            TranscriptDocumentDamage::FullReset
+        );
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "second", "local"],
+            "full-reset recovery rebuilds canonical entries and retains the notice"
+        );
+        assert!(document.source_index_is_consistent());
+    }
 }

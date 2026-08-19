@@ -541,3 +541,395 @@ impl TranscriptDocument {
         self.revision = self.revision.saturating_add(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_view_models::{
+        ChatMessageView, TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind,
+    };
+
+    fn source_id(id: &str) -> TranscriptViewItemId {
+        TranscriptViewItemId::new(id)
+    }
+
+    fn shared_item(id: &str, revision: u64, sequence: u64, text: &str) -> TranscriptViewItem {
+        TranscriptViewItem {
+            id: source_id(id),
+            revision,
+            sequence: Some(sequence),
+            timestamp_ms: Some(sequence.saturating_mul(1_000)),
+            output_location: None,
+            streaming: false,
+            kind: TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown(text),
+            },
+        }
+    }
+
+    fn canonical(id: &str, revision: u64, sequence: u64, text: &str) -> TranscriptItem {
+        crate::transcript::terminal_item_from_shared(&shared_item(id, revision, sequence, text))
+    }
+
+    fn notice(text: &str) -> TranscriptItem {
+        TranscriptItem::with_format(
+            "System",
+            text.to_owned(),
+            bcode_session_view_models::TextFormat::PlainText,
+        )
+    }
+
+    fn visible_text(document: &TranscriptDocument) -> Vec<&str> {
+        document.iter().map(TranscriptItem::text).collect()
+    }
+
+    fn ordered_ids(ids: &[&str]) -> Vec<TranscriptViewItemId> {
+        ids.iter().copied().map(source_id).collect()
+    }
+
+    #[test]
+    fn presentation_identity_is_unique_per_entry() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        document.upsert_from_shared(canonical("b", 1, 2, "second"));
+
+        let ids = (0..document.len())
+            .map(|index| document.presentation_id(index).expect("identity"))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(ids.len(), document.len());
+    }
+
+    #[test]
+    fn presentation_identity_resolves_back_to_its_current_index() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 2, "first"));
+        let canonical_id = document.presentation_id(0).expect("identity");
+
+        document.upsert_from_shared(canonical("older", 1, 1, "older"));
+        document.reorder_from_shared(&ordered_ids(&["older", "a"]));
+
+        assert_eq!(document.presentation_index(canonical_id), Some(1));
+    }
+
+    #[test]
+    fn provenance_is_explicit_for_canonical_and_ephemeral_entries() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+
+        assert_eq!(
+            document.origin(0),
+            Some(&TranscriptPresentationOrigin::Canonical {
+                source_item_id: source_id("a"),
+            })
+        );
+        match document.origin(1).expect("origin") {
+            TranscriptPresentationOrigin::Ephemeral { source, .. } => {
+                assert_eq!(source, "bcode.tui");
+            }
+            TranscriptPresentationOrigin::Canonical { .. } => {
+                panic!("notice must not be canonical");
+            }
+        }
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn ephemeral_entries_are_absent_from_canonical_source_lookup() {
+        let mut document = TranscriptDocument::default();
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+
+        assert_eq!(document.len(), 2);
+        assert_eq!(document.canonical_count(), 1);
+        assert_eq!(document.source_index(&source_id("a")), Some(1));
+    }
+
+    #[test]
+    fn notices_sharing_a_boundary_keep_insertion_order() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("first notice"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("second notice"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("third notice"));
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "first notice", "second notice", "third notice"]
+        );
+
+        document.reorder_from_shared(&ordered_ids(&["a"]));
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "first notice", "second notice", "third notice"]
+        );
+    }
+
+    #[test]
+    fn canonical_append_extends_visible_order() {
+        let mut document = TranscriptDocument::default();
+        assert_eq!(
+            document.upsert_from_shared(canonical("a", 1, 1, "first")),
+            0
+        );
+        assert_eq!(
+            document.upsert_from_shared(canonical("b", 1, 2, "second")),
+            1
+        );
+
+        assert_eq!(visible_text(&document), vec!["first", "second"]);
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn canonical_update_replaces_payload_without_changing_identity() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        let entry_id = document.presentation_id(0).expect("identity");
+        let revision = document.revision();
+
+        assert_eq!(
+            document.upsert_from_shared(canonical("a", 2, 1, "edited")),
+            0
+        );
+
+        assert_eq!(document.len(), 1);
+        assert_eq!(document.presentation_id(0), Some(entry_id));
+        assert_eq!(visible_text(&document), vec!["edited"]);
+        assert!(document.revision() > revision);
+    }
+
+    #[test]
+    fn canonical_update_at_same_revision_does_not_bump_document_revision() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        let revision = document.revision();
+
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+
+        assert_eq!(document.revision(), revision);
+    }
+
+    #[test]
+    fn canonical_removal_retains_surviving_entries_and_notices() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.upsert_from_shared(canonical("b", 1, 2, "second"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+
+        document.retain_from_shared(&BTreeSet::from([source_id("a")]));
+
+        assert_eq!(visible_text(&document), vec!["first", "local"]);
+        assert_eq!(document.source_index(&source_id("a")), Some(0));
+        assert_eq!(document.source_index(&source_id("b")), None);
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn canonical_reorder_moves_entries_and_reanchors_notices() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("after first"));
+        document.upsert_from_shared(canonical("b", 1, 2, "second"));
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "after first", "second"]
+        );
+
+        document.reorder_from_shared(&ordered_ids(&["b", "a"]));
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["second", "first", "after first"]
+        );
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn canonical_reorder_without_change_does_not_bump_revision() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.upsert_from_shared(canonical("b", 1, 2, "second"));
+        let revision = document.revision();
+
+        document.reorder_from_shared(&ordered_ids(&["a", "b"]));
+
+        assert_eq!(document.revision(), revision);
+    }
+
+    #[test]
+    fn full_replacement_preserves_canonical_identity_and_notices() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        let canonical_id = document.presentation_id(0).expect("identity");
+        let notice_id = document.presentation_id(1).expect("identity");
+
+        document.replace_from_shared(vec![
+            canonical("a", 2, 1, "edited"),
+            canonical("b", 1, 2, "second"),
+        ]);
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["edited", "local", "second"],
+            "the notice keeps its canonical anchor after a full replacement"
+        );
+        assert_eq!(document.presentation_id(0), Some(canonical_id));
+        assert_eq!(document.presentation_id(1), Some(notice_id));
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn full_replacement_clearing_canonical_entries_keeps_notices() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+
+        document.replace_from_shared(Vec::new());
+
+        assert_eq!(visible_text(&document), vec!["local"]);
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn notice_before_any_canonical_entry_stays_first() {
+        let mut document = TranscriptDocument::default();
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.reorder_from_shared(&ordered_ids(&["a"]));
+
+        assert_eq!(visible_text(&document), vec!["local", "first"]);
+    }
+
+    #[test]
+    fn notice_after_last_canonical_entry_stays_last() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.upsert_from_shared(canonical("b", 1, 2, "second"));
+
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+
+        assert_eq!(visible_text(&document), vec!["first", "second", "local"]);
+    }
+
+    #[test]
+    fn notice_between_canonical_entries_keeps_its_boundary() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        document.upsert_from_shared(canonical("b", 1, 2, "second"));
+
+        document.reorder_from_shared(&ordered_ids(&["a", "b"]));
+
+        assert_eq!(visible_text(&document), vec!["first", "local", "second"]);
+    }
+
+    #[test]
+    fn multiple_interleaved_notices_preserve_each_boundary() {
+        let mut document = TranscriptDocument::default();
+        document.push_ephemeral("bcode.tui".to_owned(), notice("before all"));
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("after first"));
+        document.upsert_from_shared(canonical("b", 1, 2, "second"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("after second"));
+        document.upsert_from_shared(canonical("c", 1, 3, "third"));
+
+        document.reorder_from_shared(&ordered_ids(&["a", "b", "c"]));
+
+        assert_eq!(
+            visible_text(&document),
+            vec![
+                "before all",
+                "first",
+                "after first",
+                "second",
+                "after second",
+                "third",
+            ]
+        );
+        assert!(document.source_index_is_consistent());
+    }
+
+    #[test]
+    fn notice_falls_back_to_sequence_when_exact_anchor_is_removed() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 10, "first"));
+        document.upsert_from_shared(canonical("b", 1, 20, "second"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        document.upsert_from_shared(canonical("c", 1, 30, "third"));
+        document.reorder_from_shared(&ordered_ids(&["a", "b", "c"]));
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "second", "local", "third"]
+        );
+
+        document.retain_from_shared(&BTreeSet::from([source_id("a"), source_id("c")]));
+        document.reorder_from_shared(&ordered_ids(&["a", "c"]));
+
+        assert_eq!(
+            visible_text(&document),
+            vec!["first", "local", "third"],
+            "the notice stays after the newest canonical entry at or before its recorded sequence"
+        );
+    }
+
+    #[test]
+    fn notice_older_than_every_resident_entry_sorts_first() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 10, "first"));
+        document.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+        document.retain_from_shared(&BTreeSet::new());
+
+        document.upsert_from_shared(canonical("later", 1, 90, "later"));
+        document.reorder_from_shared(&ordered_ids(&["later"]));
+
+        assert_eq!(visible_text(&document), vec!["local", "later"]);
+    }
+
+    #[test]
+    fn inconsistent_source_index_is_reported_and_recovered() {
+        let mut document = TranscriptDocument::default();
+        document.upsert_from_shared(canonical("a", 1, 1, "first"));
+        assert!(document.source_index_is_consistent());
+
+        document.corrupt_source_index_for_test(source_id("a"), 7);
+        assert!(!document.source_index_is_consistent());
+
+        document.upsert_from_shared(canonical("a", 2, 1, "edited"));
+
+        assert!(document.source_index_is_consistent());
+        assert_eq!(visible_text(&document), vec!["edited"]);
+    }
+
+    #[test]
+    fn copying_notices_does_not_duplicate_already_present_entries() {
+        let mut source = TranscriptDocument::default();
+        source.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+
+        let mut target = TranscriptDocument::default();
+        target.upsert_from_shared(canonical("a", 1, 1, "first"));
+        target.copy_ephemeral_from(&source);
+        target.copy_ephemeral_from(&source);
+
+        assert_eq!(visible_text(&target), vec!["local", "first"]);
+        assert!(target.source_index_is_consistent());
+    }
+
+    #[test]
+    fn copying_notices_never_copies_canonical_entries() {
+        let mut source = TranscriptDocument::default();
+        source.upsert_from_shared(canonical("a", 1, 1, "first"));
+        source.push_ephemeral("bcode.tui".to_owned(), notice("local"));
+
+        let mut target = TranscriptDocument::default();
+        target.copy_ephemeral_from(&source);
+
+        assert_eq!(visible_text(&target), vec!["local"]);
+        assert_eq!(target.canonical_count(), 0);
+    }
+}

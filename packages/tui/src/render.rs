@@ -753,6 +753,54 @@ fn ephemeral_markdown_selection_scene_reflows_without_changing_source_ranges() {
 
 #[cfg(test)]
 #[test]
+fn every_supported_ephemeral_notice_format_renders_visible_rows() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.push_ephemeral_system_plain("plain notice text".to_owned());
+    app.push_ephemeral_system_markdown("**markdown** notice".to_owned());
+    app.push_ephemeral_system_json("{\"notice\":\"json\"}".to_owned());
+
+    let formats = app
+        .transcript()
+        .iter()
+        .map(TranscriptItem::text_format)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        formats,
+        vec![
+            TextFormat::PlainText,
+            TextFormat::Markdown,
+            TextFormat::Json
+        ]
+    );
+
+    let _layout = prepare_frame(&mut app, Rect::new(0, 0, 40, 20)).expect("layout");
+    for index in 0..3 {
+        let rows = app
+            .transcript_layout()
+            .entry_row_count(
+                super::transcript_layout::VisibleTranscriptSource::Transcript,
+                index,
+            )
+            .unwrap_or_default();
+        assert!(
+            rows > 0,
+            "ephemeral notice {index} must render at least one visible row"
+        );
+    }
+
+    let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 40, 20));
+    render(&mut app, &mut Frame::new(&mut buffer));
+    let text = (0..20)
+        .filter_map(|row| buffer.row_symbols(row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("plain notice text"));
+    assert!(text.contains("markdown"));
+    assert!(text.contains("json"));
+}
+
+#[cfg(test)]
+#[test]
 fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_replacement() {
     let source = "<details><summary>More</summary>Body that wraps across several cells.</details>";
     let item = TranscriptItem::with_format("System", source.to_owned(), TextFormat::Markdown);

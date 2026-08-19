@@ -2038,6 +2038,38 @@ impl BmuxApp {
         ))
     }
 
+    /// Return stable presentation identity at one visible index.
+    #[cfg(test)]
+    pub fn transcript_presentation_id_for_test(
+        &self,
+        index: usize,
+    ) -> Option<TranscriptPresentationEntryId> {
+        self.transcript.presentation_id(index)
+    }
+
+    /// Return presentation provenance at one visible index.
+    #[cfg(test)]
+    pub fn transcript_origin_for_test(
+        &self,
+        index: usize,
+    ) -> Option<&TranscriptPresentationOrigin> {
+        self.transcript.origin(index)
+    }
+
+    /// Detach the viewport and anchor it at one absolute transcript row.
+    #[cfg(test)]
+    pub fn scroll_transcript_to_row_for_test(&mut self, row: usize) {
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
+        self.transcript_scroll_animation = None;
+        self.viewport.follow_anchor(row);
+    }
+
+    /// Return the resolved top row for latest-user-message anchoring.
+    #[cfg(test)]
+    pub fn latest_user_message_start_row_for_test(&self) -> Option<usize> {
+        self.latest_user_message_start_row()
+    }
+
     /// Return the transcript row that should render at the top of the viewport.
     #[must_use]
     pub fn transcript_top_row(&self, viewport_height: u16) -> usize {
@@ -5087,6 +5119,158 @@ mod tests {
 
         assert_eq!(reconstructed.transcript().len(), 1);
         assert_eq!(reconstructed.transcript()[0].text(), "canonical");
+    }
+
+    #[test]
+    fn reopening_the_attached_session_preserves_notices_through_the_intermediate_app() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "canonical".to_owned(),
+            },
+        }];
+        let mut attached = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        attached.push_ephemeral_system_plain("local issue".to_owned());
+
+        // `start_switch_session_at_sequence` installs an empty intermediate app for the same
+        // session before the attach result arrives. Losing notices here would make reopening the
+        // current session silently drop them even though the final app transfers state.
+        let mut intermediate = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        intermediate.take_same_session_transcript_state_from(&attached);
+        assert_eq!(
+            intermediate
+                .transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["local issue"]
+        );
+
+        let mut completed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        completed.take_same_session_transcript_state_from(&intermediate);
+
+        assert_eq!(
+            completed
+                .transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["canonical", "local issue"],
+            "the notice survives the full reopen chain and reanchors to canonical history"
+        );
+    }
+
+    #[test]
+    fn ephemeral_notices_stay_out_of_every_canonical_and_context_bearing_projection() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "canonical".to_owned(),
+            },
+        }];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        app.push_ephemeral_system_plain("local issue".to_owned());
+        assert_eq!(app.transcript().len(), 2);
+
+        // The shared semantic projection is the only source used for canonical history reads,
+        // canonical export, model context, migration, and repair. A notice that never enters it
+        // cannot reach any of those paths.
+        let snapshot = app.session_view_snapshot();
+        assert_eq!(snapshot.transcript.items.len(), 1);
+        assert!(
+            !snapshot.transcript.items.iter().any(|item| matches!(
+                &item.kind,
+                bcode_session_view_models::TranscriptViewItemKind::SystemMessage { message }
+                    if message.text.contains("local issue")
+            )),
+            "no canonical transcript item carries the ephemeral notice text"
+        );
+
+        // Ephemeral entries also carry no canonical identity or sequence, so nothing can address
+        // them as canonical history.
+        let notice = app
+            .transcript()
+            .iter()
+            .find(|item| item.text() == "local issue")
+            .expect("notice");
+        assert!(notice.source_view_item_id().is_none());
+        assert!(notice.event_sequence().is_none());
+        assert_eq!(app.transcript_index_for_sequence(1), Some(0));
+    }
+
+    #[test]
+    fn durable_presentation_notes_replay_as_canonical_entries_beside_ephemeral_notices() {
+        let session_id = bcode_session_models::SessionId::new();
+        let durable_note = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::PluginStatusNote {
+                plugin_id: "bcode.tui".to_owned(),
+                note_id: "note-1".to_owned(),
+                text: "durable note".to_owned(),
+                metadata: std::collections::BTreeMap::from([(
+                    "presentation_only".to_owned(),
+                    serde_json::Value::Bool(true),
+                )]),
+            },
+        };
+        let mut app = BmuxApp::new_with_history(
+            Some(session_id),
+            std::slice::from_ref(&durable_note),
+            &[],
+            false,
+        );
+        app.push_ephemeral_system_plain("local issue".to_owned());
+
+        assert_eq!(
+            app.transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["durable note", "local issue"]
+        );
+
+        // The durable note came from canonical history, so it owns canonical provenance and a
+        // sequence; the process-local notice owns neither.
+        assert!(matches!(
+            app.transcript.origin(0),
+            Some(TranscriptPresentationOrigin::Canonical { .. })
+        ));
+        assert_eq!(app.transcript()[0].event_sequence(), Some(1));
+        assert!(matches!(
+            app.transcript.origin(1),
+            Some(TranscriptPresentationOrigin::Ephemeral { .. })
+        ));
+        assert_eq!(app.session_view_snapshot().transcript.items.len(), 1);
+
+        // Replaying the same canonical history reproduces only the durable note.
+        let replayed = BmuxApp::new_with_history(
+            Some(session_id),
+            std::slice::from_ref(&durable_note),
+            &[],
+            false,
+        );
+        assert_eq!(
+            replayed
+                .transcript()
+                .iter()
+                .map(TranscriptItem::text)
+                .collect::<Vec<_>>(),
+            ["durable note"]
+        );
     }
 
     #[test]

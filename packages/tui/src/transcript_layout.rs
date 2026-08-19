@@ -166,7 +166,12 @@ pub struct VisibleTranscriptLine {
 pub enum VisibleTranscriptSource {
     /// Older-history status banner.
     HistoryBanner,
-    /// Committed transcript item.
+    /// Committed entry of the ordered terminal presentation document.
+    ///
+    /// This covers every committed visible entry regardless of persistence provenance: entries
+    /// adapted from canonical session history and process-local ephemeral notices share one
+    /// chronological sequence. Entry indexes are visible presentation indexes into that document,
+    /// never canonical source indexes, so consumers must not infer durability from this source.
     Transcript,
     /// Pending submission item.
     Pending,
@@ -574,6 +579,63 @@ mod tests {
         assert_eq!(visible[0].row_in_entry, 2);
         assert_eq!(visible[1].entry_index, 2);
         assert_eq!(visible[1].row_in_entry, 0);
+    }
+
+    #[test]
+    fn item_only_update_preserves_row_cache_for_unaffected_entries() {
+        let mut cache = TranscriptLayoutCache::default();
+        let rebuilds = std::cell::Cell::new(0_usize);
+        cache.sync(TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new("initial".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new("structure".to_owned()),
+            transcript_len: 4,
+            pending_len: 0,
+            transcript_signature: |index| TranscriptLayoutSignature::new(format!("item-{index}")),
+            transcript_rows: |_| vec![Line::from("row")].into(),
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| unreachable!("no pending entries"),
+            pending_rows: |_| unreachable!("no pending entries"),
+            history_banner_signature: || None,
+            history_banner_rows: || Vec::new().into(),
+            reset: || false,
+        });
+        assert_eq!(cache.total_rows(), 4);
+
+        // Entry 2 is the only changed entry: entry 1 stands in for an interleaved ephemeral
+        // notice that must keep its cached rows while a canonical sibling is regenerated.
+        let stats = cache.sync_transcript_entries(
+            TranscriptLayoutFingerprint::new("item-updated".to_owned()),
+            &BTreeSet::from([2_usize]),
+            |index| {
+                if index == 2 {
+                    TranscriptLayoutSignature::new("item-2-changed".to_owned())
+                } else {
+                    TranscriptLayoutSignature::new(format!("item-{index}"))
+                }
+            },
+            |index| {
+                rebuilds.set(rebuilds.get().saturating_add(1));
+                assert_eq!(index, 2, "only the damaged entry may regenerate rows");
+                vec![Line::from("changed one"), Line::from("changed two")].into()
+            },
+        );
+
+        assert_eq!(stats.entries_scanned, 1);
+        assert_eq!(stats.entries_rebuilt, 1);
+        assert_eq!(stats.rows_regenerated, 2);
+        assert_eq!(rebuilds.get(), 1);
+        assert_eq!(cache.total_rows(), 5);
+        assert_eq!(
+            cache.entry_start_row(VisibleTranscriptSource::Transcript, 1),
+            Some(1),
+            "the entry before the damaged one keeps its cached position"
+        );
+        assert_eq!(
+            cache.entry_start_row(VisibleTranscriptSource::Transcript, 3),
+            Some(4),
+            "later entries shift by the row delta without being rebuilt"
+        );
     }
 
     #[test]

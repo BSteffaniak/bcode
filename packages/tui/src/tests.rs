@@ -5179,6 +5179,451 @@ fn transcript_resident_window_trimming_preserves_ephemeral_notice_chronology() {
 }
 
 #[test]
+fn viewport_anchor_on_canonical_entry_survives_structural_insertion() {
+    let session_id = SessionId::new();
+    let history = (0..24)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}\nline two\nline three"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert!(app.scroll_transcript_up(18));
+    let anchor_before = app.stable_transcript_anchor().expect("detached anchor");
+    let anchored_index = app
+        .transcript()
+        .iter()
+        .position(|item| item.text().starts_with("message"))
+        .expect("canonical entry");
+    assert!(matches!(
+        app.transcript_origin_for_test(anchored_index),
+        Some(super::transcript_document::TranscriptPresentationOrigin::Canonical { .. })
+    ));
+
+    app.push_ephemeral_system_plain("local issue".to_owned());
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    assert_eq!(
+        app.stable_transcript_anchor(),
+        Some(anchor_before),
+        "a canonical viewport anchor keeps its identity and row offset across insertion"
+    );
+}
+
+#[test]
+fn viewport_anchor_on_ephemeral_entry_survives_canonical_growth() {
+    let session_id = SessionId::new();
+    let history = (0..12)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}\nline two\nline three"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.push_ephemeral_system_plain("local issue".to_owned());
+    let notice_index = app
+        .transcript()
+        .iter()
+        .position(|item| item.text() == "local issue")
+        .expect("notice entry");
+    let notice_id = app
+        .transcript_presentation_id_for_test(notice_index)
+        .expect("notice identity");
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    let notice_start_row = app
+        .transcript_layout()
+        .entry_start_row(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            notice_index,
+        )
+        .expect("notice start row");
+    app.scroll_transcript_to_row_for_test(notice_start_row);
+    assert_eq!(
+        app.stable_transcript_anchor(),
+        Some((notice_id, 0)),
+        "the viewport can anchor directly to an ephemeral entry"
+    );
+
+    app.absorb_session_event(&event(
+        session_id,
+        12,
+        SessionEventKind::AssistantMessage {
+            text: "after notice\nline two".to_owned(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    assert_eq!(
+        app.stable_transcript_anchor(),
+        Some((notice_id, 0)),
+        "an ephemeral viewport anchor stays on the same entry as canonical entries arrive"
+    );
+}
+
+#[test]
+fn latest_user_message_anchoring_targets_unified_document_order() {
+    let session_id = SessionId::new();
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "first prompt".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "first answer".to_owned(),
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.push_ephemeral_system_plain("local issue".to_owned());
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "second prompt".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    let latest_user_index = app
+        .transcript()
+        .iter()
+        .rposition(|item| item.role() == "You")
+        .expect("latest user entry");
+    assert_eq!(
+        app.transcript()
+            .get(latest_user_index)
+            .map(TranscriptItem::text),
+        Some("second prompt")
+    );
+    let expected_row = app
+        .transcript_layout()
+        .entry_start_row(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            latest_user_index,
+        )
+        .expect("latest user start row");
+
+    assert_eq!(
+        app.latest_user_message_start_row_for_test(),
+        Some(expected_row),
+        "latest-user-message anchoring resolves through unified visible order past the notice"
+    );
+}
+
+/// End-to-end walkthrough of the original defect scenario through production entry points.
+///
+/// This replaces the manual terminal walkthrough: it drives the real daemon-issue reporting path,
+/// the real session-event absorption path, real rendering, real scrolling, real history prepend,
+/// real resident-window replacement, and the real visible-selection export, asserting that
+/// `A -> diagnostic -> B` order holds throughout.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn daemon_timeout_diagnostic_holds_its_chronological_place_through_the_whole_product_path() {
+    let session_id = SessionId::new();
+    let assistant = |sequence: u64, text: &str| {
+        event(
+            session_id,
+            sequence,
+            SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        )
+    };
+    let visible = |app: &BmuxApp| {
+        app.transcript()
+            .iter()
+            .map(TranscriptItem::text)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    // Step 1: start with canonical transcript item A.
+    let mut app =
+        BmuxApp::new_with_history(Some(session_id), &[assistant(10, "item A")], &[], false);
+    assert_eq!(visible(&app), ["item A"]);
+
+    // Step 2: trigger the production daemon/client timeout reporting path.
+    super::daemon_issue::report_client_issue(
+        &mut app,
+        "send failed",
+        &bcode_client::ClientError::ConnectTimeout {
+            timeout: Duration::from_secs(5),
+        },
+    );
+
+    // Step 3: the ephemeral diagnostic appears after A.
+    let order = visible(&app);
+    assert_eq!(order.len(), 2);
+    assert_eq!(order[0], "item A");
+    assert!(order[1].contains("daemon did not respond"));
+    let diagnostic_text = order[1].clone();
+    let diagnostic_id = app
+        .transcript_presentation_id_for_test(1)
+        .expect("diagnostic identity");
+    assert!(matches!(
+        app.transcript_origin_for_test(1),
+        Some(super::transcript_document::TranscriptPresentationOrigin::Ephemeral { .. })
+    ));
+
+    // Step 4 and 5: deliver canonical item B and verify A -> diagnostic -> B.
+    app.absorb_session_event(&assistant(20, "item B"));
+    let expected = vec![
+        "item A".to_owned(),
+        diagnostic_text.clone(),
+        "item B".to_owned(),
+    ];
+    assert_eq!(visible(&app), expected);
+
+    // Step 6: resize and re-layout without changing that order.
+    for width in [80_u16, 40, 100, 24] {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 14));
+        render::render(&mut app, &mut Frame::new(&mut buffer));
+        assert_eq!(visible(&app), expected, "resize to {width} changed order");
+    }
+
+    // Step 7: scroll away and return to the bottom without relocating the diagnostic.
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 8));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    app.scroll_transcript_up(6);
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert_eq!(visible(&app), expected, "scrolling up changed order");
+    app.scroll_transcript_to_bottom();
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert_eq!(visible(&app), expected, "returning to bottom changed order");
+
+    // Step 8: update a streaming canonical entry without moving the diagnostic.
+    app.absorb_session_event(&event(
+        session_id,
+        21,
+        SessionEventKind::AssistantDelta {
+            text: "streaming tail".to_owned(),
+        },
+    ));
+    let streamed = visible(&app);
+    assert_eq!(
+        &streamed[..3],
+        &[
+            "item A".to_owned(),
+            diagnostic_text.clone(),
+            "item B".to_owned()
+        ][..],
+        "a streaming canonical update leaves earlier entries and the diagnostic in place"
+    );
+    assert!(
+        streamed
+            .last()
+            .is_some_and(|text| text.contains("streaming tail")),
+        "the streaming canonical entry lands after the diagnostic: {streamed:?}"
+    );
+    app.absorb_session_event(&event(
+        session_id,
+        22,
+        SessionEventKind::AssistantDelta {
+            text: " continued".to_owned(),
+        },
+    ));
+    let grown = visible(&app);
+    assert_eq!(
+        grown.len(),
+        streamed.len(),
+        "a second delta grows the same streaming entry instead of adding one"
+    );
+    assert_eq!(
+        &grown[..3],
+        &[
+            "item A".to_owned(),
+            diagnostic_text.clone(),
+            "item B".to_owned()
+        ][..],
+        "growing the streaming entry does not move the diagnostic"
+    );
+    let streamed_tail = grown.last().cloned().expect("streaming tail");
+    assert!(streamed_tail.contains("streaming tail") && streamed_tail.contains("continued"));
+
+    // Step 9: prepend older history without moving the diagnostic to the wrong chronology.
+    app.prepend_older_history(&[assistant(1, "older item")], false);
+    assert_eq!(
+        visible(&app),
+        vec![
+            "older item".to_owned(),
+            "item A".to_owned(),
+            diagnostic_text.clone(),
+            "item B".to_owned(),
+            streamed_tail,
+        ],
+        "older history must land before A, leaving the diagnostic between A and B"
+    );
+
+    // Step 11: select a mixed canonical/ephemeral range and copy it in visible order.
+    // Slices 1..4 span canonical "item A", the ephemeral diagnostic, and canonical "item B".
+    let slices = app
+        .transcript()
+        .iter()
+        .map(|item| bmux_tui::selection::SelectionSlice {
+            content_id: bmux_tui::selection::SelectionContentId::new(format!(
+                "bcode.transcript.item.{}.plain",
+                item.id().get()
+            )),
+            source_range: 0..item.text().len(),
+            revision: item.revision(),
+        })
+        .collect::<Vec<_>>();
+    let first = &slices[1];
+    let last = &slices[3];
+    let snapshot = bmux_tui::selection::SelectionSnapshot {
+        scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+        anchor: bmux_tui::selection::SelectionEndpoint {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            content_id: first.content_id.clone(),
+            offset: 0,
+            order: 0,
+            affinity: bmux_tui::selection::SelectionAffinity::Before,
+            revision: first.revision,
+        },
+        focus: bmux_tui::selection::SelectionEndpoint {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            content_id: last.content_id.clone(),
+            offset: last.source_range.end,
+            order: 2,
+            affinity: bmux_tui::selection::SelectionAffinity::After,
+            revision: last.revision,
+        },
+        reversed: false,
+        slices: slices[1..4].to_vec(),
+        visible_highlights: Vec::new(),
+    };
+    let copied = super::root_program::export_plain_transcript_selection_for_test(
+        app.transcript().iter(),
+        &snapshot,
+    )
+    .expect("mixed selection export");
+    let a_at = copied.find("item A").expect("A copied");
+    let diagnostic_at = copied
+        .find("daemon did not respond")
+        .expect("diagnostic copied");
+    let b_at = copied.find("item B").expect("B copied");
+    assert!(
+        a_at < diagnostic_at && diagnostic_at < b_at,
+        "visible copy preserves A -> diagnostic -> B: {copied:?}"
+    );
+
+    // Step 12: canonical history and model context exclude the diagnostic.
+    let canonical_texts = app
+        .session_view_snapshot()
+        .transcript
+        .items
+        .iter()
+        .map(|item| match &item.kind {
+            bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message } => {
+                message.text.clone()
+            }
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !canonical_texts
+            .iter()
+            .any(|text| text.contains("daemon did not respond")),
+        "the diagnostic never enters the canonical projection that feeds context and export"
+    );
+    assert_eq!(
+        canonical_texts.len(),
+        4,
+        "only canonical entries exist in shared semantic state: three messages plus the stream"
+    );
+
+    // Step 13: reconstruct the same session in-process and verify the diagnostic remains.
+    let history = [
+        assistant(1, "older item"),
+        assistant(10, "item A"),
+        assistant(20, "item B"),
+    ];
+    let mut reattached = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    reattached.take_same_session_transcript_state_from(&app);
+    assert_eq!(
+        visible(&reattached),
+        vec![
+            "older item".to_owned(),
+            "item A".to_owned(),
+            diagnostic_text.clone(),
+            "item B".to_owned(),
+        ],
+        "same-session reattachment keeps the diagnostic at its canonical boundary"
+    );
+    assert_eq!(
+        reattached.transcript_presentation_id_for_test(2),
+        Some(diagnostic_id),
+        "the preserved diagnostic keeps its stable presentation identity"
+    );
+
+    // Step 10: replace or trim the resident window and verify deterministic fallback placement.
+    let mut trimmed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    trimmed.take_same_session_transcript_state_from(&app);
+    trimmed.replace_transcript_window(&[assistant(90, "much newer")], true, true, 90);
+    assert_eq!(
+        visible(&trimmed),
+        vec![diagnostic_text, "much newer".to_owned()],
+        "when its anchor leaves the window the diagnostic sorts before newer canonical entries"
+    );
+
+    // Step 14: opening another session does not transfer the diagnostic.
+    let other_session = SessionId::new();
+    let mut other = BmuxApp::new_with_history(Some(other_session), &[], &[], false);
+    other.take_same_session_transcript_state_from(&app);
+    assert!(
+        visible(&other).is_empty(),
+        "a different session inherits no process-local notice"
+    );
+
+    // Step 15: a new draft does not inherit session-specific notices.
+    let mut draft = BmuxApp::new_with_history(None, &[], &[], false);
+    draft.take_same_session_transcript_state_from(&app);
+    assert!(
+        visible(&draft).is_empty(),
+        "a new draft inherits no process-local notice"
+    );
+
+    // Step 16: reconstructing solely from canonical history does not recreate the diagnostic.
+    let restarted = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    assert_eq!(
+        visible(&restarted),
+        vec![
+            "older item".to_owned(),
+            "item A".to_owned(),
+            "item B".to_owned()
+        ],
+        "canonical replay alone never resurrects an ephemeral diagnostic"
+    );
+}
+
+#[test]
 fn transcript_resident_window_does_not_trim_with_active_tool() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
