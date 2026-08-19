@@ -743,6 +743,7 @@ fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProje
                 responses_instruction_strategy(&settings),
                 project_reused_history,
                 dialect,
+                previous_response_id.as_deref(),
             );
             let had_provider_reasoning_state = has_provider_reasoning_state(dialect, request);
             prepend_provider_reasoning_state(&mut projection.input, dialect, request);
@@ -5040,6 +5041,7 @@ fn build_responses_request(
         responses_instruction_strategy(settings),
         capabilities.projects_reused_history && previous_response_id.is_some(),
         settings.dialect,
+        previous_response_id.as_deref(),
     );
     prepend_provider_reasoning_state(&mut projection.input, settings.dialect, request);
     let typed_request = ResponsesRequest {
@@ -5366,12 +5368,19 @@ fn responses_projection(
     strategy: ResponsesInstructionStrategy,
     project_reused_history: bool,
     dialect: OpenAiCompatibleDialect,
+    previous_response_id: Option<&str>,
 ) -> ResponsesProjection {
     let instruction_bundle =
         response_instruction_bundle(request.system_prompt.as_deref(), &request.messages);
     let input = model_messages_to_responses_input(request, project_reused_history, dialect);
-    let instructions = match strategy {
-        ResponsesInstructionStrategy::TopLevelInstructions => instruction_bundle,
+    // xAI (and public Responses API) forbid sending both `instructions` and `previous_response_id`.
+    // When reusing a prior response, the instructions are already attached to it.
+    let instructions = if previous_response_id.is_some() {
+        None
+    } else {
+        match strategy {
+            ResponsesInstructionStrategy::TopLevelInstructions => instruction_bundle,
+        }
     };
     ResponsesProjection {
         instructions,
@@ -10345,6 +10354,7 @@ mod tests {
             ResponsesInstructionStrategy::TopLevelInstructions,
             false,
             OpenAiCompatibleDialect::ChatGptCodex,
+            None,
         );
         let instructions = projection.instructions.expect("instructions should exist");
         let encoded_items =

@@ -147,6 +147,7 @@ pub async fn compact_context_inner(
         responses_instruction_strategy(&settings),
         false,
         settings.dialect,
+        None,
     );
     let body = ResponsesCompactRequest {
         model: request.model_id,
