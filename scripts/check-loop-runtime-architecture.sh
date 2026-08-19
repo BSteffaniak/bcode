@@ -1735,6 +1735,42 @@ if ! grep -F '`SessionView` is the sole semantic transcript authority' docs/rend
   violations=1
 fi
 
+# The renderer must keep exactly one representation of session attachment. A second mirrored
+# identity field previously let session-scoped commands silently no-op while prompts still worked.
+if rg -n '^\s*pub session_id: Option<SessionId>,|^\s*pub opening_session_id: Option<SessionId>,' \
+  packages/tui/src/session_flow.rs >/tmp/bcode-tui-duplicate-session-identity.txt; then
+  echo "Runtime architecture violation: ActiveChat reintroduced a mirrored session identity field." >&2
+  cat /tmp/bcode-tui-duplicate-session-identity.txt >&2
+  violations=1
+fi
+
+if rg -n '\bchat\.session_id\b|\bchat\.opening_session_id[^(]|opening_session_anchor_sequence' \
+  packages/tui/src --glob '*.rs' >/tmp/bcode-tui-raw-session-identity-access.txt; then
+  echo "Runtime architecture violation: session identity must be read through ActiveChat attachment accessors." >&2
+  cat /tmp/bcode-tui-raw-session-identity-access.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'pub enum ChatSessionAttachment' packages/tui/src/session_flow.rs >/dev/null \
+  || ! grep -F 'fn attached_session_id(' packages/tui/src/session_flow.rs >/dev/null \
+  || ! grep -F 'fn viewing_session_id(' packages/tui/src/session_flow.rs >/dev/null; then
+  echo "Runtime architecture violation: canonical chat attachment state or its accessors were removed." >&2
+  violations=1
+fi
+
+# Declared command applicability must be enforced by the host rather than re-implemented per plugin.
+if ! grep -F 'pub const fn refusal(' packages/command/src/lib.rs >/dev/null \
+  || ! grep -F 'required_session_requirement_refuses_without_active_session' packages/command/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: CommandSessionRequirement enforcement contract or coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F 'session.refusal(session_id.is_some())' packages/tui/src/chat_loop.rs >/dev/null \
+  || ! grep -F 'session.refusal(session_id.is_some())' packages/tui/src/root_program.rs >/dev/null; then
+  echo "Runtime architecture violation: slash and palette command dispatch must enforce declared session applicability." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

@@ -74,13 +74,11 @@ fn composer_submission_carries_launch_execution_defaults() {
     let mut chat = crate::session_flow::ActiveChat {
         app: crate::app::BmuxApp::new_with_history(None, &[], &[], false),
         agents: crate::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: crate::session_flow::ChatSessionAttachment::Draft,
         event_sender,
         event_receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: crate::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("test mode");
@@ -111,13 +109,11 @@ fn skill_invocation_carries_launch_execution_defaults() {
     let mut chat = crate::session_flow::ActiveChat {
         app: crate::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
         agents: crate::session_flow::AgentCatalog::default(),
-        session_id: Some(session_id),
+        attachment: crate::session_flow::ChatSessionAttachment::Attached { session_id },
         event_sender,
         event_receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: crate::effects::TuiEffectQueue::default(),
     };
     let launch = crate::TuiLaunchOptions {
@@ -2032,13 +2028,11 @@ fn new_draft_preserves_selected_agent() {
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Draft,
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_current_agent_id("plan");
@@ -2157,11 +2151,13 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Opening {
+            session_id,
+            anchor_sequence: None,
+        },
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: Some(session_id),
         opening_session_progress: Some(bcode_session_models::SessionOpenOperationSnapshot {
             operation_id: bcode_session_models::SessionOpenOperationId::new(),
             revision: 2,
@@ -2178,7 +2174,6 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
             outcome: None,
             backup_path: None,
         }),
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     let request = super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24));
@@ -2191,7 +2186,7 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
 
     super::session_flow::switch_to_draft_session(&mut chat);
 
-    assert_eq!(chat.opening_session_id, None);
+    assert_eq!(chat.opening_session_id(), None);
     assert_eq!(chat.opening_session_progress, None);
     assert!(chat.pending_effects.has_open_session(session_id));
     super::session_flow::complete_switch_session(
@@ -2203,11 +2198,11 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
             reason: "stale completion".to_owned(),
         }),
     );
-    assert_eq!(chat.session_id, None);
+    assert_eq!(chat.attached_session_id(), None);
     assert_eq!(chat.app.status(), "New draft");
 
     super::session_flow::start_switch_session(&mut chat, session_id, request);
-    assert_eq!(chat.opening_session_id, Some(session_id));
+    assert_eq!(chat.opening_session_id(), Some(session_id));
     assert!(chat.pending_effects.has_open_session(session_id));
 }
 
@@ -2218,13 +2213,11 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Draft,
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     let canonical_event = event(
@@ -2257,8 +2250,8 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
 
     super::session_flow::start_switch_session_from_search_hit(&mut chat, &hydrated, request)
         .expect("hydrated search hit navigates");
-    assert_eq!(chat.opening_session_id, Some(session_id));
-    assert_eq!(chat.opening_session_anchor_sequence, Some(7));
+    assert_eq!(chat.opening_session_id(), Some(session_id));
+    assert_eq!(chat.attachment.opening_anchor_sequence(), Some(7));
     let initial_window_request = chat
         .pending_effects
         .open_session_request(session_id)
@@ -2289,8 +2282,8 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
         )),
     );
 
-    assert_eq!(chat.session_id, Some(session_id));
-    assert_eq!(chat.opening_session_anchor_sequence, None);
+    assert_eq!(chat.attached_session_id(), Some(session_id));
+    assert_eq!(chat.attachment.opening_anchor_sequence(), None);
     assert_eq!(chat.app.status(), "jumped to search result");
     assert!(chat.app.transcript_index_for_sequence(7).is_some());
 }
@@ -2302,13 +2295,14 @@ async fn async_session_open_preserves_typed_draft() {
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Opening {
+            session_id,
+            anchor_sequence: None,
+        },
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: Some(session_id),
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("draft while opening");
@@ -2356,13 +2350,11 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Draft,
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("draft before opening");
@@ -2383,11 +2375,13 @@ async fn async_session_open_failure_clears_progress_and_remains_visible() {
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Opening {
+            session_id,
+            anchor_sequence: None,
+        },
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: Some(session_id),
         opening_session_progress: Some(bcode_session_models::SessionOpenOperationSnapshot {
             operation_id: bcode_session_models::SessionOpenOperationId::new(),
             revision: 1,
@@ -2404,7 +2398,6 @@ async fn async_session_open_failure_clears_progress_and_remains_visible() {
             outcome: None,
             backup_path: None,
         }),
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
 
@@ -2418,9 +2411,94 @@ async fn async_session_open_failure_clears_progress_and_remains_visible() {
         }),
     );
 
-    assert_eq!(chat.opening_session_id, None);
+    assert_eq!(chat.opening_session_id(), None);
     assert_eq!(chat.opening_session_progress, None);
     assert!(chat.app.status().contains("backup verification failed"));
+    // A failed open must not leave a session-scoped identity the view cannot serve.
+    assert_eq!(chat.attached_session_id(), None);
+    assert_eq!(chat.viewing_session_id(), None);
+}
+
+#[tokio::test]
+async fn racing_session_open_result_does_not_capture_attachment() {
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
+    let opening_session_id = SessionId::new();
+    let superseded_session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(opening_session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        attachment: super::session_flow::ChatSessionAttachment::Opening {
+            session_id: opening_session_id,
+            anchor_sequence: None,
+        },
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_progress: None,
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+
+    super::session_flow::complete_switch_session(
+        &mut chat,
+        superseded_session_id,
+        false,
+        Err(super::TuiError::SessionUnavailable {
+            session_id: superseded_session_id,
+            reason: "superseded".to_owned(),
+        }),
+    );
+
+    // The in-flight open must remain authoritative rather than being cleared by a stale result.
+    assert_eq!(chat.opening_session_id(), Some(opening_session_id));
+    assert_eq!(chat.attached_session_id(), None);
+}
+
+#[test]
+fn detached_session_view_still_permits_session_scoped_dispatch() {
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        attachment: super::session_flow::ChatSessionAttachment::Attached { session_id },
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_progress: None,
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+
+    chat.mark_stream_detached(session_id);
+
+    // Commands travel over independent client requests, so a reconnecting view stays dispatchable.
+    assert_eq!(chat.attached_session_id(), Some(session_id));
+    assert_eq!(chat.viewing_session_id(), Some(session_id));
+
+    chat.mark_attached(session_id);
+    assert_eq!(chat.attached_session_id(), Some(session_id));
+}
+
+#[test]
+fn opening_session_view_defers_session_scoped_dispatch() {
+    let (sender, receiver) = crate::history_flow::session_stream_channel();
+    let session_id = SessionId::new();
+    let chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        attachment: super::session_flow::ChatSessionAttachment::Opening {
+            session_id,
+            anchor_sequence: None,
+        },
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_progress: None,
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+
+    // Identity is known for presentation, but session-scoped work must wait for attachment.
+    assert_eq!(chat.viewing_session_id(), Some(session_id));
+    assert_eq!(chat.attached_session_id(), None);
 }
 
 #[tokio::test]
@@ -2430,13 +2508,11 @@ async fn async_session_open_initial_state_preserves_plugin_host() {
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Draft,
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -2457,13 +2533,14 @@ async fn async_session_open_completion_preserves_plugin_host() {
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Opening {
+            session_id,
+            anchor_sequence: None,
+        },
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: Some(session_id),
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -2500,13 +2577,11 @@ fn switch_to_draft_session_preserves_plugin_host() {
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(Some(session_id), &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: Some(session_id),
+        attachment: super::session_flow::ChatSessionAttachment::Attached { session_id },
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -2523,13 +2598,11 @@ async fn session_open_preserved_plugin_host_renders_live_request_contribution() 
     let mut chat = super::session_flow::ActiveChat {
         app: BmuxApp::new_with_history(None, &[], &[], false),
         agents: super::session_flow::AgentCatalog::default(),
-        session_id: None,
+        attachment: super::session_flow::ChatSessionAttachment::Draft,
         event_sender: sender,
         event_receiver: receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));

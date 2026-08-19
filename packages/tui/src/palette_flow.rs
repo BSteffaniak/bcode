@@ -98,7 +98,7 @@ pub fn apply_plugin_surface_outcome(
             command_id,
             arguments: Some(arguments),
             working_directory,
-            session_id: chat.session_id,
+            session_id: chat.attached_session_id(),
         });
     }
     if let Some(path) = outcome.set_session_working_directory {

@@ -6,7 +6,7 @@ use super::session_flow::ActiveChat;
 use super::slash_registry;
 
 fn defer_submission_while_session_opens(chat: &mut ActiveChat) -> bool {
-    if chat.opening_session_id.is_none() {
+    if chat.opening_session_id().is_none() {
         return false;
     }
     chat.app
@@ -25,7 +25,7 @@ pub fn stage_root_submission(
     chat: &mut ActiveChat,
     placement: bcode_ipc::PromptPlacement,
 ) -> RootSubmission {
-    if chat.opening_session_id.is_some() {
+    if chat.opening_session_id().is_some() {
         chat.app
             .set_status("Session is still opening; message kept in composer".to_owned());
         return RootSubmission::MessageStaged(false);
@@ -54,7 +54,7 @@ pub fn stage_session_message(
     if defer_submission_while_session_opens(chat) {
         return false;
     }
-    let session_id = chat.app.session_id();
+    let session_id = chat.attached_session_id();
     let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
         chat.app.clear_pending_submission(&message);
@@ -117,13 +117,14 @@ mod tests {
         let mut chat = super::super::session_flow::ActiveChat {
             app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
             agents: super::super::session_flow::AgentCatalog::default(),
-            session_id: None,
+            attachment: super::super::session_flow::ChatSessionAttachment::Opening {
+                session_id,
+                anchor_sequence: None,
+            },
             event_sender,
             event_receiver,
             event_task: None,
-            opening_session_id: Some(session_id),
             opening_session_progress: None,
-            opening_session_anchor_sequence: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         };
         chat.app.replace_composer_with("message after migration");

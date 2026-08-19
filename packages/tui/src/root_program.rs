@@ -566,7 +566,7 @@ impl BcodeRuntimeModel {
                                 .settings
                                 .launch_working_directory()
                                 .to_path_buf(),
-                            session_id: self.chat.session_id,
+                            session_id: self.chat.attached_session_id(),
                         });
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns => {
@@ -608,7 +608,7 @@ impl BcodeRuntimeModel {
                                 .settings
                                 .launch_working_directory()
                                 .to_path_buf(),
-                            session_id: self.chat.session_id,
+                            session_id: self.chat.attached_session_id(),
                         });
                 }
                 bcode_plugin_sdk::tui::PluginTuiAction::RunCommand { command } => {
@@ -719,7 +719,7 @@ impl BcodeRuntimeModel {
                         self.chat.app.set_status("model picker closed".to_owned());
                     }
                     super::model_flow::ModelPickerAction::Select(model_id) => {
-                        if let Some(session_id) = self.chat.session_id {
+                        if let Some(session_id) = self.chat.attached_session_id() {
                             self.chat
                                 .start_effect(super::effects::TuiEffect::SetSessionModel {
                                     session_id,
@@ -809,7 +809,7 @@ impl BcodeRuntimeModel {
                                 request: super::ralph_flow::RalphStartRequest {
                                     loop_name: dialog.loop_name_text(),
                                     repo_root,
-                                    session_id: self.chat.session_id,
+                                    session_id: self.chat.attached_session_id(),
                                     session_title: self
                                         .chat
                                         .app
@@ -832,7 +832,7 @@ impl BcodeRuntimeModel {
                 .handle_working_directory_dialog_event(self.settings.keymap(), &event)
             {
                 super::chat_loop::WorkingDirectoryDialogRootOutcome::Apply(path) => {
-                    let Some(session_id) = self.chat.session_id else {
+                    let Some(session_id) = self.chat.attached_session_id() else {
                         self.chat.app.set_status("no active session".to_owned());
                         return super::invalidation::UiInvalidation::Structural;
                     };
@@ -866,7 +866,7 @@ impl BcodeRuntimeModel {
                 } => {
                     let attach_session_id = match target {
                         super::wt_create_dialog::WorktreeCreateTarget::CurrentSession => {
-                            self.chat.session_id
+                            self.chat.attached_session_id()
                         }
                         super::wt_create_dialog::WorktreeCreateTarget::NewSession => None,
                     };
@@ -1217,7 +1217,7 @@ impl BcodeRuntimeModel {
                 .set_status("jumped to timeline message".to_owned());
             return;
         }
-        let Some(session_id) = self.chat.session_id else {
+        let Some(session_id) = self.chat.attached_session_id() else {
             self.chat
                 .app
                 .set_status("timeline requires an active session".to_owned());
@@ -1293,7 +1293,7 @@ impl BcodeRuntimeModel {
             .as_ref()
             .filter(|effort| self.chat.app.reasoning_effort() != Some(effort.as_str()))
             .map(|effort| self.chat.app.set_pending_reasoning_effort(effort.clone()));
-        if let Some(session_id) = self.chat.session_id {
+        if let Some(session_id) = self.chat.attached_session_id() {
             self.chat
                 .start_effect(super::effects::TuiEffect::SetSessionReasoning {
                     session_id,
@@ -1334,7 +1334,7 @@ impl BcodeRuntimeModel {
                     .to_path_buf();
                 self.chat
                     .replace_effect(super::effects::TuiEffect::ExecuteSlashCommand {
-                        session_id: self.chat.session_id,
+                        session_id: self.chat.attached_session_id(),
                         working_directory,
                         current_agent_id: self.chat.app.current_agent_id().to_owned(),
                         reasoning_display_mode: self.chat.app.reasoning_display_mode(),
@@ -1348,7 +1348,8 @@ impl BcodeRuntimeModel {
         }
     }
 
-    fn apply_root_command_action(&mut self, action: bcode_command::CommandAction) {
+    fn apply_root_command_action(&mut self, request: super::chat_loop::CommandDispatchRequest) {
+        let super::chat_loop::CommandDispatchRequest { action, session } = request;
         match action {
             bcode_command::CommandAction::Host { route } => match route.as_str() {
                 "session.new" => {
@@ -1369,7 +1370,7 @@ impl BcodeRuntimeModel {
                     super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
                 }
                 "context.compact" => {
-                    if let Some(session_id) = self.chat.session_id {
+                    if let Some(session_id) = self.chat.attached_session_id() {
                         self.chat
                             .start_effect(super::effects::TuiEffect::CompactContext { session_id });
                         self.chat.app.set_status("compacting context…".to_owned());
@@ -1399,6 +1400,11 @@ impl BcodeRuntimeModel {
                 plugin_id,
                 command_id,
             } => {
+                let session_id = self.chat.attached_session_id();
+                if let Some(refusal) = session.refusal(session_id.is_some()) {
+                    self.chat.app.set_status(refusal.message().to_owned());
+                    return;
+                }
                 let working_directory = self
                     .chat
                     .app
@@ -1411,7 +1417,7 @@ impl BcodeRuntimeModel {
                         command_id,
                         arguments: None,
                         working_directory,
-                        session_id: self.chat.session_id,
+                        session_id,
                     });
                 self.chat
                     .app
@@ -1474,7 +1480,8 @@ impl BcodeRuntimeModel {
     }
 
     fn handle_session_changed(&mut self) {
-        self.loop_state.session_changed(self.chat.session_id);
+        self.loop_state
+            .session_changed(self.chat.viewing_session_id());
         self.draft_autosave.reset_for_session_change();
     }
 
@@ -2438,7 +2445,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                     .settings
                                     .launch_working_directory()
                                     .to_path_buf(),
-                                session_id: self.chat.session_id,
+                                session_id: self.chat.attached_session_id(),
                             });
                         super::invalidation::UiInvalidation::Structural
                     }
@@ -2488,7 +2495,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                     .settings
                                     .launch_working_directory()
                                     .to_path_buf(),
-                                session_id: self.chat.session_id,
+                                session_id: self.chat.attached_session_id(),
                             });
                         super::invalidation::UiInvalidation::Structural
                     }
@@ -2549,7 +2556,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     self.ordered_notes.complete(*session_id);
                 }
                 let previous_frame_interval = self.settings.bmux_runtime_config().frame_interval;
-                let previous_session_id = self.chat.session_id;
+                let previous_session_id = self.chat.viewing_session_id();
                 let observation = result.daemon_observation();
                 self.loop_state.observe_daemon(&mut self.chat, &observation);
                 super::chat_loop::apply_effect_result(
@@ -2559,7 +2566,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     &mut self.loop_state,
                     *result,
                 );
-                if previous_session_id != self.chat.session_id {
+                if previous_session_id != self.chat.viewing_session_id() {
                     self.handle_session_changed();
                 }
                 if let Some((session_id, navigation_result)) = navigation_result {
@@ -4384,13 +4391,11 @@ mod tests {
         super::super::session_flow::ActiveChat {
             app: super::super::app::BmuxApp::new_with_history(None, &[], input_history, false),
             agents: super::super::session_flow::AgentCatalog::default(),
-            session_id: None,
+            attachment: super::super::session_flow::ChatSessionAttachment::Draft,
             event_sender,
             event_receiver,
             event_task: None,
-            opening_session_id: None,
             opening_session_progress: None,
-            opening_session_anchor_sequence: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         }
     }
@@ -4408,13 +4413,11 @@ mod tests {
                 false,
             ),
             agents: super::super::session_flow::AgentCatalog::default(),
-            session_id: Some(session_id),
+            attachment: super::super::session_flow::ChatSessionAttachment::Attached { session_id },
             event_sender,
             event_receiver,
             event_task: None,
-            opening_session_id: None,
             opening_session_progress: None,
-            opening_session_anchor_sequence: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         }
     }
@@ -5128,7 +5131,7 @@ mod tests {
     async fn managed_runtime_commits_progressive_filesystem_write_frames_without_external_wakeup() {
         let session_id = bcode_session_models::SessionId::new();
         let mut model = root_test_model();
-        model.chat.session_id = Some(session_id);
+        model.chat.mark_attached(session_id);
         model.chat.app =
             super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         model
@@ -5305,7 +5308,7 @@ mod tests {
     async fn managed_runtime_commits_progressive_filesystem_edit_frames_without_external_wakeup() {
         let session_id = bcode_session_models::SessionId::new();
         let mut model = root_test_model();
-        model.chat.session_id = Some(session_id);
+        model.chat.mark_attached(session_id);
         model.chat.app =
             super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         model
@@ -5518,7 +5521,7 @@ mod tests {
     async fn root_request_draft_handoff_waits_for_committed_paint() {
         let session_id = bcode_session_models::SessionId::new();
         let mut chat = root_test_chat();
-        chat.session_id = Some(session_id);
+        chat.mark_attached(session_id);
         chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
             std::path::PathBuf::from("."),

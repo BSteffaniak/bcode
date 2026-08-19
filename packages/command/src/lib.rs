@@ -243,6 +243,62 @@ pub enum CommandSessionRequirement {
     Absent,
 }
 
+/// Why a command may not be dispatched against the current session context.
+///
+/// Hosts evaluate this before performing any command side effect so declared applicability is
+/// enforced uniformly instead of being re-implemented by each command owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSessionRefusal {
+    /// The command requires an active session and none is available.
+    SessionRequired,
+    /// The command only applies without an active session.
+    SessionMustBeAbsent,
+}
+
+impl CommandSessionRefusal {
+    /// Return a renderer-neutral explanation for the refusal.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::SessionRequired => "this command requires an active session",
+            Self::SessionMustBeAbsent => "this command only applies without an active session",
+        }
+    }
+}
+
+impl std::fmt::Display for CommandSessionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl CommandSessionRequirement {
+    /// Evaluate declared session applicability against the dispatching context.
+    ///
+    /// `has_active_session` reports whether the host can supply canonical active-session context
+    /// for the invocation. Returns the refusal reason when dispatch must not proceed.
+    #[must_use]
+    pub const fn refusal(self, has_active_session: bool) -> Option<CommandSessionRefusal> {
+        match self {
+            Self::Optional => None,
+            Self::Required => {
+                if has_active_session {
+                    None
+                } else {
+                    Some(CommandSessionRefusal::SessionRequired)
+                }
+            }
+            Self::Absent => {
+                if has_active_session {
+                    Some(CommandSessionRefusal::SessionMustBeAbsent)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Portable command argument value kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -481,6 +537,38 @@ pub enum CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_session_requirement_never_refuses_dispatch() {
+        assert_eq!(CommandSessionRequirement::Optional.refusal(true), None);
+        assert_eq!(CommandSessionRequirement::Optional.refusal(false), None);
+    }
+
+    #[test]
+    fn required_session_requirement_refuses_without_active_session() {
+        assert_eq!(CommandSessionRequirement::Required.refusal(true), None);
+        assert_eq!(
+            CommandSessionRequirement::Required.refusal(false),
+            Some(CommandSessionRefusal::SessionRequired)
+        );
+    }
+
+    #[test]
+    fn absent_session_requirement_refuses_with_active_session() {
+        assert_eq!(CommandSessionRequirement::Absent.refusal(false), None);
+        assert_eq!(
+            CommandSessionRequirement::Absent.refusal(true),
+            Some(CommandSessionRefusal::SessionMustBeAbsent)
+        );
+    }
+
+    #[test]
+    fn session_refusal_messages_are_distinguishable() {
+        assert_ne!(
+            CommandSessionRefusal::SessionRequired.message(),
+            CommandSessionRefusal::SessionMustBeAbsent.message()
+        );
+    }
 
     #[test]
     fn bundled_palette_exposes_session_search_route() {

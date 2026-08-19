@@ -55,7 +55,7 @@ impl DraftAutosave {
     }
 
     fn scope(&self, chat: &ActiveChat) -> ComposerDraftScope {
-        chat.session_id.map_or_else(
+        chat.attached_session_id().map_or_else(
             || ComposerDraftScope::DraftSession {
                 launch_working_directory: self.launch_working_directory.clone(),
             },
@@ -102,6 +102,25 @@ impl DraftAutosave {
     pub(super) fn mark_dirty_now(&mut self) {
         self.dirty = true;
         self.save_at = Some(Instant::now());
+    }
+}
+
+/// One command palette activation carrying its declared session applicability.
+///
+/// Keeping the requirement alongside the action ensures the host can enforce declared
+/// applicability before dispatching any command side effect.
+pub struct CommandDispatchRequest {
+    pub action: CommandAction,
+    pub session: bcode_command::CommandSessionRequirement,
+}
+
+impl CommandDispatchRequest {
+    #[must_use]
+    pub fn from_contribution(contribution: bcode_command::CommandContribution) -> Self {
+        Self {
+            action: contribution.action,
+            session: contribution.session,
+        }
     }
 }
 
@@ -711,7 +730,10 @@ impl ChatLoopState {
             .set_status("command palette: type to filter, enter to run, esc close".to_owned());
     }
 
-    pub fn handle_command_palette_key(&mut self, stroke: KeyStroke) -> Option<CommandAction> {
+    pub fn handle_command_palette_key(
+        &mut self,
+        stroke: KeyStroke,
+    ) -> Option<CommandDispatchRequest> {
         let palette = self.palette.as_mut()?;
         match palette.handle_key(stroke, 12) {
             bmux_tui::palette::CommandPaletteKeyOutcome::Ignored
@@ -722,9 +744,11 @@ impl ChatLoopState {
                 None
             }
             bmux_tui::palette::CommandPaletteKeyOutcome::Activated(index) => {
-                let action = palette.contribution_at(index).map(|item| item.action);
+                let request = palette
+                    .contribution_at(index)
+                    .map(CommandDispatchRequest::from_contribution);
                 self.palette = None;
-                action
+                request
             }
         }
     }
@@ -733,15 +757,17 @@ impl ChatLoopState {
         &mut self,
         mouse: bmux_tui::event::MouseEvent,
         frame_area: Rect,
-    ) -> Option<CommandAction> {
+    ) -> Option<CommandDispatchRequest> {
         let index = super::picker_mouse::command_palette_row_in_area(
             mouse,
             super::command_palette_render::palette_list_area(frame_area),
         )?;
         let palette = self.palette.as_mut()?;
-        let action = palette.contribution_at(index).map(|item| item.action);
+        let request = palette
+            .contribution_at(index)
+            .map(CommandDispatchRequest::from_contribution);
         self.palette = None;
-        action
+        request
     }
 
     pub const fn has_slash_palette(&self) -> bool {
@@ -2267,7 +2293,7 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
     let Some(cursor) = chat.app.older_history_cursor() else {
         return false;
     };
-    let Some(session_id) = chat.session_id else {
+    let Some(session_id) = chat.attached_session_id() else {
         return false;
     };
     let started = !chat
@@ -2287,7 +2313,7 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
     let Some(cursor) = chat.app.newer_history_cursor() else {
         return false;
     };
-    let Some(session_id) = chat.session_id else {
+    let Some(session_id) = chat.attached_session_id() else {
         return false;
     };
     let started = !chat
@@ -2480,7 +2506,7 @@ pub fn apply_effect_result(
             apply_session_status_result(chat, loop_state, session_id, *hydration);
         }
         TuiEffectResult::SessionModelStatusLoaded { session_id, result } => {
-            if chat.session_id == Some(session_id) {
+            if chat.viewing_session_id() == Some(session_id) {
                 match result {
                     Ok(status)
                         if status
@@ -2505,7 +2531,7 @@ pub fn apply_effect_result(
             plugin_status,
             error,
         } => {
-            if chat.session_id == Some(session_id) {
+            if chat.viewing_session_id() == Some(session_id) {
                 chat.app.set_plugin_status(plugin_status);
                 if let Some(error) = error {
                     chat.app
@@ -2854,7 +2880,7 @@ pub fn apply_effect_result(
                                     || settings.launch_working_directory().to_path_buf(),
                                     std::path::Path::to_path_buf,
                                 ),
-                                session_id: chat.session_id,
+                                session_id: chat.attached_session_id(),
                             });
                             chat.app.set_status("opening plugin surface…".to_owned());
                         }
@@ -3023,7 +3049,7 @@ pub fn apply_config_result(
             chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
             });
-            if chat.session_id.is_none() && chat.opening_session_id.is_none() {
+            if chat.viewing_session_id().is_none() {
                 chat.replace_effect(TuiEffect::LoadDraftStatus {
                     launch_working_directory: settings.launch_working_directory().to_path_buf(),
                 });
@@ -3045,7 +3071,7 @@ fn apply_draft_status_result(
     composer_draft: Option<String>,
     error: Option<String>,
 ) {
-    if chat.session_id.is_some() || chat.opening_session_id.is_some() {
+    if chat.viewing_session_id().is_some() {
         return;
     }
     if let Some(draft) = composer_draft
@@ -3077,7 +3103,7 @@ fn apply_session_status_result(
         plugin_status,
         error,
     } = hydration;
-    if chat.session_id != Some(session_id) {
+    if chat.viewing_session_id() != Some(session_id) {
         return;
     }
     chat.app.set_plugin_status(plugin_status);
@@ -3135,12 +3161,12 @@ fn apply_older_history_result(
     result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
 ) {
     match result {
-        Ok(page) if Some(session_id) == chat.session_id => {
+        Ok(page) if Some(session_id) == chat.viewing_session_id() => {
             chat.app.prepend_older_history(&page.events, page.has_more);
         }
         Ok(_stale) => {}
         Err(error) => {
-            if Some(session_id) == chat.session_id {
+            if Some(session_id) == chat.viewing_session_id() {
                 chat.app.set_loading_older_history(false);
             }
             report_nonfatal_client_error(chat, "Older history unavailable", &error);
@@ -3154,12 +3180,12 @@ fn apply_newer_history_result(
     result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
 ) {
     match result {
-        Ok(page) if Some(session_id) == chat.session_id => {
+        Ok(page) if Some(session_id) == chat.viewing_session_id() => {
             chat.app.append_newer_history(&page.events, page.has_more);
         }
         Ok(_stale) => {}
         Err(error) => {
-            if Some(session_id) == chat.session_id {
+            if Some(session_id) == chat.viewing_session_id() {
                 chat.app.set_loading_newer_history(false);
             }
             report_nonfatal_client_error(chat, "Newer history unavailable", &error);
@@ -3204,7 +3230,7 @@ fn apply_permission_list_result(
         Ok(permissions) => {
             let active_permissions = permissions
                 .iter()
-                .filter(|permission| Some(permission.session_id) == chat.session_id)
+                .filter(|permission| Some(permission.session_id) == chat.viewing_session_id())
                 .cloned()
                 .map(permission_summary_view)
                 .collect::<Vec<_>>();
@@ -3351,12 +3377,18 @@ fn apply_root_slash_command_outcome(
         SlashCommandOutcome::PluginCommand {
             action,
             execution: _,
+            session,
             arguments,
         } => match action {
             bcode_command::CommandAction::Plugin {
                 plugin_id,
                 command_id,
             } => {
+                let session_id = chat.attached_session_id();
+                if let Some(refusal) = session.refusal(session_id.is_some()) {
+                    chat.app.set_status(refusal.message().to_owned());
+                    return;
+                }
                 let working_directory = chat.app.working_directory().map_or_else(
                     || settings.launch_working_directory().to_path_buf(),
                     std::path::Path::to_path_buf,
@@ -3366,7 +3398,7 @@ fn apply_root_slash_command_outcome(
                     command_id,
                     arguments: Some(arguments),
                     working_directory,
-                    session_id: chat.session_id,
+                    session_id,
                 });
             }
             bcode_command::CommandAction::Host { route } => chat
@@ -3374,7 +3406,7 @@ fn apply_root_slash_command_outcome(
                 .set_status(format!("host slash route pending root navigation: {route}")),
         },
         SlashCommandOutcome::OpenTimeline => {
-            let entries = if chat.session_id.is_some() {
+            let entries = if chat.viewing_session_id().is_some() {
                 chat.app.timeline_entries()
             } else {
                 Vec::new()
@@ -3400,7 +3432,7 @@ fn apply_root_slash_command_outcome(
         }
         SlashCommandOutcome::OpenThinkingSettings(focus) => {
             chat.replace_effect(TuiEffect::LoadThinkingDialog {
-                session_id: chat.session_id,
+                session_id: chat.attached_session_id(),
                 focus,
             });
             chat.app
@@ -3422,7 +3454,7 @@ fn apply_root_slash_command_outcome(
         } => {
             chat.start_effect(TuiEffect::SkillAction {
                 request: Box::new(super::effects::SkillActionRequest {
-                    session_id: chat.session_id,
+                    session_id: chat.attached_session_id(),
                     launch_working_directory: chat.app.working_directory().map_or_else(
                         || settings.launch_working_directory().to_path_buf(),
                         std::path::Path::to_path_buf,
@@ -3552,7 +3584,7 @@ fn apply_root_slash_command_outcome(
                     || settings.launch_working_directory().to_path_buf(),
                     std::path::Path::to_path_buf,
                 ),
-                session_id: chat.session_id,
+                session_id: chat.attached_session_id(),
             });
             chat.app.set_status("opening Ralph UI…".to_owned());
         }
@@ -3583,7 +3615,7 @@ fn apply_submit_message_result(
 ) {
     match result {
         Ok(result) => {
-            chat.session_id = Some(result.session_id);
+            chat.mark_attached(result.session_id);
             chat.app
                 .set_daemon_connection(super::app::DaemonConnectionState::Connected);
             if let Some(session) = result.created_session {
@@ -3636,7 +3668,7 @@ fn apply_submit_message_result(
 }
 
 fn ensure_session_stream_after_foreground_wake(chat: &mut ActiveChat) {
-    let Some(session_id) = chat.session_id else {
+    let Some(session_id) = chat.attached_session_id() else {
         return;
     };
     if chat
@@ -3663,7 +3695,7 @@ fn apply_skill_action_result(
 ) {
     match result {
         Ok(result) => {
-            chat.session_id = Some(result.session_id);
+            chat.mark_attached(result.session_id);
             if let Some(session) = result.created_session {
                 chat.app.apply_session_summary(&session);
             }
@@ -3718,7 +3750,7 @@ fn apply_set_session_model_result(
     model_id: &str,
     result: Result<(), ClientError>,
 ) {
-    if chat.session_id != Some(session_id) {
+    if chat.viewing_session_id() != Some(session_id) {
         return;
     }
     match result {
@@ -3740,7 +3772,7 @@ fn apply_set_session_reasoning_result(
     status: String,
     result: Result<(), ClientError>,
 ) {
-    if chat.session_id != Some(session_id) {
+    if chat.viewing_session_id() != Some(session_id) {
         return;
     }
     match result {
@@ -3763,7 +3795,7 @@ fn apply_compact_context_result(
     session_id: bcode_session_models::SessionId,
     result: Result<String, ClientError>,
 ) {
-    if chat.session_id != Some(session_id) {
+    if chat.viewing_session_id() != Some(session_id) {
         return;
     }
     match result {
@@ -3850,7 +3882,7 @@ fn apply_create_worktree_result(
     if let Some(session) = response.session {
         let session_id = session.id;
         chat.app.apply_session_summary(&session);
-        chat.session_id = Some(session_id);
+        chat.mark_attached(session_id);
     }
     chat.push_presentation_markdown(
         "bcode.host",
@@ -4849,7 +4881,7 @@ fn handle_artifact_completion(
     let presentation = chat.app.plugin_presentation();
     loop_state
         .artifact_stream
-        .handle_completion(chat.session_id, completion, |chunk| {
+        .handle_completion(chat.viewing_session_id(), completion, |chunk| {
             presentation.map_or_else(
                 || Err("plugin presentation unavailable".to_owned()),
                 |presentation| presentation.deliver_artifact_chunk(chunk),
@@ -4867,18 +4899,22 @@ fn absorb_session_stream_update(
             absorb_bcode_event(chat, loop_state, *event)
         }
         history_flow::SessionStreamUpdate::ResyncStarted { session_id }
-            if chat.session_id == Some(session_id) =>
+            if chat.viewing_session_id() == Some(session_id) =>
         {
             loop_state
                 .telemetry
                 .add_counter("tui.session_view.resync_started_total", 1);
+            // The stream connection is dropped for replacement while identity stays valid, so the
+            // view is stale but session-scoped commands remain dispatchable.
+            chat.mark_stream_detached(session_id);
             chat.app.set_status("Reconnecting session view…".to_owned());
             true
         }
         history_flow::SessionStreamUpdate::Resynchronized {
             session_id,
             attached,
-        } if chat.session_id == Some(session_id) => {
+        } if chat.viewing_session_id() == Some(session_id) => {
+            chat.mark_attached(session_id);
             apply_session_stream_resynchronization(chat, loop_state, &attached);
             true
         }
@@ -4979,7 +5015,7 @@ fn absorb_bcode_event(
     event: BcodeEvent,
 ) -> bool {
     match event {
-        BcodeEvent::Session(event) if Some(event.session_id) == chat.session_id => {
+        BcodeEvent::Session(event) if Some(event.session_id) == chat.viewing_session_id() => {
             let presentation = chat.app.plugin_presentation();
             loop_state.artifact_stream.observe_finalized_artifact(
                 event.session_id,
@@ -5039,11 +5075,11 @@ fn absorb_bcode_event(
             }
             true
         }
-        BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
+        BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.viewing_session_id() => {
             absorb_session_live_event(&mut chat.app, &mut loop_state.artifact_stream, &event);
             true
         }
-        BcodeEvent::RuntimeWork(event) if Some(event.session_id) == chat.session_id => {
+        BcodeEvent::RuntimeWork(event) if Some(event.session_id) == chat.viewing_session_id() => {
             chat.app.absorb_session_event(&event);
             true
         }
@@ -5146,7 +5182,7 @@ fn apply_session_open_progress(
     chat: &mut ActiveChat,
     snapshot: &bcode_session_models::SessionOpenOperationSnapshot,
 ) -> bool {
-    if chat.opening_session_id != Some(snapshot.session_id) {
+    if chat.opening_session_id() != Some(snapshot.session_id) {
         return false;
     }
     if chat

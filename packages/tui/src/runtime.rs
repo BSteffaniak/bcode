@@ -184,13 +184,11 @@ fn initialize_tui(
     let mut chat = session_flow::ActiveChat {
         app,
         agents,
-        session_id: None,
+        attachment: session_flow::ChatSessionAttachment::Draft,
         event_sender,
         event_receiver,
         event_task: None,
-        opening_session_id: None,
         opening_session_progress: None,
-        opening_session_anchor_sequence: None,
         pending_effects: TuiEffectQueue::default(),
     };
     let (declarative_streaming_policy, effective_streaming_override) = apply_initial_config(

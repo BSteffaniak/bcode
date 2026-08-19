@@ -97,11 +97,22 @@ impl RustPlugin for LoopPlugin {
 fn commands() -> Vec<CommandContribution> {
     vec![
         command(START_COMMAND, "Loop", "Start a deterministic prompt loop"),
-        command(STATUS_COMMAND, "Loop Status", "Show prompt loop status"),
-        command(PAUSE_COMMAND, "Pause Loop", "Pause the active prompt loop"),
-        command(STOP_COMMAND, "Stop Loop", "Stop the active prompt loop"),
-        command(RESUME_COMMAND, "Resume Loop", "Resume a paused prompt loop"),
+        session_command(STATUS_COMMAND, "Loop Status", "Show prompt loop status"),
+        session_command(PAUSE_COMMAND, "Pause Loop", "Pause the active prompt loop"),
+        session_command(STOP_COMMAND, "Stop Loop", "Stop the active prompt loop"),
+        session_command(RESUME_COMMAND, "Resume Loop", "Resume a paused prompt loop"),
     ]
+}
+
+/// Build a loop-control command that only applies to an active persisted session.
+///
+/// The host enforces this requirement before dispatch, so control commands never run without
+/// canonical session context.
+fn session_command(id: &str, title: &str, description: &str) -> CommandContribution {
+    CommandContribution {
+        session: bcode_command::CommandSessionRequirement::Required,
+        ..command(id, title, description)
+    }
 }
 
 fn command(id: &str, title: &str, description: &str) -> CommandContribution {
@@ -373,19 +384,19 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             }],
         },
         STATUS_COMMAND => session_id.map_or_else(
-            || status_response("/loop status requires an active session"),
+            || missing_enforced_session_response(STATUS_COMMAND),
             status_for_session,
         ),
         PAUSE_COMMAND => session_id.map_or_else(
-            || status_response("/loop pause requires an active session"),
+            || missing_enforced_session_response(PAUSE_COMMAND),
             |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Pause),
         ),
         STOP_COMMAND => session_id.map_or_else(
-            || status_response("/loop stop requires an active session"),
+            || missing_enforced_session_response(STOP_COMMAND),
             |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Cancel),
         ),
         RESUME_COMMAND => session_id.map_or_else(
-            || status_response("/loop resume requires an active session"),
+            || missing_enforced_session_response(RESUME_COMMAND),
             |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Resume),
         ),
         START_COMMAND => {
@@ -394,6 +405,16 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
         _ => status_response("unsupported loop command"),
     };
     json_response(&response)
+}
+
+/// Report a host contract violation for a command declared as requiring a session.
+///
+/// The host enforces `CommandSessionRequirement::Required` before dispatch, so reaching this
+/// path means trusted session context was not delivered.
+fn missing_enforced_session_response(command_id: &str) -> InvokeCommandResponse {
+    status_response(&format!(
+        "{command_id} requires an active session but the host dispatched it without one"
+    ))
 }
 
 fn status_response(message: &str) -> InvokeCommandResponse {
@@ -1662,6 +1683,38 @@ mod tests {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)
         }));
+    }
+
+    #[test]
+    fn loop_control_commands_declare_required_session_context() {
+        let commands = commands();
+        for control in [STATUS_COMMAND, PAUSE_COMMAND, STOP_COMMAND, RESUME_COMMAND] {
+            let command = commands
+                .iter()
+                .find(|command| command.id == control)
+                .expect("control command contributed");
+            assert_eq!(
+                command.session,
+                bcode_command::CommandSessionRequirement::Required,
+                "{control} must declare required session context so the host refuses dispatch without it"
+            );
+            assert_eq!(
+                command
+                    .session
+                    .refusal(false)
+                    .map(bcode_command::CommandSessionRefusal::message),
+                Some(bcode_command::CommandSessionRefusal::SessionRequired.message()),
+            );
+        }
+        let start = commands
+            .iter()
+            .find(|command| command.id == START_COMMAND)
+            .expect("start command contributed");
+        // Starting a loop opens a surface and remains available while drafting.
+        assert_eq!(
+            start.session,
+            bcode_command::CommandSessionRequirement::Optional
+        );
     }
 
     #[test]

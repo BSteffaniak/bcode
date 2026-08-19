@@ -26,6 +26,7 @@ pub enum SlashCommandOutcome {
     PluginCommand {
         action: bcode_command::CommandAction,
         execution: bcode_command::CommandExecution,
+        session: bcode_command::CommandSessionRequirement,
         arguments: String,
     },
     /// Open timeline message browser.
@@ -757,6 +758,7 @@ pub async fn execute_resolved(
             Ok(SlashCommandOutcome::PluginCommand {
                 action: contribution.action,
                 execution: contribution.execution,
+                session: contribution.session,
                 arguments: parts.iter().skip(1).copied().collect::<Vec<_>>().join(" "),
             })
         }
