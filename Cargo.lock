@@ -3192,7 +3192,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -3202,7 +3202,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "lz4_flex",
  "serde",
@@ -3212,7 +3212,7 @@ dependencies = [
 [[package]]
 name = "bmux_image"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -3226,7 +3226,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -3240,7 +3240,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "crossterm",
 ]
@@ -3248,7 +3248,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "serde",
  "serde_json",
@@ -3257,7 +3257,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_ipc",
  "bmux_perf_telemetry",
@@ -3278,7 +3278,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "serde",
  "serde_json",
@@ -3288,7 +3288,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3297,7 +3297,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -3316,7 +3316,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3327,7 +3327,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_keyboard",
  "unicode-segmentation",
@@ -3337,7 +3337,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -3349,7 +3349,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_keyboard",
  "bmux_terminal_grid",
@@ -3362,7 +3362,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_runtime"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#6508068f390fec254c060ee144363c7f92e765aa"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#23b5283fe47145ae00ab9fd5f4cb8c7138b0ac79"
 dependencies = [
  "bmux_tui",
  "tokio",
@@ -5777,7 +5777,7 @@ dependencies = [
 [[package]]
 name = "hyperchad"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "hyperchad_actions",
  "hyperchad_app",
@@ -5799,7 +5799,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_actions"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer_models",
@@ -5814,7 +5814,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_app"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "async-trait",
  "clap",
@@ -5837,7 +5837,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_color"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "color-hex",
  "log 0.4.33",
@@ -5849,12 +5849,12 @@ dependencies = [
 [[package]]
 name = "hyperchad_docs_config"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 
 [[package]]
 name = "hyperchad_docs_config_derive"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5864,7 +5864,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_docs_site"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "clap",
  "hyperchad",
@@ -5874,7 +5874,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_js_bundler"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "anyhow",
  "log 0.4.33",
@@ -5894,7 +5894,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_markdown"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer",
@@ -5909,7 +5909,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "async-trait",
  "bytes 1.12.1",
@@ -5926,7 +5926,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "async-trait",
  "bytes 1.12.1",
@@ -5954,7 +5954,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_actix"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -5978,7 +5978,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_http"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "flume 0.12.0",
  "http 1.5.0",
@@ -6000,7 +6000,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_lambda"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "async-trait",
  "bytes 1.12.1",
@@ -6017,7 +6017,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_web_server"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "async-trait",
  "bytes 1.12.1",
@@ -6034,7 +6034,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_vanilla_js"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "async-trait",
  "const_format",
@@ -6053,7 +6053,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_vanilla_js_hash"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "const-hex",
  "const_format",
@@ -6063,7 +6063,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_router"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "base64 0.22.1",
  "bytes 1.12.1",
@@ -6089,7 +6089,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_simulator"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "log 0.4.33",
  "moosicbox_assert",
@@ -6103,7 +6103,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_template"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "hyperchad_actions",
  "hyperchad_color",
@@ -6119,7 +6119,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_template_actions_dsl"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "hyperchad_actions",
  "log 0.4.33",
@@ -6132,7 +6132,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_template_macros"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "hyperchad_color",
  "hyperchad_template_actions_dsl",
@@ -6149,7 +6149,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "html-escape",
  "hyperchad_actions",
@@ -6171,7 +6171,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer_models"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "log 0.4.33",
  "moosicbox_assert",
@@ -7377,7 +7377,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_arb"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "log 0.4.33",
  "moosicbox_assert",
@@ -7426,7 +7426,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_logging"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "free_log_client",
  "log 0.4.33",
@@ -7436,7 +7436,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_middleware"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "actix-web",
  "futures 0.3.34",
@@ -10085,7 +10085,7 @@ dependencies = [
 [[package]]
 name = "simvar"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "simvar_harness",
 ]
@@ -10093,7 +10093,7 @@ dependencies = [
 [[package]]
 name = "simvar_harness"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "btparse",
  "color-backtrace",
@@ -10109,7 +10109,7 @@ dependencies = [
 [[package]]
 name = "simvar_utils"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "switchy",
 ]
@@ -11308,7 +11308,7 @@ dependencies = [
 [[package]]
 name = "switchy_web_server_simulator"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#87b9f5e164519e8d1cc338292bafbf8859dfc0a0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#cdfca1e550220e62738996b61a8cecb6ccd20bee"
 dependencies = [
  "bytes 1.12.1",
  "log 0.4.33",
