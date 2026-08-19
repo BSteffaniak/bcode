@@ -6165,6 +6165,11 @@ fn xai_static_context_window(model_id: &str) -> Option<u32> {
     None
 }
 
+/// Returns true if the given model id is an xAI Grok model that must be routed to api.x.ai.
+fn is_xai_model_id(model_id: &str) -> bool {
+    model_id.trim().to_ascii_lowercase().starts_with("grok-")
+}
+
 #[cfg(test)]
 fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Vec<ModelInfo> {
     model_infos_from_ids_without_catalog(model_ids, default_model)
@@ -6892,7 +6897,18 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     {
         model_ids.insert(0, default_model.clone());
     }
-    let (auth, auth_diagnostics) = openai_auth_settings(&saved, context);
+
+    // If any requested model is an xAI Grok model, force routing to the real xAI endpoint.
+    // This prevents Codex/ChatGPT subscription auth from being used for xAI models,
+    // which would otherwise produce a 400 from the Codex backend.
+    let has_xai_model = model_ids.iter().any(|m| is_xai_model_id(m));
+    let force_xai = has_xai_model;
+
+    let (mut auth, auth_diagnostics) = openai_auth_settings(&saved, context);
+    if force_xai && matches!(auth, AuthSettings::ChatGpt { .. }) {
+        // xAI models cannot use ChatGPT subscription auth; force Missing so we get a clear error.
+        auth = AuthSettings::Missing;
+    }
     let base_url = first_context_or_env(
         context,
         "base_url",
@@ -6909,13 +6925,19 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
     .or_else(|| saved.values.get("OPENAI_BASE_URL").cloned())
     .unwrap_or_else(|| {
-        if xai_mode {
+        if xai_mode || force_xai {
             DEFAULT_XAI_BASE_URL.to_string()
         } else {
             DEFAULT_BASE_URL.to_string()
         }
     });
-    let dialect = resolve_dialect(&auth, context);
+    let dialect = if force_xai {
+        // xAI models must use the Responses API against api.x.ai; never Codex.
+        OpenAiCompatibleDialect::ResponsesApi
+    } else {
+        resolve_dialect(&auth, context)
+    };
+
     let request_timeout = optional_duration_from_context_or_env(
         context,
         "request_timeout_secs",
