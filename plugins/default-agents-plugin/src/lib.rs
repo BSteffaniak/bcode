@@ -106,30 +106,31 @@ impl RustPlugin for DefaultAgentsPlugin {
     }
 }
 
-fn config_from_effective_toml(contents: Option<&str>) -> Option<bcode_config::BcodeConfig> {
-    contents.and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+/// Decode a client-supplied effective config into the raw `[agent]` layer and typed tool selection.
+///
+/// The raw [`Value`] is retained deliberately: `AgentConfig` and `PermissionConfig`
+/// declare `#[serde(default)]` without `skip_serializing_if`, so a typed round-trip
+/// materializes empty rule tables and default `external_directory` actions. Layering
+/// those synthesized entries would clobber the built-in defaults beneath them, so the
+/// raw table is composed instead, exactly as [`load_config`] composes `bcode.toml`.
+fn effective_config_layers(contents: Option<&str>) -> Option<(Value, bcode_config::ToolsConfig)> {
+    let contents = contents?;
+    let typed = bcode_config::decode_effective_config(contents).ok()?;
+    let raw = toml::from_str::<Value>(contents).ok()?;
+    Some((raw, typed.tools))
 }
 
 fn policy_and_tools_from_effective_toml(
     contents: Option<&str>,
 ) -> Option<(AgentPermissionConfig, bcode_config::ToolsConfig)> {
-    config_from_effective_toml(contents).map(|config| {
-        (
-            AgentPermissionConfig {
-                agent: config.agent,
-            },
-            config.tools,
-        )
-    })
+    let (declarative, tools_config) = effective_config_layers(contents)?;
+    let (config, _) = compose_agent_policy(&declarative, load_permissions_state_layer().as_ref());
+    Some((config, tools_config))
 }
 
 fn agent_list_with_config(effective_config_toml: Option<&str>) -> AgentList {
-    let config = config_from_effective_toml(effective_config_toml).map_or_else(
-        || load_config().0,
-        |config| AgentPermissionConfig {
-            agent: config.agent,
-        },
-    );
+    let config = policy_and_tools_from_effective_toml(effective_config_toml)
+        .map_or_else(|| load_config().0, |(config, _)| config);
     let plan = agent_config(&config, PLAN_AGENT);
     let build = agent_config(&config, BUILD_AGENT);
     AgentList {
@@ -377,11 +378,27 @@ struct PolicySource {
     diagnostics: Vec<String>,
 }
 
+/// Load the runtime permissions state layer.
+///
+/// The transported effective config carries declarative layers only, so this
+/// highest-priority layer is read here for both the local and client-supplied paths.
+fn load_permissions_state_layer() -> Option<Value> {
+    match bcode_config::load_permissions_state_value() {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "bcode.default-agents: failed to load runtime permissions state ({error}); using declarative config only"
+            );
+            None
+        }
+    }
+}
+
 fn load_config() -> (AgentPermissionConfig, PolicySource) {
-    let (base_config, diagnostics) = default_config_with_diagnostics();
     let declarative = match bcode_config::load_composed_config_value() {
         Ok(value) => value,
         Err(error) => {
+            let (base_config, diagnostics) = default_config_with_diagnostics();
             eprintln!(
                 "bcode.default-agents: failed to load declarative config ({error}); using built-in defaults"
             );
@@ -396,18 +413,22 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
         }
     };
 
-    let state = match bcode_config::load_permissions_state_value() {
-        Ok(state) => state,
-        Err(error) => {
-            eprintln!(
-                "bcode.default-agents: failed to load runtime permissions state ({error}); using declarative config only"
-            );
-            None
-        }
-    };
+    compose_agent_policy(&declarative, load_permissions_state_layer().as_ref())
+}
 
-    let declarative_empty = agent_table_is_empty(&declarative);
-    let state_empty = state.as_ref().is_none_or(agent_table_is_empty);
+/// Compose agent policy from the built-in defaults, a declarative `[agent]` layer, and
+/// the runtime permissions state layer.
+///
+/// Precedence matches `docs/permissions.md`: built-in defaults (including the
+/// plugin-owned manifest `build_tools`) sit beneath declarative config, which sits
+/// beneath the runtime permissions state.
+fn compose_agent_policy(
+    declarative: &Value,
+    state: Option<&Value>,
+) -> (AgentPermissionConfig, PolicySource) {
+    let (base_config, diagnostics) = default_config_with_diagnostics();
+    let declarative_empty = agent_table_is_empty(declarative);
+    let state_empty = state.is_none_or(agent_table_is_empty);
 
     if declarative_empty && state_empty {
         return (
@@ -436,8 +457,8 @@ fn load_config() -> (AgentPermissionConfig, PolicySource) {
             );
         }
     };
-    bcode_config::merge_config_values(&mut merged, agent_only_config_value(&declarative));
-    if let Some(state) = state.as_ref() {
+    bcode_config::merge_config_values(&mut merged, agent_only_config_value(declarative));
+    if let Some(state) = state {
         bcode_config::merge_config_values(&mut merged, agent_only_config_value(state));
     }
 
@@ -842,6 +863,188 @@ command = { "python3 *" = "allow" }
                 std::env::remove_var(name);
             }
         }
+    }
+
+    /// Point the runtime permissions state at an explicit path for hermetic layering tests.
+    struct StateGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl StateGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("BCODE_PERMISSIONS_STATE");
+            unsafe {
+                std::env::set_var("BCODE_PERMISSIONS_STATE", path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for StateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("BCODE_PERMISSIONS_STATE", value),
+                    None => std::env::remove_var("BCODE_PERMISSIONS_STATE"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn effective_config_keeps_manifest_declared_default_tools() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+
+        let effective = r#"
+[agent.plan]
+tools = { "filesystem.read" = true }
+"#;
+        let (config, tools_config) = policy_and_tools_from_effective_toml(Some(effective))
+            .expect("effective config decodes");
+        let mut plan = agent_config(&config, PLAN_AGENT);
+        apply_tool_selection(&mut plan, &tools_config, &[]);
+        let tools = active_tools_for(&plan);
+
+        assert!(
+            tools.contains(&"question".to_string()),
+            "manifest-declared default tools must survive the effective-config path: {tools:?}"
+        );
+        assert!(tools.contains(&"ask".to_string()));
+        assert!(tools.contains(&"ocr.extract".to_string()));
+        assert!(tools.contains(&"filesystem.grep".to_string()));
+    }
+
+    #[test]
+    fn effective_config_declarative_disable_wins_over_manifest_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+
+        let effective = r#"
+[agent.plan]
+tools = { "filesystem.write" = false, "filesystem.edit" = false, "question" = false }
+"#;
+        let (config, tools_config) = policy_and_tools_from_effective_toml(Some(effective))
+            .expect("effective config decodes");
+        let mut plan = agent_config(&config, PLAN_AGENT);
+        apply_tool_selection(&mut plan, &tools_config, &[]);
+        let tools = active_tools_for(&plan);
+
+        assert!(!tools.contains(&"filesystem.write".to_string()));
+        assert!(!tools.contains(&"filesystem.edit".to_string()));
+        assert!(
+            !tools.contains(&"question".to_string()),
+            "an explicit declarative disable must win over manifest defaults"
+        );
+    }
+
+    #[test]
+    fn effective_config_applies_runtime_permission_state_layer() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let state_path = root.join("permissions.toml");
+        std::fs::write(
+            &state_path,
+            r#"
+[agent.build.permission]
+read = { "**" = "allow" }
+"#,
+        )
+        .expect("state should be written");
+        let _state = StateGuard::set(&state_path);
+
+        let effective = r#"
+[agent.build]
+tools = { "filesystem.read" = true }
+[agent.build.permission]
+read = { "**" = "ask" }
+"#;
+        let request = EvaluateToolCallRequest {
+            session_id: SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: "filesystem.read".to_string(),
+            operation: bcode_agent_profile::ToolPolicyOperation::Read {
+                paths: vec!["/tmp/project/file".to_string()],
+            },
+            aliases: vec!["read".to_string()],
+            requires_permission: true,
+            policy_profile: None,
+            cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: Some(Box::new(effective.to_string())),
+        };
+
+        assert_eq!(
+            evaluate_tool_request(&request)
+                .expect("evaluation succeeds")
+                .decision,
+            AgentDecision::Allow,
+            "runtime permissions state must override declarative rules on the effective-config path"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn effective_config_without_agent_table_uses_builtin_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+
+        let (config, _) =
+            policy_and_tools_from_effective_toml(Some("[tools]\ndefault = \"agent\"\n"))
+                .expect("effective config decodes");
+
+        assert_eq!(config, default_config());
+    }
+
+    #[test]
+    fn effective_config_path_matches_direct_composition() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let state_path = root.join("permissions.toml");
+        std::fs::write(
+            &state_path,
+            r#"
+[agent.plan.permission]
+command = { "cargo check *" = "allow" }
+"#,
+        )
+        .expect("state should be written");
+        let _state = StateGuard::set(&state_path);
+
+        let effective = r##"
+[agent.plan]
+accent = "#6b7280"
+tools = { "filesystem.read" = true }
+"##;
+
+        let (from_effective, _) = policy_and_tools_from_effective_toml(Some(effective))
+            .expect("effective config decodes");
+        let declarative = toml::from_str::<Value>(effective).expect("declarative TOML parses");
+        let state = load_permissions_state_layer();
+        let (from_composition, _) = compose_agent_policy(&declarative, state.as_ref());
+
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            from_effective, from_composition,
+            "the effective-config path must apply the same layering as direct composition"
+        );
+
+        let plan = agent_config(&from_effective, PLAN_AGENT);
+        assert_eq!(
+            plan.permission.command.get("cargo check *"),
+            Some(&Action::Allow),
+            "runtime state rules must survive the effective-config path"
+        );
+        assert!(
+            plan.tools.get("question").copied().unwrap_or_default(),
+            "manifest defaults must survive the effective-config path"
+        );
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

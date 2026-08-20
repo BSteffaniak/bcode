@@ -58,6 +58,10 @@ pub struct AgentInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentListRequest {
     /// Fully resolved declarative configuration encoded as TOML by the client.
+    ///
+    /// This carries declarative config layers only. Agent-profile providers remain
+    /// responsible for layering their own manifest-declared defaults beneath it and
+    /// the runtime permissions state above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_config_toml: Option<Box<String>>,
 }
@@ -80,6 +84,10 @@ pub struct AgentContextRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_tools: Vec<ToolDefinition>,
     /// Fully resolved declarative configuration encoded as TOML by the client.
+    ///
+    /// This carries declarative config layers only. Agent-profile providers remain
+    /// responsible for layering their own manifest-declared defaults beneath it and
+    /// the runtime permissions state above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_config_toml: Option<Box<String>>,
 }
@@ -366,6 +374,10 @@ pub struct EvaluateToolCallRequest {
     #[serde(default)]
     pub cwd: Option<String>,
     /// Fully resolved declarative configuration encoded as TOML by the client.
+    ///
+    /// This carries declarative config layers only. Agent-profile providers remain
+    /// responsible for layering their own manifest-declared defaults beneath it and
+    /// the runtime permissions state above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_config_toml: Option<Box<String>>,
 }
@@ -453,6 +465,11 @@ pub struct AgentPolicyProfileIdentity {
 #[serde(deny_unknown_fields)]
 pub struct ResolveAgentPolicyProfileIdentityRequest {
     pub profile_id: String,
+    /// Fully resolved declarative configuration encoded as TOML by the client.
+    ///
+    /// This carries declarative config layers only. Agent-profile providers remain
+    /// responsible for layering their own manifest-declared defaults beneath it and
+    /// the runtime permissions state above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_config_toml: Option<Box<String>>,
 }
