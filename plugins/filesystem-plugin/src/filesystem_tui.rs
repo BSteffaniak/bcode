@@ -827,7 +827,9 @@ mod tests {
             focused: style.fg(Color::Cyan),
             selection: style,
             source: PluginTuiSourceTheme {
-                source: style,
+                // Resolved themes always supply a concrete source foreground, so the
+                // fixture must too; a bare style would hide token-vs-base precedence.
+                source: style.fg(Color::Default),
                 border: style.fg(Color::BrightBlack),
                 gutter: style.fg(Color::BrightBlack),
                 truncated: style.fg(Color::BrightBlack),
