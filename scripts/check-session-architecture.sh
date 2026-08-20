@@ -71,6 +71,20 @@ if rg -n 'fn (session_db_for_write|existing_session_db)\([^)]*\) -> Result<(Opti
   violations=1
 fi
 
+# A retained database handle must reach clients as a typed release blocker. Without this the
+# release outcome would be `Blocked` with an empty blocker list, concealing the one condition that
+# still holds process-level file locks. Lock-blocked diagnosis must also report verified holder
+# evidence instead of dead-ending on a bare lock error.
+if ! rg -q 'DatabaseHandleRetained' packages/ipc/src/lib.rs \
+  || ! rg -qU '\n                if snapshot\.database_handle_retained \{\n                    blockers\.insert\(SessionOwnershipBlocker::DatabaseHandleRetained\);' packages/server/src/lib.rs \
+  || ! rg -q 'SessionOwnershipBlocker::DatabaseHandleRetained' packages/cli/src/lib.rs \
+  || ! rg -q 'fn collect_session_locked_diagnosis' packages/cli/src/lib.rs \
+  || ! grep -F 'locked_session_diagnosis_reports_verified_holder_candidates_without_opening_database' packages/cli/src/lib.rs >/dev/null \
+  || ! grep -F 'retained_database_handle_surfaces_as_an_explicit_release_blocker' packages/server/src/lib.rs >/dev/null; then
+  echo "Session ownership violation: a retained database handle must surface as a typed release blocker and lock-blocked diagnosis must report verified holder evidence." >&2
+  violations=1
+fi
+
 if ! rg -q 'DaemonRecordClassification' packages/daemon-lifecycle/src/lib.rs \
   || ! rg -q 'classify_daemon_record\(' packages/daemon-lifecycle/src/lib.rs packages/cli/src/lib.rs \
   || ! rg -q 'UnreachableStale' packages/daemon-lifecycle/src/lib.rs packages/cli/src/lib.rs \

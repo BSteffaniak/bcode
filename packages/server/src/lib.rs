@@ -6320,6 +6320,12 @@ async fn explicit_session_ownership_release_outcome_inner(
                         }
                     });
                 }
+                // A quiescent session whose database connection could not be proven closed must
+                // report the retained handle. Without this the outcome would be `Blocked` with an
+                // empty blocker list, concealing the one condition that still holds file locks.
+                if snapshot.database_handle_retained {
+                    blockers.insert(SessionOwnershipBlocker::DatabaseHandleRetained);
+                }
                 SessionOwnershipReleaseOutcome::Blocked {
                     blockers: blockers.into_iter().collect(),
                 }
@@ -40182,6 +40188,36 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ] {
             assert!(guidance.contains(expected), "missing guidance: {expected}");
         }
+    }
+
+    #[test]
+    fn retained_database_handle_surfaces_as_an_explicit_release_blocker() {
+        // A quiescent session whose database connection cannot be proven closed must report the
+        // retained handle. Reporting `Blocked` with an empty blocker list would conceal the one
+        // condition that still holds process-level file locks.
+        use bcode_ipc::SessionOwnershipBlocker;
+
+        let snapshot = bcode_session::SessionOwnershipSnapshot {
+            attached_clients: 0,
+            guards: std::collections::BTreeMap::new(),
+            database_handle_retained: true,
+        };
+        assert!(
+            snapshot.is_quiescent(),
+            "a retained handle must not be modeled as user-visible activity"
+        );
+
+        let mut blockers = BTreeSet::new();
+        if snapshot.attached_clients > 0 {
+            blockers.insert(SessionOwnershipBlocker::AttachedClient);
+        }
+        if snapshot.database_handle_retained {
+            blockers.insert(SessionOwnershipBlocker::DatabaseHandleRetained);
+        }
+        assert_eq!(
+            blockers.into_iter().collect::<Vec<_>>(),
+            vec![SessionOwnershipBlocker::DatabaseHandleRetained]
+        );
     }
 
     #[test]

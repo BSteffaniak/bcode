@@ -87,7 +87,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 28;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 29;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -3123,6 +3123,12 @@ pub enum SessionOwnershipBlocker {
     RuntimeWork,
     PluginInvocation,
     Migration,
+    /// The session database connection could not be proven closed during release.
+    ///
+    /// The session was otherwise quiescent, so this reports a retained backend handle rather than
+    /// user-visible activity. Release fails closed in this case instead of claiming success,
+    /// because a retained handle keeps process-level file locks that would block a later owner.
+    DatabaseHandleRetained,
 }
 
 /// Typed outcome of an explicit session ownership release request.

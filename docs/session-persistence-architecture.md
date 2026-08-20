@@ -417,12 +417,19 @@ command can resolve because owner resolution starts from lease metadata.
 Quiescent release therefore closes the connection through the backend lifecycle and probes it before
 reporting success. When the connection cannot be proven terminal, release reports a blocked outcome
 carrying `database_handle_retained` instead of claiming success, so a retained handle is surfaced
-rather than concealed. Actor database accessors return borrows rather than clones so the compiler
-keeps the actor the sole owner of the handle.
+rather than concealed. That condition reaches clients as the typed
+`SessionOwnershipBlocker::DatabaseHandleRetained` release blocker. Actor database accessors return
+borrows rather than clones so the compiler keeps the actor the sole owner of the handle.
 
 Read-only and diagnostic paths deliberately do not close. Closing checkpoints the WAL and rewrites
 `session.db` and `session.db-wal`, which would make a normal read mutate canonical storage. Those
 paths drop their local handle instead, which releases the connection without mutation.
+
+`bcode session diagnose` does not dead-end when the canonical database is locked. It reports the
+lock error together with lease observations and every verified live daemon candidate (namespace,
+artifact, instance id, pid, build fingerprint, writer epoch, classification, and whether a lease
+record names it), without opening or mutating canonical storage. Only daemons with verified identity
+evidence are reported, so unverifiable ownership still fails closed.
 
 ## Historical daemon record classification
 

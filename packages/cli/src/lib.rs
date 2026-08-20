@@ -9552,6 +9552,9 @@ const fn session_ownership_blocker_label(
         bcode_ipc::SessionOwnershipBlocker::RuntimeWork => "runtime work",
         bcode_ipc::SessionOwnershipBlocker::PluginInvocation => "plugin invocation",
         bcode_ipc::SessionOwnershipBlocker::Migration => "migration",
+        bcode_ipc::SessionOwnershipBlocker::DatabaseHandleRetained => {
+            "retained session database handle"
+        }
     }
 }
 
@@ -11074,6 +11077,36 @@ async fn paged_session_history(session_id: SessionId) -> Result<PagedSessionHist
     Ok(history)
 }
 
+/// Verified evidence about which daemon holds a lock-blocked session database.
+///
+/// A database lock can outlive its lease record, in which case lease-based owner resolution reports
+/// no owner even though the database is locked. This reports live-daemon evidence so the holder is
+/// identifiable instead of the diagnosis dead-ending on a bare lock error.
+#[derive(Debug, Clone, Serialize)]
+struct SessionLockHolderCandidate {
+    namespace: String,
+    artifact_id: Option<String>,
+    daemon_instance_id: String,
+    pid: Option<u32>,
+    build_fingerprint: String,
+    storage_writer_epoch: Option<u32>,
+    classification: String,
+    /// Whether a lease record for this session also names this daemon.
+    named_by_lease_record: bool,
+}
+
+/// Bounded, non-mutating diagnosis for a session whose database cannot be opened due to a lock.
+#[derive(Debug, Clone, Serialize)]
+struct SessionLockedDiagnosis {
+    session_id: SessionId,
+    database_path: PathBuf,
+    lock_error: String,
+    owner_observations: Vec<bcode_session::lease::SessionOwnerObservation>,
+    lease_named_owners: usize,
+    holder_candidates: Vec<SessionLockHolderCandidate>,
+    recovery_guidance: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SessionDiagnosis {
     session_id: SessionId,
@@ -11276,13 +11309,126 @@ async fn collect_session_diagnosis(
 
 async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliError> {
     let root = bcode_config::default_session_store_dir();
-    let diagnosis = collect_session_diagnosis(session_id, &root).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&diagnosis)?);
-    } else {
-        print_session_diagnosis(&diagnosis);
+    match collect_session_diagnosis(session_id, &root).await {
+        Ok(diagnosis) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+            } else {
+                print_session_diagnosis(&diagnosis);
+            }
+            Ok(())
+        }
+        // A lock-blocked database must still produce actionable diagnosis. Failing here is what
+        // made an orphaned lock unrecoverable: the error named no holder and every ownership
+        // command resolves owners from lease records that may already be gone.
+        Err(CliError::SessionDb(error)) if error.is_lock_error() => {
+            let diagnosis =
+                collect_session_locked_diagnosis(session_id, &root, &error.to_string()).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+            } else {
+                print_session_locked_diagnosis(&diagnosis);
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
+}
+
+/// Collect bounded, non-mutating holder evidence for a lock-blocked session database.
+///
+/// This never opens the canonical database and never mutates lease or daemon state. It combines
+/// lease observations with verified live daemon records so the holder can be identified even when
+/// no lease record names it.
+async fn collect_session_locked_diagnosis(
+    session_id: SessionId,
+    root: &Path,
+    lock_error: &str,
+) -> Result<SessionLockedDiagnosis, CliError> {
+    let owner_observations = bcode_session::lease::session_owner_observations(root, session_id)?;
+    let lease_named_instance_ids = owner_observations
+        .iter()
+        .filter_map(|observation| observation.owner.daemon_instance_id.clone())
+        .collect::<BTreeSet<_>>();
+    let classified_records =
+        bcode_daemon_lifecycle::classified_records(&bcode_config::default_state_dir()).await;
+    let holder_candidates = classified_records
+        .iter()
+        .filter(|(_, _, classification)| {
+            // Only verified-identity live daemons are reportable. Ambiguous or stale evidence must
+            // not be presented as a holder, so unverifiable ownership still fails closed.
+            matches!(
+                classification,
+                bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+                    | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+                    | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+            )
+        })
+        .map(|(_, record, classification)| SessionLockHolderCandidate {
+            namespace: record.namespace.clone(),
+            artifact_id: record.artifact_id.as_ref().map(ToString::to_string),
+            daemon_instance_id: record.instance_id.clone(),
+            pid: record.pid,
+            build_fingerprint: record.build_fingerprint.clone(),
+            storage_writer_epoch: record.storage_writer_epoch,
+            classification: format!("{classification:?}"),
+            named_by_lease_record: lease_named_instance_ids.contains(&record.instance_id),
+        })
+        .collect::<Vec<_>>();
+    Ok(SessionLockedDiagnosis {
+        session_id,
+        database_path: bcode_session::db::session_db_path(root, session_id),
+        lock_error: lock_error.to_owned(),
+        lease_named_owners: lease_named_instance_ids.len(),
+        owner_observations,
+        holder_candidates,
+        recovery_guidance: session_locked_recovery_guidance(session_id),
+    })
+}
+
+fn session_locked_recovery_guidance(session_id: SessionId) -> String {
+    format!(
+        "The canonical database is locked by another process. Ask each verified daemon below which sessions it holds with `bcode server status` using that daemon's own executable, then run `bcode session release-owner {session_id}` for non-destructive release. A daemon that is still serving other clients is not a stale owner: Bcode runs one daemon per distinct build by design, so never stop a daemon merely because it is older. Ownership normally clears once that daemon's last client for this session exits."
+    )
+}
+
+fn print_session_locked_diagnosis(diagnosis: &SessionLockedDiagnosis) {
+    println!("session: {}", diagnosis.session_id);
+    println!(
+        "database: {}",
+        display_from_current_dir(&diagnosis.database_path)
+    );
+    println!("status: locked (canonical database not opened)");
+    println!("lock error: {}", diagnosis.lock_error);
+    println!("lease-named owners: {}", diagnosis.lease_named_owners);
+    println!("owner observations: {}", diagnosis.owner_observations.len());
+    for observation in &diagnosis.owner_observations {
+        println!(
+            "  lease_token={} pid={} liveness={:?} daemon_instance={:?}",
+            observation.owner.lease_token,
+            observation.owner.pid,
+            observation.liveness,
+            observation.owner.daemon_instance_id
+        );
+    }
+    println!(
+        "verified live daemon candidates: {}",
+        diagnosis.holder_candidates.len()
+    );
+    for candidate in &diagnosis.holder_candidates {
+        println!(
+            "  namespace={} artifact={:?} instance={} pid={:?} build={} epoch={:?} classification={} named_by_lease={}",
+            candidate.namespace,
+            candidate.artifact_id,
+            candidate.daemon_instance_id,
+            candidate.pid,
+            candidate.build_fingerprint,
+            candidate.storage_writer_epoch,
+            candidate.classification,
+            candidate.named_by_lease_record
+        );
+    }
+    println!("recovery: {}", diagnosis.recovery_guidance);
 }
 
 fn session_diagnosis_classification(
@@ -15539,13 +15685,67 @@ mod web_command_tests {
                     bcode_ipc::SessionOwnershipBlocker::RuntimeWork,
                     bcode_ipc::SessionOwnershipBlocker::PluginInvocation,
                     bcode_ipc::SessionOwnershipBlocker::Migration,
+                    bcode_ipc::SessionOwnershipBlocker::DatabaseHandleRetained,
                 ],
             },
         )
         .expect_err("blocked release should be an error");
         assert_eq!(
             error.to_string(),
-            "invalid arguments: daemon daemon-1 refused ownership release; blockers: attached client, pending attach, queued command, active runtime, runtime work, plugin invocation, migration"
+            "invalid arguments: daemon daemon-1 refused ownership release; blockers: attached client, pending attach, queued command, active runtime, runtime work, plugin invocation, migration, retained session database handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_session_diagnosis_reports_verified_holder_candidates_without_opening_database()
+    {
+        // A lock can outlive its lease record, so lease-based owner resolution can report no owner
+        // while the database is still locked. Diagnosis must then surface verified live-daemon
+        // evidence instead of dead-ending, and must not open or mutate canonical storage.
+        let root = tempfile::tempdir().expect("diagnosis root");
+        let session_id = SessionId::new();
+        let session_dir = root.path().join(session_id.to_string());
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        let db_path = session_dir.join("session.db");
+        std::fs::write(&db_path, b"canonical-bytes").expect("database fixture");
+        let before = std::fs::read(&db_path).expect("database bytes before");
+
+        let diagnosis = collect_session_locked_diagnosis(
+            session_id,
+            root.path(),
+            "Locking error: Failed locking file 'session.db-wal'. File is locked by another process",
+        )
+        .await
+        .expect("locked diagnosis should be produced");
+
+        assert_eq!(diagnosis.session_id, session_id);
+        assert_eq!(diagnosis.database_path, db_path);
+        assert!(diagnosis.lock_error.contains("locked by another process"));
+        // No lease records exist for this fixture, which is exactly the dead-end case.
+        assert_eq!(diagnosis.lease_named_owners, 0);
+        assert!(diagnosis.owner_observations.is_empty());
+        // Guidance must name a non-destructive next step and must not advise stopping a daemon for
+        // being old, because concurrent build-specific daemons are intended.
+        assert!(diagnosis.recovery_guidance.contains("release-owner"));
+        assert!(diagnosis.recovery_guidance.contains("not a stale owner"));
+        // Every reported candidate must carry verified identity evidence.
+        for candidate in &diagnosis.holder_candidates {
+            assert!(
+                matches!(
+                    candidate.classification.as_str(),
+                    "CurrentHealthy"
+                        | "HistoricalExactResponsive"
+                        | "HistoricalProcessVerifiedProtocolUnsupported"
+                ),
+                "unverified daemon evidence must not be reported as a holder: {}",
+                candidate.classification
+            );
+        }
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("database bytes after"),
+            before,
+            "locked diagnosis must not mutate canonical storage"
         );
     }
 
