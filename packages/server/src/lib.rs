@@ -20060,6 +20060,7 @@ async fn run_model_turn_inner(
             prepare_static_model_turn_context(
                 state,
                 session_id,
+                &turn_id,
                 trigger_event.sequence,
                 &execution,
                 &turn_config,
@@ -24835,15 +24836,13 @@ fn apply_turn_model_selection(
 async fn prepare_static_model_turn_context(
     state: &ServerState,
     session_id: SessionId,
+    turn_id: &str,
     trigger_event_sequence: u64,
     execution: &bcode_session_models::TurnExecutionOptions,
     config: &bcode_config::BcodeConfig,
     model_target: &model_request_target::ResolvedModelRequestTarget,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
-    let setup_labels = model_turn_metric_labels(
-        session_id,
-        &format!("{session_id}-{trigger_event_sequence}"),
-    );
+    let setup_labels = model_turn_metric_labels(session_id, turn_id);
     let agent_timer = state.metrics.timer();
     let agent_id = execution
         .agent_profile
@@ -67581,9 +67580,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             catalog_provider_id: None,
             catalog_identity: None,
         };
+        let turn_id =
+            bcode_session_models::TurnId::from_accepted_event(session_id, trigger.sequence);
         let prepared = prepare_static_model_turn_context(
             &state,
             session_id,
+            &turn_id.to_string(),
             trigger.sequence,
             &execution,
             &state.session_config(session_id).await,
