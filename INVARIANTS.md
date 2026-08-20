@@ -46,6 +46,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Repair is explicit.** Full replay, reconstruction, reindexing, migration, and repair occur only through explicit maintenance operations with their required ownership and safety checks.
 * **Historical session behavior is migration-owned.** The session runtime and session models contain only current-format behavior. Historical classification, legacy payload handling, migration planning, and conversion belong to the session-migration domain. The session domain may expose narrowly scoped current-format migration-target capabilities without owning historical policy.
 * **Canonical history is never silently merged.** Duplicate or historical session roots must not be merged automatically.
+* **Released session ownership is completely released.** When a session's runtime ownership is released, its lease, database connection, and derived handles are relinquished together; a released session must not retain process-level locks that block a later verified owner.
 
 ## Runtime, tools, and permissions
 
