@@ -288,6 +288,14 @@ impl ModelCatalogResolver {
         self.diagnostics.read().await.clone()
     }
 
+    /// Return the resolver's current catalog snapshot.
+    ///
+    /// Callers that need catalog-wide data should use this instead of reloading and re-parsing the
+    /// embedded catalog, which is significant per-call work.
+    pub async fn catalog_snapshot(&self) -> std::sync::Arc<ModelCatalog> {
+        self.catalog.read().await.clone()
+    }
+
     /// Resolve the catalog-known API surface for one model.
     ///
     /// This is a bounded single-entry lookup used when a live provider model list cannot confirm

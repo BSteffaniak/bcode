@@ -19998,9 +19998,16 @@ async fn run_model_turn_inner(
     let execution = turn_execution_options(trigger_event);
     let turn_config = state.session_config(session_id).await;
     let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+    let setup_labels = model_turn_metric_labels(session_id, &turn_id);
+    let selection_timer = state.metrics.timer();
     let mut selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
     apply_turn_model_selection(&mut selection, &execution);
+    state.metrics.record_histogram_with_labels(
+        "model.turn.setup.model_selection_duration_ms",
+        selection_timer.elapsed_ms(),
+        setup_labels.clone(),
+    );
 
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
         return ModelTurnCompletion::with_message(
@@ -20010,12 +20017,29 @@ async fn run_model_turn_inner(
     }
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
+    let compaction_policy_timer = state.metrics.timer();
     let compaction_policy =
         automatic_compaction_policy(state, &selection, &turn_config.model.compaction).await;
+    state.metrics.record_histogram_with_labels(
+        "model.turn.setup.compaction_policy_duration_ms",
+        compaction_policy_timer.elapsed_ms(),
+        setup_labels.clone(),
+    );
     let compaction_decision = compaction_policy.decision;
+    let retry_rules_timer = state.metrics.timer();
     let provider_retry_rules = provider_retry_rules(state, provider_plugin_id.as_deref()).await;
-    let remote_catalog_retry_rules =
-        remote_catalog_retry_rules(provider_plugin_id.as_deref(), &turn_config.model.retry).await;
+    let remote_catalog_retry_rules = remote_catalog_retry_rules(
+        state,
+        provider_plugin_id.as_deref(),
+        &turn_config.model.retry,
+    )
+    .await;
+    state.metrics.record_histogram_with_labels(
+        "model.turn.setup.retry_rules_duration_ms",
+        retry_rules_timer.elapsed_ms(),
+        setup_labels.clone(),
+    );
+    let target_timer = state.metrics.timer();
     let target = Box::pin(resolve_model_request_target(
         state,
         ModelRequestTargetInput {
@@ -20025,6 +20049,12 @@ async fn run_model_turn_inner(
         },
     ))
     .await;
+    state.metrics.record_histogram_with_labels(
+        "model.turn.setup.resolve_target_duration_ms",
+        target_timer.elapsed_ms(),
+        setup_labels.clone(),
+    );
+    let static_context_timer = state.metrics.timer();
     let static_context = match target {
         Ok(target) => {
             prepare_static_model_turn_context(
@@ -20041,6 +20071,11 @@ async fn run_model_turn_inner(
             "failed to resolve model request target: {error}"
         ))),
     };
+    state.metrics.record_histogram_with_labels(
+        "model.turn.setup.static_context_duration_ms",
+        static_context_timer.elapsed_ms(),
+        setup_labels,
+    );
     let static_context = match static_context {
         Ok(context) => context,
         Err(error) => {
@@ -21087,6 +21122,7 @@ async fn provider_retry_rules(
 }
 
 async fn remote_catalog_retry_rules(
+    state: &ServerState,
     provider_plugin_id: Option<&str>,
     retry_config: &bcode_config::ModelRetryConfig,
 ) -> Vec<bcode_model::ProviderRetryRule> {
@@ -21096,10 +21132,10 @@ async fn remote_catalog_retry_rules(
     let Some(provider_plugin_id) = provider_plugin_id else {
         return Vec::new();
     };
-    let Ok(catalog) = bcode_model_catalog::ModelCatalog::load_bundled_with_remote_overlay().await
-    else {
-        return Vec::new();
-    };
+    // Reuse the server's already-resolved catalog. Reloading and re-parsing the embedded catalog here
+    // cost over 100ms of per-turn setup, which is the single largest Bcode-owned cost outside the
+    // provider round.
+    let catalog = state.model_catalog.catalog_snapshot().await;
     catalog
         .document()
         .providers
@@ -24804,12 +24840,23 @@ async fn prepare_static_model_turn_context(
     config: &bcode_config::BcodeConfig,
     model_target: &model_request_target::ResolvedModelRequestTarget,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
+    let setup_labels = model_turn_metric_labels(
+        session_id,
+        &format!("{session_id}-{trigger_event_sequence}"),
+    );
+    let agent_timer = state.metrics.timer();
     let agent_id = execution
         .agent_profile
         .clone()
         .unwrap_or(session_agent_selection(state, session_id).await);
     let agent_context = agent_context(state, session_id, &agent_id).await;
+    state.metrics.record_histogram_with_labels(
+        "model.turn.static_context.agent_duration_ms",
+        agent_timer.elapsed_ms(),
+        setup_labels.clone(),
+    );
     let working_directory = state.sessions.session_working_directory(session_id).await?;
+    let skills_timer = state.metrics.timer();
     let skills = state.session_skills(session_id).await;
     let skill_catalog = if config.system_prompt.sections.skill_catalog {
         skills.as_ref().map_or_else(String::new, |registry| {
@@ -24821,6 +24868,11 @@ async fn prepare_static_model_turn_context(
     } else {
         String::new()
     };
+    state.metrics.record_histogram_with_labels(
+        "model.turn.static_context.skills_duration_ms",
+        skills_timer.elapsed_ms(),
+        setup_labels.clone(),
+    );
     let invariant_mode = config.invariants.enabled.then_some(config.invariants.mode);
     let full_fallback = state
         .invariant_full_fallback
@@ -24836,6 +24888,7 @@ async fn prepare_static_model_turn_context(
             .and_then(|context| context.operating_mode.as_deref()),
         config.composition.active_profile.as_deref(),
     );
+    let system_prompt_timer = state.metrics.timer();
     let (system_prompt, repository_system_context) = build_coding_system_prompt_parts(
         &working_directory,
         &config.system_prompt,
@@ -24847,6 +24900,11 @@ async fn prepare_static_model_turn_context(
             .as_ref()
             .and_then(|context| context.system_prompt_suffix.as_deref()),
         Some(&skill_catalog),
+    );
+    state.metrics.record_histogram_with_labels(
+        "model.turn.static_context.system_prompt_duration_ms",
+        system_prompt_timer.elapsed_ms(),
+        setup_labels,
     );
     let mut system_messages = Vec::new();
     for context in [dynamic_system_context, repository_system_context] {
