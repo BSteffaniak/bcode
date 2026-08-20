@@ -3,6 +3,12 @@ name    = "Bcode Bedrock Provider"
 version = "0.0.1"
 
 [[services]]
+description           = "Push-streamed Amazon Bedrock model provider turns"
+interface_id          = "bcode.model-provider/v3"
+invocation_operations = ["run_turn"]
+name                  = "Amazon Bedrock Model Provider v3"
+
+[[services]]
 description  = "Amazon Bedrock Runtime and Mantle model provider"
 interface_id = "bcode.model-provider/v2"
 name         = "Amazon Bedrock Model Provider"

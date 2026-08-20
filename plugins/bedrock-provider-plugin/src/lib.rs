@@ -30,13 +30,14 @@ use aws_smithy_types::{Document, Number};
 use base64::Engine as _;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MODEL_PROVIDER_INTERFACE_ID_V2, MessageRole, ModelCapability, ModelCatalogHints, ModelInfo,
-    ModelList, ModelListRequest, ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES,
-    OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
-    PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities, ProviderCapability,
-    ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext,
-    ProviderRequestProjection, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage,
-    ToolCall, ToolChoice, ToolDefinition, ValidateConfigResponse,
+    MODEL_PROVIDER_INTERFACE_ID_V2, MODEL_PROVIDER_INTERFACE_ID_V3, MessageRole, ModelCapability,
+    ModelCatalogHints, ModelInfo, ModelList, ModelListRequest, ModelMessage, ModelTurnRequest,
+    OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_RUN_TURN,
+    OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderCapabilities, ProviderCapability, ProviderError, ProviderErrorCategory,
+    ProviderErrorSource, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
+    RunTurnResponse, StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolChoice,
+    ToolDefinition, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, StreamOutcome, SyntheticStructuredOutput, TurnState, TurnStore,
@@ -154,7 +155,9 @@ impl BedrockProviderPlugin {
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if !matches!(
             context.request.interface_id.as_str(),
-            MODEL_PROVIDER_INTERFACE_ID | MODEL_PROVIDER_INTERFACE_ID_V2
+            MODEL_PROVIDER_INTERFACE_ID
+                | MODEL_PROVIDER_INTERFACE_ID_V2
+                | MODEL_PROVIDER_INTERFACE_ID_V3
         ) {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -169,6 +172,7 @@ impl BedrockProviderPlugin {
                 &context.request,
                 context.request.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2,
             ),
+            OP_RUN_TURN => self.run_turn(context),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
             OP_FINISH_TURN => self.finish_turn(&context.request),
@@ -215,6 +219,49 @@ impl BedrockProviderPlugin {
             Err(error) => push_runtime_error(&turn, error),
         }
         json_response(&StartTurnResponse { provider_turn_id })
+    }
+
+    /// Serve one complete turn over a push event stream.
+    ///
+    /// Reuses the existing turn setup, then forwards produced events to the host emitter until the
+    /// turn reaches a terminal event. Host cancellation is observed through `context.cancellation`,
+    /// and the turn is finished as this call unwinds, so no separate cancel or finish operation is
+    /// needed on the push path.
+    fn run_turn(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let request = match context.request.payload_json::<ModelTurnRequest>() {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
+        let (provider_turn_id, turn) = self
+            .turns
+            .lock()
+            .expect("bedrock turn store lock should not be poisoned")
+            .insert_started("bedrock-turn");
+        turn.enable_positioned_output();
+        turn.push(ProviderTurnEvent::RequestProjection {
+            projection: bedrock_request_projection(&request),
+        });
+        match &self.runtime {
+            Ok(runtime) => {
+                self.turn_executor.start(
+                    runtime,
+                    request,
+                    turn.clone(),
+                    Arc::clone(&self.discovery),
+                );
+            }
+            Err(error) => push_runtime_error(&turn, error),
+        }
+
+        let outcome = stream_turn_events(&turn, context);
+
+        turn.cancel();
+        self.turns
+            .lock()
+            .expect("bedrock turn store lock should not be poisoned")
+            .finish(&provider_turn_id);
+
+        outcome
     }
 
     fn poll_turn_events(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -266,6 +313,53 @@ fn push_runtime_error(turn: &TurnState, error: &str) {
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::Error,
     });
+}
+
+/// Interval used only to observe locally-buffered turn production inside this plugin.
+///
+/// This is provider-internal scheduling, not host latency: the background streaming task pushes into
+/// `TurnState` as bytes arrive from Bedrock, and this loop forwards each event to the host as soon as
+/// it observes it.
+const TURN_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Forward a turn's produced events to the host emitter until the turn terminates.
+///
+/// Returns the terminal [`RunTurnResponse`]. Cancellation is observed through the host-provided
+/// cancellation handle rather than a separate cancel operation.
+fn stream_turn_events(turn: &TurnState, context: &NativeServiceContext) -> ServiceResponse {
+    loop {
+        if context.cancellation.is_cancelled() {
+            turn.cancel();
+            for event in turn.drain() {
+                emit_provider_turn_event(context, &event);
+            }
+            return json_response(&RunTurnResponse {
+                stop_reason: Some(StopReason::Cancelled),
+            });
+        }
+        let mut terminal = None;
+        for event in turn.drain() {
+            emit_provider_turn_event(context, &event);
+            match &event {
+                ProviderTurnEvent::TurnFinished { stop_reason } => terminal = Some(*stop_reason),
+                ProviderTurnEvent::Cancelled => terminal = Some(StopReason::Cancelled),
+                _ => {}
+            }
+        }
+        if let Some(stop_reason) = terminal {
+            return json_response(&RunTurnResponse {
+                stop_reason: Some(stop_reason),
+            });
+        }
+        let _cancelled = context.cancellation.wait_cancelled(TURN_DRAIN_INTERVAL);
+    }
+}
+
+/// Emit one provider turn event as an incremental service event.
+fn emit_provider_turn_event(context: &NativeServiceContext, event: &ProviderTurnEvent) {
+    if let Ok(payload) = serde_json::to_vec(event) {
+        context.events.emit(&payload);
+    }
 }
 
 async fn stream_bedrock_turn(

@@ -2375,6 +2375,18 @@ pub struct PollTurnEventsResponse {
     pub events: Vec<ProviderTurnEvent>,
 }
 
+/// Terminal result of one push-streamed provider turn.
+///
+/// Returned by [`OP_RUN_TURN`] when the turn-long streaming call completes. Every
+/// [`ProviderTurnEvent`] for the turn is delivered as an incremental service event before this
+/// response, so this carries only the terminal outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTurnResponse {
+    /// Provider-reported stop reason, when the turn reached one.
+    #[serde(default)]
+    pub stop_reason: Option<StopReason>,
+}
+
 /// Cancel an active provider turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelTurnRequest {

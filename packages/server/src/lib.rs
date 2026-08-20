@@ -84,11 +84,12 @@ use bcode_ipc::{
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
-    ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MODEL_PROVIDER_INTERFACE_ID_V2, MessageRole,
-    ModelList, ModelMessage, ModelParameters, ModelTurnRequest, OP_AUTH_USAGE, OP_CANCEL_TURN,
-    OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest,
-    PollTurnEventsResponse, ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
-    ToolCallRequestPolicy, ToolChoice,
+    ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MODEL_PROVIDER_INTERFACE_ID_V2,
+    MODEL_PROVIDER_INTERFACE_ID_V3, MessageRole, ModelList, ModelMessage, ModelParameters,
+    ModelTurnRequest, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
+    OP_POLL_TURN_EVENTS, OP_RUN_TURN, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage, ToolCallRequestPolicy,
+    ToolChoice,
 };
 use bcode_plugin::{
     PluginInvocationBridge, PluginInvocationScope, StreamingServiceInvocationEvent,
@@ -3232,6 +3233,14 @@ async fn collect_invariant_selector_output(
     let Some(provider) = provider else {
         return Err("no unique model provider is available for invariant selection".to_string());
     };
+
+    // Prefer push delivery so selector output arrives as the provider produces it. Cancellation on
+    // timeout is handled by the caller aborting this future, which drops the invocation and stops
+    // provider work, so no separate cancel operation is needed on this path.
+    if invariant_selector_provider_serves_push(runtime, &provider) {
+        return collect_invariant_selector_output_streamed(runtime, &provider, &request).await;
+    }
+
     let start = runtime
         .plugins
         .invoke_service_json::<_, StartTurnResponse>(
@@ -3294,6 +3303,85 @@ async fn collect_invariant_selector_output(
         )
         .await;
     result
+}
+
+/// Return whether the selector's provider serves the push-streaming interface.
+fn invariant_selector_provider_serves_push(
+    runtime: &InvariantSelectorRuntime,
+    provider: &str,
+) -> bool {
+    runtime
+        .plugins
+        .registry()
+        .manifests()
+        .get(provider)
+        .is_some_and(|manifest| {
+            manifest
+                .services
+                .iter()
+                .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID_V3)
+        })
+}
+
+/// Collect selector output from one turn-long push-streamed provider call.
+///
+/// Preserves the poll path's semantics: assistant text accumulates, a provider error or cancellation
+/// fails the run, and an `Error`/`Cancelled` stop reason is an error.
+async fn collect_invariant_selector_output_streamed(
+    runtime: &InvariantSelectorRuntime,
+    provider: &str,
+    request: &ModelTurnRequest,
+) -> Result<String, String> {
+    let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let mut invocation = runtime
+        .plugins
+        .invoke_service_with_events(
+            provider,
+            MODEL_PROVIDER_INTERFACE_ID_V3,
+            OP_RUN_TURN,
+            payload,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut output = String::new();
+    loop {
+        match invocation
+            .next_event()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            StreamingServiceInvocationEvent::Event(payload) => {
+                let Ok(event) = serde_json::from_slice::<ProviderTurnEvent>(&payload) else {
+                    continue;
+                };
+                match event {
+                    ProviderTurnEvent::TextDelta { text }
+                    | ProviderTurnEvent::Output {
+                        event: bcode_model::ProviderOutputEvent::TextDelta { text },
+                        ..
+                    } => output.push_str(&text),
+                    ProviderTurnEvent::Error { error } => return Err(error.message),
+                    ProviderTurnEvent::Cancelled => {
+                        return Err("selector cancelled".to_string());
+                    }
+                    ProviderTurnEvent::TurnFinished { stop_reason } => {
+                        if matches!(
+                            stop_reason,
+                            bcode_model::StopReason::Error | bcode_model::StopReason::Cancelled
+                        ) {
+                            return Err(format!("selector ended with {stop_reason:?}"));
+                        }
+                        return Ok(output);
+                    }
+                    _ => {}
+                }
+            }
+            StreamingServiceInvocationEvent::Response(response) => {
+                response.map_err(|error| error.to_string())?;
+                return Ok(output);
+            }
+        }
+    }
 }
 
 async fn apply_invariant_selector_result(
@@ -21585,66 +21673,118 @@ async fn run_model_turn_round(
         ));
     }
     service_runtime_priority_commands(state, session_id, command_context).await;
-    let start_timer = state.metrics.timer();
     let scope = active_plugin_scope_for_session(state, session_id).await;
-    let start = wait_for_provider_call(
-        state,
-        session_id,
-        command_context,
-        cancel_state.as_ref(),
-        Box::pin(invoke_model_provider_json_blocking_scoped::<
-            _,
-            StartTurnResponse,
-        >(
-            state,
-            provider_plugin_id.map(ToString::to_string),
-            OP_START_TURN,
-            request.clone(),
-            scope,
-        )),
-    )
-    .await;
-    state.metrics.record_histogram_with_labels(
-        "model.provider.start_turn_duration_ms",
-        start_timer.elapsed_ms(),
-        provider_labels.clone(),
-    );
-    let start = match start {
-        ProviderCallWait::Completed(Ok(start)) => start,
-        ProviderCallWait::Completed(Err(error)) => {
-            let message = format!("model provider error: {error}");
-            append_trace_event(
-                state,
-                session_id,
-                Some(request.turn_id.clone()),
-                SessionTracePhase::ModelProviderRoundFinished,
-                SessionTracePayload::ProviderRound {
-                    provider_turn_id: None,
-                    provider: provider_label,
-                    round: model_round_from_turn_id(&request.turn_id),
-                    stop_reason: None,
-                    duration_ms: Some(elapsed_ms(round_start)),
-                    error: Some(message.clone()),
-                },
+    let start_timer = state.metrics.timer();
+
+    // Prefer push delivery when the provider serves the streaming interface. Events then arrive as
+    // the provider produces them, with no poll interval between them.
+    let (delivery, provider_turn_id) = if let Some((push_plugin_id, push_interface_id)) =
+        model_provider_push_route(state, provider_plugin_id)
+    {
+        let payload = match serde_json::to_vec(request) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Err(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    format!("model provider error: {error}"),
+                ));
+            }
+        };
+        let invocation = state
+            .plugins
+            .invoke_service_with_events_scoped(
+                &push_plugin_id,
+                push_interface_id,
+                OP_RUN_TURN,
+                payload,
+                scope,
             )
             .await;
-            append_system_event(state, session_id, message.clone()).await;
-            return Err(ModelTurnCompletion::with_message(
-                ModelTurnOutcome::Error,
-                message,
-            ));
+        state.metrics.record_histogram_with_labels(
+            "model.provider.run_turn_start_duration_ms",
+            start_timer.elapsed_ms(),
+            provider_labels.clone(),
+        );
+        match invocation {
+            Ok(invocation) => (
+                ModelRoundDelivery::Push(invocation),
+                format!("push-{}", request.turn_id),
+            ),
+            Err(error) => {
+                let message = format!("model provider error: {error}");
+                append_provider_round_error_trace(
+                    state,
+                    session_id,
+                    request,
+                    &provider_label,
+                    round_start,
+                    &message,
+                )
+                .await;
+                append_system_event(state, session_id, message.clone()).await;
+                return Err(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    message,
+                ));
+            }
         }
-        ProviderCallWait::Cancelled => {
-            return Err(ModelTurnCompletion::with_message(
-                ModelTurnOutcome::Cancelled,
-                "model turn cancelled",
-            ));
+    } else {
+        let start = wait_for_provider_call(
+            state,
+            session_id,
+            command_context,
+            cancel_state.as_ref(),
+            Box::pin(invoke_model_provider_json_blocking_scoped::<
+                _,
+                StartTurnResponse,
+            >(
+                state,
+                provider_plugin_id.map(ToString::to_string),
+                OP_START_TURN,
+                request.clone(),
+                scope,
+            )),
+        )
+        .await;
+        state.metrics.record_histogram_with_labels(
+            "model.provider.start_turn_duration_ms",
+            start_timer.elapsed_ms(),
+            provider_labels.clone(),
+        );
+        match start {
+            ProviderCallWait::Completed(Ok(start)) => {
+                (ModelRoundDelivery::Poll(()), start.provider_turn_id)
+            }
+            ProviderCallWait::Completed(Err(error)) => {
+                let message = format!("model provider error: {error}");
+                append_provider_round_error_trace(
+                    state,
+                    session_id,
+                    request,
+                    &provider_label,
+                    round_start,
+                    &message,
+                )
+                .await;
+                append_system_event(state, session_id, message.clone()).await;
+                return Err(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    message,
+                ));
+            }
+            ProviderCallWait::Cancelled => {
+                return Err(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Cancelled,
+                    "model turn cancelled",
+                ));
+            }
         }
     };
 
+    let delivery_is_push = delivery.is_push();
     let active_model_turn = ModelRequestAttempt {
         identity: context_projection.request.clone(),
-        provider_turn_id: start.provider_turn_id.clone(),
+        provider_turn_id: provider_turn_id.clone(),
         reuse_key: request.conversation_reuse.key.clone(),
         request_message_count: request.messages.len(),
         context_through_sequence: context_projection.context_through_sequence,
@@ -21660,7 +21800,7 @@ async fn run_model_turn_round(
         Some(request.turn_id.clone()),
         SessionTracePhase::ModelProviderRoundStarted,
         SessionTracePayload::ProviderRound {
-            provider_turn_id: Some(start.provider_turn_id.clone()),
+            provider_turn_id: Some(provider_turn_id.clone()),
             provider: provider_label.clone(),
             round: model_round_from_turn_id(&request.turn_id),
             stop_reason: None,
@@ -21670,22 +21810,38 @@ async fn run_model_turn_round(
     )
     .await;
 
-    let (mut assistant_text, mut outcome) = poll_model_turn_events(
-        state,
-        session_id,
-        ModelPollContext {
-            turn_id,
-            next_assistant_segment_order,
-            next_output_position,
-            provider_plugin_id,
-            provider_turn_id: &start.provider_turn_id,
-            structured_output: request.structured_output.is_some(),
-            streaming,
-        },
-        Arc::clone(&cancel_state),
-        command_context,
-    )
-    .await;
+    let poll_context = ModelPollContext {
+        turn_id,
+        next_assistant_segment_order,
+        next_output_position,
+        provider_plugin_id,
+        provider_turn_id: &provider_turn_id,
+        structured_output: request.structured_output.is_some(),
+        streaming,
+    };
+    let (mut assistant_text, mut outcome) = match delivery {
+        ModelRoundDelivery::Push(invocation) => {
+            stream_model_turn_events(
+                state,
+                session_id,
+                poll_context,
+                invocation,
+                Arc::clone(&cancel_state),
+                command_context,
+            )
+            .await
+        }
+        ModelRoundDelivery::Poll(()) => {
+            poll_model_turn_events(
+                state,
+                session_id,
+                poll_context,
+                Arc::clone(&cancel_state),
+                command_context,
+            )
+            .await
+        }
+    };
 
     service_runtime_priority_commands(state, session_id, command_context).await;
     ensure_terminal_poll_outcome(state, session_id, &mut outcome).await;
@@ -21761,42 +21917,43 @@ async fn run_model_turn_round(
 
     service_runtime_priority_commands(state, session_id, command_context).await;
     let active_turn = finish_provider_round(command_context).await;
-    let finish = FinishTurnRequest {
-        provider_turn_id: start.provider_turn_id,
-    };
     append_model_provider_round_finished_trace(
         state,
         session_id,
         request,
-        finish.provider_turn_id.clone(),
+        provider_turn_id.clone(),
         provider_label,
         round_start,
         &outcome,
     )
     .await;
-    let finish_result = wait_for_provider_call(
-        state,
-        session_id,
-        command_context,
-        cancel_state.as_ref(),
-        Box::pin(invoke_model_provider_json_blocking::<
-            _,
-            bcode_model::AckResponse,
-        >(
-            state,
-            active_turn.map(|turn| turn.identity.provider_plugin_id),
-            OP_FINISH_TURN,
-            finish,
-        )),
-    )
-    .await;
-    if let ProviderCallWait::Completed(Err(error)) = finish_result {
-        append_system_event(
+    // Push turns complete when their streaming call returns, so provider-side turn state is already
+    // released. Only the poll contract needs an explicit finish operation.
+    if !delivery_is_push {
+        let finish_result = wait_for_provider_call(
             state,
             session_id,
-            format!("model provider finish turn failed: {error}"),
+            command_context,
+            cancel_state.as_ref(),
+            Box::pin(invoke_model_provider_json_blocking::<
+                _,
+                bcode_model::AckResponse,
+            >(
+                state,
+                active_turn.map(|turn| turn.identity.provider_plugin_id),
+                OP_FINISH_TURN,
+                FinishTurnRequest { provider_turn_id },
+            )),
         )
         .await;
+        if let ProviderCallWait::Completed(Err(error)) = finish_result {
+            append_system_event(
+                state,
+                session_id,
+                format!("model provider finish turn failed: {error}"),
+            )
+            .await;
+        }
     }
     state.metrics.record_histogram_with_labels(
         "model.provider.round_duration_ms",
@@ -21897,6 +22054,288 @@ struct ModelPollContext<'a> {
     provider_turn_id: &'a str,
     structured_output: bool,
     streaming: &'a bcode_config::StreamingConfig,
+}
+
+/// How one provider round receives its turn events.
+enum ModelRoundDelivery {
+    /// Turn-long streaming call on `bcode.model-provider/v3`; events are pushed as produced.
+    Push(bcode_plugin::StreamingServiceInvocation),
+    /// Request/response `start_turn` + `poll_turn_events` on older provider interfaces.
+    Poll(()),
+}
+
+impl ModelRoundDelivery {
+    /// Return whether this round uses push delivery.
+    const fn is_push(&self) -> bool {
+        matches!(self, Self::Push(_))
+    }
+}
+
+/// Record a provider-round failure trace before the round returns an error.
+async fn append_provider_round_error_trace(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &ModelTurnRequest,
+    provider_label: &str,
+    round_start: Instant,
+    message: &str,
+) {
+    append_trace_event(
+        state,
+        session_id,
+        Some(request.turn_id.clone()),
+        SessionTracePhase::ModelProviderRoundFinished,
+        SessionTracePayload::ProviderRound {
+            provider_turn_id: None,
+            provider: provider_label.to_owned(),
+            round: model_round_from_turn_id(&request.turn_id),
+            stop_reason: None,
+            duration_ms: Some(elapsed_ms(round_start)),
+            error: Some(message.to_owned()),
+        },
+    )
+    .await;
+}
+
+/// Consume one push-streamed provider turn.
+///
+/// Events arrive through the plugin invocation's incremental event channel, so there is no poll
+/// interval and no idle sleep: `first_output_latency_ms` measures true arrival time. Cancellation,
+/// steering, and follow-up servicing keep the same semantics as the poll path, and the no-progress
+/// warning/timeout thresholds still come from [`bcode_config::StreamingConfig`], now measuring real
+/// provider silence instead of accumulated poll sleeps.
+#[allow(clippy::too_many_lines)]
+async fn stream_model_turn_events(
+    state: &ServerState,
+    session_id: SessionId,
+    poll: ModelPollContext<'_>,
+    mut invocation: bcode_plugin::StreamingServiceInvocation,
+    cancel_state: Arc<TurnCancelState>,
+    command_context: &mut RuntimeCommandContext<'_>,
+) -> (Option<AssistantSegmentOutput>, ModelPollOutcome) {
+    let ModelPollContext {
+        turn_id,
+        next_assistant_segment_order,
+        next_output_position,
+        provider_plugin_id,
+        provider_turn_id,
+        structured_output,
+        streaming,
+    } = poll;
+    let mut stream = ModelStreamAccumulator::new(
+        session_id,
+        turn_id,
+        *next_assistant_segment_order,
+        !structured_output,
+        Arc::clone(&cancel_state),
+    );
+    let mut outcome = ModelPollOutcome::default();
+    let output_position_base = *next_output_position;
+    let provider_context = session_model_selection(state, session_id)
+        .await
+        .provider_context;
+    let mut stream_progress = ModelStreamProgress::with_sensitive_values(
+        provider_request_context_sensitive_values(&provider_context),
+    );
+    let round_started_at = Instant::now();
+    let mut first_output_recorded = false;
+    let mut no_progress_warned = false;
+    let warning_after = Duration::from_secs(streaming.no_progress_warning_secs);
+    let timeout_after = Duration::from_secs(streaming.no_progress_timeout_secs);
+    let mut last_progress_at = Instant::now();
+
+    loop {
+        service_runtime_priority_commands(state, session_id, command_context).await;
+        if cancel_state.is_cancelled() {
+            invocation.cancel.cancel();
+            outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            ));
+            break;
+        }
+
+        let idle_for = last_progress_at.elapsed();
+        if !no_progress_warned && idle_for >= warning_after {
+            publish_provider_stream_progress_live(
+                state,
+                session_id,
+                "model-stream",
+                ProviderStreamEvent::NoProgressWarning {
+                    idle_seconds: idle_for.as_secs(),
+                    active_tool_call: stream_progress.tool_progress_snapshot(),
+                },
+            )
+            .await;
+            no_progress_warned = true;
+        }
+        if idle_for > timeout_after {
+            invocation.cancel.cancel();
+            let detail =
+                stream_progress
+                    .tool_progress_snapshot()
+                    .map_or_else(String::new, |progress| {
+                        format!(
+                            " while assembling {} arguments · {} received",
+                            progress.tool_name,
+                            format_bytes(progress.argument_bytes)
+                        )
+                    });
+            let message = format!(
+                "model provider made no progress for {} seconds before timeout{detail}",
+                timeout_after.as_secs()
+            );
+            outcome.provider_error = Some(model_no_progress_timeout_error(message.clone()));
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::IdleTimeout,
+                message,
+            ));
+            break;
+        }
+        let remaining_before_timeout = timeout_after.saturating_sub(idle_for);
+        let next_deadline = if no_progress_warned {
+            remaining_before_timeout
+        } else {
+            remaining_before_timeout.min(warning_after.saturating_sub(idle_for))
+        }
+        .max(Duration::from_millis(1));
+
+        let event = tokio::select! {
+            biased;
+            () = cancel_state.cancelled() => {
+                invocation.cancel.cancel();
+                outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
+                outcome.completion = Some(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Cancelled,
+                    "model turn cancelled",
+                ));
+                break;
+            }
+            cancel_command = command_context.cancel_commands.recv() => {
+                if let Some(command) = cancel_command {
+                    process_cancel_turn_command(
+                        state,
+                        session_id,
+                        command_context.followup_commands,
+                        command_context.queued_followups,
+                        command,
+                    )
+                    .await;
+                }
+                continue;
+            }
+            steering_command = command_context.steering_commands.recv() => {
+                if let Some(command) = steering_command {
+                    process_steering_message_command(
+                        state,
+                        session_id,
+                        command.client_id,
+                        command.text,
+                        command.completion,
+                    )
+                    .await;
+                }
+                continue;
+            }
+            event = invocation.next_event() => event,
+            () = tokio::time::sleep(next_deadline) => continue,
+        };
+
+        match event {
+            Ok(StreamingServiceInvocationEvent::Event(payload)) => {
+                let Ok(event) = serde_json::from_slice::<ProviderTurnEvent>(&payload) else {
+                    continue;
+                };
+                if model_event_is_progress(&event) {
+                    if !first_output_recorded {
+                        first_output_recorded = true;
+                        state.metrics.record_histogram_with_labels(
+                            "model.provider.first_output_latency_ms",
+                            elapsed_ms(round_started_at),
+                            provider_poll_metric_labels(session_id, provider_plugin_id, turn_id),
+                        );
+                    }
+                    last_progress_at = Instant::now();
+                    no_progress_warned = false;
+                }
+                let event = rebase_provider_output_event(event, output_position_base);
+                handle_provider_turn_event(
+                    state,
+                    session_id,
+                    provider_turn_id,
+                    turn_id,
+                    next_assistant_segment_order,
+                    event,
+                    &mut stream,
+                    &mut outcome,
+                    &mut stream_progress,
+                    command_context,
+                )
+                .await;
+                if outcome.stop_reason.is_some() || outcome.completion.is_some() {
+                    break;
+                }
+            }
+            Ok(StreamingServiceInvocationEvent::Response(response)) => {
+                if let Err(error) = response {
+                    let message = format!("model provider error: {error}");
+                    append_system_event(state, session_id, message.clone()).await;
+                    outcome.completion = Some(ModelTurnCompletion::with_message(
+                        ModelTurnOutcome::Error,
+                        message,
+                    ));
+                }
+                break;
+            }
+            Err(error) => {
+                let message = format!("model provider error: {error}");
+                append_system_event(state, session_id, message.clone()).await;
+                outcome.completion = Some(ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    message,
+                ));
+                break;
+            }
+        }
+    }
+
+    finish_all_tool_request_drafts(
+        state,
+        session_id,
+        turn_id,
+        &mut stream_progress,
+        if cancel_state.is_cancelled() {
+            bcode_session_models::ToolRequestDraftTerminalReason::Cancelled
+        } else {
+            bcode_session_models::ToolRequestDraftTerminalReason::Invalid
+        },
+    )
+    .await;
+    stream.flush(state).await;
+    let assistant = stream.finish();
+    let max_position = outcome
+        .tool_output_positions
+        .values()
+        .map(|(_, position)| position.get())
+        .chain(
+            outcome
+                .reasoning_activities
+                .values()
+                .filter_map(|activity| activity.output_position)
+                .map(bcode_session_models::TurnOutputPosition::get),
+        )
+        .chain(
+            assistant
+                .as_ref()
+                .and_then(|segment| segment.output_position)
+                .map(bcode_session_models::TurnOutputPosition::get),
+        )
+        .max();
+    if let Some(max_position) = max_position {
+        *next_output_position = max_position.saturating_add(1);
+    }
+    (assistant, outcome)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -24125,6 +24564,40 @@ fn unique_model_provider_route(state: &ServerState) -> Result<(String, &'static 
         }
     }
     Err("no unique model provider is available".to_owned())
+}
+
+/// Resolve the push-streaming provider route for this turn, when one is available.
+///
+/// Providers declare `bcode.model-provider/v3` alongside the older request/response interfaces, so
+/// this is a capability probe rather than a replacement for [`model_provider_interface_for_plugin`].
+/// Returning `None` makes the caller fall back to the poll contract instead of failing the turn.
+fn model_provider_push_route(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+) -> Option<(String, &'static str)> {
+    if let Some(provider_plugin_id) = provider_plugin_id {
+        let serves_push = state
+            .plugins
+            .registry()
+            .manifests()
+            .get(provider_plugin_id)?
+            .services
+            .iter()
+            .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID_V3);
+        return serves_push.then(|| {
+            (
+                provider_plugin_id.to_owned(),
+                MODEL_PROVIDER_INTERFACE_ID_V3,
+            )
+        });
+    }
+    state
+        .plugins
+        .registry()
+        .service_registry()
+        .unique_provider(MODEL_PROVIDER_INTERFACE_ID_V3)
+        .ok()
+        .map(|plugin_id| (plugin_id.to_owned(), MODEL_PROVIDER_INTERFACE_ID_V3))
 }
 
 fn has_model_provider(state: &ServerState, provider_plugin_id: Option<&str>) -> bool {
@@ -41923,6 +42396,38 @@ library = "test"
             &mut command_context,
             &Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
             None,
+        )
+        .await
+    }
+
+    async fn run_test_model_turn_with_cancel_state(
+        state: &ServerState,
+        session_id: SessionId,
+        trigger: &SessionEvent,
+        runtime_context: ClientRuntimeContext,
+        cancel_state: Option<Arc<TurnCancelState>>,
+    ) -> ModelTurnCompletion {
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::new(Mutex::new(None)),
+        );
+        run_model_turn(
+            state,
+            &mut permit,
+            trigger,
+            ClientId::new(),
+            Some(runtime_context),
+            &mut command_context,
+            &Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            cancel_state,
         )
         .await
     }
@@ -62240,6 +62745,398 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             labels.get("session_id").map(String::as_str),
             Some(session_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn push_delivery_streams_a_complete_turn_without_poll_operations() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("push delivery".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "stream me".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("trigger");
+        let state = test_server_state_with_fake_provider(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                ..SessionModelSelection::default()
+            },
+        );
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                selected_model_id: Some("fake-echo".to_owned()),
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Completed,
+            "push-delivered turn should complete: {:?}",
+            completion.message
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert!(
+            history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::PositionedAssistantResponseSegment { text, .. }
+                    if text.contains("stream me")
+            )),
+            "assistant output must reach the session through push delivery"
+        );
+        assert!(
+            history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::TraceEvent { trace }
+                    if matches!(
+                        &trace.payload,
+                        SessionTracePayload::ProviderRound { provider_turn_id: Some(id), .. }
+                            if id.starts_with("push-")
+                    )
+            )),
+            "the round must be traced as a push-delivered turn"
+        );
+        let snapshot = state.metrics.snapshot();
+        assert!(
+            snapshot
+                .histograms
+                .contains_key("model.provider.first_output_latency_ms"),
+            "push delivery must record time to first output"
+        );
+        assert!(
+            !snapshot
+                .histograms
+                .contains_key("model.provider.poll_idle_wait_duration_ms"),
+            "push delivery must not accumulate poll idle wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_delivery_cancels_mid_stream_without_leaking_provider_state() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("push cancel".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "cancel me".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("trigger");
+        // Hold the provider turn open so cancellation lands while the streaming call is active.
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([("fake_turn_delay_ms".to_owned(), "60000".to_owned())]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let state = test_server_state_with_fake_provider(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                provider_context: provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let cancel_trigger = Arc::clone(&cancel_state);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel_trigger.cancel().await;
+        });
+
+        let completion = run_test_model_turn_with_cancel_state(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                selected_model_id: Some("fake-echo".to_owned()),
+                provider_context,
+                ..ClientRuntimeContext::default()
+            },
+            Some(cancel_state),
+        )
+        .await;
+
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Cancelled,
+            "cancelling mid-stream must terminate the push turn: {:?}",
+            completion.message
+        );
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history");
+        assert!(
+            history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::ModelTurnFinished { outcome, .. }
+                    if *outcome == ModelTurnOutcome::Cancelled
+            )),
+            "the cancelled turn must reach a terminal persisted outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_in_tree_caller_prefers_push_delivery_when_available() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+
+        // The turn path, compaction, and the invariant selector all resolve the same push route, so a
+        // push-capable provider is never served by a fixed-interval poll loop.
+        let turn_route = model_provider_push_route(&state, Some("bcode.fake-provider"))
+            .expect("turn path resolves the push route");
+        assert_eq!(turn_route.1, MODEL_PROVIDER_INTERFACE_ID_V3);
+
+        let runtime = InvariantSelectorRuntime {
+            plugins: state.plugins.clone(),
+            config: bcode_config::InvariantsConfig::default(),
+            model: InvariantSelectorModel {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: "fake-echo".to_owned(),
+                provider_context: bcode_model::ProviderRequestContext::default(),
+            },
+            guidance: Arc::new(Mutex::new(BTreeMap::new())),
+            full_fallback: Arc::new(Mutex::new(BTreeSet::new())),
+            generations: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        assert!(
+            invariant_selector_provider_serves_push(&runtime, "bcode.fake-provider"),
+            "the invariant selector must stream when the provider serves push"
+        );
+
+        // Every in-tree provider plugin serves the push interface, so no shipped provider is served by
+        // the poll fallback. The fallback itself is retained for external providers.
+        for manifest in [
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+            include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
+            include_str!("../../../plugins/bedrock-provider-plugin/bcode-plugin.toml"),
+        ] {
+            let manifest: bcode_plugin::PluginManifest =
+                toml::from_str(manifest).expect("provider manifest should parse");
+            assert!(
+                manifest
+                    .services
+                    .iter()
+                    .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID_V3),
+                "in-tree provider {} must serve the push interface",
+                manifest.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_outcomes_are_identical_with_metrics_enabled_and_disabled() {
+        async fn run_turn_with_metrics(metrics: MetricsRegistry) -> (ModelTurnOutcome, usize) {
+            let sessions = SessionManager::default();
+            let session_id = sessions
+                .create_session(Some("metrics parity".to_owned()), test_working_directory())
+                .await
+                .expect("session")
+                .id;
+            let trigger = sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: "parity check".to_owned(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )
+                .await
+                .expect("trigger");
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.metrics = metrics;
+            state.session_model_selections.lock().await.insert(
+                session_id,
+                SessionModelSelection {
+                    provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                    model_id: Some("fake-echo".to_owned()),
+                    ..SessionModelSelection::default()
+                },
+            );
+
+            let completion = run_test_model_turn(
+                &state,
+                session_id,
+                &trigger,
+                ClientRuntimeContext {
+                    selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                    selected_model_id: Some("fake-echo".to_owned()),
+                    ..ClientRuntimeContext::default()
+                },
+            )
+            .await;
+            let assistant_segments = state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("history")
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.kind,
+                        SessionEventKind::PositionedAssistantResponseSegment { text, .. }
+                            if text.contains("parity check")
+                    )
+                })
+                .count();
+            (completion.outcome, assistant_segments)
+        }
+
+        let enabled = Box::pin(run_turn_with_metrics(MetricsRegistry::in_memory())).await;
+        let disabled = Box::pin(run_turn_with_metrics(MetricsRegistry::disabled())).await;
+
+        assert_eq!(
+            enabled.0,
+            ModelTurnOutcome::Completed,
+            "metrics-enabled turn should complete"
+        );
+        assert_eq!(
+            enabled, disabled,
+            "enabling metrics must not change the turn outcome or persisted assistant output"
+        );
+    }
+
+    #[tokio::test]
+    async fn invariant_selector_streams_output_through_push_delivery() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let runtime = InvariantSelectorRuntime {
+            plugins: state.plugins.clone(),
+            config: bcode_config::InvariantsConfig::default(),
+            model: InvariantSelectorModel {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: "fake-echo".to_owned(),
+                provider_context: bcode_model::ProviderRequestContext::default(),
+            },
+            guidance: Arc::new(Mutex::new(BTreeMap::new())),
+            full_fallback: Arc::new(Mutex::new(BTreeSet::new())),
+            generations: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+
+        assert!(
+            invariant_selector_provider_serves_push(&runtime, "bcode.fake-provider"),
+            "fake provider serves the push interface, so the selector must stream"
+        );
+        assert!(
+            !invariant_selector_provider_serves_push(&runtime, "bcode.absent-provider"),
+            "an unknown provider must fall back to the selector's poll route"
+        );
+
+        let request = ModelTurnRequest {
+            session_id: SessionId::new(),
+            turn_id: "invariant-selector-test".to_owned(),
+            model_id: "fake-echo".to_owned(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: Some("select invariants".to_owned()),
+            messages: vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "pick relevant invariants".to_owned(),
+                }],
+            }],
+            tools: Vec::new(),
+            tool_call_policy: ToolCallRequestPolicy {
+                parallel: Some(false),
+                choice: ToolChoice::None,
+            },
+            tool_schema_mode: None,
+            parameters: ModelParameters::default(),
+            structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::from([(
+                "bcode_request_kind".to_owned(),
+                "invariant_selector".to_owned(),
+            )]),
+        };
+
+        let output =
+            collect_invariant_selector_output_streamed(&runtime, "bcode.fake-provider", &request)
+                .await
+                .expect("streamed selector run should succeed");
+
+        assert!(
+            output.contains("pick relevant invariants"),
+            "streamed selector must accumulate provider text: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_uses_push_delivery_when_the_provider_serves_it() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+
+        let route = model_provider_push_route(&state, Some("bcode.fake-provider"))
+            .expect("fake provider serves the push interface");
+
+        assert_eq!(
+            route.1, MODEL_PROVIDER_INTERFACE_ID_V3,
+            "compaction resolves the same push route as the turn path, so it streams too"
+        );
+        assert!(
+            model_provider_push_route(&state, Some("bcode.absent-provider")).is_none(),
+            "compaction must fall back to the poll contract for non-push providers"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_capable_provider_negotiates_the_streaming_interface() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+
+        let route = model_provider_push_route(&state, Some("bcode.fake-provider"))
+            .expect("fake provider declares the push interface");
+
+        assert_eq!(route.0, "bcode.fake-provider");
+        assert_eq!(route.1, MODEL_PROVIDER_INTERFACE_ID_V3);
+    }
+
+    #[tokio::test]
+    async fn provider_without_push_interface_falls_back_to_poll_delivery() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+
+        assert!(
+            model_provider_push_route(&state, Some("bcode.does-not-serve-push")).is_none(),
+            "an unknown provider must not resolve a push route"
+        );
+        assert_eq!(
+            model_provider_interface_for_plugin(&state, "bcode.fake-provider"),
+            Some(MODEL_PROVIDER_INTERFACE_ID_V2),
+            "request/response routing stays on the newest non-push interface"
         );
     }
 

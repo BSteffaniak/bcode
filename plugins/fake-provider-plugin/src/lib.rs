@@ -7,15 +7,15 @@
 use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
     ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
-    MODEL_PROVIDER_INTERFACE_ID, MODEL_PROVIDER_INTERFACE_ID_V2, MessageRole, ModelCapability,
-    ModelInfo, ModelList, ModelListRequest, ModelMessage, ModelTurnRequest, NativeWebSearchRequest,
-    NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
-    OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
-    OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
-    PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities, ProviderCapability,
-    ProviderContextFormat, ProviderError, ProviderErrorCategory, ProviderTurnEvent,
-    StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolChoice, ValidateConfigRequest,
-    ValidateConfigResponse,
+    MODEL_PROVIDER_INTERFACE_ID, MODEL_PROVIDER_INTERFACE_ID_V2, MODEL_PROVIDER_INTERFACE_ID_V3,
+    MessageRole, ModelCapability, ModelInfo, ModelList, ModelListRequest, ModelMessage,
+    ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse, NativeWebSearchResult,
+    OP_CANCEL_TURN, OP_CAPABILITIES, OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES,
+    OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_RUN_TURN,
+    OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderError,
+    ProviderErrorCategory, ProviderTurnEvent, RunTurnResponse, StartTurnResponse, StopReason,
+    TokenUsage, ToolCall, ToolChoice, ValidateConfigRequest, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::ProviderOutputPositionAllocator;
 use bcode_plugin_sdk::prelude::*;
@@ -241,7 +241,9 @@ impl FakeProviderPlugin {
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if !matches!(
             context.request.interface_id.as_str(),
-            MODEL_PROVIDER_INTERFACE_ID | MODEL_PROVIDER_INTERFACE_ID_V2
+            MODEL_PROVIDER_INTERFACE_ID
+                | MODEL_PROVIDER_INTERFACE_ID_V2
+                | MODEL_PROVIDER_INTERFACE_ID_V3
         ) {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -279,6 +281,7 @@ impl FakeProviderPlugin {
                 &context.request,
                 context.request.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2,
             ),
+            OP_RUN_TURN => self.run_turn(context),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
             OP_FINISH_TURN => self.finish_turn(&context.request),
@@ -482,6 +485,42 @@ impl FakeProviderPlugin {
             request_input_tokens,
         });
         json_response(&StartTurnResponse { provider_turn_id })
+    }
+
+    /// Serve one complete turn over a push event stream.
+    ///
+    /// Reuses the existing turn setup, then drains produced events to the host emitter until the
+    /// turn reaches a terminal event. Host cancellation is observed through `context.cancellation`,
+    /// and turn state is removed as this call unwinds, so no separate cancel or finish operation is
+    /// needed on the push path.
+    fn run_turn(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let start = self.start_turn(&context.request, true);
+        if start.error.is_some() {
+            return start;
+        }
+        let Ok(started) = serde_json::from_slice::<StartTurnResponse>(&start.payload) else {
+            return start;
+        };
+        let provider_turn_id = started.provider_turn_id;
+        let Some(turn) = self
+            .state
+            .lock()
+            .expect("fake provider state lock should not be poisoned")
+            .turns
+            .get(&provider_turn_id)
+            .cloned()
+        else {
+            return ServiceResponse::error("unknown_turn", "fake provider turn was not registered");
+        };
+
+        let outcome = stream_fake_turn_events(&turn, context);
+
+        if let Ok(mut state) = self.state.lock() {
+            state.turns.remove(&provider_turn_id);
+        }
+        turn.cancel();
+
+        outcome
     }
 
     fn poll_turn_events(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -2108,6 +2147,54 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
     match ServiceResponse::json(value) {
         Ok(response) => response,
         Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+    }
+}
+
+/// Poll interval used only to observe locally-buffered fake turn production.
+///
+/// This is provider-internal scheduling for the deterministic test provider, not host latency: the
+/// host receives each event as soon as this loop observes it.
+const FAKE_TURN_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Drain a fake turn's produced events to the host emitter until the turn terminates.
+///
+/// Returns the terminal `RunTurnResponse`. Cancellation is observed through the host-provided
+/// cancellation handle rather than a separate cancel operation.
+fn stream_fake_turn_events(turn: &FakeTurn, context: &NativeServiceContext) -> ServiceResponse {
+    loop {
+        if context.cancellation.is_cancelled() {
+            turn.cancel();
+            for event in turn.drain() {
+                emit_provider_turn_event(context, &event);
+            }
+            return json_response(&RunTurnResponse {
+                stop_reason: Some(StopReason::Cancelled),
+            });
+        }
+        let mut terminal = None;
+        for event in turn.drain() {
+            emit_provider_turn_event(context, &event);
+            match &event {
+                ProviderTurnEvent::TurnFinished { stop_reason } => terminal = Some(*stop_reason),
+                ProviderTurnEvent::Cancelled => terminal = Some(StopReason::Cancelled),
+                _ => {}
+            }
+        }
+        if let Some(stop_reason) = terminal {
+            return json_response(&RunTurnResponse {
+                stop_reason: Some(stop_reason),
+            });
+        }
+        let _cancelled = context
+            .cancellation
+            .wait_cancelled(FAKE_TURN_DRAIN_INTERVAL);
+    }
+}
+
+/// Emit one provider turn event as an incremental service event.
+fn emit_provider_turn_event(context: &NativeServiceContext, event: &ProviderTurnEvent) {
+    if let Ok(payload) = serde_json::to_vec(event) {
+        context.events.emit(&payload);
     }
 }
 

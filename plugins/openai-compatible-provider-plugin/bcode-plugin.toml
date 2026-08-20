@@ -3,6 +3,12 @@ name    = "Bcode OpenAI-Compatible Provider"
 version = "0.0.1"
 
 [[services]]
+description           = "Push-streamed OpenAI-compatible model provider turns"
+interface_id          = "bcode.model-provider/v3"
+invocation_operations = ["native_web_search", "run_turn"]
+name                  = "OpenAI-Compatible Model Provider v3"
+
+[[services]]
 description           = "OpenAI-compatible chat completions model provider"
 interface_id          = "bcode.model-provider/v2"
 invocation_operations = ["native_web_search"]

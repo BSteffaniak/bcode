@@ -1032,6 +1032,34 @@ pub async fn collect_compaction_summary_once(
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
+
+    // Prefer push delivery when the provider serves the streaming interface. Compaction keeps its own
+    // narrower progress rules and tool-call-is-error policy; only the transport changes.
+    if let Some((push_plugin_id, push_interface_id)) =
+        model_provider_push_route(state, selection.provider_plugin_id.as_deref())
+    {
+        let payload = serde_json::to_vec(&request)
+            .map_err(|error| CompactionError::Provider(error.to_string()))?;
+        return stream_compaction_summary(
+            state,
+            session_id,
+            &turn_id,
+            state
+                .plugins
+                .invoke_service_with_events(
+                    &push_plugin_id,
+                    push_interface_id,
+                    OP_RUN_TURN,
+                    payload,
+                )
+                .await
+                .map_err(|error| CompactionError::Provider(error.to_string()))?,
+            command_context,
+            cancel_state,
+        )
+        .await;
+    }
+
     let provider_turn_id = if let Some(context) = &mut command_context {
         match wait_for_finalizable_provider_call(
             state,
@@ -1235,6 +1263,122 @@ pub fn compaction_error_detail(error: CompactionError) -> String {
     match error {
         CompactionError::Provider(message) => message,
         error => error.to_string(),
+    }
+}
+
+/// Consume one push-streamed compaction turn.
+///
+/// Preserves compaction's own semantics: only text/reasoning deltas count as progress, a tool call is
+/// a hard error, and the no-progress timeout still comes from `StreamingConfig` — now measuring real
+/// provider silence rather than accumulated poll sleeps.
+async fn stream_compaction_summary(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    mut invocation: bcode_plugin::StreamingServiceInvocation,
+    mut command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+) -> Result<String, CompactionError> {
+    let mut summary = String::new();
+    let timeout = Duration::from_secs(state.model_streaming.no_progress_timeout_secs);
+    let mut last_progress_at = Instant::now();
+
+    loop {
+        if cancel_state.is_cancelled() {
+            invocation.cancel.cancel();
+            return Err(CompactionError::Cancelled);
+        }
+        let idle_for = last_progress_at.elapsed();
+        if idle_for > timeout {
+            invocation.cancel.cancel();
+            return Err(CompactionError::Provider(format!(
+                "model provider made no compaction progress for {} seconds before timeout",
+                timeout.as_secs()
+            )));
+        }
+        let next_deadline = timeout
+            .saturating_sub(idle_for)
+            .max(Duration::from_millis(1));
+
+        let event = if let Some(context) = command_context.as_deref_mut() {
+            tokio::select! {
+                biased;
+                () = cancel_state.cancelled() => {
+                    invocation.cancel.cancel();
+                    return Err(CompactionError::Cancelled);
+                }
+                cancel_command = context.cancel_commands.recv() => {
+                    if let Some(command) = cancel_command {
+                        process_cancel_turn_command(
+                            state,
+                            session_id,
+                            context.followup_commands,
+                            context.queued_followups,
+                            command,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                steering_command = context.steering_commands.recv() => {
+                    if let Some(command) = steering_command {
+                        process_steering_message_command(
+                            state,
+                            session_id,
+                            command.client_id,
+                            command.text,
+                            command.completion,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                event = invocation.next_event() => event,
+                () = tokio::time::sleep(next_deadline) => continue,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = cancel_state.cancelled() => {
+                    invocation.cancel.cancel();
+                    return Err(CompactionError::Cancelled);
+                }
+                event = invocation.next_event() => event,
+                () = tokio::time::sleep(next_deadline) => continue,
+            }
+        };
+
+        match event {
+            Ok(StreamingServiceInvocationEvent::Event(payload)) => {
+                let Ok(event) = serde_json::from_slice::<ProviderTurnEvent>(&payload) else {
+                    continue;
+                };
+                if compaction_event_is_progress(&event) {
+                    last_progress_at = Instant::now();
+                }
+                match handle_compaction_events(
+                    state,
+                    session_id,
+                    turn_id,
+                    &mut summary,
+                    vec![event],
+                )
+                .await
+                {
+                    CompactionPollStatus::Continue => {}
+                    CompactionPollStatus::Finished => return Ok(summary),
+                    CompactionPollStatus::Failed(error) => {
+                        invocation.cancel.cancel();
+                        return Err(CompactionError::Provider(error));
+                    }
+                }
+            }
+            Ok(StreamingServiceInvocationEvent::Response(response)) => {
+                response.map_err(|error| CompactionError::Provider(error.to_string()))?;
+                return Ok(summary);
+            }
+            Err(error) => return Err(CompactionError::Provider(error.to_string())),
+        }
     }
 }
 
