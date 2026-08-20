@@ -18,7 +18,9 @@ mod model_ignores;
 mod model_request_target;
 mod request_routing;
 mod runtime_work;
+mod runtime_work_operations;
 mod session_bulk_migration;
+mod session_operations;
 mod worktree_creation;
 
 use model_request_target::{ModelRequestTargetInput, resolve_model_request_target};
@@ -114,10 +116,9 @@ use bcode_skill::{
     resolve_skill_permission_policy, skill_source_roots_from_config,
 };
 use bcode_skill_models::{
-    SkillActivationMode, SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillList,
-    SkillModelRequest, SkillSource, SkillToolDecision, SkillToolDecisionEntry,
-    SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest,
-    SkillToolPolicyTarget,
+    SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillList, SkillModelRequest,
+    SkillSource, SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey,
+    SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest, SkillToolPolicyTarget,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL, PreparedToolInvocation,
@@ -6457,33 +6458,21 @@ async fn handle_create_session(
     name: Option<String>,
     working_directory: PathBuf,
 ) -> Result<(), ServerError> {
-    if !working_directory.is_absolute() {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "session_working_directory_must_be_absolute",
-                "session working directory must be absolute",
-            )),
-        )
-        .await;
-    }
-    let session = state
-        .sessions
-        .create_session(name, working_directory)
-        .await?;
-    state
-        .session_catalog
-        .upsert_native_session(session.clone())
-        .await;
-    if let Ok(mut events) = state
-        .sessions
-        .session_events_range(session.id, 0, 0, 1)
-        .await
-        && let Some(event) = events.pop()
-    {
-        publish_session_event(state, &event).await;
-    }
+    let session = match session_operations::create(state, name, working_directory).await {
+        Ok(session) => session,
+        Err(session_operations::CreateSessionError::WorkingDirectoryMustBeAbsolute) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_working_directory_must_be_absolute",
+                    "session working directory must be absolute",
+                )),
+            )
+            .await;
+        }
+        Err(session_operations::CreateSessionError::Session(error)) => return Err(error.into()),
+    };
     send_response(
         writer,
         request_id,
@@ -6890,6 +6879,7 @@ async fn handle_subscribe_catalog_updates(
     .await
 }
 
+#[cfg(test)]
 async fn validate_session_working_directory(
     working_directory: &std::path::Path,
 ) -> Result<PathBuf, (&'static str, String)> {
@@ -6924,56 +6914,8 @@ async fn handle_change_session_working_directory(
     session_id: SessionId,
     working_directory: PathBuf,
 ) -> Result<(), ServerError> {
-    if !working_directory.is_absolute() {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "session_working_directory_must_be_absolute",
-                "session working directory must be absolute",
-            )),
-        )
-        .await;
-    }
-    let working_directory = match validate_session_working_directory(&working_directory).await {
-        Ok(path) => path,
-        Err((code, message)) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(code, message)),
-            )
-            .await;
-        }
-    };
-    if state.session_has_active_turn(session_id).await {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "session_busy",
-                format!("session has an active model turn: {session_id}"),
-            )),
-        )
-        .await;
-    }
-    match state
-        .sessions
-        .change_session_working_directory(session_id, working_directory)
-        .await
-    {
-        Ok(event) => {
-            let changed = event.is_some();
-            if let Some(event) = event {
-                publish_session_event(state, &event).await;
-            }
-            let session = state.sessions.session_summary(session_id).await?;
-            if changed {
-                state
-                    .session_catalog
-                    .upsert_native_session(session.clone())
-                    .await;
-            }
+    match session_operations::change_working_directory(state, session_id, working_directory).await {
+        Ok((session, changed)) => {
             send_response(
                 writer,
                 request_id,
@@ -6982,13 +6924,11 @@ async fn handle_change_session_working_directory(
             .await
         }
         Err(error) => {
+            let code = error.code();
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_cwd_change_failed",
-                    error.to_string(),
-                )),
+                Response::Err(ErrorResponse::new(code, error.to_string())),
             )
             .await
         }
@@ -8901,14 +8841,8 @@ async fn handle_rename_session(
     session_id: SessionId,
     name: Option<String>,
 ) -> Result<(), ServerError> {
-    match state.sessions.rename_session(session_id, name).await {
-        Ok(event) => {
-            publish_session_event(state, &event).await;
-            let session = state.sessions.session_summary(session_id).await?;
-            state
-                .session_catalog
-                .upsert_native_session(session.clone())
-                .await;
+    match session_operations::rename(state, session_id, name).await {
+        Ok(session) => {
             send_response(
                 writer,
                 request_id,
@@ -9541,45 +9475,8 @@ async fn handle_delete_session(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    if state.session_has_active_turn(session_id).await {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "session_busy",
-                format!("session has an active model turn: {session_id}"),
-            )),
-        )
-        .await;
-    }
-    match state.sessions.delete_session(session_id).await {
+    match session_operations::delete(state, session_id).await {
         Ok(session) => {
-            let generation = session_search::generation_fingerprint(&session);
-            session_search::remove_session_from_providers(state, session_id, Some(generation))
-                .await;
-            state
-                .session_model_selections
-                .lock()
-                .await
-                .remove(&session_id);
-            state
-                .session_agent_selections
-                .lock()
-                .await
-                .remove(&session_id);
-            state
-                .session_catalog
-                .remove_native_session(session_id)
-                .await;
-            if let Err(error) =
-                remove_session_artifact_dir(&default_session_artifact_dir(session_id))
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %error,
-                    "session deleted but its retained artifacts could not be removed"
-                );
-            }
             send_response(
                 writer,
                 request_id,
@@ -9587,7 +9484,18 @@ async fn handle_delete_session(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::DeleteSessionError::Busy(session_id)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_busy",
+                    format!("session has an active model turn: {session_id}"),
+                )),
+            )
+            .await
+        }
+        Err(session_operations::DeleteSessionError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -12917,57 +12825,8 @@ async fn handle_set_session_model(
     provider_plugin_id: Option<String>,
     model_id: String,
 ) -> Result<(), ServerError> {
-    if let Some(blocking_skill_id) = required_model_active_skill(state, session_id).await
-        && required_model_override_behavior(
-            &state.session_config(session_id).await.skills.model_policy,
-            &blocking_skill_id,
-        ) == bcode_config::SkillRequiredModelOverride::Deny
-    {
-        return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "skill_required_model_active",
-                    format!(
-                        "skill {blocking_skill_id} declares a required model; deactivate it before changing the session model"
-                    ),
-                )),
-            )
-            .await;
-    }
-    let provider = provider_plugin_id.unwrap_or_else(|| "<auto>".to_string());
-    match state
-        .sessions
-        .append_model_changed(
-            session_id,
-            provider.clone(),
-            model_id.clone(),
-            bcode_session_models::ModelSelectionSource::UserExplicit,
-        )
-        .await
-    {
-        Ok(event) => {
-            let selection = SessionModelSelection {
-                provider_plugin_id: provider_to_selection(&provider),
-                requested_model_id: None,
-                model_id: model_to_selection(&model_id),
-                thinking_level: None,
-                reasoning_effort: state.selected_reasoning.effort.clone(),
-                reasoning_summary: state.selected_reasoning.summary.clone(),
-                reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-                provider_context: state.selected_provider_context.clone(),
-            };
-            state
-                .session_model_selections
-                .lock()
-                .await
-                .insert(session_id, selection);
-            state
-                .session_model_selection_origins
-                .lock()
-                .await
-                .insert(session_id, SessionModelSelectionOrigin::User);
-            publish_session_event(state, &event).await;
+    match session_operations::set_model(state, session_id, provider_plugin_id, model_id).await {
+        Ok(()) => {
             send_response(
                 writer,
                 request_id,
@@ -12975,7 +12834,20 @@ async fn handle_set_session_model(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::SetModelError::SkillRequiredModelActive(skill_id)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "skill_required_model_active",
+                    format!(
+                        "skill {skill_id} declares a required model; deactivate it before changing the session model"
+                    ),
+                )),
+            )
+            .await
+        }
+        Err(session_operations::SetModelError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -13044,11 +12916,8 @@ async fn handle_set_session_reasoning(
     effort: Option<String>,
     summary: Option<String>,
 ) -> Result<(), ServerError> {
-    match set_session_reasoning_if_changed(state, session_id, effort, summary).await {
-        Ok(event) => {
-            if let Some(event) = event {
-                publish_session_event(state, &event).await;
-            }
+    match session_operations::set_reasoning(state, session_id, effort, summary).await {
+        Ok(_) => {
             send_response(
                 writer,
                 request_id,
@@ -13431,57 +13300,51 @@ async fn handle_activate_skill(
     session_id: SessionId,
     skill_id: SkillId,
 ) -> Result<(), ServerError> {
-    let Some(registry) = state.session_skills(session_id).await else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse {
-                code: "skills_disabled".to_string(),
-                message: "skills are disabled".to_string(),
-            }),
-        )
-        .await;
-    };
-    let Some(summary) = registry.summary(&skill_id).cloned() else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse {
-                code: "unknown_skill".to_string(),
-                message: format!("unknown skill: {skill_id}"),
-            }),
-        )
-        .await;
-    };
-    if let Err(error) = apply_skill_model_policy(state, session_id, &skill_id).await {
-        return send_response(writer, request_id, Response::Err(error)).await;
+    match session_operations::activate_skill(state, session_id, skill_id).await {
+        Ok(()) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionAgentSet),
+            )
+            .await
+        }
+        Err(session_operations::ActivateSkillError::Disabled) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("skills_disabled", "skills are disabled")),
+            )
+            .await
+        }
+        Err(session_operations::ActivateSkillError::Unknown(skill_id)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "unknown_skill",
+                    format!("unknown skill: {skill_id}"),
+                )),
+            )
+            .await
+        }
+        Err(session_operations::ActivateSkillError::ModelPolicy { code, message }) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(code, message)),
+            )
+            .await
+        }
+        Err(session_operations::ActivateSkillError::Session(error)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await
+        }
     }
-    state
-        .active_skills
-        .lock()
-        .await
-        .entry(session_id)
-        .or_default()
-        .insert(skill_id.clone());
-    let event = state
-        .sessions
-        .append_event(
-            session_id,
-            SessionEventKind::SkillActivated {
-                skill_id,
-                source: Some(summary.source),
-                mode: SkillActivationMode::Explicit,
-                activated_at_ms: current_time_ms(),
-            },
-        )
-        .await?;
-    publish_session_event(state, &event).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionAgentSet),
-    )
-    .await
 }
 
 async fn is_skill_active(state: &ServerState, session_id: SessionId, skill_id: &SkillId) -> bool {
@@ -13874,21 +13737,7 @@ async fn handle_deactivate_skill(
     session_id: SessionId,
     skill_id: SkillId,
 ) -> Result<(), ServerError> {
-    if let Some(skills) = state.active_skills.lock().await.get_mut(&session_id) {
-        skills.remove(&skill_id);
-    }
-    restore_skill_model_override(state, session_id, &skill_id).await?;
-    let event = state
-        .sessions
-        .append_event(
-            session_id,
-            SessionEventKind::SkillDeactivated {
-                skill_id,
-                deactivated_at_ms: current_time_ms(),
-            },
-        )
-        .await?;
-    publish_session_event(state, &event).await;
+    session_operations::deactivate_skill(state, session_id, skill_id).await?;
     send_response(
         writer,
         request_id,
@@ -14004,7 +13853,7 @@ async fn handle_active_skills(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let skills = active_skill_contexts(state, session_id).await;
+    let skills = session_operations::active_skills(state, session_id).await;
     send_response(
         writer,
         request_id,
@@ -14042,28 +13891,8 @@ async fn handle_set_session_agent(
     session_id: SessionId,
     agent_id: String,
 ) -> Result<(), ServerError> {
-    let Some(resolved_agent_id) = resolve_agent_id(state, &agent_id).await else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "unknown_agent",
-                format!("unknown prompt profile: {agent_id}"),
-            )),
-        )
-        .await;
-    };
-    match state
-        .sessions
-        .set_current_agent(session_id, resolved_agent_id.clone())
-        .await
-    {
+    match session_operations::set_agent(state, session_id, agent_id).await {
         Ok(()) => {
-            state
-                .session_agent_selections
-                .lock()
-                .await
-                .insert(session_id, resolved_agent_id);
             send_response(
                 writer,
                 request_id,
@@ -14071,7 +13900,18 @@ async fn handle_set_session_agent(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::SetAgentError::UnknownAgent(agent_id)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "unknown_agent",
+                    format!("unknown prompt profile: {agent_id}"),
+                )),
+            )
+            .await
+        }
+        Err(session_operations::SetAgentError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -18757,7 +18597,7 @@ async fn handle_cancel_runtime_work(
     work_id: WorkId,
 ) -> Result<(), ServerError> {
     let cancelled =
-        cancel_registered_runtime_work(state, session_id, work_id, Some(client_id)).await;
+        runtime_work_operations::cancel(state, session_id, work_id, Some(client_id)).await;
     send_response(
         writer,
         request_id,
@@ -18772,7 +18612,7 @@ async fn handle_list_runtime_work(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let work = state.runtime_work.active_for_session(session_id).await;
+    let work = runtime_work_operations::list(state, session_id).await;
     send_response(
         writer,
         request_id,
@@ -49746,6 +49586,176 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn session_operations_lifecycle_without_transport_writing() {
+        let state = test_server_state(SessionManager::default());
+        let working_directory = test_working_directory();
+        let session = session_operations::create(
+            &state,
+            Some("in-process".to_owned()),
+            working_directory.clone(),
+        )
+        .await
+        .expect("create session");
+        assert_eq!(session.name.as_deref(), Some("in-process"));
+        assert_eq!(session.working_directory, working_directory);
+        assert!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::SessionCreated { .. }))
+        );
+
+        let renamed =
+            session_operations::rename(&state, session.id, Some("renamed in process".to_owned()))
+                .await
+                .expect("rename session");
+        assert_eq!(renamed.name.as_deref(), Some("renamed in process"));
+        assert!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("renamed history")
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::SessionRenamed { .. }))
+        );
+
+        session_operations::set_model(
+            &state,
+            session.id,
+            Some("provider.test".to_owned()),
+            "model-test".to_owned(),
+        )
+        .await
+        .expect("set model");
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("model history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelChanged { provider, model, .. }
+                if provider == "provider.test" && model == "model-test"
+        )));
+
+        assert!(
+            session_operations::set_reasoning(
+                &state,
+                session.id,
+                Some("high".to_owned()),
+                Some("detailed".to_owned()),
+            )
+            .await
+            .expect("set reasoning")
+        );
+        assert!(
+            !session_operations::set_reasoning(
+                &state,
+                session.id,
+                Some("high".to_owned()),
+                Some("detailed".to_owned()),
+            )
+            .await
+            .expect("unchanged reasoning")
+        );
+
+        assert!(matches!(
+            session_operations::set_agent(
+                &state,
+                session.id,
+                "definitely-missing-agent".to_owned(),
+            )
+            .await,
+            Err(session_operations::SetAgentError::UnknownAgent(agent_id))
+                if agent_id == "definitely-missing-agent"
+        ));
+
+        let inactive_skill = bcode_skill_models::SkillId::new("not-active");
+        assert!(
+            session_operations::active_skills(&state, session.id)
+                .await
+                .is_empty()
+        );
+        assert!(matches!(
+            session_operations::activate_skill(&state, session.id, inactive_skill.clone()).await,
+            Err(session_operations::ActivateSkillError::Disabled
+                | session_operations::ActivateSkillError::Unknown(_))
+        ));
+        session_operations::deactivate_skill(&state, session.id, inactive_skill.clone())
+            .await
+            .expect("deactivate skill");
+        assert!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("skill history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::SkillDeactivated { skill_id, .. }
+                        if skill_id == &inactive_skill
+                ))
+        );
+
+        let changed_directory = tempfile::tempdir().expect("changed working directory");
+        let changed_directory_path = changed_directory
+            .path()
+            .canonicalize()
+            .expect("canonical changed directory");
+        let (changed, did_change) = session_operations::change_working_directory(
+            &state,
+            session.id,
+            changed_directory_path.clone(),
+        )
+        .await
+        .expect("change working directory");
+        assert!(did_change);
+        assert_eq!(changed.working_directory, changed_directory_path);
+
+        let deleted = session_operations::delete(&state, session.id)
+            .await
+            .expect("delete session");
+        assert_eq!(deleted.id, session.id);
+        assert!(state.sessions.session_summary(session.id).await.is_err());
+
+        assert!(matches!(
+            session_operations::create(&state, None, PathBuf::from("relative")).await,
+            Err(session_operations::CreateSessionError::WorkingDirectoryMustBeAbsolute)
+        ));
+    }
+
+    #[tokio::test]
+    async fn interaction_operations_list_and_resolve_permissions_without_transport_writing() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        let mut pending = pending_permission_for_batch("permission-1", session_id, 0, "batch-1");
+        pending.summary.batch = None;
+        let decision = Arc::clone(&pending.decision);
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("permission-1".to_owned(), pending);
+
+        let listed = interaction_operations::list_permissions(&state).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].permission_id, "permission-1");
+        assert!(
+            interaction_operations::resolve_permission(&state, "permission-1", true, false,).await
+        );
+        assert_eq!(*decision.lock().await, Some(true));
+        assert!(
+            !interaction_operations::resolve_permission(&state, "permission-1", true, false,).await
+        );
+    }
+
+    #[tokio::test]
     async fn interaction_operations_list_and_resolve_without_transport_writing() {
         let state = test_server_state(SessionManager::default());
         let client_id = ClientId::new();
@@ -51051,7 +51061,7 @@ library = "test"
     }
 
     #[tokio::test]
-    async fn batch_permission_resolution_is_latched_and_batch_scoped() {
+    async fn interaction_operations_batch_permission_resolution_is_latched_and_batch_scoped() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
         let first_batch = Arc::new(PendingPermissionBatch::new(session_id));
@@ -51073,12 +51083,12 @@ library = "test"
             ("perm-3".to_string(), unrelated.clone()),
         ]);
 
-        let individual = take_pending_permission_for_individual(&state, "perm-1")
-            .await
-            .expect("per-call decision should win before batch latch");
-        resolve_pending_permission(&state, individual, false, false).await;
+        assert!(
+            interaction_operations::resolve_permission(&state, "perm-1", false, false).await,
+            "per-call decision should win before batch latch"
+        );
         assert_eq!(
-            resolve_permission_batch_operation(&state, "batch-1", true).await,
+            interaction_operations::resolve_permission_batch(&state, "batch-1", true).await,
             1
         );
         assert_eq!(*first.decision.lock().await, Some(false));
@@ -51090,7 +51100,7 @@ library = "test"
         );
         assert_eq!(permission_batch_decision(&state, "batch-2").await, None);
         assert_eq!(
-            resolve_permission_batch_operation(&state, "batch-1", false).await,
+            interaction_operations::resolve_permission_batch(&state, "batch-1", false).await,
             0
         );
         assert_eq!(
@@ -61767,7 +61777,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn workflow_runtime_work_registers_parent_and_node_relationships() {
+    async fn runtime_work_operations_cancel_parent_and_node_without_transport_writing() {
         let sessions = SessionManager::default();
         let session = sessions
             .create_session(Some("workflow".to_string()), PathBuf::from("."))
@@ -61828,6 +61838,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
 
+        let active = runtime_work_operations::list(&state, session.id).await;
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|work| work.work_id == run_work_id));
+        assert!(active.iter().any(|work| work.work_id == node_work_id));
+
         let history = state
             .sessions
             .session_history(session.id)
@@ -61852,7 +61867,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             } if work_id == &node_work_id && parent == &run_work_id
         )));
         assert!(
-            cancel_registered_runtime_work(&state, session.id, run_work_id, None).await,
+            runtime_work_operations::cancel(&state, session.id, run_work_id, None).await,
             "parent workflow cancellation should recursively signal its node"
         );
         tokio::time::timeout(Duration::from_secs(1), async {

@@ -1968,29 +1968,42 @@ async fn read_workflow_authoring_document(
         .map(|loaded| loaded.lowering.document)
 }
 
+const MAX_CLI_INTERACTION_JSON_BYTES: usize = 256 * 1024;
+
 fn read_bounded_json(path: &Path) -> Result<serde_json::Value, CliError> {
+    read_json_with_limit(
+        path,
+        bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES,
+        "workflow JSON",
+    )
+}
+
+fn read_bounded_interaction_json(path: &Path) -> Result<serde_json::Value, CliError> {
+    read_json_with_limit(path, MAX_CLI_INTERACTION_JSON_BYTES, "interaction JSON")
+}
+
+fn read_json_with_limit(
+    path: &Path,
+    max_bytes: usize,
+    description: &str,
+) -> Result<serde_json::Value, CliError> {
     let mut bytes = Vec::new();
     if path == Path::new("-") {
         std::io::stdin()
-            .take((bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1) as u64)
+            .take((max_bytes + 1) as u64)
             .read_to_end(&mut bytes)?;
     } else {
         let metadata = fs::metadata(path)?;
-        if metadata.len()
-            > u64::try_from(bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES)
-                .unwrap_or(u64::MAX)
-        {
+        if metadata.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
             return Err(CliError::InvalidArguments(format!(
-                "workflow JSON exceeds {} bytes",
-                bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES
+                "{description} exceeds {max_bytes} bytes"
             )));
         }
         bytes = fs::read(path)?;
     }
-    if bytes.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
+    if bytes.len() > max_bytes {
         return Err(CliError::InvalidArguments(format!(
-            "workflow JSON exceeds {} bytes",
-            bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES
+            "{description} exceeds {max_bytes} bytes"
         )));
     }
     serde_json::from_slice(&bytes).map_err(CliError::Json)
@@ -2007,10 +2020,10 @@ fn print_json_line<T: Serialize>(value: &T) -> Result<(), CliError> {
 }
 
 async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliError> {
-    ensure_server_running().await?;
-    let client = BcodeClient::default_endpoint();
     match command {
         WorktreeCommand::List { cwd, json } => {
+            ensure_server_running().await?;
+            let client = BcodeClient::default_endpoint();
             let response = client
                 .list_worktrees(bcode_worktree_models::WorktreeListRequest { cwd })
                 .await?;
@@ -2041,6 +2054,8 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
             no_setup,
             json,
         } => {
+            ensure_server_running().await?;
+            let client = BcodeClient::default_endpoint();
             let response = client
                 .create_worktree(bcode_worktree_models::WorktreeCreateRequest {
                     name,
@@ -2074,6 +2089,8 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
                     "worktree removal requires --yes".to_owned(),
                 ));
             }
+            ensure_server_running().await?;
+            let client = BcodeClient::default_endpoint();
             let response = client
                 .remove_worktree(bcode_worktree_models::WorktreeRemoveRequest { cwd, path, force })
                 .await?;
@@ -2088,10 +2105,10 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
 }
 
 async fn handle_interaction_command(command: InteractionCommand) -> Result<(), CliError> {
-    ensure_server_running().await?;
-    let client = BcodeClient::default_endpoint();
     match command {
         InteractionCommand::List { json } => {
+            ensure_server_running().await?;
+            let client = BcodeClient::default_endpoint();
             let exchanges = client.list_pending_tool_exchanges().await?;
             if json {
                 print_json(&exchanges)?;
@@ -2116,7 +2133,9 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
             payload,
             json,
         } => {
-            let payload = read_bounded_json(&payload)?;
+            let payload = read_bounded_interaction_json(&payload)?;
+            ensure_server_running().await?;
+            let client = BcodeClient::default_endpoint();
             let client = compatible_interaction_client(&client, &exchange_id).await?;
             let resolved = client
                 .resolve_tool_exchange(
@@ -2127,6 +2146,8 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
             print_interaction_resolution(resolved, json)?;
         }
         InteractionCommand::Cancel { exchange_id, json } => {
+            ensure_server_running().await?;
+            let client = BcodeClient::default_endpoint();
             let client = compatible_interaction_client(&client, &exchange_id).await?;
             let resolved = client
                 .resolve_tool_exchange(
@@ -3537,6 +3558,9 @@ enum ServerCommand {
 enum SessionCommand {
     Create {
         name: Option<String>,
+        /// Print the created session summary as JSON.
+        #[arg(long)]
+        json: bool,
     },
     List {
         /// Print the session summaries as JSON.
@@ -3546,9 +3570,18 @@ enum SessionCommand {
     Rename {
         session_id: SessionId,
         name: String,
+        /// Print the renamed session summary as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Delete {
         session_id: SessionId,
+        /// Confirm permanent session deletion.
+        #[arg(long)]
+        yes: bool,
+        /// Print the deleted session summary as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Change the canonical working directory for one session.
     SetWorkingDirectory {
@@ -3596,6 +3629,16 @@ enum SessionCommand {
     /// Return active skill contexts for one session.
     ActiveSkills {
         session_id: SessionId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Invoke one skill for a model turn.
+    InvokeSkill {
+        session_id: SessionId,
+        skill_id: String,
+        /// Optional skill arguments passed verbatim to the skill runtime.
+        #[arg(default_value = "")]
+        arguments: String,
         #[arg(long)]
         json: bool,
     },
@@ -4685,10 +4728,18 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
 #[allow(clippy::too_many_lines)]
 async fn handle_session_command(command: SessionCommand) -> Result<(), CliError> {
     match command {
-        SessionCommand::Create { name } => create_session(name).await?,
+        SessionCommand::Create { name, json } => create_session(name, json).await?,
         SessionCommand::List { json } => list_sessions(json).await?,
-        SessionCommand::Rename { session_id, name } => rename_session(session_id, name).await?,
-        SessionCommand::Delete { session_id } => delete_session(session_id).await?,
+        SessionCommand::Rename {
+            session_id,
+            name,
+            json,
+        } => rename_session(session_id, name, json).await?,
+        SessionCommand::Delete {
+            session_id,
+            yes,
+            json,
+        } => delete_session(session_id, yes, json).await?,
         SessionCommand::SetWorkingDirectory {
             session_id,
             path,
@@ -4725,6 +4776,12 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         SessionCommand::ActiveSkills { session_id, json } => {
             Box::pin(list_active_skills(session_id, json)).await?;
         }
+        SessionCommand::InvokeSkill {
+            session_id,
+            skill_id,
+            arguments,
+            json,
+        } => Box::pin(invoke_session_skill(session_id, skill_id, arguments, json)).await?,
         SessionCommand::ActivateSkill {
             session_id,
             skill_id,
@@ -10355,10 +10412,14 @@ async fn session_read_client(session_id: SessionId) -> Result<BcodeClient, CliEr
     }
 }
 
-async fn create_session(name: Option<String>) -> Result<(), CliError> {
+async fn create_session(name: Option<String>, json: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let session = client.create_session(name).await?;
-    println!("{}", session.id);
+    if json {
+        println!("{}", serde_json::to_string(&session)?);
+    } else {
+        println!("{}", session.id);
+    }
     Ok(())
 }
 
@@ -10384,17 +10445,30 @@ async fn list_sessions(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn rename_session(session_id: SessionId, name: String) -> Result<(), CliError> {
+async fn rename_session(session_id: SessionId, name: String, json: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let session = client.rename_session(session_id, Some(name)).await?;
-    println!("renamed {} to {}", session.id, session.display_title());
+    if json {
+        println!("{}", serde_json::to_string(&session)?);
+    } else {
+        println!("renamed {} to {}", session.id, session.display_title());
+    }
     Ok(())
 }
 
-async fn delete_session(session_id: SessionId) -> Result<(), CliError> {
+async fn delete_session(session_id: SessionId, yes: bool, json: bool) -> Result<(), CliError> {
+    if !yes {
+        return Err(CliError::InvalidArguments(
+            "session deletion requires --yes".to_owned(),
+        ));
+    }
     let client = BcodeClient::default_endpoint();
     let session = client.delete_session(session_id).await?;
-    println!("deleted {} ({})", session.display_title(), session.id);
+    if json {
+        println!("{}", serde_json::to_string(&session)?);
+    } else {
+        println!("deleted {} ({})", session.display_title(), session.id);
+    }
     Ok(())
 }
 
@@ -10480,6 +10554,38 @@ async fn list_active_skills(session_id: SessionId, json: bool) -> Result<(), Cli
         for skill in skills {
             println!("{}", skill.skill_id);
         }
+        Ok(())
+    }
+}
+
+async fn invoke_session_skill(
+    session_id: SessionId,
+    skill_id: String,
+    arguments: String,
+    json: bool,
+) -> Result<(), CliError> {
+    let display_text = if arguments.trim().is_empty() {
+        format!("/{skill_id}")
+    } else {
+        format!("/{skill_id} {arguments}")
+    };
+    let acceptance = BcodeClient::default_endpoint()
+        .invoke_skill(
+            session_id,
+            bcode_skill_models::SkillId::new(skill_id),
+            arguments,
+            display_text,
+        )
+        .await?;
+    if json {
+        print_json(&serde_json::json!({
+            "session_id": session_id,
+            "queued": acceptance.queued,
+            "queue_position": acceptance.queue_position,
+            "disposition": acceptance.disposition,
+        }))
+    } else {
+        println!("{:?}", acceptance.disposition);
         Ok(())
     }
 }
@@ -18153,8 +18259,25 @@ mod watch_cli_tests {
 
 #[cfg(test)]
 mod worktree_cli_tests {
-    use super::{Cli, Commands, WorktreeCommand};
+    use super::{Cli, CliError, Commands, WorktreeCommand, handle_worktree_command};
     use clap::Parser as _;
+
+    #[tokio::test]
+    async fn worktree_remove_requires_confirmation_before_daemon_work() {
+        let error = handle_worktree_command(WorktreeCommand::Remove {
+            path: "../task".into(),
+            cwd: None,
+            force: false,
+            yes: false,
+            json: true,
+        })
+        .await
+        .expect_err("unconfirmed removal must fail");
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments(message) if message == "worktree removal requires --yes"
+        ));
+    }
 
     #[test]
     fn worktree_commands_parse_bounded_daemon_operations() {
@@ -18216,14 +18339,54 @@ mod worktree_cli_tests {
 
 #[cfg(test)]
 mod session_configuration_cli_tests {
-    use super::{Cli, Commands, SessionCommand};
+    use super::{Cli, CliError, Commands, SessionCommand, delete_session};
     use clap::Parser as _;
+
+    #[tokio::test]
+    async fn session_delete_requires_confirmation_before_connecting() {
+        let error = delete_session(bcode_session_models::SessionId::new(), false, true)
+            .await
+            .expect_err("unconfirmed deletion must fail");
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments(message) if message == "session deletion requires --yes"
+        ));
+    }
+
+    #[test]
+    fn session_invoke_skill_parses_machine_output() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "invoke-skill",
+            &session,
+            "skill-1",
+            "argument text",
+            "--json",
+        ])
+        .expect("skill invocation parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::InvokeSkill {
+                    skill_id,
+                    arguments,
+                    json: true,
+                    ..
+                }
+            }) if skill_id == "skill-1" && arguments == "argument text"
+        ));
+    }
 
     #[test]
     fn session_configuration_commands_parse_machine_paths() {
         let session_id = bcode_session_models::SessionId::new();
         let session = session_id.to_string();
         let cases = [
+            vec!["bcode", "session", "create", "named", "--json"],
+            vec!["bcode", "session", "rename", &session, "renamed", "--json"],
+            vec!["bcode", "session", "delete", &session, "--yes", "--json"],
             vec![
                 "bcode",
                 "session",
@@ -18277,6 +18440,20 @@ mod session_configuration_cli_tests {
             let parsed = Cli::try_parse_from(arguments).expect("session configuration parses");
             assert!(matches!(parsed.command, Some(Commands::Session { .. })));
         }
+
+        let delete_without_confirmation =
+            Cli::try_parse_from(["bcode", "session", "delete", &session, "--json"])
+                .expect("delete confirmation is validated before side effects");
+        assert!(matches!(
+            delete_without_confirmation.command,
+            Some(Commands::Session {
+                command: SessionCommand::Delete {
+                    yes: false,
+                    json: true,
+                    ..
+                }
+            })
+        ));
 
         let pool = Cli::try_parse_from([
             "bcode",
@@ -18397,8 +18574,35 @@ mod permission_cli_tests {
 
 #[cfg(test)]
 mod interaction_cli_tests {
-    use super::{Cli, Commands, InteractionCommand};
+    use super::{
+        Cli, CliError, Commands, InteractionCommand, MAX_CLI_INTERACTION_JSON_BYTES,
+        read_bounded_interaction_json,
+    };
     use clap::Parser as _;
+
+    #[test]
+    fn interaction_json_is_validated_before_daemon_work() {
+        let temp = tempfile::NamedTempFile::new().expect("temporary payload");
+        std::fs::write(temp.path(), b"not-json").expect("write malformed payload");
+        let error = read_bounded_interaction_json(temp.path()).expect_err("JSON must be valid");
+        assert!(matches!(error, CliError::Json(_)));
+    }
+
+    #[test]
+    fn interaction_json_has_a_domain_specific_bound() {
+        let temp = tempfile::NamedTempFile::new().expect("temporary payload");
+        std::fs::write(temp.path(), vec![b' '; MAX_CLI_INTERACTION_JSON_BYTES + 1])
+            .expect("write oversized payload");
+        let error =
+            read_bounded_interaction_json(temp.path()).expect_err("payload must be bounded");
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments(message)
+                if message == format!(
+                    "interaction JSON exceeds {MAX_CLI_INTERACTION_JSON_BYTES} bytes"
+                )
+        ));
+    }
 
     #[test]
     fn interaction_commands_parse_structured_list_respond_and_cancel_paths() {
