@@ -18628,16 +18628,7 @@ async fn handle_runtime_work_history(
     session_id: SessionId,
     limit: usize,
 ) -> Result<(), ServerError> {
-    let mut events = state
-        .sessions
-        .runtime_work_history(session_id, limit)
-        .await?
-        .into_iter()
-        .flat_map(|work| runtime_work_projection_to_events(session_id, work))
-        .collect::<Vec<_>>();
-    if limit > 0 && events.len() > limit {
-        events.drain(0..events.len() - limit);
-    }
+    let events = runtime_work_operations::history(state, session_id, limit).await?;
     send_response(
         writer,
         request_id,
@@ -61778,7 +61769,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn runtime_work_operations_cancel_parent_and_node_without_transport_writing() {
-        let sessions = SessionManager::default();
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions =
+            SessionManager::persistent(session_root.path()).expect("persistent sessions");
         let session = sessions
             .create_session(Some("workflow".to_string()), PathBuf::from("."))
             .await
@@ -61842,6 +61835,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(active.len(), 2);
         assert!(active.iter().any(|work| work.work_id == run_work_id));
         assert!(active.iter().any(|work| work.work_id == node_work_id));
+        let bounded_history = runtime_work_operations::history(&state, session.id, 2)
+            .await
+            .expect("runtime work history");
+        assert!(!bounded_history.is_empty());
+        assert!(bounded_history.len() <= 2);
 
         let history = state
             .sessions
