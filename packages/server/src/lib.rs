@@ -9,13 +9,15 @@
 //! Every provider usage or managed-compaction event must be applied to the exact request boundary
 //! captured before that request was sent rather than inferred from later session history.
 
-pub(crate) mod context_accounting;
+pub(crate) mod artifact_operations;
+mod context_accounting;
 pub(crate) mod context_compaction;
 mod image_input;
 mod interaction_operations;
 mod invariant_guidance;
 mod model_ignores;
 mod model_request_target;
+mod plugin_operations;
 mod request_routing;
 mod runtime_work;
 mod runtime_work_operations;
@@ -9134,19 +9136,7 @@ async fn handle_invocation_input(
     session_id: SessionId,
     input: ToolInvocationInput,
 ) -> Result<(), ServerError> {
-    let result = state
-        .active_plugin_invocations
-        .lock()
-        .map_err(|_| "active plugin invocation registry poisoned".to_owned())
-        .and_then(|invocations| {
-            let active = invocations
-                .get(&(session_id, input.invocation_id.clone()))
-                .ok_or_else(|| "plugin invocation is not active".to_owned())?;
-            if active.producer_plugin_id != input.producer_id {
-                return Err("invocation input producer does not own the invocation".to_owned());
-            }
-            enqueue_invocation_input(active, input)
-        });
+    let result = plugin_operations::route_invocation_input(state, session_id, input);
     match result {
         Ok(()) => {
             send_response(
@@ -9180,7 +9170,7 @@ async fn handle_read_session_artifact(
     offset: u64,
     length: u32,
 ) -> Result<(), ServerError> {
-    let result = read_session_artifact_range(
+    let result = artifact_operations::read_range(
         state,
         session_id,
         &artifact_id,
@@ -9192,7 +9182,7 @@ async fn handle_read_session_artifact(
     match result {
         Ok(payload) => send_response(writer, request_id, Response::Ok(payload)).await,
         Err(error) => {
-            let code = artifact_read_error_code(&error);
+            let code = artifact_operations::error_code(&error);
             send_response(
                 writer,
                 request_id,
@@ -9200,21 +9190,6 @@ async fn handle_read_session_artifact(
             )
             .await
         }
-    }
-}
-
-fn artifact_read_error_code(error: &str) -> &'static str {
-    if error.contains("was not found in the finalized projection") {
-        "artifact_not_found"
-    } else if error.contains("artifact reference has no storage URI")
-        || error.contains("artifact reference is unavailable")
-        || error.contains("artifact reference is incomplete")
-        || error.contains("artifact file is unavailable")
-        || error.contains("No such file or directory")
-    {
-        "artifact_unavailable"
-    } else {
-        "artifact_read_failed"
     }
 }
 
@@ -34951,18 +34926,7 @@ async fn handle_call_plugin_service(
     operation: String,
     payload: Vec<u8>,
 ) -> Result<(), ServerError> {
-    let interface_id = interface_id.to_string();
-    let labels = plugin_service_metric_labels(None, &interface_id, &operation);
-    let response = state
-        .metrics
-        .time_result_async(
-            "plugin.service",
-            labels,
-            state
-                .plugins
-                .invoke_service_by_interface(&interface_id, operation, payload),
-        )
-        .await;
+    let response = plugin_operations::call_service(state, interface_id, operation, payload).await;
     send_plugin_service_response(writer, request_id, response).await
 }
 
@@ -34973,16 +34937,7 @@ async fn handle_publish_plugin_event(
     topic: &str,
     payload: &[u8],
 ) -> Result<(), ServerError> {
-    let topic = topic.to_string();
-    let payload = payload.to_vec();
-    let response = state
-        .metrics
-        .time_result_async(
-            "plugin.event_delivery",
-            plugin_event_metric_labels(&topic),
-            state.plugins.publish_event(&topic, &payload),
-        )
-        .await;
+    let response = plugin_operations::publish_event(state, topic, payload).await;
     match response {
         Ok(delivered) => {
             send_response(
@@ -49449,25 +49404,25 @@ library = "test"
     #[test]
     fn artifact_read_errors_distinguish_terminal_unavailability() {
         assert_eq!(
-            artifact_read_error_code(
+            artifact_operations::error_code(
                 "artifact reference was not found in the finalized projection"
             ),
             "artifact_not_found"
         );
         assert_eq!(
-            artifact_read_error_code("artifact reference has no storage URI"),
+            artifact_operations::error_code("artifact reference has no storage URI"),
             "artifact_unavailable"
         );
         assert_eq!(
-            artifact_read_error_code("artifact reference is unavailable: missing"),
+            artifact_operations::error_code("artifact reference is unavailable: missing"),
             "artifact_unavailable"
         );
         assert_eq!(
-            artifact_read_error_code("artifact reference is incomplete"),
+            artifact_operations::error_code("artifact reference is incomplete"),
             "artifact_unavailable"
         );
         assert_eq!(
-            artifact_read_error_code("artifact references projection is stale"),
+            artifact_operations::error_code("artifact references projection is stale"),
             "artifact_read_failed"
         );
     }
@@ -50209,6 +50164,50 @@ library = "test"
             Err(worktree_operations::RemoveError::SessionInside { session_id, .. })
                 if session_id == session.id
         ));
+
+        assert!(matches!(
+            session_operations::append_presentation_note(
+                &state,
+                session.id,
+                String::new(),
+                "note".to_owned(),
+                "text".to_owned(),
+                bcode_command::CommandTextFormat::Markdown,
+            )
+            .await,
+            Err(session_operations::AppendPresentationNoteError::Invalid)
+        ));
+        session_operations::append_presentation_note(
+            &state,
+            session.id,
+            "example.plugin".to_owned(),
+            "note-1".to_owned(),
+            "presentation text".to_owned(),
+            bcode_command::CommandTextFormat::Markdown,
+        )
+        .await
+        .expect("append presentation note");
+        assert!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("presentation note history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::PluginStatusNote {
+                        plugin_id,
+                        note_id,
+                        text,
+                        metadata,
+                    } if plugin_id == "example.plugin"
+                        && note_id == "note-1"
+                        && text == "presentation text"
+                        && metadata.get("format") == Some(&serde_json::json!("markdown"))
+                        && metadata.get("presentation_only") == Some(&serde_json::json!(true))
+                ))
+        );
 
         let renamed =
             session_operations::rename(&state, session.id, Some("renamed in process".to_owned()))
