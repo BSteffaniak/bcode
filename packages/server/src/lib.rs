@@ -31218,6 +31218,16 @@ fn parse_image_tool_content_note(line: &str) -> Option<ImageRefContent> {
     })
 }
 
+const fn standard_trace_phase(phase: SessionTracePhase) -> bool {
+    !matches!(
+        phase,
+        SessionTracePhase::ModelProviderEvent
+            | SessionTracePhase::ToolPolicyEvaluated
+            | SessionTracePhase::ToolInvocationOutput
+            | SessionTracePhase::ContextCompactionDiagnostic
+    )
+}
+
 async fn append_trace_event(
     state: &ServerState,
     session_id: SessionId,
@@ -31225,7 +31235,9 @@ async fn append_trace_event(
     phase: SessionTracePhase,
     payload: SessionTracePayload,
 ) {
-    if !state.observability.enabled() {
+    if !state.observability.enabled()
+        || (!state.observability.debug_enabled() && !standard_trace_phase(phase))
+    {
         return;
     }
     let trace = SessionTraceEvent {
@@ -49512,6 +49524,32 @@ library = "test"
 
         assert!(!stable.contains("Repository invariants:"));
         assert!(!stable.contains("Shared rendering remains renderer-neutral"));
+    }
+
+    #[test]
+    fn standard_observability_excludes_diagnostic_trace_phases() {
+        for phase in [
+            SessionTracePhase::ModelProviderEvent,
+            SessionTracePhase::ToolPolicyEvaluated,
+            SessionTracePhase::ToolInvocationOutput,
+            SessionTracePhase::ContextCompactionDiagnostic,
+        ] {
+            assert!(!standard_trace_phase(phase));
+        }
+        for phase in [
+            SessionTracePhase::ModelRequestBuilt,
+            SessionTracePhase::ModelProviderRoundStarted,
+            SessionTracePhase::ModelProviderRoundFinished,
+            SessionTracePhase::ToolInvocationStarted,
+            SessionTracePhase::ToolPermissionWaitStarted,
+            SessionTracePhase::ToolPermissionWaitFinished,
+            SessionTracePhase::ToolInvocationFinished,
+            SessionTracePhase::ContextCompactionSkipped,
+            SessionTracePhase::ContextCompactionStarted,
+            SessionTracePhase::ContextCompactionFinished,
+        ] {
+            assert!(standard_trace_phase(phase));
+        }
     }
 
     #[test]
