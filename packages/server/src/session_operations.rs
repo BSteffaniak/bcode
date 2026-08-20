@@ -362,6 +362,76 @@ pub async fn history_around(
         .await?)
 }
 
+/// Request canonical turn cancellation through the queued command path.
+pub async fn cancel_turn(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    clear_queue: bool,
+    client_id: bcode_session_models::ClientId,
+) -> Result<bool, super::ServerError> {
+    super::enqueue_cancel_turn_command(state, session_id, clear_queue, Some(client_id)).await
+}
+
+/// Application failure while appending a bounded presentation-only note.
+#[derive(Debug, thiserror::Error)]
+pub enum AppendPresentationNoteError {
+    #[error("presentation note fields are empty or exceed their bounded limits")]
+    Invalid,
+    #[error(transparent)]
+    Session(#[from] bcode_session::SessionError),
+}
+
+/// Append one bounded plugin-owned presentation note to canonical history.
+pub async fn append_presentation_note(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    source_id: String,
+    note_id: String,
+    text: String,
+    format: bcode_command::CommandTextFormat,
+) -> Result<(), AppendPresentationNoteError> {
+    let invalid = source_id.trim().is_empty()
+        || source_id.len() > super::MAX_PRESENTATION_NOTE_SOURCE_ID_BYTES
+        || note_id.trim().is_empty()
+        || note_id.len() > super::MAX_PRESENTATION_NOTE_ID_BYTES
+        || text.trim().is_empty()
+        || text.len() > super::MAX_PRESENTATION_NOTE_TEXT_BYTES;
+    if invalid {
+        return Err(AppendPresentationNoteError::Invalid);
+    }
+    let metadata = std::collections::BTreeMap::from([
+        (
+            "format".to_owned(),
+            serde_json::Value::String(
+                match format {
+                    bcode_command::CommandTextFormat::PlainText => "plain_text",
+                    bcode_command::CommandTextFormat::Markdown => "markdown",
+                    bcode_command::CommandTextFormat::Json => "json",
+                }
+                .to_owned(),
+            ),
+        ),
+        (
+            "presentation_only".to_owned(),
+            serde_json::Value::Bool(true),
+        ),
+    ]);
+    let event = state
+        .sessions
+        .append_event(
+            session_id,
+            bcode_session_models::SessionEventKind::PluginStatusNote {
+                plugin_id: source_id,
+                note_id,
+                text,
+                metadata,
+            },
+        )
+        .await?;
+    super::publish_session_event(state, &event).await;
+    Ok(())
+}
+
 /// Application-level failure while creating a session.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateSessionError {

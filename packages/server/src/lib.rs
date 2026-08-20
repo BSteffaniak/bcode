@@ -6067,33 +6067,34 @@ async fn handle_update_client_runtime_context(
     writer: &SharedWriter,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<(), ServerError> {
-    if let Err(message) = validate_client_effective_config(runtime_context.as_ref()) {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new("invalid_client_config", message)),
-        )
-        .await;
+    match server_operations::update_client_runtime_context(state, client_id, runtime_context).await
+    {
+        Ok(()) => {}
+        Err(server_operations::UpdateClientContextError::InvalidConfig(message)) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("invalid_client_config", message)),
+            )
+            .await;
+        }
+        Err(server_operations::UpdateClientContextError::IncompatibleConfig(message)) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("incompatible_config", message)),
+            )
+            .await;
+        }
+        Err(server_operations::UpdateClientContextError::InvalidInteractionAdapters(message)) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new("invalid_interaction_adapters", message)),
+            )
+            .await;
+        }
     }
-    if let Err(message) = validate_client_plugin_selection(state, runtime_context.as_ref()) {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new("incompatible_config", message)),
-        )
-        .await;
-    }
-    if let Err(message) = validate_client_interaction_adapters(runtime_context.as_ref()) {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new("invalid_interaction_adapters", message)),
-        )
-        .await;
-    }
-    state
-        .set_client_runtime_context(client_id, runtime_context)
-        .await;
     send_response(
         writer,
         request_id,
@@ -6112,19 +6113,20 @@ async fn handle_ingest_client_metrics(
     writer: &SharedWriter,
     batch: bcode_metrics::ClientMetricBatch,
 ) -> Result<(), ServerError> {
-    if let Err(error) = batch.validate_for_namespace("tui.") {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "invalid_client_metrics",
-                error.to_string(),
-            )),
-        )
-        .await;
-    }
-    let accepted = batch.observations.len();
-    state.metrics.record_client_batch(batch);
+    let accepted = match server_operations::ingest_client_metrics(state, batch) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "invalid_client_metrics",
+                    error.to_string(),
+                )),
+            )
+            .await;
+        }
+    };
     send_response(
         writer,
         request_id,
@@ -12749,55 +12751,12 @@ async fn handle_append_presentation_note(
         text,
         format,
     } = request;
-    let invalid = source_id.trim().is_empty()
-        || source_id.len() > MAX_PRESENTATION_NOTE_SOURCE_ID_BYTES
-        || note_id.trim().is_empty()
-        || note_id.len() > MAX_PRESENTATION_NOTE_ID_BYTES
-        || text.trim().is_empty()
-        || text.len() > MAX_PRESENTATION_NOTE_TEXT_BYTES;
-    if invalid {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "invalid_presentation_note",
-                "presentation note fields are empty or exceed their bounded limits",
-            )),
-        )
-        .await;
-    }
-    let metadata = BTreeMap::from([
-        (
-            "format".to_owned(),
-            serde_json::Value::String(
-                match format {
-                    bcode_command::CommandTextFormat::PlainText => "plain_text",
-                    bcode_command::CommandTextFormat::Markdown => "markdown",
-                    bcode_command::CommandTextFormat::Json => "json",
-                }
-                .to_owned(),
-            ),
-        ),
-        (
-            "presentation_only".to_owned(),
-            serde_json::Value::Bool(true),
-        ),
-    ]);
-    match state
-        .sessions
-        .append_event(
-            session_id,
-            SessionEventKind::PluginStatusNote {
-                plugin_id: source_id,
-                note_id,
-                text,
-                metadata,
-            },
-        )
-        .await
+    match session_operations::append_presentation_note(
+        state, session_id, source_id, note_id, text, format,
+    )
+    .await
     {
-        Ok(event) => {
-            publish_session_event(state, &event).await;
+        Ok(()) => {
             send_response(
                 writer,
                 request_id,
@@ -12805,7 +12764,18 @@ async fn handle_append_presentation_note(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::AppendPresentationNoteError::Invalid) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "invalid_presentation_note",
+                    "presentation note fields are empty or exceed their bounded limits",
+                )),
+            )
+            .await
+        }
+        Err(session_operations::AppendPresentationNoteError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -13977,7 +13947,7 @@ async fn handle_cancel_session_turn(
     clear_queue: bool,
 ) -> Result<(), ServerError> {
     let cancelled =
-        enqueue_cancel_turn_command(state, session_id, clear_queue, Some(client_id)).await?;
+        session_operations::cancel_turn(state, session_id, clear_queue, client_id).await?;
     send_response(
         writer,
         request_id,

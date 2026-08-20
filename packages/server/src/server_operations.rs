@@ -44,7 +44,46 @@ pub async fn model_catalog_diagnostics(state: &ServerState) -> ModelCatalogDiagn
     }
 }
 
-/// Application failure while requesting daemon shutdown.
+/// Application failure while updating client runtime context.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateClientContextError {
+    #[error("invalid client configuration: {0}")]
+    InvalidConfig(String),
+    #[error("incompatible client configuration: {0}")]
+    IncompatibleConfig(String),
+    #[error("invalid interaction adapters: {0}")]
+    InvalidInteractionAdapters(String),
+}
+
+/// Validate and retain one client's runtime context without transport framing.
+pub async fn update_client_runtime_context(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    runtime_context: Option<bcode_ipc::ClientRuntimeContext>,
+) -> Result<(), UpdateClientContextError> {
+    super::validate_client_effective_config(runtime_context.as_ref())
+        .map_err(UpdateClientContextError::InvalidConfig)?;
+    super::validate_client_plugin_selection(state, runtime_context.as_ref())
+        .map_err(UpdateClientContextError::IncompatibleConfig)?;
+    super::validate_client_interaction_adapters(runtime_context.as_ref()).map_err(|message| {
+        UpdateClientContextError::InvalidInteractionAdapters(message.to_owned())
+    })?;
+    state
+        .set_client_runtime_context(client_id, runtime_context)
+        .await;
+    Ok(())
+}
+
+/// Validate and ingest one bounded client metric batch.
+pub fn ingest_client_metrics(
+    state: &ServerState,
+    batch: bcode_metrics::ClientMetricBatch,
+) -> Result<usize, bcode_metrics::ClientMetricBatchError> {
+    batch.validate_for_namespace("tui.")?;
+    let accepted = batch.observations.len();
+    state.metrics.record_client_batch(batch);
+    Ok(accepted)
+}
 #[derive(Debug, thiserror::Error)]
 #[error("daemon is busy: {0}")]
 pub struct StopBlocked(pub String);
