@@ -12,13 +12,15 @@ pub enum ResolveToolExchangeError {
 
 /// Return current pending permission summaries without transport framing.
 pub async fn list_permissions(state: &ServerState) -> Vec<bcode_ipc::PermissionSummary> {
-    state
+    let mut permissions = state
         .pending_permissions
         .lock()
         .await
         .values()
         .map(|permission| permission.summary.clone())
-        .collect()
+        .collect::<Vec<_>>();
+    permissions.sort_by(|left, right| left.permission_id.cmp(&right.permission_id));
+    permissions
 }
 
 /// Resolve one pending permission without transport framing.
@@ -48,13 +50,15 @@ pub async fn resolve_permission_batch(
 
 /// Return the current bounded pending tool-exchange summaries.
 pub async fn list_pending_tool_exchanges(state: &ServerState) -> Vec<PendingToolExchangeSummary> {
-    state
+    let mut exchanges = state
         .pending_tool_exchanges
         .lock()
         .await
         .values()
         .map(|request| request.summary.clone())
-        .collect()
+        .collect::<Vec<_>>();
+    exchanges.sort_by(|left, right| left.request.exchange_id.cmp(&right.request.exchange_id));
+    exchanges
 }
 
 /// Complete a known pending exchange from an authoritative internal consumer.

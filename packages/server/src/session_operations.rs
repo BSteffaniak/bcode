@@ -1,8 +1,366 @@
 //! Transport-neutral application operations for session lifecycle behavior.
 
-use super::ServerState;
+use super::{ServerState, session_catalog::SessionCatalogSnapshot};
+use bcode_ipc::SessionCatalogStatus;
 use bcode_session_models::SessionSummary;
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+/// Return the coherent bounded session catalog for one working directory.
+///
+/// This preserves the existing initial-load coordination while keeping response framing out of
+/// the application operation. Catalog discovery remains best-effort, bounded, and non-mutating.
+pub async fn list(
+    state: &Arc<ServerState>,
+    working_directory: &Path,
+) -> Result<SessionCatalogSnapshot, bcode_session::SessionStoreError> {
+    let snapshot = state
+        .session_catalog
+        .snapshot(state, working_directory)
+        .await;
+    if !matches!(snapshot.status, SessionCatalogStatus::Loading) {
+        return Ok(snapshot);
+    }
+
+    state.sessions.wait_catalog_loaded().await?;
+    state.session_catalog.refresh_native_now(state).await;
+    Ok(state
+        .session_catalog
+        .snapshot(state, working_directory)
+        .await)
+}
+
+/// Refresh selected session catalog sources without transport framing.
+///
+/// Refresh remains an explicit application operation; it does not run during ordinary bounded
+/// catalog reads.
+pub async fn refresh(
+    state: &Arc<ServerState>,
+    working_directory: &Path,
+    sources: Option<&[String]>,
+) -> SessionCatalogSnapshot {
+    state
+        .session_catalog
+        .refresh(state, working_directory, sources)
+        .await
+}
+
+/// Return the current bounded skill inventory without transport framing.
+#[must_use]
+pub fn list_skills(state: &ServerState) -> bcode_skill_models::SkillList {
+    state.skills.as_ref().map_or_else(
+        || bcode_skill_models::SkillList {
+            skills: Vec::new(),
+            diagnostics: Vec::new(),
+        },
+        bcode_skill::SkillRegistry::list,
+    )
+}
+
+/// Application-level failure while describing a skill.
+#[derive(Debug, thiserror::Error)]
+pub enum DescribeSkillError {
+    /// Skills are disabled for this server.
+    #[error("skills are disabled")]
+    Disabled,
+    /// The skill registry could not describe the requested skill.
+    #[error(transparent)]
+    Registry(#[from] bcode_skill::SkillRegistryError),
+}
+
+/// Return one skill manifest without transport framing.
+pub fn describe_skill(
+    state: &ServerState,
+    skill_id: &bcode_skill_models::SkillId,
+) -> Result<bcode_skill_models::SkillManifest, DescribeSkillError> {
+    let Some(registry) = &state.skills else {
+        return Err(DescribeSkillError::Disabled);
+    };
+    Ok(registry.describe(skill_id)?)
+}
+
+/// Return the available agent profiles for one client's effective configuration.
+pub async fn list_agents(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+) -> Vec<bcode_agent_profile::AgentInfo> {
+    let config = state
+        .client_runtime_context(client_id)
+        .await
+        .and_then(|context| context.effective_config_toml)
+        .and_then(|contents| bcode_config::decode_effective_config(&contents).ok());
+    super::list_profiles(state, config.as_ref()).await
+}
+
+/// Return effective agent policy status without transport framing.
+pub async fn agent_policy_status(state: &ServerState) -> bcode_agent_profile::PolicyStatusResponse {
+    super::load_agent_policy_status(state)
+        .await
+        .unwrap_or_else(|| bcode_agent_profile::PolicyStatusResponse {
+            source: "prompt profile provider not loaded".to_string(),
+            using_default: true,
+            build_enabled_tools: Vec::new(),
+            plan_enabled_tools: Vec::new(),
+            diagnostics: vec!["prompt profile provider not loaded".to_string()],
+        })
+}
+
+/// Return one session's normalized model status for a client's runtime context.
+pub async fn model_status(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+) -> bcode_ipc::SessionModelStatus {
+    let selection = super::session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        state.client_runtime_context(client_id).await,
+    )
+    .await;
+    let config = state.session_config(session_id).await;
+    super::model_status_for_selection(state, selection, Some(session_id), &config).await
+}
+
+/// Return normalized default model status for a client's runtime context.
+pub async fn default_model_status(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+) -> bcode_ipc::SessionModelStatus {
+    let runtime_context = state.client_runtime_context(client_id).await;
+    let config = runtime_context
+        .as_ref()
+        .and_then(|context| context.effective_config_toml.as_deref())
+        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+        .unwrap_or_else(|| state.startup_config.clone());
+    let selection = super::default_model_selection_with_runtime_context(state, runtime_context);
+    super::model_status_for_selection(state, selection, None, &config).await
+}
+
+/// Return the user-visible model list for a client's selected provider.
+pub async fn list_models(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    provider_plugin_id: Option<String>,
+) -> Result<(Option<String>, bcode_model::ModelList), String> {
+    let runtime_context = state
+        .client_runtime_contexts
+        .try_lock()
+        .ok()
+        .and_then(|contexts| contexts.get(&client_id).cloned());
+    let selected_provider_plugin_id = provider_plugin_id.or_else(|| {
+        runtime_context
+            .as_ref()
+            .and_then(|context| context.selected_provider_plugin_id.clone())
+    });
+    let mut models = super::resolved_provider_models_view(
+        state,
+        selected_provider_plugin_id.clone(),
+        bcode_model::ModelListRequest {
+            provider_context: runtime_context
+                .map_or_else(bcode_model::ProviderRequestContext::default, |context| {
+                    context.provider_context
+                }),
+            selected_model_id: None,
+        },
+        bcode_model_catalog::ModelListView::UserVisible,
+    )
+    .await?;
+    let provider_for_ignores = selected_provider_plugin_id
+        .as_deref()
+        .unwrap_or("bcode.openai-compatible");
+    if let Ok(rules) = bcode_config::effective_model_ignore_rules(provider_for_ignores) {
+        super::model_ignores::apply_model_ignores(&mut models.models, &rules);
+    }
+    Ok((selected_provider_plugin_id, models))
+}
+
+/// Explicitly release all process ownership retained for one canonical session.
+pub async fn release_ownership(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+) -> Result<bcode_ipc::SessionOwnershipReleaseOutcome, super::ServerError> {
+    super::explicit_session_ownership_release_outcome(state, session_id).await
+}
+
+/// Application-level scope for persisted composer drafts.
+pub enum ComposerDraftScope {
+    /// Draft associated with one canonical session.
+    Session(bcode_session_models::SessionId),
+    /// Draft associated with a not-yet-created session in one launch directory.
+    DraftSession(PathBuf),
+}
+
+/// Persist a composer draft without transport framing.
+pub async fn set_composer_draft(
+    state: &ServerState,
+    scope: ComposerDraftScope,
+    text: String,
+) -> Result<(), bcode_session::SessionError> {
+    match scope {
+        ComposerDraftScope::Session(session_id) => {
+            state
+                .sessions
+                .set_session_composer_draft(session_id, text)
+                .await?;
+        }
+        ComposerDraftScope::DraftSession(launch_working_directory) => {
+            state
+                .sessions
+                .set_draft_session_composer_draft(launch_working_directory, text)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Return a persisted composer draft without transport framing.
+pub async fn composer_draft(
+    state: &ServerState,
+    scope: ComposerDraftScope,
+) -> Result<Option<String>, bcode_session::SessionError> {
+    match scope {
+        ComposerDraftScope::Session(session_id) => {
+            state.sessions.session_composer_draft(session_id).await
+        }
+        ComposerDraftScope::DraftSession(launch_working_directory) => {
+            state
+                .sessions
+                .draft_session_composer_draft(launch_working_directory)
+                .await
+        }
+    }
+}
+
+/// Return one session's bounded derivation snapshot.
+pub async fn derivation_snapshot(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+) -> Result<bcode_session_models::SessionDerivationSourceSnapshot, bcode_session::SessionError> {
+    state.sessions.session_derivation_snapshot(session_id).await
+}
+
+/// Return bounded derivation prompt candidates for one session.
+pub async fn derivation_prompts(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionDerivationPromptQuery,
+) -> Result<bcode_session_models::SessionDerivationPromptPage, bcode_session::SessionError> {
+    state
+        .sessions
+        .session_derivation_prompt_candidates(session_id, query)
+        .await
+}
+
+/// Execute one retry-safe canonical session derivation.
+pub async fn derive(
+    state: &ServerState,
+    request: bcode_session_models::SessionDerivationRequest,
+) -> Result<bcode_session_models::SessionDerivationTerminalOutcome, bcode_session::SessionError> {
+    state.sessions.derive_session(request).await
+}
+
+/// Return status for one canonical derivation operation.
+pub async fn derivation_status(
+    state: &ServerState,
+    operation_id: bcode_session_models::SessionDerivationOperationId,
+) -> Result<bcode_session_models::SessionDerivationOperationSnapshot, bcode_session::SessionError> {
+    state.sessions.session_derivation_status(operation_id).await
+}
+
+/// Request cancellation of one canonical session-derivation operation.
+pub async fn cancel_derivation(
+    state: &ServerState,
+    operation_id: bcode_session_models::SessionDerivationOperationId,
+) -> bool {
+    state.sessions.cancel_session_derivation(operation_id).await
+}
+
+/// Application-level failure while reading session history for one client.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadHistoryError {
+    /// The active session belongs to another artifact namespace.
+    #[error("active session uses incompatible artifact namespace {0}")]
+    IncompatibleActiveNamespace(String),
+    /// Canonical bounded history read failed.
+    #[error(transparent)]
+    Session(#[from] bcode_session::SessionError),
+}
+
+/// Return complete canonical history for an explicit export/debug request.
+///
+/// This operation is intentionally separate from normal bounded history and inspection reads.
+pub async fn complete_history(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+) -> Result<Vec<bcode_session_models::SessionEvent>, ReadHistoryError> {
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
+    }
+    Ok(state.sessions.session_history(session_id).await?)
+}
+
+/// Return one bounded semantic session-inspection page without transport framing.
+pub async fn inspect(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionInspectionQuery,
+) -> Result<bcode_session_models::SessionInspectionPage, ReadHistoryError> {
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
+    }
+    Ok(state
+        .sessions
+        .session_inspection_page(session_id, query)
+        .await?)
+}
+
+/// Return one bounded session history page without transport framing.
+pub async fn history_page(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionHistoryQuery,
+) -> Result<bcode_session_models::SessionHistoryPage, ReadHistoryError> {
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
+    }
+    Ok(state
+        .sessions
+        .session_history_page(session_id, query)
+        .await?)
+}
+
+/// Return one bounded history window around a sequence without transport framing.
+pub async fn history_around(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionHistoryAroundQuery,
+) -> Result<bcode_session_models::SessionHistoryWindow, ReadHistoryError> {
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
+    }
+    Ok(state
+        .sessions
+        .session_history_around(session_id, query)
+        .await?)
+}
 
 /// Application-level failure while creating a session.
 #[derive(Debug, thiserror::Error)]

@@ -19,9 +19,12 @@ mod model_request_target;
 mod request_routing;
 mod runtime_work;
 mod runtime_work_operations;
+mod server_operations;
 mod session_bulk_migration;
 mod session_operations;
+mod session_search_operations;
 mod worktree_creation;
+mod worktree_operations;
 
 use model_request_target::{ModelRequestTargetInput, resolve_model_request_target};
 use request_routing::{
@@ -117,9 +120,9 @@ use bcode_skill::{
     resolve_skill_permission_policy, skill_source_roots_from_config,
 };
 use bcode_skill_models::{
-    SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillList, SkillModelRequest,
-    SkillSource, SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey,
-    SkillToolDecisionScope, SkillToolPolicyOutcome, SkillToolPolicyRequest, SkillToolPolicyTarget,
+    SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillModelRequest, SkillSource,
+    SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey, SkillToolDecisionScope,
+    SkillToolPolicyOutcome, SkillToolPolicyRequest, SkillToolPolicyTarget,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL, PreparedToolInvocation,
@@ -6253,7 +6256,7 @@ async fn handle_server_status(
     writer: &SharedWriter,
     working_directory: Option<&Path>,
 ) -> Result<(), ServerError> {
-    let status = state.status(working_directory).await;
+    let status = server_operations::status(state, working_directory).await;
     send_response(
         writer,
         request_id,
@@ -6267,11 +6270,7 @@ async fn handle_model_catalog_diagnostics(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let diagnostics = state.model_catalog.diagnostics().await;
-    let epoch_ms = |time: Option<std::time::SystemTime>| {
-        time.and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|value| u64::try_from(value.as_millis()).ok())
-    };
+    let diagnostics = server_operations::model_catalog_diagnostics(state).await;
     send_response(
         writer,
         request_id,
@@ -6280,10 +6279,10 @@ async fn handle_model_catalog_diagnostics(
             remote_revision: diagnostics.remote_revision,
             remote_enabled: diagnostics.remote_enabled,
             cache_state: format!("{:?}", diagnostics.cache_state).to_lowercase(),
-            cache_age_seconds: diagnostics.cache_age.map(|age| age.as_secs()),
+            cache_age_seconds: diagnostics.cache_age_seconds,
             refresh_in_progress: diagnostics.refresh_in_progress,
-            last_refresh_attempt_ms: epoch_ms(diagnostics.last_refresh_attempt),
-            last_refresh_success_ms: epoch_ms(diagnostics.last_refresh_success),
+            last_refresh_attempt_ms: diagnostics.last_refresh_attempt_ms,
+            last_refresh_success_ms: diagnostics.last_refresh_success_ms,
             last_refresh_error: diagnostics.last_refresh_error,
         }),
     )
@@ -6441,7 +6440,7 @@ async fn handle_release_session_ownership(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let outcome = explicit_session_ownership_release_outcome(state, session_id).await?;
+    let outcome = session_operations::release_ownership(state, session_id).await?;
     send_response(
         writer,
         request_id,
@@ -6459,16 +6458,8 @@ async fn handle_server_stop(
     writer: &SharedWriter,
     mode: ServerStopMode,
 ) -> Result<(), ServerError> {
-    if let Some(message) = state.active_migration_shutdown_blocker().await {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new("daemon_busy", message)),
-        )
-        .await;
-    }
-    if mode == ServerStopMode::IfIdle
-        && let Some(message) = state.idle_shutdown_blocker().await
+    if let Err(server_operations::StopBlocked(message)) =
+        server_operations::prepare_stop(state, mode).await
     {
         return send_response(
             writer,
@@ -6483,7 +6474,7 @@ async fn handle_server_stop(
         Response::Ok(ResponsePayload::ServerStopping),
     )
     .await?;
-    state.request_shutdown();
+    server_operations::request_shutdown(state);
     Ok(())
 }
 
@@ -6494,22 +6485,15 @@ async fn handle_set_composer_draft(
     scope: bcode_ipc::ComposerDraftScope,
     text: String,
 ) -> Result<(), ServerError> {
-    match scope {
+    let scope = match scope {
         bcode_ipc::ComposerDraftScope::Session { session_id } => {
-            state
-                .sessions
-                .set_session_composer_draft(session_id, text)
-                .await?;
+            session_operations::ComposerDraftScope::Session(session_id)
         }
         bcode_ipc::ComposerDraftScope::DraftSession {
             launch_working_directory,
-        } => {
-            state
-                .sessions
-                .set_draft_session_composer_draft(launch_working_directory, text)
-                .await?;
-        }
-    }
+        } => session_operations::ComposerDraftScope::DraftSession(launch_working_directory),
+    };
+    session_operations::set_composer_draft(state, scope, text).await?;
     send_response(
         writer,
         request_id,
@@ -6524,19 +6508,15 @@ async fn handle_composer_draft(
     writer: &SharedWriter,
     scope: bcode_ipc::ComposerDraftScope,
 ) -> Result<(), ServerError> {
-    let draft = match scope {
+    let scope = match scope {
         bcode_ipc::ComposerDraftScope::Session { session_id } => {
-            state.sessions.session_composer_draft(session_id).await?
+            session_operations::ComposerDraftScope::Session(session_id)
         }
         bcode_ipc::ComposerDraftScope::DraftSession {
             launch_working_directory,
-        } => {
-            state
-                .sessions
-                .draft_session_composer_draft(launch_working_directory)
-                .await?
-        }
+        } => session_operations::ComposerDraftScope::DraftSession(launch_working_directory),
     };
+    let draft = session_operations::composer_draft(state, scope).await?;
     send_response(
         writer,
         request_id,
@@ -6581,23 +6561,9 @@ async fn handle_list_sessions(
     writer: &SharedWriter,
     working_directory: &Path,
 ) -> Result<(), ServerError> {
-    let snapshot = state
-        .session_catalog
-        .snapshot(state, working_directory)
-        .await;
-    let snapshot = if matches!(snapshot.status, SessionCatalogStatus::Loading) {
-        state
-            .sessions
-            .wait_catalog_loaded()
-            .await
-            .map_err(ServerError::SessionStore)?;
-        state.session_catalog.refresh_native_now(state).await;
-        state
-            .session_catalog
-            .snapshot(state, working_directory)
-            .await
-    } else {
-        snapshot
+    let snapshot = match session_operations::list(state, working_directory).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Err(ServerError::SessionStore(error)),
     };
     send_response(
         writer,
@@ -6939,10 +6905,7 @@ async fn handle_refresh_session_catalog(
     working_directory: &Path,
     sources: Option<&[String]>,
 ) -> Result<(), ServerError> {
-    let snapshot = state
-        .session_catalog
-        .refresh(state, working_directory, sources)
-        .await;
+    let snapshot = session_operations::refresh(state, working_directory, sources).await;
     send_response(
         writer,
         request_id,
@@ -7046,7 +7009,7 @@ async fn handle_list_worktrees(
         )
         .await;
     };
-    match bcode_worktree::list_worktrees(&cwd) {
+    match worktree_operations::list(&cwd) {
         Ok(response) => {
             send_response(
                 writer,
@@ -8880,26 +8843,7 @@ async fn handle_remove_worktree(
         )
         .await;
     };
-    let sessions = state.sessions.cached_sessions(&cwd).await;
-    if let Some(session) = sessions
-        .iter()
-        .find(|session| path_is_inside(&session.working_directory, &request.path))
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "worktree_remove_command_failed",
-                format!(
-                    "session {} is rooted inside worktree {}; move or delete it before removal",
-                    session.id,
-                    display_from_current_dir(&request.path)
-                ),
-            )),
-        )
-        .await;
-    }
-    match bcode_worktree::remove_worktree(&cwd, &request.path, request.force) {
+    match worktree_operations::remove(state, &cwd, &request.path, request.force).await {
         Ok(response) => {
             send_response(
                 writer,
@@ -9609,7 +9553,7 @@ async fn handle_session_derivation_snapshot(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    match state.sessions.session_derivation_snapshot(session_id).await {
+    match session_operations::derivation_snapshot(state, session_id).await {
         Ok(snapshot) => {
             send_response(
                 writer,
@@ -9639,11 +9583,7 @@ async fn handle_session_derivation_prompts(
     session_id: SessionId,
     query: bcode_session_models::SessionDerivationPromptQuery,
 ) -> Result<(), ServerError> {
-    match state
-        .sessions
-        .session_derivation_prompt_candidates(session_id, query)
-        .await
-    {
+    match session_operations::derivation_prompts(state, session_id, query).await {
         Ok(page) => {
             send_response(
                 writer,
@@ -9672,7 +9612,7 @@ async fn handle_derive_session(
     writer: &SharedWriter,
     request: bcode_session_models::SessionDerivationRequest,
 ) -> Result<(), ServerError> {
-    match state.sessions.derive_session(request).await {
+    match session_operations::derive(state, request).await {
         Ok(outcome) => {
             send_response(
                 writer,
@@ -9701,7 +9641,7 @@ async fn handle_session_derivation_status(
     writer: &SharedWriter,
     operation_id: bcode_session_models::SessionDerivationOperationId,
 ) -> Result<(), ServerError> {
-    match state.sessions.session_derivation_status(operation_id).await {
+    match session_operations::derivation_status(state, operation_id).await {
         Ok(snapshot) => {
             send_response(
                 writer,
@@ -9730,7 +9670,7 @@ async fn handle_cancel_session_derivation(
     writer: &SharedWriter,
     operation_id: bcode_session_models::SessionDerivationOperationId,
 ) -> Result<(), ServerError> {
-    let accepted = state.sessions.cancel_session_derivation(operation_id).await;
+    let accepted = session_operations::cancel_derivation(state, operation_id).await;
     send_response(
         writer,
         request_id,
@@ -9751,14 +9691,7 @@ async fn handle_session_history(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
-        .await
-    {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    match state.sessions.session_history(session_id).await {
+    match session_operations::complete_history(state, client_id, session_id).await {
         Ok(history) => {
             send_response(
                 writer,
@@ -9770,7 +9703,10 @@ async fn handle_session_history(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
+            send_incompatible_active_session_response(writer, request_id, &namespace).await
+        }
+        Err(session_operations::ReadHistoryError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -10019,14 +9955,7 @@ async fn handle_session_history_page(
     session_id: SessionId,
     query: bcode_session_models::SessionHistoryQuery,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
-        .await
-    {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    match state.sessions.session_history_page(session_id, query).await {
+    match session_operations::history_page(state, client_id, session_id, query).await {
         Ok(page) => {
             send_response(
                 writer,
@@ -10035,7 +9964,10 @@ async fn handle_session_history_page(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
+            send_incompatible_active_session_response(writer, request_id, &namespace).await
+        }
+        Err(session_operations::ReadHistoryError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -10054,18 +9986,7 @@ async fn handle_session_history_around(
     session_id: SessionId,
     query: bcode_session_models::SessionHistoryAroundQuery,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
-        .await
-    {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    match state
-        .sessions
-        .session_history_around(session_id, query)
-        .await
-    {
+    match session_operations::history_around(state, client_id, session_id, query).await {
         Ok(window) => {
             send_response(
                 writer,
@@ -10074,7 +9995,10 @@ async fn handle_session_history_around(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
+            send_incompatible_active_session_response(writer, request_id, &namespace).await
+        }
+        Err(session_operations::ReadHistoryError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -10094,22 +10018,11 @@ async fn handle_session_search(
     routes: Vec<bcode_session_search::SessionSearchContentRoute>,
     hydrate: bool,
 ) -> Result<(), ServerError> {
-    match session_search::search_federated_with_policy_and_routes(state, &request, &policy, &routes)
-        .await
-    {
-        Ok(mut response) => {
-            let hydrated_hits = if hydrate {
-                let started = std::time::Instant::now();
-                let hydrated = session_search::hydrate_hits(state, response.hits.clone()).await;
-                session_search::report_hydration_outcomes(
-                    &mut response,
-                    &hydrated,
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                );
-                hydrated
-            } else {
-                Vec::new()
-            };
+    match session_search_operations::search(state, &request, &policy, &routes, hydrate).await {
+        Ok(session_search_operations::SearchResult {
+            response,
+            hydrated_hits,
+        }) => {
             send_response(
                 writer,
                 request_id,
@@ -10616,18 +10529,7 @@ async fn handle_session_inspection(
     session_id: SessionId,
     query: bcode_session_models::SessionInspectionQuery,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
-        .await
-    {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    match state
-        .sessions
-        .session_inspection_page(session_id, query)
-        .await
-    {
+    match session_operations::inspect(state, client_id, session_id, query).await {
         Ok(page) => {
             send_response(
                 writer,
@@ -10636,7 +10538,10 @@ async fn handle_session_inspection(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
+            send_incompatible_active_session_response(writer, request_id, &namespace).await
+        }
+        Err(session_operations::ReadHistoryError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -13037,14 +12942,7 @@ async fn handle_session_model_status(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let selection = session_model_selection_with_runtime_context(
-        state,
-        session_id,
-        state.client_runtime_context(client_id).await,
-    )
-    .await;
-    let config = state.session_config(session_id).await;
-    let status = model_status_for_selection(state, selection, Some(session_id), &config).await;
+    let status = session_operations::model_status(state, client_id, session_id).await;
     send_response(
         writer,
         request_id,
@@ -13059,14 +12957,7 @@ async fn handle_default_model_status(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let runtime_context = state.client_runtime_context(client_id).await;
-    let config = runtime_context
-        .as_ref()
-        .and_then(|context| context.effective_config_toml.as_deref())
-        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
-        .unwrap_or_else(|| state.startup_config.clone());
-    let selection = default_model_selection_with_runtime_context(state, runtime_context);
-    let status = model_status_for_selection(state, selection, None, &config).await;
+    let status = session_operations::default_model_status(state, client_id).await;
     send_response(
         writer,
         request_id,
@@ -13231,37 +13122,8 @@ async fn handle_session_model_list(
     writer: &SharedWriter,
     provider_plugin_id: Option<String>,
 ) -> Result<(), ServerError> {
-    let runtime_context = state
-        .client_runtime_contexts
-        .try_lock()
-        .ok()
-        .and_then(|contexts| contexts.get(&client_id).cloned());
-    let selected_provider_plugin_id = provider_plugin_id.or_else(|| {
-        runtime_context
-            .as_ref()
-            .and_then(|context| context.selected_provider_plugin_id.clone())
-    });
-    match resolved_provider_models_view(
-        state,
-        selected_provider_plugin_id.clone(),
-        bcode_model::ModelListRequest {
-            provider_context: runtime_context
-                .map_or_else(bcode_model::ProviderRequestContext::default, |context| {
-                    context.provider_context
-                }),
-            selected_model_id: None,
-        },
-        bcode_model_catalog::ModelListView::UserVisible,
-    )
-    .await
-    {
-        Ok(mut models) => {
-            let provider_for_ignores = selected_provider_plugin_id
-                .as_deref()
-                .unwrap_or("bcode.openai-compatible");
-            if let Ok(rules) = bcode_config::effective_model_ignore_rules(provider_for_ignores) {
-                model_ignores::apply_model_ignores(&mut models.models, &rules);
-            }
+    match session_operations::list_models(state, client_id, provider_plugin_id).await {
+        Ok((selected_provider_plugin_id, models)) => {
             send_response(
                 writer,
                 request_id,
@@ -13309,12 +13171,7 @@ async fn handle_list_agents(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let config = state
-        .client_runtime_context(client_id)
-        .await
-        .and_then(|context| context.effective_config_toml)
-        .and_then(|contents| bcode_config::decode_effective_config(&contents).ok());
-    let agents = list_profiles(state, config.as_ref()).await;
+    let agents = session_operations::list_agents(state, client_id).await;
     send_response(
         writer,
         request_id,
@@ -13328,13 +13185,7 @@ async fn handle_list_skills(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let skills = state.skills.as_ref().map_or_else(
-        || SkillList {
-            skills: Vec::new(),
-            diagnostics: Vec::new(),
-        },
-        SkillRegistry::list,
-    );
+    let skills = session_operations::list_skills(state);
     send_response(
         writer,
         request_id,
@@ -13351,18 +13202,7 @@ async fn handle_describe_skill(
     writer: &SharedWriter,
     skill_id: &SkillId,
 ) -> Result<(), ServerError> {
-    let Some(registry) = &state.skills else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse {
-                code: "skills_disabled".to_string(),
-                message: "skills are disabled".to_string(),
-            }),
-        )
-        .await;
-    };
-    match registry.describe(skill_id) {
+    match session_operations::describe_skill(state, skill_id) {
         Ok(skill) => {
             send_response(
                 writer,
@@ -13373,7 +13213,18 @@ async fn handle_describe_skill(
             )
             .await
         }
-        Err(error) => {
+        Err(session_operations::DescribeSkillError::Disabled) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse {
+                    code: "skills_disabled".to_string(),
+                    message: "skills are disabled".to_string(),
+                }),
+            )
+            .await
+        }
+        Err(session_operations::DescribeSkillError::Registry(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -13961,15 +13812,7 @@ async fn handle_agent_policy_status(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let status = agent_policy_status(state)
-        .await
-        .unwrap_or_else(|| PolicyStatusResponse {
-            source: "prompt profile provider not loaded".to_string(),
-            using_default: true,
-            build_enabled_tools: Vec::new(),
-            plan_enabled_tools: Vec::new(),
-            diagnostics: vec!["prompt profile provider not loaded".to_string()],
-        });
+    let status = session_operations::agent_policy_status(state).await;
     send_response(
         writer,
         request_id,
@@ -24172,7 +24015,7 @@ async fn update_provider_metadata_state(
     provider_state.save();
 }
 
-async fn agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse> {
+async fn load_agent_policy_status(state: &ServerState) -> Option<PolicyStatusResponse> {
     let mut status = state
         .plugins
         .invoke_service_by_interface_json::<_, PolicyStatusResponse>(
@@ -50314,7 +50157,7 @@ library = "test"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn session_operations_lifecycle_without_transport_writing() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let working_directory = test_working_directory();
         let session = session_operations::create(
             &state,
@@ -50334,6 +50177,68 @@ library = "test"
                 .iter()
                 .any(|event| matches!(event.kind, SessionEventKind::SessionCreated { .. }))
         );
+
+        let operation_client_id = bcode_session_models::ClientId::new();
+        let history_page = session_operations::history_page(
+            &state,
+            operation_client_id,
+            session.id,
+            bcode_session_models::SessionHistoryQuery {
+                cursor: None,
+                limit: 2,
+                direction: bcode_session_models::SessionHistoryDirection::Backward,
+            },
+        )
+        .await
+        .expect("history page");
+        assert!(!history_page.events.is_empty());
+        let around = session_operations::history_around(
+            &state,
+            operation_client_id,
+            session.id,
+            bcode_session_models::SessionHistoryAroundQuery {
+                sequence: history_page.events[0].sequence,
+                before: 1,
+                after: 1,
+            },
+        )
+        .await
+        .expect("history around");
+        assert!(around.anchor_present);
+        assert!(matches!(
+            session_operations::inspect(
+                &state,
+                operation_client_id,
+                session.id,
+                bcode_session_models::SessionInspectionQuery {
+                    category: bcode_session_models::SessionInspectionCategory::TerminalOutcomes,
+                    cursor: None,
+                    limit: 2,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await,
+            Err(session_operations::ReadHistoryError::Session(
+                bcode_session::SessionError::DbUnavailable(id)
+            )) if id == session.id
+        ));
+        let complete_history =
+            session_operations::complete_history(&state, operation_client_id, session.id)
+                .await
+                .expect("complete history");
+        assert!(complete_history.len() >= history_page.events.len());
+
+        assert!(matches!(
+            worktree_operations::remove(
+                &state,
+                &working_directory,
+                &working_directory,
+                false,
+            )
+            .await,
+            Err(worktree_operations::RemoveError::SessionInside { session_id, .. })
+                if session_id == session.id
+        ));
 
         let renamed =
             session_operations::rename(&state, session.id, Some("renamed in process".to_owned()))
@@ -50401,7 +50306,26 @@ library = "test"
                 if agent_id == "definitely-missing-agent"
         ));
 
+        let operation_client_id = bcode_session_models::ClientId::new();
+        let agents = session_operations::list_agents(&state, operation_client_id).await;
+        assert!(agents.iter().any(|agent| agent.id == "build"));
+        let session_model_status =
+            session_operations::model_status(&state, operation_client_id, session.id).await;
+        assert!(session_model_status.provider_plugin_id.is_some());
+        let _default_model_status =
+            session_operations::default_model_status(&state, operation_client_id).await;
+        assert!(
+            session_operations::list_models(&state, operation_client_id, None)
+                .await
+                .is_err()
+        );
+
         let inactive_skill = bcode_skill_models::SkillId::new("not-active");
+        assert!(session_operations::list_skills(&state).skills.is_empty());
+        assert!(matches!(
+            session_operations::describe_skill(&state, &inactive_skill),
+            Err(session_operations::DescribeSkillError::Disabled)
+        ));
         assert!(
             session_operations::active_skills(&state, session.id)
                 .await
@@ -50428,6 +50352,21 @@ library = "test"
                         if skill_id == &inactive_skill
                 ))
         );
+
+        assert!(
+            !session_operations::cancel_derivation(
+                &state,
+                bcode_session_models::SessionDerivationOperationId::new(),
+            )
+            .await
+        );
+
+        let listed = session_operations::list(&state, &working_directory)
+            .await
+            .expect("list sessions");
+        assert!(listed.sessions.iter().any(|entry| entry.id == session.id));
+        let refreshed = session_operations::refresh(&state, &working_directory, None).await;
+        assert!(refreshed.revision >= listed.revision);
 
         let changed_directory = tempfile::tempdir().expect("changed working directory");
         let changed_directory_path = changed_directory
@@ -50469,9 +50408,17 @@ library = "test"
             .await
             .insert("permission-1".to_owned(), pending);
 
+        let mut second = pending_permission_for_batch("permission-0", session_id, 1, "batch-2");
+        second.summary.batch = None;
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("permission-0".to_owned(), second);
         let listed = interaction_operations::list_permissions(&state).await;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].permission_id, "permission-1");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].permission_id, "permission-0");
+        assert_eq!(listed[1].permission_id, "permission-1");
         assert!(
             interaction_operations::resolve_permission(&state, "permission-1", true, false,).await
         );
