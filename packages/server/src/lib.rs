@@ -381,6 +381,7 @@ pub struct ServerState {
     startup_config: bcode_config::BcodeConfig,
     session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
     session_skills: Mutex<BTreeMap<SessionId, Option<SkillRegistry>>>,
+    session_repository_roots: Mutex<BTreeMap<SessionId, (PathBuf, Option<PathBuf>)>>,
     selected_reasoning: bcode_config::ReasoningConfig,
     selected_reasoning_capabilities: Option<bcode_model::ModelReasoningInfo>,
     provider_state: Mutex<ProviderStateStore>,
@@ -1621,6 +1622,7 @@ impl ServerState {
             startup_config: init.startup_config,
             session_configs: Mutex::default(),
             session_skills: Mutex::default(),
+            session_repository_roots: Mutex::default(),
             selected_reasoning: init.selected_reasoning,
             selected_reasoning_capabilities: init.selected_reasoning_capabilities,
             provider_state: Mutex::new(init.provider_state),
@@ -1838,6 +1840,10 @@ impl ServerState {
         {
             return;
         }
+        self.session_repository_roots
+            .lock()
+            .await
+            .remove(&session_id);
         clear_session_live_state(self, session_id);
         if let Err(error) = self
             .sessions
@@ -24832,6 +24838,30 @@ fn apply_turn_model_selection(
     }
 }
 
+async fn session_repository_root(
+    state: &ServerState,
+    session_id: SessionId,
+    working_directory: &Path,
+) -> Option<PathBuf> {
+    if let Some((cached_directory, cached_root)) = state
+        .session_repository_roots
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        && cached_directory == working_directory
+        && cached_root.is_some()
+    {
+        return cached_root;
+    }
+    let repository_root = discover_git_root(working_directory);
+    state.session_repository_roots.lock().await.insert(
+        session_id,
+        (working_directory.to_path_buf(), repository_root.clone()),
+    );
+    repository_root
+}
+
 #[allow(clippy::too_many_lines)]
 async fn prepare_static_model_turn_context(
     state: &ServerState,
@@ -24855,6 +24885,7 @@ async fn prepare_static_model_turn_context(
         setup_labels.clone(),
     );
     let working_directory = state.sessions.session_working_directory(session_id).await?;
+    let repository_root = session_repository_root(state, session_id, &working_directory).await;
     let skills_timer = state.metrics.timer();
     let skills = state.session_skills(session_id).await;
     let skill_catalog = if config.system_prompt.sections.skill_catalog {
@@ -24880,6 +24911,7 @@ async fn prepare_static_model_turn_context(
         .remove(&session_id);
     let dynamic_system_context = build_dynamic_system_context(
         &working_directory,
+        repository_root.as_deref(),
         &config.system_prompt.sections,
         &agent_id,
         agent_context
@@ -24890,6 +24922,7 @@ async fn prepare_static_model_turn_context(
     let system_prompt_timer = state.metrics.timer();
     let (system_prompt, repository_system_context) = build_coding_system_prompt_parts(
         &working_directory,
+        repository_root.as_deref(),
         &config.system_prompt,
         matches!(
             invariant_mode,
@@ -26497,6 +26530,7 @@ const REPOSITORY_INVARIANTS_FILE: &str = "INVARIANTS.md";
 
 fn build_coding_system_prompt_parts(
     cwd: &Path,
+    repository_root: Option<&Path>,
     config: &bcode_config::SystemPromptConfig,
     include_full_invariants: bool,
     agent_prompt_suffix: Option<&str>,
@@ -26504,6 +26538,7 @@ fn build_coding_system_prompt_parts(
 ) -> (String, String) {
     let (stable_context, dynamic_context) = build_repository_context_parts(
         cwd,
+        repository_root,
         config
             .repository_instructions_max_chars
             .map(std::num::NonZeroUsize::get),
@@ -26517,6 +26552,7 @@ fn build_coding_system_prompt_parts(
         && config.sections.repository_invariants
         && let Some(invariants) = read_repository_invariants(
             cwd,
+            repository_root,
             config
                 .repository_invariants_max_chars
                 .map(std::num::NonZeroUsize::get),
@@ -26569,11 +26605,15 @@ fn format_datetime_context(timestamp: &str, timezone: &str, utc_offset: &str) ->
 
 const DYNAMIC_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
 const DYNAMIC_COMMAND_BUDGET: Duration = Duration::from_millis(1_500);
+const REPOSITORY_CONTEXT_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
+const REPOSITORY_CONTEXT_COMMAND_BUDGET: Duration = Duration::from_secs(1);
 const DYNAMIC_COMMAND_MAX_CHARS: usize = 160;
 const DYNAMIC_VALUE_MAX_CHARS: usize = 80;
+const MAX_COMMAND_CAPTURE_BYTES: usize = 1_048_576;
 
 fn build_dynamic_system_context(
     cwd: &Path,
+    repository_root: Option<&Path>,
     sections: &bcode_config::SystemPromptSectionsConfig,
     agent_id: &str,
     operating_mode: Option<&str>,
@@ -26594,7 +26634,7 @@ fn build_dynamic_system_context(
         context.push(format_locale_context());
     }
     if sections.git_revision
-        && let Some(git) = format_git_revision_context(cwd, deadline)
+        && let Some(git) = format_git_revision_context(repository_root, deadline)
     {
         context.push(git);
     }
@@ -26607,7 +26647,7 @@ fn build_dynamic_system_context(
         context.push(toolchains);
     }
     if sections.worktree_context
-        && let Some(worktree) = format_worktree_context(cwd, deadline)
+        && let Some(worktree) = format_worktree_context(cwd, repository_root, deadline)
     {
         context.push(worktree);
     }
@@ -26689,21 +26729,19 @@ fn format_runtime_mode_context(agent_id: &str, operating_mode: Option<&str>) -> 
     format!("Runtime context:\n* Agent profile: {agent_id}\n* Operating mode: {operating_mode}")
 }
 
-fn format_git_revision_context(cwd: &Path, deadline: Instant) -> Option<String> {
-    let root = PathBuf::from(run_bounded_command(
-        cwd,
-        "git",
-        &["rev-parse", "--show-toplevel"],
-        deadline,
-    )?);
-    let head = run_bounded_command(&root, "git", &["rev-parse", "--short=12", "HEAD"], deadline)?;
+fn format_git_revision_context(
+    repository_root: Option<&Path>,
+    deadline: Instant,
+) -> Option<String> {
+    let root = repository_root?;
+    let head = run_bounded_command(root, "git", &["rev-parse", "--short=12", "HEAD"], deadline)?;
     let mut lines = vec![
         "Git revision context:".to_string(),
         format!("* HEAD: {head}"),
     ];
     let upstream_ref = format!("@{{{}}}", "upstream");
     if let Some(upstream) = run_bounded_command(
-        &root,
+        root,
         "git",
         &[
             "rev-parse",
@@ -26716,7 +26754,7 @@ fn format_git_revision_context(cwd: &Path, deadline: Instant) -> Option<String> 
         lines.push(format!("* Upstream: {upstream}"));
         let revision_range = ["HEAD...", upstream_ref.as_str()].concat();
         if let Some(counts) = run_bounded_command(
-            &root,
+            root,
             "git",
             &["rev-list", "--left-right", "--count", &revision_range],
             deadline,
@@ -26730,21 +26768,20 @@ fn format_git_revision_context(cwd: &Path, deadline: Instant) -> Option<String> 
     Some(lines.join("\n"))
 }
 
-fn format_worktree_context(cwd: &Path, deadline: Instant) -> Option<String> {
-    let root = PathBuf::from(run_bounded_command(
-        cwd,
-        "git",
-        &["rev-parse", "--show-toplevel"],
-        deadline,
-    )?);
+fn format_worktree_context(
+    cwd: &Path,
+    repository_root: Option<&Path>,
+    deadline: Instant,
+) -> Option<String> {
+    let root = repository_root?;
     let git_dir = PathBuf::from(run_bounded_command(
-        &root,
+        root,
         "git",
         &["rev-parse", "--absolute-git-dir"],
         deadline,
     )?);
     let common_dir = PathBuf::from(run_bounded_command(
-        &root,
+        root,
         "git",
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         deadline,
@@ -26757,7 +26794,7 @@ fn format_worktree_context(cwd: &Path, deadline: Instant) -> Option<String> {
         } else {
             "primary checkout"
         },
-        display(&root, cwd)
+        display(root, cwd)
     ))
 }
 
@@ -26778,12 +26815,25 @@ fn format_toolchain_context(cwd: &Path, deadline: Instant) -> Option<String> {
     (!versions.is_empty()).then(|| format!("Detected toolchains:\n{}", versions.join("\n")))
 }
 
-fn run_bounded_command(
+fn read_process_output(mut stream: impl std::io::Read, max_bytes: usize) -> Vec<u8> {
+    let mut collected = Vec::new();
+    let mut buffer = [0_u8; 4_096];
+    while let Ok(read) = stream.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(collected.len());
+        collected.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    collected
+}
+
+fn run_command_with_deadline(
     cwd: &Path,
     program: &str,
     args: &[&str],
     deadline: Instant,
-) -> Option<String> {
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let remaining = deadline.checked_duration_since(Instant::now())?;
     let timeout = remaining.min(DYNAMIC_COMMAND_TIMEOUT);
     if timeout.is_zero() {
@@ -26797,33 +26847,43 @@ fn run_bounded_command(
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let stdout_reader =
+        std::thread::spawn(move || read_process_output(stdout, MAX_COMMAND_CAPTURE_BYTES));
+    let stderr_reader =
+        std::thread::spawn(move || read_process_output(stderr, MAX_COMMAND_CAPTURE_BYTES));
     let Some(status) = child.wait_timeout(timeout).ok()? else {
         let _ = child.kill();
         let _ = child.wait();
         return None;
     };
-    if !status.success() {
-        return None;
-    }
-    let mut output = String::new();
-    child
-        .stdout
-        .take()?
-        .take(1_024)
-        .read_to_string(&mut output)
-        .ok()?;
-    if output.trim().is_empty()
-        && let Some(stderr) = child.stderr.take()
-    {
-        stderr.take(1_024).read_to_string(&mut output).ok()?;
-    }
-    let output = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stdout = stdout_reader.join().ok()?;
+    let stderr = stderr_reader.join().ok()?;
+    status.success().then_some((stdout, stderr))
+}
+
+fn run_bounded_command(
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Option<String> {
+    let (stdout, stderr) = run_command_with_deadline(cwd, program, args, deadline)?;
+    let output = if stdout.is_empty() { stderr } else { stdout };
+    let output = String::from_utf8_lossy(&output)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     (!output.is_empty()).then(|| truncate_text(&output, DYNAMIC_COMMAND_MAX_CHARS))
 }
 
-fn read_repository_invariants(cwd: &Path, max_chars: Option<usize>) -> Option<String> {
-    let repo_root = discover_git_root(cwd);
-    let context_root = repo_root.as_deref().unwrap_or(cwd);
+fn read_repository_invariants(
+    cwd: &Path,
+    repository_root: Option<&Path>,
+    max_chars: Option<usize>,
+) -> Option<String> {
+    let context_root = repository_root.unwrap_or(cwd);
     let path = context_root.join(REPOSITORY_INVARIANTS_FILE);
     let contents = fs::read_to_string(path).ok()?;
     let contents = contents.trim();
@@ -26854,13 +26914,26 @@ fn truncate_repository_invariants(contents: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn run_repository_command(
+    cwd: &Path,
+    args: &[&str],
+    deadline: Instant,
+    max_output_bytes: usize,
+) -> Option<String> {
+    let (stdout, _) = run_command_with_deadline(cwd, "git", args, deadline)?;
+    String::from_utf8(stdout)
+        .ok()
+        .map(|output| output.chars().take(max_output_bytes).collect::<String>())
+        .map(|output| output.trim().to_string())
+}
+
 fn build_repository_context_parts(
     cwd: &Path,
+    repository_root: Option<&Path>,
     repository_instructions_max_chars: Option<usize>,
     git_status_max_chars: usize,
 ) -> (String, String) {
-    let repo_root = discover_git_root(cwd);
-    let context_root = repo_root.as_deref().unwrap_or(cwd);
+    let context_root = repository_root.unwrap_or(cwd);
 
     let mut stable_lines = vec!["Stable repository context:".to_string()];
     stable_lines.push(format!(
@@ -26889,15 +26962,22 @@ fn build_repository_context_parts(
         "Dynamic repository context:".to_string(),
         format!("* Current directory: {}", display(cwd, cwd)),
     ];
-    if let Some(repo_root) = &repo_root {
-        dynamic_lines.push(format!("* Git root: {}", display(repo_root, cwd)));
+    if let Some(repository_root) = repository_root {
+        dynamic_lines.push(format!("* Git root: {}", display(repository_root, cwd)));
     }
-    if let Some(branch) = run_command(context_root, "git", &["branch", "--show-current"][..])
+    let deadline = Instant::now() + REPOSITORY_CONTEXT_COMMAND_BUDGET;
+    if let Some(branch) =
+        run_repository_command(context_root, &["branch", "--show-current"], deadline, 4_096)
         && !branch.is_empty()
     {
         dynamic_lines.push(format!("* Git branch: {branch}"));
     }
-    if let Some(status) = run_command(context_root, "git", &["status", "--short"][..]) {
+    if let Some(status) = run_repository_command(
+        context_root,
+        &["status", "--short"],
+        deadline,
+        git_status_max_chars.saturating_mul(4).max(4_096),
+    ) {
         let status = truncate_git_status(&status, git_status_max_chars);
         dynamic_lines.push(format!(
             "* Git status:\n{}",
@@ -26909,23 +26989,14 @@ fn build_repository_context_parts(
 }
 
 fn discover_git_root(cwd: &Path) -> Option<PathBuf> {
-    run_command(cwd, "git", &["rev-parse", "--show-toplevel"][..])
-        .filter(|root| !root.is_empty())
-        .map(PathBuf::from)
-}
-
-fn run_command(cwd: &Path, program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_string())
+    run_repository_command(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        Instant::now() + REPOSITORY_CONTEXT_COMMAND_TIMEOUT,
+        4_096,
+    )
+    .filter(|root| !root.is_empty())
+    .map(PathBuf::from)
 }
 
 fn truncate_git_status(status: &str, max_chars: usize) -> String {
@@ -49248,6 +49319,7 @@ library = "test"
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (stable, dynamic) = build_coding_system_prompt_parts(
             &cwd,
+            discover_git_root(&cwd).as_deref(),
             &bcode_config::SystemPromptConfig::default(),
             true,
             Some("agent suffix"),
@@ -49273,8 +49345,14 @@ library = "test"
             ..bcode_config::SystemPromptSectionsConfig::default()
         };
 
-        let dynamic =
-            build_dynamic_system_context(&cwd, &sections, "plan", Some("read_only"), Some("dev"));
+        let dynamic = build_dynamic_system_context(
+            &cwd,
+            None,
+            &sections,
+            "plan",
+            Some("read_only"),
+            Some("dev"),
+        );
 
         assert!(dynamic.contains("Execution environment:"));
         assert!(dynamic.contains("Hosting environment:"));
@@ -49291,7 +49369,9 @@ library = "test"
         sections.runtime_mode = false;
         sections.worktree_context = false;
         sections.config_profile = false;
-        assert!(build_dynamic_system_context(&cwd, &sections, "build", None, None).is_empty());
+        assert!(
+            build_dynamic_system_context(&cwd, None, &sections, "build", None, None).is_empty()
+        );
     }
 
     #[test]
@@ -49318,7 +49398,7 @@ library = "test"
             ..bcode_config::SystemPromptConfig::default()
         };
 
-        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, false, None, None);
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, None, &config, false, None, None);
         let datetime = format_datetime_context("2026-01-02T03:04:05+00:00", "UTC", "+00:00");
 
         assert!(stable.starts_with("custom base"));
@@ -49338,6 +49418,7 @@ library = "test"
 
         let (stable, _) = build_coding_system_prompt_parts(
             &cwd,
+            Some(&cwd),
             &bcode_config::SystemPromptConfig::default(),
             true,
             None,
@@ -49359,7 +49440,7 @@ library = "test"
             ..bcode_config::SystemPromptConfig::default()
         };
 
-        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, true, None, None);
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, None, &config, true, None, None);
 
         assert!(stable.contains("[truncated]"));
         assert!(stable.contains("Repository invariants truncated"));
@@ -49379,7 +49460,8 @@ library = "test"
         config.sections.agent_suffix = false;
         config.sections.skill_catalog = false;
 
-        let (stable, dynamic) = build_coding_system_prompt_parts(&cwd, &config, true, None, None);
+        let (stable, dynamic) =
+            build_coding_system_prompt_parts(&cwd, None, &config, true, None, None);
 
         assert!(stable.starts_with("custom base"));
         assert!(stable.contains("Repository invariants:"));
@@ -49393,7 +49475,7 @@ library = "test"
         let mut config = bcode_config::SystemPromptConfig::default();
         config.sections.repository_invariants = false;
 
-        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, true, None, None);
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, None, &config, true, None, None);
 
         assert!(!stable.contains("Repository invariants:"));
         assert!(stable.contains("Stable repository context:"));
@@ -49426,7 +49508,7 @@ library = "test"
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = bcode_config::SystemPromptConfig::default();
 
-        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, false, None, None);
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, None, &config, false, None, None);
 
         assert!(!stable.contains("Repository invariants:"));
         assert!(!stable.contains("Shared rendering remains renderer-neutral"));
