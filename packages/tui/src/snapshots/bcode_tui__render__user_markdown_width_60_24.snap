@@ -27,8 +27,8 @@ expression: output.trim_end()
 00 │ You
 01 │   Request
 02 │   
-03 │   Please update src/lib.
-04 │   rs with care.
+03 │   Please update 
+04 │   src/lib.rs with care.
 05 │   
 06 │   1.  Read the file.
 07 │   2.  Run:
@@ -37,8 +37,8 @@ expression: output.trim_end()
 10 │       │ cargo test
 11 │       └─
 12 │   
-13 │   │ Keep the change focu
-14 │   │ sed.
+13 │   │ Keep the change 
+14 │   │ focused.
 15 │   
 16 │   ┌───────┬──────────┐
 17 │   │ Check │ State    │

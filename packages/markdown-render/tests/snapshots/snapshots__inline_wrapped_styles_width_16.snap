@@ -2,6 +2,6 @@
 source: packages/markdown-render/tests/snapshots.rs
 expression: "styled_snapshot(\"**strong text wraps** and [linked text wraps](https://example.com)\",\n16)"
 ---
-00 │ [bold]strong text wrap[/]
-01 │ [bold]s[/] and [fg=blue,underline]linked tex[/]
-02 │ [fg=blue,underline]t wraps[/]
+00 │ [bold]strong text [/]
+01 │ [bold]wraps[/] and [fg=blue,underline]linked[/]
+02 │ [fg=blue,underline]text wraps[/]

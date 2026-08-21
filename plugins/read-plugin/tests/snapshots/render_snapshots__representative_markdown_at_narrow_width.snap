@@ -7,10 +7,10 @@ expression: "render(r#\"# Narrow\n\nA paragraph with **strong text**, *emphasis*
 02 │ A paragraph with strong
 03 │ text, emphasis, a link,
 04 │ inline code, and Unicode
-05 │  🦀 café.
+05 │ 🦀 café.
 06 │
-07 │ │ quoted words wrap safe
-08 │ │ ly
+07 │ │ quoted words wrap
+08 │ │ safely
 09 │
 10 │ •  ☑ complete
 11 │ •  ☐ pending

@@ -52,6 +52,33 @@ pub struct TranscriptContainerRecipe {
     pub padding_y: u16,
 }
 
+/// How overflowing container content must be re-wrapped.
+///
+/// This re-wrap is a defensive clamp: entry producers already wrap to the
+/// resolved content width, so it only applies to rows that still overflow.
+/// `ColumnExact` is the safe default because reflowing already-wrapped rows at
+/// word boundaries would discard the producer's chosen line breaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TranscriptContainerContent {
+    /// Column-significant or already-wrapped rows; clamp at grapheme boundaries.
+    #[default]
+    ColumnExact,
+    /// Unwrapped prose supplied directly to the container; wrap at word
+    /// boundaries.
+    Prose,
+}
+
+impl TranscriptContainerContent {
+    /// Return the wrapping policy for this content kind.
+    #[must_use]
+    pub const fn wrap(self) -> bmux_tui::text::TextWrap {
+        match self {
+            Self::Prose => bmux_tui::text::TextWrap::Word,
+            Self::ColumnExact => bmux_tui::text::TextWrap::Character,
+        }
+    }
+}
+
 /// One resolved transcript container recipe and semantic style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranscriptContainerStyle {
@@ -65,11 +92,32 @@ pub struct TranscriptContainerStyle {
 ///
 /// The caller retains ownership of transcript semantics and supplies only the
 /// already-rendered entry rows plus resolved presentation.
+///
+/// Rows that still overflow the resolved interior are clamped at grapheme
+/// boundaries, preserving the line breaks the entry producer already chose. Use
+/// [`apply_transcript_container_with_content`] to word-wrap unwrapped prose.
 pub fn apply_transcript_container(
     rows: &mut Vec<Line>,
     start: usize,
     presentation: TranscriptContainerStyle,
     width: u16,
+) {
+    apply_transcript_container_with_content(
+        rows,
+        start,
+        presentation,
+        width,
+        TranscriptContainerContent::ColumnExact,
+    );
+}
+
+/// Compose one transcript entry, choosing how overflow is re-wrapped.
+pub fn apply_transcript_container_with_content(
+    rows: &mut Vec<Line>,
+    start: usize,
+    presentation: TranscriptContainerStyle,
+    width: u16,
+    content: TranscriptContainerContent,
 ) {
     if matches!(presentation.recipe.layout, TranscriptContainerLayout::Plain) || start >= rows.len()
     {
@@ -131,7 +179,10 @@ pub fn apply_transcript_container(
         let wrapped = if content_width == 0 {
             vec![Line::new()]
         } else {
-            line.wrap_character(content_width)
+            line.wrap(
+                bmux_tui::text::TextWrapGeometry::uniform(content_width),
+                content.wrap(),
+            )
         };
         for line in wrapped {
             container_rows.push(container_content_line(

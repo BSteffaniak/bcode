@@ -13,17 +13,17 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 07 │ 
 08 │ Malformed $unterminated math remains source text.
 == width 24 ==
-00 │ Inline [fg=yellow]x² + α × y₁ ≤ ∞[/] a
-01 │ nd escaped [fg=yellow]n²[/].
+00 │ Inline [fg=yellow]x² + α × y₁ ≤ ∞[/] 
+01 │ and escaped [fg=yellow]n²[/].
 02 │ 
 03 │ [fg=bright-black]┌─ text[/]
 04 │ [fg=bright-black]│ [/][fg=yellow]∑_{i=1}ⁿ i²[/]
 05 │ [fg=bright-black]└─[/]
 06 │ 
 07 │ Unsupported [fg=yellow]\frac{a}{b} [/]
-08 │ [fg=yellow]+ q^{word}[/] remains faith
-09 │ ful.
+08 │ [fg=yellow]+ q^{word}[/] remains 
+09 │ faithful.
 10 │ 
 11 │ Malformed $unterminated 
-12 │ math remains source text
-13 │ .
+12 │ math remains source 
+13 │ text.

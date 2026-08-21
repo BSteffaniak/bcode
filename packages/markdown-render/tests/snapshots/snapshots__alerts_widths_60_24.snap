@@ -10,8 +10,8 @@ expression: "[60_u16,\n24].into_iter().map(|width|\n{\n    format!(\"== complete
 04 │ [fg=green]│ [/] A useful tip.
 05 │ 
 06 │ [fg=magenta]│ [/][fg=magenta,bold]❗ IMPORTANT[/]
-07 │ [fg=magenta]│ [/] Important [fg=yellow]code[/] wraps across a sufficiently na
-08 │ [fg=magenta]│ [/]rrow terminal width.
+07 │ [fg=magenta]│ [/] Important [fg=yellow]code[/] wraps across a sufficiently 
+08 │ [fg=magenta]│ [/]narrow terminal width.
 09 │ [fg=magenta]│ [/]
 10 │ [fg=magenta]│ [/][fg=bright-black]•  [/]nested list item
 11 │ [fg=magenta]│ [/][fg=bright-black]•  [/][fg=blue,underline]documentation[/]
@@ -40,51 +40,52 @@ expression: "[60_u16,\n24].into_iter().map(|width|\n{\n    format!(\"== complete
 01 │ [fg=yellow]│ [/] Streaming alert body with **incomplete emphasis
 == complete width 24 ==
 00 │ [fg=blue]│ [/][fg=blue,bold]ⓘ NOTE[/]
-01 │ [fg=blue]│ [/] A note with [bold]st[/]
-02 │ [fg=blue]│ [/][bold]rong[/] text and Unicode 
-03 │ [fg=blue]│ [/]東京.
+01 │ [fg=blue]│ [/] A note with 
+02 │ [fg=blue]│ [/][bold]strong[/] text and 
+03 │ [fg=blue]│ [/]Unicode 東京.
 04 │ 
 05 │ [fg=green]│ [/][fg=green,bold]◆ TIP[/]
 06 │ [fg=green]│ [/] A useful tip.
 07 │ 
 08 │ [fg=magenta]│ [/][fg=magenta,bold]❗ IMPORTANT[/]
 09 │ [fg=magenta]│ [/] Important
-10 │ [fg=magenta]│ [/] [fg=yellow]code[/] wraps across a s
-11 │ [fg=magenta]│ [/]ufficiently narrow ter
-12 │ [fg=magenta]│ [/]minal width.
+10 │ [fg=magenta]│ [/][fg=yellow]code[/] wraps across a 
+11 │ [fg=magenta]│ [/]sufficiently narrow 
+12 │ [fg=magenta]│ [/]terminal width.
 13 │ [fg=magenta]│ [/]
 14 │ [fg=magenta]│ [/][fg=bright-black]•  [/]nested list item
 15 │ [fg=magenta]│ [/][fg=bright-black]•  [/][fg=blue,underline]documentation[/]
 16 │ [fg=magenta]│ [/]
 17 │ [fg=magenta]│ [/][fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
-18 │ [fg=magenta]│ [/][fg=yellow]│ [/] Nested wa
-19 │ [fg=magenta]│ [/][fg=yellow]│ [/]rning.
+18 │ [fg=magenta]│ [/][fg=yellow]│ [/] Nested 
+19 │ [fg=magenta]│ [/][fg=yellow]│ [/]warning.
 20 │ 
 21 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
-22 │ [fg=yellow]│ [/] Warning tex
-23 │ [fg=yellow]│ [/]t.
+22 │ [fg=yellow]│ [/] Warning 
+23 │ [fg=yellow]│ [/]text.
 24 │ 
 25 │ [fg=red]│ [/][fg=red,bold]⛔ CAUTION[/]
-26 │ [fg=red]│ [/] Caution tex
-27 │ [fg=red]│ [/]t.
+26 │ [fg=red]│ [/] Caution 
+27 │ [fg=red]│ [/]text.
 28 │ 
 29 │ [fg=bright-black]•  [/]List context:
 30 │ [fg=bright-black]   [/]
 31 │ [fg=bright-black]   [/][fg=green]│ [/][fg=green,bold]◆ TIP[/]
 32 │ [fg=bright-black]   [/][fg=green]│ [/] Alert inside
-33 │ [fg=bright-black]   [/][fg=green]│ [/] a list item.
+33 │ [fg=bright-black]   [/][fg=green]│ [/]a list item.
 34 │ 
-35 │ [fg=bright-black]│ [/][!UNKNOWN] This remain
-36 │ [fg=bright-black]│ [/]s an ordinary quote.
-37 │ 
-38 │ [fg=bright-black]│ [/][!NOTE] trailing text 
-39 │ [fg=bright-black]│ [/]is not an alert marker
-40 │ 
-41 │ [fg=bright-black]│ [/][!NOTE Incomplete mark
-42 │ [fg=bright-black]│ [/]er remains an ordinary
-43 │ [fg=bright-black]│ [/] quote.
+35 │ [fg=bright-black]│ [/][!UNKNOWN] This 
+36 │ [fg=bright-black]│ [/]remains an ordinary 
+37 │ [fg=bright-black]│ [/]quote.
+38 │ 
+39 │ [fg=bright-black]│ [/][!NOTE] trailing text 
+40 │ [fg=bright-black]│ [/]is not an alert marker
+41 │ 
+42 │ [fg=bright-black]│ [/][!NOTE Incomplete 
+43 │ [fg=bright-black]│ [/]marker remains an 
+44 │ [fg=bright-black]│ [/]ordinary quote.
 == streaming width 24 ==
 00 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
-01 │ [fg=yellow]│ [/] Streaming a
-02 │ [fg=yellow]│ [/]lert body with **incom
-03 │ [fg=yellow]│ [/]plete emphasis
+01 │ [fg=yellow]│ [/] Streaming 
+02 │ [fg=yellow]│ [/]alert body with 
+03 │ [fg=yellow]│ [/]**incomplete emphasis

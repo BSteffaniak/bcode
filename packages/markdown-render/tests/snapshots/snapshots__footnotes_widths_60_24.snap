@@ -14,20 +14,20 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 08 │ [fg=bright-black]    [/]Unicode 東京 🧪. ↩
 09 │ [fg=bright-black]3.  [/]Unreferenced definition.
 == width 24 ==
-00 │ First[1], repeated[1], a
-01 │ nd second[2]. Missing[3]
-02 │ .
+00 │ First[1], repeated[1], 
+01 │ and second[2]. 
+02 │ Missing[3].
 03 │ 
 04 │ [fg=bright-black]────────────────────────[/]
 05 │ 
 06 │ Footnotes
 07 │ 
-08 │ [fg=bright-black]1.  [/]First definition ove
-09 │ [fg=bright-black]    [/]r multiple lines. ↩×
-10 │ [fg=bright-black]    [/]2
-11 │ [fg=bright-black]2.  [/]Second definition wi
-12 │ [fg=bright-black]    [/]th [bold]strong[/] text, [italic]emph[/]
-13 │ [fg=bright-black]    [/][italic]asis[/], [fg=yellow]code[/], and Unic
-14 │ [fg=bright-black]    [/]ode 東京 🧪. ↩
-15 │ [fg=bright-black]3.  [/]Unreferenced definit
-16 │ [fg=bright-black]    [/]ion.
+08 │ [fg=bright-black]1.  [/]First definition 
+09 │ [fg=bright-black]    [/]over multiple lines.
+10 │ [fg=bright-black]    [/]↩×2
+11 │ [fg=bright-black]2.  [/]Second definition 
+12 │ [fg=bright-black]    [/]with [bold]strong[/] text, 
+13 │ [fg=bright-black]    [/][italic]emphasis[/], [fg=yellow]code[/], and 
+14 │ [fg=bright-black]    [/]Unicode 東京 🧪. ↩
+15 │ [fg=bright-black]3.  [/]Unreferenced 
+16 │ [fg=bright-black]    [/]definition.

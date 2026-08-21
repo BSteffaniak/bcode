@@ -1179,7 +1179,13 @@ fn assign_selection_geometry(
         for grapheme in visible.graphemes(true) {
             let source_range = source_offset..source_offset.saturating_add(grapheme.len());
             source_offset = source_range.end;
-            if matches!(grapheme, "\n" | "\r\n") {
+            // Line breaks carry no display cell. Whitespace consumed by wrapping
+            // is the same case: searching forward for it would mis-map the unit
+            // onto an unrelated cell such as a blockquote or list prefix.
+            if matches!(grapheme, "\n" | "\r\n")
+                || grapheme.chars().all(char::is_whitespace)
+                    && !display.starts_with_at(grapheme, search_from)
+            {
                 projected.push(MarkdownSelectionProvenance {
                     source_ranges: vec![source_range],
                     rects: Vec::new(),
@@ -1912,6 +1918,17 @@ impl DisplayedMarkdown {
             }
         }
         Self { text, cells }
+    }
+
+    /// Return whether `target` sits exactly at `from` in the display text.
+    ///
+    /// Provenance walks graphemes in source order, so an exact match at the
+    /// current search position distinguishes a rendered grapheme from one the
+    /// renderer consumed (for example whitespace absorbed by a wrap break).
+    fn starts_with_at(&self, target: &str, from: usize) -> bool {
+        self.text
+            .get(from..)
+            .is_some_and(|suffix| suffix.starts_with(target))
     }
 
     fn find_geometry(
@@ -3550,12 +3567,31 @@ impl TextStyle {
     }
 }
 
+/// Position of an in-progress word inside the row being emitted.
+///
+/// A word can begin partway through a span because same-style graphemes are
+/// coalesced, so the anchor records a byte offset as well as a span index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WordAnchor {
+    /// Index of the span containing the word start.
+    span_index: usize,
+    /// Byte offset of the word start within that span.
+    byte_offset: usize,
+    /// Display column where the word starts.
+    column: usize,
+}
+
 #[derive(Debug)]
 struct TerminalMarkdownRenderer {
     width: usize,
     rows: Vec<Line>,
     current_spans: Vec<Span>,
     current_width: usize,
+    /// Start of the in-progress word on the current row, as
+    /// `(index into current_spans, starting display column)`.
+    ///
+    /// `None` means no word is open, so the next break may happen freely.
+    word_start: Option<WordAnchor>,
     geometry: Rc<RefCell<Vec<MarkdownContributionGeometry>>>,
     heading_rows: Rc<RefCell<Vec<u16>>>,
     origin_x: usize,
@@ -3586,6 +3622,7 @@ impl TerminalMarkdownRenderer {
             rows: Vec::new(),
             current_spans: Vec::new(),
             current_width: 0,
+            word_start: None,
             geometry: Rc::new(RefCell::new(Vec::new())),
             heading_rows: Rc::new(RefCell::new(Vec::new())),
             origin_x: 0,
@@ -3608,6 +3645,7 @@ impl TerminalMarkdownRenderer {
             rows: Vec::new(),
             current_spans: Vec::new(),
             current_width: 0,
+            word_start: None,
             geometry: Rc::clone(&self.geometry),
             heading_rows: Rc::clone(&self.heading_rows),
             origin_x,
@@ -4175,6 +4213,8 @@ impl TerminalMarkdownRenderer {
     }
 
     fn flush_line(&mut self) {
+        // Any row break ends the in-progress word.
+        self.word_start = None;
         if self.current_spans.is_empty() {
             return;
         }
@@ -4187,9 +4227,12 @@ impl TerminalMarkdownRenderer {
         for segment in text.split_inclusive('\n') {
             let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
             if style.preserve_whitespace {
-                self.push_wrapped_text(without_newline, style.style);
+                self.push_character_wrapped_text(without_newline, style.style);
             } else {
-                self.push_wrapped_text(&normalize_inline_whitespace(without_newline), style.style);
+                self.push_word_wrapped_text(
+                    &normalize_inline_whitespace(without_newline),
+                    style.style,
+                );
             }
             if segment.ends_with('\n') {
                 self.flush_line();
@@ -4197,7 +4240,28 @@ impl TerminalMarkdownRenderer {
         }
     }
 
-    fn push_wrapped_text(&mut self, text: &str, style: Style) {
+    /// Append `content` to the current row, merging into the previous span when
+    /// its style matches.
+    ///
+    /// Coalescing keeps one span per styled run instead of one span per
+    /// grapheme, which bounds the cost of every later span walk.
+    fn push_merged_span(&mut self, content: &str, style: Style) {
+        if let Some(last) = self.current_spans.last_mut()
+            && last.style == style
+        {
+            last.content.push_str(content);
+        } else {
+            self.current_spans
+                .push(Span::styled(content.to_owned(), style));
+        }
+        self.current_width = self
+            .current_width
+            .saturating_add(text_display_width(content));
+    }
+
+    /// Wrap at grapheme boundaries, for column-significant content such as
+    /// fenced code blocks where word boundaries must be ignored.
+    fn push_character_wrapped_text(&mut self, text: &str, style: Style) {
         for grapheme in text.graphemes(true) {
             let grapheme_width = text_display_width(grapheme);
             if self.current_width > 0
@@ -4205,10 +4269,108 @@ impl TerminalMarkdownRenderer {
             {
                 self.flush_line();
             }
-            self.current_spans
-                .push(Span::styled(grapheme.to_owned(), style));
-            self.current_width = self.current_width.saturating_add(grapheme_width);
+            self.push_merged_span(grapheme, style);
         }
+    }
+
+    /// Wrap at word boundaries, keeping words intact across style changes.
+    ///
+    /// The in-progress word is tracked by its exact position in the current row
+    /// rather than buffered aside, so `self.rows` and `self.current_width` stay
+    /// accurate for the geometry and selection-provenance readers that observe
+    /// them immediately after emission.
+    fn push_word_wrapped_text(&mut self, text: &str, style: Style) {
+        for grapheme in text.graphemes(true) {
+            let grapheme_width = text_display_width(grapheme);
+            let whitespace = !grapheme.is_empty() && grapheme.chars().all(char::is_whitespace);
+
+            if whitespace {
+                // Whitespace terminates the current word.
+                self.word_start = None;
+                // Prefer keeping the separator at the END of this row: every
+                // source grapheme must retain a display cell for selection
+                // provenance, and a continuation row must never begin with
+                // wrapped whitespace. When it cannot fit, break instead so the
+                // row never exceeds the requested width.
+                if self.current_width > 0
+                    && self.current_width.saturating_add(grapheme_width) > self.width
+                {
+                    self.flush_line();
+                    continue;
+                }
+                self.push_merged_span(grapheme, style);
+                continue;
+            }
+
+            if self.word_start.is_none() {
+                // Anchor the word at the exact current position. When the last
+                // span shares this style the grapheme will merge into it, so
+                // record the byte offset where the word begins inside it.
+                self.word_start = Some(match self.current_spans.last() {
+                    Some(last) if last.style == style => WordAnchor {
+                        span_index: self.current_spans.len().saturating_sub(1),
+                        byte_offset: last.content.len(),
+                        column: self.current_width,
+                    },
+                    _ => WordAnchor {
+                        span_index: self.current_spans.len(),
+                        byte_offset: 0,
+                        column: self.current_width,
+                    },
+                });
+            }
+
+            if self.current_width > 0
+                && self.current_width.saturating_add(grapheme_width) > self.width
+            {
+                // Move the whole word down when it began partway into this row;
+                // otherwise it spans the full width and must break mid-word.
+                let moved = match self.word_start {
+                    Some(anchor) if anchor.column > 0 => self.take_word_from(anchor),
+                    _ => Vec::new(),
+                };
+                self.flush_line();
+                for span in moved {
+                    self.push_merged_span(&span.content, span.style);
+                }
+                self.word_start = Some(WordAnchor {
+                    span_index: 0,
+                    byte_offset: 0,
+                    column: 0,
+                });
+            }
+            self.push_merged_span(grapheme, style);
+        }
+    }
+
+    /// Remove and return the in-progress word from the current row.
+    ///
+    /// Splitting is byte-precise because [`Self::push_merged_span`] coalesces
+    /// same-style graphemes, so a word can begin partway through a span.
+    fn take_word_from(&mut self, anchor: WordAnchor) -> Vec<Span> {
+        if anchor.span_index >= self.current_spans.len() {
+            return Vec::new();
+        }
+        let mut moved = self.current_spans.split_off(anchor.span_index);
+        if anchor.byte_offset > 0 {
+            let first = &mut moved[0];
+            if anchor.byte_offset < first.content.len() {
+                let tail = first.content.split_off(anchor.byte_offset);
+                let style = first.style;
+                let head = std::mem::replace(&mut first.content, tail);
+                self.current_spans.push(Span::styled(head, style));
+            } else {
+                // The anchor covers this whole span; it stays in place.
+                let retained = moved.remove(0);
+                self.current_spans.push(retained);
+            }
+        }
+        let moved_width: usize = moved
+            .iter()
+            .map(|span| text_display_width(&span.content))
+            .sum();
+        self.current_width = self.current_width.saturating_sub(moved_width);
+        moved
     }
 }
 
@@ -5096,6 +5258,55 @@ mod tests {
             ) && super::markdown_contribution_selection_fallback(&contribution.kind)
                 == super::MarkdownSelectionFallback::ExactSource
         }));
+    }
+
+    #[test]
+    fn wrapped_rows_coalesce_spans_per_styled_run() {
+        // Emitting one span per grapheme made every later span walk (geometry,
+        // width measurement, frame writes) scale with cell count instead of
+        // styled runs. Rows must carry one span per styled run.
+        let body = "This is a representative paragraph of assistant prose that wraps across \
+                    several terminal rows when rendered at a normal transcript width, and it \
+                    contains **strong text** plus `inline code` and a \
+                    [link](https://example.com).\n\n";
+        let source = body.repeat(8);
+
+        for width in [24_u16, 60, 80, 120] {
+            let rendered = render_markdown(&source, &MarkdownRenderOptions::new(width));
+            let spans: usize = rendered.lines.iter().map(|line| line.spans.len()).sum();
+            let optimal: usize = rendered
+                .lines
+                .iter()
+                .map(|line| {
+                    let mut runs = 0usize;
+                    let mut previous: Option<Style> = None;
+                    for span in &line.spans {
+                        if previous != Some(span.style) {
+                            runs = runs.saturating_add(1);
+                            previous = Some(span.style);
+                        }
+                    }
+                    runs
+                })
+                .sum();
+
+            assert_eq!(
+                spans, optimal,
+                "width {width}: rows must hold one span per styled run, got {spans} spans \
+                 where {optimal} styled runs exist"
+            );
+
+            let cells: usize = rendered
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.graphemes(true).count())
+                .sum();
+            assert!(
+                spans < cells / 4,
+                "width {width}: span count {spans} must stay far below cell count {cells}"
+            );
+        }
     }
 
     #[test]

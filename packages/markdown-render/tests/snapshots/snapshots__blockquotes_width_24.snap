@@ -3,9 +3,9 @@ source: packages/markdown-render/tests/snapshots.rs
 expression: "visible_snapshot(BLOCKQUOTES, 24)"
 ---
 00 │ │ outer line that wraps 
-01 │ │ because it is delibera
-02 │ │ tely long for the cons
-03 │ │ trained width
+01 │ │ because it is 
+02 │ │ deliberately long for 
+03 │ │ the constrained width
 04 │ │ 
 05 │ │ second paragraph
 06 │ │ 

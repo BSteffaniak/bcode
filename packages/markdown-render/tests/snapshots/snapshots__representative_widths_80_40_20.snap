@@ -39,15 +39,15 @@ expression: "[\"== width 80 ==\", &visible_snapshot(COMPOSITION, 80), \"== width
 == width 20 ==
 00 │ Summary
 01 │ 
-02 │ Read the guide befor
-03 │ e continuing.
+02 │ Read the guide 
+03 │ before continuing.
 04 │ 
 05 │ •  Review important 
 06 │    details
 07 │ •  Run cargo test
 08 │ 
-09 │ │ Keep output readab
-10 │ │ le.
+09 │ │ Keep output 
+10 │ │ readable.
 11 │ 
 12 │ Item: renderer
 13 │ State: ready

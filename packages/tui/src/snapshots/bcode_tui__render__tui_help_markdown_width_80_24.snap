@@ -6,29 +6,33 @@ expression: snapshot.trim_end()
 00 │ System
 01 │   TUI help
 02 │   
-03 │   •  Use the command palette for sessions, plugin commands, cancellation, and co
-04 │      ntext compaction.
-05 │   •  Transcript scrolling, composer history, session picker, and permissions hon
-06 │      or configured keybindings where wired.
+03 │   •  Use the command palette for sessions, plugin commands, cancellation, and 
+04 │      context compaction.
+05 │   •  Transcript scrolling, composer history, session picker, and permissions 
+06 │      honor configured keybindings where wired.
 07 │   •  In permission dialogs, approve or deny directly, or move focus and confirm.
 08 │ 
 == width 24 ==
 00 │ System
 01 │   TUI help
 02 │   
-03 │   •  Use the command pal
-04 │      ette for sessions, 
-05 │      plugin commands, ca
-06 │      ncellation, and con
-07 │      text compaction.
-08 │   •  Transcript scrollin
-09 │      g, composer history
-10 │      , session picker, a
-11 │      nd permissions hono
-12 │      r configured keybin
-13 │      dings where wired.
-14 │   •  In permission dialo
-15 │      gs, approve or deny
-16 │       directly, or move 
-17 │      focus and confirm.
-18 │
+03 │   •  Use the command 
+04 │      palette for 
+05 │      sessions, plugin 
+06 │      commands, 
+07 │      cancellation, and 
+08 │      context compaction.
+09 │   •  Transcript 
+10 │      scrolling, composer
+11 │      history, session 
+12 │      picker, and 
+13 │      permissions honor 
+14 │      configured 
+15 │      keybindings where 
+16 │      wired.
+17 │   •  In permission 
+18 │      dialogs, approve or
+19 │      deny directly, or 
+20 │      move focus and 
+21 │      confirm.
+22 │

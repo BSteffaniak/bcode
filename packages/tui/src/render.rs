@@ -143,6 +143,8 @@ fn apply_container_recipe(rows: &mut Vec<Line>, start: usize, layout: Transcript
     let Some(presentation) = layout.container else {
         return;
     };
+    // Entry producers already wrap to the resolved content width, so the
+    // container only clamps residual overflow and must not reflow their rows.
     bcode_tui_components::transcript::apply_transcript_container(
         rows,
         start,
@@ -5014,12 +5016,20 @@ fn push_wrapped_styled_text(
     }
 }
 
+/// Wrap `text` at word boundaries using an explicit per-row geometry.
+///
+/// Prose transcript text wraps at word boundaries; column-significant content
+/// uses the character-mode helper instead.
 fn wrap_text_with_continuation(
     text: &str,
     first_width: usize,
     continuation_width: usize,
 ) -> Vec<String> {
-    bmux_tui::text_width::wrap_text_with_continuation(text, first_width, continuation_width)
+    bmux_tui::text::wrap_text(
+        text,
+        bmux_tui::text::TextWrapGeometry::with_continuation(first_width, continuation_width),
+        bmux_tui::text::TextWrap::Word,
+    )
 }
 
 fn spans_width(spans: &[Span]) -> usize {

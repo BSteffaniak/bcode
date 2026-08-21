@@ -7,8 +7,8 @@ expression: snapshot
 01 │ │ fn main() {
 02 │ └─
 == inline ==
-00 │ Text with **unfinished emphasis and [unf
-01 │ inished link](https://example.com
+00 │ Text with **unfinished emphasis and 
+01 │ [unfinished link](https://example.com
 == structures ==
 00 │ ┌─────────┬───────┐
 01 │ │ Name    │ Value │

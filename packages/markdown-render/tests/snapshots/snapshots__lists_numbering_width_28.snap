@@ -5,17 +5,17 @@ expression: "visible_snapshot(LISTS_NUMBERING, 28)"
 00 │ 1.  starts at seven
 01 │ 2.  next item
 02 │ 3.  item with enough text to
-03 │      wrap beneath a multi-di
-04 │     git marker at narrow wid
-05 │     th
+03 │     wrap beneath a 
+04 │     multi-digit marker at 
+05 │     narrow width
 06 │ 4.  ten
 07 │ 5.  ordered parent
 08 │     
 09 │     •  unordered child
-10 │        1.  ordered grandchil
-11 │            d
+10 │        1.  ordered 
+11 │            grandchild
 12 │ 
 13 │ •  unordered parent
 14 │    1.  ordered child
-15 │        •  unordered grandchi
-16 │           ld
+15 │        •  unordered 
+16 │           grandchild

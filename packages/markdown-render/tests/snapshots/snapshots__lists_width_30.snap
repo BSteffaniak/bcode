@@ -3,9 +3,9 @@ source: packages/markdown-render/tests/snapshots.rs
 expression: "styled_snapshot(LISTS, 30)"
 ---
 00 │ [fg=bright-black]•  [/]first unordered item
-01 │ [fg=bright-black]•  [/]second item with enough tex
-02 │ [fg=bright-black]   [/]t to wrap at a constrained 
-03 │ [fg=bright-black]   [/]terminal width
+01 │ [fg=bright-black]•  [/]second item with enough 
+02 │ [fg=bright-black]   [/]text to wrap at a 
+03 │ [fg=bright-black]   [/]constrained terminal width
 04 │ [fg=bright-black]   •  [/]nested unordered
 05 │ 
 06 │ [fg=bright-black]1.  [/]first ordered

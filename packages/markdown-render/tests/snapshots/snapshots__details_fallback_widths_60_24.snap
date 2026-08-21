@@ -26,7 +26,7 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 02 │ [bold]Retry [/][fg=yellow,bold]algorithm[/]
 03 │ 
 04 │ Body with [italic]Markdown[/] and a
-05 │  list:
+05 │ list:
 06 │ 
 07 │ [fg=bright-black]•  [/]one
 08 │ [fg=bright-black]•  [/]two
@@ -35,8 +35,8 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 11 │ 
 12 │ Visible body.
 13 │ 
-14 │ <details data-unsupporte
-15 │ d="x">
+14 │ <details 
+15 │ data-unsupported="x">
 16 │ Missing summary remains 
 17 │ raw.
 18 │ </details>
