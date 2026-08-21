@@ -14648,99 +14648,6 @@ async fn handle_import_workflow(
     .await
 }
 
-async fn import_workflow_draft(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    request: bcode_ipc::ImportWorkflowDraftRequest,
-) -> Result<bcode_ipc::WorkflowDraftImportResult, ServerError> {
-    if request.collision_policy
-        != bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft
-    {
-        return Err(WorkflowStoreError::InvalidData(
-            "existing-workflow import requires require_existing_workflow_new_draft collision policy"
-                .to_string(),
-        )
-        .into());
-    }
-    let (preview, document) = workflow_operations::import_preview(
-        state,
-        format!("import-{request_id}"),
-        request.bundle,
-        request.workflow_id.clone(),
-        request.control,
-    )
-    .await?;
-    let compiled = preview.compilation.compiled.as_ref().ok_or_else(|| {
-        ServerError::WorkflowDefinitionUnsupported(
-            "import requires a successful compilation preview".to_string(),
-        )
-    })?;
-    state.authorize_local_workflow_application_operation(
-        client_id,
-        LocalWorkflowApplicationOperationRequest {
-            operation: bcode_workflow::WorkflowApplicationOperation::ImportDraft,
-            workflow_id: request.workflow_id.clone(),
-            draft_id: Some(request.draft_id.clone()),
-            revision: None,
-            preset_id: None,
-            producer: Some(document.producer.clone()),
-            requirements: compiled.requirements.clone(),
-            effects: compiled.effects.clone(),
-            activates: false,
-            executes: false,
-        },
-    )?;
-    let now = current_time_ms();
-    let draft = bcode_workflow_store::WorkflowDraft {
-        workflow_id: request.workflow_id.clone(),
-        draft_id: request.draft_id.clone(),
-        base_revision: None,
-        generation: 1,
-        checksum_sha256: document.source_digest_sha256()?,
-        producer: document.producer.clone(),
-        document,
-        created_at_ms: now,
-        updated_at_ms: now,
-    };
-    let result = {
-        let mut store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let workflow = store
-            .authored_workflow(&request.workflow_id)?
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "authored workflow not found: {}",
-                    request.workflow_id
-                ))
-            })?;
-        if store
-            .workflow_draft(&request.workflow_id, &request.draft_id)?
-            .is_some()
-        {
-            drop(store);
-            bcode_ipc::WorkflowDraftImportResult::DraftAlreadyExists {
-                workflow_id: request.workflow_id,
-                draft_id: request.draft_id,
-            }
-        } else {
-            let created = store.create_workflow_draft(&draft)?;
-            drop(store);
-            assert!(
-                created,
-                "draft absence was checked while holding the store lock"
-            );
-            bcode_ipc::WorkflowDraftImportResult::Imported {
-                workflow: authored_workflow_snapshot(workflow),
-                draft: Box::new(workflow_draft_snapshot(draft)),
-            }
-        }
-    };
-    Ok(result)
-}
-
 async fn handle_import_workflow_draft(
     request_id: u64,
     client_id: ClientId,
@@ -14748,7 +14655,13 @@ async fn handle_import_workflow_draft(
     writer: &SharedWriter,
     request: bcode_ipc::ImportWorkflowDraftRequest,
 ) -> Result<(), ServerError> {
-    let result = import_workflow_draft(request_id, client_id, state, request).await?;
+    let result = workflow_operations::import_draft(
+        state,
+        client_id,
+        format!("import-{request_id}"),
+        request,
+    )
+    .await?;
     send_response(
         writer,
         request_id,
@@ -37884,9 +37797,14 @@ mod tests {
             collision_policy: bcode_ipc::WorkflowImportCollisionPolicy::RequireNewWorkflow,
             control: bcode_ipc::WorkflowComputationControl::default(),
         };
-        let error = import_workflow_draft(2, ClientId::new(), &state, request)
-            .await
-            .expect_err("wrong collision policy");
+        let error = workflow_operations::import_draft(
+            &state,
+            ClientId::new(),
+            "import-2".to_string(),
+            request,
+        )
+        .await
+        .expect_err("wrong collision policy");
         assert!(error.to_string().contains("collision policy"));
         assert!(
             state
@@ -38585,9 +38503,14 @@ mod tests {
                 bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft,
             control: bcode_ipc::WorkflowComputationControl::default(),
         };
-        let first = import_workflow_draft(1, ClientId::new(), &state, request.clone())
-            .await
-            .expect("import");
+        let first = workflow_operations::import_draft(
+            &state,
+            ClientId::new(),
+            "import-1".to_string(),
+            request.clone(),
+        )
+        .await
+        .expect("import");
         let bcode_ipc::WorkflowDraftImportResult::Imported { workflow, draft } = first else {
             panic!("first import should create draft");
         };
@@ -38600,9 +38523,14 @@ mod tests {
         );
         assert_eq!(draft.producer.source_revision, Some(source_identity));
         assert!(matches!(
-            import_workflow_draft(2, ClientId::new(), &state, request)
-                .await
-                .expect("collision result"),
+            workflow_operations::import_draft(
+                &state,
+                ClientId::new(),
+                "import-2".to_string(),
+                request
+            )
+            .await
+            .expect("collision result"),
             bcode_ipc::WorkflowDraftImportResult::DraftAlreadyExists { .. }
         ));
         assert_eq!(

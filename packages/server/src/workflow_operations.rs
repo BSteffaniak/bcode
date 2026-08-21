@@ -1439,6 +1439,95 @@ pub async fn import_new_workflow(
     Ok((workflow, draft))
 }
 
+/// Persist a validated import as a new draft on an existing authored workflow.
+pub async fn import_draft(
+    state: &std::sync::Arc<ServerState>,
+    client_id: super::ClientId,
+    operation_id: String,
+    request: bcode_ipc::ImportWorkflowDraftRequest,
+) -> Result<bcode_ipc::WorkflowDraftImportResult, super::ServerError> {
+    if request.collision_policy
+        != bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft
+    {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "existing-workflow import requires require_existing_workflow_new_draft collision policy"
+                .to_string(),
+        )
+        .into());
+    }
+    let (preview, document) = import_preview(
+        state,
+        operation_id,
+        request.bundle,
+        request.workflow_id.clone(),
+        request.control,
+    )
+    .await?;
+    let compiled = preview.compilation.compiled.as_ref().ok_or_else(|| {
+        super::ServerError::WorkflowDefinitionUnsupported(
+            "import requires a successful compilation preview".to_string(),
+        )
+    })?;
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        super::LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::ImportDraft,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: Some(request.draft_id.clone()),
+            revision: None,
+            preset_id: None,
+            producer: Some(document.producer.clone()),
+            requirements: compiled.requirements.clone(),
+            effects: compiled.effects.clone(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let now = super::current_time_ms();
+    let draft = bcode_workflow_store::WorkflowDraft {
+        workflow_id: request.workflow_id.clone(),
+        draft_id: request.draft_id.clone(),
+        base_revision: None,
+        generation: 1,
+        checksum_sha256: document.source_digest_sha256()?,
+        producer: document.producer.clone(),
+        document,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let mut store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let workflow = store
+        .authored_workflow(&request.workflow_id)?
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
+                "authored workflow not found: {}",
+                request.workflow_id
+            ))
+        })?;
+    if store
+        .workflow_draft(&request.workflow_id, &request.draft_id)?
+        .is_some()
+    {
+        return Ok(bcode_ipc::WorkflowDraftImportResult::DraftAlreadyExists {
+            workflow_id: request.workflow_id,
+            draft_id: request.draft_id,
+        });
+    }
+    let created = store.create_workflow_draft(&draft)?;
+    drop(store);
+    assert!(
+        created,
+        "draft absence was checked while holding the store lock"
+    );
+    Ok(bcode_ipc::WorkflowDraftImportResult::Imported {
+        workflow: super::authored_workflow_snapshot(workflow),
+        draft: Box::new(super::workflow_draft_snapshot(draft)),
+    })
+}
+
 /// Return bounded workflow run summaries without transport framing.
 pub fn list_runs(
     state: &ServerState,
