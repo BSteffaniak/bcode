@@ -769,7 +769,7 @@ impl LoopSurface {
         state: &mut TextInputState,
         focused: bool,
         rows: u16,
-        theme: Option<PluginTuiTheme>,
+        theme: Option<&PluginTuiTheme>,
     ) {
         let styles = theme.map_or_else(TextInputBoxStyles::default, |theme| TextInputBoxStyles {
             text: theme.text,
@@ -859,7 +859,7 @@ impl PluginTuiSurface for LoopSurface {
             &mut self.prompt,
             self.field == Field::Prompt,
             self.prompt_area.height,
-            self.theme,
+            self.theme.as_ref(),
         );
         Self::render_input(
             self.condition_area,
@@ -868,7 +868,7 @@ impl PluginTuiSurface for LoopSurface {
             &mut self.condition,
             self.field == Field::Condition,
             self.condition_area.height,
-            self.theme,
+            self.theme.as_ref(),
         );
         Self::render_input(
             self.limit_area,
@@ -877,14 +877,14 @@ impl PluginTuiSurface for LoopSurface {
             &mut self.limit,
             self.field == Field::Limit,
             1,
-            self.theme,
+            self.theme.as_ref(),
         );
         let status_y = self.limit_area.bottom().saturating_add(1);
         if status_y < content.bottom() {
             let status = [StatusSegment::new(&self.status).severity(StatusSeverity::Muted)];
             StatusBar::new()
                 .left(&status)
-                .styles(loop_status_styles(self.theme))
+                .styles(loop_status_styles(self.theme.as_ref()))
                 .render(Rect::new(content.x, status_y, content.width, 1), frame);
         }
         let hints_y = status_y.saturating_add(1);
@@ -895,7 +895,7 @@ impl PluginTuiSurface for LoopSurface {
                 KeyHint::new("Esc", "close"),
             ];
             KeyHintBar::new(&hints)
-                .styles(loop_hint_styles(self.theme))
+                .styles(loop_hint_styles(self.theme.as_ref()))
                 .render(Rect::new(content.x, hints_y, content.width, 1), frame);
         }
     }
@@ -904,9 +904,9 @@ impl PluginTuiSurface for LoopSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<PluginTuiTheme>,
+        theme: Option<&PluginTuiTheme>,
     ) {
-        self.theme = theme;
+        self.theme = theme.copied();
         self.render(area, frame);
     }
 
@@ -980,7 +980,7 @@ impl PluginTuiSurface for LoopSurface {
     }
 }
 
-const fn loop_status_styles(theme: Option<PluginTuiTheme>) -> StatusBarStyles {
+const fn loop_status_styles(theme: Option<&PluginTuiTheme>) -> StatusBarStyles {
     match theme {
         Some(theme) => StatusBarStyles {
             default: theme.text,
@@ -1005,7 +1005,7 @@ const fn loop_status_styles(theme: Option<PluginTuiTheme>) -> StatusBarStyles {
     }
 }
 
-const fn loop_hint_styles(theme: Option<PluginTuiTheme>) -> KeyHintBarStyles {
+const fn loop_hint_styles(theme: Option<&PluginTuiTheme>) -> KeyHintBarStyles {
     match theme {
         Some(theme) => KeyHintBarStyles {
             key: theme.focused,
@@ -2024,7 +2024,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 80, 28);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
 
         assert_eq!(surface.theme, Some(theme));
         assert!(buffer.cells().iter().any(|cell| cell.style.bg == canvas.bg));

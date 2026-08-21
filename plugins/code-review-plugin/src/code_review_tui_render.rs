@@ -119,14 +119,14 @@ const fn fallback_review_diff_theme() -> bcode_plugin_sdk::tui::PluginTuiDiffThe
 pub fn render(
     app: &mut ReviewApp,
     frame: &mut Frame<'_>,
-    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
 ) {
     let area = frame.area();
     if area.is_empty() {
         return;
     }
 
-    let review_theme = theme.map_or_else(ReviewTheme::default, ReviewTheme::from);
+    let review_theme = theme.map_or_else(ReviewTheme::default, |theme| ReviewTheme::from(*theme));
     frame.fill(area, " ", review_theme.canvas);
     app.clear_mouse_regions();
     render_chrome(app, area, frame, review_theme);
@@ -278,7 +278,7 @@ fn render_main_content(
     app: &mut ReviewApp,
     area: Rect,
     frame: &mut Frame<'_>,
-    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     review_theme: ReviewTheme,
 ) {
     app.set_diff_area(area);
@@ -1697,7 +1697,7 @@ fn render_diff(
     app: &ReviewApp,
     area: Rect,
     frame: &mut Frame<'_>,
-    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     review_theme: ReviewTheme,
 ) {
     if area.is_empty() {
@@ -1735,7 +1735,7 @@ fn render_view_document(
     document: &ReviewViewDocument,
     area: Rect,
     frame: &mut Frame<'_>,
-    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     review_theme: ReviewTheme,
 ) {
     let syntax_highlighter = theme.map_or_else(SyntaxHighlighter::new, |theme| {
@@ -3899,7 +3899,7 @@ mod tests {
         app: &mut ReviewApp,
         width: u16,
         height: u16,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) -> String {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
         let mut frame = Frame::new(&mut buffer);
@@ -3924,7 +3924,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 100, 24);
         let mut buffer = Buffer::empty(area);
-        render(&mut app, &mut Frame::new(&mut buffer), Some(theme));
+        render(&mut app, &mut Frame::new(&mut buffer), Some(&theme));
         let popup = Rect::new(16, 3, 68, 18);
 
         assert_eq!(
@@ -3998,7 +3998,7 @@ mod tests {
         let mut app = crate::code_review_tui::tests::sample_app();
         let theme = terminal_native_theme();
 
-        let rendered = render_app_text_with_theme(&mut app, 100, 24, Some(theme));
+        let rendered = render_app_text_with_theme(&mut app, 100, 24, Some(&theme));
         assert!(rendered.contains("bcode review"));
     }
 

@@ -4574,11 +4574,10 @@ pub fn draw_chat_frame<W: Write>(
         }
         if let Some(surface) = &mut loop_state.plugin_surface {
             let area = frame.area();
-            surface.surface.render_with_theme(
-                area,
-                frame,
-                Some(render::plugin_theme_for_app(&chat.app)),
-            );
+            let plugin_theme = render::plugin_theme_for_app(&chat.app);
+            surface
+                .surface
+                .render_with_theme(area, frame, Some(&plugin_theme));
         }
         if let Some(picker) = &mut loop_state.provider_picker {
             super::provider_picker_render::render_provider_picker(picker, frame, theme);

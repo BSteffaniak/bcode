@@ -558,9 +558,9 @@ impl PluginTuiSurface for MetricsDashboardSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<PluginTuiTheme>,
+        theme: Option<&PluginTuiTheme>,
     ) {
-        ACTIVE_THEME.with(|active| active.set(theme));
+        ACTIVE_THEME.with(|active| active.set(theme.copied()));
         if let Some(theme) = theme {
             frame.fill(area, " ", theme.canvas);
         }
@@ -1245,7 +1245,7 @@ mod tests {
         let area = Rect::new(0, 0, 36, 14);
         let mut buffer = Buffer::empty(area);
         let theme = plugin_theme();
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
 
         assert!(
             buffer

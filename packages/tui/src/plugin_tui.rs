@@ -645,7 +645,7 @@ impl PluginTuiPresentation {
                 schema_version,
                 payload_revision,
                 width: context.width(),
-                theme_fingerprint: context.theme().map_or(0, theme_fingerprint),
+                theme_fingerprint: context.theme().as_ref().map_or(0, theme_fingerprint),
             };
             let response = {
                 let dynamic = self.dynamic_visuals.lock().ok()?;
@@ -655,7 +655,7 @@ impl PluginTuiPresentation {
                 return Some(RoutedTuiVisual {
                     render_mode: serialized_render_mode(&response, route.render_mode),
                     route,
-                    rows: serialized_visual_rows(&response, context.theme()),
+                    rows: serialized_visual_rows(&response, context.theme().as_ref()),
                     header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
                         title: response.title,
                         timeout_ms: response.timeout_ms,
@@ -678,7 +678,7 @@ impl PluginTuiPresentation {
                         width: context.width(),
                         diff_layout: format!("{:?}", context.diff_layout()),
                         working_directory: context.working_directory().map(ToOwned::to_owned),
-                        theme_fingerprint: context.theme().map_or(0, theme_fingerprint),
+                        theme_fingerprint: context.theme().as_ref().map_or(0, theme_fingerprint),
                     },
                 },
             });
@@ -908,7 +908,7 @@ fn serialized_render_mode(
     }
 }
 
-fn theme_fingerprint(theme: bcode_plugin_sdk::tui::PluginTuiTheme) -> u64 {
+fn theme_fingerprint(theme: &bcode_plugin_sdk::tui::PluginTuiTheme) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -918,7 +918,7 @@ fn theme_fingerprint(theme: bcode_plugin_sdk::tui::PluginTuiTheme) -> u64 {
 
 fn serialized_visual_rows(
     response: &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse,
-    theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+    theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
 ) -> Vec<bmux_tui::prelude::Line> {
     use bcode_plugin_sdk::tui_visual::{
         SerializedTuiColor, SerializedTuiModifier, SerializedTuiStyleRole,
@@ -1418,7 +1418,7 @@ library = "libdynamic_visual_test.dylib"
                 }],
             }],
         };
-        let themed = serialized_visual_rows(&response, Some(test_plugin_theme(7)));
+        let themed = serialized_visual_rows(&response, Some(&test_plugin_theme(7)));
         assert_eq!(themed[0].spans[0].style.fg, Some(Color::Green));
 
         let fallback = serialized_visual_rows(&response, None);

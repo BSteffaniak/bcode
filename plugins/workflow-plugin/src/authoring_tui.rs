@@ -201,7 +201,7 @@ struct AuthorSurfaceTheme {
 }
 
 impl AuthorSurfaceTheme {
-    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+    fn resolve(theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
         theme.map_or_else(
             || Self {
                 canvas: Style::new(),
@@ -1319,7 +1319,7 @@ impl WorkflowAuthorSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = AuthorSurfaceTheme::resolve(theme);
         self.last_area = area;
@@ -1377,7 +1377,7 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
     }

@@ -484,7 +484,7 @@ struct WorkflowSurfaceTheme {
 }
 
 impl WorkflowSurfaceTheme {
-    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+    fn resolve(theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
         theme.map_or_else(
             || {
                 let component = bmux_tui_components::theme::ComponentTheme::default();
@@ -2264,7 +2264,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = WorkflowSurfaceTheme::resolve(theme);
         frame.fill(area, " ", theme.canvas);
@@ -2327,7 +2327,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
     }
@@ -3954,7 +3954,7 @@ mod tests {
         surface: &WorkflowStatusSurface,
         width: u16,
         height: u16,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) -> Buffer {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
@@ -5882,8 +5882,8 @@ mod tests {
             ),
         ] {
             let plugin_theme = test_plugin_theme(foreground, accent);
-            let resolved = WorkflowSurfaceTheme::resolve(Some(plugin_theme));
-            let buffer = render_workspace_buffer_with_theme(&surface, 132, 28, Some(plugin_theme));
+            let resolved = WorkflowSurfaceTheme::resolve(Some(&plugin_theme));
+            let buffer = render_workspace_buffer_with_theme(&surface, 132, 28, Some(&plugin_theme));
             assert_eq!(resolved.text.fg, Some(foreground));
             assert_eq!(resolved.focused.fg, Some(accent));
             assert!(

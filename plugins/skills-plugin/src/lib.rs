@@ -194,7 +194,7 @@ struct SkillsSurfaceTheme {
 }
 
 impl SkillsSurfaceTheme {
-    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+    fn resolve(theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
         theme.map_or_else(
             || {
                 let component = bmux_tui_components::theme::ComponentTheme::default();
@@ -225,7 +225,7 @@ impl SkillsCommandSurface {
         &self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = SkillsSurfaceTheme::resolve(theme);
         frame.fill(area, " ", theme.canvas);
@@ -297,7 +297,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for SkillsCommandSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
     }

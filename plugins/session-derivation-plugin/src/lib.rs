@@ -388,7 +388,7 @@ impl ForkSelectSurface {
         &self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let canvas = theme.map_or_else(Style::new, |theme| theme.canvas);
         let text = theme.map_or_else(Style::new, |theme| theme.text);
@@ -457,7 +457,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_with_presentation(area, frame, theme);
     }

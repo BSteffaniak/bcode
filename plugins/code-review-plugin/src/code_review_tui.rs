@@ -409,18 +409,18 @@ impl PluginTuiSurface for CodeReviewSurface {
     }
 
     fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
-        crate::code_review_tui_render::render(&mut self.app, frame, self.theme);
+        crate::code_review_tui_render::render(&mut self.app, frame, self.theme.as_ref());
     }
 
     fn render_with_theme(
         &mut self,
         _area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
-        self.theme = theme;
+        self.theme = theme.copied();
         self.app.set_tui_theme(theme);
-        crate::code_review_tui_render::render(&mut self.app, frame, self.theme);
+        crate::code_review_tui_render::render(&mut self.app, frame, self.theme.as_ref());
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -5682,7 +5682,7 @@ impl ReviewApp {
     }
 
     /// Update renderer-owned syntax presentation and invalidate derived display rows when changed.
-    pub fn set_tui_theme(&mut self, theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) {
+    pub fn set_tui_theme(&mut self, theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>) {
         use std::hash::{Hash, Hasher};
 
         let fingerprint = theme.map_or(0, |theme| {
@@ -12663,7 +12663,7 @@ pub(crate) mod tests {
                 .is_some()
         );
 
-        app.set_tui_theme(Some(test_plugin_theme(12)));
+        app.set_tui_theme(Some(&test_plugin_theme(12)));
         assert!(
             app.view_document_cache
                 .read()
@@ -12685,14 +12685,14 @@ pub(crate) mod tests {
             themed_fingerprint
         );
 
-        app.set_tui_theme(Some(test_plugin_theme(12)));
+        app.set_tui_theme(Some(&test_plugin_theme(12)));
         assert!(
             app.view_document_cache
                 .read()
                 .expect("same identity preserves cache")
                 .is_some()
         );
-        app.set_tui_theme(Some(test_plugin_theme(99)));
+        app.set_tui_theme(Some(&test_plugin_theme(99)));
         assert!(
             app.view_document_cache
                 .read()

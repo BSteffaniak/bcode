@@ -1416,7 +1416,7 @@ pub trait PluginTuiSurface: Send {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        _theme: Option<PluginTuiTheme>,
+        _theme: Option<&PluginTuiTheme>,
     ) {
         self.render(area, frame);
     }
@@ -1515,7 +1515,7 @@ where
         snapshot: &C::Snapshot,
         area: Rect,
         frame: &mut Frame<'_>,
-        _theme: Option<PluginTuiTheme>,
+        _theme: Option<&PluginTuiTheme>,
     ) {
         self.render(snapshot, area, frame);
     }
@@ -1599,7 +1599,7 @@ where
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<PluginTuiTheme>,
+        theme: Option<&PluginTuiTheme>,
     ) {
         self.renderer
             .render_with_theme(&self.controller.snapshot(), area, frame, theme);

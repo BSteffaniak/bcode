@@ -641,9 +641,9 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         snapshot: &QuestionSnapshot,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<PluginTuiTheme>,
+        theme: Option<&PluginTuiTheme>,
     ) {
-        self.theme = QuestionSurfaceTheme::resolve(theme.as_ref());
+        self.theme = QuestionSurfaceTheme::resolve(theme);
         self.render_snapshot(snapshot, area, frame);
     }
 
@@ -974,7 +974,7 @@ mod tests {
     ) -> Buffer {
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);
-        renderer.render_with_theme(snapshot, area, &mut frame, Some(*theme));
+        renderer.render_with_theme(snapshot, area, &mut frame, Some(theme));
         buffer
     }
 

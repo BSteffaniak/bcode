@@ -37,7 +37,7 @@ struct ReviewHomeTheme {
 }
 
 impl ReviewHomeTheme {
-    fn resolve(theme: Option<PluginTuiTheme>) -> Self {
+    fn resolve(theme: Option<&PluginTuiTheme>) -> Self {
         theme.map_or_else(
             || Self {
                 canvas: Style::new(),
@@ -767,7 +767,7 @@ impl PluginTuiSurface for ReviewHomeSurface {
         &mut self,
         _area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<PluginTuiTheme>,
+        theme: Option<&PluginTuiTheme>,
     ) {
         render(&self.app, frame, ReviewHomeTheme::resolve(theme));
     }

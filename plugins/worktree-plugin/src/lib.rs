@@ -873,7 +873,7 @@ struct WorktreeSurfaceTheme {
 }
 
 impl WorktreeSurfaceTheme {
-    fn resolve(theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
+    fn resolve(theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>) -> Self {
         theme.map_or_else(
             || Self {
                 canvas: Style::new(),
@@ -898,7 +898,7 @@ impl WorktreeCommandSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = WorktreeSurfaceTheme::resolve(theme);
         frame.fill(area, " ", theme.canvas);
@@ -1081,7 +1081,7 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        theme: Option<bcode_plugin_sdk::tui::PluginTuiTheme>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
     }
@@ -1376,7 +1376,7 @@ mod tests {
         let area = Rect::new(0, 0, 18, 8);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
         let theme = test_plugin_theme();
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(theme));
+        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
 
         assert!(
             buffer
