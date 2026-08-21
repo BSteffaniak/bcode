@@ -432,6 +432,53 @@ pub async fn append_presentation_note(
     Ok(())
 }
 
+/// Application result of one explicit context-compaction request.
+pub enum CompactResult {
+    Compacted(String),
+    Noop(String),
+}
+
+/// Application failure while explicitly compacting session context.
+#[derive(Debug, thiserror::Error)]
+pub enum CompactError {
+    #[error("active session uses incompatible artifact namespace {0}")]
+    IncompatibleActiveNamespace(String),
+    #[error(transparent)]
+    Compaction(#[from] super::CompactionError),
+    #[error(transparent)]
+    Server(#[from] super::ServerError),
+}
+
+/// Explicitly compact one session through the canonical queued command path.
+pub async fn compact(
+    state: &Arc<ServerState>,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+) -> Result<CompactResult, CompactError> {
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(CompactError::IncompatibleActiveNamespace(namespace));
+    }
+    let selection = super::session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        state.client_runtime_context(client_id).await,
+    )
+    .await;
+    match super::enqueue_compact_session_command(state, session_id, client_id, selection).await? {
+        Ok(message) => Ok(CompactResult::Compacted(message)),
+        Err(super::CompactionError::PlanUnavailable(reason)) => {
+            Ok(CompactResult::Noop(reason.to_string()))
+        }
+        Err(super::CompactionError::InsufficientProgress { message, .. }) => {
+            Ok(CompactResult::Noop(message))
+        }
+        Err(error) => Err(CompactError::Compaction(error)),
+    }
+}
+
 /// Application-level failure while creating a session.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateSessionError {

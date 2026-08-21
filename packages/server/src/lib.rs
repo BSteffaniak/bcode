@@ -25,6 +25,7 @@ mod server_operations;
 mod session_bulk_migration;
 mod session_operations;
 mod session_search_operations;
+mod workflow_operations;
 mod worktree_creation;
 mod worktree_operations;
 
@@ -17159,11 +17160,7 @@ async fn handle_list_workflow_definitions(
     writer: &SharedWriter,
     limit: usize,
 ) -> Result<(), ServerError> {
-    let definitions = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .list_definitions(limit)?;
+    let definitions = workflow_operations::list_definitions(state, limit)?;
     send_response(
         writer,
         request_id,
@@ -17179,11 +17176,7 @@ async fn handle_describe_workflow_definition(
     definition_id: String,
     version: u32,
 ) -> Result<(), ServerError> {
-    let definition = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .definition(&definition_id, version)?;
+    let definition = workflow_operations::describe_definition(state, &definition_id, version)?;
     send_response(
         writer,
         request_id,
@@ -17329,7 +17322,7 @@ async fn handle_inspect_workflow_run(
     run_id: String,
     limit: usize,
 ) -> Result<(), ServerError> {
-    let inspection = workflow_run_inspection(state, &run_id, limit).await?;
+    let inspection = workflow_operations::inspect_run(state, &run_id, limit).await?;
     send_response(
         writer,
         request_id,
@@ -17888,11 +17881,7 @@ async fn handle_list_workflow_runs(
     writer: &SharedWriter,
     limit: usize,
 ) -> Result<(), ServerError> {
-    let runs = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .list_runs(limit)?;
+    let runs = workflow_operations::list_runs(state, limit)?;
     send_response(
         writer,
         request_id,
@@ -17908,37 +17897,7 @@ async fn handle_workflow_run_outputs(
     run_id: String,
     limit: usize,
 ) -> Result<(), ServerError> {
-    let outputs = {
-        let store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let summaries = store.output_summaries(&run_id, limit)?;
-        let checksums = summaries
-            .into_iter()
-            .map(|output| (output.output_id, output.checksum_sha256))
-            .collect::<BTreeMap<_, _>>();
-        store
-            .validated_outputs(&run_id, limit)?
-            .into_iter()
-            .map(|output| bcode_ipc::WorkflowOutputInspection {
-                version: bcode_ipc::WORKFLOW_OUTPUT_INSPECTION_VERSION,
-                checksum_sha256: checksums
-                    .get(&output.output_id)
-                    .cloned()
-                    .expect("validated output has a matching bounded summary"),
-                output_id: output.output_id,
-                run_id: output.run_id,
-                node_id: output.node_id,
-                activation_id: output.activation_id,
-                schema_id: output.schema_id,
-                schema_version: output.schema_version,
-                value: output.value,
-                artifact_reference: output.artifact_reference,
-                created_at_ms: output.created_at_ms,
-            })
-            .collect()
-    };
+    let outputs = workflow_operations::run_outputs(state, &run_id, limit)?;
     send_response(
         writer,
         request_id,
@@ -18648,21 +18607,8 @@ async fn handle_compact_session(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    if let Some(active_namespace) = state
-        .active_session_namespace_mismatch(session_id, client_id)
-        .await
-    {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    let selection = session_model_selection_with_runtime_context(
-        state,
-        session_id,
-        state.client_runtime_context(client_id).await,
-    )
-    .await;
-    match enqueue_compact_session_command(state, session_id, client_id, selection).await? {
-        Ok(message) => {
+    match session_operations::compact(state, client_id, session_id).await {
+        Ok(session_operations::CompactResult::Compacted(message)) => {
             send_response(
                 writer,
                 request_id,
@@ -18673,13 +18619,14 @@ async fn handle_compact_session(
             )
             .await
         }
-        Err(CompactionError::PlanUnavailable(reason)) => {
-            send_compaction_noop_response(writer, request_id, reason.to_string()).await
-        }
-        Err(CompactionError::InsufficientProgress { message, .. }) => {
+        Ok(session_operations::CompactResult::Noop(message)) => {
             send_compaction_noop_response(writer, request_id, message).await
         }
-        Err(CompactionError::Session(error)) => {
+        Err(session_operations::CompactError::IncompatibleActiveNamespace(namespace)) => {
+            send_incompatible_active_session_response(writer, request_id, &namespace).await
+        }
+        Err(session_operations::CompactError::Server(error)) => Err(error),
+        Err(session_operations::CompactError::Compaction(CompactionError::Session(error))) => {
             send_response(
                 writer,
                 request_id,
@@ -18687,7 +18634,7 @@ async fn handle_compact_session(
             )
             .await
         }
-        Err(CompactionError::ProviderUnavailable) => {
+        Err(session_operations::CompactError::Compaction(CompactionError::ProviderUnavailable)) => {
             send_response(
                 writer,
                 request_id,
@@ -18698,7 +18645,7 @@ async fn handle_compact_session(
             )
             .await
         }
-        Err(CompactionError::Cancelled) => {
+        Err(session_operations::CompactError::Compaction(CompactionError::Cancelled)) => {
             send_response(
                 writer,
                 request_id,
@@ -18709,10 +18656,12 @@ async fn handle_compact_session(
             )
             .await
         }
-        Err(CompactionError::UncompactableCurrentTurn { .. }) => {
-            send_uncompactable_current_turn_response(writer, request_id).await
-        }
-        Err(CompactionError::RequestStillTooLarge { .. }) => {
+        Err(session_operations::CompactError::Compaction(
+            CompactionError::UncompactableCurrentTurn { .. },
+        )) => send_uncompactable_current_turn_response(writer, request_id).await,
+        Err(session_operations::CompactError::Compaction(
+            CompactionError::RequestStillTooLarge { .. },
+        )) => {
             send_response(
                 writer,
                 request_id,
@@ -18723,7 +18672,13 @@ async fn handle_compact_session(
             )
             .await
         }
-        Err(CompactionError::Provider(error)) => {
+        Err(session_operations::CompactError::Compaction(CompactionError::PlanUnavailable(
+            reason,
+        ))) => send_compaction_noop_response(writer, request_id, reason.to_string()).await,
+        Err(session_operations::CompactError::Compaction(
+            CompactionError::InsufficientProgress { message, .. },
+        )) => send_compaction_noop_response(writer, request_id, message).await,
+        Err(session_operations::CompactError::Compaction(CompactionError::Provider(error))) => {
             send_response(
                 writer,
                 request_id,
