@@ -1047,6 +1047,12 @@ pub struct PluginTuiSyntaxTheme {
     pub type_name: PluginTuiSyntaxColor,
     pub operator: PluginTuiSyntaxColor,
     pub punctuation: PluginTuiSyntaxColor,
+    /// Markup section headings.
+    pub heading: PluginTuiSyntaxColor,
+    /// Markup link destinations.
+    pub link: PluginTuiSyntaxColor,
+    /// Markup literal spans such as inline code.
+    pub raw: PluginTuiSyntaxColor,
 }
 
 /// Semantic styles for source-code cards supplied by the TUI host.
@@ -1152,6 +1158,9 @@ mod component_theme_tests {
             type_name: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
             operator: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
             punctuation: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            heading: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            link: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            raw: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
         };
         PluginTuiTheme {
             component_theme_version: version,

@@ -136,6 +136,9 @@ fn syntax_palette(
         type_name: color(theme.type_name),
         operator: color(theme.operator),
         punctuation: color(theme.punctuation),
+        heading: color(theme.heading),
+        link: color(theme.link),
+        raw: color(theme.raw),
     }
 }
 

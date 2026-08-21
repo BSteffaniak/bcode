@@ -300,6 +300,9 @@ mod tests {
             type_name: custom,
             operator: custom,
             punctuation: custom,
+            heading: custom,
+            link: custom,
+            raw: custom,
         };
         let file = ReviewFile {
             old_path: Some("src/lib.rs".to_string()),

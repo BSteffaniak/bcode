@@ -2017,6 +2017,9 @@ mod tests {
                 type_name: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
                 operator: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
                 punctuation: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                heading: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                link: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                raw: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
             },
         };
         let area = Rect::new(0, 0, 80, 28);

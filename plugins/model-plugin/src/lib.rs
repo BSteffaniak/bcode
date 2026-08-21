@@ -576,6 +576,9 @@ mod tests {
                 type_name: syntax_color,
                 operator: syntax_color,
                 punctuation: syntax_color,
+                heading: syntax_color,
+                link: syntax_color,
+                raw: syntax_color,
             },
         };
         let surface = ModelCommandSurface {

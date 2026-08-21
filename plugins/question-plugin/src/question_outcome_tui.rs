@@ -173,6 +173,9 @@ mod tests {
                 type_name: PluginTuiSyntaxColor::from_tui(Color::Default),
                 operator: PluginTuiSyntaxColor::from_tui(Color::Default),
                 punctuation: PluginTuiSyntaxColor::from_tui(Color::Default),
+                heading: PluginTuiSyntaxColor::from_tui(Color::Default),
+                link: PluginTuiSyntaxColor::from_tui(Color::Default),
+                raw: PluginTuiSyntaxColor::from_tui(Color::Default),
             },
         };
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(

@@ -773,6 +773,9 @@ fn syntax_palette(
         type_name: color(theme.type_name),
         operator: color(theme.operator),
         punctuation: color(theme.punctuation),
+        heading: color(theme.heading),
+        link: color(theme.link),
+        raw: color(theme.raw),
     }
 }
 
@@ -858,6 +861,9 @@ mod tests {
                 type_name: PluginTuiSyntaxColor::from_tui(Color::Cyan),
                 operator: PluginTuiSyntaxColor::from_tui(Color::Default),
                 punctuation: PluginTuiSyntaxColor::from_tui(Color::Default),
+                heading: PluginTuiSyntaxColor::from_tui(Color::Magenta),
+                link: PluginTuiSyntaxColor::from_tui(Color::BrightBlue),
+                raw: PluginTuiSyntaxColor::from_tui(Color::BrightGreen),
             },
         }
     }
@@ -1292,6 +1298,41 @@ mod tests {
                 >= 3,
             "expected multiple syntax colors in themed file contents: {rows:?}"
         );
+    }
+
+    #[test]
+    fn renders_markdown_contents_with_distinct_markup_colors() {
+        let payload = serde_json::json!({
+            "path": "README.md",
+            "contents": "# Heading\n\ntext `code` [link](https://example.com)",
+            "start_line": 1,
+            "truncated": false
+        });
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            None,
+        )
+        .with_theme(terminal_native_syntax_theme());
+        let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+            &FilesystemTuiVisualAdapter,
+            "bcode.filesystem.read",
+            &payload,
+            &context,
+        );
+
+        for (color, description) in [
+            (Color::Magenta, "heading"),
+            (Color::BrightBlue, "link"),
+            (Color::BrightGreen, "inline code"),
+        ] {
+            assert!(
+                rows.iter()
+                    .flat_map(|line| line.spans.iter())
+                    .any(|span| span.style.fg == Some(color)),
+                "expected themed markdown {description} spans: {rows:?}"
+            );
+        }
     }
 
     #[test]

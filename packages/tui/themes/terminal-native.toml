@@ -125,6 +125,15 @@ fg = "$text"
 [styles."syntax.punctuation"]
 fg = "$text"
 
+[styles."syntax.heading"]
+fg = "ansi:magenta"
+
+[styles."syntax.link"]
+fg = "ansi:bright_blue"
+
+[styles."syntax.raw"]
+fg = "ansi:bright_green"
+
 [styles."transcript.user.label"]
 fg        = "$accent"
 modifiers = ["bold"]

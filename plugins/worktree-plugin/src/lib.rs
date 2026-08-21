@@ -1344,6 +1344,9 @@ mod tests {
                 type_name: syntax,
                 operator: syntax,
                 punctuation: syntax,
+                heading: syntax,
+                link: syntax,
+                raw: syntax,
             },
         }
     }

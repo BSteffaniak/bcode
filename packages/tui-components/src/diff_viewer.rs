@@ -193,6 +193,9 @@ mod tests {
             type_name: color,
             operator: color,
             punctuation: color,
+            heading: color,
+            link: color,
+            raw: color,
         };
         let document = diff_from_text_at_lines_with_palette(
             "file.rs",

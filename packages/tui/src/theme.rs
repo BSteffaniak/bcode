@@ -712,6 +712,9 @@ fn syntax_palette(
         type_name: color("syntax.type", info_color),
         operator: color("syntax.operator", text_color),
         punctuation: color("syntax.punctuation", text_color),
+        heading: color("syntax.heading", info_color),
+        link: color("syntax.link", info_color),
+        raw: color("syntax.raw", success_color),
     }
 }
 
@@ -1029,6 +1032,9 @@ mod capability_tests {
                 ("syntax.type", presented.syntax.type_name),
                 ("syntax.operator", presented.syntax.operator),
                 ("syntax.punctuation", presented.syntax.punctuation),
+                ("syntax.heading", presented.syntax.heading),
+                ("syntax.link", presented.syntax.link),
+                ("syntax.raw", presented.syntax.raw),
             ] {
                 let expected = resolved
                     .style(role)

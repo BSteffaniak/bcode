@@ -2719,6 +2719,9 @@ mod tests {
                 type_name: PluginTuiSyntaxColor::from_tui(Color::White),
                 operator: PluginTuiSyntaxColor::from_tui(Color::Cyan),
                 punctuation: PluginTuiSyntaxColor::from_tui(Color::White),
+                heading: PluginTuiSyntaxColor::from_tui(Color::Magenta),
+                link: PluginTuiSyntaxColor::from_tui(Color::BrightBlue),
+                raw: PluginTuiSyntaxColor::from_tui(Color::BrightGreen),
             },
         };
         let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(

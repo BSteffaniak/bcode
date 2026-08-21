@@ -282,6 +282,9 @@ fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::t
             type_name: syntax_color(syntax.type_name),
             operator: syntax_color(syntax.operator),
             punctuation: syntax_color(syntax.punctuation),
+            heading: syntax_color(syntax.heading),
+            link: syntax_color(syntax.link),
+            raw: syntax_color(syntax.raw),
         },
     }
 }

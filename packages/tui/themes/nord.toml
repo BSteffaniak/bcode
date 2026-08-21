@@ -146,6 +146,15 @@ fg = "#81a1c1"
 [styles."syntax.punctuation"]
 fg = "#e5e9f0"
 
+[styles."syntax.heading"]
+fg = "#8fbcbb"
+
+[styles."syntax.link"]
+fg = "#88c0d0"
+
+[styles."syntax.raw"]
+fg = "#a3be8c"
+
 [styles."tool.running.title"]
 fg        = "$info"
 modifiers = ["bold"]

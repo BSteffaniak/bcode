@@ -63,9 +63,9 @@ impl Default for QuestionSurfaceTheme {
 }
 
 impl QuestionSurfaceTheme {
-    fn resolve(theme: Option<PluginTuiTheme>) -> Self {
+    fn resolve(theme: Option<&PluginTuiTheme>) -> Self {
         theme
-            .and_then(|theme| theme.component_theme())
+            .and_then(PluginTuiTheme::component_theme)
             .map_or_else(Self::default, |theme| Self {
                 text: theme.text,
                 muted: theme.muted,
@@ -643,7 +643,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         frame: &mut Frame<'_>,
         theme: Option<PluginTuiTheme>,
     ) {
-        self.theme = QuestionSurfaceTheme::resolve(theme);
+        self.theme = QuestionSurfaceTheme::resolve(theme.as_ref());
         self.render_snapshot(snapshot, area, frame);
     }
 
@@ -970,11 +970,11 @@ mod tests {
         renderer: &mut QuestionTerminalRenderer,
         snapshot: &QuestionSnapshot,
         area: Rect,
-        theme: PluginTuiTheme,
+        theme: &PluginTuiTheme,
     ) -> Buffer {
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);
-        renderer.render_with_theme(snapshot, area, &mut frame, Some(theme));
+        renderer.render_with_theme(snapshot, area, &mut frame, Some(*theme));
         buffer
     }
 
@@ -1212,10 +1212,13 @@ mod tests {
                 type_name: syntax_color,
                 operator: syntax_color,
                 punctuation: syntax_color,
+                heading: syntax_color,
+                link: syntax_color,
+                raw: syntax_color,
             },
         };
         let buffer =
-            render_snapshot_with_theme(&mut renderer, &snapshot, Rect::new(0, 0, 48, 12), theme);
+            render_snapshot_with_theme(&mut renderer, &snapshot, Rect::new(0, 0, 48, 12), &theme);
         let text = rendered_text(&buffer);
 
         assert!(text.contains("[ Submit ]"));

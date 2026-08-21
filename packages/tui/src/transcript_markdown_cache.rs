@@ -299,6 +299,9 @@ mod tests {
             type_name: color(8),
             operator: color(9),
             punctuation: color(10),
+            heading: color(11),
+            link: color(12),
+            raw: color(13),
         };
         let palette_options = base.clone().with_syntax_palette(palette);
         let palette_result = cache.project(&item, palette_options.clone());

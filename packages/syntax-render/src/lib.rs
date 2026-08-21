@@ -21,6 +21,10 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 
 /// Renderer-neutral semantic syntax role.
+///
+/// Code roles describe programming-language tokens. Markup roles describe prose
+/// structure emitted by markup grammars such as Markdown, `AsciiDoc`,
+/// `reStructuredText`, Textile, Org Mode, and `MediaWiki`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyntaxRole {
     Text,
@@ -33,6 +37,12 @@ pub enum SyntaxRole {
     Type,
     Operator,
     Punctuation,
+    /// Section headings in markup languages.
+    Heading,
+    /// Link destinations in markup languages.
+    Link,
+    /// Literal spans in markup languages, such as inline code.
+    Raw,
 }
 
 /// Renderer-neutral syntax-highlighted text span.
@@ -100,6 +110,12 @@ pub struct SyntaxPalette {
     pub operator: SyntaxColor,
     /// Punctuation and delimiters.
     pub punctuation: SyntaxColor,
+    /// Markup section headings.
+    pub heading: SyntaxColor,
+    /// Markup link destinations.
+    pub link: SyntaxColor,
+    /// Markup literal spans such as inline code.
+    pub raw: SyntaxColor,
 }
 
 impl Default for SyntaxPalette {
@@ -115,6 +131,9 @@ impl Default for SyntaxPalette {
             type_name: SyntaxColor::rgb(78, 201, 176),
             operator: SyntaxColor::rgb(212, 212, 212),
             punctuation: SyntaxColor::rgb(212, 212, 212),
+            heading: SyntaxColor::rgb(97, 175, 239),
+            link: SyntaxColor::rgb(86, 182, 194),
+            raw: SyntaxColor::rgb(209, 154, 102),
         }
     }
 }
@@ -132,6 +151,9 @@ impl SyntaxPalette {
             SyntaxRole::Type => self.type_name,
             SyntaxRole::Operator => self.operator,
             SyntaxRole::Punctuation => self.punctuation,
+            SyntaxRole::Heading => self.heading,
+            SyntaxRole::Link => self.link,
+            SyntaxRole::Raw => self.raw,
         }
     }
 }
@@ -396,32 +418,10 @@ struct FontEmphasis {
     underline: bool,
 }
 
-impl FontEmphasis {
-    const fn bold() -> Self {
-        Self {
-            bold: true,
-            italic: false,
-            underline: false,
-        }
-    }
-
-    const fn italic() -> Self {
-        Self {
-            bold: false,
-            italic: true,
-            underline: false,
-        }
-    }
-
-    const fn underline() -> Self {
-        Self {
-            bold: false,
-            italic: false,
-            underline: true,
-        }
-    }
-}
-
+/// Resolve one scope stack into a semantic role and font emphasis.
+///
+/// Code roles are resolved first so languages embedded in markup fences keep
+/// their own semantic colors; markup roles describe the remaining prose spans.
 fn classify_scope_stack(stack: &ScopeStack) -> (SyntaxRole, FontEmphasis) {
     let scopes = stack
         .scopes
@@ -430,19 +430,28 @@ fn classify_scope_stack(stack: &ScopeStack) -> (SyntaxRole, FontEmphasis) {
         .collect::<Vec<_>>();
     let has = |needle: &str| scopes.iter().any(|scope| scope_contains(scope, needle));
 
-    // Code-token scopes win over markup scopes so languages embedded in Markdown
-    // fences keep their own semantic colors.
-    let role = if has("comment") {
-        SyntaxRole::Comment
+    let role = code_role(&has)
+        .or_else(|| markup_role(&has))
+        // Delimiters are shared by both families, so they resolve only after
+        // language and markup structure had a chance to claim the span.
+        .or_else(|| has("punctuation").then_some(SyntaxRole::Punctuation))
+        .unwrap_or(SyntaxRole::Text);
+    (role, emphasis(&has))
+}
+
+/// Classify programming-language token scopes.
+fn code_role(has: &impl Fn(&str) -> bool) -> Option<SyntaxRole> {
+    if has("comment") {
+        Some(SyntaxRole::Comment)
     } else if has("string") || has("character") || has("regexp") {
-        SyntaxRole::String
+        Some(SyntaxRole::String)
     } else if has("constant.numeric")
         || has("constant.language.boolean")
         || has("constant.language.null")
     {
-        SyntaxRole::Number
+        Some(SyntaxRole::Number)
     } else if has("entity.name.function") || has("support.function") || has("meta.function-call") {
-        SyntaxRole::Function
+        Some(SyntaxRole::Function)
     } else if has("entity.name.type")
         || has("entity.name.class")
         || has("entity.name.struct")
@@ -450,52 +459,47 @@ fn classify_scope_stack(stack: &ScopeStack) -> (SyntaxRole, FontEmphasis) {
         || has("entity.name.namespace")
         || has("support.type")
     {
-        SyntaxRole::Type
+        Some(SyntaxRole::Type)
     } else if has("keyword.operator") {
-        SyntaxRole::Operator
+        Some(SyntaxRole::Operator)
     } else if has("keyword")
         || has("storage.modifier")
         || has("storage.control")
         || has("storage.type")
     {
-        SyntaxRole::Keyword
+        Some(SyntaxRole::Keyword)
     } else if has("variable")
         || has("entity.name.field")
         || has("entity.name.property")
         || has("support.variable")
     {
-        SyntaxRole::Variable
+        Some(SyntaxRole::Variable)
     } else {
-        return markup_classification(&has);
-    };
-    (role, markup_emphasis(&has))
-}
-
-/// Classify prose scopes once no code-token scope matched.
-fn markup_classification(has: &impl Fn(&str) -> bool) -> (SyntaxRole, FontEmphasis) {
-    if has("markup.heading") || has("entity.name.section") {
-        (SyntaxRole::Keyword, FontEmphasis::bold())
-    } else if has("markup.underline.link") || has("markup.link") {
-        (SyntaxRole::Function, FontEmphasis::underline())
-    } else if has("markup.raw") && !has("source") {
-        // Fenced blocks embed a `source.*` scope; only unembedded raw spans such as
-        // inline code should adopt the raw-literal color.
-        (SyntaxRole::String, markup_emphasis(has))
-    } else if has("markup.quote") {
-        (SyntaxRole::Comment, markup_emphasis(has))
-    } else if has("markup.list") || has("meta.separator") {
-        (SyntaxRole::Punctuation, markup_emphasis(has))
-    } else if has("markup.italic") && !has("markup.bold") {
-        (SyntaxRole::Text, FontEmphasis::italic())
-    } else if has("punctuation") {
-        (SyntaxRole::Punctuation, markup_emphasis(has))
-    } else {
-        (SyntaxRole::Text, markup_emphasis(has))
+        None
     }
 }
 
-/// Derive emphasis that applies regardless of the resolved semantic role.
-fn markup_emphasis(has: &impl Fn(&str) -> bool) -> FontEmphasis {
+/// Classify markup structure scopes shared by prose grammars.
+fn markup_role(has: &impl Fn(&str) -> bool) -> Option<SyntaxRole> {
+    if has("markup.heading") || has("entity.name.section") {
+        Some(SyntaxRole::Heading)
+    } else if has("markup.underline.link") || has("markup.link") {
+        Some(SyntaxRole::Link)
+    } else if has("markup.raw") && !has("source") {
+        // Fenced blocks embed a `source.*` scope; only unembedded raw spans such
+        // as inline code adopt the markup literal color.
+        Some(SyntaxRole::Raw)
+    } else if has("markup.quote") {
+        Some(SyntaxRole::Comment)
+    } else if has("markup.list") || has("meta.separator") {
+        Some(SyntaxRole::Punctuation)
+    } else {
+        None
+    }
+}
+
+/// Derive font emphasis that applies regardless of the resolved semantic role.
+fn emphasis(has: &impl Fn(&str) -> bool) -> FontEmphasis {
     FontEmphasis {
         bold: has("markup.bold") || has("markup.heading"),
         italic: has("markup.italic"),
@@ -580,6 +584,9 @@ mod tests {
             type_name: SyntaxColor::Ansi(AnsiColor::Cyan),
             operator: SyntaxColor::Default,
             punctuation: SyntaxColor::Rgb(12, 34, 56),
+            heading: SyntaxColor::Ansi(AnsiColor::Magenta),
+            link: SyntaxColor::Indexed(45),
+            raw: SyntaxColor::Ansi(AnsiColor::Yellow),
         };
         let lines = ["// comment", "pub fn main() { let value = 42; }"];
         let spans = SyntaxHighlighter::with_palette(palette)
@@ -616,6 +623,9 @@ mod tests {
             type_name: SyntaxColor::rgb(8, 8, 8),
             operator: SyntaxColor::rgb(9, 9, 9),
             punctuation: SyntaxColor::rgb(10, 10, 10),
+            heading: SyntaxColor::rgb(11, 11, 11),
+            link: SyntaxColor::rgb(12, 12, 12),
+            raw: SyntaxColor::rgb(13, 13, 13),
         };
         let lines = ["// comment", "pub fn main() { let value = 42; }"];
         let spans = SyntaxHighlighter::with_palette(palette)
@@ -672,7 +682,7 @@ mod tests {
             (
                 "README.md",
                 "# Heading\n\nprose text\n",
-                SyntaxRole::Keyword,
+                SyntaxRole::Heading,
             ),
         ];
 
@@ -832,7 +842,7 @@ mod tests {
         };
 
         let heading = find("Heading");
-        assert_eq!(heading.role, SyntaxRole::Keyword);
+        assert_eq!(heading.role, SyntaxRole::Heading);
         assert!(heading.bold, "headings render bold: {heading:?}");
 
         let bold = find("bold");
@@ -842,12 +852,48 @@ mod tests {
         assert!(italic.italic, "italic spans render italic: {italic:?}");
 
         let link = find("https://example.com");
-        assert_eq!(link.role, SyntaxRole::Function);
+        assert_eq!(link.role, SyntaxRole::Link);
         assert!(link.underline, "links render underlined: {link:?}");
 
-        assert_eq!(find("code").role, SyntaxRole::String);
+        assert_eq!(find("code").role, SyntaxRole::Raw);
         assert_eq!(find(" quoted").role, SyntaxRole::Comment);
         assert_eq!(find("-").role, SyntaxRole::Punctuation);
+    }
+
+    #[test]
+    fn markup_roles_resolve_distinct_palette_colors() {
+        let palette = SyntaxPalette {
+            heading: SyntaxColor::rgb(11, 11, 11),
+            link: SyntaxColor::rgb(12, 12, 12),
+            raw: SyntaxColor::rgb(13, 13, 13),
+            ..SyntaxPalette::default()
+        };
+        let source = "# Heading\n\ntext `code` [link](https://example.com)\n";
+        let lines = source.lines().collect::<Vec<_>>();
+        let spans = SyntaxHighlighter::with_palette(palette)
+            .highlight_lines_tokens("README.md", &lines)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        for (role, color) in [
+            (SyntaxRole::Heading, palette.heading),
+            (SyntaxRole::Link, palette.link),
+            (SyntaxRole::Raw, palette.raw),
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.style.role == role && span.style.foreground == color),
+                "missing {role:?} with {color:?}: {spans:?}"
+            );
+        }
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.style.foreground == palette.color(span.style.role)),
+            "every markup span resolves its own role color: {spans:?}"
+        );
     }
 
     #[test]

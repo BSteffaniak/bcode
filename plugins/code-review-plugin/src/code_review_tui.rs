@@ -114,6 +114,9 @@ fn syntax_palette(
         type_name: color(theme.type_name),
         operator: color(theme.operator),
         punctuation: color(theme.punctuation),
+        heading: color(theme.heading),
+        link: color(theme.link),
+        raw: color(theme.raw),
     }
 }
 
@@ -12640,6 +12643,9 @@ pub(crate) mod tests {
                 type_name: syntax_color,
                 operator: syntax_color,
                 punctuation: syntax_color,
+                heading: syntax_color,
+                link: syntax_color,
+                raw: syntax_color,
             },
         }
     }

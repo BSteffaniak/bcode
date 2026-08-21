@@ -140,6 +140,9 @@ mod tests {
             type_name: color,
             operator: color,
             punctuation: color,
+            heading: color,
+            link: color,
+            raw: color,
         };
         let rows = source_viewer_rows(
             SourceViewerInput {
