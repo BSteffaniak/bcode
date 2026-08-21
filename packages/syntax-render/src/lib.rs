@@ -374,10 +374,10 @@ impl ScopeClassifier {
             if content.is_empty() {
                 continue;
             }
-            let role = classify_scope_stack(&self.scope_stack);
+            let (role, font) = classify_scope_stack(&self.scope_stack);
             spans.push(SyntaxSpan::new(
                 content.to_owned(),
-                syntax_style(role, self.palette.color(role)),
+                syntax_style(role, self.palette.color(role), font),
             ));
         }
         Some(if spans.is_empty() {
@@ -388,7 +388,41 @@ impl ScopeClassifier {
     }
 }
 
-fn classify_scope_stack(stack: &ScopeStack) -> SyntaxRole {
+/// Font emphasis derived from syntax scopes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FontEmphasis {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+impl FontEmphasis {
+    const fn bold() -> Self {
+        Self {
+            bold: true,
+            italic: false,
+            underline: false,
+        }
+    }
+
+    const fn italic() -> Self {
+        Self {
+            bold: false,
+            italic: true,
+            underline: false,
+        }
+    }
+
+    const fn underline() -> Self {
+        Self {
+            bold: false,
+            italic: false,
+            underline: true,
+        }
+    }
+}
+
+fn classify_scope_stack(stack: &ScopeStack) -> (SyntaxRole, FontEmphasis) {
     let scopes = stack
         .scopes
         .iter()
@@ -396,7 +430,9 @@ fn classify_scope_stack(stack: &ScopeStack) -> SyntaxRole {
         .collect::<Vec<_>>();
     let has = |needle: &str| scopes.iter().any(|scope| scope_contains(scope, needle));
 
-    if has("comment") {
+    // Code-token scopes win over markup scopes so languages embedded in Markdown
+    // fences keep their own semantic colors.
+    let role = if has("comment") {
         SyntaxRole::Comment
     } else if has("string") || has("character") || has("regexp") {
         SyntaxRole::String
@@ -429,10 +465,41 @@ fn classify_scope_stack(stack: &ScopeStack) -> SyntaxRole {
         || has("support.variable")
     {
         SyntaxRole::Variable
-    } else if has("punctuation") {
-        SyntaxRole::Punctuation
     } else {
-        SyntaxRole::Text
+        return markup_classification(&has);
+    };
+    (role, markup_emphasis(&has))
+}
+
+/// Classify prose scopes once no code-token scope matched.
+fn markup_classification(has: &impl Fn(&str) -> bool) -> (SyntaxRole, FontEmphasis) {
+    if has("markup.heading") || has("entity.name.section") {
+        (SyntaxRole::Keyword, FontEmphasis::bold())
+    } else if has("markup.underline.link") || has("markup.link") {
+        (SyntaxRole::Function, FontEmphasis::underline())
+    } else if has("markup.raw") && !has("source") {
+        // Fenced blocks embed a `source.*` scope; only unembedded raw spans such as
+        // inline code should adopt the raw-literal color.
+        (SyntaxRole::String, markup_emphasis(has))
+    } else if has("markup.quote") {
+        (SyntaxRole::Comment, markup_emphasis(has))
+    } else if has("markup.list") || has("meta.separator") {
+        (SyntaxRole::Punctuation, markup_emphasis(has))
+    } else if has("markup.italic") && !has("markup.bold") {
+        (SyntaxRole::Text, FontEmphasis::italic())
+    } else if has("punctuation") {
+        (SyntaxRole::Punctuation, markup_emphasis(has))
+    } else {
+        (SyntaxRole::Text, markup_emphasis(has))
+    }
+}
+
+/// Derive emphasis that applies regardless of the resolved semantic role.
+fn markup_emphasis(has: &impl Fn(&str) -> bool) -> FontEmphasis {
+    FontEmphasis {
+        bold: has("markup.bold") || has("markup.heading"),
+        italic: has("markup.italic"),
+        underline: has("markup.underline"),
     }
 }
 
@@ -446,17 +513,17 @@ fn scope_contains(scope: &str, needle: &str) -> bool {
 fn plain_syntax_spans(line: &str, palette: SyntaxPalette) -> Vec<SyntaxSpan> {
     vec![SyntaxSpan::new(
         line.to_owned(),
-        syntax_style(SyntaxRole::Text, palette.text),
+        syntax_style(SyntaxRole::Text, palette.text, FontEmphasis::default()),
     )]
 }
 
-const fn syntax_style(role: SyntaxRole, color: SyntaxColor) -> SyntaxStyle {
+const fn syntax_style(role: SyntaxRole, color: SyntaxColor, font: FontEmphasis) -> SyntaxStyle {
     SyntaxStyle {
         role,
         foreground: color,
-        bold: false,
-        italic: false,
-        underline: false,
+        bold: font.bold,
+        italic: font.italic,
+        underline: font.underline,
     }
 }
 
@@ -602,6 +669,11 @@ mod tests {
                 "{ pkgs }: \"${pkgs.hello}\"",
                 SyntaxRole::String,
             ),
+            (
+                "README.md",
+                "# Heading\n\nprose text\n",
+                SyntaxRole::Keyword,
+            ),
         ];
 
         for (hint, source, expected) in cases {
@@ -739,5 +811,91 @@ mod tests {
                 "expected syntax styles for {hint}"
             );
         }
+    }
+
+    #[test]
+    fn markdown_prose_roles_and_emphasis_are_semantic() {
+        let source = "# Heading\n\n**bold** and *italic* with `code` and [link](https://example.com)\n\n> quoted\n\n- item one\n";
+        let lines = source.lines().collect::<Vec<_>>();
+        let spans = SyntaxHighlighter::new()
+            .highlight_lines_tokens("README.md", &lines)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        let find = |text: &str| {
+            spans
+                .iter()
+                .find(|span| span.content == text)
+                .unwrap_or_else(|| panic!("missing {text:?} in {spans:?}"))
+                .style
+        };
+
+        let heading = find("Heading");
+        assert_eq!(heading.role, SyntaxRole::Keyword);
+        assert!(heading.bold, "headings render bold: {heading:?}");
+
+        let bold = find("bold");
+        assert!(bold.bold, "bold spans render bold: {bold:?}");
+
+        let italic = find("italic");
+        assert!(italic.italic, "italic spans render italic: {italic:?}");
+
+        let link = find("https://example.com");
+        assert_eq!(link.role, SyntaxRole::Function);
+        assert!(link.underline, "links render underlined: {link:?}");
+
+        assert_eq!(find("code").role, SyntaxRole::String);
+        assert_eq!(find(" quoted").role, SyntaxRole::Comment);
+        assert_eq!(find("-").role, SyntaxRole::Punctuation);
+    }
+
+    #[test]
+    fn markdown_fenced_code_keeps_embedded_language_roles() {
+        let source = "```rust\n// note\npub fn main() { let value = 42; }\n```";
+        let lines = source.lines().collect::<Vec<_>>();
+        let spans = SyntaxHighlighter::new()
+            .highlight_lines_tokens("README.md", &lines)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        for (text, expected) in [
+            ("//", SyntaxRole::Comment),
+            ("fn", SyntaxRole::Keyword),
+            ("main", SyntaxRole::Function),
+            ("42", SyntaxRole::Number),
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.content.trim() == text && span.style.role == expected),
+                "expected {expected:?} for {text:?}: {spans:?}"
+            );
+        }
+        assert!(
+            !spans
+                .iter()
+                .any(|span| span.content.trim() == "42" && span.style.role == SyntaxRole::String),
+            "embedded code must not fall back to the raw-literal role: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_highlighting_preserves_source_text() {
+        let source = "# Heading\n\ntext with `code`\n\n- item\n";
+        let lines = source.lines().collect::<Vec<_>>();
+        let reconstructed = SyntaxHighlighter::new()
+            .highlight_lines_tokens("README.md", &lines)
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(reconstructed, source.trim_end_matches('\n'));
     }
 }

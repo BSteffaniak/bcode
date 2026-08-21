@@ -162,6 +162,12 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
     if style.bold {
         output = output.add_modifier(Modifier::BOLD);
     }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        output = output.add_modifier(Modifier::UNDERLINE);
+    }
     output
 }
 

@@ -109,6 +109,12 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
     if style.bold {
         output = output.add_modifier(Modifier::BOLD);
     }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        output = output.add_modifier(Modifier::UNDERLINE);
+    }
     output
 }
 
@@ -152,6 +158,40 @@ mod tests {
             rows.iter()
                 .flat_map(|row| &row.spans)
                 .any(|span| { span.style.fg == Some(Color::Rgb(7, 8, 9)) })
+        );
+    }
+
+    #[cfg(feature = "syntax")]
+    #[test]
+    fn markdown_emphasis_reaches_generic_source_rows() {
+        use bmux_tui::prelude::Modifier;
+
+        let rows = source_viewer_rows(
+            SourceViewerInput {
+                label: "README.md",
+                syntax_palette: None,
+                contents: "# Heading\n\ntext with [link](https://example.com)\n",
+                start_line: 1,
+                max_lines: 30,
+                truncated_message: "truncated",
+                line_numbers: true,
+            },
+            80,
+        );
+        let spans = rows.iter().flat_map(|row| &row.spans).collect::<Vec<_>>();
+
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == "H" && span.style.modifiers.contains(Modifier::BOLD)),
+            "expected bold markdown heading spans: {spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == "h"
+                    && span.style.modifiers.contains(Modifier::UNDERLINE)),
+            "expected underlined markdown link spans: {spans:?}"
         );
     }
 
