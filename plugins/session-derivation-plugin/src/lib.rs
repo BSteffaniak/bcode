@@ -498,6 +498,21 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
     }
 }
 
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    bcode_plugin_sdk::static_plugin_vtable!(
+        SessionDerivationPlugin,
+        include_str!("../bcode-plugin.toml")
+    )
+}
+
+#[cfg(not(feature = "static-bundled"))]
+bcode_plugin_sdk::export_plugin!(
+    SessionDerivationPlugin,
+    include_str!("../bcode-plugin.toml")
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,18 +578,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(
-        SessionDerivationPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(
-    SessionDerivationPlugin,
-    include_str!("../bcode-plugin.toml")
-);
