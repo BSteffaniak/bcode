@@ -194,9 +194,9 @@ if ! rg -q 'record_histogram_with_exact_labels' packages/server/src/lib.rs \
   || ! rg -q 'workflow.authoring.compilation.duration_ms' packages/server/src/lib.rs \
   || ! rg -q 'workflow.authoring.publication.duration_ms' packages/server/src/lib.rs \
   || ! rg -q 'workflow.authoring.conflicts_total' packages/server/src/lib.rs \
-  || ! rg -q 'workflow.authoring.import_preview.duration_ms' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.import_preview.duration_ms' packages/server/src/workflow_operations.rs \
   || ! rg -q 'workflow.authoring.start_resolution.duration_ms' packages/server/src/lib.rs \
-  || rg -n 'workflow\.authoring\.(validation|compilation|publication|conflicts|import_preview|start_resolution)' packages/server/src/lib.rs \
+  || rg -n 'workflow\.authoring\.(validation|compilation|publication|conflicts|import_preview|start_resolution)' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
       | rg -q '(workflow_id|draft_id|preset_id|document|prompt|schema|secret|message)'; then
   echo "Workflow observability violation: authored lifecycle metrics and bounded labels must remain present and content-free." >&2
   violations=1

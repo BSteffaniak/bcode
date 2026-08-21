@@ -14582,65 +14582,6 @@ async fn handle_delete_workflow_preset(
     .await
 }
 
-fn import_document(
-    bundle: &bcode_workflow::WorkflowExportBundle,
-    target_workflow_id: &str,
-) -> bcode_workflow::WorkflowAuthoringDocument {
-    let mut document = bundle.revision.document.clone();
-    document.workflow_id = target_workflow_id.to_string();
-    document.producer = bcode_workflow::WorkflowProducerProvenance {
-        kind: bcode_workflow::WorkflowProducerKind::Generated,
-        producer_id: Some("workflow-import".to_string()),
-        source_revision: Some(bundle.revision.identity.clone()),
-    };
-    document
-}
-
-async fn workflow_import_preview(
-    request_id: u64,
-    state: &ServerState,
-    bundle: bcode_workflow::WorkflowExportBundle,
-    target_workflow_id: String,
-    control: bcode_ipc::WorkflowComputationControl,
-) -> Result<
-    (
-        bcode_workflow::WorkflowImportPreview,
-        bcode_workflow::WorkflowAuthoringDocument,
-    ),
-    ServerError,
-> {
-    bundle.validate()?;
-    let document = import_document(&bundle, &target_workflow_id);
-    let catalog = workflow_operations::authoring_catalog(state).await?;
-    let preview_document = document.clone();
-    let compilation_started_at = Instant::now();
-    let compilation =
-        run_workflow_computation(state, control, format!("import-{request_id}"), move || {
-            preview_document.compilation_preview(&catalog, None)
-        })
-        .await?;
-    record_workflow_authoring_duration(
-        &state.metrics,
-        "workflow.authoring.import_preview.duration_ms",
-        compilation_started_at,
-        if compilation.compiled.is_some() {
-            "accepted"
-        } else {
-            "rejected"
-        },
-    );
-    Ok((
-        bcode_workflow::WorkflowImportPreview {
-            version: bcode_workflow::WORKFLOW_IMPORT_PREVIEW_VERSION,
-            bundle_version: bundle.version,
-            source_identity: bundle.revision.identity,
-            target_workflow_id,
-            compilation,
-        },
-        document,
-    ))
-}
-
 async fn handle_export_workflow_revision(
     request_id: u64,
     state: &Arc<ServerState>,
@@ -14664,9 +14605,9 @@ async fn handle_preview_workflow_import(
     writer: &SharedWriter,
     request: bcode_ipc::PreviewWorkflowImportRequest,
 ) -> Result<(), ServerError> {
-    let (preview, _) = workflow_import_preview(
-        request_id,
+    let (preview, _) = workflow_operations::import_preview(
         state,
+        format!("import-{request_id}"),
         request.bundle,
         request.target_workflow_id,
         request.control,
@@ -14689,66 +14630,13 @@ async fn handle_import_workflow(
     writer: &SharedWriter,
     request: bcode_ipc::ImportWorkflowRequest,
 ) -> Result<(), ServerError> {
-    if request.collision_policy != bcode_ipc::WorkflowImportCollisionPolicy::RequireNewWorkflow {
-        return Err(WorkflowStoreError::InvalidData(
-            "new-workflow import requires require_new_workflow collision policy".to_string(),
-        )
-        .into());
-    }
-    let (preview, document) = workflow_import_preview(
-        request_id,
+    let (workflow, draft) = workflow_operations::import_new_workflow(
         state,
-        request.bundle,
-        request.target_workflow_id.clone(),
-        request.control,
+        client_id,
+        format!("import-{request_id}"),
+        request,
     )
     .await?;
-    let compiled = preview.compilation.compiled.as_ref().ok_or_else(|| {
-        ServerError::WorkflowDefinitionUnsupported(
-            "import requires a successful compilation preview".to_string(),
-        )
-    })?;
-    state.authorize_local_workflow_application_operation(
-        client_id,
-        LocalWorkflowApplicationOperationRequest {
-            operation: bcode_workflow::WorkflowApplicationOperation::ImportWorkflow,
-            workflow_id: request.target_workflow_id.clone(),
-            draft_id: None,
-            revision: None,
-            preset_id: None,
-            producer: Some(document.producer.clone()),
-            requirements: compiled.requirements.clone(),
-            effects: compiled.effects.clone(),
-            activates: false,
-            executes: false,
-        },
-    )?;
-    let now = current_time_ms();
-    let workflow = bcode_workflow_store::AuthoredWorkflow {
-        workflow_id: request.target_workflow_id.clone(),
-        title: document.metadata.title.clone(),
-        description: document.metadata.description.clone(),
-        archived: false,
-        active_revision: None,
-        created_at_ms: now,
-        updated_at_ms: now,
-    };
-    let draft = bcode_workflow_store::WorkflowDraft {
-        workflow_id: request.target_workflow_id,
-        draft_id: request.draft_id,
-        base_revision: None,
-        generation: 1,
-        checksum_sha256: document.source_digest_sha256()?,
-        producer: document.producer.clone(),
-        document,
-        created_at_ms: now,
-        updated_at_ms: now,
-    };
-    state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .create_authored_workflow_with_initial_draft(&workflow, &draft)?;
     send_response(
         writer,
         request_id,
@@ -14775,9 +14663,9 @@ async fn import_workflow_draft(
         )
         .into());
     }
-    let (preview, document) = workflow_import_preview(
-        request_id,
+    let (preview, document) = workflow_operations::import_preview(
         state,
+        format!("import-{request_id}"),
         request.bundle,
         request.workflow_id.clone(),
         request.control,
@@ -14885,9 +14773,9 @@ async fn handle_import_workflow_revision(
         )
         .into());
     }
-    let (preview, document) = workflow_import_preview(
-        request_id,
+    let (preview, document) = workflow_operations::import_preview(
         state,
+        format!("import-{request_id}"),
         request.bundle,
         request.workflow_id.clone(),
         request.control,
@@ -37964,9 +37852,9 @@ mod tests {
         };
         bundle.validate().expect("bundle");
         let target = "authored/round-trip".to_string();
-        let (import_preview, imported) = workflow_import_preview(
-            1,
+        let (import_preview, imported) = workflow_operations::import_preview(
             &state,
+            "import-1".to_string(),
             bundle.clone(),
             target.clone(),
             bcode_ipc::WorkflowComputationControl::default(),

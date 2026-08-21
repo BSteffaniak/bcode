@@ -1312,6 +1312,133 @@ pub fn export_revision(
     Ok(bundle)
 }
 
+/// Validate and preview one portable workflow import without transport framing.
+pub async fn import_preview(
+    state: &ServerState,
+    operation_id: String,
+    bundle: bcode_workflow::WorkflowExportBundle,
+    target_workflow_id: String,
+    control: bcode_ipc::WorkflowComputationControl,
+) -> Result<
+    (
+        bcode_workflow::WorkflowImportPreview,
+        bcode_workflow::WorkflowAuthoringDocument,
+    ),
+    super::ServerError,
+> {
+    bundle.validate()?;
+    let mut document = bundle.revision.document.clone();
+    document.workflow_id.clone_from(&target_workflow_id);
+    document.producer = bcode_workflow::WorkflowProducerProvenance {
+        kind: bcode_workflow::WorkflowProducerKind::Generated,
+        producer_id: Some("workflow-import".to_string()),
+        source_revision: Some(bundle.revision.identity.clone()),
+    };
+    let catalog = authoring_catalog(state).await?;
+    let preview_document = document.clone();
+    let started_at = std::time::Instant::now();
+    let compilation = super::run_workflow_computation(state, control, operation_id, move || {
+        preview_document.compilation_preview(&catalog, None)
+    })
+    .await?;
+    super::record_workflow_authoring_duration(
+        &state.metrics,
+        "workflow.authoring.import_preview.duration_ms",
+        started_at,
+        if compilation.compiled.is_some() {
+            "accepted"
+        } else {
+            "rejected"
+        },
+    );
+    Ok((
+        bcode_workflow::WorkflowImportPreview {
+            version: bcode_workflow::WORKFLOW_IMPORT_PREVIEW_VERSION,
+            bundle_version: bundle.version,
+            source_identity: bundle.revision.identity,
+            target_workflow_id,
+            compilation,
+        },
+        document,
+    ))
+}
+
+/// Persist a validated import as a new authored workflow and initial draft.
+pub async fn import_new_workflow(
+    state: &std::sync::Arc<ServerState>,
+    client_id: super::ClientId,
+    operation_id: String,
+    request: bcode_ipc::ImportWorkflowRequest,
+) -> Result<
+    (
+        bcode_workflow_store::AuthoredWorkflow,
+        bcode_workflow_store::WorkflowDraft,
+    ),
+    super::ServerError,
+> {
+    if request.collision_policy != bcode_ipc::WorkflowImportCollisionPolicy::RequireNewWorkflow {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "new-workflow import requires require_new_workflow collision policy".to_string(),
+        )
+        .into());
+    }
+    let (preview, document) = import_preview(
+        state,
+        operation_id,
+        request.bundle,
+        request.target_workflow_id.clone(),
+        request.control,
+    )
+    .await?;
+    let compiled = preview.compilation.compiled.as_ref().ok_or_else(|| {
+        super::ServerError::WorkflowDefinitionUnsupported(
+            "import requires a successful compilation preview".to_string(),
+        )
+    })?;
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        super::LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::ImportWorkflow,
+            workflow_id: request.target_workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: None,
+            producer: Some(document.producer.clone()),
+            requirements: compiled.requirements.clone(),
+            effects: compiled.effects.clone(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let now = super::current_time_ms();
+    let workflow = bcode_workflow_store::AuthoredWorkflow {
+        workflow_id: request.target_workflow_id.clone(),
+        title: document.metadata.title.clone(),
+        description: document.metadata.description.clone(),
+        archived: false,
+        active_revision: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let draft = bcode_workflow_store::WorkflowDraft {
+        workflow_id: request.target_workflow_id,
+        draft_id: request.draft_id,
+        base_revision: None,
+        generation: 1,
+        checksum_sha256: document.source_digest_sha256()?,
+        producer: document.producer.clone(),
+        document,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .create_authored_workflow_with_initial_draft(&workflow, &draft)?;
+    Ok((workflow, draft))
+}
+
 /// Return bounded workflow run summaries without transport framing.
 pub fn list_runs(
     state: &ServerState,
