@@ -348,11 +348,15 @@ fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionSt
     bcode_plugin_sdk::SessionStatusResponse { contribution }
 }
 
+fn command_session_id(request: &InvokeCommandRequest) -> Option<SessionId> {
+    request
+        .context
+        .as_ref()
+        .and_then(|context| context.session_id)
+}
+
 fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
-    let session_id = request
-        .args
-        .get("session_id")
-        .and_then(|value| SessionId::from_str(value).ok());
+    let session_id = command_session_id(request);
     let arguments = request.args.get("arguments").map_or("", String::as_str);
     let response = match request.command_id.as_str() {
         START_COMMAND if arguments == "status" => session_id.map_or_else(
@@ -1683,6 +1687,30 @@ mod tests {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)
         }));
+    }
+
+    #[test]
+    fn loop_control_commands_read_trusted_session_context() {
+        let session_id = SessionId::new();
+        let request = InvokeCommandRequest {
+            command_id: STATUS_COMMAND.to_owned(),
+            args: std::collections::BTreeMap::from([(
+                "session_id".to_owned(),
+                SessionId::new().to_string(),
+            )]),
+            context: Some(bcode_command::CommandInvocationContext {
+                session_id: Some(session_id),
+                working_directory: PathBuf::from("/workspace"),
+            }),
+        };
+
+        assert_eq!(command_session_id(&request), Some(session_id));
+
+        let untrusted_only = InvokeCommandRequest {
+            context: None,
+            ..request
+        };
+        assert_eq!(command_session_id(&untrusted_only), None);
     }
 
     #[test]
