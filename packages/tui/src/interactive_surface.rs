@@ -177,8 +177,12 @@ impl InteractiveSurfaceQueue {
 pub enum InteractiveSurfaceEventOutcome {
     /// The surface ignored the event, so normal host routing may continue.
     Ignored,
-    /// The surface consumed the event without completing the interaction.
+    /// The surface consumed the event without requesting a presentation refresh.
     Consumed,
+    /// The surface changed renderer-owned presentation without changing its logical extent.
+    Redraw,
+    /// The surface changed its preferred logical extent and requires layout reconciliation.
+    Relayout,
     /// The surface completed the interaction with a canonical resolution.
     Resolved(ToolExchangeResolution),
 }
@@ -189,6 +193,8 @@ pub struct InteractiveSurfaceState {
     surface: BoxedPluginTuiSurface,
     host: TokioPluginTuiHost,
     pending_resolution: Option<ToolExchangeResolution>,
+    last_width: u16,
+    last_preferred_height: u16,
 }
 
 impl InteractiveSurfaceState {
@@ -208,6 +214,8 @@ impl InteractiveSurfaceState {
                 },
             )),
             pending_resolution: None,
+            last_width: 0,
+            last_preferred_height: 0,
         }
     }
 
@@ -252,6 +260,8 @@ impl InteractiveSurfaceState {
             surface,
             host,
             pending_resolution: None,
+            last_width: 0,
+            last_preferred_height: 0,
         })
     }
 
@@ -312,7 +322,17 @@ impl InteractiveSurfaceState {
     /// Return preferred rendered height at `width`.
     #[must_use]
     pub fn preferred_height(&mut self, width: u16) -> u16 {
-        bounded_surface_height(width, self.surface.preferred_height(width))
+        self.last_width = width;
+        self.last_preferred_height =
+            bounded_surface_height(width, self.surface.preferred_height(width));
+        self.last_preferred_height
+    }
+
+    fn preferred_height_for_event(&mut self) -> u16 {
+        bounded_surface_height(
+            self.last_width,
+            self.surface.preferred_height(self.last_width),
+        )
     }
 
     /// Render a bounded logical slice without allocating the full logical surface.
@@ -459,10 +479,20 @@ impl InteractiveSurfaceState {
         if let Some(resolution) = &self.pending_resolution {
             return InteractiveSurfaceEventOutcome::Resolved(resolution.clone());
         }
-        let outcome = match self.surface.handle_event(event, &self.host) {
+        let before_height = self.last_preferred_height;
+        let action = self.surface.handle_event(event, &self.host);
+        let outcome = match action {
             PluginTuiAction::None => InteractiveSurfaceEventOutcome::Ignored,
-            PluginTuiAction::Redraw
-            | PluginTuiAction::SubscribeWorkflowRuns
+            PluginTuiAction::Redraw => {
+                let after_height = self.preferred_height_for_event();
+                self.last_preferred_height = after_height;
+                if before_height == 0 || after_height == before_height {
+                    InteractiveSurfaceEventOutcome::Redraw
+                } else {
+                    InteractiveSurfaceEventOutcome::Relayout
+                }
+            }
+            PluginTuiAction::SubscribeWorkflowRuns
             | PluginTuiAction::SelectWorkflowRun { .. }
             | PluginTuiAction::UpdateWorkflowCatalogQuery { .. }
             | PluginTuiAction::LoadMoreWorkflowRuns { .. }
@@ -490,9 +520,10 @@ impl InteractiveSurfaceState {
     fn handle_event(&mut self, event: &Event) -> Option<ToolExchangeResolution> {
         match self.handle_event_outcome(event) {
             InteractiveSurfaceEventOutcome::Resolved(resolution) => Some(resolution),
-            InteractiveSurfaceEventOutcome::Ignored | InteractiveSurfaceEventOutcome::Consumed => {
-                None
-            }
+            InteractiveSurfaceEventOutcome::Ignored
+            | InteractiveSurfaceEventOutcome::Consumed
+            | InteractiveSurfaceEventOutcome::Redraw
+            | InteractiveSurfaceEventOutcome::Relayout => None,
         }
     }
 }
@@ -996,7 +1027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renderer_local_question_edits_are_reported_as_consumed_redraws() {
+    async fn renderer_local_edits_are_reported_as_redraws() {
         let mut surface = question_surface(serde_json::json!([{
             "header": null,
             "question": "Explain?",
@@ -1014,7 +1045,7 @@ mod tests {
 
         assert!(matches!(
             surface.handle_event_outcome(&key(KeyCode::Left)),
-            InteractiveSurfaceEventOutcome::Consumed
+            InteractiveSurfaceEventOutcome::Redraw
         ));
         assert!(matches!(
             surface.handle_event_outcome(&Event::Key(KeyStroke {
@@ -1024,14 +1055,14 @@ mod tests {
                     ..Modifiers::NONE
                 },
             })),
-            InteractiveSurfaceEventOutcome::Consumed
+            InteractiveSurfaceEventOutcome::Redraw
         ));
         assert!(matches!(
             surface.handle_event_outcome(&Event::Mouse(bmux_tui::event::MouseEvent::new(
                 bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
                 bmux_tui::geometry::Point::new(2, 3),
             ))),
-            InteractiveSurfaceEventOutcome::Consumed
+            InteractiveSurfaceEventOutcome::Redraw
         ));
     }
 

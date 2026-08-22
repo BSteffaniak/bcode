@@ -2002,9 +2002,10 @@ impl ChatLoopState {
             .handle_event_outcome(&Event::Tick)
         {
             InteractiveSurfaceEventOutcome::Resolved(resolution) => Some(resolution),
-            InteractiveSurfaceEventOutcome::Ignored | InteractiveSurfaceEventOutcome::Consumed => {
-                None
-            }
+            InteractiveSurfaceEventOutcome::Ignored
+            | InteractiveSurfaceEventOutcome::Consumed
+            | InteractiveSurfaceEventOutcome::Redraw
+            | InteractiveSurfaceEventOutcome::Relayout => None,
         }
     }
 

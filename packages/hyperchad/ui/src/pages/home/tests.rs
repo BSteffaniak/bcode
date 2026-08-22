@@ -1337,6 +1337,7 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
             },
             "validation_error": "Please answer required question 1 before submitting.",
             "answers": [{"question_index": 0, "selected": ["yes"], "custom": null}],
+            "selected_option_indices": [[0]],
             "focus": {"type": "question", "question_index": 0},
             "focused_control_id": "question-0"
         })),
@@ -1411,6 +1412,7 @@ fn question_snapshot_renders_multiple_checkbox_and_exclusive_custom_semantics() 
                 }]
             },
             "answers": [{"question_index": 0, "selected": ["a"], "custom": "other"}],
+            "selected_option_indices": [[0]],
             "focus": {"type": "custom", "question_index": 0},
             "focused_control_id": "question-0.custom"
         })),

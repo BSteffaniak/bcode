@@ -14,6 +14,31 @@ if rg -n 'bcode_(workflow|workflow_models|workflow_store|loop|question|worktree)
   violations=1
 fi
 
+if python3 - <<'PY' >/tmp/bcode-interactive-surface-domain-leaks.txt
+from pathlib import Path
+
+violations = []
+for relative in (
+    "packages/plugin-sdk/src/tui.rs",
+    "packages/tui/src/interactive_surface.rs",
+    "packages/tui/src/chat_loop.rs",
+    "packages/tui/src/root_program.rs",
+):
+    source = Path(relative).read_text(encoding="utf-8").split("#[cfg(test)]\nmod tests", 1)[0]
+    for line_number, line in enumerate(source.splitlines(), 1):
+        if "question" in line.lower():
+            violations.append(f"{relative}:{line_number}:{line}")
+print("\n".join(violations))
+raise SystemExit(bool(violations))
+PY
+then
+  :
+else
+  echo "Runtime architecture violation: generic interaction hosts contain question-domain behavior." >&2
+  cat /tmp/bcode-interactive-surface-domain-leaks.txt >&2
+  violations=1
+fi
+
 if rg -n 'features\s*=\s*\["all"\]' packages plugins --glob 'Cargo.toml' \
   >/tmp/bcode-tui-components-all-feature-consumers.txt; then
   echo "Runtime architecture violation: production consumers must request exact component features." >&2

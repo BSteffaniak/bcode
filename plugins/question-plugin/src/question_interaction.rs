@@ -1,5 +1,7 @@
 //! Renderer-neutral question interaction controller.
 
+use std::collections::BTreeSet;
+
 use bcode_plugin_sdk::interaction::PluginInteraction;
 use bcode_tool::{
     InteractionControlId, InteractionInput, InteractionNavigation, InteractionOutput,
@@ -56,8 +58,11 @@ impl QuestionFocusTarget {
 pub struct QuestionSnapshot {
     /// Original normalized request.
     pub request: NormalizedQuestionRequest,
-    /// Current answers.
+    /// Current answers in submitted-value form.
     pub answers: Vec<QuestionAnswerPayload>,
+    /// Selected option indices for unambiguous renderer presentation.
+    #[serde(default)]
+    pub selected_option_indices: Vec<Vec<usize>>,
     /// Current validation error, when submission is not yet valid.
     #[serde(default)]
     pub validation_error: Option<String>,
@@ -73,6 +78,7 @@ pub struct QuestionSnapshot {
 pub struct QuestionInteractionController {
     request: NormalizedQuestionRequest,
     answers: Vec<QuestionAnswerPayload>,
+    selected_option_indices: Vec<BTreeSet<usize>>,
     focus: QuestionFocusTarget,
     invalid_question_index: Option<usize>,
     validation_error: Option<String>,
@@ -92,10 +98,12 @@ impl QuestionInteractionController {
                 custom: None,
             })
             .collect();
+        let selected_option_indices = request.questions.iter().map(|_| BTreeSet::new()).collect();
         let focus = first_focus_target(&request);
         Self {
             request,
             answers,
+            selected_option_indices,
             focus,
             invalid_question_index: None,
             validation_error: None,
@@ -193,18 +201,31 @@ impl QuestionInteractionController {
         let Some(answer) = self.answers.get_mut(question_index) else {
             return;
         };
+        let Some(selected_option_indices) = self.selected_option_indices.get_mut(question_index)
+        else {
+            return;
+        };
         let value = option.value.clone().unwrap_or_else(|| option.label.clone());
         if question.selection_mode == QuestionSelectionMode::Multiple {
-            if let Some(index) = answer
-                .selected
-                .iter()
-                .position(|selected| selected == &value)
-            {
-                answer.selected.remove(index);
+            if selected_option_indices.remove(&option_index) {
+                if !selected_option_indices.iter().any(|selected_index| {
+                    question.options[*selected_index]
+                        .value
+                        .as_ref()
+                        .unwrap_or(&question.options[*selected_index].label)
+                        == &value
+                }) {
+                    answer.selected.retain(|selected| selected != &value);
+                }
             } else {
-                answer.selected.push(value);
+                selected_option_indices.insert(option_index);
+                if !answer.selected.contains(&value) {
+                    answer.selected.push(value);
+                }
             }
         } else {
+            selected_option_indices.clear();
+            selected_option_indices.insert(option_index);
             answer.selected = vec![value];
         }
         if question.custom_mode == QuestionCustomMode::Exclusive {
@@ -232,6 +253,11 @@ impl QuestionInteractionController {
         self.validation_error = None;
         if question.custom_mode == QuestionCustomMode::Exclusive {
             answer.selected.clear();
+            if let Some(selected_option_indices) =
+                self.selected_option_indices.get_mut(question_index)
+            {
+                selected_option_indices.clear();
+            }
         }
     }
 
@@ -274,6 +300,11 @@ impl QuestionInteractionController {
         QuestionSnapshot {
             request: self.request.clone(),
             answers: self.answers.clone(),
+            selected_option_indices: self
+                .selected_option_indices
+                .iter()
+                .map(|selected| selected.iter().copied().collect())
+                .collect(),
             validation_error: self.validation_error.clone(),
             focus: self.focus,
             focused_control_id: self.focus.control_id(),
@@ -582,6 +613,33 @@ mod tests {
             payload["questions"][0]["selected"],
             json!(["Tests", "Release notes"])
         );
+    }
+
+    #[test]
+    fn duplicate_option_values_keep_each_checkbox_identity() {
+        let mut controller = QuestionInteractionController::new(request(question(
+            &[("First", "same"), ("Second", "same")],
+            QuestionSelectionMode::Multiple,
+            false,
+            QuestionCustomMode::Additional,
+            false,
+        )));
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 1),
+        });
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.selected_option_indices[0], [0, 1]);
+        assert_eq!(snapshot.answers[0].selected, ["same"]);
+
+        controller.handle_input(InteractionInput::Activate {
+            control_id: option_control_id(0, 0),
+        });
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.selected_option_indices[0], [1]);
+        assert_eq!(snapshot.answers[0].selected, ["same"]);
     }
 
     #[test]

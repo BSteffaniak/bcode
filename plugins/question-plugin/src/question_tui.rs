@@ -179,11 +179,7 @@ impl QuestionTerminalRenderer {
         for (option_index, option) in question.options.iter().enumerate() {
             let start_y = *content_y;
             let option_id = option_control_id(question_index, option_index);
-            let value = option
-                .value
-                .clone()
-                .unwrap_or_else(|| option_index.to_string());
-            let selected = snapshot.answers[question_index].selected.contains(&value);
+            let selected = snapshot.selected_option_indices[question_index].contains(&option_index);
             let marker = if question.selection_mode == QuestionSelectionMode::Multiple {
                 if selected { "[x]" } else { "[ ]" }
             } else if selected {
@@ -193,8 +189,6 @@ impl QuestionTerminalRenderer {
             };
             let shortcut = option_shortcut_label(option_index);
             let shortcut_width = shortcut.len();
-            let prefix = format!("  {shortcut}. {marker} ");
-            let continuation = " ".repeat(7_usize.saturating_add(shortcut_width));
             let focused = matches!(
                 snapshot.focus,
                 QuestionFocusTarget::Option {
@@ -202,6 +196,9 @@ impl QuestionTerminalRenderer {
                     option_index: focused_option,
                 } if focused_question == question_index && focused_option == option_index
             );
+            let focus_marker = if focused { '>' } else { ' ' };
+            let prefix = format!("{focus_marker} {shortcut}. {marker} ");
+            let continuation = " ".repeat(7_usize.saturating_add(shortcut_width));
             self.render_wrapped(
                 frame,
                 content_y,
@@ -1354,7 +1351,9 @@ mod tests {
         let focused = controller.snapshot();
         assert_eq!(focused.focus, QuestionFocusTarget::Submit);
         let repeated = render_snapshot(&mut renderer, &focused, area);
-        assert_eq!(rendered_text(&initial), rendered_text(&repeated));
+        assert_ne!(rendered_text(&initial), rendered_text(&repeated));
+        assert!(rendered_text(&initial).contains("> 1. ( ) First"));
+        assert!(rendered_text(&repeated).contains("  1. ( ) First"));
 
         let logical_height = renderer.preferred_height(&focused, area.width);
         let mut buffer = Buffer::empty(area);

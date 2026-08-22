@@ -2322,6 +2322,34 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed => {
                             return Ok(bmux_tui_runtime::Update::redraw());
                         }
+                        super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw => {
+                            self.invalidation = self
+                                .invalidation
+                                .merge(super::invalidation::UiInvalidation::Paint);
+                            self.presentation_damage = self
+                                .loop_state
+                                .active_interactive_surface_geometry()
+                                .map_or(bmux_tui::damage::Damage::Full, |geometry| {
+                                    bmux_tui::damage::Damage::regions(
+                                        [geometry.destination],
+                                        self.committed_area,
+                                        bmux_tui::damage::DamagePolicy {
+                                            max_regions: 1,
+                                            max_area_percent: 100,
+                                        },
+                                    )
+                                });
+                            self.fast_temporal_presentation = false;
+                            return Ok(bmux_tui_runtime::Update::redraw());
+                        }
+                        super::interactive_surface::InteractiveSurfaceEventOutcome::Relayout => {
+                            self.invalidation = self
+                                .invalidation
+                                .merge(super::invalidation::UiInvalidation::Items);
+                            self.presentation_damage = bmux_tui::damage::Damage::Full;
+                            self.fast_temporal_presentation = false;
+                            return Ok(bmux_tui_runtime::Update::redraw());
+                        }
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Resolved(
                             resolution,
                         ) => {
@@ -4504,7 +4532,7 @@ mod tests {
                     modifiers: bmux_keyboard::Modifiers::NONE,
                 },
             )),
-            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw
         ));
         let tab = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
             key: bmux_keyboard::KeyCode::Tab,
@@ -4656,7 +4684,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     loop_state.handle_interactive_surface_event(&event),
-                    super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+                    super::super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw
                 ));
             }
 
@@ -4769,7 +4797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn question_navigation_through_root_is_consumed_once_without_history_fallthrough() {
+    async fn interactive_surface_navigation_repaints_without_composer_history_fallthrough() {
         let history = [bcode_session_models::SessionInputHistoryEntry {
             timestamp_ms: 1,
             sequence: 1,
@@ -4821,13 +4849,13 @@ mod tests {
             model
                 .loop_state
                 .handle_interactive_surface_event(&key(bmux_keyboard::KeyCode::Enter)),
-            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw
         ));
         assert!(matches!(
             model
                 .loop_state
                 .handle_interactive_surface_event(&key(bmux_keyboard::KeyCode::Tab)),
-            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Consumed
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Redraw
         ));
         let outcome = model
             .loop_state
@@ -4919,6 +4947,11 @@ mod tests {
 
         assert_eq!(model.chat.app.composer().text(), "draft prompt");
         assert!(!model.chat.app.input_history_navigation_active());
+        assert_eq!(
+            model.invalidation,
+            super::super::invalidation::UiInvalidation::Paint
+        );
+        assert!(!model.fast_temporal_presentation);
     }
 
     #[tokio::test]

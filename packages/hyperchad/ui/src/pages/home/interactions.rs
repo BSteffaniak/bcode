@@ -15,6 +15,8 @@ struct QuestionSnapshot {
     request: QuestionRequest,
     validation_error: Option<String>,
     answers: Vec<QuestionAnswer>,
+    #[serde(default)]
+    selected_option_indices: Vec<Vec<usize>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,14 +61,12 @@ enum QuestionCustomMode {
 #[derive(Debug, Deserialize)]
 struct QuestionOption {
     label: String,
-    value: Option<String>,
     description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct QuestionAnswer {
     question_index: usize,
-    selected: Vec<String>,
     custom: Option<String>,
 }
 
@@ -305,15 +305,10 @@ fn question_option(
     control: QuestionControl,
     option: &QuestionOption,
 ) -> Containers {
-    let selected_value = option
-        .value
-        .as_deref()
-        .map_or_else(|| option_index.to_string(), ToOwned::to_owned);
     let selected = snapshot
-        .answers
-        .iter()
-        .find(|answer| answer.question_index == question_index)
-        .is_some_and(|answer| answer.selected.contains(&selected_value));
+        .selected_option_indices
+        .get(question_index)
+        .is_some_and(|selected| selected.contains(&option_index));
     let option_label_id = format!("question-{question_index}-option-{option_index}-label");
     container! {
         form hx-post=(context.action_target(PresentationAction::ResolveInteraction)) hx-target="#bcode-web-shell" hx-swap=this {
