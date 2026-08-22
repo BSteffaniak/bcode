@@ -1459,6 +1459,81 @@ pub struct NativeServiceContext {
     pub transient_progress_limits: TransientProgressLimits,
 }
 
+/// Semantic credentials delivered by the host for the current plugin invocation.
+///
+/// Credential lookup is scoped to the plugin identity already bound by the host. Plugin code names
+/// only the provider and canonical credential; it never constructs host storage keys or supplies a
+/// plugin owner.
+#[derive(Debug, Clone, Copy)]
+pub struct PluginCredentials<'a> {
+    plugin_id: &'a str,
+    secrets: &'a BTreeMap<String, String>,
+}
+
+impl<'a> PluginCredentials<'a> {
+    /// Return one host-delivered semantic credential.
+    #[must_use]
+    pub fn get(&self, provider_id: &str, credential_id: &str) -> Option<&'a str> {
+        semantic_credential_id(provider_id, "provider_id").ok()?;
+        semantic_credential_id(credential_id, "credential_id").ok()?;
+        self.secrets
+            .get(&format!("{}/{provider_id}/{credential_id}", self.plugin_id))
+            .map(String::as_str)
+    }
+
+    /// Require one host-delivered semantic credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns a secret-safe error when either identifier is invalid or the credential was not
+    /// delivered for this invocation.
+    pub fn require(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+    ) -> Result<&'a str, PluginCredentialError> {
+        semantic_credential_id(provider_id, "provider_id")?;
+        semantic_credential_id(credential_id, "credential_id")?;
+        self.get(provider_id, credential_id)
+            .ok_or(PluginCredentialError::Unavailable)
+    }
+}
+
+/// Secret-safe semantic credential lookup failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginCredentialError {
+    InvalidIdentifier { field: &'static str },
+    Unavailable,
+}
+
+impl std::fmt::Display for PluginCredentialError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidIdentifier { field } => {
+                write!(formatter, "invalid semantic credential identifier: {field}")
+            }
+            Self::Unavailable => {
+                formatter.write_str("credential is unavailable for this plugin invocation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PluginCredentialError {}
+
+fn semantic_credential_id(value: &str, field: &'static str) -> Result<(), PluginCredentialError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(PluginCredentialError::InvalidIdentifier { field })
+    }
+}
+
 /// Resolved plugin configuration delivered by the host.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginConfigContext {
@@ -1477,6 +1552,15 @@ pub struct PluginConfigContext {
 }
 
 impl PluginConfigContext {
+    /// Return semantic credentials scoped to the host-bound plugin identity.
+    #[must_use]
+    const fn credentials<'a>(&'a self, plugin_id: &'a str) -> PluginCredentials<'a> {
+        PluginCredentials {
+            plugin_id,
+            secrets: &self.secrets,
+        }
+    }
+
     /// Decode the resolved plugin config into a typed value.
     ///
     /// # Errors
@@ -1505,6 +1589,12 @@ impl PluginConfigContext {
 }
 
 impl NativeServiceContext {
+    /// Return semantic credentials scoped to this host-bound plugin invocation.
+    #[must_use]
+    pub fn credentials(&self) -> PluginCredentials<'_> {
+        self.config.credentials(&self.plugin_id)
+    }
+
     /// Decode the resolved plugin config into a typed value.
     ///
     /// # Errors
@@ -2899,6 +2989,73 @@ mod tests {
             bcode_tool::ToolContributionOperation::Remove
         );
         assert_eq!(decoded[3].contribution.payload, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn semantic_credentials_are_owner_scoped_borrowed_and_secret_safe() {
+        let secret = "semantic-test-secret";
+        let context = super::PluginConfigContext {
+            secrets: BTreeMap::from([
+                ("example.plugin/exa/api_key".to_owned(), secret.to_owned()),
+                (
+                    "other.plugin/exa/api_key".to_owned(),
+                    "other-secret".to_owned(),
+                ),
+            ]),
+            ..super::PluginConfigContext::default()
+        };
+        let credentials = context.credentials("example.plugin");
+        let value = credentials
+            .require("exa", "api_key")
+            .expect("owned semantic credential");
+        assert_eq!(value, secret);
+        assert_eq!(
+            value.as_ptr(),
+            context.secrets["example.plugin/exa/api_key"].as_ptr()
+        );
+        assert_eq!(credentials.get("missing", "api_key"), None);
+        assert_eq!(credentials.get("exa/other", "api_key"), None);
+        assert_eq!(
+            credentials.require("exa", "missing"),
+            Err(super::PluginCredentialError::Unavailable)
+        );
+        let error = credentials
+            .require("exa/other", "api_key")
+            .expect_err("invalid provider identifier");
+        assert_eq!(
+            error,
+            super::PluginCredentialError::InvalidIdentifier {
+                field: "provider_id"
+            }
+        );
+        let encoded = format!("{error:?} {error}");
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("other-secret"));
+    }
+
+    #[test]
+    fn native_service_context_credentials_use_host_bound_plugin_id() {
+        let context = super::NativeServiceContext {
+            plugin_id: "example.plugin".to_owned(),
+            request: ServiceRequest {
+                interface_id: "example/v1".to_owned(),
+                operation: "run".to_owned(),
+                payload: Vec::new(),
+            },
+            config: super::PluginConfigContext {
+                secrets: BTreeMap::from([
+                    ("example.plugin/exa/api_key".to_owned(), "owned".to_owned()),
+                    ("other.plugin/exa/api_key".to_owned(), "other".to_owned()),
+                ]),
+                ..super::PluginConfigContext::default()
+            },
+            events: ServiceEventEmitter::default(),
+            cancellation: ServiceCancellation::default(),
+            bridge: ServiceBridge::default(),
+            transient_progress_limits: TransientProgressLimits::default(),
+        };
+        assert_eq!(context.credentials().get("exa", "api_key"), Some("owned"));
+        assert_ne!(context.credentials().get("exa", "api_key"), Some("other"));
     }
 
     #[test]

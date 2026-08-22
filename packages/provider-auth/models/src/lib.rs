@@ -91,6 +91,112 @@ pub const MAX_AUTH_FLOW_EFFECTS: usize = 16;
 /// Maximum wait requested by one normalized interactive-flow effect.
 pub const MAX_AUTH_WAIT_MILLIS: u64 = 5 * 60 * 1_000;
 
+/// Current schema version for host-owned credential update requests.
+pub const AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION: u16 = 1;
+/// Host application-service interface for provider-auth operations.
+pub const AUTH_HOST_INTERFACE_ID: &str = "bcode.provider-auth/v1";
+/// Operation used to persist refreshed credentials for the current owned profile.
+pub const OP_UPDATE_CREDENTIALS: &str = "update_credentials";
+
+/// Provider refresh result submitted to host-owned credential custody.
+///
+/// The caller identity, provider owner, vault path, storage profile, and backend keys are
+/// intentionally absent. The host binds those from the active invocation and selected profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCredentialUpdateRequest {
+    pub schema_version: u16,
+    pub profile: String,
+    pub credentials: BTreeMap<String, String>,
+}
+
+impl AuthCredentialUpdateRequest {
+    /// Validate portable bounds before host authorization or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, invalid profile/credential IDs, an empty or
+    /// excessive credential set, or oversized credential values.
+    pub fn validate(&self) -> Result<(), AuthContractError> {
+        validate_schema(
+            "auth credential update",
+            self.schema_version,
+            AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+        )?;
+        validate_id("profile", &self.profile)?;
+        if self.credentials.is_empty() {
+            return Err(AuthContractError::EmptyCollection {
+                field: "credentials",
+            });
+        }
+        validate_count(
+            "credentials",
+            self.credentials.len(),
+            MAX_AUTH_SECRET_FIELDS,
+        )?;
+        for (credential_id, value) in &self.credentials {
+            validate_id("credential_id", credential_id)?;
+            validate_text("credential_value", value, MAX_AUTH_FLOW_STATE_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+/// Secret-free result of one host-owned credential update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCredentialUpdateResponse {
+    pub schema_version: u16,
+    pub updated_credentials: Vec<String>,
+}
+
+/// Current schema version for semantic auth-security inspection.
+pub const AUTH_SECURITY_INSPECTION_SCHEMA_VERSION: u16 = 1;
+/// Operation used to inspect security for an authorized auth profile.
+pub const OP_INSPECT_SECURITY: &str = "inspect_security";
+
+/// Semantic request for host-owned auth security inspection.
+///
+/// Vault paths and device-seal implementation settings are intentionally absent and derived by the
+/// host from the authorized profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSecurityInspectionRequest {
+    pub schema_version: u16,
+    pub provider_id: String,
+    pub profile: String,
+}
+
+impl AuthSecurityInspectionRequest {
+    /// Validate portable request bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported version or invalid provider/profile identifier.
+    pub fn validate(&self) -> Result<(), AuthContractError> {
+        validate_schema(
+            "auth security inspection",
+            self.schema_version,
+            AUTH_SECURITY_INSPECTION_SCHEMA_VERSION,
+        )?;
+        validate_id("provider_id", &self.provider_id)?;
+        validate_id("profile", &self.profile)
+    }
+}
+
+/// Secret-free semantic auth-security status.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSecurityInspectionResponse {
+    pub schema_version: u16,
+    pub provider_id: String,
+    pub profile: String,
+    pub policy: String,
+    pub vault_exists: bool,
+    pub profile_keys_enabled: bool,
+    pub profile_exists: bool,
+    pub profile_device_sealed: bool,
+    pub policy_satisfied: bool,
+    pub diagnostics: Vec<AuthDiagnostic>,
+}
+
 /// Stable provider registration contributed by one plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProviderContribution {

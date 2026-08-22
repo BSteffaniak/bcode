@@ -89,6 +89,25 @@ Place the library and an adjusted `bcode-plugin.toml` together under a discovery
 
 ## Plugin-owned authentication
 
+Plugins declare provider-owned authentication methods during activation. Bcode owns enrollment,
+vault custody, profile ownership checks, and invocation-time delivery.
+
+Plugin implementations consume semantic credentials through the invocation context rather than
+constructing host secret keys or opening the vault:
+
+```rust
+let api_key = context
+    .credentials()
+    .require("example-provider", "api_key")?;
+```
+
+The provider and credential IDs come from the plugin's registered auth contribution. The host binds
+plugin ownership from the loaded plugin identity, so plugin code never supplies an owner ID, vault
+path, storage profile, or backend key. Missing-credential errors are intentionally secret-safe.
+
+Native plugins remain trusted in-process code; this API enforces Bcode's supported ownership and
+custody architecture rather than claiming adversarial sandbox isolation.
+
 Enabled plugins register their authentication providers and methods. The host owns hidden prompting, secure credential custody, ownership checks, and invocation-scoped delivery; plugins own provider identity, credential declarations, OAuth/device protocols, refresh, verification, and revocation.
 
 ```sh

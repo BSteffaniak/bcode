@@ -6947,7 +6947,7 @@ fn settings() -> Settings {
 
 #[allow(clippy::too_many_lines)]
 fn settings_for_context(context: &ProviderRequestContext) -> Settings {
-    let saved = saved_openai_auth();
+    let saved = SavedOpenAiAuth::default();
     let allow_saved_auth = context.auth.is_none();
     let xai_mode = env_has_xai_keys(context) || (allow_saved_auth && saved_has_xai_keys(&saved));
     let chatgpt_mode = (context_has_chatgpt_auth(context)
@@ -7080,44 +7080,6 @@ struct SavedOpenAiAuth {
     vault: Option<std::path::PathBuf>,
 }
 
-fn saved_openai_auth() -> SavedOpenAiAuth {
-    let Ok(config) = bcode_config::load_config() else {
-        return SavedOpenAiAuth::default();
-    };
-    let Some(auth) = config.auth.openai else {
-        return SavedOpenAiAuth::default();
-    };
-    if auth.backend != "sshenv" {
-        return SavedOpenAiAuth::default();
-    }
-    let vault = auth
-        .vault
-        .clone()
-        .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let store = sshenv_vault::SshenvStore::new(
-        sshenv_vault::SshenvStoreConfig::new(vault.clone()).with_private_key_paths(
-            bcode_provider_auth::security::vault_private_key_paths(&vault),
-        ),
-    );
-    let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
-        return SavedOpenAiAuth {
-            values: BTreeMap::new(),
-            mode: Some(auth.mode),
-            profile: Some(auth.profile),
-            vault: Some(vault),
-        };
-    };
-    SavedOpenAiAuth {
-        values: profile
-            .into_iter()
-            .map(|(key, value)| (key, value.to_string()))
-            .collect(),
-        mode: Some(auth.mode),
-        profile: Some(auth.profile),
-        vault: Some(vault),
-    }
-}
-
 fn saved_openai_auth_is_chatgpt(saved: &SavedOpenAiAuth) -> bool {
     matches!(saved.mode, Some(AuthMode::ChatGpt))
         || saved
@@ -7166,31 +7128,6 @@ fn openai_auth_settings(
         }
         if auth.credentials.contains_key("access_token") {
             return semantic_chatgpt_auth_settings(auth);
-        }
-    }
-    if let Some(auth_profile_name) = &context.auth_profile
-        && let Ok(config) = bcode_config::load_config()
-        && let Some(auth_profile) = config.auth.profiles.get(auth_profile_name)
-    {
-        let resolved = bcode_provider_auth::resolve_auth_profile(auth_profile_name, auth_profile);
-        if let Some(api_key) = resolved.auth.credentials.get("api_key") {
-            return (
-                AuthSettings::ApiKey(api_key.value.clone()),
-                AuthDiagnostics {
-                    source: "resolved_auth_profile".to_string(),
-                    mode: resolved
-                        .auth
-                        .scheme
-                        .clone()
-                        .unwrap_or_else(|| "api_key".to_string()),
-                    detail: format!(
-                        "resolved auth profile '{auth_profile_name}' credential 'api_key'"
-                    ),
-                },
-            );
-        }
-        if resolved.auth.credentials.contains_key("access_token") {
-            return semantic_chatgpt_auth_settings(&resolved.auth);
         }
     }
     if let Some(api_key_env) = configured_api_key_env(context) {
@@ -7381,26 +7318,16 @@ fn semantic_chatgpt_auth_settings(
                 .and_then(|credential| credential.value.parse().ok()),
             account_id,
             profile: profile.clone(),
-            vault: vault.clone(),
+            vault,
             storage: auth.storage.clone(),
         },
         AuthDiagnostics {
             source: "runtime_auth".to_string(),
             mode: "chatgpt".to_string(),
-            detail: match (&profile, &vault) {
-                (Some(profile), Some(vault)) => format!(
-                    "runtime semantic ChatGPT/Codex auth from profile '{profile}' in vault {}",
-                    display_from_current_dir(vault)
-                ),
-                (Some(profile), None) => {
-                    format!("runtime semantic ChatGPT/Codex auth from profile '{profile}'")
-                }
-                (None, Some(vault)) => format!(
-                    "runtime semantic ChatGPT/Codex auth from vault {}",
-                    display_from_current_dir(vault)
-                ),
-                (None, None) => "runtime semantic ChatGPT/Codex auth".to_string(),
-            },
+            detail: profile.as_ref().map_or_else(
+                || "runtime semantic ChatGPT/Codex auth".to_owned(),
+                |profile| format!("runtime semantic ChatGPT/Codex auth from profile '{profile}'"),
+            ),
         },
     )
 }
@@ -7444,26 +7371,16 @@ fn context_chatgpt_auth_settings(
                 .and_then(|value| value.parse().ok()),
             account_id,
             profile: profile.clone(),
-            vault: vault.clone(),
+            vault,
             storage: BTreeMap::new(),
         },
         AuthDiagnostics {
             source: "runtime_context".to_string(),
             mode: "chatgpt".to_string(),
-            detail: match (&profile, &vault) {
-                (Some(profile), Some(vault)) => format!(
-                    "runtime sshenv ChatGPT/Codex auth from profile '{profile}' in vault {}",
-                    display_from_current_dir(vault)
-                ),
-                (Some(profile), None) => {
-                    format!("runtime sshenv ChatGPT/Codex auth from profile '{profile}'")
-                }
-                (None, Some(vault)) => format!(
-                    "runtime sshenv ChatGPT/Codex auth from vault {}",
-                    display_from_current_dir(vault)
-                ),
-                (None, None) => "runtime ChatGPT/Codex auth".to_string(),
-            },
+            detail: profile.as_ref().map_or_else(
+                || "runtime ChatGPT/Codex auth".to_owned(),
+                |profile| format!("runtime ChatGPT/Codex auth from profile '{profile}'"),
+            ),
         },
     )
 }
@@ -9838,6 +9755,73 @@ mod tests {
 
     fn test_api_key_auth() -> AuthSettings {
         AuthSettings::ApiKey("token".to_string())
+    }
+
+    #[test]
+    fn semantic_runtime_auth_precedes_configured_and_conventional_environment_keys() {
+        let context = ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext {
+                scheme: Some("api_key".to_owned()),
+                credentials: BTreeMap::from([(
+                    "api_key".to_owned(),
+                    bcode_model::ProviderAuthCredential {
+                        value: "runtime-key".to_owned(),
+                        source: Some("integrated_auth".to_owned()),
+                    },
+                )]),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            settings: BTreeMap::from([("api_key_env".to_owned(), "CUSTOM_OPENAI_KEY".to_owned())]),
+            env: BTreeMap::from([
+                ("CUSTOM_OPENAI_KEY".to_owned(), "configured-key".to_owned()),
+                ("OPENAI_API_KEY".to_owned(), "conventional-key".to_owned()),
+            ]),
+            ..ProviderRequestContext::default()
+        };
+        let (auth, diagnostics) = openai_auth_settings(&SavedOpenAiAuth::default(), &context);
+        assert!(matches!(auth, AuthSettings::ApiKey(value) if value == "runtime-key"));
+        assert_eq!(diagnostics.source, "runtime_auth");
+    }
+
+    #[test]
+    fn configured_api_key_environment_precedes_conventional_environment_key() {
+        let context = ProviderRequestContext {
+            settings: BTreeMap::from([("api_key_env".to_owned(), "CUSTOM_OPENAI_KEY".to_owned())]),
+            env: BTreeMap::from([
+                ("CUSTOM_OPENAI_KEY".to_owned(), "configured-key".to_owned()),
+                ("OPENAI_API_KEY".to_owned(), "conventional-key".to_owned()),
+            ]),
+            auth: Some(bcode_model::ProviderAuthContext::default()),
+            ..ProviderRequestContext::default()
+        };
+        let (auth, diagnostics) = openai_auth_settings(&SavedOpenAiAuth::default(), &context);
+        assert!(matches!(auth, AuthSettings::ApiKey(value) if value == "configured-key"));
+        assert_eq!(diagnostics.source, "runtime_context");
+        assert!(diagnostics.detail.contains("CUSTOM_OPENAI_KEY"));
+    }
+
+    #[test]
+    fn xai_model_never_uses_chatgpt_subscription_auth() {
+        let context = ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext {
+                profile: Some("openai".to_owned()),
+                scheme: Some("chatgpt".to_owned()),
+                credentials: BTreeMap::from([(
+                    "access_token".to_owned(),
+                    bcode_model::ProviderAuthCredential {
+                        value: "chatgpt-token".to_owned(),
+                        source: Some("integrated_auth".to_owned()),
+                    },
+                )]),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            env: BTreeMap::from([("BCODE_XAI_MODELS".to_owned(), "grok-4.3".to_owned())]),
+            ..ProviderRequestContext::default()
+        };
+        let settings = settings_for_context(&context);
+        assert!(matches!(settings.auth, AuthSettings::Missing));
+        assert_eq!(settings.base_url, DEFAULT_XAI_BASE_URL);
+        assert_eq!(settings.dialect, OpenAiCompatibleDialect::ResponsesApi);
     }
 
     #[test]

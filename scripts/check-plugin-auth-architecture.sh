@@ -21,6 +21,14 @@ if rg -n 'sshenv_vault|read_auth_vault|write_auth_vault|SshenvStore' \
   violations=1
 fi
 
+web_search_production_source="$(sed '/^#\[cfg(test)\]/,$d' plugins/web-search-plugin/src/lib.rs)"
+if rg -n '\.secrets\b|bcode\.web-search/exa/api_key' <<<"$web_search_production_source" \
+  >/tmp/bcode-web-search-secret-map-bypass.txt; then
+  echo "Auth architecture violation: web-search must use semantic invocation credentials instead of the raw secret map or host key format." >&2
+  cat /tmp/bcode-web-search-secret-map-bypass.txt >&2
+  violations=1
+fi
+
 if rg -n 'bcode_provider_auth\s*=|sshenv_vault\s*=' plugins/web-search-plugin/Cargo.toml \
   >/tmp/bcode-web-search-auth-custody.txt; then
   echo "Auth architecture violation: the Exa integration must use host-owned auth lifecycle instead of direct vault custody." >&2

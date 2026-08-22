@@ -11,6 +11,7 @@
 pub mod auth_pool_routing;
 pub mod auth_pool_state;
 pub mod lifecycle;
+pub mod operations;
 pub mod security;
 
 /// Return portable, secret-free summaries for all configured or runtime auth pools.
@@ -210,7 +211,77 @@ pub fn resolve_provider_request_context(
         }
     }
 
+    if context.auth.is_none()
+        && context.auth_candidates.is_empty()
+        && request.selection.auth_profile.is_none()
+        && request.selection.auth_pool.is_none()
+        && let Some(legacy_auth) = request.config.auth.openai.as_ref()
+        && legacy_auth.backend == "sshenv"
+    {
+        let profile = legacy_openai_profile(legacy_auth);
+        let resolved = resolve_auth_profile(&legacy_auth.profile, &profile);
+        context.auth_profile = Some(legacy_auth.profile.clone());
+        context.env = resolved.env;
+        context.auth = Some(resolved.auth);
+    }
+
     context
+}
+
+fn legacy_openai_profile(
+    auth: &bcode_config::AuthProviderConfig,
+) -> bcode_config::AuthProfileConfig {
+    let (scheme, map) = match auth.mode {
+        bcode_config::AuthMode::ApiKey => (
+            "api_key",
+            BTreeMap::from([(
+                "api_key".to_owned(),
+                bcode_config::AuthCredentialMapping {
+                    env: Some("BCODE_OPENAI_API_KEY".to_owned()),
+                    key: None,
+                },
+            )]),
+        ),
+        bcode_config::AuthMode::ChatGpt => (
+            "chatgpt",
+            BTreeMap::from([
+                legacy_openai_credential("access_token", "BCODE_OPENAI_CODEX_ACCESS_TOKEN"),
+                legacy_openai_credential("refresh_token", "BCODE_OPENAI_CODEX_REFRESH_TOKEN"),
+                legacy_openai_credential("id_token", "BCODE_OPENAI_CODEX_ID_TOKEN"),
+                legacy_openai_credential("expires_at", "BCODE_OPENAI_CODEX_EXPIRES_AT"),
+                legacy_openai_credential("account_id", "BCODE_OPENAI_CODEX_ACCOUNT_ID"),
+            ]),
+        ),
+    };
+    let mut settings = BTreeMap::from([
+        ("provider".to_owned(), "openai".to_owned()),
+        ("profile".to_owned(), auth.profile.clone()),
+        ("mode".to_owned(), scheme.to_owned()),
+    ]);
+    if let Some(vault) = &auth.vault {
+        settings.insert("vault".to_owned(), vault.display().to_string());
+    }
+    bcode_config::AuthProfileConfig {
+        backend: auth.backend.clone(),
+        provider_id: Some("openai".to_owned()),
+        owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
+        scheme: Some(scheme.to_owned()),
+        map,
+        settings,
+    }
+}
+
+fn legacy_openai_credential(
+    credential_id: &str,
+    storage_key: &str,
+) -> (String, bcode_config::AuthCredentialMapping) {
+    (
+        credential_id.to_owned(),
+        bcode_config::AuthCredentialMapping {
+            env: Some(storage_key.to_owned()),
+            key: None,
+        },
+    )
 }
 
 fn push_config_auth_candidate(
@@ -825,6 +896,305 @@ fn apply_default_priming_required_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_openai_method(
+        mode: &bcode_config::AuthMode,
+    ) -> bcode_provider_auth_models::AuthMethodContribution {
+        match mode {
+            bcode_config::AuthMode::ApiKey => {
+                bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+                    method_id: "api_key".to_owned(),
+                    display_name: "API key".to_owned(),
+                    fields: vec![bcode_provider_auth_models::AuthSecretField {
+                        credential_id: "api_key".to_owned(),
+                        storage_key: "BCODE_OPENAI_API_KEY".to_owned(),
+                        prompt: "OpenAI API key".to_owned(),
+                        optional: false,
+                        validation: bcode_provider_auth_models::AuthSecretValidation::default(),
+                    }],
+                    supports_verification: false,
+                    supports_revocation: false,
+                }
+            }
+            bcode_config::AuthMode::ChatGpt => {
+                bcode_provider_auth_models::AuthMethodContribution::Interactive {
+                    method_id: "chatgpt".to_owned(),
+                    display_name: "ChatGPT".to_owned(),
+                    operation: "flow".to_owned(),
+                    credentials: [
+                        ("access_token", "BCODE_OPENAI_CODEX_ACCESS_TOKEN"),
+                        ("refresh_token", "BCODE_OPENAI_CODEX_REFRESH_TOKEN"),
+                        ("id_token", "BCODE_OPENAI_CODEX_ID_TOKEN"),
+                        ("expires_at", "BCODE_OPENAI_CODEX_EXPIRES_AT"),
+                        ("account_id", "BCODE_OPENAI_CODEX_ACCOUNT_ID"),
+                    ]
+                    .into_iter()
+                    .map(|(credential_id, storage_key)| {
+                        bcode_provider_auth_models::AuthCredentialStorage {
+                            credential_id: credential_id.to_owned(),
+                            storage_key: storage_key.to_owned(),
+                        }
+                    })
+                    .collect(),
+                    supports_revocation: false,
+                }
+            }
+        }
+    }
+
+    fn legacy_openai_resolved(auth: &bcode_config::AuthProviderConfig) -> ResolvedAuthProfile {
+        let mut profile = legacy_openai_profile(auth);
+        profile
+            .settings
+            .insert("device_seal".to_owned(), "off".to_owned());
+        ResolvedAuthProfile {
+            profile_name: auth.profile.clone(),
+            provider_id: "openai".to_owned(),
+            owner_plugin_id: "bcode.openai-compatible".to_owned(),
+            profile,
+            source: AuthProfileSource::Declarative,
+        }
+    }
+
+    #[test]
+    fn legacy_openai_api_key_round_trips_through_host_custody() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth = bcode_config::AuthProviderConfig {
+            backend: "sshenv".to_owned(),
+            mode: bcode_config::AuthMode::ApiKey,
+            profile: "legacy-openai-api".to_owned(),
+            vault: Some(temp.path().join("vault")),
+        };
+        let resolved = legacy_openai_resolved(&auth);
+        let method = legacy_openai_method(&auth.mode);
+        lifecycle::AuthVaultLifecycle::new(&resolved, "openai", "bcode.openai-compatible", &method)
+            .expect("owned legacy lifecycle")
+            .upsert(BTreeMap::from([(
+                "api_key".to_owned(),
+                "legacy-api-key".to_owned(),
+            )]))
+            .expect("store legacy API key");
+
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                openai: Some(auth),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let context = resolve_provider_request_context(ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection::default(),
+        });
+        let semantic = context.auth.expect("host semantic auth");
+        assert_eq!(semantic.profile.as_deref(), Some("legacy-openai-api"));
+        assert_eq!(semantic.scheme.as_deref(), Some("api_key"));
+        assert_eq!(
+            semantic
+                .credentials
+                .get("api_key")
+                .map(|credential| credential.value.as_str()),
+            Some("legacy-api-key")
+        );
+    }
+
+    #[test]
+    fn legacy_openai_chatgpt_round_trips_through_host_custody() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth = bcode_config::AuthProviderConfig {
+            backend: "sshenv".to_owned(),
+            mode: bcode_config::AuthMode::ChatGpt,
+            profile: "legacy-openai-chatgpt".to_owned(),
+            vault: Some(temp.path().join("vault")),
+        };
+        let resolved = legacy_openai_resolved(&auth);
+        let method = legacy_openai_method(&auth.mode);
+        lifecycle::AuthVaultLifecycle::new(&resolved, "openai", "bcode.openai-compatible", &method)
+            .expect("owned legacy lifecycle")
+            .replace_owned(BTreeMap::from([
+                ("access_token".to_owned(), "legacy-access".to_owned()),
+                ("refresh_token".to_owned(), "legacy-refresh".to_owned()),
+                ("expires_at".to_owned(), "12345".to_owned()),
+                ("account_id".to_owned(), "account-1".to_owned()),
+            ]))
+            .expect("store legacy ChatGPT credentials");
+
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                openai: Some(auth),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let context = resolve_provider_request_context(ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection::default(),
+        });
+        let semantic = context.auth.expect("host semantic auth");
+        assert_eq!(semantic.profile.as_deref(), Some("legacy-openai-chatgpt"));
+        assert_eq!(semantic.scheme.as_deref(), Some("chatgpt"));
+        assert_eq!(
+            semantic
+                .credentials
+                .get("access_token")
+                .map(|credential| credential.value.as_str()),
+            Some("legacy-access")
+        );
+        assert_eq!(
+            semantic
+                .credentials
+                .get("refresh_token")
+                .map(|credential| credential.value.as_str()),
+            Some("legacy-refresh")
+        );
+        assert_eq!(
+            semantic
+                .credentials
+                .get("account_id")
+                .map(|credential| credential.value.as_str()),
+            Some("account-1")
+        );
+    }
+
+    #[test]
+    fn legacy_openai_ownership_fails_before_vault_access() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vault = temp.path().join("must-not-exist");
+        let auth = bcode_config::AuthProviderConfig {
+            backend: "sshenv".to_owned(),
+            mode: bcode_config::AuthMode::ApiKey,
+            profile: "legacy-openai".to_owned(),
+            vault: Some(vault.clone()),
+        };
+        let resolved = legacy_openai_resolved(&auth);
+        let method = legacy_openai_method(&auth.mode);
+        assert!(matches!(
+            lifecycle::AuthVaultLifecycle::new(&resolved, "openai", "bcode.other", &method,),
+            Err(lifecycle::AuthVaultLifecycleError::Ownership(
+                AuthProfileResolutionError::OwnerMismatch { .. }
+            ))
+        ));
+        assert!(!vault.exists());
+    }
+
+    #[test]
+    fn legacy_openai_profile_is_host_materialized_only_without_explicit_selection() {
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                openai: Some(bcode_config::AuthProviderConfig {
+                    backend: "sshenv".to_owned(),
+                    mode: bcode_config::AuthMode::ChatGpt,
+                    profile: "legacy-openai".to_owned(),
+                    vault: Some(PathBuf::from("/missing/legacy-vault")),
+                }),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let legacy = resolve_provider_request_context(ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection::default(),
+        });
+        let auth = legacy.auth.expect("legacy auth is host materialized");
+        assert_eq!(legacy.auth_profile.as_deref(), Some("legacy-openai"));
+        assert_eq!(auth.profile.as_deref(), Some("legacy-openai"));
+        assert_eq!(auth.scheme.as_deref(), Some("chatgpt"));
+        assert!(auth.credentials.is_empty());
+        assert!(!auth.diagnostics.is_empty());
+
+        let explicit = resolve_provider_request_context(ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection {
+                auth_profile: Some("missing-explicit".to_owned()),
+                ..bcode_config::ResolvedModelSelection::default()
+            },
+        });
+        assert_eq!(explicit.auth_profile.as_deref(), Some("missing-explicit"));
+        assert!(explicit.auth.is_none());
+    }
+
+    #[test]
+    fn request_context_selected_profile_and_pool_precedence_are_characterized() {
+        let profile = |name: &str| bcode_config::AuthProfileConfig {
+            backend: "env".to_owned(),
+            provider_id: Some("openai".to_owned()),
+            owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
+            scheme: Some("api_key".to_owned()),
+            map: BTreeMap::from([(
+                "api_key".to_owned(),
+                bcode_config::AuthCredentialMapping {
+                    env: Some(format!("BCODE_TEST_{}_KEY", name.to_ascii_uppercase())),
+                    key: None,
+                },
+            )]),
+            settings: BTreeMap::new(),
+        };
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                profiles: BTreeMap::from([
+                    ("custody-one".to_owned(), profile("custody-one")),
+                    ("custody-two".to_owned(), profile("custody-two")),
+                ]),
+                pools: BTreeMap::from([(
+                    "custody-test-pool".to_owned(),
+                    bcode_config::AuthPoolConfig {
+                        profiles: vec!["custody-one".to_owned(), "custody-two".to_owned()],
+                        preferred_profile: Some("custody-two".to_owned()),
+                        ..bcode_config::AuthPoolConfig::default()
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+
+        let selected = resolve_provider_request_context(ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection {
+                auth_profile: Some("custody-one".to_owned()),
+                ..bcode_config::ResolvedModelSelection::default()
+            },
+        });
+        assert_eq!(selected.auth_profile.as_deref(), Some("custody-one"));
+        assert_eq!(
+            selected.auth.and_then(|auth| auth.scheme).as_deref(),
+            Some("api_key")
+        );
+
+        let pooled = resolve_provider_request_context(ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection {
+                auth_profile: Some("custody-one".to_owned()),
+                auth_pool: Some("custody-test-pool".to_owned()),
+                ..bcode_config::ResolvedModelSelection::default()
+            },
+        });
+        assert_eq!(pooled.auth_candidates.len(), 2);
+        assert_eq!(pooled.auth_profile.as_deref(), Some("custody-two"));
+        assert_eq!(
+            pooled
+                .auth_candidates
+                .iter()
+                .map(|candidate| candidate.profile.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("custody-two"), Some("custody-one")]
+        );
+    }
+
+    #[test]
+    fn request_context_missing_profile_is_explicit_and_does_not_fallback() {
+        let context = resolve_provider_request_context(ProviderRequestContextResolution {
+            config: &bcode_config::BcodeConfig::default(),
+            selection: bcode_config::ResolvedModelSelection {
+                auth_profile: Some("missing".to_owned()),
+                ..bcode_config::ResolvedModelSelection::default()
+            },
+        });
+        assert_eq!(context.auth_profile.as_deref(), Some("missing"));
+        assert!(context.auth.is_none());
+        assert!(context.auth_candidates.is_empty());
+        assert!(context.env.is_empty());
+    }
 
     #[test]
     fn fresh_provider_lookup_is_unconfigured_without_hiding_dangling_selections() {
