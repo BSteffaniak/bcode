@@ -1976,6 +1976,7 @@ dependencies = [
  "hyperchad_transformer_models",
  "insta",
  "pulldown-cmark",
+ "smallvec",
  "test-log",
  "unicode-segmentation",
  "unicode-width 0.2.2",

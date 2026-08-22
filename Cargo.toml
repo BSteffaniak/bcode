@@ -342,6 +342,9 @@ serde_json = { version = "1.0.149", default-features = false, features = [
 # supported release targets.
 sha2 = { version = "0.10.9", default-features = false }
 shuck-formatter = { version = "0.0.41", default-features = false }
+smallvec = { version = "1.15.2", default-features = false, features = [
+    "union",
+] }
 ssh-key = { version = "0.6.7", default-features = false, features = [
     "ed25519",
     "getrandom",

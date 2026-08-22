@@ -41,6 +41,7 @@ use std::{
     hash::{Hash, Hasher},
     ops::Range,
     rc::Rc,
+    sync::Arc,
 };
 
 use bcode_mermaid_render::{
@@ -56,6 +57,7 @@ use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType,
     Options as ParserOptions, Parser, Tag, TagEnd,
 };
+use smallvec::{SmallVec, smallvec};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
@@ -771,19 +773,37 @@ pub fn parse_markdown_document(markdown: &str) -> MarkdownDocument {
     }
 }
 
+/// Source ranges for one provenance unit.
+///
+/// Projected text units hold exactly one range, so inline capacity avoids a
+/// heap allocation per rendered grapheme.
+pub type MarkdownSourceRanges = SmallVec<[Range<usize>; 1]>;
+
+/// Display rectangles for one provenance unit.
+///
+/// A grapheme normally occupies one cell rectangle, so inline capacity avoids a
+/// heap allocation per rendered grapheme.
+pub type MarkdownCellRects = SmallVec<[MarkdownCellRect; 1]>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownSelectionProvenance {
     /// Original UTF-8 source ranges in canonical source order.
-    pub source_ranges: Vec<Range<usize>>,
+    pub source_ranges: MarkdownSourceRanges,
     /// Post-layout document-relative cells when this unit has truthful visible geometry.
-    pub rects: Vec<MarkdownCellRect>,
+    pub rects: MarkdownCellRects,
     /// Optional semantic identity for whole-unit expansion.
     pub semantic_expansion: Option<String>,
     /// Parser semantic kind represented by the ranges.
     pub kind: MarkdownSelectionKind,
     /// Active parser containers from outermost to innermost.
-    pub containers: Vec<MarkdownSelectionContainer>,
+    pub containers: MarkdownSelectionContainers,
 }
+
+/// Active parser containers for one provenance unit.
+///
+/// Container stacks are shared by every grapheme of a text event, so they are
+/// reference-counted instead of cloned per unit.
+pub type MarkdownSelectionContainers = Arc<[MarkdownSelectionContainer]>;
 
 /// Parser container associated with one selection provenance unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1077,18 +1097,28 @@ fn semantic_expansion_id(event: &MarkdownSemanticEvent) -> Option<String> {
 }
 
 fn markdown_selection_provenance(document: &MarkdownDocument) -> Vec<MarkdownSelectionProvenance> {
-    let mut containers = Vec::new();
+    let mut containers: Vec<MarkdownSelectionContainer> = Vec::new();
+    // The container stack is shared by every unit produced while it is
+    // unchanged, so snapshot it into an `Arc` only when it actually changes.
+    let mut shared_containers: MarkdownSelectionContainers = Arc::from([]);
+    let mut shared_is_current = true;
     document
         .events
         .iter()
         .filter(|event| event.source_range.start <= event.source_range.end)
         .map(|event| {
-            if let MarkdownSemanticEventKind::End(end) = event.kind {
-                pop_selection_container(&mut containers, end);
+            if let MarkdownSemanticEventKind::End(end) = event.kind
+                && pop_selection_container(&mut containers, end)
+            {
+                shared_is_current = false;
+            }
+            if !shared_is_current {
+                shared_containers = Arc::from(containers.as_slice());
+                shared_is_current = true;
             }
             let unit = MarkdownSelectionProvenance {
-                source_ranges: vec![event.source_range.clone()],
-                rects: Vec::new(),
+                source_ranges: smallvec![event.source_range.clone()],
+                rects: MarkdownCellRects::new(),
                 semantic_expansion: semantic_expansion_id(event),
                 kind: match &event.kind {
                     MarkdownSemanticEventKind::Start(_) => MarkdownSelectionKind::Start,
@@ -1099,12 +1129,13 @@ fn markdown_selection_provenance(document: &MarkdownDocument) -> Vec<MarkdownSel
                     MarkdownSemanticEventKind::HardBreak => MarkdownSelectionKind::HardBreak,
                     _ => MarkdownSelectionKind::Other,
                 },
-                containers: containers.clone(),
+                containers: Arc::clone(&shared_containers),
             };
             if let MarkdownSemanticEventKind::Start(tag) = &event.kind
                 && let Some(container) = selection_container(tag)
             {
                 containers.push(container);
+                shared_is_current = false;
             }
             unit
         })
@@ -1127,10 +1158,11 @@ const fn selection_container(tag: &MarkdownSemanticTag) -> Option<MarkdownSelect
     }
 }
 
+/// Pop `end`'s container from the stack, returning whether the stack changed.
 fn pop_selection_container(
     containers: &mut Vec<MarkdownSelectionContainer>,
     end: MarkdownSemanticTagEnd,
-) {
+) -> bool {
     let expected = match end {
         MarkdownSemanticTagEnd::Heading => Some(MarkdownSelectionContainer::Heading),
         MarkdownSemanticTagEnd::BlockQuote => Some(MarkdownSelectionContainer::BlockQuote),
@@ -1148,7 +1180,9 @@ fn pop_selection_container(
         && containers.last() == Some(&expected)
     {
         containers.pop();
+        return true;
     }
+    false
 }
 
 fn assign_selection_geometry(
@@ -1159,7 +1193,10 @@ fn assign_selection_geometry(
 ) -> Vec<MarkdownSelectionProvenance> {
     let display = DisplayedMarkdown::new(lines);
     let mut search_from = 0;
-    let mut projected = Vec::new();
+    // Text events expand to one unit per grapheme, so the projected vector is
+    // far larger than the incoming event count. Reserve from the display cell
+    // count to avoid repeated growth reallocation.
+    let mut projected = Vec::with_capacity(display.cells.len().max(provenance.len()));
     for (unit, event) in provenance.into_iter().zip(&document.events) {
         let (MarkdownSemanticEventKind::Text(visible) | MarkdownSemanticEventKind::Code(visible)) =
             &event.kind
@@ -1176,6 +1213,12 @@ fn assign_selection_geometry(
             continue;
         }
         let mut source_offset = event.source_range.start;
+        // Every grapheme in one text event shares the same container stack and
+        // semantic identity. Hoist them out of the per-grapheme loop so the loop
+        // only allocates the single-element range vector it must own.
+        let unit_containers = unit.containers;
+        let unit_semantic_expansion = unit.semantic_expansion;
+        let unit_kind = unit.kind;
         for grapheme in visible.graphemes(true) {
             let source_range = source_offset..source_offset.saturating_add(grapheme.len());
             source_offset = source_range.end;
@@ -1187,31 +1230,31 @@ fn assign_selection_geometry(
                     && !display.starts_with_at(grapheme, search_from)
             {
                 projected.push(MarkdownSelectionProvenance {
-                    source_ranges: vec![source_range],
-                    rects: Vec::new(),
-                    semantic_expansion: unit.semantic_expansion.clone(),
-                    kind: unit.kind,
-                    containers: unit.containers.clone(),
+                    source_ranges: smallvec![source_range],
+                    rects: MarkdownCellRects::new(),
+                    semantic_expansion: unit_semantic_expansion.clone(),
+                    kind: unit_kind,
+                    containers: Arc::clone(&unit_containers),
                 });
                 continue;
             }
             let Some((display_range, rects)) = display.find_geometry(grapheme, search_from) else {
                 projected.push(MarkdownSelectionProvenance {
-                    source_ranges: vec![source_range],
-                    rects: Vec::new(),
-                    semantic_expansion: unit.semantic_expansion.clone(),
-                    kind: unit.kind,
-                    containers: unit.containers.clone(),
+                    source_ranges: smallvec![source_range],
+                    rects: MarkdownCellRects::new(),
+                    semantic_expansion: unit_semantic_expansion.clone(),
+                    kind: unit_kind,
+                    containers: Arc::clone(&unit_containers),
                 });
                 continue;
             };
             search_from = display_range.end;
             projected.push(MarkdownSelectionProvenance {
-                source_ranges: vec![source_range],
+                source_ranges: smallvec![source_range],
                 rects,
-                semantic_expansion: unit.semantic_expansion.clone(),
-                kind: unit.kind,
-                containers: unit.containers.clone(),
+                semantic_expansion: unit_semantic_expansion.clone(),
+                kind: unit_kind,
+                containers: Arc::clone(&unit_containers),
             });
         }
     }
@@ -1873,7 +1916,7 @@ fn projected_contribution_geometry(
                     }
                     .to_owned()
                 }),
-                rects,
+                rects: rects.into_vec(),
             })
         })
         .collect()
@@ -1935,21 +1978,28 @@ impl DisplayedMarkdown {
         &self,
         target: &str,
         from: usize,
-    ) -> Option<(Range<usize>, Vec<MarkdownCellRect>)> {
+    ) -> Option<(Range<usize>, MarkdownCellRects)> {
         if target.is_empty() {
             return None;
         }
-        let start = self
-            .text
-            .get(from..)
-            .and_then(|suffix| {
-                suffix
-                    .find(target)
-                    .map(|offset| from.saturating_add(offset))
-            })
-            .or_else(|| self.text.find(target))?;
+        // Provenance walks graphemes in source order, so the overwhelmingly
+        // common case is an exact match at `from`. Check that first to avoid a
+        // substring search per grapheme, which made projection quadratic in
+        // document length.
+        let start = if self.starts_with_at(target, from) {
+            from
+        } else {
+            self.text
+                .get(from..)
+                .and_then(|suffix| {
+                    suffix
+                        .find(target)
+                        .map(|offset| from.saturating_add(offset))
+                })
+                .or_else(|| self.text.find(target))?
+        };
         let range = start..start.saturating_add(target.len());
-        let mut rects: Vec<MarkdownCellRect> = Vec::new();
+        let mut rects: MarkdownCellRects = MarkdownCellRects::new();
         // `cells` is built in display order, so `byte_start` is sorted. Binary
         // search to the first overlapping cell instead of scanning every cell:
         // this is called once per source grapheme, so a linear scan here makes
@@ -4689,7 +4739,23 @@ fn spans_width(spans: &[Span]) -> usize {
         .sum()
 }
 
+/// Return the terminal display width of `text`, expanding tabs to four cells.
+///
+/// This runs once per grapheme during layout, so it uses a single-byte ASCII
+/// fast path and avoids a second scan when no tab is present.
 fn text_display_width(text: &str) -> usize {
+    if let [byte] = text.as_bytes() {
+        // Printable single-byte ASCII is one cell; tabs expand to four.
+        if byte.is_ascii_graphic() || *byte == b' ' {
+            return 1;
+        }
+        if *byte == b'\t' {
+            return 4;
+        }
+    }
+    if !text.contains('\t') {
+        return UnicodeWidthStr::width(text);
+    }
     text.split('\t')
         .map(UnicodeWidthStr::width)
         .sum::<usize>()
@@ -5537,6 +5603,57 @@ mod tests {
         .join("\n");
 
         assert!(output.lines().filter(|line| line.starts_with("│ ")).count() >= 2);
+    }
+
+    #[test]
+    fn provenance_units_avoid_per_grapheme_heap_allocation() {
+        // Text events expand to one provenance unit per grapheme, so any
+        // per-unit heap allocation is multiplied by document length. Source
+        // ranges and cell rects must stay inline, and container stacks must be
+        // shared rather than cloned per unit.
+        let doc = "Prose with **strong text** and `inline code` in a list:\n\n\
+                   - first item with enough words to wrap at a narrow width\n\
+                   - second item\n\n\
+                   > quoted words\n"
+            .repeat(8);
+        let rendered = render_markdown(&doc, &MarkdownRenderOptions::new(40));
+
+        assert!(
+            rendered.selection_provenance.len() > 500,
+            "expected a grapheme-dense projection, got {} units",
+            rendered.selection_provenance.len()
+        );
+        assert!(
+            rendered
+                .selection_provenance
+                .iter()
+                .all(|unit| !unit.source_ranges.spilled()),
+            "source ranges must stay inline for every provenance unit"
+        );
+        assert!(
+            rendered
+                .selection_provenance
+                .iter()
+                .all(|unit| !unit.rects.spilled()),
+            "cell rects must stay inline for every provenance unit"
+        );
+
+        // Container stacks are shared, so distinct allocations must be far fewer
+        // than units rather than one per unit.
+        let distinct_container_stacks = rendered
+            .selection_provenance
+            .iter()
+            .map(|unit| {
+                std::ptr::from_ref::<[super::MarkdownSelectionContainer]>(&*unit.containers)
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            distinct_container_stacks * 4 < rendered.selection_provenance.len(),
+            "container stacks must be shared across units: {distinct_container_stacks} distinct \
+             allocations for {} units",
+            rendered.selection_provenance.len()
+        );
     }
 
     #[test]

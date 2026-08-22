@@ -19,6 +19,7 @@ hyperchad_markdown           = { workspace = true, features = ["syntax-highlight
 hyperchad_transformer        = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
 pulldown-cmark               = { workspace = true }
+smallvec                     = { workspace = true }
 unicode-segmentation         = { workspace = true }
 unicode-width                = { workspace = true }
 url                          = { workspace = true }
