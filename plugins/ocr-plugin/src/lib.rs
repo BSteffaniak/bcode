@@ -341,8 +341,8 @@ impl OcrPlugin {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ExtractRequest {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtractRequest {
     #[serde(default)]
     path: Option<PathBuf>,
     #[serde(default)]
@@ -359,7 +359,7 @@ struct ExtractRequest {
     timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 struct OcrOptions {
     #[serde(default)]
     psm: Option<u8>,
@@ -373,23 +373,23 @@ struct OcrOptions {
     extra: serde_json::Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct ExtractResponse {
-    text: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractResponse {
+    pub text: String,
     #[serde(skip)]
-    full_text: String,
-    source: SourceResponse,
-    engine: String,
-    language: String,
-    truncated: bool,
-    text_bytes: usize,
-    full_text_bytes: usize,
+    pub full_text: String,
+    pub source: SourceResponse,
+    pub engine: String,
+    pub language: String,
+    pub truncated: bool,
+    pub text_bytes: usize,
+    pub full_text_bytes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SourceResponse {
-    path: String,
-    url: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceResponse {
+    pub path: String,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -450,6 +450,26 @@ enum OcrError {
     #[cfg(feature = "_bundled-tesseract-runtime")]
     #[error("bundled tesseract failed: {0}")]
     BundledTesseract(String),
+}
+
+pub fn extract_path(path: &Path) -> Result<ExtractResponse, String> {
+    let runtime = ProviderRuntime::new().map_err(|error| error.to_string())?;
+    runtime
+        .block_on(extract_async(
+            ExtractRequest {
+                path: Some(path.to_path_buf()),
+                url: None,
+                language: None,
+                engine: None,
+                options: None,
+                max_bytes: None,
+                timeout_ms: None,
+            },
+            std::env::current_dir().map_err(|error| error.to_string())?,
+            None,
+        ))
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
 }
 
 async fn extract_async(

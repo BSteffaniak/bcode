@@ -4795,6 +4795,48 @@ impl Bcode {
         Ok(discovered)
     }
 
+    /// Execute one manifest-discovered embedded plugin tool through the canonical agent tool path.
+    ///
+    /// This application-facing boundary preserves plugin-owned preparation, authorization,
+    /// execution, result normalization, cancellation, and lifecycle events while allowing an
+    /// embedding application to invoke a known tool without first asking a model to select it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when plugin discovery fails, the requested tool is unavailable or
+    /// ambiguous, policy preparation denies the call, or tool execution fails.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn execute_embedded_tool(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolExecutionOutput> {
+        let mut matching = self
+            .discover_tools()
+            .await?
+            .into_iter()
+            .filter(|tool| tool.definition.name == tool_name);
+        let tool = matching.next().ok_or_else(|| {
+            BcodeError::ToolExecution(format!("embedded tool `{tool_name}` is unavailable"))
+        })?;
+        if matching.next().is_some() {
+            return Err(BcodeError::ToolExecution(format!(
+                "embedded tool `{tool_name}` is ambiguous"
+            )));
+        }
+        let agent = self
+            .agent()
+            .plugin_tool(tool.definition, tool.plugin_id)
+            .build();
+        agent
+            .execute_tool_call(&ToolCall {
+                id: format!("sdk-{tool_name}"),
+                name: tool_name.to_owned(),
+                arguments,
+            })
+            .await
+    }
+
     /// Return models advertised by an embedded provider plugin.
     ///
     /// # Errors
@@ -6832,6 +6874,52 @@ impl Agent {
                 |factory| Ok(factory()),
             )?;
         self.generate_object_with_provider(&mut provider, prompt)
+            .await
+    }
+
+    /// Generate and deserialize a structured object using explicit options and cancellation.
+    ///
+    /// This is the application-facing embedded-provider path when callers need bounded repair and
+    /// end-to-end cancellation without taking ownership of provider construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded provider is configured, provider invocation fails,
+    /// cancellation is requested, structured JSON cannot be extracted, schema validation fails,
+    /// repair attempts are exhausted, or deserialization fails.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn generate_object_with_options<T>(
+        &self,
+        prompt: impl Into<String>,
+        options: StructuredOutputOptions,
+        cancellation: CancellationToken,
+        timeout: Duration,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let mut provider: Box<dyn ModelProviderInvoker> =
+            self.provider_factory.as_ref().map_or_else(
+                || {
+                    self.provider
+                        .clone()
+                        .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
+                        .ok_or(BcodeError::MissingProvider)
+                },
+                |factory| Ok(factory()),
+            )?;
+        let agent = Agent {
+            timeout,
+            ..self.clone()
+        };
+        agent
+            .generate_object_with_provider_and_request_options(
+                &mut provider,
+                prompt,
+                options,
+                Vec::new(),
+                cancellation,
+            )
             .await
     }
 

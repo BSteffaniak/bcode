@@ -332,8 +332,8 @@ impl DocumentPlugin {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ExtractRequest {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtractRequest {
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
@@ -344,15 +344,15 @@ struct ExtractRequest {
     timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ExtractResponse {
-    source: String,
-    content_type: String,
-    artifact_kind: String,
-    text: String,
-    truncated: bool,
-    extractor: String,
-    fallback_used: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractResponse {
+    pub source: String,
+    pub content_type: String,
+    pub artifact_kind: String,
+    pub text: String,
+    pub truncated: bool,
+    pub extractor: String,
+    pub fallback_used: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -390,6 +390,29 @@ enum DocumentError {
     NativeExtract(String),
     #[error("pdftotext failed with status {status}: {stderr}")]
     PdfToTextFailed { status: String, stderr: String },
+}
+
+/// Extract a local PDF through the document capability without model participation.
+pub fn extract_document_path(path: &Path) -> Result<ExtractResponse, String> {
+    let runtime = ProviderRuntime::new().map_err(|error| error.to_string())?;
+    runtime
+        .block_on(extract_async(
+            ExtractRequest {
+                url: None,
+                path: Some(path.to_path_buf()),
+                max_bytes: None,
+                timeout_ms: None,
+            },
+            None,
+        ))
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+pub async fn extract_document(request: ExtractRequest) -> Result<ExtractResponse, String> {
+    extract_async(request, None)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn extract_async(
@@ -464,54 +487,100 @@ fn extract_pdf_text(
     progress: Option<&ProgressReporter>,
 ) -> Result<PdfExtraction, DocumentError> {
     if let Some(progress) = &progress {
-        progress.emit("document native extraction started");
+        progress.emit("document extraction candidates started");
     }
-    match extract_pdf_text_native(document_path) {
-        Ok(text) if meaningful_text(&text) => {
+    let native = extract_pdf_text_native(document_path);
+    let layout = pdftotext_available()
+        .then(|| extract_pdf_text_pdftotext(document_path, text_path))
+        .transpose()?;
+    match (native, layout) {
+        (Ok(native), Some(layout)) => {
+            let native_score = extraction_quality_score(&native);
+            let layout_score = extraction_quality_score(&layout);
+            let (text, extractor, fallback_used) = if layout_score > native_score {
+                (
+                    layout,
+                    "pdftotext".to_owned(),
+                    Some(format!(
+                        "selected_higher_quality_layout_{layout_score}_over_native_{native_score}"
+                    )),
+                )
+            } else {
+                (
+                    native,
+                    "native".to_owned(),
+                    (layout_score < native_score).then(|| {
+                        format!(
+                            "selected_higher_quality_native_{native_score}_over_layout_{layout_score}"
+                        )
+                    }),
+                )
+            };
             if let Some(progress) = &progress {
                 progress.emit(format!(
-                    "document native extraction succeeded: {} bytes",
+                    "document extraction selected {extractor}: {} bytes",
                     text.len()
                 ));
             }
             Ok(PdfExtraction {
                 text,
-                extractor: "native".to_string(),
-                fallback_used: None,
+                extractor,
+                fallback_used,
             })
         }
-        Ok(_) | Err(_) if pdftotext_available() => {
-            if let Some(progress) = &progress {
-                progress.emit("document native extraction low text; trying pdftotext");
-            }
-            let text = extract_pdf_text_pdftotext(document_path, text_path)?;
-            if let Some(progress) = &progress {
-                progress.emit(format!(
-                    "document pdftotext extraction succeeded: {} bytes",
-                    text.len()
-                ));
-            }
-            Ok(PdfExtraction {
-                text,
-                extractor: "pdftotext".to_string(),
-                fallback_used: Some("native_unavailable_or_low_text".to_string()),
-            })
-        }
-        Ok(text) => {
-            if let Some(progress) = &progress {
-                progress.emit(format!(
-                    "document native extraction low text: {} bytes",
-                    text.len()
-                ));
-            }
-            Ok(PdfExtraction {
-                text,
-                extractor: "native".to_string(),
-                fallback_used: Some("native_low_text".to_string()),
-            })
-        }
-        Err(error) => Err(error),
+        (Ok(text), None) if meaningful_text(&text) => Ok(PdfExtraction {
+            text,
+            extractor: "native".to_owned(),
+            fallback_used: None,
+        }),
+        (Ok(text), None) => Ok(PdfExtraction {
+            text,
+            extractor: "native".to_owned(),
+            fallback_used: Some("native_low_text".to_owned()),
+        }),
+        (Err(_), Some(text)) => Ok(PdfExtraction {
+            text,
+            extractor: "pdftotext".to_owned(),
+            fallback_used: Some("native_unavailable".to_owned()),
+        }),
+        (Err(error), None) => Err(error),
     }
+}
+
+fn extraction_quality_score(text: &str) -> i64 {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return i64::MIN;
+    }
+    let isolated = tokens
+        .iter()
+        .filter(|token| {
+            token
+                .chars()
+                .filter(|character| character.is_alphanumeric())
+                .count()
+                == 1
+        })
+        .count();
+    let suspicious_lines = text
+        .lines()
+        .filter(|line| {
+            let line_tokens = line.split_whitespace().collect::<Vec<_>>();
+            let isolated = line_tokens
+                .iter()
+                .filter(|token| token.chars().count() == 1)
+                .count();
+            line_tokens.len() >= 8 && isolated * 2 >= line_tokens.len()
+        })
+        .count();
+    let section_hits = ["experience", "education", "skills", "technologies"]
+        .iter()
+        .filter(|heading| text.to_ascii_lowercase().contains(**heading))
+        .count();
+    i64::try_from(tokens.len()).unwrap_or(i64::MAX)
+        + i64::try_from(section_hits).unwrap_or_default() * 100
+        - i64::try_from(isolated).unwrap_or(i64::MAX) * 4
+        - i64::try_from(suspicious_lines).unwrap_or(i64::MAX) * 250
 }
 
 fn extract_pdf_text_native(document_path: &Path) -> Result<String, DocumentError> {
