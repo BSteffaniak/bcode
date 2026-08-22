@@ -11,14 +11,135 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use bmux_tui::prelude::{Color, Modifier, Span, Style};
 use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+
+/// Maximum source bytes retained by the multi-line highlight cache.
+///
+/// Highlighting is a pure function of language, source text, and palette, so
+/// results are reusable. Streaming re-renders a completed code block on every
+/// token, which makes repeat lookups the common case. The budget bounds retained
+/// memory so routine interactive rendering stays bounded.
+const HIGHLIGHT_CACHE_MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Largest single block retained by the highlight cache.
+///
+/// Blocks larger than this are highlighted without being retained so one huge
+/// block cannot evict the entire working set.
+const HIGHLIGHT_CACHE_MAX_ENTRY_BYTES: usize = 256 * 1024;
+
+static HIGHLIGHT_CACHE: OnceLock<Mutex<HighlightCache>> = OnceLock::new();
+
+/// Identity of one cached multi-line highlight result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HighlightCacheKey {
+    /// Resolved syntax name, not the caller's hint, so aliases share entries.
+    syntax_name: String,
+    /// Hash of the palette the result was styled with.
+    ///
+    /// Palettes are compared by hash so theme changes cannot serve stale colors
+    /// without requiring an ordering impl on the public palette type.
+    palette_hash: u64,
+    /// Exact source text, newline-joined.
+    source: String,
+}
+
+impl HighlightCacheKey {
+    fn new(syntax_name: &str, palette: SyntaxPalette, source: String) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        palette.hash(&mut hasher);
+        Self {
+            syntax_name: syntax_name.to_owned(),
+            palette_hash: hasher.finish(),
+            source,
+        }
+    }
+}
+
+/// Bounded least-recently-used cache of multi-line highlight results.
+///
+/// Recency is tracked with a monotonic counter rather than list surgery, which
+/// keeps every operation logarithmic and the structure easy to reason about.
+#[derive(Debug, Default)]
+struct HighlightCache {
+    entries: BTreeMap<HighlightCacheKey, (u64, Vec<Vec<SyntaxSpan>>)>,
+    recency: BTreeMap<u64, HighlightCacheKey>,
+    next_tick: u64,
+    retained_source_bytes: usize,
+}
+
+impl HighlightCache {
+    /// Return a cached result, marking it most recently used.
+    fn get(&mut self, key: &HighlightCacheKey) -> Option<Vec<Vec<SyntaxSpan>>> {
+        let (tick, value) = self.entries.get(key)?;
+        let previous_tick = *tick;
+        let value = value.clone();
+        let tick = self.take_tick();
+        self.recency.remove(&previous_tick);
+        self.recency.insert(tick, key.clone());
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.0 = tick;
+        }
+        Some(value)
+    }
+
+    /// Retain `value` for `key`, evicting least recently used entries as needed.
+    fn insert(&mut self, key: HighlightCacheKey, value: &[Vec<SyntaxSpan>]) {
+        let entry_bytes = key.source.len();
+        if entry_bytes > HIGHLIGHT_CACHE_MAX_ENTRY_BYTES {
+            return;
+        }
+        if let Some((previous_tick, _)) = self.entries.remove(&key) {
+            self.recency.remove(&previous_tick);
+            self.retained_source_bytes = self.retained_source_bytes.saturating_sub(entry_bytes);
+        }
+        while self.retained_source_bytes.saturating_add(entry_bytes)
+            > HIGHLIGHT_CACHE_MAX_SOURCE_BYTES
+        {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+        let tick = self.take_tick();
+        self.recency.insert(tick, key.clone());
+        self.retained_source_bytes = self.retained_source_bytes.saturating_add(entry_bytes);
+        self.entries.insert(key, (tick, value.to_vec()));
+    }
+
+    /// Drop the least recently used entry, returning whether one was removed.
+    fn evict_oldest(&mut self) -> bool {
+        let Some((&tick, _)) = self.recency.iter().next() else {
+            return false;
+        };
+        let Some(key) = self.recency.remove(&tick) else {
+            return false;
+        };
+        if self.entries.remove(&key).is_some() {
+            self.retained_source_bytes =
+                self.retained_source_bytes.saturating_sub(key.source.len());
+        }
+        true
+    }
+
+    const fn take_tick(&mut self) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick = self.next_tick.saturating_add(1);
+        tick
+    }
+}
+
+fn highlight_cache() -> &'static Mutex<HighlightCache> {
+    HIGHLIGHT_CACHE.get_or_init(|| Mutex::new(HighlightCache::default()))
+}
 
 /// Renderer-neutral semantic syntax role.
 ///
@@ -312,6 +433,10 @@ impl SyntaxHighlighter {
     }
 
     /// Highlight multiple lines into renderer-neutral syntax spans.
+    ///
+    /// Results are memoized on resolved syntax, palette, and exact source text.
+    /// Re-rendering an unchanged block, as streaming does on every token, reuses
+    /// the retained result instead of reparsing.
     #[must_use]
     pub fn highlight_lines_tokens(
         &self,
@@ -324,15 +449,33 @@ impl SyntaxHighlighter {
                 .map(|line| plain_syntax_spans(line, self.palette))
                 .collect();
         };
+        let key = HighlightCacheKey::new(&syntax.name, self.palette, lines.join("\n"));
+        // Scope the guard so the cache lock is never held while highlighting.
+        let cached = {
+            let mut cache = highlight_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.get(&key)
+        };
+        if let Some(cached) = cached {
+            return cached;
+        }
         let mut classifier = ScopeClassifier::new(syntax, self.palette);
-        lines
+        let highlighted = lines
             .iter()
             .map(|line| {
                 classifier
                     .classify_line(line)
                     .unwrap_or_else(|| plain_syntax_spans(line, self.palette))
             })
-            .collect()
+            .collect::<Vec<_>>();
+        {
+            let mut cache = highlight_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.insert(key, &highlighted);
+        }
+        highlighted
     }
 }
 
@@ -551,8 +694,143 @@ const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiColor, SyntaxColor, SyntaxHighlighter, SyntaxPalette, SyntaxRole, syntax_for};
+    use super::{
+        AnsiColor, HighlightCache, HighlightCacheKey, SyntaxColor, SyntaxHighlighter,
+        SyntaxPalette, SyntaxRole, highlight_cache, syntax_for,
+    };
     use bmux_tui::prelude::Color;
+
+    #[test]
+    fn cached_highlighting_matches_uncached_output_exactly() {
+        let lines = [
+            "fn main() {",
+            "    let value = compute(1); // comment",
+            "    println!(\"{value}\");",
+            "}",
+        ];
+        let highlighter = SyntaxHighlighter::new();
+
+        // First call populates the cache; second must hit it.
+        let first = highlighter.highlight_lines_tokens("rust", &lines);
+        let second = highlighter.highlight_lines_tokens("rust", &lines);
+
+        assert_eq!(
+            first, second,
+            "a cache hit must be byte-identical to a fresh highlight"
+        );
+        assert!(
+            first.iter().any(|line| line.len() > 1),
+            "expected real highlighting"
+        );
+    }
+
+    #[test]
+    fn cached_highlighting_is_keyed_by_palette() {
+        let lines = ["let value = 1;"];
+        let mut palette = SyntaxPalette::default();
+        let default_result =
+            SyntaxHighlighter::with_palette(palette).highlight_lines_tokens("rust", &lines);
+
+        palette.keyword = SyntaxColor::Rgb(1, 2, 3);
+        let recolored =
+            SyntaxHighlighter::with_palette(palette).highlight_lines_tokens("rust", &lines);
+
+        assert_ne!(
+            default_result, recolored,
+            "a palette change must not serve a stale cached result"
+        );
+    }
+
+    #[test]
+    fn cached_highlighting_shares_entries_across_language_aliases() {
+        let lines = ["const value = 1;"];
+        let highlighter = SyntaxHighlighter::new();
+
+        // Aliases resolve to the same syntax, so they must produce identical
+        // output and share one cache entry.
+        let by_alias = highlighter.highlight_lines_tokens("js", &lines);
+        let by_name = highlighter.highlight_lines_tokens("javascript", &lines);
+
+        assert_eq!(by_alias, by_name);
+    }
+
+    #[test]
+    fn highlight_cache_evicts_least_recently_used_within_budget() {
+        use std::fmt::Write as _;
+
+        let mut cache = HighlightCache::default();
+        let value = vec![vec![]];
+        // Entries small enough to be retained individually, but large enough
+        // that a handful exceeds the total budget.
+        let entry_bytes = super::HIGHLIGHT_CACHE_MAX_ENTRY_BYTES;
+        let entry_count = super::HIGHLIGHT_CACHE_MAX_SOURCE_BYTES / entry_bytes;
+
+        let keys = (0..=entry_count)
+            .map(|index| {
+                let mut source = "x".repeat(entry_bytes.saturating_sub(8));
+                let _ = write!(source, "{index:08}");
+                HighlightCacheKey::new("rust", SyntaxPalette::default(), source)
+            })
+            .collect::<Vec<_>>();
+        for key in &keys {
+            cache.insert(key.clone(), &value);
+        }
+
+        assert!(
+            cache.retained_source_bytes <= super::HIGHLIGHT_CACHE_MAX_SOURCE_BYTES,
+            "retained bytes {} must stay within the budget {}",
+            cache.retained_source_bytes,
+            super::HIGHLIGHT_CACHE_MAX_SOURCE_BYTES
+        );
+        assert!(
+            cache.get(&keys[0]).is_none(),
+            "the least recently used entry must be evicted first"
+        );
+        assert!(
+            cache.get(keys.last().expect("keys")).is_some(),
+            "the newest entry must be retained"
+        );
+    }
+
+    #[test]
+    fn highlight_cache_refuses_oversized_entries() {
+        let mut cache = HighlightCache::default();
+        let key = HighlightCacheKey::new(
+            "rust",
+            SyntaxPalette::default(),
+            "x".repeat(super::HIGHLIGHT_CACHE_MAX_ENTRY_BYTES + 1),
+        );
+
+        cache.insert(key.clone(), &[vec![]]);
+
+        assert!(
+            cache.get(&key).is_none(),
+            "one oversized block must not be retained"
+        );
+        assert_eq!(cache.retained_source_bytes, 0);
+    }
+
+    #[test]
+    fn highlight_cache_reuses_repeated_lookups() {
+        let lines = ["struct Retained { field: usize }"];
+        let highlighter = SyntaxHighlighter::new();
+        let key = HighlightCacheKey::new(
+            &syntax_for("rust").expect("rust syntax").name,
+            SyntaxPalette::default(),
+            lines.join("\n"),
+        );
+
+        let _ = highlighter.highlight_lines_tokens("rust", &lines);
+
+        assert!(
+            highlight_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .is_some(),
+            "a highlighted block must be retained for reuse"
+        );
+    }
 
     #[test]
     fn syntax_colors_preserve_terminal_representations() {

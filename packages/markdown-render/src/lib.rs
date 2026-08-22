@@ -1471,6 +1471,11 @@ impl MarkdownStreamingRenderState {
         }
         let mut lines = self.stable_lines.clone();
         append_markdown_blocks(&mut lines, &suffix_result.lines);
+        // Provenance must stay byte-exact against a full render. Block Start/End
+        // ranges depend on block terminators that a split segment cannot observe
+        // (pulldown-cmark reports a paragraph as `0..28` where the checkpointed
+        // segment can only see `0..27`), so provenance is derived from the whole
+        // accepted source rather than stitched from retained pieces.
         let document = parse_markdown_document(markdown);
         let selection_provenance = assign_selection_geometry(
             markdown_selection_provenance(&document),
