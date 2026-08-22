@@ -1,7 +1,12 @@
 //! Transport-neutral application operations for daemon status and lifecycle.
 
 use super::ServerState;
+use std::collections::BTreeSet;
 use std::path::Path;
+
+const MAX_CLIENT_INTERACTION_ADAPTERS: usize = 64;
+pub const MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES: usize = 128;
+pub const MAX_CLIENT_EFFECTIVE_CONFIG_BYTES: usize = 1024 * 1024;
 
 /// Return normalized daemon status without transport framing.
 pub async fn status(
@@ -61,11 +66,11 @@ pub async fn update_client_runtime_context(
     client_id: bcode_session_models::ClientId,
     runtime_context: Option<bcode_ipc::ClientRuntimeContext>,
 ) -> Result<(), UpdateClientContextError> {
-    super::validate_client_effective_config(runtime_context.as_ref())
+    validate_client_effective_config(runtime_context.as_ref())
         .map_err(UpdateClientContextError::InvalidConfig)?;
-    super::validate_client_plugin_selection(state, runtime_context.as_ref())
+    validate_client_plugin_selection(state, runtime_context.as_ref())
         .map_err(UpdateClientContextError::IncompatibleConfig)?;
-    super::validate_client_interaction_adapters(runtime_context.as_ref()).map_err(|message| {
+    validate_client_interaction_adapters(runtime_context.as_ref()).map_err(|message| {
         UpdateClientContextError::InvalidInteractionAdapters(message.to_owned())
     })?;
     state
@@ -107,4 +112,85 @@ pub async fn prepare_stop(
 /// Trigger daemon shutdown after transport acknowledgment.
 pub fn request_shutdown(state: &ServerState) {
     state.request_shutdown();
+}
+
+pub fn validate_client_effective_config(
+    context: Option<&bcode_ipc::ClientRuntimeContext>,
+) -> Result<(), String> {
+    let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
+    else {
+        return Ok(());
+    };
+    if contents.len() > MAX_CLIENT_EFFECTIVE_CONFIG_BYTES {
+        return Err("effective client config exceeds the 1 MiB transport limit".to_owned());
+    }
+    bcode_config::decode_effective_config(contents)
+        .map(|_| ())
+        .map_err(|error| format!("invalid effective client config: {error}"))
+}
+
+pub fn validate_client_plugin_selection(
+    state: &ServerState,
+    context: Option<&bcode_ipc::ClientRuntimeContext>,
+) -> Result<(), String> {
+    let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
+    else {
+        return Ok(());
+    };
+    let config = bcode_config::decode_effective_config(contents)
+        .map_err(|error| format!("invalid effective client config: {error}"))?;
+    let selection =
+        bcode_config::plugin_selection_with_default_plugin_ids(&config, &state.default_plugin_ids);
+    if selection == state.startup_plugin_selection {
+        return Ok(());
+    }
+    Err(format!(
+        "client effective plugin selection {:?} does not match daemon startup selection {:?}; restart the daemon with the desired plugin configuration",
+        selection, state.startup_plugin_selection
+    ))
+}
+
+pub fn validate_client_interaction_adapters(
+    context: Option<&bcode_ipc::ClientRuntimeContext>,
+) -> Result<(), &'static str> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if context.interaction_adapters.len() > MAX_CLIENT_INTERACTION_ADAPTERS {
+        return Err("too many interaction adapters");
+    }
+    let mut routes = BTreeSet::new();
+    for adapter in &context.interaction_adapters {
+        let identifiers = [
+            adapter.producer_id.as_str(),
+            adapter.exchange_schema.as_str(),
+            adapter.platform_id.as_str(),
+            adapter.interaction_kind.as_str(),
+        ];
+        if identifiers
+            .iter()
+            .any(|value| value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES)
+            || adapter.tui_surface_kind.as_deref().is_some_and(|value| {
+                value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES
+            })
+        {
+            return Err("interaction adapter identifiers must be non-empty and at most 128 bytes");
+        }
+        if adapter.min_schema_version == 0
+            || adapter.max_schema_version < adapter.min_schema_version
+        {
+            return Err("interaction adapter schema version range must be positive and ordered");
+        }
+        if !routes.insert((
+            adapter.producer_id.as_str(),
+            adapter.exchange_schema.as_str(),
+            adapter.min_schema_version,
+            adapter.max_schema_version,
+            adapter.platform_id.as_str(),
+            adapter.priority,
+        )) {
+            return Err("duplicate interaction adapter route");
+        }
+    }
+    Ok(())
 }

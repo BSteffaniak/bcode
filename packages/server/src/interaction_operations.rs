@@ -8,6 +8,8 @@ use bcode_ipc::PendingToolExchangeSummary;
 pub enum ResolveToolExchangeError {
     /// The requesting client did not advertise a compatible exchange adapter.
     IncompatibleConsumer,
+    /// The serialized resolution is malformed or uses an unknown variant.
+    InvalidResolution,
 }
 
 /// Return current pending permission summaries without transport framing.
@@ -78,6 +80,13 @@ pub async fn complete_pending_tool_exchange(
     *request.resolution.lock().await = Some(resolution);
     request.notify.notify_waiters();
     true
+}
+
+/// Decode one serialized tool-exchange resolution without exposing serde failures.
+pub fn decode_tool_exchange_resolution(
+    resolution_json: serde_json::Value,
+) -> Result<ToolExchangeResolution, ResolveToolExchangeError> {
+    serde_json::from_value(resolution_json).map_err(|_| ResolveToolExchangeError::InvalidResolution)
 }
 
 /// Resolve one pending exchange through canonical server-owned interaction state.

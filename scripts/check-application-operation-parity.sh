@@ -96,6 +96,24 @@ for phrase in required_phrases:
 print("application operation parity inventory is complete for checked source enums")
 PY
 
+boundary_doc="docs/application-operation-boundary.md"
+[[ -f "$boundary_doc" ]] || fail "$boundary_doc is missing"
+
+for phrase in \
+  'focused, server-owned operation modules' \
+  'local IPC adapter owns' \
+  'not durable resume protocols' \
+  'Plugin workflows remain plugin-owned' \
+  'future concrete adapter'; do
+  if ! rg -Fqi "$phrase" "$boundary_doc"; then
+    fail "$boundary_doc is missing required boundary coverage: $phrase"
+  fi
+done
+
+if ! rg -Fq '[`application-operation-boundary.md`](application-operation-boundary.md)' "$doc"; then
+  fail "$doc does not link the application operation boundary"
+fi
+
 raw_ipc_callers="$(
   rg -l 'bcode_ipc::Request|\bRequest::' packages --glob '*.rs' \
     | grep -Ev '^packages/(client|server|ipc|daemon-lifecycle)/|(^|/)tests?(/|\.rs$)' \

@@ -76,16 +76,15 @@ use bcode_agent_runtime::{
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionBatchCorrelation, PermissionSummary,
-    PluginContributions, PluginServiceError, PluginServiceResponse, PluginServiceSummary,
-    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphIterationSummary,
-    RalphLifecycleRequest, RalphListIterationsRequest, RalphListIterationsResponse,
-    RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse,
-    RalphRunRequest, RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse,
-    RalphRunSummary, RalphStatusRequest, RalphStatusResponse, RalphStatusSummary,
-    RalphValidationSummary, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
-    SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest, WorktreeListRequest,
-    WorktreeRemoveRequest, decode_request, encode_envelope_frames, event_envelope, recv_envelope,
-    response_envelope, write_encoded_envelope_frames,
+    PluginServiceError, PluginServiceResponse, RalphApproveRequest, RalphCancelRequest,
+    RalphCancelResponse, RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
+    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
+    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
+    RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
+    RalphStatusSummary, RalphValidationSummary, Request, Response, ResponsePayload, ServerStatus,
+    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
+    WorktreeListRequest, WorktreeRemoveRequest, decode_request, encode_envelope_frames,
+    event_envelope, recv_envelope, response_envelope, write_encoded_envelope_frames,
 };
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
@@ -6179,102 +6178,34 @@ async fn handle_permission_interaction_request(
         PermissionInteractionRequest::ResolveToolExchange {
             exchange_id,
             resolution_json,
-        } => {
-            let resolution = serde_json::from_value(resolution_json)?;
-            handle_resolve_tool_exchange(
-                request_id,
-                client_id,
-                state,
-                writer,
-                &exchange_id,
-                resolution,
-            )
-            .await
-        }
+        } => match interaction_operations::decode_tool_exchange_resolution(resolution_json) {
+            Ok(resolution) => {
+                handle_resolve_tool_exchange(
+                    request_id,
+                    client_id,
+                    state,
+                    writer,
+                    &exchange_id,
+                    resolution,
+                )
+                .await
+            }
+            Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
+                send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "invalid_exchange_resolution",
+                        "tool exchange resolution is malformed or unsupported",
+                    )),
+                )
+                .await
+            }
+            Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
+                unreachable!("decoding does not inspect consumer compatibility")
+            }
+        },
     }
-}
-
-const MAX_CLIENT_INTERACTION_ADAPTERS: usize = 64;
-const MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES: usize = 128;
-const MAX_CLIENT_EFFECTIVE_CONFIG_BYTES: usize = 1024 * 1024;
-
-fn validate_client_effective_config(context: Option<&ClientRuntimeContext>) -> Result<(), String> {
-    let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
-    else {
-        return Ok(());
-    };
-    if contents.len() > MAX_CLIENT_EFFECTIVE_CONFIG_BYTES {
-        return Err("effective client config exceeds the 1 MiB transport limit".to_owned());
-    }
-    bcode_config::decode_effective_config(contents)
-        .map(|_| ())
-        .map_err(|error| format!("invalid effective client config: {error}"))
-}
-
-fn validate_client_plugin_selection(
-    state: &ServerState,
-    context: Option<&ClientRuntimeContext>,
-) -> Result<(), String> {
-    let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
-    else {
-        return Ok(());
-    };
-    let config = bcode_config::decode_effective_config(contents)
-        .map_err(|error| format!("invalid effective client config: {error}"))?;
-    let selection =
-        bcode_config::plugin_selection_with_default_plugin_ids(&config, &state.default_plugin_ids);
-    if selection == state.startup_plugin_selection {
-        return Ok(());
-    }
-    Err(format!(
-        "client effective plugin selection {:?} does not match daemon startup selection {:?}; restart the daemon with the desired plugin configuration",
-        selection, state.startup_plugin_selection
-    ))
-}
-
-fn validate_client_interaction_adapters(
-    context: Option<&ClientRuntimeContext>,
-) -> Result<(), &'static str> {
-    let Some(context) = context else {
-        return Ok(());
-    };
-    if context.interaction_adapters.len() > MAX_CLIENT_INTERACTION_ADAPTERS {
-        return Err("too many interaction adapters");
-    }
-    let mut routes = BTreeSet::new();
-    for adapter in &context.interaction_adapters {
-        let identifiers = [
-            adapter.producer_id.as_str(),
-            adapter.exchange_schema.as_str(),
-            adapter.platform_id.as_str(),
-            adapter.interaction_kind.as_str(),
-        ];
-        if identifiers
-            .iter()
-            .any(|value| value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES)
-            || adapter.tui_surface_kind.as_deref().is_some_and(|value| {
-                value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES
-            })
-        {
-            return Err("interaction adapter identifiers must be non-empty and at most 128 bytes");
-        }
-        if adapter.min_schema_version == 0
-            || adapter.max_schema_version < adapter.min_schema_version
-        {
-            return Err("interaction adapter schema version range must be positive and ordered");
-        }
-        if !routes.insert((
-            adapter.producer_id.as_str(),
-            adapter.exchange_schema.as_str(),
-            adapter.min_schema_version,
-            adapter.max_schema_version,
-            adapter.platform_id.as_str(),
-            adapter.priority,
-        )) {
-            return Err("duplicate interaction adapter route");
-        }
-    }
-    Ok(())
 }
 
 async fn handle_update_client_runtime_context(
@@ -6410,7 +6341,9 @@ async fn handle_hello(
         )
         .await;
     }
-    if let Err(message) = validate_client_effective_config(hello.runtime_context.as_ref()) {
+    if let Err(message) =
+        server_operations::validate_client_effective_config(hello.runtime_context.as_ref())
+    {
         return send_response(
             writer,
             request_id,
@@ -6418,7 +6351,9 @@ async fn handle_hello(
         )
         .await;
     }
-    if let Err(message) = validate_client_plugin_selection(state, hello.runtime_context.as_ref()) {
+    if let Err(message) =
+        server_operations::validate_client_plugin_selection(state, hello.runtime_context.as_ref())
+    {
         return send_response(
             writer,
             request_id,
@@ -6426,7 +6361,9 @@ async fn handle_hello(
         )
         .await;
     }
-    if let Err(message) = validate_client_interaction_adapters(hello.runtime_context.as_ref()) {
+    if let Err(message) =
+        server_operations::validate_client_interaction_adapters(hello.runtime_context.as_ref())
+    {
         return send_response(
             writer,
             request_id,
@@ -9319,31 +9256,6 @@ impl Drop for ActivePluginInvocationRegistration {
     }
 }
 
-fn enqueue_invocation_input(
-    active: &ActivePluginInvocation,
-    input: ToolInvocationInput,
-) -> Result<(), String> {
-    if input.producer_id.trim().is_empty() {
-        return Err("invocation input producer id must not be empty".to_owned());
-    }
-    if input.schema.trim().is_empty() || input.schema_version == 0 {
-        return Err("invocation input schema and version must be valid".to_owned());
-    }
-    if input.input_id.trim().is_empty() {
-        return Err("invocation input id must not be empty".to_owned());
-    }
-    let encoded = serde_json::to_vec(&input).map_err(|error| error.to_string())?;
-    if encoded.len() > 64 * 1024 {
-        return Err("invocation input exceeds 64 KiB".to_owned());
-    }
-    active.inputs.try_send(input).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(_) => "plugin invocation input queue is full".to_owned(),
-        mpsc::error::TrySendError::Closed(_) => {
-            "plugin invocation input route is closed".to_owned()
-        }
-    })
-}
-
 async fn handle_invocation_input(
     request_id: u64,
     state: &ServerState,
@@ -9365,7 +9277,7 @@ async fn handle_invocation_input(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("invocation_input_failed", error)),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await
         }
@@ -14650,6 +14562,9 @@ async fn handle_resolve_tool_exchange(
                 )),
             )
             .await
+        }
+        Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
+            unreachable!("typed resolution was decoded before operation dispatch")
         }
     }
 }
@@ -30510,7 +30425,7 @@ async fn handle_list_plugin_services(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let services = plugin_service_summaries(&state.plugins);
+    let services = plugin_operations::list_services(state);
     send_response(
         writer,
         request_id,
@@ -30524,21 +30439,7 @@ async fn handle_list_plugin_contributions(
     state: &ServerState,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let mut command_contributions = state
-        .plugins
-        .registered_command_contributions(&bcode_command::CommandSurface::Palette);
-    command_contributions.extend(
-        state
-            .plugins
-            .registered_command_contributions(&bcode_command::CommandSurface::Slash),
-    );
-    command_contributions.sort_by(|left, right| left.id.cmp(&right.id));
-    command_contributions.dedup_by(|left, right| left.id == right.id);
-    let contributions = PluginContributions {
-        command_contributions,
-        commands: state.plugins.command_contributions(),
-        config_extensions: state.plugins.config_extensions(),
-    };
+    let contributions = plugin_operations::list_contributions(state);
     send_response(
         writer,
         request_id,
@@ -30732,43 +30633,13 @@ async fn handle_invoke_plugin_service(
     operation: String,
     payload: Vec<u8>,
 ) -> Result<(), ServerError> {
-    let plugin_id = plugin_id.to_string();
-    let interface_id = interface_id.to_string();
-    let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
-    let authorized_session_id = command_invocation_session(&interface_id, &operation, &payload);
-    let (bridge, mut bridge_requests) = server_plugin_bridge();
-    let invocation = state.plugins.invoke_service_with_bridge_scoped(
-        &plugin_id,
+    let response = Box::pin(plugin_operations::invoke_service(
+        state,
+        plugin_id,
         interface_id,
         operation,
         payload,
-        bcode_plugin::PluginInvocationScope::Global,
-        Some(bridge),
-    );
-    let response = Box::pin(
-        state
-            .metrics
-            .time_result_async("plugin.service", labels, async {
-                tokio::pin!(invocation);
-                loop {
-                    tokio::select! {
-                        result = &mut invocation => break result,
-                        bridge_call = bridge_requests.recv() => {
-                            let Some(bridge_call) = bridge_call else {
-                                continue;
-                            };
-                            let response = resolve_command_plugin_bridge_request(
-                                &state.sessions,
-                                authorized_session_id,
-                                bridge_call.request,
-                                &bridge_call.cancellation,
-                            ).await;
-                            let _ = bridge_call.response.send(response);
-                        }
-                    }
-                }
-            }),
-    )
+    ))
     .await;
     send_plugin_service_response(writer, request_id, response).await
 }
@@ -30806,7 +30677,7 @@ async fn handle_publish_plugin_event(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("plugin_error", error.to_string())),
+                Response::Err(ErrorResponse::new(error.code, error.message)),
             )
             .await
         }
@@ -30836,7 +30707,7 @@ fn plugin_service_metric_labels(
 async fn send_plugin_service_response(
     writer: &SharedWriter,
     request_id: u64,
-    response: Result<bcode_plugin::ServiceResponse, bcode_plugin::PluginLoadError>,
+    response: Result<bcode_plugin::ServiceResponse, plugin_operations::PublicPluginError>,
 ) -> Result<(), ServerError> {
     let response = match response {
         Ok(response) => Response::Ok(ResponsePayload::PluginServiceResult {
@@ -30848,25 +30719,9 @@ async fn send_plugin_service_response(
                 }),
             },
         }),
-        Err(error) => Response::Err(ErrorResponse::new("plugin_error", error.to_string())),
+        Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
     };
     send_response(writer, request_id, response).await
-}
-
-fn plugin_service_summaries(
-    plugins: &bcode_plugin::PluginRuntimeHost,
-) -> Vec<PluginServiceSummary> {
-    plugins
-        .service_summaries()
-        .into_iter()
-        .map(|(plugin_id, service)| PluginServiceSummary {
-            plugin_id,
-            interface_id: service.interface_id,
-            name: service.name,
-            description: service.description,
-            workflow_blocks: service.workflow_blocks,
-        })
-        .collect()
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
@@ -37352,14 +37207,16 @@ library = "test"
             effective_config_toml: Some(Box::new(encoded)),
             ..ClientRuntimeContext::default()
         };
-        assert!(validate_client_effective_config(Some(&context)).is_ok());
+        assert!(server_operations::validate_client_effective_config(Some(&context)).is_ok());
 
         let mut state = test_server_state(SessionManager::default());
         state.startup_plugin_selection = bcode_config::plugin_selection_with_default_plugin_ids(
             &config,
             &state.default_plugin_ids,
         );
-        assert!(validate_client_plugin_selection(&state, Some(&context)).is_ok());
+        assert!(
+            server_operations::validate_client_plugin_selection(&state, Some(&context)).is_ok()
+        );
 
         let mut incompatible_config = config;
         incompatible_config.plugins.enabled = BTreeSet::from(["extra.plugin".to_owned()]);
@@ -37371,21 +37228,24 @@ library = "test"
             ),
             ..ClientRuntimeContext::default()
         };
-        assert!(validate_client_plugin_selection(&state, Some(&incompatible)).is_err());
+        assert!(
+            server_operations::validate_client_plugin_selection(&state, Some(&incompatible))
+                .is_err()
+        );
 
         let invalid = ClientRuntimeContext {
             effective_config_toml: Some(Box::new("[model\ninvalid".to_owned())),
             ..ClientRuntimeContext::default()
         };
-        assert!(validate_client_effective_config(Some(&invalid)).is_err());
+        assert!(server_operations::validate_client_effective_config(Some(&invalid)).is_err());
 
         let oversized = ClientRuntimeContext {
             effective_config_toml: Some(Box::new(
-                "x".repeat(MAX_CLIENT_EFFECTIVE_CONFIG_BYTES + 1),
+                "x".repeat(server_operations::MAX_CLIENT_EFFECTIVE_CONFIG_BYTES + 1),
             )),
             ..ClientRuntimeContext::default()
         };
-        assert!(validate_client_effective_config(Some(&oversized)).is_err());
+        assert!(server_operations::validate_client_effective_config(Some(&oversized)).is_err());
     }
 
     #[test]
@@ -37404,27 +37264,28 @@ library = "test"
             interaction_adapters: vec![adapter.clone()],
             ..ClientRuntimeContext::default()
         };
-        assert!(validate_client_interaction_adapters(Some(&context)).is_ok());
+        assert!(server_operations::validate_client_interaction_adapters(Some(&context)).is_ok());
 
         let duplicate = ClientRuntimeContext {
             interaction_adapters: vec![adapter.clone(), adapter.clone()],
             ..ClientRuntimeContext::default()
         };
         assert_eq!(
-            validate_client_interaction_adapters(Some(&duplicate)),
+            server_operations::validate_client_interaction_adapters(Some(&duplicate)),
             Err("duplicate interaction adapter route")
         );
 
         let invalid = ClientRuntimeContext {
             interaction_adapters: vec![
                 bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
-                    producer_id: "x".repeat(MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES + 1),
+                    producer_id: "x"
+                        .repeat(server_operations::MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES + 1),
                     ..adapter
                 },
             ],
             ..ClientRuntimeContext::default()
         };
-        assert!(validate_client_interaction_adapters(Some(&invalid)).is_err());
+        assert!(server_operations::validate_client_interaction_adapters(Some(&invalid)).is_err());
     }
 
     #[tokio::test]
@@ -37563,19 +37424,19 @@ library = "test"
                 "nested": {"value": 42},
             }),
         };
-        enqueue_invocation_input(&active, input.clone()).expect("enqueue input");
+        plugin_operations::enqueue_invocation_input(&active, input.clone()).expect("enqueue input");
         let queued = receiver.try_recv().expect("queued input");
         assert_eq!(queued, input);
 
         let mut opaque_scalar = input.clone();
         opaque_scalar.input_id = "input-scalar".to_owned();
         opaque_scalar.payload = serde_json::json!("not-an-object");
-        enqueue_invocation_input(&active, opaque_scalar.clone())
+        plugin_operations::enqueue_invocation_input(&active, opaque_scalar.clone())
             .expect("opaque scalar payload should remain uninterpreted");
         assert_eq!(receiver.try_recv().expect("queued scalar"), opaque_scalar);
         let mut oversized = input;
         oversized.payload = serde_json::json!({"payload": "x".repeat(65 * 1024)});
-        assert!(enqueue_invocation_input(&active, oversized).is_err());
+        assert!(plugin_operations::enqueue_invocation_input(&active, oversized).is_err());
     }
 
     #[tokio::test]
@@ -37596,11 +37457,11 @@ library = "test"
         for index in 0..ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY {
             let mut queued = input.clone();
             queued.input_id = format!("input-{index}");
-            enqueue_invocation_input(&active, queued).expect("queue input");
+            plugin_operations::enqueue_invocation_input(&active, queued).expect("queue input");
         }
         assert_eq!(
-            enqueue_invocation_input(&active, input),
-            Err("plugin invocation input queue is full".to_string())
+            plugin_operations::enqueue_invocation_input(&active, input),
+            Err(plugin_operations::RouteInvocationInputError::QueueFull)
         );
     }
     #[test]
@@ -46432,6 +46293,63 @@ library = "test"
         assert_eq!(*resolution.lock().await, None);
     }
 
+    #[test]
+    fn interaction_operation_rejects_unknown_resolution_variants() {
+        assert_eq!(
+            interaction_operations::decode_tool_exchange_resolution(serde_json::json!({
+                "status": "future_resolution"
+            })),
+            Err(interaction_operations::ResolveToolExchangeError::InvalidResolution)
+        );
+        assert_eq!(
+            interaction_operations::decode_tool_exchange_resolution(serde_json::json!({
+                "status": "cancelled"
+            })),
+            Ok(ToolExchangeResolution::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_inventory_operations_run_without_transport_writing() {
+        let state = test_server_state_with_shell_plugin(SessionManager::default());
+
+        let services = plugin_operations::list_services(&state);
+        assert!(services.iter().any(|service| {
+            service.plugin_id == "bcode.shell"
+                && service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID
+        }));
+
+        let response = Box::pin(plugin_operations::invoke_service(
+            &state,
+            "bcode.shell",
+            bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+            "unsupported-operation".to_owned(),
+            Vec::new(),
+        ))
+        .await
+        .expect("invoke shell service in process");
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("unsupported_operation")
+        );
+
+        let contributions = plugin_operations::list_contributions(&state);
+        assert_eq!(
+            contributions.commands,
+            state.plugins.command_contributions()
+        );
+        assert_eq!(
+            contributions.config_extensions,
+            state.plugins.config_extensions()
+        );
+
+        let private =
+            bcode_plugin::PluginLoadError::Io(std::io::Error::other("secret-provider-detail"));
+        let public = plugin_operations::normalize_error(&private);
+        assert_eq!(public.code, "plugin_error");
+        assert!(!public.message.contains("secret-provider-detail"));
+    }
+
     #[tokio::test]
     async fn explicit_ownership_release_reports_success_and_actor_blockers() {
         let root = tempfile::tempdir().expect("session root");
@@ -51236,7 +51154,7 @@ library = "test"
                     .get(&(session_id, call.id.clone()))
                     .cloned();
                 if let Some(active) = routed {
-                    enqueue_invocation_input(
+                    plugin_operations::enqueue_invocation_input(
                         &active,
                         ToolInvocationInput {
                             invocation_id: call.id.clone(),
