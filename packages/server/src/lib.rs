@@ -5059,8 +5059,8 @@ async fn handle_workflow_mutation_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
-                    workflow: authored_workflow_snapshot(workflow),
-                    draft: Box::new(workflow_draft_snapshot(draft)),
+                    workflow: workflow_operations::authored_workflow_snapshot(workflow),
+                    draft: Box::new(workflow_operations::workflow_draft_snapshot(draft)),
                 }),
             )
             .await
@@ -5147,7 +5147,7 @@ async fn handle_workflow_mutation_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::AuthoredWorkflowArchived {
-                    workflow: authored_workflow_snapshot(workflow),
+                    workflow: workflow_operations::authored_workflow_snapshot(workflow),
                 }),
             )
             .await
@@ -5167,7 +5167,7 @@ async fn handle_workflow_mutation_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowDraftForked {
-                    draft: Box::new(workflow_draft_snapshot(draft)),
+                    draft: Box::new(workflow_operations::workflow_draft_snapshot(draft)),
                 }),
             )
             .await
@@ -5178,7 +5178,7 @@ async fn handle_workflow_mutation_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowPresetCreated {
-                    preset: workflow_preset_snapshot(preset),
+                    preset: workflow_operations::workflow_preset_snapshot(preset),
                 }),
             )
             .await
@@ -5242,8 +5242,8 @@ async fn handle_workflow_mutation_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowImported {
-                    workflow: authored_workflow_snapshot(workflow),
-                    draft: Box::new(workflow_draft_snapshot(draft)),
+                    workflow: workflow_operations::authored_workflow_snapshot(workflow),
+                    draft: Box::new(workflow_operations::workflow_draft_snapshot(draft)),
                 }),
             )
             .await
@@ -5644,8 +5644,8 @@ async fn handle_workflow_validation_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
-                    workflow: authored_workflow_snapshot(workflow),
-                    draft: Box::new(workflow_draft_snapshot(draft)),
+                    workflow: workflow_operations::authored_workflow_snapshot(workflow),
+                    draft: Box::new(workflow_operations::workflow_draft_snapshot(draft)),
                 }),
             )
             .await
@@ -14552,7 +14552,9 @@ async fn publish_workflow_draft(
     let (result, outcome) = match publication {
         Ok(publication) => (
             bcode_ipc::WorkflowPublicationResult::Published {
-                revision: Box::new(workflow_revision_snapshot(publication.revision)),
+                revision: Box::new(workflow_operations::workflow_revision_snapshot(
+                    publication.revision,
+                )),
                 active_revision: publication.active_revision,
             },
             "published",
@@ -14716,7 +14718,9 @@ async fn import_workflow_revision(
         );
     let result = match publication {
         Ok(publication) => bcode_ipc::WorkflowRevisionImportResult::Imported {
-            revision: Box::new(workflow_revision_snapshot(publication.revision)),
+            revision: Box::new(workflow_operations::workflow_revision_snapshot(
+                publication.revision,
+            )),
             active_revision: publication.active_revision,
         },
         Err(error @ WorkflowStoreError::AuthoringConflict { .. }) => {
@@ -14938,308 +14942,6 @@ async fn start_authored_workflow(
         preset_generation: preset.as_ref().map(|preset| preset.generation),
         configuration,
     })
-}
-
-fn authored_workflow_page(
-    page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::AuthoredWorkflow>,
-    _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::AuthoredWorkflowSnapshot,
-    bcode_workflow::WorkflowAuthoringListCursor,
-> {
-    let bcode_workflow_store::WorkflowAuthoringStorePage {
-        items: workflows,
-        has_more,
-    } = page;
-    let next_cursor = has_more.then(|| {
-        let last = workflows
-            .last()
-            .expect("a page with more items is non-empty");
-        bcode_workflow::WorkflowAuthoringListCursor {
-            updated_at_ms: last.updated_at_ms,
-            entity_id: last.workflow_id.clone(),
-        }
-    });
-    bcode_ipc::WorkflowAuthoringPage {
-        items: workflows
-            .into_iter()
-            .map(authored_workflow_snapshot)
-            .collect(),
-        next_cursor,
-    }
-}
-
-fn workflow_draft_page(
-    page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::WorkflowDraft>,
-    _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::WorkflowDraftSnapshot,
-    bcode_workflow::WorkflowAuthoringListCursor,
-> {
-    let bcode_workflow_store::WorkflowAuthoringStorePage {
-        items: drafts,
-        has_more,
-    } = page;
-    let next_cursor = has_more.then(|| {
-        let last = drafts.last().expect("a page with more items is non-empty");
-        bcode_workflow::WorkflowAuthoringListCursor {
-            updated_at_ms: last.updated_at_ms,
-            entity_id: last.draft_id.clone(),
-        }
-    });
-    bcode_ipc::WorkflowAuthoringPage {
-        items: drafts.into_iter().map(workflow_draft_snapshot).collect(),
-        next_cursor,
-    }
-}
-
-fn workflow_revision_page(
-    page: bcode_workflow_store::WorkflowAuthoringStorePage<
-        bcode_workflow_store::PublishedWorkflowRevision,
-    >,
-    _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::WorkflowRevisionSnapshot,
-    bcode_workflow::WorkflowRevisionListCursor,
-> {
-    let bcode_workflow_store::WorkflowAuthoringStorePage {
-        items: revisions,
-        has_more,
-    } = page;
-    let next_cursor = has_more.then(|| bcode_workflow::WorkflowRevisionListCursor {
-        revision: revisions
-            .last()
-            .expect("a page with more items is non-empty")
-            .revision,
-    });
-    bcode_ipc::WorkflowAuthoringPage {
-        items: revisions
-            .into_iter()
-            .map(workflow_revision_snapshot)
-            .collect(),
-        next_cursor,
-    }
-}
-
-fn workflow_preset_page(
-    page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::WorkflowPreset>,
-    _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::WorkflowPresetSnapshot,
-    bcode_workflow::WorkflowAuthoringListCursor,
-> {
-    let bcode_workflow_store::WorkflowAuthoringStorePage {
-        items: presets,
-        has_more,
-    } = page;
-    let next_cursor = has_more.then(|| {
-        let last = presets.last().expect("a page with more items is non-empty");
-        bcode_workflow::WorkflowAuthoringListCursor {
-            updated_at_ms: last.updated_at_ms,
-            entity_id: last.preset_id.clone(),
-        }
-    });
-    bcode_ipc::WorkflowAuthoringPage {
-        items: presets.into_iter().map(workflow_preset_snapshot).collect(),
-        next_cursor,
-    }
-}
-
-fn authored_workflow_inspection(
-    state: &ServerState,
-    workflow_id: &str,
-    limit: usize,
-) -> Result<Option<bcode_ipc::AuthoredWorkflowInspection>, ServerError> {
-    let store = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(workflow) = store.authored_workflow(workflow_id)? else {
-        return Ok(None);
-    };
-    let drafts = store
-        .list_workflow_drafts(workflow_id, limit)?
-        .into_iter()
-        .map(|draft| bcode_ipc::WorkflowDraftInspectionSummary {
-            identity: bcode_workflow::WorkflowDraftIdentity {
-                workflow_id: draft.workflow_id,
-                draft_id: draft.draft_id,
-            },
-            base_revision: draft.base_revision,
-            generation: draft.generation,
-            checksum_sha256: draft.checksum_sha256,
-            created_at_ms: draft.created_at_ms,
-            updated_at_ms: draft.updated_at_ms,
-        })
-        .collect();
-    let revisions = store
-        .list_workflow_revisions(workflow_id, limit)?
-        .into_iter()
-        .map(|revision| bcode_ipc::WorkflowRevisionInspectionSummary {
-            identity: bcode_workflow::WorkflowRevisionIdentity {
-                workflow_id: revision.workflow_id,
-                revision: revision.revision,
-            },
-            source_checksum_sha256: revision.source_checksum_sha256,
-            executable_source_checksum_sha256: revision.executable_source_checksum_sha256,
-            definition_identity: revision.definition_identity,
-            published_at_ms: revision.published_at_ms,
-        })
-        .collect();
-    let presets = store
-        .list_workflow_presets(workflow_id, limit)?
-        .into_iter()
-        .map(|preset| bcode_ipc::WorkflowPresetInspectionSummary {
-            workflow_id: preset.workflow_id,
-            preset_id: preset.preset_id,
-            revision: preset.revision,
-            generation: preset.generation,
-            has_run_limit_override: preset.run_limits.is_some(),
-            created_at_ms: preset.created_at_ms,
-            updated_at_ms: preset.updated_at_ms,
-        })
-        .collect();
-    let events = store
-        .workflow_authoring_events(workflow_id, None, limit)?
-        .into_iter()
-        .map(|event| bcode_ipc::WorkflowAuthoringEventSnapshot {
-            event_seq: event.event_seq,
-            workflow_id: event.workflow_id,
-            event_type: event.event_type,
-            revision: event
-                .payload
-                .get("revision")
-                .and_then(serde_json::Value::as_u64),
-            definition_id: event
-                .payload
-                .get("definition_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string),
-            definition_version: event
-                .payload
-                .get("definition_version")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|version| u32::try_from(version).ok()),
-            activated: event
-                .payload
-                .get("activated")
-                .and_then(serde_json::Value::as_bool),
-            created_at_ms: event.created_at_ms,
-        })
-        .collect();
-    let issues = store
-        .diagnose_authored_workflow(workflow_id, limit)?
-        .into_iter()
-        .map(workflow_authoring_issue_snapshot)
-        .collect();
-    drop(store);
-    Ok(Some(bcode_ipc::AuthoredWorkflowInspection {
-        workflow: authored_workflow_snapshot(workflow),
-        drafts,
-        revisions,
-        presets,
-        events,
-        issues,
-    }))
-}
-
-fn workflow_authoring_issue_snapshot(
-    issue: bcode_workflow_store::WorkflowAuthoringIssue,
-) -> bcode_ipc::WorkflowAuthoringIssueSnapshot {
-    match issue {
-        bcode_workflow_store::WorkflowAuthoringIssue::InvalidActiveRevision { revision } => {
-            bcode_ipc::WorkflowAuthoringIssueSnapshot::InvalidActiveRevision { revision }
-        }
-        bcode_workflow_store::WorkflowAuthoringIssue::MissingCompiledDefinition {
-            revision,
-            definition_id,
-            definition_version,
-        } => bcode_ipc::WorkflowAuthoringIssueSnapshot::MissingCompiledDefinition {
-            revision,
-            definition_id,
-            definition_version,
-        },
-        bcode_workflow_store::WorkflowAuthoringIssue::OrphanedPreset {
-            preset_id,
-            revision,
-        } => bcode_ipc::WorkflowAuthoringIssueSnapshot::OrphanedPreset {
-            preset_id,
-            revision,
-        },
-        bcode_workflow_store::WorkflowAuthoringIssue::StaleDraftBase {
-            draft_id,
-            base_revision,
-        } => bcode_ipc::WorkflowAuthoringIssueSnapshot::StaleDraftBase {
-            draft_id,
-            base_revision,
-        },
-    }
-}
-
-fn authored_workflow_snapshot(
-    workflow: bcode_workflow_store::AuthoredWorkflow,
-) -> bcode_ipc::AuthoredWorkflowSnapshot {
-    bcode_ipc::AuthoredWorkflowSnapshot {
-        workflow_id: workflow.workflow_id,
-        title: workflow.title,
-        description: workflow.description,
-        archived: workflow.archived,
-        active_revision: workflow.active_revision,
-        created_at_ms: workflow.created_at_ms,
-        updated_at_ms: workflow.updated_at_ms,
-    }
-}
-
-fn workflow_draft_snapshot(
-    draft: bcode_workflow_store::WorkflowDraft,
-) -> bcode_ipc::WorkflowDraftSnapshot {
-    bcode_ipc::WorkflowDraftSnapshot {
-        identity: bcode_workflow::WorkflowDraftIdentity {
-            workflow_id: draft.workflow_id,
-            draft_id: draft.draft_id,
-        },
-        base_revision: draft.base_revision,
-        generation: draft.generation,
-        checksum_sha256: draft.checksum_sha256,
-        document: draft.document,
-        producer: draft.producer,
-        created_at_ms: draft.created_at_ms,
-        updated_at_ms: draft.updated_at_ms,
-    }
-}
-
-fn workflow_revision_snapshot(
-    revision: bcode_workflow_store::PublishedWorkflowRevision,
-) -> bcode_ipc::WorkflowRevisionSnapshot {
-    bcode_ipc::WorkflowRevisionSnapshot {
-        identity: bcode_workflow::WorkflowRevisionIdentity {
-            workflow_id: revision.workflow_id,
-            revision: revision.revision,
-        },
-        source_checksum_sha256: revision.source_checksum_sha256,
-        executable_source_checksum_sha256: revision.executable_source_checksum_sha256,
-        definition_identity: revision.definition_identity,
-        document: revision.document,
-        producer: revision.producer,
-        published_at_ms: revision.published_at_ms,
-    }
-}
-
-fn workflow_preset_snapshot(
-    preset: bcode_workflow_store::WorkflowPreset,
-) -> bcode_ipc::WorkflowPresetSnapshot {
-    bcode_ipc::WorkflowPresetSnapshot {
-        workflow_id: preset.workflow_id,
-        preset_id: preset.preset_id,
-        revision: preset.revision,
-        name: preset.name,
-        generation: preset.generation,
-        configuration: preset.configuration,
-        run_limits: preset.run_limits,
-        producer: preset.producer,
-        created_at_ms: preset.created_at_ms,
-        updated_at_ms: preset.updated_at_ms,
-    }
 }
 
 fn validate_workflow_definition_for_production(
@@ -15956,443 +15658,6 @@ async fn drive_workflow_run_and_parents(
             .map(|link| link.parent_run_id);
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-async fn workflow_run_inspection(
-    state: &ServerState,
-    run_id: &str,
-    limit: usize,
-) -> Result<bcode_ipc::WorkflowRunInspection, ServerError> {
-    let (
-        run,
-        definition,
-        terminal_output,
-        activations,
-        waits,
-        mutation_approvals,
-        attempts,
-        events,
-        decisions,
-        grants,
-        resource_leases,
-        outputs,
-        child_run_links,
-        descendant_runs,
-        repeat_outcomes,
-        execution_session_links,
-    ) = {
-        let store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let run = store.run_summary(run_id)?.ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
-        })?;
-        let definition = store
-            .definition(&run.definition_id, run.definition_version)?
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "workflow definition not found: {} v{}",
-                    run.definition_id, run.definition_version
-                ))
-            })?;
-        let terminal_output = store.canonical_terminal_output(run_id)?.map(|output| {
-            bcode_ipc::WorkflowTerminalOutputInspection {
-                version: bcode_ipc::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION,
-                checksum_sha256: run
-                    .terminal_output_checksum_sha256
-                    .clone()
-                    .expect("canonical terminal output has a checksum"),
-                output_id: output.output_id,
-                node_id: output.node_id,
-                activation_id: output.activation_id,
-                schema_id: output.schema_id,
-                schema_version: output.schema_version,
-                value: output.value,
-                artifact_reference: output.artifact_reference,
-                created_at_ms: output.created_at_ms,
-            }
-        });
-        let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
-        let mut repeat_outcomes = store.repeat_outcomes(run_id, limit)?;
-        for descendant in &descendant_runs {
-            let remaining = limit.saturating_sub(repeat_outcomes.len());
-            if remaining == 0 {
-                break;
-            }
-            repeat_outcomes.extend(store.repeat_outcomes(&descendant.run.run_id, remaining)?);
-        }
-        let execution_session_links = store.execution_session_links_for_run(run_id, limit)?;
-        (
-            run,
-            definition,
-            terminal_output,
-            store.activations_for_run(run_id, limit)?,
-            store.waiting_activations(run_id, limit)?,
-            store.pending_mutation_approvals(run_id, limit)?,
-            store.attempt_history(run_id, None, limit)?,
-            store.event_history(run_id, None, limit)?,
-            store.decisions_for_run(run_id, limit)?,
-            store.grants_for_run(run_id, limit)?,
-            store.resource_leases_for_run(run_id, limit)?,
-            store.output_summaries(run_id, limit)?,
-            store.child_run_links(run_id, limit)?,
-            descendant_runs,
-            repeat_outcomes,
-            execution_session_links,
-        )
-    };
-    let mut child_sessions = Vec::with_capacity(execution_session_links.len());
-    for link in execution_session_links {
-        if child_sessions.len() >= limit {
-            break;
-        }
-        let session_id = link.session_id.parse().map_err(|_| {
-            WorkflowStoreError::InvalidData(
-                "workflow execution-session link has invalid session identity".to_string(),
-            )
-        })?;
-        let summary = state.sessions.session_summary(session_id).await?;
-        if summary.execution.as_ref().is_none_or(|execution| {
-            execution.provenance.run_id != run_id
-                || execution.provenance.node_id != link.node_id
-                || execution.provenance.activation_id.as_deref()
-                    != Some(link.activation_id.as_str())
-                || execution.provenance.attempt != link.attempt
-        }) {
-            return Err(WorkflowStoreError::InvalidData(
-                "workflow execution-session link conflicts with session provenance".to_string(),
-            )
-            .into());
-        }
-        child_sessions.push(summary);
-    }
-    Ok(bcode_ipc::WorkflowRunInspection {
-        run,
-        definition,
-        terminal_output,
-        activations,
-        waits,
-        mutation_approvals,
-        attempts,
-        events,
-        decisions,
-        grants,
-        resource_leases,
-        outputs,
-        child_run_links,
-        descendant_runs,
-        repeat_outcomes,
-        child_sessions,
-    })
-}
-
-const WORKFLOW_RUN_VIEW_COLLECTION_LIMIT_MAX: usize = 1_000;
-
-#[must_use]
-fn workflow_run_view_collection_limit(requested: usize) -> usize {
-    requested.min(WORKFLOW_RUN_VIEW_COLLECTION_LIMIT_MAX)
-}
-
-#[allow(clippy::too_many_lines)]
-fn workflow_run_view(
-    state: &ServerState,
-    run_id: &str,
-    limit: usize,
-) -> Result<bcode_workflow_view_models::WorkflowRunView, ServerError> {
-    let limit = workflow_run_view_collection_limit(limit);
-    let view = {
-        let store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let run = store.run_summary(run_id)?.ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
-        })?;
-        let definition = store
-            .definition(&run.definition_id, run.definition_version)?
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "workflow definition not found: {} v{}",
-                    run.definition_id, run.definition_version
-                ))
-            })?;
-        let outputs = store.output_summaries(run_id, limit)?;
-        let output_values = store
-            .validated_outputs(run_id, limit)?
-            .into_iter()
-            .map(|output| (output.output_id, output.value))
-            .collect::<BTreeMap<_, _>>();
-        let activations = store.activations_for_run(run_id, limit)?;
-        let waits = store.waiting_activations(run_id, limit)?;
-        let mutation_approvals = store.pending_mutation_approvals(run_id, limit)?;
-        let attempts = store.attempt_history(run_id, None, limit)?;
-        let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
-        let child_sessions = store.execution_session_links_for_run(run_id, limit)?;
-        let run_item = workflow_run_list_item(&store, &run)?;
-        let parsed_definition: bcode_workflow::WorkflowDefinition =
-            serde_json::from_str(&definition.definition_json).map_err(|error| {
-                WorkflowStoreError::InvalidData(format!(
-                    "workflow definition is not valid current-format JSON: {error}"
-                ))
-            })?;
-        let wait_views = waits
-            .into_iter()
-            .map(|wait| {
-                let node = parsed_definition.node(&wait.node_id).ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(format!(
-                        "workflow wait references missing node: {}",
-                        wait.node_id
-                    ))
-                })?;
-                let kind = match wait.kind {
-                    bcode_workflow_store::WorkflowWaitKind::Input => {
-                        bcode_workflow_view_models::WorkflowWaitKind::Input
-                    }
-                    bcode_workflow_store::WorkflowWaitKind::Approval => {
-                        bcode_workflow_view_models::WorkflowWaitKind::Approval
-                    }
-                };
-                Ok(bcode_workflow_view_models::WorkflowWaitView {
-                    node_id: wait.node_id,
-                    activation_id: wait.activation_id,
-                    kind,
-                    prompt: node.name.clone(),
-                    expected_schema: (kind == bcode_workflow_view_models::WorkflowWaitKind::Input)
-                        .then(|| node.output.schema.clone()),
-                    input: wait.input,
-                    requested_at_ms: wait.requested_at_ms,
-                })
-            })
-            .collect::<Result<Vec<_>, WorkflowStoreError>>()?;
-        let mutation_approval_views = mutation_approvals
-            .into_iter()
-            .map(|approval| {
-                let warning = match approval.scope.reconciliation {
-                    bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay => None,
-                    bcode_workflow::WorkflowBlockReconciliation::ReceiptStatus => Some(
-                        "Execution is reconciled through an owner receipt after restart."
-                            .to_string(),
-                    ),
-                    bcode_workflow::WorkflowBlockReconciliation::RepairRequired => Some(
-                        "An ambiguous accepted execution requires explicit repair.".to_string(),
-                    ),
-                };
-                bcode_workflow_view_models::WorkflowMutationApprovalView {
-                    approval_id: approval.approval_id,
-                    node_id: approval.node_id,
-                    activation_id: approval.activation_id,
-                    plugin_id: approval.scope.plugin_id,
-                    block_id: approval.scope.block_id,
-                    block_version: approval.scope.block_version,
-                    operation: approval.scope.operation,
-                    effect: bcode_workflow_view_models::WorkflowOperationEffect::Mutating,
-                    input_summary: approval.scope.input_summary,
-                    resource_claims: approval
-                        .scope
-                        .resource_claims
-                        .into_iter()
-                        .map(
-                            |claim| bcode_workflow_view_models::WorkflowResourceClaimView {
-                                resource: claim.resource,
-                                access: match claim.access {
-                                    bcode_workflow::ResourceAccess::Read => "read".to_string(),
-                                    bcode_workflow::ResourceAccess::Write => "write".to_string(),
-                                },
-                            },
-                        )
-                        .collect(),
-                    workspace_snapshot: approval.scope.workspace_snapshot,
-                    reconciliation_warning: warning,
-                    requested_at_ms: approval.requested_at_ms,
-                    expires_at_ms: approval.expires_at_ms,
-                }
-            })
-            .collect();
-        let descendant_views = descendant_runs
-            .into_iter()
-            .map(|descendant| {
-                Ok(bcode_workflow_view_models::WorkflowDescendantRunView {
-                    run: workflow_run_list_item(&store, &descendant.run)?,
-                    parent_run_id: descendant.link.parent_run_id,
-                    parent_node_id: descendant.link.parent_node_id,
-                    depth: descendant.link.depth,
-                })
-            })
-            .collect::<Result<Vec<_>, WorkflowStoreError>>()?;
-        drop(store);
-        bcode_workflow_view::project_run(bcode_workflow_view::WorkflowRunProjectionInput {
-            run: run_item,
-            terminal_output_id: run.terminal_output_id,
-            definition: bcode_workflow_view::WorkflowDefinitionProjectionInput {
-                definition_json: definition.definition_json,
-            },
-            activations: activations
-                .into_iter()
-                .map(
-                    |activation| bcode_workflow_view::WorkflowActivationProjectionInput {
-                        node_id: activation.node_id,
-                        activation_id: activation.activation_id,
-                        status: activation.status,
-                    },
-                )
-                .collect(),
-            waits: wait_views,
-            mutation_approvals: mutation_approval_views,
-            attempts: attempts
-                .into_iter()
-                .map(|attempt| bcode_workflow_view_models::WorkflowAttemptView {
-                    node_id: attempt.node_id,
-                    activation_id: attempt.activation_id,
-                    attempt: attempt.attempt,
-                    dispatch_identity: attempt.dispatch_identity,
-                    status: attempt.status,
-                    has_receipt: attempt.has_receipt,
-                    prepared_at_ms: attempt.prepared_at_ms,
-                    terminal_at_ms: attempt.terminal_at_ms,
-                })
-                .collect(),
-            outputs: outputs
-                .into_iter()
-                .map(
-                    |output| bcode_workflow_view::WorkflowOutputProjectionInput {
-                        value: output_values.get(&output.output_id).cloned(),
-                        output_id: output.output_id,
-                        node_id: output.node_id,
-                        activation_id: output.activation_id,
-                        schema_id: output.schema_id,
-                        schema_version: output.schema_version,
-                        checksum_sha256: output.checksum_sha256,
-                        artifact_reference: output.artifact_reference,
-                        created_at_ms: output.created_at_ms,
-                    },
-                )
-                .collect(),
-            descendant_runs: descendant_views,
-            child_sessions: child_sessions
-                .into_iter()
-                .map(
-                    |link| bcode_workflow_view_models::WorkflowChildSessionView {
-                        node_id: link.node_id,
-                        activation_id: link.activation_id,
-                        attempt: link.attempt,
-                        session_id: link.session_id,
-                    },
-                )
-                .collect(),
-        })
-    };
-    Ok(view)
-}
-
-fn workflow_run_list_item(
-    store: &bcode_workflow_store::WorkflowStore,
-    run: &bcode_workflow_store::WorkflowRunSummary,
-) -> Result<bcode_workflow_view_models::WorkflowRunListItem, WorkflowStoreError> {
-    let summary = store.run_catalog_summary(&run.run_id)?;
-    workflow_run_list_item_with_summary(store, run, &summary)
-}
-
-fn workflow_run_list_item_with_summary(
-    store: &bcode_workflow_store::WorkflowStore,
-    run: &bcode_workflow_store::WorkflowRunSummary,
-    summary: &bcode_workflow_store::WorkflowRunCatalogSummary,
-) -> Result<bcode_workflow_view_models::WorkflowRunListItem, WorkflowStoreError> {
-    let authored_workflow = run
-        .authored_provenance
-        .as_ref()
-        .map(|source| store.authored_workflow(&source.workflow_id))
-        .transpose()?
-        .flatten();
-    let parent_run_id = store
-        .parent_run_link(&run.run_id)?
-        .map(|link| link.parent_run_id);
-    let editable_draft_id = if let Some(source) = &run.authored_provenance {
-        store
-            .list_workflow_drafts(&source.workflow_id, 1)?
-            .first()
-            .map(|draft| draft.draft_id.clone())
-    } else {
-        None
-    };
-    let display_title = authored_workflow.as_ref().map_or_else(
-        || {
-            run.binding
-                .as_ref()
-                .and_then(|binding| binding.display_label.clone())
-                .unwrap_or_else(|| run.definition_id.clone())
-        },
-        |workflow| workflow.title.clone(),
-    );
-    let definition_disposition = run.authored_provenance.as_ref().map_or(
-        bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly,
-        |source| bcode_workflow_view_models::WorkflowDefinitionDisposition::Published {
-            workflow_id: source.workflow_id.clone(),
-            revision: source.revision,
-            editable_draft_id,
-        },
-    );
-    Ok(bcode_workflow_view_models::WorkflowRunListItem {
-        run_id: run.run_id.clone(),
-        display_title,
-        binding_label: run
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.display_label.clone()),
-        definition_id: run.definition_id.clone(),
-        definition_version: run.definition_version,
-        authored_source: run.authored_provenance.as_ref().map(|source| {
-            bcode_workflow_view_models::WorkflowAuthoredSourceView {
-                workflow_id: source.workflow_id.clone(),
-                revision: source.revision,
-            }
-        }),
-        definition_disposition,
-        parent_run_id,
-        descendant_count: summary.descendant_count,
-        progress: bcode_workflow_view_models::WorkflowRunProgress {
-            total_nodes: summary.total_nodes,
-            not_started: summary.not_started,
-            active: summary.active,
-            blocked: summary.blocked,
-            completed: summary.completed,
-            failed: summary.failed,
-            cancelled: summary.cancelled,
-            skipped: summary.skipped,
-            repair_required: summary.repair_required,
-        },
-        attention: bcode_workflow_view_models::WorkflowAttentionSummary {
-            pending_inputs: summary.pending_inputs,
-            pending_approvals: summary.pending_approvals,
-            pending_mutation_approvals: summary.pending_mutation_approvals,
-            retryable_failures: summary.retryable_failures,
-            repair_required: run.status == bcode_workflow_store::RunStatus::RepairRequired
-                || summary.repair_required > 0,
-        },
-        status: match run.status {
-            bcode_workflow_store::RunStatus::Running => {
-                bcode_workflow_view_models::WorkflowRunStatus::Running
-            }
-            bcode_workflow_store::RunStatus::Paused => {
-                bcode_workflow_view_models::WorkflowRunStatus::Paused
-            }
-            bcode_workflow_store::RunStatus::Completed => {
-                bcode_workflow_view_models::WorkflowRunStatus::Completed
-            }
-            bcode_workflow_store::RunStatus::Failed => {
-                bcode_workflow_view_models::WorkflowRunStatus::Failed
-            }
-            bcode_workflow_store::RunStatus::Cancelled => {
-                bcode_workflow_view_models::WorkflowRunStatus::Cancelled
-            }
-            bcode_workflow_store::RunStatus::RepairRequired => {
-                bcode_workflow_view_models::WorkflowRunStatus::RepairRequired
-            }
-        },
-        created_at_ms: run.created_at_ms,
-        updated_at_ms: run.updated_at_ms,
-    })
 }
 
 async fn handle_cancel_runtime_work(
@@ -34342,11 +33607,11 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 mod tests {
     #[test]
     fn workflow_run_view_collection_limit_bounds_outputs_and_attempts() {
-        assert_eq!(super::workflow_run_view_collection_limit(0), 0);
-        assert_eq!(super::workflow_run_view_collection_limit(250), 250);
+        assert_eq!(workflow_operations::run_view_collection_limit(0), 0);
+        assert_eq!(workflow_operations::run_view_collection_limit(250), 250);
         assert_eq!(
-            super::workflow_run_view_collection_limit(usize::MAX),
-            super::WORKFLOW_RUN_VIEW_COLLECTION_LIMIT_MAX
+            workflow_operations::run_view_collection_limit(usize::MAX),
+            1_000
         );
     }
 
@@ -59458,7 +58723,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("run summary")
             .expect("run");
         assert_eq!(run.status, bcode_workflow_store::RunStatus::Completed);
-        let inspection = workflow_run_inspection(&state, "input-wake-run", 10)
+        let inspection = workflow_operations::inspect_run(&state, "input-wake-run", 10)
             .await
             .expect("inspection");
         let terminal = inspection.terminal_output.expect("terminal output");
@@ -59620,7 +58885,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_ipc::decode_response(&response.payload).expect("decode response"),
             Response::Ok(ResponsePayload::WorkflowWaitResolved { .. })
         ));
-        let inspection = workflow_run_inspection(&state, "approval-wake-run", 10)
+        let inspection = workflow_operations::inspect_run(&state, "approval-wake-run", 10)
             .await
             .expect("inspection");
         assert_eq!(
