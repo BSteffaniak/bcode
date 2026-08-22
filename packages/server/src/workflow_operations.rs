@@ -2,6 +2,56 @@
 
 use super::ServerState;
 
+/// Resolve and start one authored workflow revision, active revision, or preset.
+pub async fn start_authored(
+    client_id: super::ClientId,
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::StartAuthoredWorkflowRequest,
+    authorize: bool,
+) -> Result<bcode_ipc::AuthoredWorkflowRunStartResponse, super::ServerError> {
+    super::start_authored_workflow(client_id, state, request, authorize).await
+}
+
+/// Import one exact next published revision into an existing authored workflow.
+pub async fn import_revision(
+    request_id: u64,
+    client_id: super::ClientId,
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::ImportWorkflowRevisionRequest,
+) -> Result<bcode_ipc::WorkflowRevisionImportResult, super::ServerError> {
+    super::import_workflow_revision(request_id, client_id, state, request).await
+}
+
+/// Publish one draft and admit its resulting revision when publication succeeds.
+pub async fn publish_and_start(
+    request_id: u64,
+    client_id: super::ClientId,
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::PublishAndStartWorkflowRequest,
+) -> Result<bcode_ipc::WorkflowPublishAndStartResult, super::ServerError> {
+    super::publish_and_start_workflow(request_id, client_id, state, request).await
+}
+
+/// Publish one validated authored workflow draft.
+pub async fn publish_draft(
+    request_id: u64,
+    client_id: super::ClientId,
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::PublishWorkflowDraftRequest,
+    operation: bcode_workflow::WorkflowApplicationOperation,
+) -> Result<bcode_ipc::WorkflowPublicationResult, super::ServerError> {
+    super::publish_workflow_draft(request_id, client_id, state, request, operation).await
+}
+
+/// Build one bounded semantic workflow run view.
+pub fn run_view(
+    state: &ServerState,
+    run_id: &str,
+    limit: usize,
+) -> Result<bcode_workflow_view_models::WorkflowRunView, super::ServerError> {
+    super::workflow_run_view(state, run_id, limit)
+}
+
 /// Return one bounded page of authored workflows.
 pub fn list_authored_workflows(
     state: &ServerState,
@@ -188,6 +238,286 @@ pub fn publish_package(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .publish_workflow_package(&request.request, request.published_at_ms)
+}
+
+/// Validate and plan one bounded workflow package closure.
+pub async fn validate_package(
+    state: &ServerState,
+    request: bcode_ipc::WorkflowPackageComputationRequest,
+    fallback_operation_id: String,
+) -> Result<bcode_ipc::WorkflowPackageValidationResult, super::ServerError> {
+    let catalog = authoring_catalog(state).await?;
+    let plan =
+        super::run_workflow_computation(state, request.control, fallback_operation_id, move || {
+            bcode_workflow::plan_workflow_package_closure(&request.closure, &catalog)
+        })
+        .await??;
+    Ok(bcode_ipc::WorkflowPackageValidationResult { plan })
+}
+
+/// Preview one already planned workflow package without persistence side effects.
+pub async fn preview_package(
+    state: &ServerState,
+    request: bcode_ipc::WorkflowPackagePreviewRequest,
+    fallback_operation_id: String,
+) -> Result<bcode_workflow::WorkflowPackagePreview, super::ServerError> {
+    let mut catalog = authoring_catalog(state).await?;
+    for dependency in &request.dependency_plans {
+        for member in &dependency.members {
+            catalog.workflow_definitions.insert(
+                member.definition_identity.definition_id.clone(),
+                member.lowering.document.definition.clone(),
+            );
+        }
+    }
+    super::run_workflow_computation(state, request.control, fallback_operation_id, move || {
+        bcode_workflow::preview_workflow_package(&request.plan, &catalog, &request.configurations)
+    })
+    .await?
+    .map_err(super::ServerError::from)
+}
+
+/// Lower and validate one bounded authored-workflow source document.
+pub async fn validate_source(
+    state: &ServerState,
+    request: bcode_ipc::WorkflowSourceComputationRequest,
+    fallback_operation_id: String,
+) -> Result<bcode_ipc::WorkflowSourceValidationResult, super::ServerError> {
+    let catalog = authoring_catalog(state).await?;
+    let source_format = request.source_format;
+    let lowering =
+        super::run_workflow_computation(state, request.control, fallback_operation_id, move || {
+            bcode_workflow::lower_workflow_authoring_source(
+                &request.source,
+                source_format,
+                &catalog,
+            )
+        })
+        .await??;
+    Ok(bcode_ipc::WorkflowSourceValidationResult {
+        source_format,
+        lowering,
+    })
+}
+
+/// Lower and preview compilation for one bounded authored-workflow source document.
+pub async fn preview_source(
+    state: &ServerState,
+    request: bcode_ipc::WorkflowSourcePreviewRequest,
+    fallback_operation_id: String,
+) -> Result<bcode_ipc::WorkflowSourcePreviewResult, super::ServerError> {
+    let catalog = authoring_catalog(state).await?;
+    let source_format = request.source_format;
+    let configuration = request.configuration;
+    let (lowering, preview) =
+        super::run_workflow_computation(state, request.control, fallback_operation_id, move || {
+            let lowering = bcode_workflow::lower_workflow_authoring_source(
+                &request.source,
+                source_format,
+                &catalog,
+            )?;
+            let preview = lowering
+                .document
+                .compilation_preview(&catalog, configuration.as_ref());
+            Ok::<_, bcode_workflow::WorkflowError>((lowering, preview))
+        })
+        .await??;
+    Ok(bcode_ipc::WorkflowSourcePreviewResult {
+        source_format,
+        lowering,
+        preview,
+    })
+}
+
+/// Validate one bounded authored-workflow document.
+pub async fn validate_authoring(
+    state: &ServerState,
+    document: bcode_workflow::WorkflowAuthoringDocument,
+    control: bcode_ipc::WorkflowComputationControl,
+    fallback_operation_id: String,
+) -> Result<bcode_workflow::WorkflowValidationReport, super::ServerError> {
+    super::run_workflow_computation(state, control, fallback_operation_id, move || {
+        document.validation_report()
+    })
+    .await
+}
+
+/// Preview compilation for one bounded authored-workflow document.
+pub async fn preview_compilation(
+    state: &ServerState,
+    document: bcode_workflow::WorkflowAuthoringDocument,
+    configuration: Option<serde_json::Value>,
+    control: bcode_ipc::WorkflowComputationControl,
+    fallback_operation_id: String,
+) -> Result<bcode_workflow::WorkflowCompilationPreview, super::ServerError> {
+    let catalog = authoring_catalog(state).await?;
+    super::run_workflow_computation(state, control, fallback_operation_id, move || {
+        document.compilation_preview(&catalog, configuration.as_ref())
+    })
+    .await
+}
+
+/// Instantiate one exact enabled template as a new authored workflow and initial draft.
+pub async fn instantiate_template(
+    client_id: super::ClientId,
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::WorkflowTemplateInstantiationRequest,
+) -> Result<
+    (
+        bcode_workflow_store::AuthoredWorkflow,
+        bcode_workflow_store::WorkflowDraft,
+    ),
+    super::ServerError,
+> {
+    super::instantiate_workflow_template(client_id, state, request).await
+}
+
+/// Admit one run for an already persisted exact workflow definition.
+pub async fn start_run(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::WorkflowRunStartRequest,
+    provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
+) -> Result<bcode_ipc::WorkflowRunStartResponse, super::ServerError> {
+    super::start_workflow_run(state, request, provenance).await
+}
+
+/// Validate, persist, and admit one exact workflow definition.
+pub async fn start(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::WorkflowStartRequest,
+) -> Result<bcode_ipc::WorkflowRunStartResponse, super::ServerError> {
+    let started_at = std::time::Instant::now();
+    super::validate_workflow_definition_for_production(state, &request.definition)?;
+    if request.identity.kind != request.binding.workflow_kind {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow logical identity does not match its binding kind".to_string(),
+        )
+        .into());
+    }
+    let expected_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        request.identity.kind.clone(),
+        &request.definition,
+    )
+    .map_err(|error| bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string()))?;
+    if expected_identity != request.identity {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow exact identity does not match its compiled definition".to_string(),
+        )
+        .into());
+    }
+    let stored = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .persist_definition(
+            &request.identity.definition_id,
+            request.identity.definition_version,
+            &request.definition,
+        )?;
+    if stored.definition_id != request.identity.definition_id
+        || stored.version != request.identity.definition_version
+    {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow exact identity does not match persisted definition".to_string(),
+        )
+        .into());
+    }
+    let result = super::start_workflow_run(
+        state,
+        bcode_ipc::WorkflowRunStartRequest {
+            definition_id: request.identity.definition_id,
+            definition_version: request.identity.definition_version,
+            run_id: request.run_id,
+            workspace_snapshot: request.workspace_snapshot.unwrap_or_default(),
+            parent_session_id: request.parent_session_id,
+            parent_session_generation: None,
+            binding: Some(request.binding),
+            input: Some(request.input),
+            limits: request.limits,
+        },
+        None,
+    )
+    .await;
+    state.metrics.record_histogram_with_labels(
+        "workflow.admission.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        std::collections::BTreeMap::from([(
+            "outcome".to_string(),
+            if result.is_ok() { "ok" } else { "error" }.to_string(),
+        )]),
+    );
+    result
+}
+
+/// Compile and start one exact enabled workflow template.
+pub async fn start_template(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_ipc::WorkflowTemplateStartRequest,
+) -> Result<bcode_ipc::WorkflowRunStartResponse, super::ServerError> {
+    let template = super::find_workflow_template(
+        state,
+        &request.owner_plugin_id,
+        &request.template_id,
+        request.template_version,
+    )
+    .ok_or_else(|| {
+        bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow template not found or disabled".to_string(),
+        )
+    })?;
+    let description = template_description(state, &request.owner_plugin_id, template)?;
+    if !description.diagnostics.is_empty() {
+        return Err(super::ServerError::WorkflowCapabilityUnavailable(
+            description
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let validator =
+        jsonschema::validator_for(&template.configuration_schema().schema).map_err(|error| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
+                "invalid template configuration schema: {error}"
+            ))
+        })?;
+    if let Err(error) = validator.validate(&request.configuration) {
+        return Err(
+            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
+                "template configuration is invalid: {error}"
+            ))
+            .into(),
+        );
+    }
+    let binding_kind = description.identity.kind.clone();
+    let definition = super::compile_workflow_template(template, &request.configuration)?;
+    super::persist_exact_template_call_dependencies(state, &definition)?;
+    let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        description.identity.kind,
+        &definition,
+    )
+    .map_err(|error| bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string()))?;
+    start(
+        state,
+        bcode_ipc::WorkflowStartRequest {
+            identity,
+            definition,
+            run_id: request.run_id,
+            workspace_snapshot: request.workspace_snapshot,
+            parent_session_id: request.parent_session_id,
+            input: request.configuration,
+            binding: bcode_workflow_store::WorkflowRunBinding {
+                owner_plugin_id: request.owner_plugin_id,
+                workflow_kind: binding_kind,
+                scope_key: request.template_version.to_string(),
+                display_label: Some(template.title.clone()),
+                single_active: false,
+            },
+            limits: request.limits,
+        },
+    )
+    .await
 }
 
 /// Request cancellation of a workflow tree while holding its durable execution authority.

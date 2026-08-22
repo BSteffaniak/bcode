@@ -5053,7 +5053,17 @@ async fn handle_workflow_mutation_request(
     state.require_workflow_store()?;
     match request {
         WorkflowMutationRequest::CreateAuthoredWorkflow(request) => {
-            handle_create_authored_workflow(request_id, client_id, state, writer, request).await
+            let (workflow, draft) =
+                workflow_operations::create_authored_workflow(state, client_id, request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
+                    workflow: authored_workflow_snapshot(workflow),
+                    draft: Box::new(workflow_draft_snapshot(draft)),
+                }),
+            )
+            .await
         }
         WorkflowMutationRequest::CancelWorkflowComputation { operation_id } => {
             let cancelled = cancel_workflow_computation(state, &operation_id);
@@ -5078,59 +5088,205 @@ async fn handle_workflow_mutation_request(
             .await
         }
         WorkflowMutationRequest::ApplyWorkflowDraftEdits(request) => {
-            handle_apply_workflow_draft_edits(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::apply_draft_edits(state, client_id, request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDraftEditResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::UpdateWorkflowDraft(request) => {
-            handle_update_workflow_draft(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::update_draft(state, client_id, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDraftUpdateResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::PublishWorkflowDraft(request) => {
-            handle_publish_workflow_draft(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::publish_draft(
+                request_id,
+                client_id,
+                state,
+                request,
+                bcode_workflow::WorkflowApplicationOperation::PublishDraft,
+            )
+            .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPublicationResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::PublishAndStartWorkflow(request) => {
-            handle_publish_and_start_workflow(request_id, client_id, state, writer, *request).await
+            let result =
+                workflow_operations::publish_and_start(request_id, client_id, state, *request)
+                    .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPublishAndStartResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::ActivateWorkflowRevision(request) => {
-            handle_activate_workflow_revision(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::activate_revision(state, client_id, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowActivationResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::SetAuthoredWorkflowArchived(request) => {
-            handle_set_authored_workflow_archived(request_id, client_id, state, writer, request)
-                .await
+            let workflow = workflow_operations::set_archived(state, client_id, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AuthoredWorkflowArchived {
+                    workflow: authored_workflow_snapshot(workflow),
+                }),
+            )
+            .await
         }
         WorkflowMutationRequest::DiscardWorkflowDraft(request) => {
-            handle_discard_workflow_draft(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::discard_draft(state, client_id, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDraftDiscardResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::ForkWorkflowDraft(request) => {
-            handle_fork_workflow_draft(request_id, client_id, state, writer, request).await
+            let draft = workflow_operations::fork_draft(state, client_id, request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDraftForked {
+                    draft: Box::new(workflow_draft_snapshot(draft)),
+                }),
+            )
+            .await
         }
         WorkflowMutationRequest::CreateWorkflowPreset(request) => {
-            handle_create_workflow_preset(request_id, client_id, state, writer, request).await
+            let preset = workflow_operations::create_preset(state, client_id, request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPresetCreated {
+                    preset: workflow_preset_snapshot(preset),
+                }),
+            )
+            .await
         }
         WorkflowMutationRequest::UpdateWorkflowPreset(request) => {
-            handle_update_workflow_preset(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::update_preset(state, client_id, request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPresetUpdateResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::DeleteWorkflowPreset(request) => {
-            handle_delete_workflow_preset(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::delete_preset(state, client_id, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPresetDeleteResult { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::ExportWorkflowRevision(request) => {
-            handle_export_workflow_revision(request_id, state, writer, request).await
+            let bundle = workflow_operations::export_revision(state, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRevisionExported {
+                    bundle: Box::new(bundle),
+                }),
+            )
+            .await
         }
         WorkflowMutationRequest::PreviewWorkflowImport(request) => {
-            handle_preview_workflow_import(request_id, state, writer, request).await
+            let (preview, _) = workflow_operations::import_preview(
+                state,
+                format!("import-{request_id}"),
+                request.bundle,
+                request.target_workflow_id,
+                request.control,
+            )
+            .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowImportPreview {
+                    preview: Box::new(preview),
+                }),
+            )
+            .await
         }
         WorkflowMutationRequest::ImportWorkflow(request) => {
-            handle_import_workflow(request_id, client_id, state, writer, request).await
+            let (workflow, draft) = workflow_operations::import_new_workflow(
+                state,
+                client_id,
+                format!("import-{request_id}"),
+                request,
+            )
+            .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowImported {
+                    workflow: authored_workflow_snapshot(workflow),
+                    draft: Box::new(workflow_draft_snapshot(draft)),
+                }),
+            )
+            .await
         }
         WorkflowMutationRequest::ImportWorkflowDraft(request) => {
-            handle_import_workflow_draft(request_id, client_id, state, writer, request).await
+            let result = workflow_operations::import_draft(
+                state,
+                client_id,
+                format!("import-{request_id}"),
+                request,
+            )
+            .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDraftImported { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::ImportWorkflowRevision(request) => {
-            handle_import_workflow_revision(request_id, client_id, state, writer, request).await
+            let result =
+                workflow_operations::import_revision(request_id, client_id, state, request).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRevisionImported { result }),
+            )
+            .await
         }
         WorkflowMutationRequest::StartAuthoredWorkflow(request) => {
-            handle_start_authored_workflow(request_id, client_id, state, writer, request).await
+            let started = workflow_operations::start_authored(client_id, state, request, true).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AuthoredWorkflowRunStarted(started)),
+            )
+            .await
         }
         WorkflowMutationRequest::StartWorkflowPackageExport(request) => {
-            handle_start_workflow_package_export(request_id, client_id, state, writer, request).await
+            Box::pin(handle_start_workflow_package_export(
+                request_id, client_id, state, writer, request,
+            ))
+            .await
         }
     }
 }
@@ -5288,7 +5444,13 @@ async fn handle_workflow_validation_request(
     state.require_workflow_store()?;
     match request {
         WorkflowDefinitionRequest::WorkflowAuthoringCatalog => {
-            handle_workflow_authoring_catalog(request_id, state, writer).await
+            let catalog = workflow_operations::authoring_catalog(state).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowAuthoringCatalog { catalog }),
+            )
+            .await
         }
         WorkflowDefinitionRequest::GetWorkflowPackagePublication { package_id } => {
             let receipt = workflow_operations::package_publication(state, &package_id)?;
@@ -5322,46 +5484,28 @@ async fn handle_workflow_validation_request(
             .await
         }
         WorkflowDefinitionRequest::ValidateWorkflowPackage(request) => {
-            let catalog = workflow_operations::authoring_catalog(state).await?;
-            let result = run_workflow_computation(
+            let result = workflow_operations::validate_package(
                 state,
-                request.control,
+                request,
                 format!("validate-package-{request_id}"),
-                move || bcode_workflow::plan_workflow_package_closure(&request.closure, &catalog),
             )
-            .await??;
+            .await?;
             send_response(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowPackageValidated {
-                    result: Box::new(bcode_ipc::WorkflowPackageValidationResult { plan: result }),
+                    result: Box::new(result),
                 }),
             )
             .await
         }
         WorkflowDefinitionRequest::PreviewWorkflowPackage(request) => {
-            let mut catalog = workflow_operations::authoring_catalog(state).await?;
-            for dependency in &request.dependency_plans {
-                for member in &dependency.members {
-                    catalog.workflow_definitions.insert(
-                        member.definition_identity.definition_id.clone(),
-                        member.lowering.document.definition.clone(),
-                    );
-                }
-            }
-            let result = run_workflow_computation(
+            let result = workflow_operations::preview_package(
                 state,
-                request.control,
+                request,
                 format!("preview-package-{request_id}"),
-                move || {
-                    bcode_workflow::preview_workflow_package(
-                        &request.plan,
-                        &catalog,
-                        &request.configurations,
-                    )
-                },
             )
-            .await??;
+            .await?;
             send_response(
                 writer,
                 request_id,
@@ -5372,74 +5516,44 @@ async fn handle_workflow_validation_request(
             .await
         }
         WorkflowDefinitionRequest::ValidateWorkflowSource(request) => {
-            let catalog = workflow_operations::authoring_catalog(state).await?;
-            let source_format = request.source_format;
-            let result = run_workflow_computation(
+            let result = workflow_operations::validate_source(
                 state,
-                request.control,
+                request,
                 format!("validate-source-{request_id}"),
-                move || {
-                    bcode_workflow::lower_workflow_authoring_source(
-                        &request.source,
-                        source_format,
-                        &catalog,
-                    )
-                },
             )
-            .await??;
+            .await?;
             send_response(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowSourceValidated {
-                    result: Box::new(bcode_ipc::WorkflowSourceValidationResult {
-                        source_format,
-                        lowering: result,
-                    }),
+                    result: Box::new(result),
                 }),
             )
             .await
         }
         WorkflowDefinitionRequest::PreviewWorkflowSource(request) => {
-            let catalog = workflow_operations::authoring_catalog(state).await?;
-            let source_format = request.source_format;
-            let configuration = request.configuration;
-            let result = run_workflow_computation(
+            let result = workflow_operations::preview_source(
                 state,
-                request.control,
+                request,
                 format!("preview-source-{request_id}"),
-                move || {
-                    let lowering = bcode_workflow::lower_workflow_authoring_source(
-                        &request.source,
-                        source_format,
-                        &catalog,
-                    )?;
-                    let preview = lowering
-                        .document
-                        .compilation_preview(&catalog, configuration.as_ref());
-                    Ok::<_, bcode_workflow::WorkflowError>((lowering, preview))
-                },
             )
-            .await??;
+            .await?;
             send_response(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowSourcePreviewed {
-                    result: Box::new(bcode_ipc::WorkflowSourcePreviewResult {
-                        source_format,
-                        lowering: result.0,
-                        preview: result.1,
-                    }),
+                    result: Box::new(result),
                 }),
             )
             .await
         }
         WorkflowDefinitionRequest::ValidateWorkflowAuthoring { document, control } => {
             let started_at = Instant::now();
-            let report = run_workflow_computation(
+            let report = workflow_operations::validate_authoring(
                 state,
+                document,
                 control,
                 format!("validate-{request_id}"),
-                move || document.validation_report(),
             )
             .await?;
             record_workflow_authoring_duration(
@@ -5460,59 +5574,131 @@ async fn handle_workflow_validation_request(
             configuration,
             control,
         } => {
-            handle_preview_workflow_compilation(
-                request_id,
+            let started_at = Instant::now();
+            let preview = workflow_operations::preview_compilation(
                 state,
-                writer,
                 document,
                 configuration,
                 control,
+                format!("preview-{request_id}"),
+            )
+            .await?;
+            record_workflow_authoring_duration(
+                &state.metrics,
+                "workflow.authoring.compilation.duration_ms",
+                started_at,
+                if preview.compiled.is_some() {
+                    "compiled"
+                } else {
+                    "rejected"
+                },
+            );
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowCompilationPreview {
+                    preview: Box::new(preview),
+                }),
             )
             .await
         }
         WorkflowDefinitionRequest::ListWorkflowTemplates { limit } => {
-            handle_list_workflow_templates(request_id, state, writer, limit).await
+            let templates = workflow_operations::list_templates(state, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowTemplateList { templates }),
+            )
+            .await
         }
         WorkflowDefinitionRequest::DescribeWorkflowTemplate {
             owner_plugin_id,
             template_id,
             template_version,
         } => {
-            handle_describe_workflow_template(
-                request_id,
+            let template = workflow_operations::describe_template(
                 state,
-                writer,
-                owner_plugin_id,
-                template_id,
+                &owner_plugin_id,
+                &template_id,
                 template_version,
+            )?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowTemplateDescription { template }),
             )
             .await
         }
         WorkflowDefinitionRequest::InstantiateWorkflowTemplate(request) => {
-            handle_instantiate_workflow_template(request_id, client_id, state, writer, request)
-                .await
+            let (workflow, draft) =
+                workflow_operations::instantiate_template(client_id, state, request).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
+                    workflow: authored_workflow_snapshot(workflow),
+                    draft: Box::new(workflow_draft_snapshot(draft)),
+                }),
+            )
+            .await
         }
         WorkflowDefinitionRequest::StartWorkflowTemplate(request) => {
-            handle_start_workflow_template(request_id, state, writer, request).await
+            let started = workflow_operations::start_template(state, request).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowTemplateStarted(started)),
+            )
+            .await
         }
         WorkflowDefinitionRequest::RegisterWorkflowDefinition(request) => {
-            handle_register_workflow_definition(request_id, state, writer, request).await
+            let definition = workflow_operations::register_definition(state, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDefinitionRegistered { definition }),
+            )
+            .await
         }
         WorkflowDefinitionRequest::StartWorkflow(request) => {
-            handle_start_workflow(request_id, state, writer, request).await
+            let started = workflow_operations::start(state, request).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+            )
+            .await
         }
         WorkflowDefinitionRequest::StartWorkflowRun(request) => {
-            handle_start_workflow_run(request_id, state, writer, request).await
+            let started = workflow_operations::start_run(state, request, None).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+            )
+            .await
         }
         WorkflowDefinitionRequest::ListWorkflowDefinitions { limit } => {
-            handle_list_workflow_definitions(request_id, state, writer, limit).await
+            let definitions = workflow_operations::list_definitions(state, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDefinitionList { definitions }),
+            )
+            .await
         }
         WorkflowDefinitionRequest::DescribeWorkflowDefinition {
             definition_id,
             version,
         } => {
-            handle_describe_workflow_definition(request_id, state, writer, definition_id, version)
-                .await
+            let definition =
+                workflow_operations::describe_definition(state, &definition_id, version)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDefinitionDescription { definition }),
+            )
+            .await
         }
     }
 }
@@ -5533,50 +5719,155 @@ async fn handle_workflow_run_request(
     state.require_workflow_store()?;
     match request {
         RuntimeAndModelRequest::InspectWorkflowRun { run_id, limit } => {
-            handle_inspect_workflow_run(request_id, state, writer, run_id, limit).await
+            let inspection = workflow_operations::inspect_run(state, &run_id, limit).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunInspection {
+                    inspection: Box::new(inspection),
+                }),
+            )
+            .await
         }
         RuntimeAndModelRequest::WorkflowRunView { run_id, limit } => {
-            handle_workflow_run_view(request_id, state, writer, run_id, limit).await
+            let view = workflow_operations::run_view(state, &run_id, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunView {
+                    view: Box::new(view),
+                }),
+            )
+            .await
         }
         RuntimeAndModelRequest::WorkflowCatalogView { request } => {
-            handle_workflow_catalog_view(request_id, state, writer, request).await
+            let view = workflow_operations::catalog_view(state, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowCatalogView { view }),
+            )
+            .await
         }
         RuntimeAndModelRequest::WorkflowRunStatus { run_id } => {
-            handle_workflow_run_status(request_id, state, writer, run_id).await
+            let run = workflow_operations::run_status(state, &run_id)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunStatus { run }),
+            )
+            .await
         }
         RuntimeAndModelRequest::AssociatedWorkflowRun { key } => {
-            handle_associated_workflow_run(request_id, state, writer, key).await
+            let key = bcode_workflow_store::WorkflowRunBindingKey {
+                owner_plugin_id: key.owner_plugin_id,
+                workflow_kind: key.workflow_kind,
+                scope_key: key.scope_key,
+            };
+            let run = workflow_operations::associated_run(state, &key)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AssociatedWorkflowRun { run }),
+            )
+            .await
         }
         RuntimeAndModelRequest::InspectAssociatedWorkflowRun { key, limit } => {
-            handle_inspect_associated_workflow_run(request_id, state, writer, key, limit).await
+            let key = bcode_workflow_store::WorkflowRunBindingKey {
+                owner_plugin_id: key.owner_plugin_id,
+                workflow_kind: key.workflow_kind,
+                scope_key: key.scope_key,
+            };
+            let inspection =
+                workflow_operations::inspect_associated_run(state, &key, limit).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AssociatedWorkflowRunInspection { inspection }),
+            )
+            .await
         }
         RuntimeAndModelRequest::ControlAssociatedWorkflowRun { key, action } => {
-            handle_control_associated_workflow_run(request_id, state, writer, key, action).await
+            let key = bcode_workflow_store::WorkflowRunBindingKey {
+                owner_plugin_id: key.owner_plugin_id,
+                workflow_kind: key.workflow_kind,
+                scope_key: key.scope_key,
+            };
+            let (run, changed) =
+                workflow_operations::control_associated_run(state, &key, action).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AssociatedWorkflowRunControlled { run, changed }),
+            )
+            .await
         }
         RuntimeAndModelRequest::ListWorkflowRuns { limit } => {
-            handle_list_workflow_runs(request_id, state, writer, limit).await
+            let runs = workflow_operations::list_runs(state, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunList { runs }),
+            )
+            .await
         }
         RuntimeAndModelRequest::WorkflowRunOutputs { run_id, limit } => {
-            handle_workflow_run_outputs(request_id, state, writer, run_id, limit).await
+            let outputs = workflow_operations::run_outputs(state, &run_id, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunOutputs { outputs }),
+            )
+            .await
         }
         RuntimeAndModelRequest::CancelWorkflowRun { run_id } => {
-            handle_cancel_workflow_run(request_id, state, writer, run_id).await
+            let recorded = workflow_operations::cancel_run(state, &run_id).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunCancellationRequested { recorded }),
+            )
+            .await
         }
         RuntimeAndModelRequest::PauseWorkflowRun { run_id } => {
-            handle_pause_workflow_run(request_id, state, writer, run_id).await
+            let changed = workflow_operations::pause_run(state, &run_id).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunPaused { changed }),
+            )
+            .await
         }
         RuntimeAndModelRequest::ResumeWorkflowRun { run_id } => {
-            handle_resume_workflow_run(request_id, state, writer, run_id).await
+            let changed = workflow_operations::resume_run(state, &run_id).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunResumed { changed }),
+            )
+            .await
         }
         RuntimeAndModelRequest::DoctorWorkflowRun { run_id, limit } => {
-            handle_doctor_workflow_run(request_id, state, writer, run_id, limit).await
+            let report = workflow_operations::doctor_run(state, &run_id, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDoctorReport { report }),
+            )
+            .await
         }
         RuntimeAndModelRequest::RepairWorkflowAttempt {
             dispatch_identity,
             resolution,
         } => {
-            handle_repair_workflow_attempt(request_id, state, writer, dispatch_identity, resolution)
-                .await
+            let result =
+                workflow_operations::repair_attempt(state, &dispatch_identity, &resolution)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowAttemptRepaired { result }),
+            )
+            .await
         }
         RuntimeAndModelRequest::RetryWorkflowNode {
             run_id,
@@ -5584,19 +5875,29 @@ async fn handle_workflow_run_request(
             activation_id,
             failed_attempt,
         } => {
-            handle_retry_workflow_node(
-                request_id,
+            let result = workflow_operations::retry_node(
                 state,
-                writer,
-                run_id,
-                node_id,
-                activation_id,
+                &run_id,
+                &node_id,
+                &activation_id,
                 failed_attempt,
+            )
+            .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowNodeRetried { result }),
             )
             .await
         }
         RuntimeAndModelRequest::ListWorkflowWaits { run_id, limit } => {
-            handle_list_workflow_waits(request_id, state, writer, run_id, limit).await
+            let waits = workflow_operations::list_waits(state, &run_id, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowWaitList { waits }),
+            )
+            .await
         }
         RuntimeAndModelRequest::ProvideWorkflowInput {
             run_id,
@@ -5604,14 +5905,13 @@ async fn handle_workflow_run_request(
             activation_id,
             value,
         } => {
-            handle_provide_workflow_input(
-                request_id,
-                state,
+            let result =
+                workflow_operations::provide_input(state, &run_id, &node_id, &activation_id, value)
+                    .await?;
+            send_response(
                 writer,
-                run_id,
-                node_id,
-                activation_id,
-                value,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
             )
             .await
         }
@@ -5621,33 +5921,50 @@ async fn handle_workflow_run_request(
             activation_id,
             approved,
         } => {
-            handle_resolve_workflow_approval(
-                request_id,
+            let result = workflow_operations::resolve_approval(
                 state,
-                writer,
-                run_id,
-                node_id,
-                activation_id,
+                &run_id,
+                &node_id,
+                &activation_id,
                 approved,
+            )
+            .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
             )
             .await
         }
         RuntimeAndModelRequest::ListWorkflowMutationApprovalsAll { limit } => {
-            handle_list_workflow_mutation_approvals_all(request_id, state, writer, limit).await
+            let approvals = workflow_operations::list_mutation_approvals_all(state, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
+            )
+            .await
         }
         RuntimeAndModelRequest::ListWorkflowMutationApprovals { run_id, limit } => {
-            handle_list_workflow_mutation_approvals(request_id, state, writer, run_id, limit).await
+            let approvals = workflow_operations::list_mutation_approvals(state, &run_id, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
+            )
+            .await
         }
         RuntimeAndModelRequest::ResolveWorkflowMutationApproval {
             approval_id,
             decision,
         } => {
-            handle_resolve_workflow_mutation_approval(
-                request_id,
-                state,
+            let result =
+                workflow_operations::resolve_mutation_approval(state, &approval_id, decision)
+                    .await?;
+            send_response(
                 writer,
-                approval_id,
-                decision,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowMutationApprovalResolved { result }),
             )
             .await
         }
@@ -5656,22 +5973,39 @@ async fn handle_workflow_run_request(
             cursor,
             limit,
         } => {
-            handle_workflow_attempt_history(request_id, state, writer, run_id, cursor, limit).await
+            let attempts =
+                workflow_operations::attempt_history(state, &run_id, cursor.as_ref(), limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowAttemptHistory { attempts }),
+            )
+            .await
         }
         RuntimeAndModelRequest::WorkflowEventHistory {
             run_id,
             after_sequence,
             limit,
         } => {
-            handle_workflow_event_history(request_id, state, writer, run_id, after_sequence, limit)
-                .await
+            let events = workflow_operations::event_history(state, &run_id, after_sequence, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowEventHistory { events }),
+            )
+            .await
         }
         RuntimeAndModelRequest::WorkflowLiveEventCatchUp {
             after_sequence,
             limit,
         } => {
-            handle_workflow_live_event_catch_up(request_id, state, writer, after_sequence, limit)
-                .await
+            let page = workflow_operations::live_event_catch_up(state, after_sequence, limit)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowLiveEventCatchUp { page }),
+            )
+            .await
         }
         RuntimeAndModelRequest::SubscribeWorkflowRuns => {
             handle_subscribe_workflow_runs(request_id, client_id, state, writer).await
@@ -14126,58 +14460,6 @@ async fn handle_apply_workflow_source(
     .await
 }
 
-async fn handle_create_authored_workflow(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::CreateAuthoredWorkflowRequest,
-) -> Result<(), ServerError> {
-    let (workflow, draft) =
-        workflow_operations::create_authored_workflow(state, client_id, request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
-            workflow: authored_workflow_snapshot(workflow),
-            draft: Box::new(workflow_draft_snapshot(draft)),
-        }),
-    )
-    .await
-}
-
-async fn handle_apply_workflow_draft_edits(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::ApplyWorkflowDraftEditsRequest,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::apply_draft_edits(state, client_id, request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDraftEditResult { result }),
-    )
-    .await
-}
-
-async fn handle_update_workflow_draft(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::UpdateWorkflowDraftRequest,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::update_draft(state, client_id, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDraftUpdateResult { result }),
-    )
-    .await
-}
-
 fn authoring_conflict_result(
     error: WorkflowStoreError,
 ) -> Result<bcode_ipc::WorkflowAuthoringConflict, WorkflowStoreError> {
@@ -14193,29 +14475,6 @@ fn authoring_conflict_result(
         }),
         error => Err(error),
     }
-}
-
-async fn handle_publish_workflow_draft(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::PublishWorkflowDraftRequest,
-) -> Result<(), ServerError> {
-    let result = publish_workflow_draft(
-        request_id,
-        client_id,
-        state,
-        request,
-        bcode_workflow::WorkflowApplicationOperation::PublishDraft,
-    )
-    .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowPublicationResult { result }),
-    )
-    .await
 }
 
 async fn publish_workflow_draft(
@@ -14307,22 +14566,6 @@ async fn publish_workflow_draft(
     Ok(result)
 }
 
-async fn handle_publish_and_start_workflow(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::PublishAndStartWorkflowRequest,
-) -> Result<(), ServerError> {
-    let result = publish_and_start_workflow(request_id, client_id, state, request).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowPublishAndStartResult { result }),
-    )
-    .await
-}
-
 async fn publish_and_start_workflow(
     request_id: u64,
     client_id: ClientId,
@@ -14387,74 +14630,6 @@ async fn publish_and_start_workflow(
     Ok(result)
 }
 
-async fn handle_activate_workflow_revision(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::ActivateWorkflowRevisionRequest,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::activate_revision(state, client_id, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowActivationResult { result }),
-    )
-    .await
-}
-
-async fn handle_set_authored_workflow_archived(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::SetAuthoredWorkflowArchivedRequest,
-) -> Result<(), ServerError> {
-    let workflow = workflow_operations::set_archived(state, client_id, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AuthoredWorkflowArchived {
-            workflow: authored_workflow_snapshot(workflow),
-        }),
-    )
-    .await
-}
-
-async fn handle_discard_workflow_draft(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::DiscardWorkflowDraftRequest,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::discard_draft(state, client_id, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDraftDiscardResult { result }),
-    )
-    .await
-}
-
-async fn handle_fork_workflow_draft(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::ForkWorkflowDraftRequest,
-) -> Result<(), ServerError> {
-    let draft = workflow_operations::fork_draft(state, client_id, request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDraftForked {
-            draft: Box::new(workflow_draft_snapshot(draft)),
-        }),
-    )
-    .await
-}
-
 fn workflow_preset_from_mutation(
     mutation: bcode_ipc::WorkflowPresetMutation,
     generation: u64,
@@ -14474,151 +14649,12 @@ fn workflow_preset_from_mutation(
     }
 }
 
-async fn handle_create_workflow_preset(
+async fn import_workflow_revision(
     request_id: u64,
     client_id: ClientId,
     state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::CreateWorkflowPresetRequest,
-) -> Result<(), ServerError> {
-    let preset = workflow_operations::create_preset(state, client_id, request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowPresetCreated {
-            preset: workflow_preset_snapshot(preset),
-        }),
-    )
-    .await
-}
-
-async fn handle_update_workflow_preset(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::UpdateWorkflowPresetRequest,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::update_preset(state, client_id, request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowPresetUpdateResult { result }),
-    )
-    .await
-}
-
-async fn handle_delete_workflow_preset(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::DeleteWorkflowPresetRequest,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::delete_preset(state, client_id, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowPresetDeleteResult { result }),
-    )
-    .await
-}
-
-async fn handle_export_workflow_revision(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::ExportWorkflowRevisionRequest,
-) -> Result<(), ServerError> {
-    let bundle = workflow_operations::export_revision(state, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRevisionExported {
-            bundle: Box::new(bundle),
-        }),
-    )
-    .await
-}
-
-async fn handle_preview_workflow_import(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::PreviewWorkflowImportRequest,
-) -> Result<(), ServerError> {
-    let (preview, _) = workflow_operations::import_preview(
-        state,
-        format!("import-{request_id}"),
-        request.bundle,
-        request.target_workflow_id,
-        request.control,
-    )
-    .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowImportPreview {
-            preview: Box::new(preview),
-        }),
-    )
-    .await
-}
-
-async fn handle_import_workflow(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::ImportWorkflowRequest,
-) -> Result<(), ServerError> {
-    let (workflow, draft) = workflow_operations::import_new_workflow(
-        state,
-        client_id,
-        format!("import-{request_id}"),
-        request,
-    )
-    .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowImported {
-            workflow: authored_workflow_snapshot(workflow),
-            draft: Box::new(workflow_draft_snapshot(draft)),
-        }),
-    )
-    .await
-}
-
-async fn handle_import_workflow_draft(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::ImportWorkflowDraftRequest,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::import_draft(
-        state,
-        client_id,
-        format!("import-{request_id}"),
-        request,
-    )
-    .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDraftImported { result }),
-    )
-    .await
-}
-
-async fn handle_import_workflow_revision(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
     request: bcode_ipc::ImportWorkflowRevisionRequest,
-) -> Result<(), ServerError> {
+) -> Result<bcode_ipc::WorkflowRevisionImportResult, ServerError> {
     if request.collision_policy
         != bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision
     {
@@ -14680,28 +14716,7 @@ async fn handle_import_workflow_revision(
         }
         Err(error) => return Err(error.into()),
     };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRevisionImported { result }),
-    )
-    .await
-}
-
-async fn handle_start_authored_workflow(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::StartAuthoredWorkflowRequest,
-) -> Result<(), ServerError> {
-    let started = start_authored_workflow(client_id, state, request, true).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AuthoredWorkflowRunStarted(started)),
-    )
-    .await
+    Ok(result)
 }
 
 fn resolve_authored_workflow_run(
@@ -14964,7 +14979,7 @@ async fn start_authored_workflow(
                 "workflow run input does not match published interface: {error}"
             ))
         })?;
-    let started = start_workflow_run(
+    let started = workflow_operations::start_run(
         state,
         bcode_ipc::WorkflowRunStartRequest {
             definition_id: revision.definition_identity.definition_id.clone(),
@@ -15305,56 +15320,6 @@ fn workflow_preset_snapshot(
     }
 }
 
-async fn handle_workflow_authoring_catalog(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowAuthoringCatalog {
-            catalog: workflow_operations::authoring_catalog(state).await?,
-        }),
-    )
-    .await
-}
-
-async fn handle_preview_workflow_compilation(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    document: bcode_workflow::WorkflowAuthoringDocument,
-    configuration: Option<serde_json::Value>,
-    control: bcode_ipc::WorkflowComputationControl,
-) -> Result<(), ServerError> {
-    let catalog = workflow_operations::authoring_catalog(state).await?;
-    let started_at = Instant::now();
-    let preview =
-        run_workflow_computation(state, control, format!("preview-{request_id}"), move || {
-            document.compilation_preview(&catalog, configuration.as_ref())
-        })
-        .await?;
-    record_workflow_authoring_duration(
-        &state.metrics,
-        "workflow.authoring.compilation.duration_ms",
-        started_at,
-        if preview.compiled.is_some() {
-            "compiled"
-        } else {
-            "rejected"
-        },
-    );
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowCompilationPreview {
-            preview: Box::new(preview),
-        }),
-    )
-    .await
-}
-
 fn validate_workflow_definition_for_production(
     state: &ServerState,
     definition: &bcode_workflow::WorkflowDefinition,
@@ -15493,43 +15458,6 @@ fn find_workflow_template<'a>(
         .map(|(_, template)| template)
 }
 
-async fn handle_list_workflow_templates(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let templates = workflow_operations::list_templates(state, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowTemplateList { templates }),
-    )
-    .await
-}
-
-async fn handle_describe_workflow_template(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    owner_plugin_id: String,
-    template_id: String,
-    template_version: u32,
-) -> Result<(), ServerError> {
-    let template = workflow_operations::describe_template(
-        state,
-        &owner_plugin_id,
-        &template_id,
-        template_version,
-    )?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowTemplateDescription { template }),
-    )
-    .await
-}
-
 async fn instantiate_workflow_template(
     client_id: ClientId,
     state: &Arc<ServerState>,
@@ -15628,25 +15556,6 @@ async fn instantiate_workflow_template(
     Ok((workflow, draft))
 }
 
-async fn handle_instantiate_workflow_template(
-    request_id: u64,
-    client_id: ClientId,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::WorkflowTemplateInstantiationRequest,
-) -> Result<(), ServerError> {
-    let (workflow, draft) = instantiate_workflow_template(client_id, state, request).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
-            workflow: authored_workflow_snapshot(workflow),
-            draft: Box::new(workflow_draft_snapshot(draft)),
-        }),
-    )
-    .await
-}
-
 fn persist_exact_template_call_dependencies(
     state: &ServerState,
     definition: &bcode_workflow::WorkflowDefinition,
@@ -15690,193 +15599,6 @@ fn persist_exact_template_call_dependencies(
         persist_exact_template_call_dependencies(state, child_definition)?;
     }
     Ok(())
-}
-
-async fn handle_start_workflow_template(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::WorkflowTemplateStartRequest,
-) -> Result<(), ServerError> {
-    let template = find_workflow_template(
-        state,
-        &request.owner_plugin_id,
-        &request.template_id,
-        request.template_version,
-    )
-    .ok_or_else(|| {
-        WorkflowStoreError::InvalidData("workflow template not found or disabled".to_string())
-    })?;
-    let description =
-        workflow_operations::template_description(state, &request.owner_plugin_id, template)?;
-    if !description.diagnostics.is_empty() {
-        return Err(ServerError::WorkflowCapabilityUnavailable(
-            description
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
-        ));
-    }
-    let validator =
-        jsonschema::validator_for(&template.configuration_schema().schema).map_err(|error| {
-            WorkflowStoreError::InvalidData(format!(
-                "invalid template configuration schema: {error}"
-            ))
-        })?;
-    if let Err(error) = validator.validate(&request.configuration) {
-        return Err(WorkflowStoreError::InvalidData(format!(
-            "template configuration is invalid: {error}"
-        ))
-        .into());
-    }
-    let binding_kind = description.identity.kind.clone();
-    let definition = compile_workflow_template(template, &request.configuration)?;
-    persist_exact_template_call_dependencies(state, &definition)?;
-    let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
-        description.identity.kind,
-        &definition,
-    )
-    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-    let started = start_workflow(
-        state,
-        bcode_ipc::WorkflowStartRequest {
-            identity,
-            definition,
-            run_id: request.run_id,
-            workspace_snapshot: request.workspace_snapshot,
-            parent_session_id: request.parent_session_id,
-            input: request.configuration,
-            binding: bcode_workflow_store::WorkflowRunBinding {
-                owner_plugin_id: request.owner_plugin_id,
-                workflow_kind: binding_kind,
-                scope_key: request.template_version.to_string(),
-                display_label: Some(template.title.clone()),
-                single_active: false,
-            },
-            limits: request.limits,
-        },
-    )
-    .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowTemplateStarted(started)),
-    )
-    .await
-}
-
-async fn handle_register_workflow_definition(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: bcode_ipc::WorkflowDefinitionRegistrationRequest,
-) -> Result<(), ServerError> {
-    let definition = workflow_operations::register_definition(state, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDefinitionRegistered { definition }),
-    )
-    .await
-}
-
-async fn start_workflow(
-    state: &Arc<ServerState>,
-    request: bcode_ipc::WorkflowStartRequest,
-) -> Result<bcode_ipc::WorkflowRunStartResponse, ServerError> {
-    let started_at = std::time::Instant::now();
-    validate_workflow_definition_for_production(state, &request.definition)?;
-    if request.identity.kind != request.binding.workflow_kind {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow logical identity does not match its binding kind".to_string(),
-        )
-        .into());
-    }
-    let expected_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
-        request.identity.kind.clone(),
-        &request.definition,
-    )
-    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-    if expected_identity != request.identity {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow exact identity does not match its compiled definition".to_string(),
-        )
-        .into());
-    }
-    let stored = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .persist_definition(
-            &request.identity.definition_id,
-            request.identity.definition_version,
-            &request.definition,
-        )?;
-    if stored.definition_id != request.identity.definition_id
-        || stored.version != request.identity.definition_version
-    {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow exact identity does not match persisted definition".to_string(),
-        )
-        .into());
-    }
-    let result = start_workflow_run(
-        state,
-        bcode_ipc::WorkflowRunStartRequest {
-            definition_id: request.identity.definition_id,
-            definition_version: request.identity.definition_version,
-            run_id: request.run_id,
-            workspace_snapshot: request.workspace_snapshot.unwrap_or_default(),
-            parent_session_id: request.parent_session_id,
-            parent_session_generation: None,
-            binding: Some(request.binding),
-            input: Some(request.input),
-            limits: request.limits,
-        },
-        None,
-    )
-    .await;
-    state.metrics.record_histogram_with_labels(
-        "workflow.admission.duration_ms",
-        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        BTreeMap::from([(
-            "outcome".to_string(),
-            if result.is_ok() { "ok" } else { "error" }.to_string(),
-        )]),
-    );
-    result
-}
-
-async fn handle_start_workflow(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::WorkflowStartRequest,
-) -> Result<(), ServerError> {
-    let started = start_workflow(state, request).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
-    )
-    .await
-}
-
-async fn handle_start_workflow_run(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    request: bcode_ipc::WorkflowRunStartRequest,
-) -> Result<(), ServerError> {
-    let started = start_workflow_run(state, request, None).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
-    )
-    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -16314,37 +16036,6 @@ async fn drive_workflow_run_and_parents(
     Ok(())
 }
 
-async fn handle_list_workflow_definitions(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let definitions = workflow_operations::list_definitions(state, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDefinitionList { definitions }),
-    )
-    .await
-}
-
-async fn handle_describe_workflow_definition(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    definition_id: String,
-    version: u32,
-) -> Result<(), ServerError> {
-    let definition = workflow_operations::describe_definition(state, &definition_id, version)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDefinitionDescription { definition }),
-    )
-    .await
-}
-
 #[allow(clippy::too_many_lines)]
 async fn workflow_run_inspection(
     state: &ServerState,
@@ -16475,24 +16166,6 @@ async fn workflow_run_inspection(
     })
 }
 
-async fn handle_inspect_workflow_run(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let inspection = workflow_operations::inspect_run(state, &run_id, limit).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunInspection {
-            inspection: Box::new(inspection),
-        }),
-    )
-    .await
-}
-
 const WORKFLOW_RUN_VIEW_COLLECTION_LIMIT_MAX: usize = 1_000;
 
 #[must_use]
@@ -16501,20 +16174,18 @@ fn workflow_run_view_collection_limit(requested: usize) -> usize {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_workflow_run_view(
-    request_id: u64,
+fn workflow_run_view(
     state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
+    run_id: &str,
     limit: usize,
-) -> Result<(), ServerError> {
+) -> Result<bcode_workflow_view_models::WorkflowRunView, ServerError> {
     let limit = workflow_run_view_collection_limit(limit);
     let view = {
         let store = state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let run = store.run_summary(&run_id)?.ok_or_else(|| {
+        let run = store.run_summary(run_id)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
         })?;
         let definition = store
@@ -16525,18 +16196,18 @@ async fn handle_workflow_run_view(
                     run.definition_id, run.definition_version
                 ))
             })?;
-        let outputs = store.output_summaries(&run_id, limit)?;
+        let outputs = store.output_summaries(run_id, limit)?;
         let output_values = store
-            .validated_outputs(&run_id, limit)?
+            .validated_outputs(run_id, limit)?
             .into_iter()
             .map(|output| (output.output_id, output.value))
             .collect::<BTreeMap<_, _>>();
-        let activations = store.activations_for_run(&run_id, limit)?;
-        let waits = store.waiting_activations(&run_id, limit)?;
-        let mutation_approvals = store.pending_mutation_approvals(&run_id, limit)?;
-        let attempts = store.attempt_history(&run_id, None, limit)?;
-        let descendant_runs = store.descendant_run_summaries(&run_id, limit)?;
-        let child_sessions = store.execution_session_links_for_run(&run_id, limit)?;
+        let activations = store.activations_for_run(run_id, limit)?;
+        let waits = store.waiting_activations(run_id, limit)?;
+        let mutation_approvals = store.pending_mutation_approvals(run_id, limit)?;
+        let attempts = store.attempt_history(run_id, None, limit)?;
+        let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
+        let child_sessions = store.execution_session_links_for_run(run_id, limit)?;
         let run_item = workflow_run_list_item(&store, &run)?;
         let parsed_definition: bcode_workflow::WorkflowDefinition =
             serde_json::from_str(&definition.definition_json).map_err(|error| {
@@ -16690,14 +16361,7 @@ async fn handle_workflow_run_view(
                 .collect(),
         })
     };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunView {
-            view: Box::new(view),
-        }),
-    )
-    .await
+    Ok(view)
 }
 
 fn workflow_run_list_item(
@@ -16807,382 +16471,6 @@ fn workflow_run_list_item_with_summary(
         created_at_ms: run.created_at_ms,
         updated_at_ms: run.updated_at_ms,
     })
-}
-
-async fn handle_workflow_catalog_view(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: bcode_workflow_view_models::WorkflowCatalogRequest,
-) -> Result<(), ServerError> {
-    let view = workflow_operations::catalog_view(state, &request)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowCatalogView { view }),
-    )
-    .await
-}
-
-async fn handle_workflow_run_status(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-) -> Result<(), ServerError> {
-    let run = workflow_operations::run_status(state, &run_id)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunStatus { run }),
-    )
-    .await
-}
-
-async fn handle_associated_workflow_run(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    key: bcode_ipc::WorkflowRunBindingLookup,
-) -> Result<(), ServerError> {
-    let key = bcode_workflow_store::WorkflowRunBindingKey {
-        owner_plugin_id: key.owner_plugin_id,
-        workflow_kind: key.workflow_kind,
-        scope_key: key.scope_key,
-    };
-    let run = workflow_operations::associated_run(state, &key)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AssociatedWorkflowRun { run }),
-    )
-    .await
-}
-
-async fn handle_inspect_associated_workflow_run(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    key: bcode_ipc::WorkflowRunBindingLookup,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let key = bcode_workflow_store::WorkflowRunBindingKey {
-        owner_plugin_id: key.owner_plugin_id,
-        workflow_kind: key.workflow_kind,
-        scope_key: key.scope_key,
-    };
-    let inspection = workflow_operations::inspect_associated_run(state, &key, limit).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AssociatedWorkflowRunInspection { inspection }),
-    )
-    .await
-}
-
-async fn handle_control_associated_workflow_run(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    key: bcode_ipc::WorkflowRunBindingLookup,
-    action: bcode_ipc::WorkflowRunControlAction,
-) -> Result<(), ServerError> {
-    let key = bcode_workflow_store::WorkflowRunBindingKey {
-        owner_plugin_id: key.owner_plugin_id,
-        workflow_kind: key.workflow_kind,
-        scope_key: key.scope_key,
-    };
-    let (run, changed) = workflow_operations::control_associated_run(state, &key, action).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::AssociatedWorkflowRunControlled { run, changed }),
-    )
-    .await
-}
-
-async fn handle_list_workflow_runs(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let runs = workflow_operations::list_runs(state, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunList { runs }),
-    )
-    .await
-}
-
-async fn handle_workflow_run_outputs(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let outputs = workflow_operations::run_outputs(state, &run_id, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunOutputs { outputs }),
-    )
-    .await
-}
-
-async fn handle_cancel_workflow_run(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    run_id: String,
-) -> Result<(), ServerError> {
-    let recorded = workflow_operations::cancel_run(state, &run_id).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunCancellationRequested { recorded }),
-    )
-    .await
-}
-
-async fn handle_pause_workflow_run(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    run_id: String,
-) -> Result<(), ServerError> {
-    let changed = workflow_operations::pause_run(state, &run_id).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunPaused { changed }),
-    )
-    .await
-}
-
-async fn handle_resume_workflow_run(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    run_id: String,
-) -> Result<(), ServerError> {
-    let changed = workflow_operations::resume_run(state, &run_id).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunResumed { changed }),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_doctor_workflow_run(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let report = workflow_operations::doctor_run(state, &run_id, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowDoctorReport { report }),
-    )
-    .await
-}
-
-async fn handle_repair_workflow_attempt(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    dispatch_identity: String,
-    resolution: bcode_workflow_store::RepairResolution,
-) -> Result<(), ServerError> {
-    let result = workflow_operations::repair_attempt(state, &dispatch_identity, &resolution)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowAttemptRepaired { result }),
-    )
-    .await
-}
-
-async fn handle_retry_workflow_node(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    run_id: String,
-    node_id: String,
-    activation_id: String,
-    failed_attempt: u32,
-) -> Result<(), ServerError> {
-    let result =
-        workflow_operations::retry_node(state, &run_id, &node_id, &activation_id, failed_attempt)
-            .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowNodeRetried { result }),
-    )
-    .await
-}
-
-async fn handle_list_workflow_waits(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let waits = workflow_operations::list_waits(state, &run_id, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowWaitList { waits }),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_provide_workflow_input(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    run_id: String,
-    node_id: String,
-    activation_id: String,
-    value: serde_json::Value,
-) -> Result<(), ServerError> {
-    let result =
-        workflow_operations::provide_input(state, &run_id, &node_id, &activation_id, value).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_resolve_workflow_approval(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    run_id: String,
-    node_id: String,
-    activation_id: String,
-    approved: bool,
-) -> Result<(), ServerError> {
-    let result =
-        workflow_operations::resolve_approval(state, &run_id, &node_id, &activation_id, approved)
-            .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
-    )
-    .await
-}
-
-async fn handle_list_workflow_mutation_approvals_all(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let approvals = workflow_operations::list_mutation_approvals_all(state, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
-    )
-    .await
-}
-
-async fn handle_list_workflow_mutation_approvals(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let approvals = workflow_operations::list_mutation_approvals(state, &run_id, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
-    )
-    .await
-}
-
-async fn handle_resolve_workflow_mutation_approval(
-    request_id: u64,
-    state: &Arc<ServerState>,
-    writer: &SharedWriter,
-    approval_id: String,
-    decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
-) -> Result<(), ServerError> {
-    let result =
-        workflow_operations::resolve_mutation_approval(state, &approval_id, decision).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowMutationApprovalResolved { result }),
-    )
-    .await
-}
-
-async fn handle_workflow_attempt_history(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-    cursor: Option<bcode_workflow_store::AttemptCursor>,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let attempts = workflow_operations::attempt_history(state, &run_id, cursor.as_ref(), limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowAttemptHistory { attempts }),
-    )
-    .await
-}
-
-async fn handle_workflow_event_history(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
-    after_sequence: Option<u64>,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let events = workflow_operations::event_history(state, &run_id, after_sequence, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowEventHistory { events }),
-    )
-    .await
-}
-
-async fn handle_workflow_live_event_catch_up(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    after_sequence: u64,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let page = workflow_operations::live_event_catch_up(state, after_sequence, limit)?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowLiveEventCatchUp { page }),
-    )
-    .await
 }
 
 async fn handle_cancel_runtime_work(
@@ -58478,7 +57766,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &definition,
         )
         .expect("identity");
-        start_workflow(
+        workflow_operations::start(
             &state,
             bcode_ipc::WorkflowStartRequest {
                 identity,
@@ -58733,7 +58021,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let identity =
             bcode_workflow::WorkflowDefinitionIdentity::for_definition("bcode.loop", &definition)
                 .expect("identity");
-        start_workflow(
+        workflow_operations::start(
             &state,
             bcode_ipc::WorkflowStartRequest {
                 identity,
@@ -58951,7 +58239,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &definition,
         )
         .expect("identity");
-        start_workflow(
+        workflow_operations::start(
             &state,
             bcode_ipc::WorkflowStartRequest {
                 identity,
@@ -60903,18 +60191,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             };
         assert!(
-            start_workflow_run(&state, request("missing", None), None)
+            workflow_operations::start_run(&state, request("missing", None), None)
                 .await
                 .is_err()
         );
         assert!(
-            start_workflow_run(&state, request("stale", Some(generation + 1)), None)
+            workflow_operations::start_run(&state, request("stale", Some(generation + 1)), None)
                 .await
                 .is_err()
         );
-        let started = start_workflow_run(&state, request("pinned", Some(generation)), None)
-            .await
-            .expect("pinned start");
+        let started =
+            workflow_operations::start_run(&state, request("pinned", Some(generation)), None)
+                .await
+                .expect("pinned start");
         assert_eq!(started.run.parent_session_generation, Some(generation));
     }
 
@@ -60954,10 +60243,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             limits: bcode_workflow_store::WorkflowRunLimits::default(),
         };
 
-        let first = start_workflow(&state, request.clone())
+        let first = workflow_operations::start(&state, request.clone())
             .await
             .expect("first start");
-        let retry = start_workflow(&state, request).await.expect("retry");
+        let retry = workflow_operations::start(&state, request)
+            .await
+            .expect("retry");
         assert_eq!(first, retry);
         assert_eq!(first.run.workspace_snapshot, "/repo");
 
@@ -61037,10 +60328,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             limits: bcode_workflow_store::WorkflowRunLimits::default(),
         };
 
-        let first = start_workflow_run(&state, request.clone(), None)
+        let first = workflow_operations::start_run(&state, request.clone(), None)
             .await
             .expect("first start");
-        let second = start_workflow_run(&state, request.clone(), None)
+        let second = workflow_operations::start_run(&state, request.clone(), None)
             .await
             .expect("idempotent retry");
         assert_eq!(first.run, second.run);
@@ -61071,7 +60362,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .count();
         assert_eq!(started_events, 1);
 
-        let conflict = start_workflow_run(
+        let conflict = workflow_operations::start_run(
             &state,
             bcode_ipc::WorkflowRunStartRequest {
                 workspace_snapshot: "different-snapshot".to_string(),
