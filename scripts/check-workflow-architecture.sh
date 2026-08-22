@@ -188,14 +188,14 @@ if ! rg -q 'pub fn validate_persistable_authoring_value' packages/workflow/src/l
   violations=1
 fi
 
-if ! rg -q 'record_histogram_with_exact_labels' packages/server/src/lib.rs \
-  || ! rg -q 'add_counter_with_exact_labels' packages/server/src/lib.rs \
-  || ! rg -q 'workflow.authoring.validation.duration_ms' packages/server/src/lib.rs \
-  || ! rg -q 'workflow.authoring.compilation.duration_ms' packages/server/src/lib.rs \
-  || ! rg -q 'workflow.authoring.publication.duration_ms' packages/server/src/lib.rs \
-  || ! rg -q 'workflow.authoring.conflicts_total' packages/server/src/lib.rs \
+if ! rg -q 'record_histogram_with_exact_labels' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
+  || ! rg -q 'add_counter_with_exact_labels' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
+  || ! rg -q 'workflow.authoring.validation.duration_ms' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
+  || ! rg -q 'workflow.authoring.compilation.duration_ms' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
+  || ! rg -q 'workflow.authoring.publication.duration_ms' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
+  || ! rg -q 'workflow.authoring.conflicts_total' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
   || ! rg -q 'workflow.authoring.import_preview.duration_ms' packages/server/src/workflow_operations.rs \
-  || ! rg -q 'workflow.authoring.start_resolution.duration_ms' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.start_resolution.duration_ms' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
   || rg -n 'workflow\.authoring\.(validation|compilation|publication|conflicts|import_preview|start_resolution)' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
       | rg -q '(workflow_id|draft_id|preset_id|document|prompt|schema|secret|message)'; then
   echo "Workflow observability violation: authored lifecycle metrics and bounded labels must remain present and content-free." >&2
@@ -259,8 +259,8 @@ awk '/pub struct AuthoredWorkflowSnapshot/{capture=1} /pub struct WorkflowDefini
 rm -f /tmp/bcode-workflow-authoring-ipc-violations
 
 if ! rg -q 'pub fn production_admission' packages/workflow/src/lib.rs \
-  || ! rg -q 'WorkflowProductionCapabilities::current' packages/server/src/lib.rs \
-  || ! rg -q 'validate_workflow_definition_for_production' packages/server/src/lib.rs; then
+  || ! rg -q 'WorkflowProductionCapabilities::current' packages/server/src/lib.rs packages/server/src/workflow_operations.rs \
+  || ! rg -q 'validate_workflow_definition_for_production' packages/server/src/lib.rs packages/server/src/workflow_operations.rs; then
   echo "Workflow admission violation: durable registration/start must use the production capability contract." >&2
   violations=1
 fi
@@ -499,7 +499,7 @@ fi
 
 if ! rg -q 'WorkflowDependencyManifestEntry' packages/workflow/src/lib.rs \
   || ! rg -q 'workflow_dependency_manifest' packages/workflow/src/lib.rs \
-  || ! rg -q 'workflow_dependency_manifest' packages/server/src/lib.rs; then
+  || ! rg -q 'workflow_dependency_manifest' packages/server/src/lib.rs packages/server/src/workflow_operations.rs; then
   echo "Workflow dependency-manifest violation: portable export/import no longer binds exact child targets." >&2
   violations=1
 fi
