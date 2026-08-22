@@ -34795,6 +34795,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_workflow_source_runs_in_process_without_transport_framing() {
+        let state = Arc::new(test_server_state_with_shell_plugin(
+            SessionManager::default(),
+        ));
+        let source = include_str!("../../../fixtures/workflows/concise-run.workflow.yaml");
+        let request = || bcode_ipc::ApplyWorkflowSourceRequest {
+            source_format: bcode_workflow::WorkflowSourceFormat::Yaml,
+            source: source.to_string(),
+            draft_id: bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string(),
+        };
+
+        let created = workflow_operations::apply_source(ClientId::new(), &state, request())
+            .await
+            .expect("create source draft in process");
+        assert_eq!(
+            created.outcome,
+            bcode_workflow::WorkflowSourceApplyOutcome::Created
+        );
+        assert_eq!(created.generation, 1);
+
+        let updated = workflow_operations::apply_source(ClientId::new(), &state, request())
+            .await
+            .expect("update source draft in process");
+        assert_eq!(
+            updated.outcome,
+            bcode_workflow::WorkflowSourceApplyOutcome::Updated
+        );
+        assert_eq!(updated.generation, 2);
+        assert_eq!(
+            updated.canonical_digest_sha256,
+            created.canonical_digest_sha256
+        );
+
+        let draft = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workflow_draft(
+                &created.workflow_id,
+                bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID,
+            )
+            .expect("read draft")
+            .expect("canonical draft");
+        assert_eq!(draft.generation, 2);
+        assert_eq!(
+            draft.document.source_digest_sha256().expect("draft digest"),
+            created.canonical_digest_sha256
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn export_preview_import_preserves_semantics_and_enforces_collision_policy() {
         let sessions = SessionManager::default();

@@ -202,6 +202,15 @@ if ! rg -q 'record_histogram_with_exact_labels' packages/server/src/lib.rs packa
   violations=1
 fi
 
+if rg -n '(SharedWriter|ResponsePayload|send_response|request_id[[:space:]]*:)' \
+  packages/server/src/workflow_operations.rs \
+  >/tmp/bcode-workflow-operation-transport-leaks 2>/dev/null; then
+  echo "Workflow operation boundary violation: reusable workflow operations must not depend on response writers, response payloads, response encoding, or transport request IDs." >&2
+  cat /tmp/bcode-workflow-operation-transport-leaks >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-operation-transport-leaks
+
 if ! rg -q 'pub struct WorkflowApplicationOperationFacts' packages/workflow/src/lib.rs \
   || ! rg -q 'WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION' packages/workflow/src/lib.rs \
   || ! rg -q 'authorize_workflow_application_operation' packages/server/src/lib.rs \

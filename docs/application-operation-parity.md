@@ -4,6 +4,8 @@ This inventory records how user-visible Bcode actions cross the application boun
 
 The canonical implementation path is:
 
+See [`application-operation-boundary.md`](application-operation-boundary.md) for the implemented ownership split between focused operations and transport adapters.
+
 ```text
 CLI, TUI, HyperChad, or SDK caller
 → typed client or shared renderer action
