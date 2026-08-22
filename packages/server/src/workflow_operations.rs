@@ -1,6 +1,194 @@
-//! Transport-neutral application operations for workflow inspection.
+//! Transport-neutral application operations for workflow authoring and execution.
 
 use super::ServerState;
+
+/// Return one bounded page of authored workflows.
+pub fn list_authored_workflows(
+    state: &ServerState,
+    cursor: Option<&bcode_workflow::WorkflowAuthoringListCursor>,
+    limit: usize,
+) -> Result<
+    bcode_ipc::WorkflowAuthoringPage<
+        bcode_ipc::AuthoredWorkflowSnapshot,
+        bcode_workflow::WorkflowAuthoringListCursor,
+    >,
+    bcode_workflow_store::WorkflowStoreError,
+> {
+    let page = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .list_authored_workflows_page(cursor, limit)?;
+    Ok(super::authored_workflow_page(page, limit))
+}
+
+/// Return one authored workflow description when it exists.
+pub fn authored_workflow(
+    state: &ServerState,
+    workflow_id: &str,
+) -> Result<Option<bcode_ipc::AuthoredWorkflowSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .authored_workflow(workflow_id)
+        .map(|workflow| workflow.map(super::authored_workflow_snapshot))
+}
+
+/// Return a bounded authored-workflow inspection when the workflow exists.
+pub fn inspect_authored_workflow(
+    state: &ServerState,
+    workflow_id: &str,
+    limit: usize,
+) -> Result<Option<bcode_ipc::AuthoredWorkflowInspection>, super::ServerError> {
+    super::authored_workflow_inspection(state, workflow_id, limit)
+}
+
+/// Return one bounded page of drafts for an authored workflow.
+pub fn list_drafts(
+    state: &ServerState,
+    workflow_id: &str,
+    cursor: Option<&bcode_workflow::WorkflowAuthoringListCursor>,
+    limit: usize,
+) -> Result<
+    bcode_ipc::WorkflowAuthoringPage<
+        bcode_ipc::WorkflowDraftSnapshot,
+        bcode_workflow::WorkflowAuthoringListCursor,
+    >,
+    bcode_workflow_store::WorkflowStoreError,
+> {
+    let page = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .list_workflow_drafts_page(workflow_id, cursor, limit.saturating_add(1))?;
+    Ok(super::workflow_draft_page(page, limit))
+}
+
+/// Return one authored workflow draft when it exists.
+pub fn draft(
+    state: &ServerState,
+    workflow_id: &str,
+    draft_id: &str,
+) -> Result<Option<bcode_ipc::WorkflowDraftSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workflow_draft(workflow_id, draft_id)
+        .map(|draft| draft.map(super::workflow_draft_snapshot))
+}
+
+/// Return one bounded page of published revisions for an authored workflow.
+pub fn list_revisions(
+    state: &ServerState,
+    workflow_id: &str,
+    cursor: Option<bcode_workflow::WorkflowRevisionListCursor>,
+    limit: usize,
+) -> Result<
+    bcode_ipc::WorkflowAuthoringPage<
+        bcode_ipc::WorkflowRevisionSnapshot,
+        bcode_workflow::WorkflowRevisionListCursor,
+    >,
+    bcode_workflow_store::WorkflowStoreError,
+> {
+    let page = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .list_workflow_revisions_page(workflow_id, cursor, limit)?;
+    Ok(super::workflow_revision_page(page, limit))
+}
+
+/// Return one published workflow revision when it exists.
+pub fn revision(
+    state: &ServerState,
+    workflow_id: &str,
+    revision: u64,
+) -> Result<Option<bcode_ipc::WorkflowRevisionSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workflow_revision(workflow_id, revision)
+        .map(|revision| revision.map(super::workflow_revision_snapshot))
+}
+
+/// Return one bounded page of presets for an authored workflow.
+pub fn list_presets(
+    state: &ServerState,
+    workflow_id: &str,
+    cursor: Option<&bcode_workflow::WorkflowAuthoringListCursor>,
+    limit: usize,
+) -> Result<
+    bcode_ipc::WorkflowAuthoringPage<
+        bcode_ipc::WorkflowPresetSnapshot,
+        bcode_workflow::WorkflowAuthoringListCursor,
+    >,
+    bcode_workflow_store::WorkflowStoreError,
+> {
+    let page = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .list_workflow_presets_page(workflow_id, cursor, limit.saturating_add(1))?;
+    Ok(super::workflow_preset_page(page, limit))
+}
+
+/// Return one authored workflow preset when it exists.
+pub fn preset(
+    state: &ServerState,
+    workflow_id: &str,
+    preset_id: &str,
+) -> Result<Option<bcode_ipc::WorkflowPresetSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workflow_preset(workflow_id, preset_id)
+        .map(|preset| preset.map(super::workflow_preset_snapshot))
+}
+
+/// Return the latest durable publication receipt for one workflow package.
+pub fn package_publication(
+    state: &ServerState,
+    package_id: &str,
+) -> Result<
+    Option<bcode_workflow::WorkflowPackagePublicationReceipt>,
+    bcode_workflow_store::WorkflowStoreError,
+> {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workflow_package_publication(package_id, None)
+}
+
+/// Atomically apply one validated workflow package to the canonical workflow store.
+pub fn apply_package(
+    state: &ServerState,
+    request: &bcode_ipc::ApplyWorkflowPackageRequest,
+) -> Result<bcode_workflow::WorkflowPackageMutationResult, bcode_workflow_store::WorkflowStoreError>
+{
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_workflow_package(&request.request, request.applied_at_ms)
+}
+
+/// Atomically publish one workflow package in the canonical workflow store.
+pub fn publish_package(
+    state: &ServerState,
+    request: &bcode_ipc::PublishWorkflowPackageRequest,
+) -> Result<bcode_workflow::WorkflowPackageMutationResult, bcode_workflow_store::WorkflowStoreError>
+{
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .publish_workflow_package(&request.request, request.published_at_ms)
+}
 
 /// Request cancellation of a workflow tree while holding its durable execution authority.
 pub async fn cancel_run(

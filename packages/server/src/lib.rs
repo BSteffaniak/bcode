@@ -5149,12 +5149,7 @@ async fn handle_workflow_authoring_request(
     state.require_workflow_store()?;
     match request {
         WorkflowAuthoringRequest::ListAuthoredWorkflows { cursor, limit } => {
-            let workflows = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_authored_workflows_page(cursor.as_ref(), limit)?;
-            let page = authored_workflow_page(workflows, limit);
+            let page = workflow_operations::list_authored_workflows(state, cursor.as_ref(), limit)?;
             send_response(
                 writer,
                 request_id,
@@ -5163,12 +5158,7 @@ async fn handle_workflow_authoring_request(
             .await
         }
         WorkflowAuthoringRequest::GetAuthoredWorkflow { workflow_id } => {
-            let workflow = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .authored_workflow(&workflow_id)?
-                .map(authored_workflow_snapshot);
+            let workflow = workflow_operations::authored_workflow(state, &workflow_id)?;
             send_response(
                 writer,
                 request_id,
@@ -5177,7 +5167,8 @@ async fn handle_workflow_authoring_request(
             .await
         }
         WorkflowAuthoringRequest::InspectAuthoredWorkflow { workflow_id, limit } => {
-            let inspection = authored_workflow_inspection(state, &workflow_id, limit)?;
+            let inspection =
+                workflow_operations::inspect_authored_workflow(state, &workflow_id, limit)?;
             send_response(
                 writer,
                 request_id,
@@ -5192,16 +5183,8 @@ async fn handle_workflow_authoring_request(
             cursor,
             limit,
         } => {
-            let drafts = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_workflow_drafts_page(
-                    &workflow_id,
-                    cursor.as_ref(),
-                    limit.saturating_add(1),
-                )?;
-            let page = workflow_draft_page(drafts, limit);
+            let page =
+                workflow_operations::list_drafts(state, &workflow_id, cursor.as_ref(), limit)?;
             send_response(
                 writer,
                 request_id,
@@ -5213,13 +5196,7 @@ async fn handle_workflow_authoring_request(
             workflow_id,
             draft_id,
         } => {
-            let draft = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .workflow_draft(&workflow_id, &draft_id)?
-                .map(workflow_draft_snapshot)
-                .map(Box::new);
+            let draft = workflow_operations::draft(state, &workflow_id, &draft_id)?.map(Box::new);
             send_response(
                 writer,
                 request_id,
@@ -5232,12 +5209,7 @@ async fn handle_workflow_authoring_request(
             cursor,
             limit,
         } => {
-            let revisions = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_workflow_revisions_page(&workflow_id, cursor, limit)?;
-            let page = workflow_revision_page(revisions, limit);
+            let page = workflow_operations::list_revisions(state, &workflow_id, cursor, limit)?;
             send_response(
                 writer,
                 request_id,
@@ -5249,13 +5221,8 @@ async fn handle_workflow_authoring_request(
             workflow_id,
             revision,
         } => {
-            let revision = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .workflow_revision(&workflow_id, revision)?
-                .map(workflow_revision_snapshot)
-                .map(Box::new);
+            let revision =
+                workflow_operations::revision(state, &workflow_id, revision)?.map(Box::new);
             send_response(
                 writer,
                 request_id,
@@ -5282,16 +5249,8 @@ async fn handle_workflow_authoring_request(
             cursor,
             limit,
         } => {
-            let presets = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_workflow_presets_page(
-                    &workflow_id,
-                    cursor.as_ref(),
-                    limit.saturating_add(1),
-                )?;
-            let page = workflow_preset_page(presets, limit);
+            let page =
+                workflow_operations::list_presets(state, &workflow_id, cursor.as_ref(), limit)?;
             send_response(
                 writer,
                 request_id,
@@ -5303,12 +5262,7 @@ async fn handle_workflow_authoring_request(
             workflow_id,
             preset_id,
         } => {
-            let preset = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .workflow_preset(&workflow_id, &preset_id)?
-                .map(workflow_preset_snapshot);
+            let preset = workflow_operations::preset(state, &workflow_id, &preset_id)?;
             send_response(
                 writer,
                 request_id,
@@ -5337,11 +5291,7 @@ async fn handle_workflow_validation_request(
             handle_workflow_authoring_catalog(request_id, state, writer).await
         }
         WorkflowDefinitionRequest::GetWorkflowPackagePublication { package_id } => {
-            let receipt = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .workflow_package_publication(&package_id, None)?;
+            let receipt = workflow_operations::package_publication(state, &package_id)?;
             send_response(
                 writer,
                 request_id,
@@ -5350,11 +5300,7 @@ async fn handle_workflow_validation_request(
             .await
         }
         WorkflowDefinitionRequest::ApplyWorkflowPackage(request) => {
-            let result = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply_workflow_package(&request.request, request.applied_at_ms)?;
+            let result = workflow_operations::apply_package(state, &request)?;
             send_response(
                 writer,
                 request_id,
@@ -5365,11 +5311,7 @@ async fn handle_workflow_validation_request(
             .await
         }
         WorkflowDefinitionRequest::PublishWorkflowPackage(request) => {
-            let result = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .publish_workflow_package(&request.request, request.published_at_ms)?;
+            let result = workflow_operations::publish_package(state, &request)?;
             send_response(
                 writer,
                 request_id,
