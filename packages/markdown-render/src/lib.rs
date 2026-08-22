@@ -41,7 +41,7 @@ use std::{
     hash::{Hash, Hasher},
     ops::Range,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use bcode_mermaid_render::{
@@ -1261,23 +1261,184 @@ fn assign_selection_geometry(
     projected
 }
 
-/// Rendered Markdown lines plus semantic contributions for richer consumers.
+/// Inputs retained so provenance-derived data can be produced on demand.
+///
+/// Selection provenance costs one unit per rendered grapheme, and most renders
+/// never need it: streaming re-renders a document on every token, while
+/// selection and hit testing touch only the visible rows. Retaining the source
+/// keeps derivation exact while moving its cost off the render path.
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownProvenanceInputs {
+    /// Source the projection was rendered from, in final coordinates.
+    source: String,
+    /// Parsed semantic document, reused when the render already produced one.
+    document: Option<MarkdownDocument>,
+}
+
+impl MarkdownProvenanceInputs {
+    /// Return the parsed document, parsing `source` only if needed.
+    fn document(&self) -> Cow<'_, MarkdownDocument> {
+        self.document.as_ref().map_or_else(
+            || Cow::Owned(parse_markdown_document(&self.source)),
+            Cow::Borrowed,
+        )
+    }
+}
+
+/// Rendered Markdown lines plus semantic contributions for richer consumers.
+///
+/// Rows, contributions, geometry, and anchors are computed eagerly. Selection
+/// provenance, code-block selections, and the layout signature are derived on
+/// first use and then retained, so renders that never select pay nothing for
+/// them.
+#[derive(Debug)]
 pub struct MarkdownRenderResult {
     /// Terminal text projection.
     pub lines: Vec<Line>,
-    /// Renderer-owned source provenance available to selection consumers.
-    pub selection_provenance: Vec<MarkdownSelectionProvenance>,
-    /// Exact canonical fenced and indented code-block ranges.
-    pub code_block_selections: Vec<MarkdownCodeBlockSelection>,
     /// Source-order semantic contributions independent of TUI event-loop types.
     pub contributions: Vec<MarkdownContribution>,
     /// Post-layout document-relative cell rectangles for rich contributions.
     pub geometry: Vec<MarkdownContributionGeometry>,
     /// Post-layout document anchors for internal fragment navigation.
     pub anchors: Vec<MarkdownDocumentAnchor>,
-    /// Layout signature including every renderer-owned layout-affecting option.
-    pub layout_signature: String,
+    /// Options the projection was rendered with, retained for the signature.
+    options: MarkdownRenderOptions,
+    /// Retained inputs for on-demand provenance derivation.
+    provenance_inputs: Option<MarkdownProvenanceInputs>,
+    /// Provenance for the whole document, derived on first use.
+    selection_provenance: OnceLock<Vec<MarkdownSelectionProvenance>>,
+    /// Code-block selections for the whole document, derived on first use.
+    code_block_selections: OnceLock<Vec<MarkdownCodeBlockSelection>>,
+    /// Layout signature, derived on first use.
+    layout_signature: OnceLock<String>,
+}
+
+impl Clone for MarkdownRenderResult {
+    fn clone(&self) -> Self {
+        Self {
+            lines: self.lines.clone(),
+            contributions: self.contributions.clone(),
+            geometry: self.geometry.clone(),
+            anchors: self.anchors.clone(),
+            options: self.options.clone(),
+            provenance_inputs: self.provenance_inputs.clone(),
+            // Derived data is carried over when already computed so a clone
+            // never repeats work, and stays unset otherwise.
+            selection_provenance: self.selection_provenance.get().cloned().map_or_else(
+                OnceLock::new,
+                |value| {
+                    let cell = OnceLock::new();
+                    let _ = cell.set(value);
+                    cell
+                },
+            ),
+            code_block_selections: self.code_block_selections.get().cloned().map_or_else(
+                OnceLock::new,
+                |value| {
+                    let cell = OnceLock::new();
+                    let _ = cell.set(value);
+                    cell
+                },
+            ),
+            layout_signature: self.layout_signature.get().cloned().map_or_else(
+                OnceLock::new,
+                |value| {
+                    let cell = OnceLock::new();
+                    let _ = cell.set(value);
+                    cell
+                },
+            ),
+        }
+    }
+}
+
+impl PartialEq for MarkdownRenderResult {
+    /// Compare rendered output and every derived projection.
+    ///
+    /// Equality forces derivation so two results compare by value regardless of
+    /// which derived fields either side happens to have realized.
+    fn eq(&self, other: &Self) -> bool {
+        self.lines == other.lines
+            && self.contributions == other.contributions
+            && self.geometry == other.geometry
+            && self.anchors == other.anchors
+            && self.selection_provenance() == other.selection_provenance()
+            && self.code_block_selections() == other.code_block_selections()
+    }
+}
+
+impl Eq for MarkdownRenderResult {}
+
+impl MarkdownRenderResult {
+    /// Return selection provenance for the whole document.
+    ///
+    /// Derived on first use and retained. Prefer
+    /// [`Self::selection_provenance_for_rows`] when only visible rows matter.
+    #[must_use]
+    pub fn selection_provenance(&self) -> &[MarkdownSelectionProvenance] {
+        self.selection_provenance.get_or_init(|| {
+            let Some(inputs) = self.provenance_inputs.as_ref() else {
+                return Vec::new();
+            };
+            let document = inputs.document();
+            assign_selection_geometry(
+                markdown_selection_provenance(&document),
+                &document,
+                &inputs.source,
+                &self.lines,
+            )
+        })
+    }
+
+    /// Return provenance units intersecting `rows`.
+    ///
+    /// Selection and hit testing only need the visible window, so this avoids
+    /// materializing whole-document provenance for a screenful of rows.
+    #[must_use]
+    pub fn selection_provenance_for_rows(
+        &self,
+        rows: Range<u16>,
+    ) -> Vec<MarkdownSelectionProvenance> {
+        self.selection_provenance()
+            .iter()
+            .filter(|unit| {
+                unit.rects
+                    .iter()
+                    .any(|rect| rect.y >= rows.start && rect.y < rows.end)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Return exact canonical fenced and indented code-block ranges.
+    #[must_use]
+    pub fn code_block_selections(&self) -> &[MarkdownCodeBlockSelection] {
+        self.code_block_selections.get_or_init(|| {
+            let Some(inputs) = self.provenance_inputs.as_ref() else {
+                return Vec::new();
+            };
+            markdown_code_block_selections_from_document(&inputs.source, &inputs.document())
+        })
+    }
+
+    /// Return the layout signature covering every renderer-owned layout input.
+    #[must_use]
+    pub fn layout_signature(&self) -> &str {
+        self.layout_signature.get_or_init(|| {
+            let source = self
+                .provenance_inputs
+                .as_ref()
+                .map_or("", |inputs| inputs.source.as_str());
+            markdown_layout_signature(
+                source,
+                &self.options,
+                &self.contributions,
+                &self.geometry,
+                self.selection_provenance(),
+                self.code_block_selections(),
+            )
+        })
+    }
 }
 
 /// Stable internal document anchor and its rendered row.
@@ -1471,36 +1632,24 @@ impl MarkdownStreamingRenderState {
         }
         let mut lines = self.stable_lines.clone();
         append_markdown_blocks(&mut lines, &suffix_result.lines);
-        // Provenance must stay byte-exact against a full render. Block Start/End
-        // ranges depend on block terminators that a split segment cannot observe
-        // (pulldown-cmark reports a paragraph as `0..28` where the checkpointed
-        // segment can only see `0..27`), so provenance is derived from the whole
-        // accepted source rather than stitched from retained pieces.
-        let document = parse_markdown_document(markdown);
-        let selection_provenance = assign_selection_geometry(
-            markdown_selection_provenance(&document),
-            &document,
-            markdown,
-            &lines,
-        );
-        let code_block_selections =
-            markdown_code_block_selections_from_document(markdown, &document);
-        let layout_signature = markdown_layout_signature(
-            markdown,
-            options,
-            &[],
-            &[],
-            &selection_provenance,
-            &code_block_selections,
-        );
+        // Provenance stays byte-exact by deriving from the whole accepted source,
+        // but derivation is deferred: streaming tokens produce rows without ever
+        // paying whole-document provenance or signature cost.
         let result = MarkdownRenderResult {
             lines,
-            selection_provenance,
-            code_block_selections,
             contributions: Vec::new(),
             geometry: Vec::new(),
             anchors: Vec::new(),
-            layout_signature,
+            options: options.clone(),
+            provenance_inputs: Some(MarkdownProvenanceInputs {
+                source: markdown.to_owned(),
+                // Deferred: streaming tokens never parse the whole source unless
+                // a selection actually asks for provenance.
+                document: None,
+            }),
+            selection_provenance: OnceLock::new(),
+            code_block_selections: OnceLock::new(),
+            layout_signature: OnceLock::new(),
         };
         self.source.clear();
         self.source.push_str(markdown);
@@ -1688,29 +1837,43 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     );
     #[cfg(test)]
     let signature_started = std::time::Instant::now();
-    let code_block_selections = markdown_code_block_selections_from_document(markdown, &document);
-    let layout_signature = markdown_layout_signature(
-        markdown,
-        options,
-        &contributions,
-        &geometry,
-        &selection_provenance,
-        &code_block_selections,
-    );
+    // Provenance, code-block selections, and the signature are derived on first
+    // use from the retained document, so this render path does not pay for them.
+    let provenance_inputs = (projected_markdown.as_ref() == markdown).then(|| {
+        MarkdownProvenanceInputs {
+            source: markdown.to_owned(),
+            // This render already parsed the source, so reuse it.
+            document: Some(document.clone()),
+        }
+    });
     #[cfg(test)]
     record_markdown_stage(
         |diagnostics, elapsed| diagnostics.signature = elapsed,
         signature_started,
     );
-    MarkdownRenderResult {
+    let result = MarkdownRenderResult {
         lines,
-        selection_provenance,
-        code_block_selections,
         contributions,
         geometry,
         anchors,
-        layout_signature,
+        options: options.clone(),
+        provenance_inputs,
+        selection_provenance: OnceLock::new(),
+        code_block_selections: OnceLock::new(),
+        layout_signature: OnceLock::new(),
+    };
+    // When the projected source diverges from the caller's source, provenance
+    // cannot be derived from the original document, so retain the geometry that
+    // was already assigned against the rendered lines.
+    if projected_markdown.as_ref() != markdown {
+        let _ = result.selection_provenance.set(selection_provenance);
+        let _ = result
+            .code_block_selections
+            .set(markdown_code_block_selections_from_document(
+                markdown, &document,
+            ));
     }
+    result
 }
 
 fn markdown_document_anchors(
@@ -4862,7 +5025,7 @@ mod tests {
             .collect::<String>();
         assert!(open_text.contains("▼ Retry"));
         assert!(open_text.contains("Run it again."));
-        assert_ne!(closed.layout_signature, open.layout_signature);
+        assert_ne!(closed.layout_signature(), open.layout_signature());
     }
 
     #[test]
@@ -4959,7 +5122,7 @@ mod tests {
         assert!(both_text.contains("▼ Outer"));
         assert!(both_text.contains("▼ Inner"));
         assert!(both_text.contains("Secret"));
-        assert_ne!(outer_open.layout_signature, both_open.layout_signature);
+        assert_ne!(outer_open.layout_signature(), both_open.layout_signature());
     }
 
     #[test]
@@ -5075,7 +5238,7 @@ mod tests {
             let start = source.find(needle).expect("needle");
             let end = start + needle.len();
             rendered
-                .selection_provenance
+                .selection_provenance()
                 .iter()
                 .find(|unit| {
                     matches!(
@@ -5122,7 +5285,7 @@ mod tests {
         let source = "# > **strong *inner*** [label](https://example.com) `code`  \nnext";
         let rendered = render_markdown(source, &MarkdownRenderOptions::new(24));
         let slices = rendered
-            .selection_provenance
+            .selection_provenance()
             .iter()
             .flat_map(|unit| &unit.source_ranges)
             .filter_map(|range| source.get(range.clone()))
@@ -5151,7 +5314,7 @@ mod tests {
             &MarkdownRenderOptions::new(18),
         );
         let emphasized = rendered
-            .selection_provenance
+            .selection_provenance()
             .iter()
             .filter(|unit| unit.kind == super::MarkdownSelectionKind::Text)
             .filter(|unit| {
@@ -5185,7 +5348,7 @@ mod tests {
         let markdown = "```rust\nfn main() {\n\tprintln!(\"hi\");\n}\n```";
         let rendered = render_markdown(markdown, &MarkdownRenderOptions::new(80));
         let code = rendered
-            .selection_provenance
+            .selection_provenance()
             .iter()
             .filter(|unit| {
                 matches!(
@@ -5261,11 +5424,14 @@ mod tests {
         let plain = render_markdown("text", &MarkdownRenderOptions::new(40));
         let fenced = render_markdown("```\ntext\n```", &MarkdownRenderOptions::new(40));
 
-        assert!(plain.layout_signature.starts_with("markdown-layout-v5:"));
-        assert!(fenced.layout_signature.starts_with("markdown-layout-v5:"));
-        assert_ne!(plain.layout_signature, fenced.layout_signature);
-        assert_ne!(plain.selection_provenance, fenced.selection_provenance);
-        assert_ne!(plain.code_block_selections, fenced.code_block_selections);
+        assert!(plain.layout_signature().starts_with("markdown-layout-v5:"));
+        assert!(fenced.layout_signature().starts_with("markdown-layout-v5:"));
+        assert_ne!(plain.layout_signature(), fenced.layout_signature());
+        assert_ne!(plain.selection_provenance(), fenced.selection_provenance());
+        assert_ne!(
+            plain.code_block_selections(),
+            fenced.code_block_selections()
+        );
     }
 
     #[test]
@@ -5393,8 +5559,8 @@ mod tests {
     fn code_block_selection_uses_parser_truth_for_nested_indentation() {
         let list = "- item\n\n      indented code\n      next\n";
         let rendered = render_markdown(list, &MarkdownRenderOptions::new(80));
-        assert_eq!(rendered.code_block_selections.len(), 1);
-        let block = &rendered.code_block_selections[0];
+        assert_eq!(rendered.code_block_selections().len(), 1);
+        let block = &rendered.code_block_selections()[0];
         assert_eq!(
             &list[block.whole_range.clone()],
             "      indented code\n      next\n"
@@ -5402,14 +5568,17 @@ mod tests {
 
         let ordinary_indent = "paragraph\n    continuation\n";
         let rendered = render_markdown(ordinary_indent, &MarkdownRenderOptions::new(80));
-        assert!(rendered.code_block_selections.is_empty());
+        assert!(rendered.code_block_selections().is_empty());
     }
 
     #[test]
     fn code_block_selection_distinguishes_exact_fence_body_and_footer() {
         let markdown = "```rust\r\nfn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n```\r\n";
         let rendered = render_markdown(markdown, &MarkdownRenderOptions::new(80));
-        let block = rendered.code_block_selections.first().expect("code block");
+        let block = rendered
+            .code_block_selections()
+            .first()
+            .expect("code block");
 
         assert_eq!(block.kind, super::MarkdownCodeBlockSelectionKind::Fenced);
         assert_eq!(
@@ -5464,7 +5633,10 @@ mod tests {
         let source =
             "```text\na very long source line that wraps visually without a canonical newline\n```";
         let rendered = render_markdown(source, &MarkdownRenderOptions::new(16));
-        let block = rendered.code_block_selections.first().expect("code block");
+        let block = rendered
+            .code_block_selections()
+            .first()
+            .expect("code block");
         assert_eq!(
             block
                 .body_ranges
@@ -5474,7 +5646,7 @@ mod tests {
             "a very long source line that wraps visually without a canonical newline\n"
         );
         let body_rows = rendered
-            .selection_provenance
+            .selection_provenance()
             .iter()
             .filter(|unit| {
                 unit.source_ranges.iter().all(|range| {
@@ -5495,7 +5667,7 @@ mod tests {
         let indented = "    first\n\tsecond\n\nnext";
         let rendered = render_markdown(indented, &MarkdownRenderOptions::new(80));
         let block = rendered
-            .code_block_selections
+            .code_block_selections()
             .first()
             .expect("indented block");
         assert_eq!(block.kind, super::MarkdownCodeBlockSelectionKind::Indented);
@@ -5509,7 +5681,7 @@ mod tests {
         let incomplete = "~~~rust\nlet value = 1;";
         let rendered = render_markdown(incomplete, &MarkdownRenderOptions::new(80));
         let block = rendered
-            .code_block_selections
+            .code_block_selections()
             .first()
             .expect("incomplete block");
         assert!(block.footer_range.is_none());
@@ -5529,8 +5701,8 @@ mod tests {
         let markdown = "# *hello* [world](https://example.com)\n\n`code`  \nnext";
         let result = render_markdown(markdown, &MarkdownRenderOptions::new(40));
 
-        assert!(!result.selection_provenance.is_empty());
-        assert!(result.selection_provenance.iter().all(|entry| {
+        assert!(!result.selection_provenance().is_empty());
+        assert!(result.selection_provenance().iter().all(|entry| {
             entry
                 .rects
                 .iter()
@@ -5550,13 +5722,13 @@ mod tests {
         ] {
             assert!(
                 result
-                    .selection_provenance
+                    .selection_provenance()
                     .iter()
                     .any(|entry| entry.kind == kind),
                 "missing {kind:?}"
             );
         }
-        assert!(result.selection_provenance.iter().any(|entry| {
+        assert!(result.selection_provenance().iter().any(|entry| {
             entry.source_ranges.iter().any(|range| {
                 markdown
                     .get(range.clone())
@@ -5573,7 +5745,7 @@ mod tests {
             "```\npartial",
         ] {
             let result = render_markdown(markdown, &MarkdownRenderOptions::new(20));
-            assert!(result.selection_provenance.iter().all(|entry| {
+            assert!(result.selection_provenance().iter().all(|entry| {
                 entry.source_ranges.iter().all(|range| {
                     range.end <= markdown.len()
                         && markdown.is_char_boundary(range.start)
@@ -5581,7 +5753,7 @@ mod tests {
                 })
             }));
             if markdown.starts_with("```") {
-                assert!(result.selection_provenance.iter().any(|entry| {
+                assert!(result.selection_provenance().iter().any(|entry| {
                     entry
                         .semantic_expansion
                         .as_deref()
@@ -5611,6 +5783,106 @@ mod tests {
     }
 
     #[test]
+    fn lazily_derived_provenance_matches_eager_derivation_exactly() {
+        // Provenance is derived on first use rather than during rendering. A
+        // deferred derivation must be byte-identical to one forced immediately,
+        // including for streaming projections that reuse retained rows.
+        let sources = [
+            "Prose with **strong text**, `inline code`, and a [link](https://example.com).",
+            "# Heading\n\ntext\n\n- item one\n- item two\n\n> quoted\n",
+            "```rust\nfn main() {}\n```\n\ntrailing prose\n",
+            "| a | b |\n| - | - |\n| 1 | 2 |\n",
+        ];
+        for source in sources {
+            let options = MarkdownRenderOptions::new(40);
+
+            let deferred = render_markdown(source, &options);
+            let mut forced = render_markdown(source, &options);
+            // Force derivation before comparison on one side only.
+            let forced_units = forced.selection_provenance().to_vec();
+            let forced_blocks = forced.code_block_selections().to_vec();
+            let forced_signature = forced.layout_signature().to_owned();
+            forced = render_markdown(source, &options);
+
+            assert_eq!(
+                deferred.selection_provenance(),
+                forced_units.as_slice(),
+                "deferred provenance must equal eager provenance for {source:?}"
+            );
+            assert_eq!(
+                deferred.code_block_selections(),
+                forced_blocks.as_slice(),
+                "deferred code-block selections must match for {source:?}"
+            );
+            assert_eq!(
+                deferred.layout_signature(),
+                forced_signature,
+                "deferred signature must match for {source:?}"
+            );
+            assert_eq!(
+                deferred, forced,
+                "results must compare equal regardless of derivation order"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_projection_provenance_matches_a_full_render() {
+        // The streaming path reuses retained rows, so its deferred provenance
+        // must still match a full render of the same accepted source.
+        let source = "First paragraph grows here.\n\nSecond paragraph streams progressively.";
+        let options = MarkdownRenderOptions::new(24).with_streaming(true);
+        let mut state = MarkdownStreamingRenderState::default();
+        for end in source
+            .char_indices()
+            .map(|(index, character)| index.saturating_add(character.len_utf8()))
+        {
+            let prefix = &source[..end];
+            let streamed = state.render(prefix, &options);
+            let full = render_markdown(prefix, &options);
+            assert_eq!(
+                streamed.selection_provenance(),
+                full.selection_provenance(),
+                "streaming provenance must be exact at prefix {end}"
+            );
+            assert_eq!(streamed.layout_signature(), full.layout_signature());
+        }
+    }
+
+    #[test]
+    fn row_scoped_provenance_matches_the_whole_document_projection() {
+        let source = "First paragraph wraps across rows.\n\nSecond paragraph also wraps here.";
+        let rendered = render_markdown(source, &MarkdownRenderOptions::new(20));
+        let row_count = u16::try_from(rendered.lines.len()).expect("row count fits");
+
+        // Querying every row must reproduce exactly the units that carry geometry.
+        let mut scoped = rendered
+            .selection_provenance_for_rows(0..row_count)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut expected = rendered
+            .selection_provenance()
+            .iter()
+            .filter(|unit| !unit.rects.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        scoped.sort_by_key(|unit| unit.source_ranges.first().map(|range| range.start));
+        expected.sort_by_key(|unit| unit.source_ranges.first().map(|range| range.start));
+        assert_eq!(scoped, expected);
+
+        // A single row must never return units from other rows.
+        for row in 0..row_count {
+            assert!(
+                rendered
+                    .selection_provenance_for_rows(row..row.saturating_add(1))
+                    .iter()
+                    .all(|unit| unit.rects.iter().any(|rect| rect.y == row)),
+                "row {row} returned a unit with no geometry on that row"
+            );
+        }
+    }
+
+    #[test]
     fn provenance_units_avoid_per_grapheme_heap_allocation() {
         // Text events expand to one provenance unit per grapheme, so any
         // per-unit heap allocation is multiplied by document length. Source
@@ -5624,20 +5896,20 @@ mod tests {
         let rendered = render_markdown(&doc, &MarkdownRenderOptions::new(40));
 
         assert!(
-            rendered.selection_provenance.len() > 500,
+            rendered.selection_provenance().len() > 500,
             "expected a grapheme-dense projection, got {} units",
-            rendered.selection_provenance.len()
+            rendered.selection_provenance().len()
         );
         assert!(
             rendered
-                .selection_provenance
+                .selection_provenance()
                 .iter()
                 .all(|unit| !unit.source_ranges.spilled()),
             "source ranges must stay inline for every provenance unit"
         );
         assert!(
             rendered
-                .selection_provenance
+                .selection_provenance()
                 .iter()
                 .all(|unit| !unit.rects.spilled()),
             "cell rects must stay inline for every provenance unit"
@@ -5646,7 +5918,7 @@ mod tests {
         // Container stacks are shared, so distinct allocations must be far fewer
         // than units rather than one per unit.
         let distinct_container_stacks = rendered
-            .selection_provenance
+            .selection_provenance()
             .iter()
             .map(|unit| {
                 std::ptr::from_ref::<[super::MarkdownSelectionContainer]>(&*unit.containers)
@@ -5654,10 +5926,10 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         assert!(
-            distinct_container_stacks * 4 < rendered.selection_provenance.len(),
+            distinct_container_stacks * 4 < rendered.selection_provenance().len(),
             "container stacks must be shared across units: {distinct_container_stacks} distinct \
              allocations for {} units",
-            rendered.selection_provenance.len()
+            rendered.selection_provenance().len()
         );
     }
 
@@ -6075,7 +6347,7 @@ mod tests {
             "![alt](image.png)",
             &MarkdownRenderOptions::new(40).with_rich_reserved_rows(1, 1),
         );
-        assert_ne!(image.layout_signature, compact.layout_signature);
+        assert_ne!(image.layout_signature(), compact.layout_signature());
     }
 
     #[test]

@@ -1966,6 +1966,7 @@ fn register_transcript_selection_scene(
                             .unwrap_or(u64::MAX)
                             .saturating_mul(1_000_000),
                         item.revision(),
+                        Some(document_row),
                     )
                     .into_iter()
                     .filter(|fragment| {

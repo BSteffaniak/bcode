@@ -616,13 +616,13 @@ fn markdown_layout_signature_tracks_every_renderer_owned_layout_input() {
     ];
     for variant in variants {
         assert_ne!(
-            base_result.layout_signature,
-            render_markdown("[link](relative.md)", &variant).layout_signature
+            base_result.layout_signature(),
+            render_markdown("[link](relative.md)", &variant).layout_signature()
         );
     }
     assert_ne!(
-        base_result.layout_signature,
-        render_markdown("[different](relative.md)", &base).layout_signature
+        base_result.layout_signature(),
+        render_markdown("[different](relative.md)", &base).layout_signature()
     );
 }
 

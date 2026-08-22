@@ -7,6 +7,14 @@ use bcode_markdown_render::{
 };
 use bmux_tui::selection::SelectionFragment;
 
+/// Return selection fragments for one rendered Markdown projection.
+///
+/// `document_row` restricts derivation to a single document row. Per-frame
+/// rendering needs exactly one row, so restricting avoids building
+/// whole-document fragments that are then discarded. `unit_index` ordering
+/// matches the unrestricted projection, so fragment order stays stable
+/// regardless of which row is requested.
+#[allow(clippy::too_many_arguments)]
 pub fn markdown_selection_fragments(
     scope_id: &str,
     content_id: &str,
@@ -14,9 +22,15 @@ pub fn markdown_selection_fragments(
     origin: bmux_tui::geometry::Point,
     order_base: u64,
     revision: u64,
+    document_row: Option<u16>,
 ) -> Vec<SelectionFragment> {
     let mut fragments = Vec::new();
-    for (unit_index, unit) in rendered.selection_provenance.iter().enumerate() {
+    for (unit_index, unit) in rendered.selection_provenance().iter().enumerate() {
+        if let Some(document_row) = document_row
+            && !unit.rects.iter().any(|rect| rect.y == document_row)
+        {
+            continue;
+        }
         let content_id = markdown_unit_content_id(content_id, rendered, unit);
         append_unit_fragments(
             &mut fragments,
@@ -50,9 +64,9 @@ fn append_code_block_chrome_fragments(
     order_base: u64,
     revision: u64,
 ) {
-    for (block_index, block) in rendered.code_block_selections.iter().enumerate() {
+    for (block_index, block) in rendered.code_block_selections().iter().enumerate() {
         let body_rects = rendered
-            .selection_provenance
+            .selection_provenance()
             .iter()
             .filter(|unit| {
                 unit.source_ranges
@@ -132,7 +146,7 @@ fn markdown_unit_content_id(
     unit: &MarkdownSelectionProvenance,
 ) -> String {
     rendered
-        .code_block_selections
+        .code_block_selections()
         .iter()
         .find(|block| {
             unit.source_ranges
@@ -321,6 +335,7 @@ mod tests {
             bmux_tui::geometry::Point::new(4, 7),
             10,
             2,
+            None,
         );
 
         assert!(!fragments.is_empty());
@@ -342,6 +357,7 @@ mod tests {
             bmux_tui::geometry::Point::new(0, 0),
             0,
             1,
+            None,
         );
 
         assert!(fragments.iter().any(|fragment| {

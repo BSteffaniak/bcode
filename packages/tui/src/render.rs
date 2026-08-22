@@ -840,7 +840,7 @@ fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_re
     let cached = render_markdown(source, &markdown_render_options(&app, &item, 24));
     assert_eq!(narrow.lines, cached.lines);
     assert_eq!(narrow.geometry, cached.geometry);
-    assert_eq!(narrow.layout_signature, cached.layout_signature);
+    assert_eq!(narrow.layout_signature(), cached.layout_signature());
 
     let replacement = TranscriptItem::with_format(
         "System",
@@ -3525,7 +3525,7 @@ fn rich_content_matrix_is_bounded_and_semantic_across_themes() {
             assert!(visible.contains("Streaming"));
             assert!(visible.contains("WARNING"));
             assert!(visible.contains("More"));
-            markdown_signatures.push((theme_id, width, rendered.layout_signature));
+            markdown_signatures.push((theme_id, width, rendered.layout_signature().to_owned()));
         }
 
         for layout in [DiffViewerLayout::Unified, DiffViewerLayout::SideBySide] {
