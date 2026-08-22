@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use bcode_workflow_view_models::{
     WORKFLOW_VIEW_VERSION, WorkflowActionAffordance, WorkflowActionKind, WorkflowActionTarget,
     WorkflowAttemptView, WorkflowCatalogView, WorkflowChildSessionView, WorkflowDescendantRunView,
-    WorkflowEdgeView, WorkflowMutationApprovalView, WorkflowNodeKind, WorkflowNodeStatus,
-    WorkflowNodeView, WorkflowOutputValue, WorkflowOutputView, WorkflowProjectionHealth,
-    WorkflowRunListItem, WorkflowRunStatus, WorkflowRunView, WorkflowTerminalView,
-    WorkflowWaitKind, WorkflowWaitView,
+    WorkflowEdgeView, WorkflowFailureDiagnostic, WorkflowMutationApprovalView, WorkflowNodeKind,
+    WorkflowNodeStatus, WorkflowNodeView, WorkflowOutputValue, WorkflowOutputView,
+    WorkflowProjectionHealth, WorkflowRunListItem, WorkflowRunStatus, WorkflowRunView,
+    WorkflowTerminalView, WorkflowWaitKind, WorkflowWaitView,
 };
 
 /// Portable definition source needed to project a workflow graph.
@@ -43,6 +43,15 @@ pub struct WorkflowOutputProjectionInput {
     pub created_at_ms: u64,
 }
 
+/// Canonical bounded workflow event supplied for semantic failure projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowFailureEventProjectionInput {
+    pub event_sequence: u64,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub created_at_ms: u64,
+}
+
 /// Complete bounded portable input needed to project one workflow run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRunProjectionInput {
@@ -54,6 +63,7 @@ pub struct WorkflowRunProjectionInput {
     pub mutation_approvals: Vec<WorkflowMutationApprovalView>,
     pub attempts: Vec<WorkflowAttemptView>,
     pub outputs: Vec<WorkflowOutputProjectionInput>,
+    pub failure_events: Vec<WorkflowFailureEventProjectionInput>,
     pub descendant_runs: Vec<WorkflowDescendantRunView>,
     pub child_sessions: Vec<WorkflowChildSessionView>,
 }
@@ -191,12 +201,50 @@ pub fn project_run(input: WorkflowRunProjectionInput) -> WorkflowRunView {
                 created_at_ms: output.created_at_ms,
             })
             .collect(),
+        failure_diagnostics: input
+            .failure_events
+            .into_iter()
+            .filter_map(project_failure_diagnostic)
+            .collect(),
         descendant_runs: input.descendant_runs,
         child_sessions: input.child_sessions,
         actions,
         terminal,
         health,
     }
+}
+
+fn project_failure_diagnostic(
+    event: WorkflowFailureEventProjectionInput,
+) -> Option<WorkflowFailureDiagnostic> {
+    let payload = event.payload.as_object()?;
+    let message = payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| payload.get("reason").and_then(serde_json::Value::as_str))?
+        .trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(WorkflowFailureDiagnostic {
+        kind: event.event_type,
+        message: message.to_string(),
+        node_id: payload
+            .get("node_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        activation_id: payload
+            .get("activation_id")
+            .or_else(|| payload.get("member_activation_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        dispatch_identity: payload
+            .get("dispatch_identity")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        event_sequence: event.event_sequence,
+        occurred_at_ms: event.created_at_ms,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -564,6 +612,15 @@ mod tests {
                 artifact_reference: None,
                 created_at_ms: 4,
             }],
+            failure_events: vec![WorkflowFailureEventProjectionInput {
+                event_sequence: 5,
+                event_type: "attempt_failed".to_string(),
+                payload: serde_json::json!({
+                    "dispatch_identity": "dispatch-1",
+                    "message": "provider rejected the request"
+                }),
+                created_at_ms: 5,
+            }],
             descendant_runs: Vec::new(),
             child_sessions: Vec::new(),
         });
@@ -576,5 +633,10 @@ mod tests {
             bcode_workflow_view_models::WorkflowWaitKind::Input
         );
         assert_eq!(view.outputs[0].value, WorkflowOutputValue::Unresolved);
+        assert_eq!(view.failure_diagnostics.len(), 1);
+        assert_eq!(
+            view.failure_diagnostics[0].message,
+            "provider rejected the request"
+        );
     }
 }

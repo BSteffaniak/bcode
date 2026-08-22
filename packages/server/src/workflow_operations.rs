@@ -767,6 +767,7 @@ pub fn run_view(
         let waits = store.waiting_activations(run_id, limit)?;
         let mutation_approvals = store.pending_mutation_approvals(run_id, limit)?;
         let attempts = store.attempt_history(run_id, None, limit)?;
+        let failure_events = store.failure_history(run_id, limit)?;
         let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
         let child_sessions = store.execution_session_links_for_run(run_id, limit)?;
         let run_item = run_list_item(&store, &run)?;
@@ -905,6 +906,17 @@ pub fn run_view(
                         checksum_sha256: output.checksum_sha256,
                         artifact_reference: output.artifact_reference,
                         created_at_ms: output.created_at_ms,
+                    },
+                )
+                .collect(),
+            failure_events: failure_events
+                .into_iter()
+                .map(
+                    |event| bcode_workflow_view::WorkflowFailureEventProjectionInput {
+                        event_sequence: event.event_seq,
+                        event_type: event.event_type,
+                        payload: event.payload,
+                        created_at_ms: event.created_at_ms,
                     },
                 )
                 .collect(),

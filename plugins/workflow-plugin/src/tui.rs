@@ -7,17 +7,21 @@ use bcode_plugin_sdk::tui::{
 };
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
-use bmux_tui::event::Event;
+use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::geometry::{Insets, Point, Rect};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
-use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
+use bmux_tui_components::action_row::{
+    ActionButton, ActionRow, ActionRowOutcome, ActionRowState, ActionRowStyles,
+};
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
-use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
-use bmux_tui_components::tab_bar::{TabBar, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::pane::{
+    Pane, PaneMousePolicy, PanePolicy, PaneState, PaneStyles, ResizeHandles,
+};
+use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
 use bmux_tui_components::table::{
-    Table, TableAlign, TableColumn, TableRow, TableState, TableStyles,
+    Table, TableAlign, TableColumn, TableOutcome, TableRow, TableState, TableStyles,
 };
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
@@ -175,6 +179,11 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 options: request.options,
                 selected_approval: 0,
                 text_view: TextViewState::new(),
+                catalog_table_state: TableState::new(None),
+                inspector_tab_state: TabBarState::new(Some(0)),
+                narrow_tab_state: TabBarState::new(Some(0)),
+                action_row_state: ActionRowState::new(),
+                workspace_areas: WorkflowWorkspaceAreas::default(),
                 selected_run_id: None,
                 selected_node_id: None,
                 selected_wait_id: None,
@@ -215,23 +224,40 @@ enum WorkflowWorkspaceFocus {
     Actions,
 }
 
-impl WorkflowWorkspaceFocus {
-    const fn next(self) -> Self {
-        match self {
-            Self::Catalog => Self::Graph,
-            Self::Graph => Self::Inspector,
-            Self::Inspector => Self::Actions,
-            Self::Actions => Self::Catalog,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowNarrowPage {
     Runs,
     Graph,
     Inspector,
     Actions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkflowWorkspaceAreas {
+    workspace: Rect,
+    catalog_pane: Rect,
+    catalog_content: Rect,
+    graph_pane: Rect,
+    graph_content: Rect,
+    inspector_pane: Rect,
+    inspector_content: Rect,
+    inspector_tabs: Rect,
+    actions_pane: Rect,
+    actions_content: Rect,
+    narrow_tabs: Rect,
+}
+
+impl WorkflowWorkspaceAreas {
+    fn pane_at(self, position: Point) -> Option<WorkflowWorkspaceFocus> {
+        [
+            (WorkflowWorkspaceFocus::Catalog, self.catalog_pane),
+            (WorkflowWorkspaceFocus::Graph, self.graph_pane),
+            (WorkflowWorkspaceFocus::Inspector, self.inspector_pane),
+            (WorkflowWorkspaceFocus::Actions, self.actions_pane),
+        ]
+        .into_iter()
+        .find_map(|(focus, area)| area.contains(position).then_some(focus))
+    }
 }
 
 impl WorkflowNarrowPage {
@@ -241,6 +267,15 @@ impl WorkflowNarrowPage {
             Self::Graph => 1,
             Self::Inspector => 2,
             Self::Actions => 3,
+        }
+    }
+
+    const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Graph,
+            2 => Self::Inspector,
+            3 => Self::Actions,
+            _ => Self::Runs,
         }
     }
 
@@ -437,6 +472,11 @@ struct WorkflowStatusSurface {
     options: serde_json::Value,
     selected_approval: usize,
     text_view: TextViewState,
+    catalog_table_state: TableState,
+    inspector_tab_state: TabBarState,
+    narrow_tab_state: TabBarState,
+    action_row_state: ActionRowState,
+    workspace_areas: WorkflowWorkspaceAreas,
     selected_run_id: Option<String>,
     selected_node_id: Option<String>,
     selected_wait_id: Option<(String, String)>,
@@ -726,14 +766,7 @@ impl WorkflowStatusSurface {
         if area.is_empty() {
             return area;
         }
-        let pane = Pane::new()
-            .title(Line::from(title))
-            .padding(Insets::new(1, 1, 1, 1))
-            .styles(PaneStyles {
-                background: Some(theme.canvas),
-                border: theme.component.border,
-                focused_border: theme.focused,
-            });
+        let pane = workflow_pane(title, theme);
         let mut state = PaneState::new(area);
         state.interaction = state.interaction.focused(focused);
         pane.render(&state, frame);
@@ -784,6 +817,106 @@ impl WorkflowStatusSurface {
     ) {
         let inner = Self::render_focused_pane(area, frame, theme, "Actions", focused);
         self.render_action_panel(inner, frame, theme);
+    }
+
+    fn calculate_workspace_areas(
+        &self,
+        area: Rect,
+        theme: WorkflowSurfaceTheme,
+    ) -> WorkflowWorkspaceAreas {
+        const GUTTER: u16 = 1;
+        let mut areas = WorkflowWorkspaceAreas {
+            workspace: area,
+            ..WorkflowWorkspaceAreas::default()
+        };
+        if area.height < 4 || area.width < 24 || self.catalog.is_none() {
+            return areas;
+        }
+        let header_height = u16::from(self.has_workspace_notice())
+            .saturating_add(2)
+            .min(area.height);
+        let footer_height = 1.min(area.height.saturating_sub(header_height));
+        let body = Rect::new(
+            area.x,
+            area.y.saturating_add(header_height),
+            area.width,
+            area.height
+                .saturating_sub(header_height)
+                .saturating_sub(footer_height),
+        );
+        if area.width >= 112 {
+            let available = body.width.saturating_sub(GUTTER.saturating_mul(2));
+            let catalog_width = available.saturating_mul(28) / 100;
+            let inspector_width = available.saturating_mul(30) / 100;
+            let graph_width = available
+                .saturating_sub(catalog_width)
+                .saturating_sub(inspector_width);
+            areas.catalog_pane = Rect::new(body.x, body.y, catalog_width, body.height);
+            areas.graph_pane = Rect::new(
+                areas.catalog_pane.right().saturating_add(GUTTER),
+                body.y,
+                graph_width,
+                body.height,
+            );
+            areas.inspector_pane = Rect::new(
+                areas.graph_pane.right().saturating_add(GUTTER),
+                body.y,
+                inspector_width,
+                body.height,
+            );
+        } else if area.width >= 72 {
+            let available = body.width.saturating_sub(GUTTER);
+            let catalog_width = available.saturating_mul(38) / 100;
+            areas.catalog_pane = Rect::new(body.x, body.y, catalog_width, body.height);
+            areas.inspector_pane = Rect::new(
+                areas.catalog_pane.right().saturating_add(GUTTER),
+                body.y,
+                available.saturating_sub(catalog_width),
+                body.height,
+            );
+        } else {
+            areas.narrow_tabs = Rect::new(body.x, body.y, body.width, 1);
+            let pane = Rect::new(
+                body.x,
+                body.y.saturating_add(1),
+                body.width,
+                body.height.saturating_sub(1),
+            );
+            match self.narrow_page {
+                WorkflowNarrowPage::Runs => areas.catalog_pane = pane,
+                WorkflowNarrowPage::Graph => areas.graph_pane = pane,
+                WorkflowNarrowPage::Inspector => areas.inspector_pane = pane,
+                WorkflowNarrowPage::Actions => areas.actions_pane = pane,
+            }
+        }
+        for (pane_area, title, content) in [
+            (areas.catalog_pane, "Runs", &mut areas.catalog_content),
+            (
+                areas.graph_pane,
+                "Execution graph",
+                &mut areas.graph_content,
+            ),
+            (
+                areas.inspector_pane,
+                "Inspector",
+                &mut areas.inspector_content,
+            ),
+            (areas.actions_pane, "Actions", &mut areas.actions_content),
+        ] {
+            if !pane_area.is_empty() {
+                *content = workflow_pane(title, theme).inner_area(&PaneState::new(pane_area));
+            }
+        }
+        let inspector_tabbed = area.width < 112 || areas.inspector_content.width < 44;
+        if inspector_tabbed && !areas.inspector_content.is_empty() {
+            areas.inspector_tabs = Rect::new(
+                areas.inspector_content.x,
+                areas.inspector_content.y,
+                areas.inspector_content.width,
+                1,
+            );
+        }
+        areas
     }
 
     #[allow(clippy::too_many_lines)]
@@ -909,16 +1042,18 @@ impl WorkflowStatusSurface {
             return;
         }
         let mut hints = vec![
-            KeyHint::new("←/→", "run"),
-            KeyHint::new("↑/↓", "node/item"),
+            KeyHint::new("↑/↓", "focused pane"),
+            KeyHint::new("←/→", "tabs/selection"),
             KeyHint::new("Tab", "focus/page"),
             KeyHint::new("1-4", "page"),
             KeyHint::new("[/]", "section"),
             KeyHint::new("/", "search"),
             KeyHint::new("f/s/g", "filter/sort/group"),
             KeyHint::new("m", "more"),
-            KeyHint::new("D/T/N", "definitions/templates/new"),
         ];
+        if footer.width >= 120 {
+            hints.push(KeyHint::new("D/T/N", "definitions/templates/new"));
+        }
         if self.workspace_focus == WorkflowWorkspaceFocus::Inspector
             && (1..=5).contains(&self.active_detail_tab)
         {
@@ -930,13 +1065,13 @@ impl WorkflowStatusSurface {
             )
             .is_some()
         {
-            hints.push(KeyHint::new("V", "view definition"));
+            hints.insert(0, KeyHint::new("V", "view definition"));
         }
         if self
             .selected_definition_action(bcode_workflow_view_models::WorkflowActionKind::EditDraft)
             .is_some()
         {
-            hints.push(KeyHint::new("E", "edit draft"));
+            hints.insert(0, KeyHint::new("E", "edit draft"));
         }
         if self
             .selected_definition_action(
@@ -944,7 +1079,7 @@ impl WorkflowStatusSurface {
             )
             .is_some()
         {
-            hints.push(KeyHint::new("F", "fork definition"));
+            hints.insert(0, KeyHint::new("F", "fork definition"));
         }
         KeyHintBar::new(&hints)
             .styles(KeyHintBarStyles {
@@ -1126,10 +1261,6 @@ impl WorkflowStatusSurface {
                 ])
             })
             .collect::<Vec<_>>();
-        let selected = self
-            .selected_run_id
-            .as_deref()
-            .and_then(|run_id| catalog.runs.iter().position(|run| run.run_id == run_id));
         Table::new(&columns, &rows)
             .styles(TableStyles {
                 header: theme.focused,
@@ -1142,7 +1273,7 @@ impl WorkflowStatusSurface {
                 separator: theme.component.border,
                 empty: theme.muted,
             })
-            .render(area, &TableState::new(selected), frame);
+            .render(area, &self.catalog_table_state, frame);
     }
 
     fn render_graph(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
@@ -1221,7 +1352,7 @@ impl WorkflowStatusSurface {
                 })
                 .render(
                     Rect::new(area.x, area.y, area.width, tab_height),
-                    &TabBarState::new(Some(self.active_detail_tab)),
+                    &self.inspector_tab_state,
                     frame,
                 );
         }
@@ -1312,7 +1443,12 @@ impl WorkflowStatusSurface {
                 pressed: theme.selected,
                 disabled: theme.muted,
             })
-            .render_with_fallback_style(row_area, frame, theme.canvas);
+            .render_state_with_fallback_style(
+                row_area,
+                &self.action_row_state,
+                frame,
+                theme.canvas,
+            );
         for (index, action) in run.actions.iter().enumerate() {
             if let Some(reason) = &action.unavailable_reason {
                 let row = u16::try_from(index).unwrap_or(u16::MAX).saturating_add(2);
@@ -1357,7 +1493,7 @@ impl WorkflowStatusSurface {
             })
             .render(
                 Rect::new(area.x, area.y, area.width, 1),
-                &TabBarState::new(Some(self.narrow_page.index())),
+                &self.narrow_tab_state,
                 frame,
             );
         let page_area = Rect::new(
@@ -1398,6 +1534,31 @@ impl WorkflowStatusSurface {
             .saturating_add_signed(offset)
             .min(catalog.runs.len().saturating_sub(1));
         let run_id = catalog.runs[next].run_id.clone();
+        if self.selected_run_id.as_deref() == Some(run_id.as_str()) {
+            return PluginTuiAction::Redraw;
+        }
+        self.selected_run_id = Some(run_id.clone());
+        self.selected_node_id = None;
+        self.selected_wait_id = None;
+        self.selected_input_wait_id = None;
+        self.selected_approval_id = None;
+        self.selected_attempt_id = None;
+        self.selected_output_id = None;
+        self.selected_child_session_id = None;
+        self.detail_errors.remove(&run_id);
+        self.detail_loading_run_id = Some(run_id.clone());
+        PluginTuiAction::SelectWorkflowRun { run_id }
+    }
+
+    fn select_run_index(&mut self, index: usize) -> PluginTuiAction {
+        let run_id = self
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.runs.get(index))
+            .map(|run| run.run_id.clone());
+        let Some(run_id) = run_id else {
+            return PluginTuiAction::None;
+        };
         if self.selected_run_id.as_deref() == Some(run_id.as_str()) {
             return PluginTuiAction::Redraw;
         }
@@ -1619,8 +1780,289 @@ impl WorkflowStatusSurface {
         PluginTuiAction::Redraw
     }
 
+    fn advance_workspace_focus(&mut self, reverse: bool) {
+        if !self.workspace_areas.narrow_tabs.is_empty() {
+            self.narrow_page = if reverse {
+                self.narrow_page.previous()
+            } else {
+                self.narrow_page.next()
+            };
+            self.workspace_focus = match self.narrow_page {
+                WorkflowNarrowPage::Runs => WorkflowWorkspaceFocus::Catalog,
+                WorkflowNarrowPage::Graph => WorkflowWorkspaceFocus::Graph,
+                WorkflowNarrowPage::Inspector => WorkflowWorkspaceFocus::Inspector,
+                WorkflowNarrowPage::Actions => WorkflowWorkspaceFocus::Actions,
+            };
+            return;
+        }
+        let visible = [
+            (
+                WorkflowWorkspaceFocus::Catalog,
+                self.workspace_areas.catalog_pane,
+            ),
+            (
+                WorkflowWorkspaceFocus::Graph,
+                self.workspace_areas.graph_pane,
+            ),
+            (
+                WorkflowWorkspaceFocus::Inspector,
+                self.workspace_areas.inspector_pane,
+            ),
+            (
+                WorkflowWorkspaceFocus::Actions,
+                self.workspace_areas.actions_pane,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(focus, area)| (!area.is_empty()).then_some(focus))
+        .collect::<Vec<_>>();
+        if visible.is_empty() {
+            return;
+        }
+        let current = visible
+            .iter()
+            .position(|focus| *focus == self.workspace_focus)
+            .unwrap_or(0);
+        let next = if reverse {
+            current.checked_sub(1).unwrap_or(visible.len() - 1)
+        } else {
+            current.saturating_add(1) % visible.len()
+        };
+        self.workspace_focus = visible[next];
+    }
+
+    fn selected_action_buttons(&self) -> Vec<ActionButton> {
+        self.selected_run_view()
+            .map(|run| {
+                run.actions
+                    .iter()
+                    .map(|action| {
+                        ActionButton::new(
+                            format!("{:?}", action.kind),
+                            format!(
+                                "{} {:?}",
+                                workflow_action_shortcut(action.kind),
+                                action.kind
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn activate_action_id(&mut self, id: &str) -> PluginTuiAction {
+        let kind = self.selected_run_view().and_then(|run| {
+            run.actions
+                .iter()
+                .find(|action| format!("{:?}", action.kind) == id)
+                .map(|action| action.kind)
+        });
+        let Some(kind) = kind else {
+            return PluginTuiAction::None;
+        };
+        match kind {
+            bcode_workflow_view_models::WorkflowActionKind::Pause
+            | bcode_workflow_view_models::WorkflowActionKind::Resume => self
+                .handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Char('p'),
+                ))),
+            bcode_workflow_view_models::WorkflowActionKind::Cancel => self
+                .handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Char('c'),
+                ))),
+            bcode_workflow_view_models::WorkflowActionKind::ProvideInput => self
+                .handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Char('i'),
+                ))),
+            bcode_workflow_view_models::WorkflowActionKind::Approve
+            | bcode_workflow_view_models::WorkflowActionKind::ApproveMutation => self
+                .handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Char('a'),
+                ))),
+            bcode_workflow_view_models::WorkflowActionKind::Deny
+            | bcode_workflow_view_models::WorkflowActionKind::DenyMutation => self
+                .handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Char('d'),
+                ))),
+            bcode_workflow_view_models::WorkflowActionKind::RetryNode => self
+                .handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Char('r'),
+                ))),
+            bcode_workflow_view_models::WorkflowActionKind::OpenSession => self
+                .handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                    KeyCode::Char('o'),
+                ))),
+            bcode_workflow_view_models::WorkflowActionKind::ViewDefinition => self
+                .definition_action(bcode_workflow_view_models::WorkflowActionKind::ViewDefinition),
+            bcode_workflow_view_models::WorkflowActionKind::EditDraft => {
+                self.definition_action(bcode_workflow_view_models::WorkflowActionKind::EditDraft)
+            }
+            bcode_workflow_view_models::WorkflowActionKind::ForkDefinition => self
+                .definition_action(bcode_workflow_view_models::WorkflowActionKind::ForkDefinition),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_workspace_components(&mut self, event: &Event) -> PluginTuiAction {
+        if self.workspace_areas.workspace.is_empty() {
+            return PluginTuiAction::None;
+        }
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(focus) = self.workspace_areas.pane_at(mouse.position)
+        {
+            self.workspace_focus = focus;
+        }
+        if !self.workspace_areas.narrow_tabs.is_empty() {
+            let pages = [
+                TabItem::new("runs", "Runs"),
+                TabItem::new("graph", "Graph"),
+                TabItem::new("inspector", "Inspector"),
+                TabItem::new("actions", "Actions"),
+            ];
+            match TabBar::new(&pages).handle_event(
+                self.workspace_areas.narrow_tabs,
+                &mut self.narrow_tab_state,
+                event,
+            ) {
+                TabBarOutcome::Selected(index) => {
+                    self.narrow_page = WorkflowNarrowPage::from_index(index);
+                    self.workspace_focus = match self.narrow_page {
+                        WorkflowNarrowPage::Runs => WorkflowWorkspaceFocus::Catalog,
+                        WorkflowNarrowPage::Graph => WorkflowWorkspaceFocus::Graph,
+                        WorkflowNarrowPage::Inspector => WorkflowWorkspaceFocus::Inspector,
+                        WorkflowNarrowPage::Actions => WorkflowWorkspaceFocus::Actions,
+                    };
+                    return PluginTuiAction::Redraw;
+                }
+                TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
+                TabBarOutcome::Ignored => {}
+            }
+        }
+        let pane_area = match self.workspace_focus {
+            WorkflowWorkspaceFocus::Catalog => self.workspace_areas.catalog_pane,
+            WorkflowWorkspaceFocus::Graph => self.workspace_areas.graph_pane,
+            WorkflowWorkspaceFocus::Inspector => self.workspace_areas.inspector_pane,
+            WorkflowWorkspaceFocus::Actions => self.workspace_areas.actions_pane,
+        };
+        if !pane_area.is_empty() {
+            let title = match self.workspace_focus {
+                WorkflowWorkspaceFocus::Catalog => "Runs",
+                WorkflowWorkspaceFocus::Graph => "Execution graph",
+                WorkflowWorkspaceFocus::Inspector => "Inspector",
+                WorkflowWorkspaceFocus::Actions => "Actions",
+            };
+            let mut pane_state = PaneState::new(pane_area);
+            let _ = workflow_input_pane(title).handle_event(&mut pane_state, event);
+        }
+        if self.workspace_focus == WorkflowWorkspaceFocus::Catalog
+            && !self.workspace_areas.catalog_content.is_empty()
+        {
+            let Some(catalog) = self.catalog.as_ref() else {
+                return PluginTuiAction::None;
+            };
+            let columns = [
+                TableColumn::new("Workflow").flex(3).align(TableAlign::Left),
+                TableColumn::new("Status").flex(2).align(TableAlign::Left),
+            ];
+            let rows = catalog
+                .runs
+                .iter()
+                .map(|run| {
+                    TableRow::rich(vec![
+                        Line::from(run.display_title.clone()),
+                        Line::from(format!("{:?}", run.status)),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            match Table::new(&columns, &rows).handle_event(
+                self.workspace_areas.catalog_content,
+                &mut self.catalog_table_state,
+                event,
+            ) {
+                TableOutcome::Focused(index) | TableOutcome::Selected(index) => {
+                    return self.select_run_index(index);
+                }
+                TableOutcome::Redraw => return PluginTuiAction::Redraw,
+                TableOutcome::Ignored => {}
+            }
+        }
+        if self.workspace_focus == WorkflowWorkspaceFocus::Graph
+            && let Event::Mouse(mouse) = event
+            && self.workspace_areas.graph_content.contains(mouse.position)
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => return self.select_adjacent_node(-1),
+                MouseEventKind::ScrollDown => return self.select_adjacent_node(1),
+                _ => {}
+            }
+        }
+        if self.workspace_focus == WorkflowWorkspaceFocus::Inspector
+            && !self.workspace_areas.inspector_tabs.is_empty()
+        {
+            let tabs = [
+                TabItem::new("overview", "Overview"),
+                TabItem::new("inputs", "Inputs"),
+                TabItem::new("outputs", "Outputs"),
+                TabItem::new("attempts", "Attempts"),
+                TabItem::new("approvals", "Approvals"),
+                TabItem::new("sessions", "Sessions"),
+                TabItem::new("definition", "Definition"),
+            ];
+            match TabBar::new(&tabs).handle_event(
+                self.workspace_areas.inspector_tabs,
+                &mut self.inspector_tab_state,
+                event,
+            ) {
+                TabBarOutcome::Selected(index) => {
+                    self.active_detail_tab = index;
+                    return PluginTuiAction::Redraw;
+                }
+                TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
+                TabBarOutcome::Ignored => {}
+            }
+            if let Event::Mouse(mouse) = event
+                && self
+                    .workspace_areas
+                    .inspector_content
+                    .contains(mouse.position)
+            {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => return self.select_adjacent_detail_item(-1),
+                    MouseEventKind::ScrollDown => return self.select_adjacent_detail_item(1),
+                    _ => {}
+                }
+            }
+        }
+        if self.workspace_focus == WorkflowWorkspaceFocus::Actions
+            && !self.workspace_areas.actions_content.is_empty()
+        {
+            let actions = self.selected_action_buttons();
+            match ActionRow::new(&actions).handle_event(
+                self.workspace_areas.actions_content,
+                &mut self.action_row_state,
+                event,
+            ) {
+                ActionRowOutcome::Activated { id, .. } => return self.activate_action_id(&id),
+                outcome if outcome.needs_redraw() => return PluginTuiAction::Redraw,
+                _ => {}
+            }
+        }
+        PluginTuiAction::None
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_control_center_event(&mut self, event: &Event) -> PluginTuiAction {
+        if self.pending_confirmation.is_none()
+            && self.input_form.is_none()
+            && self.catalog_search_buffer.is_none()
+        {
+            let action = self.handle_workspace_components(event);
+            if !matches!(action, PluginTuiAction::None) {
+                return action;
+            }
+        }
         let Event::Key(key) = event else {
             return PluginTuiAction::None;
         };
@@ -1778,22 +2220,38 @@ impl WorkflowStatusSurface {
         }
         match key.key {
             KeyCode::Escape | KeyCode::Char('q') => PluginTuiAction::Close { outcome: None },
-            KeyCode::Left | KeyCode::Char('h') => self.select_adjacent_run(-1),
-            KeyCode::Right | KeyCode::Char('l') => self.select_adjacent_run(1),
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.workspace_focus == WorkflowWorkspaceFocus::Inspector {
-                    self.select_adjacent_detail_item(-1)
-                } else {
-                    self.select_adjacent_node(-1)
+            KeyCode::Left | KeyCode::Char('h') => match self.workspace_focus {
+                WorkflowWorkspaceFocus::Catalog => self.select_adjacent_run(-1),
+                WorkflowWorkspaceFocus::Inspector => {
+                    self.active_detail_tab = self.active_detail_tab.saturating_sub(1);
+                    PluginTuiAction::Redraw
                 }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.workspace_focus == WorkflowWorkspaceFocus::Inspector {
-                    self.select_adjacent_detail_item(1)
-                } else {
-                    self.select_adjacent_node(1)
+                WorkflowWorkspaceFocus::Graph | WorkflowWorkspaceFocus::Actions => {
+                    PluginTuiAction::None
                 }
-            }
+            },
+            KeyCode::Right | KeyCode::Char('l') => match self.workspace_focus {
+                WorkflowWorkspaceFocus::Catalog => self.select_adjacent_run(1),
+                WorkflowWorkspaceFocus::Inspector => {
+                    self.active_detail_tab = self.active_detail_tab.saturating_add(1).min(6);
+                    PluginTuiAction::Redraw
+                }
+                WorkflowWorkspaceFocus::Graph | WorkflowWorkspaceFocus::Actions => {
+                    PluginTuiAction::None
+                }
+            },
+            KeyCode::Up | KeyCode::Char('k') => match self.workspace_focus {
+                WorkflowWorkspaceFocus::Catalog => self.select_adjacent_run(-1),
+                WorkflowWorkspaceFocus::Graph => self.select_adjacent_node(-1),
+                WorkflowWorkspaceFocus::Inspector => self.select_adjacent_detail_item(-1),
+                WorkflowWorkspaceFocus::Actions => PluginTuiAction::None,
+            },
+            KeyCode::Down | KeyCode::Char('j') => match self.workspace_focus {
+                WorkflowWorkspaceFocus::Catalog => self.select_adjacent_run(1),
+                WorkflowWorkspaceFocus::Graph => self.select_adjacent_node(1),
+                WorkflowWorkspaceFocus::Inspector => self.select_adjacent_detail_item(1),
+                WorkflowWorkspaceFocus::Actions => PluginTuiAction::None,
+            },
             KeyCode::Char('/') => {
                 self.catalog_search_buffer = Some(
                     self.catalog
@@ -1852,18 +2310,7 @@ impl WorkflowStatusSurface {
                     PluginTuiAction::LoadMoreWorkflowRuns { cursor }
                 }),
             KeyCode::Tab => {
-                if key.modifiers.shift {
-                    self.narrow_page = self.narrow_page.previous();
-                    self.workspace_focus = match self.narrow_page {
-                        WorkflowNarrowPage::Runs => WorkflowWorkspaceFocus::Catalog,
-                        WorkflowNarrowPage::Graph => WorkflowWorkspaceFocus::Graph,
-                        WorkflowNarrowPage::Inspector => WorkflowWorkspaceFocus::Inspector,
-                        WorkflowNarrowPage::Actions => WorkflowWorkspaceFocus::Actions,
-                    };
-                } else {
-                    self.workspace_focus = self.workspace_focus.next();
-                    self.narrow_page = self.narrow_page.next();
-                }
+                self.advance_workspace_focus(key.modifiers.shift);
                 PluginTuiAction::Redraw
             }
             KeyCode::Char('1') => {
@@ -2261,7 +2708,7 @@ impl WorkflowStatusSurface {
     }
 
     fn render_themed(
-        &self,
+        &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
@@ -2282,6 +2729,23 @@ impl WorkflowStatusSurface {
         let pane_state = PaneState::new(area);
         pane.render(&pane_state, frame);
         let content = pane.inner_area(&pane_state);
+        self.workspace_areas = self.calculate_workspace_areas(content, theme);
+        let selected_run = self.catalog.as_ref().and_then(|catalog| {
+            self.selected_run_id
+                .as_deref()
+                .and_then(|run_id| catalog.runs.iter().position(|run| run.run_id == run_id))
+        });
+        self.catalog_table_state.set_selected(selected_run);
+        self.catalog_table_state.interaction.focused =
+            self.workspace_focus == WorkflowWorkspaceFocus::Catalog;
+        self.inspector_tab_state
+            .set_selected(Some(self.active_detail_tab));
+        self.inspector_tab_state
+            .set_focused(self.workspace_focus == WorkflowWorkspaceFocus::Inspector);
+        self.narrow_tab_state
+            .set_selected(Some(self.narrow_page.index()));
+        self.action_row_state.interaction.focused =
+            self.workspace_focus == WorkflowWorkspaceFocus::Actions;
         if let Some(confirmation) = &self.pending_confirmation {
             Self::render_confirmation(content, frame, theme, confirmation);
             return;
@@ -2649,6 +3113,29 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 }
 
+fn workflow_input_pane(title: &'static str) -> Pane<'static> {
+    Pane::new().title(Line::from(title)).policy(PanePolicy {
+        mouse: PaneMousePolicy {
+            enabled: true,
+            click_to_focus: true,
+            title_bar_drag: false,
+            scroll_wheel: false,
+            resize_handles: ResizeHandles::NONE,
+        },
+        ..PanePolicy::default()
+    })
+}
+
+fn workflow_pane(title: &'static str, theme: WorkflowSurfaceTheme) -> Pane<'static> {
+    workflow_input_pane(title)
+        .padding(Insets::new(1, 1, 1, 1))
+        .styles(PaneStyles {
+            background: Some(theme.canvas),
+            border: theme.component.border,
+            focused_border: theme.focused,
+        })
+}
+
 const fn next_catalog_filter(
     filter: bcode_workflow_view_models::WorkflowCatalogFilter,
 ) -> bcode_workflow_view_models::WorkflowCatalogFilter {
@@ -3013,6 +3500,19 @@ fn inspector_overview_lines(run: &bcode_workflow_view_models::WorkflowRunView) -
     if let Some(terminal) = &run.terminal {
         lines.push(Line::from(format!("Terminal: {terminal:?}")));
     }
+    if !run.failure_diagnostics.is_empty() {
+        lines.push(Line::from("Failure diagnostics:"));
+        for diagnostic in run.failure_diagnostics.iter().rev().take(5) {
+            let target = diagnostic
+                .node_id
+                .as_deref()
+                .map_or_else(String::new, |node| format!(" · {node}"));
+            lines.push(Line::from(format!(
+                "  {}{target} · {}",
+                diagnostic.kind, diagnostic.message
+            )));
+        }
+    }
     lines
 }
 
@@ -3192,6 +3692,19 @@ fn inspector_attempt_lines(
                         .map_or_else(|| "pending".to_string(), |value| value.to_string()),
                     if attempt.has_receipt { "yes" } else { "no" }
                 )),
+                run.failure_diagnostics
+                    .iter()
+                    .rev()
+                    .find(|diagnostic| {
+                        diagnostic.dispatch_identity.as_deref()
+                            == Some(attempt.dispatch_identity.as_str())
+                            || diagnostic.activation_id.as_deref()
+                                == Some(attempt.activation_id.as_str())
+                    })
+                    .map_or_else(
+                        || Line::from("Failure: no canonical diagnostic recorded"),
+                        |diagnostic| Line::from(format!("Failure: {}", diagnostic.message)),
+                    ),
             ]
         })
         .collect()
@@ -3936,7 +4449,11 @@ mod tests {
     use super::*;
     use bmux_tui::buffer::Buffer;
 
-    fn render_workspace_text(surface: &WorkflowStatusSurface, width: u16, height: u16) -> String {
+    fn render_workspace_text(
+        surface: &mut WorkflowStatusSurface,
+        width: u16,
+        height: u16,
+    ) -> String {
         render_workspace_buffer(surface, width, height)
             .cells()
             .chunks(usize::from(width))
@@ -3951,7 +4468,7 @@ mod tests {
     }
 
     fn render_workspace_buffer_with_theme(
-        surface: &WorkflowStatusSurface,
+        surface: &mut WorkflowStatusSurface,
         width: u16,
         height: u16,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
@@ -3962,7 +4479,11 @@ mod tests {
         buffer
     }
 
-    fn render_workspace_buffer(surface: &WorkflowStatusSurface, width: u16, height: u16) -> Buffer {
+    fn render_workspace_buffer(
+        surface: &mut WorkflowStatusSurface,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
         render_workspace_buffer_with_theme(surface, width, height, None)
     }
 
@@ -4277,6 +4798,15 @@ mod tests {
                 artifact_reference: None,
                 created_at_ms: 3,
             }],
+            failure_diagnostics: vec![bcode_workflow_view_models::WorkflowFailureDiagnostic {
+                kind: "attempt_failed".to_string(),
+                message: "review provider rejected the request".to_string(),
+                node_id: Some("reviewer".to_string()),
+                activation_id: Some("activation-1".to_string()),
+                dispatch_identity: Some("dispatch-2".to_string()),
+                event_sequence: 7,
+                occurred_at_ms: 3,
+            }],
             descendant_runs: Vec::new(),
             child_sessions: vec![bcode_workflow_view_models::WorkflowChildSessionView {
                 node_id: "reviewer".to_string(),
@@ -4338,6 +4868,11 @@ mod tests {
             options: serde_json::Value::Null,
             selected_approval: 0,
             text_view: TextViewState::new(),
+            catalog_table_state: TableState::new(Some(0)),
+            inspector_tab_state: TabBarState::new(Some(0)),
+            narrow_tab_state: TabBarState::new(Some(0)),
+            action_row_state: ActionRowState::new(),
+            workspace_areas: WorkflowWorkspaceAreas::default(),
             selected_run_id: Some("run-1".to_string()),
             selected_node_id: Some("reviewer".to_string()),
             selected_wait_id: Some(("approval".to_string(), "approval-activation".to_string())),
@@ -4400,7 +4935,7 @@ mod tests {
 
         let mut surface = projected_surface();
         surface.narrow_page = WorkflowNarrowPage::Actions;
-        let rendered = render_workspace_text(&surface, 62, 24);
+        let rendered = render_workspace_text(&mut surface, 62, 24);
         for expected in ["p Pause", "c Cancel", "a Approve", "r RetryNode"] {
             assert!(
                 rendered.contains(expected),
@@ -4555,7 +5090,7 @@ mod tests {
                 unavailable_reason: None,
             },
         ]);
-        let rendered = render_workspace_text(&surface, 200, 32);
+        let rendered = render_workspace_text(&mut surface, 200, 32);
         assert!(rendered.contains("V view definition"));
         assert!(rendered.contains("F fork definition"));
     }
@@ -4863,7 +5398,7 @@ mod tests {
                 && surface_id == WORKFLOW_AUTHOR_SURFACE_KIND
                 && options["entry"] == "new_workflow"
         ));
-        let rendered = render_workspace_text(&surface, 240, 28);
+        let rendered = render_workspace_text(&mut surface, 240, 28);
         assert!(rendered.contains("definitions/templates/new"));
     }
 
@@ -5630,29 +6165,29 @@ mod tests {
         let mut surface = projected_surface();
         let catalog = surface.catalog.as_mut().expect("catalog");
         catalog.runs.clear();
-        assert!(render_workspace_text(&surface, 88, 24).contains("No workflow runs yet"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("No workflow runs yet"));
 
         let mut surface = projected_surface();
         surface.catalog_loading = true;
         surface.catalog_stale = true;
-        assert!(render_workspace_text(&surface, 88, 24).contains("showing stale results"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("showing stale results"));
         surface.catalog_loading = false;
         surface.catalog_stale = false;
         surface.live_status = "live updates unavailable: offline".to_string();
-        assert!(render_workspace_text(&surface, 88, 24).contains("offline"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("offline"));
         surface.live_status = "resynchronizing bounded workflow state…".to_string();
-        assert!(render_workspace_text(&surface, 88, 24).contains("resynchronizing"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("resynchronizing"));
         surface.live_status = "live".to_string();
         surface.runs.get_mut("run-1").expect("run").health =
             bcode_workflow_view_models::WorkflowProjectionHealth::Degraded {
                 reason: "bounded detail unavailable".to_string(),
             };
-        assert!(render_workspace_text(&surface, 88, 24).contains("projection is degraded"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("projection is degraded"));
         surface.runs.get_mut("run-1").expect("run").health =
             bcode_workflow_view_models::WorkflowProjectionHealth::RepairRequired {
                 reason: "explicit repair required".to_string(),
             };
-        assert!(render_workspace_text(&surface, 88, 24).contains("requires repair"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("requires repair"));
     }
 
     #[test]
@@ -5663,18 +6198,18 @@ mod tests {
                 reason: "bounded projection incomplete".to_string(),
             };
         assert!(surface.has_workspace_notice());
-        assert!(render_workspace_text(&surface, 88, 24).contains("projection is degraded"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("projection is degraded"));
 
         surface.runs.get_mut("run-1").expect("run").health =
             bcode_workflow_view_models::WorkflowProjectionHealth::UnsupportedVersion {
                 version: 99,
             };
-        assert!(render_workspace_text(&surface, 88, 24).contains("unsupported projection"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("unsupported projection"));
 
         let run = surface.runs.get_mut("run-1").expect("run");
         run.health = bcode_workflow_view_models::WorkflowProjectionHealth::Current;
         run.run.status = bcode_workflow_view_models::WorkflowRunStatus::RepairRequired;
-        assert!(render_workspace_text(&surface, 88, 24).contains("requires explicit repair"));
+        assert!(render_workspace_text(&mut surface, 88, 24).contains("requires explicit repair"));
     }
 
     #[test]
@@ -5693,7 +6228,7 @@ mod tests {
         surface.active_detail_tab = 2;
 
         for (width, height) in [(132, 28), (88, 24)] {
-            let buffer = render_workspace_buffer(&surface, width, height);
+            let buffer = render_workspace_buffer(&mut surface, width, height);
             assert_eq!(
                 buffer.cells().len(),
                 usize::from(width) * usize::from(height)
@@ -5707,7 +6242,7 @@ mod tests {
             assert!(rendered.contains("Findings"));
         }
         surface.narrow_page = WorkflowNarrowPage::Inspector;
-        let buffer = render_workspace_buffer(&surface, 62, 20);
+        let buffer = render_workspace_buffer(&mut surface, 62, 20);
         assert_eq!(buffer.cells().len(), 62 * 20);
         let rendered = buffer
             .cells()
@@ -5819,7 +6354,7 @@ mod tests {
 
     #[test]
     fn semantic_status_styles_and_focus_are_applied_to_rendered_workspace() {
-        let surface = projected_surface();
+        let mut surface = projected_surface();
         let theme = WorkflowSurfaceTheme::resolve(None);
         assert_eq!(
             workflow_run_style(
@@ -5854,7 +6389,7 @@ mod tests {
             theme.muted
         );
 
-        let buffer = render_workspace_buffer(&surface, 132, 28);
+        let buffer = render_workspace_buffer(&mut surface, 132, 28);
         assert!(
             buffer
                 .cells()
@@ -5873,7 +6408,7 @@ mod tests {
 
     #[test]
     fn multiple_host_themes_drive_workspace_styles_without_changing_semantics() {
-        let surface = projected_surface();
+        let mut surface = projected_surface();
         for (foreground, accent) in [
             (bmux_tui::style::Color::White, bmux_tui::style::Color::Cyan),
             (
@@ -5883,7 +6418,8 @@ mod tests {
         ] {
             let plugin_theme = test_plugin_theme(foreground, accent);
             let resolved = WorkflowSurfaceTheme::resolve(Some(&plugin_theme));
-            let buffer = render_workspace_buffer_with_theme(&surface, 132, 28, Some(&plugin_theme));
+            let buffer =
+                render_workspace_buffer_with_theme(&mut surface, 132, 28, Some(&plugin_theme));
             assert_eq!(resolved.text.fg, Some(foreground));
             assert_eq!(resolved.focused.fg, Some(accent));
             assert!(
@@ -5907,20 +6443,73 @@ mod tests {
         let mut surface = projected_surface();
         surface.runs.clear();
         surface.detail_loading_run_id = None;
-        let rendered = render_workspace_text(&surface, 88, 24);
+        let rendered = render_workspace_text(&mut surface, 88, 24);
         assert!(rendered.contains("Selected run detail is not loaded"));
         assert!(!rendered.contains("Loading selected run"));
     }
 
     #[test]
+    fn focused_pane_navigation_and_component_mouse_events_are_scoped() {
+        let mut surface = projected_surface();
+        let _ = render_workspace_buffer(&mut surface, 132, 28);
+        assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Catalog);
+        assert_eq!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Down
+            ),)),
+            PluginTuiAction::Redraw
+        );
+
+        surface.workspace_focus = WorkflowWorkspaceFocus::Actions;
+        assert_eq!(
+            surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Down
+            ),)),
+            PluginTuiAction::None
+        );
+        let graph = surface.workspace_areas.graph_pane;
+        let click = Event::Mouse(bmux_tui::event::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(graph.x.saturating_add(1), graph.y.saturating_add(1)),
+        ));
+        assert_eq!(
+            surface.handle_control_center_event(&click),
+            PluginTuiAction::None
+        );
+        assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Graph);
+    }
+
+    #[test]
+    fn failed_run_overview_and_attempts_show_canonical_diagnostics() {
+        let surface = projected_surface();
+        let run = surface.selected_run_view().expect("run");
+        let overview = inspector_overview_lines(run)
+            .into_iter()
+            .map(|line| line.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let attempts = inspector_attempt_lines(
+            run,
+            surface.selected_attempt_id.as_ref(),
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(overview.contains("review provider rejected the request"));
+        assert!(attempts.contains("Failure: review provider rejected the request"));
+    }
+
+    #[test]
     fn responsive_workspace_uses_explicit_narrow_pages_and_bordered_panes() {
         let mut surface = projected_surface();
-        let wide = render_workspace_text(&surface, 132, 28);
+        let wide = render_workspace_text(&mut surface, 132, 28);
         assert!(wide.contains("Runs"));
         assert!(wide.contains("Execution graph"));
         assert!(wide.contains("Inspector"));
 
-        let narrow_runs = render_workspace_text(&surface, 62, 24);
+        let narrow_runs = render_workspace_text(&mut surface, 62, 24);
         assert!(narrow_runs.contains("Runs"));
         assert!(narrow_runs.contains("Graph"));
         assert!(narrow_runs.contains("Inspector"));
@@ -5935,7 +6524,7 @@ mod tests {
         );
         assert_eq!(surface.narrow_page, WorkflowNarrowPage::Graph);
         assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Graph);
-        let narrow_graph = render_workspace_text(&surface, 62, 24);
+        let narrow_graph = render_workspace_text(&mut surface, 62, 24);
         assert!(narrow_graph.contains("Execution graph"));
         assert!(narrow_graph.contains("Reviewer"));
 
@@ -5947,16 +6536,16 @@ mod tests {
         );
         assert_eq!(surface.narrow_page, WorkflowNarrowPage::Actions);
         assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Actions);
-        assert!(render_workspace_text(&surface, 62, 24).contains("Actions"));
+        assert!(render_workspace_text(&mut surface, 62, 24).contains("Actions"));
         assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
         assert_eq!(surface.selected_node_id.as_deref(), Some("reviewer"));
     }
 
     #[test]
     fn responsive_layout_changes_preserve_stable_selection() {
-        let surface = projected_surface();
+        let mut surface = projected_surface();
         for (width, expected) in [(132, "Execution graph"), (88, "Overview"), (62, "Review")] {
-            let rendered = render_workspace_text(&surface, width, 24);
+            let rendered = render_workspace_text(&mut surface, width, 24);
             assert!(rendered.contains(expected), "missing {expected} at {width}");
             assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
             assert_eq!(surface.selected_node_id.as_deref(), Some("reviewer"));
@@ -5977,11 +6566,11 @@ mod tests {
             .collect();
         surface.selected_run_id = Some("run-000".to_string());
 
-        let rendered = render_workspace_text(&surface, 132, 28);
+        let rendered = render_workspace_text(&mut surface, 132, 28);
         assert!(rendered.contains("Showing 100"));
         for _ in 0..150 {
             let _ = surface.handle_control_center_event(&Event::Key(
-                bmux_keyboard::KeyStroke::simple(KeyCode::Right),
+                bmux_keyboard::KeyStroke::simple(KeyCode::Down),
             ));
         }
         assert_eq!(surface.selected_run_id.as_deref(), Some("run-099"));

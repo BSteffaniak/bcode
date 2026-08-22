@@ -9857,6 +9857,51 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Return the newest bounded canonical failure events for one run in chronological order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` is invalid, JSON is malformed, or the query fails.
+    pub fn failure_history(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowEventRow>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT event_seq, run_id, event_type, payload_json, created_at_ms \
+             FROM workflow_events WHERE run_id = ?1 AND event_type IN (\
+               'attempt_failed', 'fan_out_member_failed', 'run_failed', \
+               'parallel_join_failed', 'mutation_approval_denied', \
+               'mutation_approval_expired', 'run_deadline_elapsed') \
+             ORDER BY event_seq DESC LIMIT ?2",
+        )?;
+        let mut events = statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (event_seq, run_id, event_type, payload_json, created_at_ms) = row?;
+                Ok(WorkflowEventRow {
+                    event_seq,
+                    run_id,
+                    event_type,
+                    payload: serde_json::from_str(&payload_json)?,
+                    created_at_ms,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkflowStoreError>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
     /// Return keyset-paged workflow events after `after_sequence`.
     ///
     /// # Errors
@@ -17790,6 +17835,44 @@ mod tests {
                 .status,
             RunStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn failure_history_returns_newest_bounded_canonical_diagnostics_in_order() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = definition("example");
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("transaction");
+        append_event(
+            &transaction,
+            "run-1",
+            "attempt_failed",
+            &serde_json::json!({"message": "first"}).to_string(),
+            2,
+        )
+        .expect("first failure");
+        append_event(&transaction, "run-1", "run_paused", "{}", 3).expect("non-failure");
+        append_event(
+            &transaction,
+            "run-1",
+            "run_failed",
+            &serde_json::json!({"reason": "second"}).to_string(),
+            4,
+        )
+        .expect("second failure");
+        transaction.commit().expect("commit");
+
+        let events = store.failure_history("run-1", 2).expect("failure history");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "attempt_failed");
+        assert_eq!(events[1].event_type, "run_failed");
     }
 
     #[test]

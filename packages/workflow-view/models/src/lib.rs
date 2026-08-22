@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current workflow projection schema version.
-pub const WORKFLOW_VIEW_VERSION: u32 = 2;
+pub const WORKFLOW_VIEW_VERSION: u32 = 3;
 
 /// Current workflow live-event contract version.
 pub const WORKFLOW_LIVE_EVENT_VERSION: u32 = 1;
@@ -377,6 +377,8 @@ pub struct WorkflowRunView {
     pub mutation_approvals: Vec<WorkflowMutationApprovalView>,
     pub attempts: Vec<WorkflowAttemptView>,
     pub outputs: Vec<WorkflowOutputView>,
+    /// Bounded canonical diagnostics explaining terminal or node failure.
+    pub failure_diagnostics: Vec<WorkflowFailureDiagnostic>,
     pub descendant_runs: Vec<WorkflowDescendantRunView>,
     pub child_sessions: Vec<WorkflowChildSessionView>,
     pub actions: Vec<WorkflowActionAffordance>,
@@ -529,6 +531,25 @@ pub struct WorkflowAttemptView {
     pub terminal_at_ms: Option<u64>,
 }
 
+/// Renderer-neutral diagnostic for one canonical workflow failure event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowFailureDiagnostic {
+    /// Canonical event classification, such as `attempt_failed`.
+    pub kind: String,
+    /// Human-readable bounded reason for the failure.
+    pub message: String,
+    /// Exact node identity when the canonical event provides one.
+    pub node_id: Option<String>,
+    /// Exact activation identity when the canonical event provides one.
+    pub activation_id: Option<String>,
+    /// Exact dispatch identity when the canonical event provides one.
+    pub dispatch_identity: Option<String>,
+    /// Canonical event sequence used for deterministic ordering.
+    pub event_sequence: u64,
+    pub occurred_at_ms: u64,
+}
+
 /// Availability of a canonical validated output value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "availability", rename_all = "snake_case")]
@@ -664,6 +685,7 @@ mod live_event_tests {
             mutation_approvals: Vec::new(),
             attempts: Vec::new(),
             outputs: Vec::new(),
+            failure_diagnostics: Vec::new(),
             descendant_runs: Vec::new(),
             child_sessions: Vec::new(),
             actions: vec![WorkflowActionAffordance {

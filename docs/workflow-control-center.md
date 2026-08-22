@@ -5,6 +5,7 @@ Open the plugin-owned workflow operations workspace with `/workflow`.
 The surface subscribes to durable workflow notifications and performs bounded semantic refetches. It presents:
 
 * a paginated run catalog with search, filter, sort, and grouping controls;
+* bounded canonical failure diagnostics for failed runs and attempts;
 * a responsive execution graph and tabbed inspector for the selected run;
 * exact selected inputs, approvals, attempts, outputs, child sessions, and definition provenance;
 * contextual enabled and disabled actions with their exact visible targets;
@@ -14,8 +15,17 @@ Wide terminals use Runs, Graph, and Inspector panes. Medium terminals combine th
 
 ## Navigation
 
-* Left / Right or `h` / `l`: select the previous or next run.
-* Up / Down or `k` / `j`: select a graph node; when the Inspector has focus, select an exact input, output, attempt, approval, or child session.
+Keyboard navigation is scoped to the focused pane. `Tab` changes pane focus; clicking a pane focuses
+it. Interactive tables, tabs, action buttons, and scrollable selections use BMUX component keyboard
+and mouse handling.
+
+* In Runs, Up / Down or `k` / `j` selects the previous or next run.
+* In Graph, Up / Down or `k` / `j` selects a graph node.
+* In Inspector, Left / Right changes sections and Up / Down selects an exact input, output, attempt,
+  approval, or child session.
+* In Actions, Left / Right changes the active action and Enter activates it.
+* Mouse clicks focus panes and select run rows, inspector tabs, narrow-layout pages, and actions;
+  wheel input moves the focused run, graph, or inspector selection.
 * `Tab`: move workspace focus; on narrow terminals it also advances the active page.
 * `1` through `4`: open the narrow Runs, Graph, Inspector, or Actions page.
 * `[` / `]`: select the previous or next Inspector section.
@@ -25,6 +35,10 @@ Wide terminals use Runs, Graph, and Inspector panes. Medium terminals combine th
 * `m`: load the next bounded catalog page when available.
 
 Selection uses stable workflow identities. Live catalog reorder does not silently retarget the selected run, node, wait, approval, attempt, output, or child session.
+
+Failed runs show bounded canonical diagnostics in Overview and associate recorded failure messages
+with exact attempts when dispatch or activation identity is available. Diagnostics come from the
+server-owned workflow event history; the TUI does not reinterpret raw workflow events.
 
 ## Exact workflow actions
 
