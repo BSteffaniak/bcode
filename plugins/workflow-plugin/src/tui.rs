@@ -184,6 +184,15 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 narrow_tab_state: TabBarState::new(Some(0)),
                 action_row_state: ActionRowState::new(),
                 workspace_areas: WorkflowWorkspaceAreas::default(),
+                workspace_mode: WorkflowWorkspaceMode::Discover,
+                workspace_mode_state: TabBarState::new(Some(0)),
+                discover_areas: WorkflowDiscoverAreas::default(),
+                launch_table_state: TableState::new(None),
+                selected_launch_source: None,
+                launch_detail: None,
+                launch_detail_loading: false,
+                launch_detail_error: None,
+                launch_detail_updates: None,
                 selected_run_id: None,
                 selected_node_id: None,
                 selected_wait_id: None,
@@ -220,6 +229,36 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
             }) as BoxedPluginTuiSurface)
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowWorkspaceMode {
+    Discover,
+    Runs,
+}
+
+impl WorkflowWorkspaceMode {
+    const fn index(self) -> usize {
+        match self {
+            Self::Discover => 0,
+            Self::Runs => 1,
+        }
+    }
+
+    const fn from_index(index: usize) -> Self {
+        if index == 1 {
+            Self::Runs
+        } else {
+            Self::Discover
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkflowDiscoverAreas {
+    tabs: Rect,
+    catalog: Rect,
+    detail: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +522,19 @@ struct WorkflowStatusSurface {
     narrow_tab_state: TabBarState,
     action_row_state: ActionRowState,
     workspace_areas: WorkflowWorkspaceAreas,
+    workspace_mode: WorkflowWorkspaceMode,
+    workspace_mode_state: TabBarState,
+    discover_areas: WorkflowDiscoverAreas,
+    launch_table_state: TableState,
+    selected_launch_source: Option<bcode_workflow::WorkflowLaunchSourceIdentity>,
+    launch_detail: Option<bcode_workflow::WorkflowLaunchDetail>,
+    launch_detail_loading: bool,
+    launch_detail_error: Option<String>,
+    launch_detail_updates: Option<
+        tokio::sync::mpsc::Receiver<
+            Result<bcode_workflow::WorkflowLaunchDetail, bcode_plugin_sdk::tui::PluginTuiHostError>,
+        >,
+    >,
     selected_run_id: Option<String>,
     selected_node_id: Option<String>,
     selected_wait_id: Option<(String, String)>,
@@ -936,6 +988,202 @@ impl WorkflowStatusSurface {
             );
         }
         areas
+    }
+
+    fn calculate_discover_areas(area: Rect) -> WorkflowDiscoverAreas {
+        if area.width < 24 || area.height < 4 {
+            return WorkflowDiscoverAreas::default();
+        }
+        let tabs = Rect::new(area.x, area.y, area.width, 1);
+        let body = Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        );
+        if area.width >= 80 {
+            let catalog_width = body.width.saturating_mul(42) / 100;
+            WorkflowDiscoverAreas {
+                tabs,
+                catalog: Rect::new(body.x, body.y, catalog_width, body.height),
+                detail: Rect::new(
+                    body.x.saturating_add(catalog_width).saturating_add(1),
+                    body.y,
+                    body.width.saturating_sub(catalog_width).saturating_sub(1),
+                    body.height,
+                ),
+            }
+        } else {
+            WorkflowDiscoverAreas {
+                tabs,
+                catalog: body,
+                detail: Rect::new(0, 0, 0, 0),
+            }
+        }
+    }
+
+    fn render_workspace_modes(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+    ) {
+        let modes = [
+            TabItem::new("discover", "Discover"),
+            TabItem::new("runs", "Runs"),
+        ];
+        TabBar::new(&modes)
+            .styles(TabBarStyles {
+                normal: theme.muted,
+                selected: theme.selected,
+                focused: theme.focused,
+                hovered: theme.focused,
+                pressed: theme.selected,
+                disabled: theme.muted,
+                separator: theme.component.border,
+            })
+            .render(area, &self.workspace_mode_state, frame);
+    }
+
+    fn render_discover_workspace(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+    ) {
+        self.render_workspace_modes(self.discover_areas.tabs, frame, theme);
+        let catalog_inner = Self::render_focused_pane(
+            self.discover_areas.catalog,
+            frame,
+            theme,
+            "Launchable workflows",
+            true,
+        );
+        self.render_launch_catalog(catalog_inner, frame, theme);
+        if !self.discover_areas.detail.is_empty() {
+            let detail_inner = Self::render_focused_pane(
+                self.discover_areas.detail,
+                frame,
+                theme,
+                "Workflow preview",
+                false,
+            );
+            self.render_launch_detail(detail_inner, frame, theme);
+        }
+        if area.width < 80 {
+            let detail_height = area.height.saturating_sub(self.discover_areas.tabs.height) / 2;
+            if detail_height > 3 {
+                let detail = Rect::new(
+                    self.discover_areas.catalog.x,
+                    self.discover_areas
+                        .catalog
+                        .bottom()
+                        .saturating_sub(detail_height),
+                    self.discover_areas.catalog.width,
+                    detail_height,
+                );
+                let inner =
+                    Self::render_focused_pane(detail, frame, theme, "Workflow preview", false);
+                self.render_launch_detail(inner, frame, theme);
+            }
+        }
+    }
+
+    fn render_launch_catalog(
+        &self,
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+    ) {
+        let Some(page) = self.launch_catalog.as_ref() else {
+            let message =
+                self.launch_catalog_error
+                    .as_deref()
+                    .unwrap_or(if self.launch_catalog_loading {
+                        "Discovering workflows…"
+                    } else {
+                        "No launch catalog loaded"
+                    });
+            frame.write_line(
+                area,
+                &Line::from_spans(vec![Span::styled(
+                    message,
+                    if self.launch_catalog_error.is_some() {
+                        theme.error
+                    } else {
+                        theme.muted
+                    },
+                )]),
+            );
+            return;
+        };
+        if page.items.is_empty() {
+            frame.write_line(
+                area,
+                &Line::from_spans(vec![Span::styled(
+                    "No workflows discovered in configured roots",
+                    theme.muted,
+                )]),
+            );
+            return;
+        }
+        let columns = [
+            TableColumn::new("Workflow").flex(3),
+            TableColumn::new("Source").flex(2),
+            TableColumn::new("Readiness").flex(2),
+        ];
+        let rows = page
+            .items
+            .iter()
+            .map(|item| {
+                TableRow::rich(vec![
+                    Line::from(item.title.clone()),
+                    Line::from(item.source_label.clone()),
+                    Line::from(format!("{:?}", item.readiness)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        Table::new(&columns, &rows)
+            .styles(TableStyles {
+                header: theme.focused,
+                row: theme.text,
+                selected: theme.selected,
+                selected_column: theme.selected,
+                selected_cell: theme.warning,
+                hovered: theme.focused,
+                disabled: theme.muted,
+                separator: theme.component.border,
+                empty: theme.muted,
+            })
+            .render(area, &self.launch_table_state, frame);
+    }
+
+    fn render_launch_detail(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+        let lines = if self.launch_detail_loading {
+            vec![Line::from("Loading exact workflow preview…")]
+        } else if let Some(error) = &self.launch_detail_error {
+            vec![Line::from_spans(vec![Span::styled(error, theme.error)])]
+        } else if let Some(detail) = &self.launch_detail {
+            launch_detail_lines(detail, theme)
+        } else if let Some(page) = &self.launch_catalog {
+            page.items
+                .iter()
+                .find(|item| self.selected_launch_source.as_ref() == Some(&item.source))
+                .map_or_else(
+                    || vec![Line::from("Select a discovered workflow")],
+                    |item| launch_item_lines(item, theme),
+                )
+        } else {
+            vec![Line::from("Select a discovered workflow")]
+        };
+        TextView::new(&lines)
+            .policy(TextViewPolicy::scrollable())
+            .styles(TextViewStyles {
+                text: theme.text,
+                empty: theme.muted,
+                background: theme.canvas,
+            })
+            .render(area, &self.text_view, frame);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2087,15 +2335,134 @@ impl WorkflowStatusSurface {
         PluginTuiAction::None
     }
 
+    fn request_launch_detail(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let (Some(workspace), Some(source)) = (
+            self.launch_workspace.clone(),
+            self.selected_launch_source.clone(),
+        ) else {
+            return PluginTuiAction::None;
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        self.launch_detail_updates = Some(receiver);
+        self.launch_detail_loading = true;
+        self.launch_detail_error = None;
+        let future = host.workflow_launch_detail(bcode_workflow::WorkflowLaunchDetailRequest {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            workspace,
+            source,
+        });
+        host.spawn(Box::pin(async move {
+            let _ = sender.send(future.await).await;
+        }));
+        PluginTuiAction::Redraw
+    }
+
+    fn select_launch_index(&mut self, index: usize, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let source = self
+            .launch_catalog
+            .as_ref()
+            .and_then(|page| page.items.get(index))
+            .map(|item| item.source.clone());
+        let Some(source) = source else {
+            return PluginTuiAction::None;
+        };
+        self.launch_table_state.set_selected(Some(index));
+        if self.selected_launch_source.as_ref() == Some(&source) && self.launch_detail.is_some() {
+            return PluginTuiAction::Redraw;
+        }
+        self.selected_launch_source = Some(source);
+        self.launch_detail = None;
+        self.request_launch_detail(host)
+    }
+
+    fn handle_discover_components(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiAction {
+        let modes = [
+            TabItem::new("discover", "Discover"),
+            TabItem::new("runs", "Runs"),
+        ];
+        match TabBar::new(&modes).handle_event(
+            self.discover_areas.tabs,
+            &mut self.workspace_mode_state,
+            event,
+        ) {
+            TabBarOutcome::Selected(index) => {
+                self.workspace_mode = WorkflowWorkspaceMode::from_index(index);
+                return PluginTuiAction::Redraw;
+            }
+            TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
+            TabBarOutcome::Ignored => {}
+        }
+        let Some(page) = self.launch_catalog.as_ref() else {
+            return PluginTuiAction::None;
+        };
+        let columns = [
+            TableColumn::new("Workflow").flex(3),
+            TableColumn::new("Source").flex(2),
+            TableColumn::new("Readiness").flex(2),
+        ];
+        let rows = page
+            .items
+            .iter()
+            .map(|item| {
+                TableRow::new(vec![
+                    item.title.as_str(),
+                    item.source_label.as_str(),
+                    match item.readiness {
+                        bcode_workflow::WorkflowLaunchReadiness::Ready => "Ready",
+                        bcode_workflow::WorkflowLaunchReadiness::Unpublished => "Unpublished",
+                        bcode_workflow::WorkflowLaunchReadiness::Drifted => "Drifted",
+                        bcode_workflow::WorkflowLaunchReadiness::Invalid => "Invalid",
+                        bcode_workflow::WorkflowLaunchReadiness::Ambiguous => "Ambiguous",
+                        bcode_workflow::WorkflowLaunchReadiness::Unavailable => "Unavailable",
+                    },
+                ])
+            })
+            .collect::<Vec<_>>();
+        match Table::new(&columns, &rows).handle_event(
+            self.discover_areas.catalog,
+            &mut self.launch_table_state,
+            event,
+        ) {
+            TableOutcome::Focused(index) | TableOutcome::Selected(index) => {
+                self.select_launch_index(index, host)
+            }
+            TableOutcome::Redraw => PluginTuiAction::Redraw,
+            TableOutcome::Ignored => PluginTuiAction::None,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_control_center_event(&mut self, event: &Event) -> PluginTuiAction {
+        self.handle_control_center_event_with_host(event, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_control_center_event_with_host(
+        &mut self,
+        event: &Event,
+        host: Option<&dyn PluginTuiHost>,
+    ) -> PluginTuiAction {
         if self.pending_confirmation.is_none()
             && self.input_form.is_none()
             && self.catalog_search_buffer.is_none()
         {
-            let action = self.handle_workspace_components(event);
-            if !matches!(action, PluginTuiAction::None) {
-                return action;
+            if self.workspace_mode == WorkflowWorkspaceMode::Discover {
+                let Some(host) = host else {
+                    return PluginTuiAction::None;
+                };
+                let action = self.handle_discover_components(event, host);
+                if !matches!(action, PluginTuiAction::None) {
+                    return action;
+                }
+            } else {
+                let action = self.handle_workspace_components(event);
+                if !matches!(action, PluginTuiAction::None) {
+                    return action;
+                }
             }
         }
         let Event::Key(key) = event else {
@@ -2764,7 +3131,18 @@ impl WorkflowStatusSurface {
         let pane_state = PaneState::new(area);
         pane.render(&pane_state, frame);
         let content = pane.inner_area(&pane_state);
-        self.workspace_areas = self.calculate_workspace_areas(content, theme);
+        let mode_tabs = Rect::new(content.x, content.y, content.width, 1);
+        let mode_content = Rect::new(
+            content.x,
+            content.y.saturating_add(1),
+            content.width,
+            content.height.saturating_sub(1),
+        );
+        self.workspace_mode_state
+            .set_selected(Some(self.workspace_mode.index()));
+        self.discover_areas = Self::calculate_discover_areas(content);
+        self.discover_areas.tabs = mode_tabs;
+        self.workspace_areas = self.calculate_workspace_areas(mode_content, theme);
         let selected_run = self.catalog.as_ref().and_then(|catalog| {
             self.selected_run_id
                 .as_deref()
@@ -2779,6 +3157,14 @@ impl WorkflowStatusSurface {
             .set_focused(self.workspace_focus == WorkflowWorkspaceFocus::Inspector);
         self.narrow_tab_state
             .set_selected(Some(self.narrow_page.index()));
+        let selected_launch = self.launch_catalog.as_ref().and_then(|page| {
+            self.selected_launch_source
+                .as_ref()
+                .and_then(|selected| page.items.iter().position(|item| &item.source == selected))
+        });
+        self.launch_table_state.set_selected(selected_launch);
+        self.launch_table_state.interaction.focused =
+            self.workspace_mode == WorkflowWorkspaceMode::Discover;
         self.action_row_state.interaction.focused =
             self.workspace_focus == WorkflowWorkspaceFocus::Actions;
         if let Some(confirmation) = &self.pending_confirmation {
@@ -2790,7 +3176,15 @@ impl WorkflowStatusSurface {
             return;
         }
         if self.subscription_requested || self.catalog.is_some() {
-            self.render_workspace(content, frame, theme);
+            match self.workspace_mode {
+                WorkflowWorkspaceMode::Discover => {
+                    self.render_discover_workspace(content, frame, theme);
+                }
+                WorkflowWorkspaceMode::Runs => {
+                    self.render_workspace_modes(mode_tabs, frame, theme);
+                    self.render_workspace(mode_content, frame, theme);
+                }
+            }
             return;
         }
         let rows = surface_lines(&self.options, self.selected_approval)
@@ -2865,10 +3259,30 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             self.launch_catalog_loading = false;
             match result {
                 Ok(page) => {
+                    self.selected_launch_source = self
+                        .selected_launch_source
+                        .take()
+                        .filter(|selected| page.items.iter().any(|item| &item.source == selected))
+                        .or_else(|| page.items.first().map(|item| item.source.clone()));
                     self.launch_catalog = Some(page);
                     self.launch_catalog_error = None;
                 }
                 Err(error) => self.launch_catalog_error = Some(error.to_string()),
+            }
+            return PluginTuiAction::Redraw;
+        }
+        if let Some(receiver) = self.launch_detail_updates.as_mut()
+            && let Ok(result) = receiver.try_recv()
+        {
+            self.launch_detail_loading = false;
+            match result {
+                Ok(detail) => {
+                    if self.selected_launch_source.as_ref() == Some(&detail.item.source) {
+                        self.launch_detail = Some(detail);
+                        self.launch_detail_error = None;
+                    }
+                }
+                Err(error) => self.launch_detail_error = Some(error.to_string()),
             }
             return PluginTuiAction::Redraw;
         }
@@ -3138,9 +3552,9 @@ impl PluginTuiSurface for WorkflowStatusSurface {
         }
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if self.subscription_requested || self.catalog.is_some() {
-            return self.handle_control_center_event(event);
+            return self.handle_control_center_event_with_host(event, Some(host));
         }
         let approval_count =
             mutation_approvals(&self.options).map_or(0, <[serde_json::Value]>::len);
@@ -3180,6 +3594,101 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             _ => PluginTuiAction::None,
         }
     }
+}
+
+fn launch_item_lines(
+    item: &bcode_workflow::WorkflowLaunchCatalogItem,
+    theme: WorkflowSurfaceTheme,
+) -> Vec<Line> {
+    let readiness_style = match item.readiness {
+        bcode_workflow::WorkflowLaunchReadiness::Ready => theme.success,
+        bcode_workflow::WorkflowLaunchReadiness::Unpublished
+        | bcode_workflow::WorkflowLaunchReadiness::Drifted => theme.warning,
+        bcode_workflow::WorkflowLaunchReadiness::Invalid
+        | bcode_workflow::WorkflowLaunchReadiness::Ambiguous
+        | bcode_workflow::WorkflowLaunchReadiness::Unavailable => theme.error,
+    };
+    let mut lines = vec![
+        Line::from_spans(vec![Span::styled(
+            item.title.clone(),
+            theme.focused.add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(
+            item.description
+                .clone()
+                .unwrap_or_else(|| "No description".to_string()),
+        ),
+        Line::from(format!("Source: {}", item.source_label)),
+        Line::from_spans(vec![Span::styled(
+            format!("Readiness: {:?}", item.readiness),
+            readiness_style,
+        )]),
+    ];
+    if let Some(reason) = &item.unavailable_reason {
+        lines.push(Line::from_spans(vec![Span::styled(reason, theme.warning)]));
+    }
+    lines.push(Line::from(format!(
+        "Requirements: {} plugins · {} blocks · {} agents",
+        item.requirements.plugins.len(),
+        item.requirements.blocks.len(),
+        item.requirements.agents.len()
+    )));
+    lines.push(Line::from(format!(
+        "Capability: {:?} · resources: {}",
+        item.effects.maximum_capability,
+        item.effects.resources.len()
+    )));
+    if let Some(publication) = &item.publication {
+        lines.push(Line::from(format!(
+            "Published: {} revision {} · {} v{}",
+            publication.workflow_id,
+            publication.revision,
+            publication.definition_identity.definition_id,
+            publication.definition_identity.definition_version
+        )));
+    }
+    lines.push(Line::from("Actions:"));
+    lines.extend(item.actions.iter().map(|action| {
+        Line::from(format!(
+            "  {} {:?}{}",
+            if action.enabled { "✓" } else { "–" },
+            action.kind,
+            action
+                .unavailable_reason
+                .as_ref()
+                .map_or_else(String::new, |reason| format!(" · {reason}"))
+        ))
+    }));
+    lines
+}
+
+fn launch_detail_lines(
+    detail: &bcode_workflow::WorkflowLaunchDetail,
+    theme: WorkflowSurfaceTheme,
+) -> Vec<Line> {
+    let mut lines = launch_item_lines(&detail.item, theme);
+    lines.extend([
+        Line::from(""),
+        Line::from(format!(
+            "Graph: {} nodes · {} edges · {} entries · {} exits",
+            detail.document.definition.nodes.len(),
+            detail.document.definition.edges.len(),
+            detail.document.definition.entries.len(),
+            detail.document.definition.exits.len()
+        )),
+        Line::from(format!(
+            "Input schema: {}",
+            detail.document.definition.input.type_name
+        )),
+        Line::from(format!(
+            "Configuration schema: {}",
+            detail.document.configuration_schema.type_name
+        )),
+    ]);
+    for node in detail.document.definition.nodes.values() {
+        lines.push(Line::from(format!("  • {} · {:?}", node.name, node.kind)));
+    }
+    lines
 }
 
 fn workflow_input_pane(title: &'static str) -> Pane<'static> {
@@ -4942,6 +5451,15 @@ mod tests {
             narrow_tab_state: TabBarState::new(Some(0)),
             action_row_state: ActionRowState::new(),
             workspace_areas: WorkflowWorkspaceAreas::default(),
+            workspace_mode: WorkflowWorkspaceMode::Runs,
+            workspace_mode_state: TabBarState::new(Some(1)),
+            discover_areas: WorkflowDiscoverAreas::default(),
+            launch_table_state: TableState::new(None),
+            selected_launch_source: None,
+            launch_detail: None,
+            launch_detail_loading: false,
+            launch_detail_error: None,
+            launch_detail_updates: None,
             selected_run_id: Some("run-1".to_string()),
             selected_node_id: Some("reviewer".to_string()),
             selected_wait_id: Some(("approval".to_string(), "approval-activation".to_string())),
@@ -6574,6 +7092,93 @@ mod tests {
         .join("\n");
         assert!(overview.contains("review provider rejected the request"));
         assert!(attempts.contains("Failure: review provider rejected the request"));
+    }
+
+    #[test]
+    fn discover_workspace_renders_launch_catalog_and_exact_detail() {
+        let mut surface = projected_surface();
+        surface.workspace_mode = WorkflowWorkspaceMode::Discover;
+        let document = bcode_workflow::WorkflowAuthoringDocument {
+            schema_version: bcode_workflow::WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+            workflow_id: "discovered".to_string(),
+            metadata: bcode_workflow::WorkflowAuthoringMetadata {
+                title: "Discovered workflow".to_string(),
+                description: Some("Launch from source".to_string()),
+                labels: std::collections::BTreeMap::new(),
+            },
+            configuration_schema: bcode_workflow::ValueSchema {
+                type_name: "config/v1".to_string(),
+                schema: serde_json::json!({}),
+            },
+            configuration_defaults: None,
+            plugin_input_defaults: std::collections::BTreeMap::new(),
+            definition: bcode_workflow::WorkflowDefinition {
+                schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "discovered".to_string(),
+                input: bcode_workflow::ValueSchema {
+                    type_name: "input/v1".to_string(),
+                    schema: serde_json::json!({}),
+                },
+                output: bcode_workflow::ValueSchema {
+                    type_name: "output/v1".to_string(),
+                    schema: serde_json::json!({}),
+                },
+                nodes: std::collections::BTreeMap::new(),
+                entries: Vec::new(),
+                exits: Vec::new(),
+                edges: Vec::new(),
+            },
+            bindings: Vec::new(),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            run_limits: bcode_workflow::WorkflowRunLimitPolicy::default(),
+            producer: bcode_workflow::WorkflowProducerProvenance {
+                kind: bcode_workflow::WorkflowProducerKind::Human,
+                producer_id: None,
+                source_revision: None,
+            },
+            presentation: None,
+        };
+        let item = bcode_workflow::WorkflowLaunchCatalogItem {
+            source: bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource {
+                source_path: std::path::PathBuf::from("/tmp/discovered.workflow.yaml"),
+                source_format: bcode_workflow::WorkflowSourceFormat::Yaml,
+            },
+            source_label: "explicit".to_string(),
+            precedence: 0,
+            title: "Discovered workflow".to_string(),
+            description: Some("Launch from source".to_string()),
+            readiness: bcode_workflow::WorkflowLaunchReadiness::Unpublished,
+            unavailable_reason: Some("publish first".to_string()),
+            package_lock_digest_sha256: None,
+            publication: None,
+            actions: Vec::new(),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            permissions: bcode_workflow::WorkflowPermissionPreview::default(),
+            input_schema: document.definition.input.clone(),
+            configuration_schema: document.configuration_schema.clone(),
+            diagnostics: Vec::new(),
+        };
+        surface.selected_launch_source = Some(item.source.clone());
+        surface.launch_catalog = Some(bcode_workflow::WorkflowLaunchCatalogPage {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            items: vec![item.clone()],
+            diagnostics: Vec::new(),
+            next_cursor: None,
+        });
+        surface.launch_detail = Some(bcode_workflow::WorkflowLaunchDetail {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            item,
+            document,
+            package_plan: None,
+        });
+
+        let rendered = render_workspace_text(&mut surface, 132, 30);
+        assert!(rendered.contains("Discover"));
+        assert!(rendered.contains("Launchable workflows"));
+        assert!(rendered.contains("Discovered workflow"));
+        assert!(rendered.contains("Graph: 0 nodes"));
+        assert!(rendered.contains("Input schema: input/v1"));
     }
 
     #[test]
