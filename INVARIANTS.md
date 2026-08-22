@@ -10,6 +10,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Product semantics are frontend-independent.** Terminal, web, desktop, SDK, and future clients may present behavior differently, but no frontend exclusively defines shared product behavior.
 * **Clients use defined application boundaries.** Frontends and integrations must not acquire private daemon, persistence, or provider implementation details to perform application behavior.
 * **Daemon artifact versions are isolated.** A client may connect only to the exact daemon artifact identity it targets; when no matching daemon is available, startup coordination launches one matching daemon without replacing, blocking, or depending on other artifact versions.
+* **Daemon state locations are isolated.** A client may connect only to a daemon serving the state location it resolved; daemons serving different state locations coexist without sharing endpoints, registries, or coordination state.
 
 ## Package and dependency ownership
 
@@ -40,12 +41,13 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 ## Session persistence
 
 * **Event history is canonical.** The canonical session event store is authoritative; catalogs, manifests, projections, indexes, and in-memory views are derived.
-* **A session has one canonical storage path.** Writer identity, build identity, process, and frontend must not select alternate canonical storage for the same session ID.
+* **A session has one canonical storage path.** Exactly one state location owns a session's canonical storage, and the path within that location derives only from the session ID. Writer identity, build identity, process, frontend, and aggregated discovery must not select alternate canonical storage for the same session ID, and an unavailable or unverifiable location must not resolve to a substitute location.
 * **Normal session reads are bounded and non-mutating.** Catalog, open, attach, history, renderer, and model-context paths must not migrate, repair, reindex, or full-replay session history.
 * **Damage is surfaced rather than concealed.** Missing, stale, corrupt, ambiguous, future, or inconsistent derived state produces a degraded or repair-required result unless trustworthy sidecars permit bounded incremental catch-up.
 * **Repair is explicit.** Full replay, reconstruction, reindexing, migration, and repair occur only through explicit maintenance operations with their required ownership and safety checks.
 * **Historical session behavior is migration-owned.** The session runtime and session models contain only current-format behavior. Historical classification, legacy payload handling, migration planning, and conversion belong to the session-migration domain. The session domain may expose narrowly scoped current-format migration-target capabilities without owning historical policy.
-* **Canonical history is never silently merged.** Duplicate or historical session roots must not be merged automatically.
+* **Canonical history is never silently merged.** Duplicate or historical session roots must not be merged automatically. When more than one state location claims the same session ID, the conflict is surfaced and no location is opened as authoritative until an explicit maintenance operation resolves it.
+* **Aggregated session discovery does not confer authority.** Session discovery may span multiple state locations, but a session's mutations, ownership, and repair apply only to the location that owns its canonical storage.
 * **Released session ownership is completely released.** When a session's runtime ownership is released, its lease, database connection, and derived handles are relinquished together; a released session must not retain process-level locks that block a later verified owner.
 
 ## Runtime, tools, and permissions
