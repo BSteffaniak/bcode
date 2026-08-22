@@ -1188,49 +1188,19 @@ async fn handle_workflow_package_command(
     command: WorkflowPackageCommand,
 ) -> Result<(), CliError> {
     if let WorkflowPackageCommand::Discover { workspace, limit } = command {
-        let workspace = workspace.map_or_else(std::env::current_dir, fs::canonicalize)?;
-        let config = bcode_config::load_config()?;
-        let mut snapshots = Vec::new();
-        for package in discover_workflow_packages(&workspace, &config, limit)? {
-            let closure = read_workflow_package_closure(&package.manifest)?;
-            let validation = client
-                .validate_workflow_package(bcode_ipc::WorkflowPackageComputationRequest {
-                    closure,
-                    control: bcode_ipc::WorkflowComputationControl::default(),
-                })
-                .await?;
-            let entry_index = validation
-                .plan
-                .packages
-                .iter()
-                .position(|entry| entry.package_id == validation.plan.entry_package_id)
-                .ok_or_else(|| {
-                    CliError::InvalidArguments(
-                        "planned package closure has no entry package".to_string(),
-                    )
-                })?;
-            let entry = &validation.plan.packages[entry_index];
-            let preview = client
-                .preview_workflow_package(bcode_ipc::WorkflowPackagePreviewRequest {
-                    plan: entry.plan.clone(),
-                    dependency_plans: validation.plan.packages[..entry_index]
-                        .iter()
-                        .map(|package| package.plan.clone())
-                        .collect(),
-                    configurations: std::collections::BTreeMap::new(),
-                    control: bcode_ipc::WorkflowComputationControl::default(),
-                })
-                .await?;
-            let receipt = client
-                .workflow_package_publication(package.package_id.clone())
-                .await?;
-            snapshots.push(workflow_package_discovery_snapshot(
-                package,
-                &preview,
-                receipt.as_ref(),
-            )?);
-        }
-        print_json(&snapshots)?;
+        let workspace = workspace.map_or_else(std::env::current_dir, Ok)?;
+        let page = client
+            .workflow_launch_catalog(bcode_workflow::WorkflowLaunchCatalogRequest {
+                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                workspace,
+                limit,
+                cursor: None,
+                search: None,
+                source_kind: None,
+                readiness: None,
+            })
+            .await?;
+        print_json(&page)?;
         return Ok(());
     }
     if let WorkflowPackageCommand::Publish {
@@ -1527,226 +1497,6 @@ fn read_workflow_package_manifest(
         .validate()
         .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
     Ok(manifest)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowPackageLockState {
-    Unpublished,
-    Published,
-    Drifted,
-}
-
-/// Portable package discovery and preview details exposed without private store access.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPackageDiscoverySnapshot {
-    pub package_id: String,
-    pub source: String,
-    pub manifest: PathBuf,
-    pub precedence: u32,
-    pub package_lock_digest_sha256: String,
-    pub lock_state: WorkflowPackageLockState,
-    pub requirements: bcode_workflow::WorkflowRequirementSummary,
-    pub effects: bcode_workflow::WorkflowEffectSummary,
-    pub permissions: bcode_workflow::WorkflowPermissionPreview,
-    pub diagnostics: Vec<bcode_workflow::WorkflowValidationDiagnostic>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct DiscoveredWorkflowPackage {
-    package_id: String,
-    source: String,
-    manifest: PathBuf,
-    precedence: u32,
-}
-
-fn workflow_package_lock_state(
-    receipt: Option<&bcode_workflow::WorkflowPackagePublicationReceipt>,
-    package_lock_digest_sha256: &str,
-) -> WorkflowPackageLockState {
-    receipt.map_or(WorkflowPackageLockState::Unpublished, |receipt| {
-        if receipt.package_lock_digest_sha256 == package_lock_digest_sha256 {
-            WorkflowPackageLockState::Published
-        } else {
-            WorkflowPackageLockState::Drifted
-        }
-    })
-}
-
-fn workflow_package_discovery_snapshot(
-    package: DiscoveredWorkflowPackage,
-    preview: &bcode_workflow::WorkflowPackagePreview,
-    receipt: Option<&bcode_workflow::WorkflowPackagePublicationReceipt>,
-) -> Result<WorkflowPackageDiscoverySnapshot, CliError> {
-    let package_lock_digest_sha256 = preview
-        .lock
-        .digest_sha256()
-        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
-    let mut requirements = bcode_workflow::WorkflowRequirementSummary::default();
-    let mut effects = bcode_workflow::WorkflowEffectSummary::default();
-    let mut permissions = bcode_workflow::WorkflowPermissionPreview::default();
-    let mut diagnostics = Vec::new();
-    for member in &preview.members {
-        diagnostics.extend(member.compilation.validation.diagnostics.clone());
-        if let Some(compiled) = &member.compilation.compiled {
-            requirements
-                .capabilities
-                .extend(compiled.requirements.capabilities.iter().cloned());
-            requirements
-                .plugins
-                .extend(compiled.requirements.plugins.iter().cloned());
-            requirements
-                .blocks
-                .extend(compiled.requirements.blocks.iter().cloned());
-            requirements
-                .agents
-                .extend(compiled.requirements.agents.iter().cloned());
-            effects.maximum_capability = effects
-                .maximum_capability
-                .max(compiled.effects.maximum_capability);
-            effects
-                .block_effects
-                .extend(compiled.effects.block_effects.iter().copied());
-            effects
-                .reconciliation
-                .extend(compiled.effects.reconciliation.iter().copied());
-            effects.resources.extend(compiled.effects.resources.clone());
-            permissions.maximum_capability = permissions
-                .maximum_capability
-                .max(compiled.permissions.maximum_capability);
-            permissions
-                .explicit_grant_nodes
-                .extend(compiled.permissions.explicit_grant_nodes.clone());
-            permissions
-                .mutation_approval_nodes
-                .extend(compiled.permissions.mutation_approval_nodes.clone());
-        }
-    }
-    effects.resources.sort();
-    effects.resources.dedup();
-    permissions.explicit_grant_nodes.sort();
-    permissions.explicit_grant_nodes.dedup();
-    permissions.mutation_approval_nodes.sort();
-    permissions.mutation_approval_nodes.dedup();
-    let lock_state = workflow_package_lock_state(receipt, &package_lock_digest_sha256);
-    Ok(WorkflowPackageDiscoverySnapshot {
-        package_id: package.package_id,
-        source: package.source,
-        manifest: package.manifest,
-        precedence: package.precedence,
-        package_lock_digest_sha256,
-        lock_state,
-        requirements,
-        effects,
-        permissions,
-        diagnostics,
-    })
-}
-
-fn workflow_manifest_paths(root: &Path, limit: usize) -> Result<Vec<PathBuf>, CliError> {
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut paths = std::fs::read_dir(root)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(|name| {
-                        name.ends_with(".workflow-package.json")
-                            || name.ends_with(".workflow-package.yaml")
-                            || name.ends_with(".workflow-package.yml")
-                            || name.ends_with(".workflow-package.toml")
-                    })
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.truncate(limit);
-    Ok(paths)
-}
-
-fn discover_workflow_packages(
-    workspace: &Path,
-    config: &bcode_config::BcodeConfig,
-    limit: usize,
-) -> Result<Vec<DiscoveredWorkflowPackage>, CliError> {
-    if limit == 0 || limit > 1_000 {
-        return Err(CliError::InvalidArguments(
-            "workflow discovery limit must be within 1..=1000".to_string(),
-        ));
-    }
-    let workspace = fs::canonicalize(workspace)?;
-    let mut roots = Vec::new();
-    if config.workflows.include_repo_workflows {
-        roots.push((
-            workspace.join(".bcode/workflows"),
-            "repository:.bcode/workflows",
-            10_u32,
-        ));
-        roots.push((workspace.join("workflows"), "repository:workflows", 20_u32));
-    }
-    roots.extend(
-        config
-            .workflows
-            .paths
-            .iter()
-            .enumerate()
-            .map(|(index, path)| {
-                (
-                    path.clone(),
-                    "configured",
-                    30_u32.saturating_add(u32::try_from(index).unwrap_or(u32::MAX - 30)),
-                )
-            }),
-    );
-    if config.workflows.include_user_workflows {
-        roots.push((
-            bcode_config::default_config_dir().join("workflows"),
-            "user-config:workflows",
-            100,
-        ));
-        roots.push((
-            bcode_config::default_state_dir().join("workflows"),
-            "user-state:workflows",
-            110,
-        ));
-    }
-    let mut discovered = std::collections::BTreeMap::<String, DiscoveredWorkflowPackage>::new();
-    for (root, label, precedence) in roots {
-        let Ok(root) = fs::canonicalize(root) else {
-            continue;
-        };
-        for manifest in workflow_manifest_paths(&root, limit)? {
-            let package = read_workflow_package_manifest(&manifest)?;
-            let candidate = DiscoveredWorkflowPackage {
-                package_id: package.package_id.clone(),
-                source: label.to_string(),
-                manifest,
-                precedence,
-            };
-            if let Some(existing) = discovered.get(&candidate.package_id) {
-                if existing.precedence == candidate.precedence {
-                    return Err(CliError::InvalidArguments(format!(
-                        "workflow package '{}' is ambiguous at precedence {}",
-                        candidate.package_id, candidate.precedence
-                    )));
-                }
-                continue;
-            }
-            discovered.insert(candidate.package_id.clone(), candidate);
-            if discovered.len() >= limit {
-                break;
-            }
-        }
-        if discovered.len() >= limit {
-            break;
-        }
-    }
-    Ok(discovered.into_values().collect())
 }
 
 fn read_workflow_package_closure(
@@ -17843,55 +17593,6 @@ mod workflow_source_tests {
     }
 
     #[test]
-    fn primary_cli_discovers_workspace_and_configured_packages_with_precedence() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join(".bcode/workflows");
-        let configured = temp.path().join("configured");
-        for (root, package_id) in [(&repo, "repo"), (&configured, "configured")] {
-            std::fs::create_dir_all(root).expect("root");
-            std::fs::write(
-                root.join("main.workflow.yaml"),
-                format!(
-                    "workflow_source_version: 3\nworkflow_id: {package_id}\ntitle: {package_id}\nsteps:\n  - id: value\n    input:\n      schema: {{type_name: value/v1, schema: {{type: string}}}}\n"
-                ),
-            )
-            .expect("source");
-            std::fs::write(
-                root.join(format!("{package_id}.workflow-package.yaml")),
-                format!(
-                    "version: 3\npackage_id: {package_id}\nexports: {{main: main}}\nmembers:\n  - member_id: main\n    source_name: main.workflow.yaml\n"
-                ),
-            )
-            .expect("manifest");
-        }
-        let config = bcode_config::BcodeConfig {
-            workflows: bcode_config::WorkflowsConfig {
-                include_repo_workflows: true,
-                include_user_workflows: false,
-                paths: vec![configured.clone()],
-            },
-            ..bcode_config::BcodeConfig::default()
-        };
-        let discovered = discover_workflow_packages(temp.path(), &config, 10).expect("discovery");
-        assert_eq!(
-            discovered
-                .iter()
-                .map(|package| package.package_id.as_str())
-                .collect::<Vec<_>>(),
-            ["configured", "repo"]
-        );
-        assert_eq!(discovered[1].source, "repository:.bcode/workflows");
-        assert_eq!(discovered[1].precedence, 10);
-
-        std::fs::copy(
-            configured.join("configured.workflow-package.yaml"),
-            configured.join("duplicate.workflow-package.yaml"),
-        )
-        .expect("duplicate manifest");
-        assert!(discover_workflow_packages(temp.path(), &config, 10).is_err());
-    }
-
-    #[test]
     #[allow(clippy::too_many_lines)]
     fn primary_cli_discovers_and_plans_hermetic_external_data_quality_package() {
         let repository = tempfile::tempdir().expect("external repository");
@@ -17946,12 +17647,13 @@ mod workflow_source_tests {
             ..bcode_config::BcodeConfig::default()
         };
         let discovered =
-            discover_workflow_packages(repository.path(), &config, 10).expect("external discovery");
-        assert!(
-            discovered
-                .iter()
-                .any(|package| package.package_id == "external/data-quality")
-        );
+            bcode_workflow_discovery::discover_workflows(repository.path(), &config.workflows, 10)
+                .expect("external discovery");
+        assert!(discovered.sources.iter().any(|source| matches!(
+            source,
+            bcode_workflow_discovery::DiscoveredWorkflowSource::Package { package_id, .. }
+                if package_id == "external/data-quality"
+        )));
         let closure = read_workflow_package_closure_in_root(
             &data_root.join("data-quality.workflow-package.yaml"),
             Some(&workflow_root),
@@ -17968,30 +17670,6 @@ mod workflow_source_tests {
         .expect("external data quality plan");
         assert_eq!(plan.entry_package_id, "external/data-quality");
         assert_eq!(plan.packages.len(), 3);
-    }
-
-    #[test]
-    fn package_discovery_reports_publication_lock_state_without_mutation() {
-        let digest = "a".repeat(64);
-        let receipt = bcode_workflow::WorkflowPackagePublicationReceipt {
-            version: bcode_workflow::WORKFLOW_PACKAGE_PUBLICATION_RECEIPT_VERSION,
-            package_id: "package".to_string(),
-            package_lock_digest_sha256: digest.clone(),
-            published_at_ms: 1,
-            exports: Vec::new(),
-        };
-        assert_eq!(
-            workflow_package_lock_state(None, &digest),
-            WorkflowPackageLockState::Unpublished
-        );
-        assert_eq!(
-            workflow_package_lock_state(Some(&receipt), &digest),
-            WorkflowPackageLockState::Published
-        );
-        assert_eq!(
-            workflow_package_lock_state(Some(&receipt), &"b".repeat(64)),
-            WorkflowPackageLockState::Drifted
-        );
     }
 
     #[test]

@@ -6,6 +6,12 @@ This document describes the public, bounded package and execution path used by s
 
 Explicit manifest paths are always supported. Repository discovery checks `.bcode/workflows` before `workflows`; configured roots follow repository roots, then user configuration and state roots. Equal-precedence duplicate package identities are ambiguous and fail closed. Discovery is bounded by the requested result limit.
 
+Filesystem discovery is owned by `bcode_workflow_discovery` and orchestrated through workflow
+application operations. CLI, TUI, and future clients consume the same versioned launch-catalog
+contract. The bounded catalog includes package exports, standalone `*.workflow.{json,yaml,yml,toml}`
+sources not owned as package members, and available plugin templates. Discovery itself is read-only:
+it does not apply drafts, publish revisions, grant authority, repair state, or start runs.
+
 Manifests and members are canonicalized and confined to their authorized package root. Import paths are relative normal-component JSON, YAML, or TOML paths. Absolute paths, parent traversal, symlink escape, duplicate canonical manifests, cycles, excessive closure depth, and unreachable closure members are rejected.
 
 ## Imports, locks, publication, and drift

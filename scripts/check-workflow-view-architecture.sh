@@ -62,4 +62,23 @@ rg -q 'const RUN_DETAIL_LIMIT: usize = 1_000;' packages/tui/src/plugin_surface_h
 rg -q 'WorkflowRunWatchEvent::ResyncRequired' packages/tui/src/plugin_surface_host.rs \
     || fail 'workflow host lacks explicit bounded resynchronization handling'
 
+if rg -n 'discover_workflow_packages|workflow_manifest_paths|WorkflowPackageDiscoverySnapshot' \
+    packages/cli/src plugins/workflow-plugin/src; then
+    fail 'workflow discovery is duplicated in CLI or workflow TUI ownership'
+fi
+
+if rg -n 'bmux|ratatui|crossterm|Terminal[<(]|Frame[<(]|\bRect\b|KeyCode|MouseEvent' \
+    packages/workflow/src/lib.rs | rg 'WorkflowLaunch|LaunchCatalog' >/dev/null; then
+    fail 'portable workflow launch contracts contain terminal implementation types'
+fi
+
+rg -q 'name\s*=\s*"bcode_workflow_discovery"' packages/workflow-discovery/Cargo.toml \
+    || fail 'workflow discovery lacks a domain-owned package'
+rg -q 'workflow_launch_catalog' packages/client/src/lib.rs \
+    || fail 'client lacks portable workflow launch-catalog routing'
+rg -q 'WorkflowLaunchCatalog' packages/ipc/src/lib.rs \
+    || fail 'IPC lacks portable workflow launch-catalog contracts'
+rg -q 'discover_workflows' packages/server/src/workflow_operations.rs \
+    || fail 'application operations do not own workflow discovery orchestration'
+
 printf 'workflow-view architecture check passed\n'

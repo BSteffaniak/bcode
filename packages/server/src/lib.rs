@@ -213,6 +213,8 @@ pub enum ServerError {
     WorkflowStore(#[from] bcode_workflow_store::WorkflowStoreError),
     #[error("workflow contract error: {0}")]
     Workflow(#[from] bcode_workflow::WorkflowError),
+    #[error("workflow discovery error: {0}")]
+    WorkflowDiscovery(#[from] bcode_workflow_discovery::WorkflowDiscoveryError),
     #[error("workflow definition is unsupported by this production host: {0}")]
     WorkflowDefinitionUnsupported(String),
     #[error("workflow capability is unavailable: {0}")]
@@ -4182,6 +4184,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowPresets { .. } => "list_workflow_presets",
         Request::GetWorkflowPreset { .. } => "get_workflow_preset",
         Request::WorkflowAuthoringCatalog => "workflow_authoring_catalog",
+        Request::WorkflowLaunchCatalog(_) => "workflow_launch_catalog",
+        Request::WorkflowLaunchDetail(_) => "workflow_launch_detail",
         Request::GetWorkflowPackagePublication { .. } => "get_workflow_package_publication",
         Request::ApplyWorkflowPackage(_) => "apply_workflow_package",
         Request::PublishWorkflowPackage(_) => "publish_workflow_package",
@@ -5380,6 +5384,26 @@ async fn handle_workflow_validation_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowAuthoringCatalog { catalog }),
+            )
+            .await
+        }
+        WorkflowDefinitionRequest::WorkflowLaunchCatalog(request) => {
+            let page = workflow_operations::launch_catalog(state, &request).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowLaunchCatalog { page }),
+            )
+            .await
+        }
+        WorkflowDefinitionRequest::WorkflowLaunchDetail(request) => {
+            let detail = workflow_operations::launch_detail(state, &request).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowLaunchDetail {
+                    detail: Box::new(detail),
+                }),
             )
             .await
         }

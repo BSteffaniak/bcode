@@ -3213,6 +3213,42 @@ impl BcodeClient {
         }
     }
 
+    /// Discover one bounded portable launch catalog for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or discovery/preview fails.
+    pub async fn workflow_launch_catalog(
+        &self,
+        request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    ) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, ClientError> {
+        match self
+            .send_request(Request::WorkflowLaunchCatalog(request))
+            .await?
+        {
+            ResponsePayload::WorkflowLaunchCatalog { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Inspect one exact workflow launch target without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the source is unavailable or stale.
+    pub async fn workflow_launch_detail(
+        &self,
+        request: bcode_workflow::WorkflowLaunchDetailRequest,
+    ) -> Result<bcode_workflow::WorkflowLaunchDetail, ClientError> {
+        match self
+            .send_request(Request::WorkflowLaunchDetail(request))
+            .await?
+        {
+            ResponsePayload::WorkflowLaunchDetail { detail } => Ok(*detail),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read one bounded derived package publication receipt without mutation.
     ///
     /// # Errors

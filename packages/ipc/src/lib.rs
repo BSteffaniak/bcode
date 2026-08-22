@@ -651,6 +651,10 @@ pub enum Request {
     },
     /// Return the portable runtime-workflow authoring catalog.
     WorkflowAuthoringCatalog,
+    /// Discover one bounded page of launchable workflow sources for a workspace.
+    WorkflowLaunchCatalog(bcode_workflow::WorkflowLaunchCatalogRequest),
+    /// Inspect one exact launch source without mutation.
+    WorkflowLaunchDetail(bcode_workflow::WorkflowLaunchDetailRequest),
     /// Read one bounded derived package publication receipt without mutation.
     GetWorkflowPackagePublication {
         package_id: String,
@@ -2884,6 +2888,12 @@ pub enum ResponsePayload {
     },
     WorkflowAuthoringCatalog {
         catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    },
+    WorkflowLaunchCatalog {
+        page: bcode_workflow::WorkflowLaunchCatalogPage,
+    },
+    WorkflowLaunchDetail {
+        detail: Box<bcode_workflow::WorkflowLaunchDetail>,
     },
     WorkflowPackagePublication {
         receipt: Option<bcode_workflow::WorkflowPackagePublicationReceipt>,

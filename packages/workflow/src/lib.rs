@@ -20,6 +20,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -40,6 +41,310 @@ const MAX_DEFINITION_BOUNDARIES: usize = 10_000;
 
 /// Stable workflow definition schema version.
 pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 2;
+
+/// Current portable workflow launch-catalog contract version.
+pub const WORKFLOW_LAUNCH_CATALOG_VERSION: u32 = 1;
+/// Maximum entries returned by one launch-catalog request.
+pub const MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE: usize = 1_000;
+/// Maximum bytes accepted in launch-catalog search text.
+pub const MAX_WORKFLOW_LAUNCH_CATALOG_SEARCH_BYTES: usize = 512;
+
+/// Portable source class for one discoverable workflow launch target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLaunchSourceKind {
+    PackageExport,
+    StandaloneSource,
+    /// Template source supplied by a plugin.
+    Template,
+}
+
+/// Readiness of one discoverable workflow launch target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLaunchReadiness {
+    Ready,
+    Unpublished,
+    Drifted,
+    Invalid,
+    Ambiguous,
+    Unavailable,
+}
+
+/// Explicit lifecycle action exposed for one launch target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLaunchActionKind {
+    Validate,
+    Preview,
+    Apply,
+    Publish,
+    Start,
+    OpenAuthoring,
+    OpenSource,
+}
+
+/// Presentation-only action availability; canonical operations revalidate every request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchActionAffordance {
+    pub kind: WorkflowLaunchActionKind,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Secret-safe portable diagnostic for one discovered source that could not become a catalog item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchDiagnostic {
+    pub source_label: String,
+    pub path: PathBuf,
+    pub code: String,
+    pub message: String,
+}
+
+/// Exact immutable published package export identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchPublicationIdentity {
+    pub workflow_id: String,
+    pub revision: u64,
+    pub definition_identity: WorkflowDefinitionIdentity,
+}
+
+/// Exact portable identity for a discoverable workflow launch target.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "source_kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowLaunchSourceIdentity {
+    PackageExport {
+        package_id: String,
+        export: String,
+        manifest_path: PathBuf,
+    },
+    StandaloneSource {
+        workflow_id: String,
+        source_path: PathBuf,
+        source_format: WorkflowSourceFormat,
+    },
+    ExplicitSource {
+        source_path: PathBuf,
+        source_format: WorkflowSourceFormat,
+    },
+    Template {
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    },
+}
+
+/// Deterministic cursor for one bounded launch-catalog page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchCatalogCursor {
+    pub title: String,
+    pub source_key: String,
+}
+
+/// Renderer-neutral bounded workflow launch-catalog request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchCatalogRequest {
+    pub version: u32,
+    pub workspace: PathBuf,
+    pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<WorkflowLaunchCatalogCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<WorkflowLaunchSourceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<WorkflowLaunchReadiness>,
+}
+
+impl WorkflowLaunchCatalogRequest {
+    /// Validate portable bounds before filesystem or application work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, empty workspace paths, invalid page bounds, or
+    /// oversized search text.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_LAUNCH_CATALOG_VERSION {
+            return Err(authoring_error(
+                "launch_catalog.version",
+                format!(
+                    "unsupported launch catalog version {}; expected {WORKFLOW_LAUNCH_CATALOG_VERSION}",
+                    self.version
+                ),
+            ));
+        }
+        if self.workspace.as_os_str().is_empty() {
+            return Err(authoring_error(
+                "launch_catalog.workspace",
+                "launch catalog requires a workspace path",
+            ));
+        }
+        if self.limit == 0 || self.limit > MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE {
+            return Err(authoring_error(
+                "launch_catalog.limit",
+                format!(
+                    "launch catalog limit must be within 1..={MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE}"
+                ),
+            ));
+        }
+        if self.search.as_ref().is_some_and(|search| {
+            search.trim().is_empty() || search.len() > MAX_WORKFLOW_LAUNCH_CATALOG_SEARCH_BYTES
+        }) {
+            return Err(authoring_error(
+                "launch_catalog.search",
+                format!(
+                    "launch catalog search must contain 1..={MAX_WORKFLOW_LAUNCH_CATALOG_SEARCH_BYTES} bytes"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Content-minimized renderer-neutral launch catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchCatalogItem {
+    pub source: WorkflowLaunchSourceIdentity,
+    pub source_label: String,
+    pub precedence: u32,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub readiness: WorkflowLaunchReadiness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_lock_digest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<WorkflowLaunchPublicationIdentity>,
+    pub actions: Vec<WorkflowLaunchActionAffordance>,
+    pub requirements: WorkflowRequirementSummary,
+    pub effects: WorkflowEffectSummary,
+    pub permissions: WorkflowPermissionPreview,
+    pub input_schema: ValueSchema,
+    pub configuration_schema: ValueSchema,
+    pub diagnostics: Vec<WorkflowValidationDiagnostic>,
+}
+
+/// One bounded renderer-neutral workflow launch-catalog page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchCatalogPage {
+    pub version: u32,
+    pub items: Vec<WorkflowLaunchCatalogItem>,
+    pub diagnostics: Vec<WorkflowLaunchDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<WorkflowLaunchCatalogCursor>,
+}
+
+/// Request for exact semantic detail about one launch source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchDetailRequest {
+    pub version: u32,
+    pub workspace: PathBuf,
+    pub source: WorkflowLaunchSourceIdentity,
+}
+
+impl WorkflowLaunchDetailRequest {
+    /// Validate the request contract version and workspace identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions or an empty workspace path.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_LAUNCH_CATALOG_VERSION {
+            return Err(authoring_error(
+                "launch_detail.version",
+                format!(
+                    "unsupported launch detail version {}; expected {WORKFLOW_LAUNCH_CATALOG_VERSION}",
+                    self.version
+                ),
+            ));
+        }
+        if self.workspace.as_os_str().is_empty() {
+            return Err(authoring_error(
+                "launch_detail.workspace",
+                "launch detail requires a workspace path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact renderer-neutral definition and lifecycle facts for one launch target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLaunchDetail {
+    pub version: u32,
+    pub item: WorkflowLaunchCatalogItem,
+    pub document: WorkflowAuthoringDocument,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_plan: Option<WorkflowPackageClosurePlan>,
+}
+
+#[cfg(test)]
+mod launch_catalog_contract_tests {
+    use super::*;
+
+    fn request(version: u32) -> WorkflowLaunchCatalogRequest {
+        WorkflowLaunchCatalogRequest {
+            version,
+            workspace: PathBuf::from("/workspace"),
+            limit: 100,
+            cursor: None,
+            search: None,
+            source_kind: None,
+            readiness: None,
+        }
+    }
+
+    #[test]
+    fn launch_catalog_request_accepts_current_bounded_contract() {
+        assert!(request(WORKFLOW_LAUNCH_CATALOG_VERSION).validate().is_ok());
+    }
+
+    #[test]
+    fn launch_catalog_request_rejects_future_versions_and_invalid_bounds() {
+        assert!(
+            request(WORKFLOW_LAUNCH_CATALOG_VERSION + 1)
+                .validate()
+                .is_err()
+        );
+        let mut invalid = request(WORKFLOW_LAUNCH_CATALOG_VERSION);
+        invalid.limit = 0;
+        assert!(invalid.validate().is_err());
+        invalid.limit = MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE + 1;
+        assert!(invalid.validate().is_err());
+        invalid.limit = 1;
+        invalid.search = Some("x".repeat(MAX_WORKFLOW_LAUNCH_CATALOG_SEARCH_BYTES + 1));
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn launch_detail_request_rejects_future_versions() {
+        let current = WorkflowLaunchDetailRequest {
+            version: WORKFLOW_LAUNCH_CATALOG_VERSION,
+            workspace: PathBuf::from("/workspace"),
+            source: WorkflowLaunchSourceIdentity::ExplicitSource {
+                source_path: PathBuf::from("/tmp/example.workflow.yaml"),
+                source_format: WorkflowSourceFormat::Yaml,
+            },
+        };
+        assert!(current.validate().is_ok());
+        let mut future = current;
+        future.version += 1;
+        assert!(future.validate().is_err());
+    }
+}
 
 /// Stable durable-production capability contract version.
 pub const WORKFLOW_PRODUCTION_CAPABILITY_VERSION: u32 = 1;
@@ -6537,7 +6842,7 @@ fn validate_workflow_package_dag(
 }
 
 /// Portable source encoding for one authored workflow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowSourceFormat {
     /// JavaScript Object Notation.

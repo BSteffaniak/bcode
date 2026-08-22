@@ -432,6 +432,10 @@ pub enum WorkflowAuthoringRequest {
 pub enum WorkflowDefinitionRequest {
     /// Return the portable runtime-workflow authoring catalog.
     WorkflowAuthoringCatalog,
+    /// Discover one bounded page of launchable workflow sources for a workspace.
+    WorkflowLaunchCatalog(bcode_workflow::WorkflowLaunchCatalogRequest),
+    /// Inspect one exact launch source without mutation.
+    WorkflowLaunchDetail(bcode_workflow::WorkflowLaunchDetailRequest),
     /// Read one bounded derived package publication receipt without mutation.
     GetWorkflowPackagePublication { package_id: String },
     /// Atomically apply one previously validated package plan as canonical package drafts.
@@ -1014,6 +1018,12 @@ impl RoutedRequest {
             }),
             Request::WorkflowAuthoringCatalog => Self::WorkflowDefinition(Box::new(
                 WorkflowDefinitionRequest::WorkflowAuthoringCatalog,
+            )),
+            Request::WorkflowLaunchCatalog(request) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::WorkflowLaunchCatalog(request),
+            )),
+            Request::WorkflowLaunchDetail(request) => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::WorkflowLaunchDetail(request),
             )),
             Request::GetWorkflowPackagePublication { package_id } => Self::WorkflowDefinition(
                 Box::new(WorkflowDefinitionRequest::GetWorkflowPackagePublication { package_id }),

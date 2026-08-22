@@ -97,6 +97,7 @@ members = [
     "packages/hyperchad/ui",
     "packages/vim-edit",
     "packages/workflow",
+    "packages/workflow-discovery",
     "packages/workflow-store",
     "packages/workflow-view",
     "packages/workflow-view/models",
@@ -210,6 +211,7 @@ bcode_vim_edit                          = { version = "0.0.1-alpha.0", default-f
 bcode_vim_edit_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/vim-edit-plugin" }
 bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }
 bcode_workflow                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow" }
+bcode_workflow_discovery                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow-discovery" }
 bcode_workflow_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/workflow-plugin" }
 bcode_workflow_store                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow-store" }
 bcode_workflow_view                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/workflow-view" }

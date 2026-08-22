@@ -196,6 +196,24 @@ pub type PluginWorkflowAuthoringCatalogFuture = Pin<
     >,
 >;
 
+/// Async portable workflow launch-catalog result.
+pub type PluginWorkflowLaunchCatalogFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_workflow::WorkflowLaunchCatalogPage, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async exact workflow launch-detail result.
+pub type PluginWorkflowLaunchDetailFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_workflow::WorkflowLaunchDetail, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Portable authored draft used by plugin-owned authoring surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginWorkflowAuthoringDraft {
@@ -598,6 +616,30 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Discover one bounded renderer-neutral workflow launch catalog.
+    fn workflow_launch_catalog(
+        &self,
+        _request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    ) -> PluginWorkflowLaunchCatalogFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow launch discovery is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Inspect one exact renderer-neutral workflow launch target.
+    fn workflow_launch_detail(
+        &self,
+        _request: bcode_workflow::WorkflowLaunchDetailRequest,
+    ) -> PluginWorkflowLaunchDetailFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow launch detail is not available from this host".to_string(),
             ))
         })
     }

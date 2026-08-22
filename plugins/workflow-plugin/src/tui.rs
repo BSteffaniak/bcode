@@ -206,6 +206,12 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 pending_action_target: None,
                 inline_error: None,
                 catalog_search_buffer: None,
+                launch_catalog: None,
+                launch_catalog_loading: false,
+                launch_catalog_error: None,
+                launch_catalog_requested: false,
+                launch_workspace: request.repo_path,
+                launch_catalog_updates: None,
                 updates: None,
                 catalog: None,
                 runs: std::collections::BTreeMap::new(),
@@ -502,6 +508,19 @@ struct WorkflowStatusSurface {
     )>,
     inline_error: Option<String>,
     catalog_search_buffer: Option<String>,
+    launch_catalog: Option<bcode_workflow::WorkflowLaunchCatalogPage>,
+    launch_catalog_loading: bool,
+    launch_catalog_error: Option<String>,
+    launch_catalog_requested: bool,
+    launch_workspace: Option<std::path::PathBuf>,
+    launch_catalog_updates: Option<
+        tokio::sync::mpsc::Receiver<
+            Result<
+                bcode_workflow::WorkflowLaunchCatalogPage,
+                bcode_plugin_sdk::tui::PluginTuiHostError,
+            >,
+        >,
+    >,
     updates: Option<PluginTuiSurfaceUpdateReceiver>,
     catalog: Option<bcode_workflow_view_models::WorkflowCatalogView>,
     runs: std::collections::BTreeMap<String, bcode_workflow_view_models::WorkflowRunView>,
@@ -1092,6 +1111,7 @@ impl WorkflowStatusSurface {
             .render(footer, frame);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_workspace_header(
         &self,
         area: Rect,
@@ -1139,7 +1159,22 @@ impl WorkflowStatusSurface {
                 Span::styled(format!("active {active}  "), theme.info),
                 Span::styled(format!("attention {attention}  "), theme.warning),
                 Span::styled(format!("failed {failed}  "), theme.error),
-                Span::styled(format!("completed {completed}"), theme.success),
+                Span::styled(format!("completed {completed}  "), theme.success),
+                Span::styled(
+                    format!(
+                        "launchable {}",
+                        self.launch_catalog
+                            .as_ref()
+                            .map_or(0, |page| page.items.len())
+                    ),
+                    if self.launch_catalog_error.is_some() {
+                        theme.error
+                    } else if self.launch_catalog_loading {
+                        theme.warning
+                    } else {
+                        theme.info
+                    },
+                ),
             ]),
         );
         if area.height > 1 {
@@ -2802,7 +2837,41 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn poll(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if !self.launch_catalog_requested {
+            self.launch_catalog_requested = true;
+            if let Some(workspace) = self.launch_workspace.clone() {
+                self.launch_catalog_loading = true;
+                let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                self.launch_catalog_updates = Some(receiver);
+                let request = bcode_workflow::WorkflowLaunchCatalogRequest {
+                    version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                    workspace,
+                    limit: 100,
+                    cursor: None,
+                    search: None,
+                    source_kind: None,
+                    readiness: None,
+                };
+                let future = host.workflow_launch_catalog(request);
+                host.spawn(Box::pin(async move {
+                    let _ = sender.send(future.await).await;
+                }));
+            }
+        }
+        if let Some(receiver) = self.launch_catalog_updates.as_mut()
+            && let Ok(result) = receiver.try_recv()
+        {
+            self.launch_catalog_loading = false;
+            match result {
+                Ok(page) => {
+                    self.launch_catalog = Some(page);
+                    self.launch_catalog_error = None;
+                }
+                Err(error) => self.launch_catalog_error = Some(error.to_string()),
+            }
+            return PluginTuiAction::Redraw;
+        }
         if !self.subscription_requested {
             self.subscription_requested = true;
             return PluginTuiAction::SubscribeWorkflowRuns;
@@ -4895,6 +4964,12 @@ mod tests {
             pending_action_target: None,
             inline_error: None,
             catalog_search_buffer: None,
+            launch_catalog: None,
+            launch_catalog_loading: false,
+            launch_catalog_error: None,
+            launch_catalog_requested: false,
+            launch_workspace: None,
+            launch_catalog_updates: None,
             updates: None,
             catalog: Some(bcode_workflow_view_models::WorkflowCatalogView {
                 version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,

@@ -18,11 +18,11 @@ use bcode_plugin_sdk::tui::{
     PluginWorkflowAuthoringValidationFuture, PluginWorkflowControlAction,
     PluginWorkflowControlFuture, PluginWorkflowControlResult, PluginWorkflowGeneratedCandidate,
     PluginWorkflowGeneratedCandidateAcceptance, PluginWorkflowGeneratedCandidateAcceptanceFuture,
-    PluginWorkflowInspection, PluginWorkflowInspectionFuture, PluginWorkflowLookup,
-    PluginWorkflowLookupFuture, PluginWorkflowPackageExportStartRequest, PluginWorkflowStartFuture,
-    PluginWorkflowStartRequest, PluginWorkflowStartResponse, PluginWorkflowStatus,
-    PluginWorkflowSummary, PluginWorkflowTemplateInstantiationFuture,
-    PluginWorkflowTemplateInstantiationRequest,
+    PluginWorkflowInspection, PluginWorkflowInspectionFuture, PluginWorkflowLaunchCatalogFuture,
+    PluginWorkflowLaunchDetailFuture, PluginWorkflowLookup, PluginWorkflowLookupFuture,
+    PluginWorkflowPackageExportStartRequest, PluginWorkflowStartFuture, PluginWorkflowStartRequest,
+    PluginWorkflowStartResponse, PluginWorkflowStatus, PluginWorkflowSummary,
+    PluginWorkflowTemplateInstantiationFuture, PluginWorkflowTemplateInstantiationRequest,
 };
 use bcode_session_models::SessionId;
 use bcode_session_view::SessionView;
@@ -195,6 +195,32 @@ impl PluginTuiHost for BcodePluginTuiHost {
         Box::pin(async move {
             client
                 .workflow_authoring_catalog()
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn workflow_launch_catalog(
+        &self,
+        request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    ) -> PluginWorkflowLaunchCatalogFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .workflow_launch_catalog(request)
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn workflow_launch_detail(
+        &self,
+        request: bcode_workflow::WorkflowLaunchDetailRequest,
+    ) -> PluginWorkflowLaunchDetailFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .workflow_launch_detail(request)
                 .await
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
         })

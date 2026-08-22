@@ -1512,6 +1512,683 @@ pub fn package_publication(
         .workflow_package_publication(package_id, None)
 }
 
+/// Inspect one exact workflow launch target without mutation.
+pub async fn launch_detail(
+    state: &ServerState,
+    request: &bcode_workflow::WorkflowLaunchDetailRequest,
+) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
+    request.validate()?;
+    match &request.source {
+        bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource {
+            source_path,
+            source_format,
+        } => {
+            let source = bcode_workflow_discovery::inspect_explicit_source(source_path)?;
+            let bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
+                source,
+                source_format: actual_format,
+                source_path,
+                ..
+            } = source
+            else {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "explicit launch detail identity expected a standalone source".to_string(),
+                )
+                .into());
+            };
+            if actual_format != *source_format {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "explicit launch source format changed".to_string(),
+                )
+                .into());
+            }
+            let catalog = authoring_catalog(state).await?;
+            let lowering =
+                bcode_workflow::lower_workflow_authoring_source(&source, actual_format, &catalog)?;
+            let preview = lowering.document.compilation_preview(&catalog, None);
+            let item = standalone_launch_item(
+                "explicit".to_string(),
+                0,
+                source_path.clone(),
+                actual_format,
+                &lowering,
+                &preview,
+                true,
+            );
+            Ok(bcode_workflow::WorkflowLaunchDetail {
+                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                item,
+                document: lowering.document,
+                package_plan: None,
+            })
+        }
+        source => {
+            let page = launch_catalog(
+                state,
+                &bcode_workflow::WorkflowLaunchCatalogRequest {
+                    version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                    workspace: request.workspace.clone(),
+                    limit: bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE,
+                    cursor: None,
+                    search: None,
+                    source_kind: None,
+                    readiness: None,
+                },
+            )
+            .await?;
+            let item = page
+                .items
+                .into_iter()
+                .find(|item| &item.source == source)
+                .ok_or_else(|| {
+                    bcode_workflow_store::WorkflowStoreError::InvalidData(
+                        "workflow launch target is no longer discoverable".to_string(),
+                    )
+                })?;
+            launch_detail_for_catalog_item(state, &request.workspace, item).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn launch_detail_for_catalog_item(
+    state: &ServerState,
+    workspace: &std::path::Path,
+    item: bcode_workflow::WorkflowLaunchCatalogItem,
+) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
+    let catalog = authoring_catalog(state).await?;
+    let (document, package_plan) = match &item.source {
+        bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+            export,
+            manifest_path,
+            ..
+        } => {
+            let source = bcode_workflow_discovery::inspect_explicit_source(manifest_path)?;
+            let bcode_workflow_discovery::DiscoveredWorkflowSource::Package { closure, .. } =
+                source
+            else {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "package launch identity no longer resolves to a package".to_string(),
+                )
+                .into());
+            };
+            let plan = bcode_workflow::plan_workflow_package_closure(&closure, &catalog)?;
+            let entry = plan
+                .packages
+                .iter()
+                .find(|entry| entry.package_id == plan.entry_package_id)
+                .ok_or_else(|| {
+                    bcode_workflow_store::WorkflowStoreError::InvalidData(
+                        "package plan has no entry package".to_string(),
+                    )
+                })?;
+            let member_id = entry
+                .plan
+                .lock
+                .exports
+                .iter()
+                .find(|candidate| candidate.export == *export)
+                .map(|candidate| candidate.member_id.as_str())
+                .ok_or_else(|| {
+                    bcode_workflow_store::WorkflowStoreError::InvalidData(
+                        "package export is no longer available".to_string(),
+                    )
+                })?;
+            let document = entry
+                .plan
+                .members
+                .iter()
+                .find(|member| member.member_id == member_id)
+                .map(|member| member.lowering.document.clone())
+                .ok_or_else(|| {
+                    bcode_workflow_store::WorkflowStoreError::InvalidData(
+                        "package export member is missing".to_string(),
+                    )
+                })?;
+            (document, Some(plan))
+        }
+        bcode_workflow::WorkflowLaunchSourceIdentity::StandaloneSource {
+            source_path,
+            source_format,
+            ..
+        } => {
+            let source = bcode_workflow_discovery::inspect_explicit_source(source_path)?;
+            let bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
+                source,
+                source_format: actual_format,
+                ..
+            } = source
+            else {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "standalone launch identity no longer resolves to a source".to_string(),
+                )
+                .into());
+            };
+            if actual_format != *source_format {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "standalone launch source format changed".to_string(),
+                )
+                .into());
+            }
+            (
+                bcode_workflow::lower_workflow_authoring_source(&source, actual_format, &catalog)?
+                    .document,
+                None,
+            )
+        }
+        bcode_workflow::WorkflowLaunchSourceIdentity::Template {
+            owner_plugin_id,
+            template_id,
+            template_version,
+        } => {
+            let template =
+                describe_template(state, owner_plugin_id, template_id, *template_version)?
+                    .ok_or_else(|| {
+                        bcode_workflow_store::WorkflowStoreError::InvalidData(
+                            "workflow template is no longer available".to_string(),
+                        )
+                    })?;
+            let document = template.authoring_document.ok_or_else(|| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "workflow template has no maintainable authoring document".to_string(),
+                )
+            })?;
+            (document, None)
+        }
+        bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource { .. } => {
+            return Err(
+                bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
+                    "explicit source detail must use its direct path operation in {}",
+                    workspace.display()
+                ))
+                .into(),
+            );
+        }
+    };
+    Ok(bcode_workflow::WorkflowLaunchDetail {
+        version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        item,
+        document,
+        package_plan,
+    })
+}
+
+/// Discover and semantically preview one bounded workflow launch-catalog page.
+///
+/// Discovery is read-only. It never applies, publishes, repairs, or starts a workflow.
+#[allow(clippy::too_many_lines)]
+pub async fn launch_catalog(
+    state: &ServerState,
+    request: &bcode_workflow::WorkflowLaunchCatalogRequest,
+) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
+    request.validate()?;
+    let config = &state.startup_config.workflows;
+    let discovery = bcode_workflow_discovery::discover_workflows(
+        &request.workspace,
+        config,
+        request.limit.saturating_add(1),
+    )?;
+    let catalog = authoring_catalog(state).await?;
+    let mut items = Vec::new();
+    for source in discovery.sources {
+        match source {
+            bcode_workflow_discovery::DiscoveredWorkflowSource::Package {
+                source_label,
+                precedence,
+                manifest_path,
+                closure,
+                ..
+            } => {
+                let plan = bcode_workflow::plan_workflow_package_closure(&closure, &catalog)?;
+                let entry_index = plan
+                    .packages
+                    .iter()
+                    .position(|entry| entry.package_id == plan.entry_package_id)
+                    .ok_or_else(|| {
+                        bcode_workflow_store::WorkflowStoreError::InvalidData(
+                            "planned workflow package closure has no entry package".to_string(),
+                        )
+                    })?;
+                let entry = &plan.packages[entry_index];
+                let mut preview_catalog = catalog.clone();
+                for dependency in &plan.packages[..entry_index] {
+                    for member in &dependency.plan.members {
+                        preview_catalog.workflow_definitions.insert(
+                            member.definition_identity.definition_id.clone(),
+                            member.lowering.document.definition.clone(),
+                        );
+                    }
+                }
+                let preview = bcode_workflow::preview_workflow_package(
+                    &entry.plan,
+                    &preview_catalog,
+                    &BTreeMap::new(),
+                )?;
+                let receipt = package_publication(state, &entry.package_id)?;
+                let lock_digest = preview.lock.digest_sha256()?;
+                let readiness = receipt.as_ref().map_or(
+                    bcode_workflow::WorkflowLaunchReadiness::Unpublished,
+                    |receipt| {
+                        if receipt.package_lock_digest_sha256 == lock_digest {
+                            bcode_workflow::WorkflowLaunchReadiness::Ready
+                        } else {
+                            bcode_workflow::WorkflowLaunchReadiness::Drifted
+                        }
+                    },
+                );
+                for locked_export in &entry.plan.lock.exports {
+                    let export = &locked_export.export;
+                    let member_id = &locked_export.member_id;
+                    let member = preview
+                        .members
+                        .iter()
+                        .find(|member| &member.member_id == member_id)
+                        .ok_or_else(|| {
+                            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
+                                "workflow package export '{export}' references missing member '{member_id}'"
+                            ))
+                        })?;
+                    let planned = entry
+                        .plan
+                        .members
+                        .iter()
+                        .find(|planned| &planned.member_id == member_id)
+                        .ok_or_else(|| {
+                            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
+                                "workflow package export '{export}' has no planned member '{member_id}'"
+                            ))
+                        })?;
+                    let compiled = member.compilation.compiled.as_ref();
+                    items.push(bcode_workflow::WorkflowLaunchCatalogItem {
+                        source: bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+                            package_id: entry.package_id.clone(),
+                            export: export.clone(),
+                            manifest_path: manifest_path.clone(),
+                        },
+                        source_label: source_label.clone(),
+                        precedence,
+                        title: planned.lowering.document.metadata.title.clone(),
+                        description: planned.lowering.document.metadata.description.clone(),
+                        readiness,
+                        unavailable_reason: match readiness {
+                            bcode_workflow::WorkflowLaunchReadiness::Ready => None,
+                            bcode_workflow::WorkflowLaunchReadiness::Unpublished => {
+                                Some("package must be explicitly applied and published".to_string())
+                            }
+                            bcode_workflow::WorkflowLaunchReadiness::Drifted => Some(
+                                "published package lock differs from discovered source".to_string(),
+                            ),
+                            _ => Some("workflow package is unavailable".to_string()),
+                        },
+                        package_lock_digest_sha256: Some(lock_digest.clone()),
+                        publication: receipt
+                            .as_ref()
+                            .and_then(|receipt| {
+                                receipt
+                                    .exports
+                                    .iter()
+                                    .find(|candidate| candidate.export == *export)
+                            })
+                            .and_then(|published| {
+                                published.published_revision.as_ref().map(|revision| {
+                                    bcode_workflow::WorkflowLaunchPublicationIdentity {
+                                        workflow_id: revision.workflow_id.clone(),
+                                        revision: revision.revision,
+                                        definition_identity: published.definition_identity.clone(),
+                                    }
+                                })
+                            }),
+                        actions: package_launch_actions(readiness),
+                        requirements: compiled
+                            .map(|compiled| compiled.requirements.clone())
+                            .unwrap_or_default(),
+                        effects: compiled
+                            .map(|compiled| compiled.effects.clone())
+                            .unwrap_or_default(),
+                        permissions: compiled
+                            .map(|compiled| compiled.permissions.clone())
+                            .unwrap_or_default(),
+                        input_schema: planned.lowering.document.definition.input.clone(),
+                        configuration_schema: planned
+                            .lowering
+                            .document
+                            .configuration_schema
+                            .clone(),
+                        diagnostics: member.compilation.validation.diagnostics.clone(),
+                    });
+                }
+            }
+            bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
+                source_label,
+                precedence,
+                source_path,
+                source_format,
+                source,
+            } => {
+                let lowering = bcode_workflow::lower_workflow_authoring_source(
+                    &source,
+                    source_format,
+                    &catalog,
+                )?;
+                let preview = lowering.document.compilation_preview(&catalog, None);
+                items.push(standalone_launch_item(
+                    source_label,
+                    precedence,
+                    source_path,
+                    source_format,
+                    &lowering,
+                    &preview,
+                    false,
+                ));
+            }
+        }
+    }
+    for template in list_templates(state, request.limit.saturating_add(1))? {
+        let Some(document) = template.authoring_document else {
+            continue;
+        };
+        let preview = document.compilation_preview(&catalog, None);
+        let compiled = preview.compiled.as_ref();
+        let readiness = if template.diagnostics.is_empty() && preview.is_compiled() {
+            bcode_workflow::WorkflowLaunchReadiness::Ready
+        } else {
+            bcode_workflow::WorkflowLaunchReadiness::Unavailable
+        };
+        items.push(bcode_workflow::WorkflowLaunchCatalogItem {
+            source: bcode_workflow::WorkflowLaunchSourceIdentity::Template {
+                owner_plugin_id: template.owner_plugin_id.clone(),
+                template_id: template.template.template_id.clone(),
+                template_version: template.template.template_version,
+            },
+            source_label: format!("plugin:{}", template.owner_plugin_id),
+            precedence: 200,
+            title: document.metadata.title.clone(),
+            description: document.metadata.description.clone(),
+            readiness,
+            unavailable_reason: (!template.diagnostics.is_empty()).then(|| {
+                template
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }),
+            package_lock_digest_sha256: None,
+            publication: None,
+            actions: template_launch_actions(readiness),
+            requirements: compiled.map_or_else(
+                || document.requirements.clone(),
+                |compiled| compiled.requirements.clone(),
+            ),
+            effects: compiled
+                .map(|compiled| compiled.effects.clone())
+                .unwrap_or_default(),
+            permissions: compiled
+                .map(|compiled| compiled.permissions.clone())
+                .unwrap_or_default(),
+            input_schema: document.definition.input.clone(),
+            configuration_schema: document.configuration_schema.clone(),
+            diagnostics: preview.validation.diagnostics,
+        });
+    }
+    Ok(project_launch_catalog_page(
+        items,
+        discovery
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| bcode_workflow::WorkflowLaunchDiagnostic {
+                source_label: diagnostic.source_label,
+                path: diagnostic.path,
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+            .collect(),
+        request,
+    ))
+}
+
+fn project_launch_catalog_page(
+    mut items: Vec<bcode_workflow::WorkflowLaunchCatalogItem>,
+    diagnostics: Vec<bcode_workflow::WorkflowLaunchDiagnostic>,
+    request: &bcode_workflow::WorkflowLaunchCatalogRequest,
+) -> bcode_workflow::WorkflowLaunchCatalogPage {
+    let search = request.search.as_ref().map(|search| search.to_lowercase());
+    items.retain(|item| {
+        request.source_kind.is_none_or(|kind| {
+            matches!(
+                (kind, &item.source),
+                (
+                    bcode_workflow::WorkflowLaunchSourceKind::PackageExport,
+                    bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport { .. }
+                ) | (
+                    bcode_workflow::WorkflowLaunchSourceKind::StandaloneSource,
+                    bcode_workflow::WorkflowLaunchSourceIdentity::StandaloneSource { .. }
+                        | bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource { .. }
+                ) | (
+                    bcode_workflow::WorkflowLaunchSourceKind::Template,
+                    bcode_workflow::WorkflowLaunchSourceIdentity::Template { .. }
+                )
+            )
+        }) && request
+            .readiness
+            .is_none_or(|readiness| readiness == item.readiness)
+            && search.as_ref().is_none_or(|search| {
+                item.title.to_lowercase().contains(search)
+                    || item
+                        .description
+                        .as_ref()
+                        .is_some_and(|description| description.to_lowercase().contains(search))
+                    || item.source_label.to_lowercase().contains(search)
+            })
+    });
+    items.sort_by(|left, right| {
+        (&left.title, launch_source_key(&left.source))
+            .cmp(&(&right.title, launch_source_key(&right.source)))
+    });
+    if let Some(cursor) = &request.cursor {
+        items.retain(|item| {
+            (&item.title, launch_source_key(&item.source))
+                > (&cursor.title, cursor.source_key.clone())
+        });
+    }
+    let has_more = items.len() > request.limit;
+    items.truncate(request.limit);
+    let next_cursor = has_more.then(|| items.last()).flatten().map(|item| {
+        bcode_workflow::WorkflowLaunchCatalogCursor {
+            title: item.title.clone(),
+            source_key: launch_source_key(&item.source),
+        }
+    });
+    bcode_workflow::WorkflowLaunchCatalogPage {
+        version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        items,
+        diagnostics,
+        next_cursor,
+    }
+}
+
+fn standalone_launch_item(
+    source_label: String,
+    precedence: u32,
+    source_path: std::path::PathBuf,
+    source_format: bcode_workflow::WorkflowSourceFormat,
+    lowering: &bcode_workflow::WorkflowSourceLoweringResult,
+    preview: &bcode_workflow::WorkflowCompilationPreview,
+    explicit: bool,
+) -> bcode_workflow::WorkflowLaunchCatalogItem {
+    let compiled = preview.compiled.as_ref();
+    bcode_workflow::WorkflowLaunchCatalogItem {
+        source: if explicit {
+            bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource {
+                source_path,
+                source_format,
+            }
+        } else {
+            bcode_workflow::WorkflowLaunchSourceIdentity::StandaloneSource {
+                workflow_id: lowering.document.workflow_id.clone(),
+                source_path,
+                source_format,
+            }
+        },
+        source_label,
+        precedence,
+        title: lowering.document.metadata.title.clone(),
+        description: lowering.document.metadata.description.clone(),
+        readiness: if preview.is_compiled() {
+            bcode_workflow::WorkflowLaunchReadiness::Unpublished
+        } else {
+            bcode_workflow::WorkflowLaunchReadiness::Invalid
+        },
+        unavailable_reason: Some(
+            "source must be explicitly applied and published before start".to_string(),
+        ),
+        package_lock_digest_sha256: None,
+        publication: None,
+        actions: source_launch_actions(preview.is_compiled()),
+        requirements: compiled.map_or_else(
+            || lowering.document.requirements.clone(),
+            |compiled| compiled.requirements.clone(),
+        ),
+        effects: compiled
+            .map(|compiled| compiled.effects.clone())
+            .unwrap_or_default(),
+        permissions: compiled
+            .map(|compiled| compiled.permissions.clone())
+            .unwrap_or_default(),
+        input_schema: lowering.document.definition.input.clone(),
+        configuration_schema: lowering.document.configuration_schema.clone(),
+        diagnostics: preview.validation.diagnostics.clone(),
+    }
+}
+
+fn package_launch_actions(
+    readiness: bcode_workflow::WorkflowLaunchReadiness,
+) -> Vec<bcode_workflow::WorkflowLaunchActionAffordance> {
+    use bcode_workflow::{
+        WorkflowLaunchActionAffordance as Action, WorkflowLaunchActionKind as Kind,
+    };
+    let available = |kind| Action {
+        kind,
+        enabled: true,
+        unavailable_reason: None,
+    };
+    let unavailable = |kind, reason: &str| Action {
+        kind,
+        enabled: false,
+        unavailable_reason: Some(reason.to_string()),
+    };
+    match readiness {
+        bcode_workflow::WorkflowLaunchReadiness::Ready => vec![
+            available(Kind::Validate),
+            available(Kind::Preview),
+            available(Kind::Start),
+            available(Kind::OpenAuthoring),
+            available(Kind::OpenSource),
+        ],
+        bcode_workflow::WorkflowLaunchReadiness::Unpublished
+        | bcode_workflow::WorkflowLaunchReadiness::Drifted => vec![
+            available(Kind::Validate),
+            available(Kind::Preview),
+            available(Kind::Apply),
+            unavailable(
+                Kind::Publish,
+                "apply the exact discovered package drafts first",
+            ),
+            unavailable(Kind::Start, "publish the exact package lock first"),
+            available(Kind::OpenAuthoring),
+            available(Kind::OpenSource),
+        ],
+        _ => vec![
+            available(Kind::Validate),
+            unavailable(Kind::Start, "workflow package is not launchable"),
+            available(Kind::OpenSource),
+        ],
+    }
+}
+
+fn source_launch_actions(compiled: bool) -> Vec<bcode_workflow::WorkflowLaunchActionAffordance> {
+    use bcode_workflow::{
+        WorkflowLaunchActionAffordance as Action, WorkflowLaunchActionKind as Kind,
+    };
+    [
+        (Kind::Validate, true, None),
+        (
+            Kind::Preview,
+            compiled,
+            Some("source validation must succeed"),
+        ),
+        (
+            Kind::Apply,
+            compiled,
+            Some("source validation must succeed"),
+        ),
+        (Kind::Publish, false, Some("apply the source draft first")),
+        (
+            Kind::Start,
+            false,
+            Some("publish an immutable revision first"),
+        ),
+        (Kind::OpenAuthoring, true, None),
+        (Kind::OpenSource, true, None),
+    ]
+    .into_iter()
+    .map(|(kind, enabled, reason)| Action {
+        kind,
+        enabled,
+        unavailable_reason: (!enabled).then(|| reason.unwrap_or("unavailable").to_string()),
+    })
+    .collect()
+}
+
+fn template_launch_actions(
+    readiness: bcode_workflow::WorkflowLaunchReadiness,
+) -> Vec<bcode_workflow::WorkflowLaunchActionAffordance> {
+    use bcode_workflow::{
+        WorkflowLaunchActionAffordance as Action, WorkflowLaunchActionKind as Kind,
+    };
+    let ready = readiness == bcode_workflow::WorkflowLaunchReadiness::Ready;
+    vec![
+        Action {
+            kind: Kind::Preview,
+            enabled: ready,
+            unavailable_reason: (!ready)
+                .then(|| "template requirements are unavailable".to_string()),
+        },
+        Action {
+            kind: Kind::Start,
+            enabled: ready,
+            unavailable_reason: (!ready)
+                .then(|| "template requirements are unavailable".to_string()),
+        },
+        Action {
+            kind: Kind::OpenAuthoring,
+            enabled: true,
+            unavailable_reason: None,
+        },
+    ]
+}
+
+fn launch_source_key(source: &bcode_workflow::WorkflowLaunchSourceIdentity) -> String {
+    match source {
+        bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+            package_id, export, ..
+        } => format!("package:{package_id}:{export}"),
+        bcode_workflow::WorkflowLaunchSourceIdentity::StandaloneSource {
+            workflow_id,
+            source_path,
+            ..
+        } => format!("source:{workflow_id}:{}", source_path.display()),
+        bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource { source_path, .. } => {
+            format!("explicit:{}", source_path.display())
+        }
+        bcode_workflow::WorkflowLaunchSourceIdentity::Template {
+            owner_plugin_id,
+            template_id,
+            template_version,
+        } => format!("template:{owner_plugin_id}:{template_id}:{template_version}"),
+    }
+}
+
 /// Atomically apply one validated workflow package to the canonical workflow store.
 pub fn apply_package(
     state: &ServerState,
