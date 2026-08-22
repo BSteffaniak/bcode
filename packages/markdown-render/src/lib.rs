@@ -1950,9 +1950,18 @@ impl DisplayedMarkdown {
             .or_else(|| self.text.find(target))?;
         let range = start..start.saturating_add(target.len());
         let mut rects: Vec<MarkdownCellRect> = Vec::new();
-        for cell in self.cells.iter().filter(|cell| {
-            cell.byte_start < range.end && range.start < cell.byte_end && cell.width > 0
-        }) {
+        // `cells` is built in display order, so `byte_start` is sorted. Binary
+        // search to the first overlapping cell instead of scanning every cell:
+        // this is called once per source grapheme, so a linear scan here makes
+        // whole-document projection quadratic in cell count.
+        let first = self
+            .cells
+            .partition_point(|cell| cell.byte_end <= range.start);
+        for cell in self.cells[first..]
+            .iter()
+            .take_while(|cell| cell.byte_start < range.end)
+            .filter(|cell| cell.width > 0)
+        {
             if let Some(last) = rects.last_mut()
                 && usize::from(last.y) == cell.row
                 && usize::from(last.x.saturating_add(last.width)) == cell.column
