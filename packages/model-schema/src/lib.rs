@@ -31,6 +31,28 @@ pub enum UnsupportedKeywordPolicy {
     Remove,
 }
 
+/// Policy for siblings of a JSON Schema `$ref`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceSiblingPolicy {
+    /// Preserve all siblings allowed by general JSON Schema.
+    #[default]
+    Preserve,
+    /// Remove annotation-only siblings and reject semantic siblings whose behavior cannot be kept.
+    RemoveAnnotationsRejectSemantic,
+}
+
+/// Policy for `oneOf` unions in a provider dialect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OneOfPolicy {
+    /// Preserve general JSON Schema `oneOf` unions.
+    #[default]
+    Preserve,
+    /// Collapse branches made only of `const` plus annotations into an equivalent `enum`.
+    CollapseAnnotatedConstants,
+}
+
 /// Declarative provider JSON Schema dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaDialect {
@@ -42,6 +64,12 @@ pub struct SchemaDialect {
     /// Accepted `minItems` values. Empty means every value is accepted.
     #[serde(default)]
     pub accepted_min_items: BTreeSet<u64>,
+    /// Policy for `oneOf` unions.
+    #[serde(default)]
+    pub one_of: OneOfPolicy,
+    /// Policy for keywords adjacent to a `$ref`.
+    #[serde(default)]
+    pub reference_siblings: ReferenceSiblingPolicy,
     /// Reject references outside the current schema document.
     #[serde(default = "default_true")]
     pub reject_external_references: bool,
@@ -60,6 +88,8 @@ impl Default for SchemaDialect {
             object_properties: ObjectPropertyPolicy::Preserve,
             unsupported_keywords: std::collections::BTreeMap::new(),
             accepted_min_items: BTreeSet::new(),
+            one_of: OneOfPolicy::Preserve,
+            reference_siblings: ReferenceSiblingPolicy::Preserve,
             reject_external_references: true,
             reject_recursive_references: true,
         }
@@ -137,6 +167,8 @@ fn normalize_object(
     dialect: &SchemaDialect,
     path: &str,
 ) -> Result<(), SchemaPortabilityError> {
+    collapse_annotated_constant_one_of(object, dialect, path)?;
+    normalize_reference_siblings(object, dialect, path)?;
     for (keyword, policy) in &dialect.unsupported_keywords {
         if object.contains_key(keyword) {
             match policy {
@@ -185,6 +217,69 @@ fn normalize_object(
         if let Some(child) = object.get_mut(&key) {
             normalize_value(child, dialect, &join_pointer(path, &key))?;
         }
+    }
+    Ok(())
+}
+
+fn collapse_annotated_constant_one_of(
+    object: &mut Map<String, Value>,
+    dialect: &SchemaDialect,
+    path: &str,
+) -> Result<(), SchemaPortabilityError> {
+    if dialect.one_of == OneOfPolicy::Preserve {
+        return Ok(());
+    }
+    let Some(branches) = object.get("oneOf").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut values = Vec::with_capacity(branches.len());
+    for (index, branch) in branches.iter().enumerate() {
+        let Some(branch) = branch.as_object() else {
+            return Err(SchemaPortabilityError::new(
+                &join_pointer(&join_pointer(path, "oneOf"), &index.to_string()),
+                "oneOf branch is not an annotated constant",
+            ));
+        };
+        if branch
+            .keys()
+            .any(|key| !matches!(key.as_str(), "const" | "description" | "title" | "$comment"))
+        {
+            return Err(SchemaPortabilityError::new(
+                &join_pointer(&join_pointer(path, "oneOf"), &index.to_string()),
+                "oneOf branch contains semantics that cannot be collapsed to enum",
+            ));
+        }
+        let value = branch.get("const").ok_or_else(|| {
+            SchemaPortabilityError::new(
+                &join_pointer(&join_pointer(path, "oneOf"), &index.to_string()),
+                "oneOf branch is missing const",
+            )
+        })?;
+        values.push(value.clone());
+    }
+    object.remove("oneOf");
+    object.insert("enum".to_owned(), Value::Array(values));
+    Ok(())
+}
+
+fn normalize_reference_siblings(
+    object: &mut Map<String, Value>,
+    dialect: &SchemaDialect,
+    path: &str,
+) -> Result<(), SchemaPortabilityError> {
+    if !object.contains_key("$ref")
+        || dialect.reference_siblings == ReferenceSiblingPolicy::Preserve
+    {
+        return Ok(());
+    }
+    for annotation in ["description", "title", "$comment", "deprecated", "examples"] {
+        object.remove(annotation);
+    }
+    if let Some(sibling) = object.keys().find(|key| key.as_str() != "$ref") {
+        return Err(SchemaPortabilityError::new(
+            &join_pointer(path, sibling),
+            format!("semantic keyword `{sibling}` cannot accompany `$ref` in this dialect"),
+        ));
     }
     Ok(())
 }
@@ -309,6 +404,79 @@ mod tests {
             normalized.pointer("/properties/child/required"),
             Some(&serde_json::json!(["name"]))
         );
+    }
+
+    #[test]
+    fn collapses_annotated_constant_one_of_and_rejects_semantic_branches() {
+        let dialect = SchemaDialect {
+            one_of: OneOfPolicy::CollapseAnnotatedConstants,
+            ..SchemaDialect::default()
+        };
+        let normalized = normalize(
+            &serde_json::json!({
+                "oneOf": [
+                    {"const": "high", "description": "High confidence"},
+                    {"const": "low", "description": "Low confidence"}
+                ]
+            }),
+            &dialect,
+        )
+        .expect("annotated constants should collapse");
+        assert_eq!(normalized, serde_json::json!({"enum": ["high", "low"]}));
+
+        let error = normalize(
+            &serde_json::json!({
+                "oneOf": [
+                    {"type": "object", "properties": {"left": {"type": "string"}}},
+                    {"type": "object", "properties": {"right": {"type": "string"}}}
+                ]
+            }),
+            &dialect,
+        )
+        .expect_err("semantic unions must not be silently collapsed");
+        assert_eq!(error.path(), "/oneOf/0");
+    }
+
+    #[test]
+    fn removes_reference_annotations_and_rejects_semantic_siblings_when_required() {
+        let dialect = SchemaDialect {
+            reference_siblings: ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
+            ..SchemaDialect::default()
+        };
+        let normalized = normalize(
+            &serde_json::json!({
+                "$defs": {"confidence": {"type": "string"}},
+                "type": "object",
+                "properties": {
+                    "confidence": {
+                        "$ref": "#/$defs/confidence",
+                        "description": "Model-reported confidence"
+                    }
+                }
+            }),
+            &dialect,
+        )
+        .expect("annotation-only siblings should be removed");
+        assert_eq!(
+            normalized.pointer("/properties/confidence"),
+            Some(&serde_json::json!({"$ref": "#/$defs/confidence"}))
+        );
+
+        let error = normalize(
+            &serde_json::json!({
+                "$defs": {"confidence": {"type": "string"}},
+                "type": "object",
+                "properties": {
+                    "confidence": {
+                        "$ref": "#/$defs/confidence",
+                        "minLength": 1
+                    }
+                }
+            }),
+            &dialect,
+        )
+        .expect_err("semantic siblings must not be silently discarded");
+        assert_eq!(error.path(), "/properties/confidence/minLength");
     }
 
     #[test]

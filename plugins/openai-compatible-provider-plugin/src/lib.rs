@@ -5310,6 +5310,9 @@ fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value,
         schema,
         &bcode_model_schema::SchemaDialect {
             object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+            one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
+            reference_siblings:
+                bcode_model_schema::ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
             ..bcode_model_schema::SchemaDialect::default()
         },
     )
@@ -9388,6 +9391,43 @@ mod tests {
         assert_eq!(
             schema["properties"]["nested"]["required"],
             serde_json::json!(["value"])
+        );
+    }
+
+    #[test]
+    fn strict_schema_collapses_documented_enum_and_removes_ref_annotations() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "ConformanceResult".to_string(),
+            schema: serde_json::json!({
+                "$defs": {
+                    "confidence": {
+                        "oneOf": [
+                            {"const": "high", "description": "High confidence"},
+                            {"const": "low", "description": "Low confidence"}
+                        ]
+                    }
+                },
+                "type": "object",
+                "properties": {
+                    "confidence": {
+                        "$ref": "#/$defs/confidence",
+                        "description": "Model-reported confidence"
+                    }
+                }
+            }),
+            strict: true,
+        });
+
+        let body = build_responses_request(&settings, &request, "model").expect("request");
+        assert_eq!(
+            body.pointer("/text/format/schema/properties/confidence"),
+            Some(&serde_json::json!({"$ref": "#/$defs/confidence"}))
+        );
+        assert_eq!(
+            body.pointer("/text/format/schema/$defs/confidence"),
+            Some(&serde_json::json!({"enum": ["high", "low"]}))
         );
     }
 
