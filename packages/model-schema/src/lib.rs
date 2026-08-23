@@ -240,10 +240,12 @@ fn collapse_annotated_constant_one_of(
                 "oneOf branch is not an annotated constant",
             ));
         };
-        if branch
-            .keys()
-            .any(|key| !matches!(key.as_str(), "const" | "description" | "title" | "$comment"))
-        {
+        if branch.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "const" | "type" | "description" | "title" | "$comment"
+            )
+        }) {
             return Err(SchemaPortabilityError::new(
                 &join_pointer(&join_pointer(path, "oneOf"), &index.to_string()),
                 "oneOf branch contains semantics that cannot be collapsed to enum",
@@ -415,8 +417,8 @@ mod tests {
         let normalized = normalize(
             &serde_json::json!({
                 "oneOf": [
-                    {"const": "high", "description": "High confidence"},
-                    {"const": "low", "description": "Low confidence"}
+                    {"type": "string", "const": "high", "description": "High confidence"},
+                    {"type": "string", "const": "low", "description": "Low confidence"}
                 ]
             }),
             &dialect,

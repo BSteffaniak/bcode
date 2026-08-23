@@ -9404,8 +9404,8 @@ mod tests {
                 "$defs": {
                     "confidence": {
                         "oneOf": [
-                            {"const": "high", "description": "High confidence"},
-                            {"const": "low", "description": "Low confidence"}
+                            {"type": "string", "const": "high", "description": "High confidence"},
+                            {"type": "string", "const": "low", "description": "Low confidence"}
                         ]
                     }
                 },
