@@ -5,7 +5,7 @@ violations=0
 
 if rg -n 'launch_working_directory: std::env::current_dir\(\)|unwrap_or_else\(\|\| std::path::Path::new\("\."\)\)' \
   packages/tui/src/skill_flow.rs packages/tui/src/chat_loop.rs >/tmp/bcode-tui-daemon-relative-cwd.txt \
-  || ! grep -F 'session_working_directory_must_be_absolute' packages/server/src/lib.rs >/dev/null; then
+  || ! grep -F 'session_working_directory_must_be_absolute' packages/server/src/session_operations.rs >/dev/null; then
   echo "Session working-directory violation: frontend launch paths must remain explicit and daemon session paths must reject relative values." >&2
   cat /tmp/bcode-tui-daemon-relative-cwd.txt 2>/dev/null >&2 || true
   violations=1

@@ -6670,23 +6670,26 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
                 }
                 bcode_ipc::Request::ReadSessionArtifact { offset, .. } => {
                     bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionArtifactRange {
-                        artifact_id: "call-live-shell-shell-run".to_owned(),
-                        reference_key: "shell_recording".to_owned(),
-                        content_type: Some(
-                            "application/x-bcode-shell-recording; version=3".to_owned(),
-                        ),
-                        offset,
-                        total_bytes: u64::try_from(response_bytes.len()).expect("recording length"),
-                        reference_bytes: Some(
-                            u64::try_from(response_bytes.len()).expect("recording length"),
-                        ),
-                        reference_revision: 2,
-                        finalized: false,
-                        finalized_event_seq: None,
-                        availability: Some("active".to_owned()),
-                        complete: Some(false),
-                        checksum_sha256: None,
-                        bytes: response_bytes.clone(),
+                        range: bcode_ipc::SessionArtifactRange {
+                            artifact_id: "call-live-shell-shell-run".to_owned(),
+                            reference_key: "shell_recording".to_owned(),
+                            content_type: Some(
+                                "application/x-bcode-shell-recording; version=3".to_owned(),
+                            ),
+                            offset,
+                            total_bytes: u64::try_from(response_bytes.len())
+                                .expect("recording length"),
+                            reference_bytes: Some(
+                                u64::try_from(response_bytes.len()).expect("recording length"),
+                            ),
+                            reference_revision: 2,
+                            finalized: false,
+                            finalized_event_seq: None,
+                            availability: Some("active".to_owned()),
+                            complete: Some(false),
+                            checksum_sha256: None,
+                            bytes: response_bytes.clone(),
+                        },
                     })
                 }
                 request => panic!("unexpected request: {request:?}"),

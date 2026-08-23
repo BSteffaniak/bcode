@@ -288,6 +288,28 @@ pub enum ReadHistoryError {
     Session(#[from] bcode_session::SessionError),
 }
 
+impl ReadHistoryError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::IncompatibleActiveNamespace(_) => "session_incompatible_active_client",
+            Self::Session(_) => "session_unavailable",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Self::IncompatibleActiveNamespace(_) => {
+                "session is active for an incompatible client; reconnect with a matching client or wait until the session is inactive"
+            }
+            Self::Session(_) => "session is unavailable",
+        }
+    }
+}
+
 /// Return complete canonical history for an explicit export/debug request.
 ///
 /// This operation is intentionally separate from normal bounded history and inspection reads.
@@ -488,6 +510,26 @@ pub enum CreateSessionError {
     /// Canonical session creation failed.
     #[error(transparent)]
     Session(#[from] bcode_session::SessionError),
+}
+
+impl CreateSessionError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::WorkingDirectoryMustBeAbsolute => "session_working_directory_must_be_absolute",
+            Self::Session(_) => "session_create_failed",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Self::WorkingDirectoryMustBeAbsolute => "session working directory must be absolute",
+            Self::Session(_) => "session creation failed",
+        }
+    }
 }
 
 /// Application-level failure while activating a session skill.
@@ -701,12 +743,10 @@ pub enum ChangeWorkingDirectoryError {
     #[error("session working directory must be absolute")]
     MustBeAbsolute,
     /// The path cannot be inspected or canonicalized.
-    #[error("{message}")]
+    #[error("session working directory is unavailable")]
     Unavailable {
         /// Stable public error code.
         code: &'static str,
-        /// Secret-safe public message.
-        message: String,
     },
     /// Active model work prevents changing session identity context.
     #[error("session has an active model turn: {0}")]
@@ -722,9 +762,22 @@ impl ChangeWorkingDirectoryError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::MustBeAbsolute => "session_working_directory_must_be_absolute",
-            Self::Unavailable { code, .. } => code,
+            Self::Unavailable { code } => code,
             Self::Busy(_) => "session_busy",
             Self::Session(_) => "session_cwd_change_failed",
+        }
+    }
+    /// Return the secret-safe public message for this failure.
+    #[must_use]
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::MustBeAbsolute => "session working directory must be absolute",
+            Self::Unavailable {
+                code: "session_working_directory_not_directory",
+            } => "session working directory path is not a directory",
+            Self::Unavailable { .. } => "session working directory is unavailable",
+            Self::Busy(_) => "session has active work and cannot change working directory",
+            Self::Session(_) => "session working directory change failed",
         }
     }
 }
@@ -738,23 +791,20 @@ pub async fn change_working_directory(
     if !working_directory.is_absolute() {
         return Err(ChangeWorkingDirectoryError::MustBeAbsolute);
     }
-    let metadata = tokio::fs::metadata(&working_directory)
-        .await
-        .map_err(|error| ChangeWorkingDirectoryError::Unavailable {
+    let metadata = tokio::fs::metadata(&working_directory).await.map_err(|_| {
+        ChangeWorkingDirectoryError::Unavailable {
             code: "session_working_directory_unavailable",
-            message: format!("session working directory is not accessible: {error}"),
-        })?;
+        }
+    })?;
     if !metadata.is_dir() {
         return Err(ChangeWorkingDirectoryError::Unavailable {
             code: "session_working_directory_not_directory",
-            message: "session working directory path is not a directory".to_owned(),
         });
     }
     let working_directory = tokio::fs::canonicalize(working_directory)
         .await
-        .map_err(|error| ChangeWorkingDirectoryError::Unavailable {
+        .map_err(|_| ChangeWorkingDirectoryError::Unavailable {
             code: "session_working_directory_unavailable",
-            message: format!("session working directory cannot be resolved: {error}"),
         })?;
     if state.session_has_active_turn(session_id).await {
         return Err(ChangeWorkingDirectoryError::Busy(session_id));
@@ -786,6 +836,26 @@ pub enum DeleteSessionError {
     /// Canonical session deletion failed.
     #[error(transparent)]
     Session(#[from] bcode_session::SessionError),
+}
+
+impl DeleteSessionError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Busy(_) => "session_busy",
+            Self::Session(_) => "session_delete_failed",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Self::Busy(_) => "session has active work and cannot be deleted",
+            Self::Session(_) => "session deletion failed",
+        }
+    }
 }
 
 /// Delete one idle canonical session and dispose its derived state.

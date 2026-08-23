@@ -1,8 +1,8 @@
 //! Transport-neutral application operations for session-owned artifacts.
 
-use super::{ResponsePayload, ServerState};
+use super::ServerState;
 
-/// Read one bounded, confined range from a finalized session artifact.
+/// Read one bounded, confined range from a finalized or active session artifact.
 pub async fn read_range(
     state: &ServerState,
     session_id: bcode_session_models::SessionId,
@@ -10,7 +10,7 @@ pub async fn read_range(
     reference_key: &str,
     offset: u64,
     length: u32,
-) -> Result<ResponsePayload, String> {
+) -> Result<bcode_ipc::SessionArtifactRange, String> {
     super::read_session_artifact_range(
         state,
         session_id,

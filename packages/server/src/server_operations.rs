@@ -16,27 +16,14 @@ pub async fn status(
     state.status(working_directory).await
 }
 
-/// Transport-neutral model-catalog diagnostics.
-pub struct ModelCatalogDiagnostics {
-    pub embedded_revision: String,
-    pub remote_revision: Option<String>,
-    pub remote_enabled: bool,
-    pub cache_state: String,
-    pub cache_age_seconds: Option<u64>,
-    pub refresh_in_progress: bool,
-    pub last_refresh_attempt_ms: Option<u64>,
-    pub last_refresh_success_ms: Option<u64>,
-    pub last_refresh_error: Option<String>,
-}
-
 /// Return normalized model-catalog diagnostics without transport framing.
-pub async fn model_catalog_diagnostics(state: &ServerState) -> ModelCatalogDiagnostics {
+pub async fn model_catalog_diagnostics(state: &ServerState) -> bcode_ipc::ModelCatalogDiagnostics {
     let diagnostics = state.model_catalog.diagnostics().await;
     let epoch_ms = |time: Option<std::time::SystemTime>| {
         time.and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|value| u64::try_from(value.as_millis()).ok())
     };
-    ModelCatalogDiagnostics {
+    bcode_ipc::ModelCatalogDiagnostics {
         embedded_revision: diagnostics.embedded_revision,
         remote_revision: diagnostics.remote_revision,
         remote_enabled: diagnostics.remote_enabled,
@@ -49,15 +36,36 @@ pub async fn model_catalog_diagnostics(state: &ServerState) -> ModelCatalogDiagn
     }
 }
 
-/// Application failure while updating client runtime context.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateClientContextError {
-    #[error("invalid client configuration: {0}")]
-    InvalidConfig(String),
-    #[error("incompatible client configuration: {0}")]
-    IncompatibleConfig(String),
-    #[error("invalid interaction adapters: {0}")]
-    InvalidInteractionAdapters(String),
+    #[error("invalid client configuration")]
+    InvalidConfig,
+    #[error("incompatible client configuration")]
+    IncompatibleConfig,
+    #[error("invalid interaction adapters")]
+    InvalidInteractionAdapters,
+}
+
+impl UpdateClientContextError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig => "invalid_client_config",
+            Self::IncompatibleConfig => "incompatible_config",
+            Self::InvalidInteractionAdapters => "invalid_interaction_adapters",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig => "client configuration is invalid",
+            Self::IncompatibleConfig => "client configuration is incompatible with this daemon",
+            Self::InvalidInteractionAdapters => "client interaction adapters are invalid",
+        }
+    }
 }
 
 /// Validate and retain one client's runtime context without transport framing.
@@ -66,45 +74,79 @@ pub async fn update_client_runtime_context(
     client_id: bcode_session_models::ClientId,
     runtime_context: Option<bcode_ipc::ClientRuntimeContext>,
 ) -> Result<(), UpdateClientContextError> {
-    validate_client_effective_config(runtime_context.as_ref())
-        .map_err(UpdateClientContextError::InvalidConfig)?;
-    validate_client_plugin_selection(state, runtime_context.as_ref())
-        .map_err(UpdateClientContextError::IncompatibleConfig)?;
-    validate_client_interaction_adapters(runtime_context.as_ref()).map_err(|message| {
-        UpdateClientContextError::InvalidInteractionAdapters(message.to_owned())
-    })?;
+    validate_client_effective_config(runtime_context.as_ref())?;
+    validate_client_plugin_selection(state, runtime_context.as_ref())?;
+    validate_client_interaction_adapters(runtime_context.as_ref())?;
     state
         .set_client_runtime_context(client_id, runtime_context)
         .await;
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum IngestClientMetricsError {
+    #[error("invalid client metrics")]
+    InvalidBatch,
+}
+
+impl IngestClientMetricsError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidBatch => "invalid_client_metrics",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Self::InvalidBatch => "client metrics batch is invalid",
+        }
+    }
+}
+
 /// Validate and ingest one bounded client metric batch.
 pub fn ingest_client_metrics(
     state: &ServerState,
     batch: bcode_metrics::ClientMetricBatch,
-) -> Result<usize, bcode_metrics::ClientMetricBatchError> {
-    batch.validate_for_namespace("tui.")?;
+) -> Result<usize, IngestClientMetricsError> {
+    batch
+        .validate_for_namespace("tui.")
+        .map_err(|_| IngestClientMetricsError::InvalidBatch)?;
     let accepted = batch.observations.len();
     state.metrics.record_client_batch(batch);
     Ok(accepted)
 }
 #[derive(Debug, thiserror::Error)]
-#[error("daemon is busy: {0}")]
-pub struct StopBlocked(pub String);
+#[error("daemon is busy")]
+pub struct StopBlocked;
+
+impl StopBlocked {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code() -> &'static str {
+        "daemon_busy"
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message() -> &'static str {
+        "daemon has active work and cannot stop in the requested mode"
+    }
+}
 
 /// Validate a shutdown request before the transport publishes acknowledgment.
 pub async fn prepare_stop(
     state: &ServerState,
     mode: bcode_ipc::ServerStopMode,
 ) -> Result<(), StopBlocked> {
-    if let Some(message) = state.active_migration_shutdown_blocker().await {
-        return Err(StopBlocked(message));
+    if state.active_migration_shutdown_blocker().await.is_some() {
+        return Err(StopBlocked);
     }
-    if mode == bcode_ipc::ServerStopMode::IfIdle
-        && let Some(message) = state.idle_shutdown_blocker().await
-    {
-        return Err(StopBlocked(message));
+    if mode == bcode_ipc::ServerStopMode::IfIdle && state.idle_shutdown_blocker().await.is_some() {
+        return Err(StopBlocked);
     }
     Ok(())
 }
@@ -116,48 +158,45 @@ pub fn request_shutdown(state: &ServerState) {
 
 pub fn validate_client_effective_config(
     context: Option<&bcode_ipc::ClientRuntimeContext>,
-) -> Result<(), String> {
+) -> Result<(), UpdateClientContextError> {
     let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
     else {
         return Ok(());
     };
     if contents.len() > MAX_CLIENT_EFFECTIVE_CONFIG_BYTES {
-        return Err("effective client config exceeds the 1 MiB transport limit".to_owned());
+        return Err(UpdateClientContextError::InvalidConfig);
     }
     bcode_config::decode_effective_config(contents)
         .map(|_| ())
-        .map_err(|error| format!("invalid effective client config: {error}"))
+        .map_err(|_| UpdateClientContextError::InvalidConfig)
 }
 
 pub fn validate_client_plugin_selection(
     state: &ServerState,
     context: Option<&bcode_ipc::ClientRuntimeContext>,
-) -> Result<(), String> {
+) -> Result<(), UpdateClientContextError> {
     let Some(contents) = context.and_then(|context| context.effective_config_toml.as_deref())
     else {
         return Ok(());
     };
     let config = bcode_config::decode_effective_config(contents)
-        .map_err(|error| format!("invalid effective client config: {error}"))?;
+        .map_err(|_| UpdateClientContextError::InvalidConfig)?;
     let selection =
         bcode_config::plugin_selection_with_default_plugin_ids(&config, &state.default_plugin_ids);
     if selection == state.startup_plugin_selection {
         return Ok(());
     }
-    Err(format!(
-        "client effective plugin selection {:?} does not match daemon startup selection {:?}; restart the daemon with the desired plugin configuration",
-        selection, state.startup_plugin_selection
-    ))
+    Err(UpdateClientContextError::IncompatibleConfig)
 }
 
 pub fn validate_client_interaction_adapters(
     context: Option<&bcode_ipc::ClientRuntimeContext>,
-) -> Result<(), &'static str> {
+) -> Result<(), UpdateClientContextError> {
     let Some(context) = context else {
         return Ok(());
     };
     if context.interaction_adapters.len() > MAX_CLIENT_INTERACTION_ADAPTERS {
-        return Err("too many interaction adapters");
+        return Err(UpdateClientContextError::InvalidInteractionAdapters);
     }
     let mut routes = BTreeSet::new();
     for adapter in &context.interaction_adapters {
@@ -174,12 +213,12 @@ pub fn validate_client_interaction_adapters(
                 value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES
             })
         {
-            return Err("interaction adapter identifiers must be non-empty and at most 128 bytes");
+            return Err(UpdateClientContextError::InvalidInteractionAdapters);
         }
         if adapter.min_schema_version == 0
             || adapter.max_schema_version < adapter.min_schema_version
         {
-            return Err("interaction adapter schema version range must be positive and ordered");
+            return Err(UpdateClientContextError::InvalidInteractionAdapters);
         }
         if !routes.insert((
             adapter.producer_id.as_str(),
@@ -189,7 +228,7 @@ pub fn validate_client_interaction_adapters(
             adapter.platform_id.as_str(),
             adapter.priority,
         )) {
-            return Err("duplicate interaction adapter route");
+            return Err(UpdateClientContextError::InvalidInteractionAdapters);
         }
     }
     Ok(())

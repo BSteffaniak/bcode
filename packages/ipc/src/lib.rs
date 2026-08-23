@@ -1397,6 +1397,53 @@ pub struct PermissionSummary {
     pub can_remember_policy: bool,
 }
 
+/// Normalized model-catalog diagnostics exposed at the application boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogDiagnostics {
+    pub embedded_revision: String,
+    pub remote_revision: Option<String>,
+    pub remote_enabled: bool,
+    pub cache_state: String,
+    pub cache_age_seconds: Option<u64>,
+    pub refresh_in_progress: bool,
+    pub last_refresh_attempt_ms: Option<u64>,
+    pub last_refresh_success_ms: Option<u64>,
+    pub last_refresh_error: Option<String>,
+}
+
+/// Bounded generic session artifact byte range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionArtifactRange {
+    pub artifact_id: String,
+    pub reference_key: String,
+    pub content_type: Option<String>,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub reference_bytes: Option<u64>,
+    pub reference_revision: u64,
+    pub finalized: bool,
+    pub finalized_event_seq: Option<u64>,
+    pub availability: Option<String>,
+    pub complete: Option<bool>,
+    pub checksum_sha256: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl SessionArtifactRange {
+    /// Return the offset immediately after this response.
+    #[must_use]
+    pub fn next_offset(&self) -> u64 {
+        self.offset
+            .saturating_add(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Return whether this response reaches the current artifact EOF.
+    #[must_use]
+    pub fn is_eof(&self) -> bool {
+        self.next_offset() >= self.total_bytes
+    }
+}
+
 /// Pending renderer-neutral invocation exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingToolExchangeSummary {
@@ -3030,30 +3077,10 @@ pub enum ResponsePayload {
     },
     /// Effective model catalog diagnostics.
     ModelCatalogDiagnostics {
-        embedded_revision: String,
-        remote_revision: Option<String>,
-        remote_enabled: bool,
-        cache_state: String,
-        cache_age_seconds: Option<u64>,
-        refresh_in_progress: bool,
-        last_refresh_attempt_ms: Option<u64>,
-        last_refresh_success_ms: Option<u64>,
-        last_refresh_error: Option<String>,
+        diagnostics: ModelCatalogDiagnostics,
     },
     SessionArtifactRange {
-        artifact_id: String,
-        reference_key: String,
-        content_type: Option<String>,
-        offset: u64,
-        total_bytes: u64,
-        reference_bytes: Option<u64>,
-        reference_revision: u64,
-        finalized: bool,
-        finalized_event_seq: Option<u64>,
-        availability: Option<String>,
-        complete: Option<bool>,
-        checksum_sha256: Option<String>,
-        bytes: Vec<u8>,
+        range: SessionArtifactRange,
     },
     SessionHistoryAround {
         window: SessionHistoryWindow,

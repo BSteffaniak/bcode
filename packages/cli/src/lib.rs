@@ -4017,6 +4017,12 @@ enum ModelCommand {
         json: bool,
     },
     Capabilities,
+    /// Inspect normalized embedded/remote model-catalog state.
+    Diagnostics {
+        /// Print the complete diagnostics contract as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Validate,
     Ignore {
         model_id: String,
@@ -4837,6 +4843,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                     model_status(session_id, json).await?;
                 }
                 ModelCommand::Capabilities => model_capabilities().await?,
+                ModelCommand::Diagnostics { json } => model_catalog_diagnostics(json).await?,
                 ModelCommand::Validate => model_validate_config().await?,
                 ModelCommand::Set {
                     session_id,
@@ -8822,6 +8829,34 @@ async fn set_session_model(
         .set_session_model(session_id, provider_plugin_id, model_id)
         .await?;
     println!("session model set");
+    Ok(())
+}
+
+async fn model_catalog_diagnostics(json: bool) -> Result<(), CliError> {
+    let diagnostics = BcodeClient::default_endpoint()
+        .model_catalog_diagnostics()
+        .await?;
+    if json {
+        print_json(&diagnostics)?;
+    } else {
+        println!("embedded revision: {}", diagnostics.embedded_revision);
+        println!(
+            "remote revision: {}",
+            diagnostics.remote_revision.as_deref().unwrap_or("-")
+        );
+        println!("remote enabled: {}", diagnostics.remote_enabled);
+        println!("cache state: {}", diagnostics.cache_state);
+        println!(
+            "cache age seconds: {}",
+            diagnostics
+                .cache_age_seconds
+                .map_or_else(|| "-".to_owned(), |seconds| seconds.to_string())
+        );
+        println!("refresh in progress: {}", diagnostics.refresh_in_progress);
+        if let Some(error) = diagnostics.last_refresh_error {
+            println!("last refresh error: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -18718,6 +18753,24 @@ mod plugin_cli_tests {
                     json: true,
                     ..
                 }
+            })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod model_cli_tests {
+    use super::{Cli, Commands, ModelCommand};
+    use clap::Parser as _;
+
+    #[test]
+    fn model_diagnostics_supports_machine_output() {
+        let cli = Cli::try_parse_from(["bcode", "model", "diagnostics", "--json"])
+            .expect("model diagnostics parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Model {
+                command: ModelCommand::Diagnostics { json: true }
             })
         ));
     }

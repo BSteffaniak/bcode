@@ -1,8 +1,8 @@
 //! Request-only hydration of artifact-backed tool-result images.
 
 use super::{
-    ContentBlock, MAX_ARTIFACT_RANGE_BYTES, ModelTurnRequest, ResponsePayload, ServerState,
-    SessionId, read_session_artifact_range, resolved_provider_models, select_model_info,
+    ContentBlock, MAX_ARTIFACT_RANGE_BYTES, ModelTurnRequest, ServerState, SessionId,
+    read_session_artifact_range, resolved_provider_models, select_model_info,
 };
 use base64::Engine as _;
 use std::fmt::Write as _;
@@ -161,14 +161,8 @@ pub async fn read_image_artifact(
             length,
         )
         .await?;
-        let ResponsePayload::SessionArtifactRange {
-            total_bytes,
-            bytes: chunk,
-            ..
-        } = response
-        else {
-            return Err("artifact reader returned an unexpected response".to_owned());
-        };
+        let total_bytes = response.total_bytes;
+        let chunk = response.bytes;
         bytes.extend_from_slice(&chunk);
         offset = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         if offset >= total_bytes {

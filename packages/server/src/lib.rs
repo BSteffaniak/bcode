@@ -6199,34 +6199,17 @@ async fn handle_update_client_runtime_context(
     writer: &SharedWriter,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<(), ServerError> {
-    match server_operations::update_client_runtime_context(state, client_id, runtime_context).await
-    {
-        Ok(()) => {}
-        Err(server_operations::UpdateClientContextError::InvalidConfig(message)) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new("invalid_client_config", message)),
-            )
-            .await;
-        }
-        Err(server_operations::UpdateClientContextError::IncompatibleConfig(message)) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new("incompatible_config", message)),
-            )
-            .await;
-        }
-        Err(server_operations::UpdateClientContextError::InvalidInteractionAdapters(message)) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new("invalid_interaction_adapters", message)),
-            )
-            .await;
-        }
-    }
+    let result =
+        server_operations::update_client_runtime_context(state, client_id, runtime_context).await;
+    let Ok(()) = result else {
+        let error = result.expect_err("failed client context update must contain an error");
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(error.code(), error.message())),
+        )
+        .await;
+    };
     send_response(
         writer,
         request_id,
@@ -6245,19 +6228,15 @@ async fn handle_ingest_client_metrics(
     writer: &SharedWriter,
     batch: bcode_metrics::ClientMetricBatch,
 ) -> Result<(), ServerError> {
-    let accepted = match server_operations::ingest_client_metrics(state, batch) {
-        Ok(accepted) => accepted,
-        Err(error) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "invalid_client_metrics",
-                    error.to_string(),
-                )),
-            )
-            .await;
-        }
+    let result = server_operations::ingest_client_metrics(state, batch);
+    let Ok(accepted) = result else {
+        let error = result.expect_err("failed client metrics result must contain an error");
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(error.code(), error.message())),
+        )
+        .await;
     };
     send_response(
         writer,
@@ -6325,33 +6304,24 @@ async fn handle_hello(
         )
         .await;
     }
-    if let Err(message) =
+    let validation =
         server_operations::validate_client_effective_config(hello.runtime_context.as_ref())
-    {
+            .and_then(|()| {
+                server_operations::validate_client_plugin_selection(
+                    state,
+                    hello.runtime_context.as_ref(),
+                )
+            })
+            .and_then(|()| {
+                server_operations::validate_client_interaction_adapters(
+                    hello.runtime_context.as_ref(),
+                )
+            });
+    if let Err(error) = validation {
         return send_response(
             writer,
             request_id,
-            Response::Err(ErrorResponse::new("invalid_client_config", message)),
-        )
-        .await;
-    }
-    if let Err(message) =
-        server_operations::validate_client_plugin_selection(state, hello.runtime_context.as_ref())
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new("incompatible_config", message)),
-        )
-        .await;
-    }
-    if let Err(message) =
-        server_operations::validate_client_interaction_adapters(hello.runtime_context.as_ref())
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new("invalid_interaction_adapters", message)),
+            Response::Err(ErrorResponse::new(error.code(), error.message())),
         )
         .await;
     }
@@ -6414,17 +6384,7 @@ async fn handle_model_catalog_diagnostics(
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::ModelCatalogDiagnostics {
-            embedded_revision: diagnostics.embedded_revision,
-            remote_revision: diagnostics.remote_revision,
-            remote_enabled: diagnostics.remote_enabled,
-            cache_state: format!("{:?}", diagnostics.cache_state).to_lowercase(),
-            cache_age_seconds: diagnostics.cache_age_seconds,
-            refresh_in_progress: diagnostics.refresh_in_progress,
-            last_refresh_attempt_ms: diagnostics.last_refresh_attempt_ms,
-            last_refresh_success_ms: diagnostics.last_refresh_success_ms,
-            last_refresh_error: diagnostics.last_refresh_error,
-        }),
+        Response::Ok(ResponsePayload::ModelCatalogDiagnostics { diagnostics }),
     )
     .await
 }
@@ -6598,13 +6558,14 @@ async fn handle_server_stop(
     writer: &SharedWriter,
     mode: ServerStopMode,
 ) -> Result<(), ServerError> {
-    if let Err(server_operations::StopBlocked(message)) =
-        server_operations::prepare_stop(state, mode).await
-    {
+    if server_operations::prepare_stop(state, mode).await.is_err() {
         return send_response(
             writer,
             request_id,
-            Response::Err(ErrorResponse::new("daemon_busy", message)),
+            Response::Err(ErrorResponse::new(
+                server_operations::StopBlocked::code(),
+                server_operations::StopBlocked::message(),
+            )),
         )
         .await;
     }
@@ -6674,18 +6635,14 @@ async fn handle_create_session(
 ) -> Result<(), ServerError> {
     let session = match session_operations::create(state, name, working_directory).await {
         Ok(session) => session,
-        Err(session_operations::CreateSessionError::WorkingDirectoryMustBeAbsolute) => {
+        Err(error) => {
             return send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_working_directory_must_be_absolute",
-                    "session working directory must be absolute",
-                )),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await;
         }
-        Err(session_operations::CreateSessionError::Session(error)) => return Err(error.into()),
     };
     send_response(
         writer,
@@ -7121,11 +7078,10 @@ async fn handle_change_session_working_directory(
             .await
         }
         Err(error) => {
-            let code = error.code();
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new(code, error.to_string())),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await
         }
@@ -9291,7 +9247,14 @@ async fn handle_read_session_artifact(
     )
     .await;
     match result {
-        Ok(payload) => send_response(writer, request_id, Response::Ok(payload)).await,
+        Ok(range) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionArtifactRange { range }),
+            )
+            .await
+        }
         Err(error) => {
             let code = artifact_operations::error_code(&error);
             send_response(
@@ -9449,7 +9412,7 @@ async fn read_active_artifact_range(
     offset: u64,
     length: u32,
     active: ActiveArtifactReference,
-) -> Result<ResponsePayload, String> {
+) -> Result<bcode_ipc::SessionArtifactRange, String> {
     if active.abandoned {
         return Err(
             "active artifact is incomplete because its producer stopped before finalization"
@@ -9470,7 +9433,7 @@ async fn read_active_artifact_range(
     })
     .await
     .map_err(|error| format!("active artifact range reader task failed: {error}"))??;
-    Ok(ResponsePayload::SessionArtifactRange {
+    Ok(bcode_ipc::SessionArtifactRange {
         artifact_id: artifact_id.to_owned(),
         reference_key: reference_key.to_owned(),
         content_type: active.content_type,
@@ -9498,7 +9461,7 @@ async fn read_session_artifact_range(
     reference_key: &str,
     offset: u64,
     length: u32,
-) -> Result<ResponsePayload, String> {
+) -> Result<bcode_ipc::SessionArtifactRange, String> {
     if length == 0 || length > MAX_ARTIFACT_RANGE_BYTES {
         return Err(format!(
             "artifact range length must be between 1 and {MAX_ARTIFACT_RANGE_BYTES} bytes"
@@ -9576,7 +9539,7 @@ async fn read_session_artifact_range(
     })
     .await
     .map_err(|error| format!("artifact range reader task failed: {error}"))??;
-    let response = ResponsePayload::SessionArtifactRange {
+    let response = bcode_ipc::SessionArtifactRange {
         artifact_id: artifact_id.to_owned(),
         reference_key: reference_key.to_owned(),
         content_type: reference.content_type,
@@ -9610,25 +9573,11 @@ async fn handle_delete_session(
             )
             .await
         }
-        Err(session_operations::DeleteSessionError::Busy(session_id)) => {
+        Err(error) => {
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_busy",
-                    format!("session has an active model turn: {session_id}"),
-                )),
-            )
-            .await
-        }
-        Err(session_operations::DeleteSessionError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_delete_failed",
-                    error.to_string(),
-                )),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await
         }
@@ -10643,17 +10592,13 @@ async fn handle_session_inspection(
 async fn send_incompatible_active_session_response(
     writer: &SharedWriter,
     request_id: u64,
-    active_namespace: &str,
+    _active_namespace: &str,
 ) -> Result<(), ServerError> {
+    let error = session_operations::ReadHistoryError::IncompatibleActiveNamespace(String::new());
     send_response(
         writer,
         request_id,
-        Response::Err(ErrorResponse::new(
-            "session_incompatible_active_client",
-            format!(
-                "session is active for daemon compatibility namespace {active_namespace}; reconnect with a matching client or wait until the session is inactive"
-            ),
-        )),
+        Response::Err(ErrorResponse::new(error.code(), error.message())),
     )
     .await
 }
@@ -36715,10 +36660,10 @@ library = "test"
             interaction_adapters: vec![adapter.clone(), adapter.clone()],
             ..ClientRuntimeContext::default()
         };
-        assert_eq!(
-            server_operations::validate_client_interaction_adapters(Some(&duplicate)),
-            Err("duplicate interaction adapter route")
-        );
+        let duplicate_error =
+            server_operations::validate_client_interaction_adapters(Some(&duplicate))
+                .expect_err("duplicate interaction route");
+        assert_eq!(duplicate_error.code(), "invalid_interaction_adapters");
 
         let invalid = ClientRuntimeContext {
             interaction_adapters: vec![
@@ -37008,7 +36953,7 @@ library = "test"
                     artifact.committed_bytes == 9 && artifact.revision == 1
                 })
         ));
-        let ResponsePayload::SessionArtifactRange {
+        let bcode_ipc::SessionArtifactRange {
             total_bytes,
             reference_revision,
             finalized,
@@ -37016,10 +36961,7 @@ library = "test"
             ..
         } = read_session_artifact_range(&state, session_id, "artifact-active", "recording", 0, 64)
             .await
-            .expect("active range")
-        else {
-            panic!("expected artifact range");
-        };
+            .expect("active range");
         assert_eq!(total_bytes, 9);
         assert_eq!(reference_revision, 1);
         assert!(!finalized);
@@ -37054,7 +36996,7 @@ library = "test"
                 .len(),
             1
         );
-        let ResponsePayload::SessionArtifactRange {
+        let bcode_ipc::SessionArtifactRange {
             total_bytes,
             reference_revision,
             finalized,
@@ -37064,10 +37006,7 @@ library = "test"
             ..
         } = read_session_artifact_range(&state, session_id, "artifact-active", "recording", 9, 64)
             .await
-            .expect("finalized live range remains readable before projection")
-        else {
-            panic!("expected artifact range");
-        };
+            .expect("finalized live range remains readable before projection");
         assert_eq!(total_bytes, 20);
         assert_eq!(reference_revision, 2);
         assert!(finalized);
@@ -37194,7 +37133,7 @@ library = "test"
                 .is_empty(),
             "live registration must retire only after the durable projection commits"
         );
-        let ResponsePayload::SessionArtifactRange {
+        let bcode_ipc::SessionArtifactRange {
             bytes,
             finalized,
             finalized_event_seq,
@@ -37208,10 +37147,7 @@ library = "test"
             9,
         )
         .await
-        .expect("canonical range")
-        else {
-            panic!("expected artifact range");
-        };
+        .expect("canonical range");
         assert_eq!(bytes, b"canonical");
         assert!(finalized && finalized_event_seq.is_some());
         drop(registration);
@@ -45321,6 +45257,85 @@ library = "test"
         }
     }
 
+    #[test]
+    fn session_read_errors_are_stable_and_secret_safe() {
+        let namespace = "secret-active-namespace".to_owned();
+        let incompatible =
+            session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace);
+        assert_eq!(incompatible.code(), "session_incompatible_active_client");
+        assert!(!incompatible.message().contains("secret-active-namespace"));
+
+        let session_id = SessionId::new();
+        let private = session_operations::ReadHistoryError::Session(
+            bcode_session::SessionError::MigrationBackup {
+                session_id,
+                reason: "secret-read-detail".to_owned(),
+            },
+        );
+        assert_eq!(private.code(), "session_unavailable");
+        assert_eq!(private.message(), "session is unavailable");
+        assert!(!private.message().contains("secret-read-detail"));
+    }
+
+    #[test]
+    fn session_create_errors_are_stable_and_secret_safe() {
+        let session_id = SessionId::new();
+        let private = session_operations::CreateSessionError::Session(
+            bcode_session::SessionError::MigrationBackup {
+                session_id,
+                reason: "secret-create-detail".to_owned(),
+            },
+        );
+        assert_eq!(private.code(), "session_create_failed");
+        assert_eq!(private.message(), "session creation failed");
+        assert!(!private.message().contains("secret-create-detail"));
+        assert!(!private.message().contains(&session_id.to_string()));
+    }
+
+    #[test]
+    fn session_cwd_errors_are_stable_and_secret_safe() {
+        let session_id = SessionId::new();
+        let busy = session_operations::ChangeWorkingDirectoryError::Busy(session_id);
+        assert_eq!(busy.code(), "session_busy");
+        assert_eq!(
+            busy.message(),
+            "session has active work and cannot change working directory"
+        );
+        assert!(!busy.message().contains(&session_id.to_string()));
+
+        let private = session_operations::ChangeWorkingDirectoryError::Session(
+            bcode_session::SessionError::MigrationBackup {
+                session_id,
+                reason: "secret-cwd-detail".to_owned(),
+            },
+        );
+        assert_eq!(private.code(), "session_cwd_change_failed");
+        assert_eq!(private.message(), "session working directory change failed");
+        assert!(!private.message().contains("secret-cwd-detail"));
+    }
+
+    #[test]
+    fn session_delete_errors_are_stable_and_secret_safe() {
+        let session_id = SessionId::new();
+        let busy = session_operations::DeleteSessionError::Busy(session_id);
+        assert_eq!(busy.code(), "session_busy");
+        assert_eq!(
+            busy.message(),
+            "session has active work and cannot be deleted"
+        );
+        assert!(!busy.message().contains(&session_id.to_string()));
+
+        let private = session_operations::DeleteSessionError::Session(
+            bcode_session::SessionError::MigrationBackup {
+                session_id,
+                reason: "secret-database-detail".to_owned(),
+            },
+        );
+        assert_eq!(private.code(), "session_delete_failed");
+        assert_eq!(private.message(), "session deletion failed");
+        assert!(!private.message().contains("secret-database-detail"));
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn session_operations_lifecycle_without_transport_writing() {
@@ -46388,6 +46403,52 @@ library = "test"
         );
     }
 
+    #[test]
+    fn server_stop_errors_are_stable_and_secret_safe() {
+        assert_eq!(server_operations::StopBlocked::code(), "daemon_busy");
+        assert_eq!(
+            server_operations::StopBlocked::message(),
+            "daemon has active work and cannot stop in the requested mode"
+        );
+        assert!(!server_operations::StopBlocked::message().contains("migration"));
+        assert!(!server_operations::StopBlocked::message().contains("session"));
+    }
+
+    #[tokio::test]
+    async fn client_context_errors_are_stable_and_secret_safe() {
+        let state = test_server_state(SessionManager::default());
+        let client_id = ClientId::new();
+        let context = bcode_ipc::ClientRuntimeContext {
+            effective_config_toml: Some(Box::new("secret-invalid-config = [".to_owned())),
+            ..bcode_ipc::ClientRuntimeContext::default()
+        };
+        let error =
+            server_operations::update_client_runtime_context(&state, client_id, Some(context))
+                .await
+                .expect_err("invalid config");
+        assert_eq!(error.code(), "invalid_client_config");
+        assert_eq!(error.message(), "client configuration is invalid");
+        assert!(!error.message().contains("secret-invalid-config"));
+        assert!(state.client_runtime_context(client_id).await.is_none());
+    }
+
+    #[test]
+    fn client_metrics_errors_are_stable_and_secret_safe() {
+        let state = test_server_state(SessionManager::default());
+        let batch = bcode_metrics::ClientMetricBatch {
+            observations: vec![bcode_metrics::ClientMetricObservation::CounterDelta {
+                name: "secret.metric.name".to_owned(),
+                value: 1,
+                labels: bcode_metrics::MetricLabels::new(),
+            }],
+        };
+        let error =
+            server_operations::ingest_client_metrics(&state, batch).expect_err("invalid namespace");
+        assert_eq!(error.code(), "invalid_client_metrics");
+        assert_eq!(error.message(), "client metrics batch is invalid");
+        assert!(!error.message().contains("secret.metric.name"));
+    }
+
     #[tokio::test]
     async fn plugin_inventory_operations_run_without_transport_writing() {
         let state = test_server_state_with_shell_plugin(SessionManager::default());
@@ -46437,11 +46498,37 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn plugin_service_operations_match_real_ipc_results() {
-        let state = Arc::new(test_server_state_with_shell_plugin(
+        const SUBSCRIBING_SHELL_MANIFEST: &str = r#"
+id = "bcode.shell"
+name = "Bcode Shell Tool"
+version = "0.0.1"
+
+[[services]]
+name = "Shell Tool"
+interface_id = "bcode.workflow-block/v1"
+
+[[event_subscriptions]]
+topic = "example.subscribed"
+delivery = "barrier"
+timeout_ms = 1000
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+type = "native"
+abi_version = 3
+library = "libbcode_shell_plugin.dylib"
+event_symbol = "bcode_plugin_handle_event_v1"
+"#;
+        let state = Arc::new(test_server_state_with_shell_plugin_manifest(
             SessionManager::default(),
+            SUBSCRIBING_SHELL_MANIFEST,
         ));
         let direct_services = plugin_operations::list_services(state.as_ref());
+        let direct_diagnostics = server_operations::model_catalog_diagnostics(state.as_ref()).await;
         let direct = plugin_operations::project_service_response(
             Box::pin(plugin_operations::invoke_service(
                 state.as_ref(),
@@ -46456,8 +46543,14 @@ library = "test"
         assert_eq!(
             plugin_operations::publish_event(state.as_ref(), "example.unsubscribed", b"payload")
                 .await
-                .expect("direct plugin event"),
+                .expect("direct unsubscribed plugin event"),
             0
+        );
+        assert_eq!(
+            plugin_operations::publish_event(state.as_ref(), "example.subscribed", b"payload")
+                .await
+                .expect("direct subscribed plugin event"),
+            1
         );
 
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
@@ -46474,6 +46567,13 @@ library = "test"
             }
         });
         let client = bcode_client::BcodeClient::new(endpoint);
+        assert_eq!(
+            client
+                .model_catalog_diagnostics()
+                .await
+                .expect("IPC model-catalog diagnostics"),
+            direct_diagnostics
+        );
         assert_eq!(
             client.plugin_services().await.expect("IPC services"),
             direct_services
@@ -46500,8 +46600,15 @@ library = "test"
             client
                 .publish_plugin_event("example.unsubscribed".to_owned(), b"payload".to_vec())
                 .await
-                .expect("IPC plugin event"),
+                .expect("IPC unsubscribed plugin event"),
             0
+        );
+        assert_eq!(
+            client
+                .publish_plugin_event("example.subscribed".to_owned(), b"payload".to_vec())
+                .await
+                .expect("IPC subscribed plugin event"),
+            1
         );
         server.abort();
     }
@@ -47578,8 +47685,18 @@ library = "test"
     }
 
     fn test_server_state_with_shell_plugin(sessions: SessionManager) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        test_server_state_with_shell_plugin_manifest(
+            sessions,
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+        )
+    }
+
+    fn test_server_state_with_shell_plugin_manifest(
+        sessions: SessionManager,
+        manifest_toml: &'static str,
+    ) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            manifest_toml,
             bcode_shell_plugin::static_plugin(),
         );
         let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(

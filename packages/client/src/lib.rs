@@ -41,38 +41,7 @@ const DEFAULT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LONG_POLL_TRANSPORT_GRACE: Duration = Duration::from_secs(5);
 
-/// Bounded generic session artifact byte range.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionArtifactRange {
-    pub artifact_id: String,
-    pub reference_key: String,
-    pub content_type: Option<String>,
-    pub offset: u64,
-    pub total_bytes: u64,
-    pub reference_bytes: Option<u64>,
-    pub reference_revision: u64,
-    pub finalized: bool,
-    pub finalized_event_seq: Option<u64>,
-    pub availability: Option<String>,
-    pub complete: Option<bool>,
-    pub checksum_sha256: Option<String>,
-    pub bytes: Vec<u8>,
-}
-
-impl SessionArtifactRange {
-    /// Return the offset immediately after this response.
-    #[must_use]
-    pub fn next_offset(&self) -> u64 {
-        self.offset
-            .saturating_add(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
-    }
-
-    /// Return whether this response reaches the current artifact EOF.
-    #[must_use]
-    pub fn is_eof(&self) -> bool {
-        self.next_offset() >= self.total_bytes
-    }
-}
+pub use bcode_ipc::SessionArtifactRange;
 
 #[cfg(test)]
 mod artifact_range_tests {
@@ -1147,6 +1116,20 @@ impl BcodeClient {
         }
     }
 
+    /// Query normalized model-catalog diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn model_catalog_diagnostics(
+        &self,
+    ) -> Result<bcode_ipc::ModelCatalogDiagnostics, ClientError> {
+        match self.send_request(Request::ModelCatalogDiagnostics).await? {
+            ResponsePayload::ModelCatalogDiagnostics { diagnostics } => Ok(diagnostics),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Query local server status.
     ///
     /// # Errors
@@ -1922,35 +1905,7 @@ impl BcodeClient {
             })
             .await?
         {
-            ResponsePayload::SessionArtifactRange {
-                artifact_id,
-                reference_key,
-                content_type,
-                offset,
-                total_bytes,
-                reference_bytes,
-                reference_revision,
-                finalized,
-                finalized_event_seq,
-                availability,
-                complete,
-                checksum_sha256,
-                bytes,
-            } => Ok(SessionArtifactRange {
-                artifact_id,
-                reference_key,
-                content_type,
-                offset,
-                total_bytes,
-                reference_bytes,
-                reference_revision,
-                finalized,
-                finalized_event_seq,
-                availability,
-                complete,
-                checksum_sha256,
-                bytes,
-            }),
+            ResponsePayload::SessionArtifactRange { range } => Ok(range),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
