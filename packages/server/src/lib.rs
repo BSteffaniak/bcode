@@ -6016,10 +6016,22 @@ async fn handle_agent_permission_plugin_request(
             send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::ListPluginServices => {
-            handle_list_plugin_services(request_id, state, writer).await
+            let services = plugin_operations::list_services(state);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PluginServices { services }),
+            )
+            .await
         }
         AgentSkillPluginRequest::ListPluginContributions => {
-            handle_list_plugin_contributions(request_id, state, writer).await
+            let contributions = plugin_operations::list_contributions(state);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PluginContributions { contributions }),
+            )
+            .await
         }
         AgentSkillPluginRequest::InvokePluginService {
             plugin_id,
@@ -24319,16 +24331,14 @@ async fn resolve_server_exchange(
     request: ToolExchangeRequest,
     cancel_state: &TurnCancelState,
 ) -> Result<ToolExchangeResolution, String> {
-    if request.invocation_id != call.id {
-        return Ok(ToolExchangeResolution::Failed {
-            code: "invocation_id_mismatch".to_string(),
-            message: "exchange does not belong to the active tool invocation".to_string(),
-        });
-    }
-    if !interaction_operations::has_exchange_consumer(state, &request).await {
-        return Ok(ToolExchangeResolution::NoCompatibleConsumer);
-    }
-    interaction_operations::request_tool_exchange(state, session_id, &request, cancel_state).await
+    interaction_operations::execute_tool_exchange(
+        state,
+        session_id,
+        &call.id,
+        &request,
+        cancel_state,
+    )
+    .await
 }
 
 #[derive(Debug)]
@@ -29968,34 +29978,6 @@ const fn session_token_usage(usage: &TokenUsage) -> SessionTokenUsage {
         cache_write_input_tokens: usage.cache_write_input_tokens,
         reasoning_tokens: usage.reasoning_tokens,
     }
-}
-
-async fn handle_list_plugin_services(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let services = plugin_operations::list_services(state);
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PluginServices { services }),
-    )
-    .await
-}
-
-async fn handle_list_plugin_contributions(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let contributions = plugin_operations::list_contributions(state);
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PluginContributions { contributions }),
-    )
-    .await
 }
 
 fn command_invocation_session(
@@ -45742,6 +45724,485 @@ library = "test"
         assert!(
             !interaction_operations::resolve_permission(&state, "permission-1", true, false,).await
         );
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_executes_complete_exchange_lifecycle_without_transport() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let client_id = ClientId::new();
+        state.register_client(client_id).await;
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![
+                        bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                            producer_id: "example.plugin".to_owned(),
+                            exchange_schema: "example.request".to_owned(),
+                            min_schema_version: 1,
+                            max_schema_version: 1,
+                            platform_id: "test".to_owned(),
+                            priority: 1,
+                            interaction_kind: "example.interaction".to_owned(),
+                            tui_surface_kind: None,
+                        },
+                    ],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let session_id = SessionId::new();
+        let request = ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "exchange-complete".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"prompt": "continue?"}),
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+        let operation_state = Arc::clone(&state);
+        let operation_request = request.clone();
+        let operation = tokio::spawn(async move {
+            interaction_operations::execute_tool_exchange(
+                operation_state.as_ref(),
+                session_id,
+                "call-1",
+                &operation_request,
+                &TurnCancelState::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exchange should become pending");
+        assert!(
+            interaction_operations::complete_pending_tool_exchange(
+                state.as_ref(),
+                &request.exchange_id,
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"accepted": true}),
+                },
+            )
+            .await
+        );
+        assert_eq!(
+            operation.await.expect("join").expect("exchange operation"),
+            ToolExchangeResolution::Responded {
+                payload: serde_json::json!({"accepted": true}),
+            }
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+
+        let mismatched = interaction_operations::execute_tool_exchange(
+            state.as_ref(),
+            session_id,
+            "other-call",
+            &request,
+            &TurnCancelState::default(),
+        )
+        .await
+        .expect("mismatch outcome");
+        assert!(matches!(
+            mismatched,
+            ToolExchangeResolution::Failed { ref code, .. }
+                if code == "invocation_id_mismatch"
+        ));
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_terminal_outcome_is_stable_against_stale_resolution() {
+        let state = test_server_state(SessionManager::default());
+        let pending = pending_tool_exchange(
+            "exchange-terminal-stable",
+            "example.plugin",
+            "example.request",
+        );
+        let resolution = Arc::clone(&pending.resolution);
+        state
+            .pending_tool_exchanges
+            .lock()
+            .await
+            .insert("exchange-terminal-stable".to_owned(), pending);
+
+        assert!(
+            interaction_operations::complete_pending_tool_exchange(
+                &state,
+                "exchange-terminal-stable",
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"accepted": true}),
+                },
+            )
+            .await
+        );
+        assert!(
+            !interaction_operations::complete_pending_tool_exchange(
+                &state,
+                "exchange-terminal-stable",
+                ToolExchangeResolution::Cancelled,
+            )
+            .await
+        );
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::Responded {
+                payload: serde_json::json!({"accepted": true}),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_rejects_incompatible_resolving_client() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let consumer_id = ClientId::new();
+        state.register_client(consumer_id).await;
+        state
+            .set_client_runtime_context(
+                consumer_id,
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![
+                        bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                            producer_id: "example.plugin".to_owned(),
+                            exchange_schema: "example.request".to_owned(),
+                            min_schema_version: 1,
+                            max_schema_version: 1,
+                            platform_id: "test".to_owned(),
+                            priority: 1,
+                            interaction_kind: "example.interaction".to_owned(),
+                            tui_surface_kind: None,
+                        },
+                    ],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let incompatible_id = ClientId::new();
+        state.register_client(incompatible_id).await;
+        let request = ToolExchangeRequest {
+            invocation_id: "call-incompatible".to_owned(),
+            exchange_id: "exchange-incompatible".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"prompt": "continue?"}),
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+        let cancel = Arc::new(TurnCancelState::default());
+        let operation_state = Arc::clone(&state);
+        let operation_request = request.clone();
+        let operation_cancel = Arc::clone(&cancel);
+        let operation = tokio::spawn(async move {
+            interaction_operations::execute_tool_exchange(
+                operation_state.as_ref(),
+                SessionId::new(),
+                "call-incompatible",
+                &operation_request,
+                operation_cancel.as_ref(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exchange should become pending");
+
+        assert_eq!(
+            interaction_operations::resolve_tool_exchange(
+                state.as_ref(),
+                incompatible_id,
+                &request.exchange_id,
+                ToolExchangeResolution::Cancelled,
+            )
+            .await,
+            Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer)
+        );
+        assert!(
+            state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id),
+            "incompatible resolver must not mutate authoritative pending state"
+        );
+
+        cancel.cancel().await;
+        assert_eq!(
+            operation.await.expect("join").expect("exchange operation"),
+            ToolExchangeResolution::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_terminalizes_exchange_when_last_consumer_detaches() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let client_id = ClientId::new();
+        state.register_client(client_id).await;
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![
+                        bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                            producer_id: "example.plugin".to_owned(),
+                            exchange_schema: "example.request".to_owned(),
+                            min_schema_version: 1,
+                            max_schema_version: 1,
+                            platform_id: "test".to_owned(),
+                            priority: 1,
+                            interaction_kind: "example.interaction".to_owned(),
+                            tui_surface_kind: None,
+                        },
+                    ],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let request = ToolExchangeRequest {
+            invocation_id: "call-detach".to_owned(),
+            exchange_id: "exchange-detach".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"prompt": "continue?"}),
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+        let operation_state = Arc::clone(&state);
+        let operation_request = request.clone();
+        let operation = tokio::spawn(async move {
+            interaction_operations::execute_tool_exchange(
+                operation_state.as_ref(),
+                SessionId::new(),
+                "call-detach",
+                &operation_request,
+                &TurnCancelState::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exchange should become pending");
+
+        state
+            .client_runtime_contexts
+            .lock()
+            .await
+            .remove(&client_id);
+        interaction_operations::resolve_exchanges_without_consumers(state.as_ref()).await;
+        assert_eq!(
+            operation.await.expect("join").expect("exchange operation"),
+            ToolExchangeResolution::ConsumerDetached
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_rejects_conflicting_duplicate_exchange_without_transport() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let client_id = ClientId::new();
+        state.register_client(client_id).await;
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![
+                        bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                            producer_id: "example.plugin".to_owned(),
+                            exchange_schema: "example.request".to_owned(),
+                            min_schema_version: 1,
+                            max_schema_version: 1,
+                            platform_id: "test".to_owned(),
+                            priority: 1,
+                            interaction_kind: "example.interaction".to_owned(),
+                            tui_surface_kind: None,
+                        },
+                    ],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let request = ToolExchangeRequest {
+            invocation_id: "call-duplicate".to_owned(),
+            exchange_id: "exchange-duplicate".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"prompt": "continue?"}),
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+        let cancel = Arc::new(TurnCancelState::default());
+        let operation_state = Arc::clone(&state);
+        let operation_request = request.clone();
+        let operation_cancel = Arc::clone(&cancel);
+        let first = tokio::spawn(async move {
+            interaction_operations::execute_tool_exchange(
+                operation_state.as_ref(),
+                SessionId::new(),
+                "call-duplicate",
+                &operation_request,
+                operation_cancel.as_ref(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first exchange should become pending");
+
+        let duplicate = interaction_operations::execute_tool_exchange(
+            state.as_ref(),
+            SessionId::new(),
+            "call-duplicate",
+            &request,
+            &TurnCancelState::default(),
+        )
+        .await
+        .expect_err("conflicting duplicate must fail");
+        assert!(duplicate.contains("duplicate interactive tool request id"));
+        assert!(
+            state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id),
+            "duplicate rejection must not remove the authoritative pending exchange"
+        );
+
+        cancel.cancel().await;
+        assert_eq!(
+            first.await.expect("join").expect("first exchange"),
+            ToolExchangeResolution::Cancelled
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_fails_closed_without_compatible_consumer() {
+        let state = test_server_state(SessionManager::default());
+        let request = ToolExchangeRequest {
+            invocation_id: "call-no-consumer".to_owned(),
+            exchange_id: "exchange-no-consumer".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"prompt": "continue?"}),
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+
+        assert_eq!(
+            interaction_operations::execute_tool_exchange(
+                &state,
+                SessionId::new(),
+                "call-no-consumer",
+                &request,
+                &TurnCancelState::default(),
+            )
+            .await
+            .expect("no-consumer outcome"),
+            ToolExchangeResolution::NoCompatibleConsumer
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_cancels_pending_exchange_without_transport() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let client_id = ClientId::new();
+        state.register_client(client_id).await;
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(ClientRuntimeContext {
+                    interaction_adapters: vec![
+                        bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
+                            producer_id: "example.plugin".to_owned(),
+                            exchange_schema: "example.request".to_owned(),
+                            min_schema_version: 1,
+                            max_schema_version: 1,
+                            platform_id: "test".to_owned(),
+                            priority: 1,
+                            interaction_kind: "example.interaction".to_owned(),
+                            tui_surface_kind: None,
+                        },
+                    ],
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let request = ToolExchangeRequest {
+            invocation_id: "call-cancel".to_owned(),
+            exchange_id: "exchange-cancel".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"prompt": "continue?"}),
+            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+        };
+        let cancel = Arc::new(TurnCancelState::default());
+        let operation_state = Arc::clone(&state);
+        let operation_request = request.clone();
+        let operation_cancel = Arc::clone(&cancel);
+        let operation = tokio::spawn(async move {
+            interaction_operations::execute_tool_exchange(
+                operation_state.as_ref(),
+                SessionId::new(),
+                "call-cancel",
+                &operation_request,
+                operation_cancel.as_ref(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exchange should become pending");
+        cancel.cancel().await;
+        assert_eq!(
+            operation.await.expect("join").expect("exchange operation"),
+            ToolExchangeResolution::Cancelled
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -65308,17 +65769,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .sessions
             .session_history(session.id)
             .await
-            .expect("bypass trace history");
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::TraceEvent { trace }
-                if matches!(
-                    &trace.payload,
-                    SessionTracePayload::ToolPolicyEvaluated { decision, reason, .. }
-                        if decision == "bypassed_by_turn_permission_mode"
-                            && reason.as_deref() == Some("discretionary permission policy bypassed for this turn")
-                )
-        )));
+            .expect("bypass history");
+        assert!(
+            !history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::TraceEvent { trace }
+                    if matches!(
+                        &trace.payload,
+                        SessionTracePayload::ToolPolicyEvaluated { .. }
+                    )
+            )),
+            "debug-only policy traces must not persist when debug observability is disabled"
+        );
         assert!(state.pending_permissions.lock().await.is_empty());
         assert!(
             state

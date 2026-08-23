@@ -394,6 +394,33 @@ pub async fn resolve_permission_batch(
     resolved
 }
 
+/// Validate and execute one complete server-owned tool exchange lifecycle.
+///
+/// Invocation identity is checked before registration, and absence of any compatible consumer is
+/// surfaced without creating pending state.
+///
+/// # Errors
+///
+/// Returns a normalized failure when the exchange identity is already pending.
+pub async fn execute_tool_exchange(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: &str,
+    request: &bcode_session_models::ToolExchangeRequest,
+    cancel_state: &TurnCancelState,
+) -> Result<ToolExchangeResolution, String> {
+    if request.invocation_id != tool_call_id {
+        return Ok(ToolExchangeResolution::Failed {
+            code: "invocation_id_mismatch".to_owned(),
+            message: "exchange does not belong to the active tool invocation".to_owned(),
+        });
+    }
+    if !has_exchange_consumer(state, request).await {
+        return Ok(ToolExchangeResolution::NoCompatibleConsumer);
+    }
+    request_tool_exchange(state, session_id, request, cancel_state).await
+}
+
 /// Register, recheck consumer availability, and await one tool exchange terminal outcome.
 ///
 /// # Errors

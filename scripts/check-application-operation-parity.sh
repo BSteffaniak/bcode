@@ -150,6 +150,7 @@ required_interaction_operations=(
   cancel_pending_permissions_for_session
   client_supports_exchange
   decode_tool_exchange_resolution
+  execute_tool_exchange
   has_exchange_consumer
   list_pending_tool_exchanges
   list_permissions
@@ -169,7 +170,27 @@ for operation in "${required_interaction_operations[@]}"; do
   fi
 done
 
-if rg -n '^(async )?fn (abort_tool_exchange|client_supports_exchange|has_exchange_consumer|request_tool_exchange|wait_for_tool_exchange_resolution|handle_(list_permissions|resolve_permission|resolve_permission_batch|list_pending_tool_exchanges|resolve_tool_exchange|add_permission_rule)|resolve_exchanges_without_consumers|resolve_pending_permission|take_pending_permission_for_individual|resolve_permission_batch_operation|cancel_pending_permissions_for_session|register_pending_(permission|tool_exchange)|append_permission_(requested|resolved)_event|remembered_skill_tool_decision|next_permission_(batch_)?id)\b' \
+required_interaction_operation_tests=(
+  interaction_operation_cancels_pending_exchange_without_transport
+  interaction_operation_executes_complete_exchange_lifecycle_without_transport
+  interaction_operation_fails_closed_without_compatible_consumer
+  interaction_operation_rejects_conflicting_duplicate_exchange_without_transport
+  interaction_operation_rejects_incompatible_resolving_client
+  interaction_operation_terminal_outcome_is_stable_against_stale_resolution
+  interaction_operation_terminalizes_exchange_when_last_consumer_detaches
+  interaction_operations_batch_permission_resolution_is_latched_and_batch_scoped
+  cancellation_while_waiting_for_permission_resolves_denied_without_tool_start
+  bypass_authorization_preserves_structural_checks_without_permission_state
+  permission_resolution_crosses_real_ipc_and_persists_resolution
+  server_question_exchange_completes_original_plugin_invocation
+)
+for test_name in "${required_interaction_operation_tests[@]}"; do
+  if ! rg -q "(async )?fn $test_name\\b" packages/server/src/lib.rs; then
+    fail "interaction operation boundary is missing behavioral proof $test_name"
+  fi
+done
+
+if rg -n '^(async )?fn (abort_tool_exchange|client_supports_exchange|execute_tool_exchange|has_exchange_consumer|request_tool_exchange|wait_for_tool_exchange_resolution|handle_(list_permissions|resolve_permission|resolve_permission_batch|list_pending_tool_exchanges|resolve_tool_exchange|add_permission_rule)|resolve_exchanges_without_consumers|resolve_pending_permission|take_pending_permission_for_individual|resolve_permission_batch_operation|cancel_pending_permissions_for_session|register_pending_(permission|tool_exchange)|append_permission_(requested|resolved)_event|remembered_skill_tool_decision|next_permission_(batch_)?id)\b' \
   packages/server/src/lib.rs >/dev/null; then
   fail "permission or interaction application behavior leaked back into server-root transport code"
 fi
