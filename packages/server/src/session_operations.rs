@@ -70,6 +70,26 @@ pub enum DescribeSkillError {
     Registry(#[from] bcode_skill::SkillRegistryError),
 }
 
+impl DescribeSkillError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Disabled => "skills_disabled",
+            Self::Registry(_) => "skill_describe_failed",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Self::Disabled => "skills are disabled",
+            Self::Registry(_) => "skill is unavailable",
+        }
+    }
+}
+
 /// Return one skill manifest without transport framing.
 pub fn describe_skill(
     state: &ServerState,
@@ -552,6 +572,30 @@ pub enum ActivateSkillError {
     /// Canonical session mutation failed.
     #[error(transparent)]
     Session(#[from] bcode_session::SessionError),
+}
+
+impl ActivateSkillError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Disabled => "skills_disabled",
+            Self::Unknown(_) => "unknown_skill",
+            Self::ModelPolicy { code, .. } => code,
+            Self::Session(_) => "skill_activation_failed",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Disabled => "skills are disabled",
+            Self::Unknown(_) => "skill is unavailable",
+            Self::ModelPolicy { message, .. } => message,
+            Self::Session(_) => "skill activation failed",
+        }
+    }
 }
 
 /// Activate one session skill through canonical policy and event paths.

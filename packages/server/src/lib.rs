@@ -9256,11 +9256,10 @@ async fn handle_read_session_artifact(
             .await
         }
         Err(error) => {
-            let code = artifact_operations::error_code(&error);
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new(code, error)),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await
         }
@@ -13178,25 +13177,11 @@ async fn handle_describe_skill(
             )
             .await
         }
-        Err(session_operations::DescribeSkillError::Disabled) => {
+        Err(error) => {
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse {
-                    code: "skills_disabled".to_string(),
-                    message: "skills are disabled".to_string(),
-                }),
-            )
-            .await
-        }
-        Err(session_operations::DescribeSkillError::Registry(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse {
-                    code: "skill_describe_failed".to_string(),
-                    message: error.to_string(),
-                }),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await
         }
@@ -13219,38 +13204,11 @@ async fn handle_activate_skill(
             )
             .await
         }
-        Err(session_operations::ActivateSkillError::Disabled) => {
+        Err(error) => {
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("skills_disabled", "skills are disabled")),
-            )
-            .await
-        }
-        Err(session_operations::ActivateSkillError::Unknown(skill_id)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "unknown_skill",
-                    format!("unknown skill: {skill_id}"),
-                )),
-            )
-            .await
-        }
-        Err(session_operations::ActivateSkillError::ModelPolicy { code, message }) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(code, message)),
-            )
-            .await
-        }
-        Err(session_operations::ActivateSkillError::Session(error)) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await
         }
@@ -44575,26 +44533,24 @@ library = "test"
     #[test]
     fn artifact_read_errors_distinguish_terminal_unavailability() {
         assert_eq!(
-            artifact_operations::error_code(
+            artifact_operations::classify_internal_error(
                 "artifact reference was not found in the finalized projection"
             ),
-            "artifact_not_found"
+            artifact_operations::ReadArtifactError::NotFound
         );
+        for message in [
+            "artifact reference has no storage URI",
+            "artifact reference is unavailable: missing",
+            "artifact reference is incomplete",
+        ] {
+            assert_eq!(
+                artifact_operations::classify_internal_error(message),
+                artifact_operations::ReadArtifactError::Unavailable
+            );
+        }
         assert_eq!(
-            artifact_operations::error_code("artifact reference has no storage URI"),
-            "artifact_unavailable"
-        );
-        assert_eq!(
-            artifact_operations::error_code("artifact reference is unavailable: missing"),
-            "artifact_unavailable"
-        );
-        assert_eq!(
-            artifact_operations::error_code("artifact reference is incomplete"),
-            "artifact_unavailable"
-        );
-        assert_eq!(
-            artifact_operations::error_code("artifact references projection is stale"),
-            "artifact_read_failed"
+            artifact_operations::classify_internal_error("artifact references projection is stale"),
+            artifact_operations::ReadArtifactError::Failed
         );
     }
 
@@ -45255,6 +45211,40 @@ library = "test"
             resolution: Arc::new(Mutex::new(None)),
             notify: Arc::new(Notify::new()),
         }
+    }
+
+    #[test]
+    fn artifact_read_errors_are_stable_and_secret_safe() {
+        for (error, code, message) in [
+            (
+                artifact_operations::ReadArtifactError::NotFound,
+                "artifact_not_found",
+                "artifact was not found",
+            ),
+            (
+                artifact_operations::ReadArtifactError::Unavailable,
+                "artifact_unavailable",
+                "artifact is unavailable",
+            ),
+            (
+                artifact_operations::ReadArtifactError::Failed,
+                "artifact_read_failed",
+                "artifact read failed",
+            ),
+        ] {
+            assert_eq!(error.code(), code);
+            assert_eq!(error.message(), message);
+            assert!(!error.message().contains("secret-artifact-path"));
+        }
+    }
+
+    #[test]
+    fn skill_errors_are_stable_and_secret_safe() {
+        let skill_id = SkillId::new("secret-skill-id");
+        let unknown = session_operations::ActivateSkillError::Unknown(skill_id);
+        assert_eq!(unknown.code(), "unknown_skill");
+        assert_eq!(unknown.message(), "skill is unavailable");
+        assert!(!unknown.message().contains("secret-skill-id"));
     }
 
     #[test]
