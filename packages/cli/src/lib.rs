@@ -111,6 +111,12 @@ pub enum CliError {
     SessionRepairUsage(String),
     #[error("invalid arguments: {0}")]
     InvalidArguments(String),
+    #[error("turn was rejected: {0:?}")]
+    TurnRejected(bcode_session_models::TurnRejectionReason),
+    #[error("turn was cancelled before start")]
+    TurnCancelledBeforeStart,
+    #[error("tool exchange resolution is malformed or unsupported")]
+    InvalidExchangeResolution,
     #[error(transparent)]
     PluginCliComposition(#[from] plugin_cli::CompositionError),
     #[error("plugin CLI command failed: {0}")]
@@ -123,6 +129,59 @@ pub enum CliError {
     SurfaceRepoPath(String),
     #[error("{0}")]
     AuthPrimeFailed(String),
+}
+
+impl CliError {
+    /// Stable process exit status for this CLI failure category.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::InvalidArguments(_)
+            | Self::InvalidSessionHistoryRange
+            | Self::NewSessionWithCommand
+            | Self::SessionRepairUsage(_)
+            | Self::Json(_) => 2,
+            Self::Client(ClientError::Server { code, .. }) if code.contains("authorization") => 3,
+            Self::TurnRejected(_) => 3,
+            Self::Client(ClientError::Server { code, .. })
+                if code.contains("cancel") || code == "invalid_exchange_resolution" =>
+            {
+                4
+            }
+            Self::TurnCancelledBeforeStart | Self::InvalidExchangeResolution => 4,
+            Self::Signal(_) => 130,
+            Self::Client(_)
+            | Self::DaemonLifecycle(_)
+            | Self::DaemonStart(_)
+            | Self::Config(_)
+            | Self::Server(_)
+            | Self::WorkflowStore(_)
+            | Self::SessionDb(_)
+            | Self::SessionLease(_)
+            | Self::SessionStore(_)
+            | Self::Session(_)
+            | Self::SessionMigrationBackup(_)
+            | Self::SessionMigrationStorage(_)
+            | Self::SessionRepair(_)
+            | Self::Settings(_)
+            | Self::Tui(_)
+            | Self::Plugin(_)
+            | Self::PluginServiceCall(_)
+            | Self::LoginProfile(_)
+            | Self::BundledPluginInstallFailed(_)
+            | Self::PluginService { .. }
+            | Self::IncompatibleDaemonStorage(_)
+            | Self::PluginCliComposition(_)
+            | Self::PluginCli(_)
+            | Self::Theme(_)
+            | Self::ThemeIo(_)
+            | Self::SurfaceRepoPath(_)
+            | Self::AuthPrimeFailed(_)
+            | Self::Sshenv(_) => 1,
+            #[cfg(feature = "web-renderer")]
+            Self::HyperChadRender(_) => 1,
+        }
+    }
 }
 
 use std::sync::OnceLock;
@@ -1948,11 +2007,11 @@ fn print_interaction_resolution(resolved: bool, json: bool) -> Result<(), CliErr
 
 async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
     match command {
-        PluginCommand::List { root } => list_plugins(&root)?,
-        PluginCommand::Services { root, daemon } => {
-            list_plugin_services(&root, daemon).await?;
+        PluginCommand::List { root, json } => list_plugins(&root, json)?,
+        PluginCommand::Services { root, daemon, json } => {
+            list_plugin_services(&root, daemon, json).await?;
         }
-        PluginCommand::Check { root } => check_plugins(&root)?,
+        PluginCommand::Check { root, json } => check_plugins(&root, json)?,
         PluginCommand::Invoke {
             root,
             daemon,
@@ -1960,6 +2019,7 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
             interface_id,
             operation,
             payload,
+            json,
         } => {
             invoke_plugin_service(
                 &root,
@@ -1968,6 +2028,7 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
                 &operation,
                 payload,
                 daemon,
+                json,
             )
             .await?;
         }
@@ -1977,13 +2038,15 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
             interface_id,
             operation,
             payload,
-        } => call_plugin_service(&root, &interface_id, &operation, payload, daemon).await?,
+            json,
+        } => call_plugin_service(&root, &interface_id, &operation, payload, daemon, json).await?,
         PluginCommand::Publish {
             root,
             daemon,
             topic,
             payload,
-        } => publish_plugin_event(&root, &topic, payload, daemon).await?,
+            json,
+        } => publish_plugin_event(&root, &topic, payload, daemon, json).await?,
     }
     Ok(())
 }
@@ -2354,8 +2417,9 @@ async fn handle_permission_command(command: PermissionCommand) -> Result<(), Cli
             category,
             pattern,
             action,
+            json,
         } => {
-            add_permission_rule(&agent, &category, pattern, &action).await?;
+            add_permission_rule(&agent, &category, pattern, &action, json).await?;
         }
     }
     Ok(())
@@ -3297,11 +3361,22 @@ enum ServerCommand {
         /// Force termination if graceful shutdown does not complete.
         #[arg(long)]
         force: bool,
+        /// Confirm forceful daemon termination.
+        #[arg(long, requires = "force")]
+        yes: bool,
     },
     Cleanup,
-    StopAll,
+    StopAll {
+        /// Confirm stopping all registered daemons.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Gracefully stop every live daemon whose storage writer epoch is incompatible.
-    RetireIncompatible,
+    RetireIncompatible {
+        /// Confirm retiring every verified incompatible daemon.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -4331,6 +4406,9 @@ enum PermissionCommand {
         /// Action: `allow`, `ask`, or `deny`.
         #[arg(long)]
         action: String,
+        /// Print the resulting configuration path as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4413,16 +4491,25 @@ enum PluginCommand {
     List {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
+        /// Print structured plugin manifests as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Services {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
         #[arg(long)]
         daemon: bool,
+        /// Print structured service summaries as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Check {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
+        /// Print structured plugin check results as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Invoke {
         #[arg(long = "root")]
@@ -4433,6 +4520,9 @@ enum PluginCommand {
         interface_id: String,
         operation: String,
         payload: Option<String>,
+        /// Print the structured plugin response as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Call {
         #[arg(long = "root")]
@@ -4442,6 +4532,9 @@ enum PluginCommand {
         interface_id: String,
         operation: String,
         payload: Option<String>,
+        /// Print the structured plugin response as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Publish {
         #[arg(long = "root")]
@@ -4450,6 +4543,9 @@ enum PluginCommand {
         daemon: bool,
         topic: String,
         payload: Option<String>,
+        /// Print the delivery count as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4467,10 +4563,31 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         ServerCommand::StartupProbe => daemon_startup_probe().await?,
         ServerCommand::Metrics { json, report } => server_metrics(json, report).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
-        ServerCommand::Stop { force } => server_stop(force).await?,
+        ServerCommand::Stop { force, yes } => {
+            if force && !yes {
+                return Err(CliError::InvalidArguments(
+                    "forced server stop requires --yes".to_owned(),
+                ));
+            }
+            server_stop(force).await?;
+        }
         ServerCommand::Cleanup => server_cleanup(false).await?,
-        ServerCommand::StopAll => server_cleanup(true).await?,
-        ServerCommand::RetireIncompatible => retire_incompatible_daemons().await?,
+        ServerCommand::StopAll { yes } => {
+            if !yes {
+                return Err(CliError::InvalidArguments(
+                    "stopping all registered daemons requires --yes".to_owned(),
+                ));
+            }
+            server_cleanup(true).await?;
+        }
+        ServerCommand::RetireIncompatible { yes } => {
+            if !yes {
+                return Err(CliError::InvalidArguments(
+                    "retiring incompatible daemons requires --yes".to_owned(),
+                ));
+            }
+            retire_incompatible_daemons().await?;
+        }
     }
     Ok(())
 }
@@ -8319,12 +8436,26 @@ fn open_browser(url: &str) {
         .spawn();
 }
 
-fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
+fn list_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
 
+    if json {
+        let output = plugins
+            .iter()
+            .map(|plugin| {
+                serde_json::json!({
+                    "plugin_id": plugin.manifest.id,
+                    "version": plugin.manifest.version.to_string(),
+                    "name": plugin.manifest.name,
+                    "manifest_path": display_from_current_dir(&plugin.manifest_path).to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        return print_json(&output);
+    }
     if plugins.is_empty() {
         println!("no plugins discovered");
         return Ok(());
@@ -8342,9 +8473,16 @@ fn list_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn list_plugin_services(roots: &[std::path::PathBuf], daemon: bool) -> Result<(), CliError> {
+async fn list_plugin_services(
+    roots: &[std::path::PathBuf],
+    daemon: bool,
+    json: bool,
+) -> Result<(), CliError> {
     if daemon {
         let services = BcodeClient::default_endpoint().plugin_services().await?;
+        if json {
+            return print_json(&services);
+        }
         if services.is_empty() {
             println!("no plugin services discovered");
             return Ok(());
@@ -8364,6 +8502,22 @@ async fn list_plugin_services(roots: &[std::path::PathBuf], daemon: bool) -> Res
     let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
+    if json {
+        let services = plugins
+            .iter()
+            .flat_map(|plugin| {
+                plugin.manifest.services.iter().map(|service| {
+                    serde_json::json!({
+                        "plugin_id": plugin.manifest.id,
+                        "interface_id": service.interface_id,
+                        "name": service.name,
+                        "description": service.description,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        return print_json(&services);
+    }
     let mut has_services = false;
     for plugin in plugins {
         for service in plugin.manifest.services {
@@ -8382,11 +8536,24 @@ async fn list_plugin_services(roots: &[std::path::PathBuf], daemon: bool) -> Res
     Ok(())
 }
 
-fn check_plugins(roots: &[std::path::PathBuf]) -> Result<(), CliError> {
+fn check_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let selection = plugin_selection_for_config(&config);
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
+    if json {
+        let mut checked = Vec::with_capacity(plugins.len());
+        for plugin in plugins {
+            let loaded = bcode_plugin::load_registered_plugin(&plugin)?;
+            loaded.activate()?;
+            loaded.deactivate()?;
+            checked.push(serde_json::json!({
+                "plugin_id": loaded.manifest().id,
+                "status": "ok",
+            }));
+        }
+        return print_json(&checked);
+    }
     if plugins.is_empty() {
         println!("no plugins discovered");
         return Ok(());
@@ -8408,6 +8575,7 @@ async fn invoke_plugin_service(
     operation: &str,
     payload: Option<String>,
     daemon: bool,
+    json: bool,
 ) -> Result<(), CliError> {
     let payload = payload.unwrap_or_default().into_bytes();
     if daemon {
@@ -8419,8 +8587,7 @@ async fn invoke_plugin_service(
                 payload,
             )
             .await?;
-        print_service_response(response);
-        return Ok(());
+        return print_service_response(response, json);
     }
 
     let config = bcode_config::load_config()?;
@@ -8430,8 +8597,7 @@ async fn invoke_plugin_service(
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
     let response = host.invoke_service(plugin_id, interface_id, operation, payload)?;
     host.deactivate_all()?;
-    print_service_response(response);
-    Ok(())
+    print_service_response(response, json)
 }
 
 async fn call_plugin_service(
@@ -8440,14 +8606,14 @@ async fn call_plugin_service(
     operation: &str,
     payload: Option<String>,
     daemon: bool,
+    json: bool,
 ) -> Result<(), CliError> {
     let payload = payload.unwrap_or_default().into_bytes();
     if daemon {
         let response = BcodeClient::default_endpoint()
             .call_plugin_service(interface_id.to_string(), operation.to_string(), payload)
             .await?;
-        print_service_response(response);
-        return Ok(());
+        return print_service_response(response, json);
     }
 
     let config = bcode_config::load_config()?;
@@ -8457,17 +8623,29 @@ async fn call_plugin_service(
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
     let response = host.invoke_service_by_interface(interface_id, operation, payload)?;
     host.deactivate_all()?;
-    print_service_response(response);
-    Ok(())
+    print_service_response(response, json)
 }
 
-fn print_service_response(response: impl Into<PrintableServiceResponse>) {
+fn print_service_response(
+    response: impl Into<PrintableServiceResponse>,
+    json: bool,
+) -> Result<(), CliError> {
     let response = response.into();
+    if json {
+        return print_json(&serde_json::json!({
+            "payload": response.payload,
+            "error": response.error.as_ref().map(|error| serde_json::json!({
+                "code": error.code,
+                "message": error.message,
+            })),
+        }));
+    }
     if let Some(error) = response.error {
         println!("ERROR\t{}\t{}", error.code, error.message);
     } else {
         println!("{}", String::from_utf8_lossy(&response.payload));
     }
+    Ok(())
 }
 
 struct PrintableServiceResponse {
@@ -8509,14 +8687,14 @@ async fn publish_plugin_event(
     topic: &str,
     payload: Option<String>,
     daemon: bool,
+    json: bool,
 ) -> Result<(), CliError> {
     let payload = payload.unwrap_or_default().into_bytes();
     if daemon {
         let delivered = BcodeClient::default_endpoint()
             .publish_plugin_event(topic.to_string(), payload)
             .await?;
-        println!("delivered\t{delivered}");
-        return Ok(());
+        return print_plugin_delivery(delivered, json);
     }
 
     let config = bcode_config::load_config()?;
@@ -8526,8 +8704,16 @@ async fn publish_plugin_event(
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
     let delivered = host.publish_event(topic, &payload)?;
     host.deactivate_all()?;
-    println!("delivered\t{delivered}");
-    Ok(())
+    print_plugin_delivery(delivered, json)
+}
+
+fn print_plugin_delivery(delivered: usize, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&serde_json::json!({ "delivered": delivered }))
+    } else {
+        println!("delivered\t{delivered}");
+        Ok(())
+    }
 }
 
 async fn list_models(json: bool, provider: Option<String>) -> Result<(), CliError> {
@@ -13028,6 +13214,7 @@ async fn add_permission_rule(
     category: &str,
     pattern: String,
     action: &str,
+    json: bool,
 ) -> Result<(), CliError> {
     let config_path = BcodeClient::default_endpoint()
         .add_permission_rule(
@@ -13037,8 +13224,12 @@ async fn add_permission_rule(
             action.to_string(),
         )
         .await?;
-    println!("permission rule added: {config_path}");
-    Ok(())
+    if json {
+        print_json(&serde_json::json!({ "config_path": config_path }))
+    } else {
+        println!("permission rule added: {config_path}");
+        Ok(())
+    }
 }
 
 fn print_permission(permission: &PermissionSummary) {
@@ -13348,6 +13539,17 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
                 },
             )
             .await?;
+        let terminal_failure = match &admission {
+            bcode_session_models::TurnAdmission::Rejected(reason) => {
+                Some(CliError::TurnRejected(reason.clone()))
+            }
+            bcode_session_models::TurnAdmission::CancelledBeforeStart(_) => {
+                Some(CliError::TurnCancelledBeforeStart)
+            }
+            bcode_session_models::TurnAdmission::Accepted(_)
+            | bcode_session_models::TurnAdmission::Existing(_)
+            | bcode_session_models::TurnAdmission::Deferred(_) => None,
+        };
         if json {
             print_json(&serde_json::json!({
                 "session_id": session_id,
@@ -13355,6 +13557,9 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
             }))?;
         } else {
             println!("{admission:?}");
+        }
+        if let Some(error) = terminal_failure {
+            return Err(error);
         }
     }
     Ok(())
@@ -16291,14 +16496,37 @@ mod web_command_tests {
         ));
     }
 
-    #[test]
-    fn server_stop_force_command_parses() {
-        let cli = Cli::try_parse_from(["bcode", "server", "stop", "--force"])
-            .expect("forced stop command should parse");
+    #[tokio::test]
+    async fn destructive_server_commands_require_explicit_confirmation() {
+        let unconfirmed = Cli::try_parse_from(["bcode", "server", "stop", "--force"])
+            .expect("unconfirmed force stop parses before side-effect validation");
+        let Some(Commands::Server { command }) = unconfirmed.command else {
+            panic!("server command");
+        };
         assert!(matches!(
-            cli.command,
+            handle_server_command(command).await,
+            Err(CliError::InvalidArguments(message))
+                if message == "forced server stop requires --yes"
+        ));
+
+        let stop = Cli::try_parse_from(["bcode", "server", "stop", "--force", "--yes"])
+            .expect("confirmed forced stop command should parse");
+        assert!(matches!(
+            stop.command,
             Some(Commands::Server {
-                command: ServerCommand::Stop { force: true }
+                command: ServerCommand::Stop {
+                    force: true,
+                    yes: true,
+                }
+            })
+        ));
+
+        let stop_all = Cli::try_parse_from(["bcode", "server", "stop-all", "--yes"])
+            .expect("confirmed stop-all command should parse");
+        assert!(matches!(
+            stop_all.command,
+            Some(Commands::Server {
+                command: ServerCommand::StopAll { yes: true }
             })
         ));
     }
@@ -16324,13 +16552,13 @@ mod web_command_tests {
     }
 
     #[test]
-    fn retire_incompatible_server_command_parses() {
-        let cli = Cli::try_parse_from(["bcode", "server", "retire-incompatible"])
-            .expect("retirement command should parse");
+    fn retire_incompatible_server_command_requires_confirmation() {
+        let cli = Cli::try_parse_from(["bcode", "server", "retire-incompatible", "--yes"])
+            .expect("confirmed retirement command should parse");
         assert!(matches!(
             cli.command,
             Some(Commands::Server {
-                command: ServerCommand::RetireIncompatible
+                command: ServerCommand::RetireIncompatible { yes: true }
             })
         ));
     }
@@ -18221,6 +18449,37 @@ mod permission_cli_tests {
             }) if permission_id == "permission-1"
         ));
 
+        let add = Cli::try_parse_from([
+            "bcode",
+            "permission",
+            "add",
+            "--agent",
+            "build",
+            "--category",
+            "read",
+            "--pattern",
+            "**/*.rs",
+            "--action",
+            "allow",
+            "--json",
+        ])
+        .expect("JSON permission rule addition parses");
+        assert!(matches!(
+            add.command,
+            Some(Commands::Permission {
+                command: PermissionCommand::Add {
+                    agent,
+                    category,
+                    pattern,
+                    action,
+                    json: true,
+                }
+            }) if agent == "build"
+                && category == "read"
+                && pattern == "**/*.rs"
+                && action == "allow"
+        ));
+
         let batch = Cli::try_parse_from([
             "bcode",
             "permission",
@@ -18263,6 +18522,149 @@ mod permission_cli_tests {
                 .expect("session id round trip"),
             session_id
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::{CliError, ClientError};
+
+    #[test]
+    fn exit_codes_distinguish_usage_authorization_cancellation_and_runtime_failures() {
+        assert_eq!(
+            CliError::InvalidArguments("bad input".to_owned()).exit_code(),
+            2
+        );
+        assert_eq!(
+            CliError::Client(ClientError::Server {
+                code: "authorization_denied".to_owned(),
+                message: "denied".to_owned(),
+            })
+            .exit_code(),
+            3
+        );
+        assert_eq!(
+            CliError::Client(ClientError::Server {
+                code: "cancelled".to_owned(),
+                message: "cancelled".to_owned(),
+            })
+            .exit_code(),
+            4
+        );
+        assert_eq!(CliError::PluginCli("failed".to_owned()).exit_code(), 1);
+        assert_eq!(
+            CliError::TurnRejected(bcode_session_models::TurnRejectionReason::ExecutionPolicy)
+                .exit_code(),
+            3
+        );
+        assert_eq!(CliError::TurnCancelledBeforeStart.exit_code(), 4);
+        assert_eq!(CliError::InvalidExchangeResolution.exit_code(), 4);
+    }
+}
+
+#[cfg(test)]
+mod plugin_cli_tests {
+    use super::{Cli, Commands, PluginCommand};
+    use clap::Parser as _;
+
+    #[test]
+    fn plugin_services_parse_daemon_json_output() {
+        let cli = Cli::try_parse_from(["bcode", "plugin", "services", "--daemon", "--json"])
+            .expect("daemon plugin service JSON listing parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Plugin {
+                command: PluginCommand::Services {
+                    daemon: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn plugin_inventory_and_checks_parse_machine_output() {
+        let list = Cli::try_parse_from(["bcode", "plugin", "list", "--json"])
+            .expect("plugin list JSON output parses");
+        assert!(matches!(
+            list.command,
+            Some(Commands::Plugin {
+                command: PluginCommand::List { json: true, .. }
+            })
+        ));
+        let check = Cli::try_parse_from(["bcode", "plugin", "check", "--json"])
+            .expect("plugin check JSON output parses");
+        assert!(matches!(
+            check.command,
+            Some(Commands::Plugin {
+                command: PluginCommand::Check { json: true, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn plugin_actions_parse_machine_output() {
+        let invoke = Cli::try_parse_from([
+            "bcode",
+            "plugin",
+            "invoke",
+            "example",
+            "example/v1",
+            "run",
+            "--daemon",
+            "--json",
+        ])
+        .expect("plugin invocation JSON output parses");
+        assert!(matches!(
+            invoke.command,
+            Some(Commands::Plugin {
+                command: PluginCommand::Invoke {
+                    daemon: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        let call = Cli::try_parse_from([
+            "bcode",
+            "plugin",
+            "call",
+            "example/v1",
+            "run",
+            "--daemon",
+            "--json",
+        ])
+        .expect("plugin call JSON output parses");
+        assert!(matches!(
+            call.command,
+            Some(Commands::Plugin {
+                command: PluginCommand::Call {
+                    daemon: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        let publish = Cli::try_parse_from([
+            "bcode",
+            "plugin",
+            "publish",
+            "example.topic",
+            "--daemon",
+            "--json",
+        ])
+        .expect("plugin publish JSON output parses");
+        assert!(matches!(
+            publish.command,
+            Some(Commands::Plugin {
+                command: PluginCommand::Publish {
+                    daemon: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
     }
 }
 

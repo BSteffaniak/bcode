@@ -65,6 +65,6 @@ async fn main() {
 
     if let Err(error) = result {
         eprintln!("error: {error}");
-        std::process::exit(1);
+        std::process::exit(i32::from(error.exit_code()));
     }
 }

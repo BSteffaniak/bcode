@@ -93,6 +93,21 @@ for phrase in required_phrases:
             f"application operation parity check failed: required coverage phrase missing: {phrase}"
         )
 
+classification_commands = [
+    "`Onboard`", "`ArtifactId`", "`Server`", "`Session`", "`Web`", "`Plugin`",
+    "`Theme`", "`Model`", "`Auth`", "`Login`", "`Permission`", "`Interaction`",
+    "`Worktree`", "`Workflow`", "`RuntimeWork`", "`Cancel`", "`Attach`", "`Tui`", "`Send`",
+]
+classification_section = DOC.split("### Top-level CLI ownership classification", 1)
+if len(classification_section) != 2:
+    raise SystemExit("application operation parity check failed: top-level CLI ownership classification is missing")
+classification_text = classification_section[1].split("## Maintenance rules", 1)[0]
+for command in classification_commands:
+    if f"| {command} |" not in classification_text:
+        raise SystemExit(
+            f"application operation parity check failed: top-level ownership classification missing: {command}"
+        )
+
 print("application operation parity inventory is complete for checked source enums")
 PY
 
@@ -112,6 +127,27 @@ done
 
 if ! rg -Fq '[`application-operation-boundary.md`](application-operation-boundary.md)' "$doc"; then
   fail "$doc does not link the application operation boundary"
+fi
+
+if rg -n '^fn validate_client_(effective_config|plugin_selection|interaction_adapters)' \
+  packages/server/src/lib.rs >/dev/null; then
+  fail "client runtime-context validation leaked back into the IPC dispatcher"
+fi
+
+for operation in \
+  validate_client_effective_config \
+  validate_client_plugin_selection \
+  validate_client_interaction_adapters; do
+  if ! rg -Fq "pub fn $operation" packages/server/src/server_operations.rs; then
+    fail "server operation boundary is missing $operation"
+  fi
+done
+
+if ! rg -Fq 'decode_tool_exchange_resolution' packages/server/src/interaction_operations.rs; then
+  fail "interaction operation boundary is missing typed exchange-resolution decoding"
+fi
+if rg -Fq 'serde_json::from_value(resolution_json)?' packages/server/src/lib.rs; then
+  fail "tool-exchange resolution decoding leaked back into generic IPC dispatch"
 fi
 
 raw_ipc_callers="$(

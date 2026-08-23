@@ -4554,16 +4554,13 @@ impl BcodeClient {
         exchange_id: String,
         resolution: bcode_session_models::ToolExchangeResolution,
     ) -> Result<bool, ClientError> {
+        let resolution_json = serde_json::to_value(resolution).map_err(|error| {
+            ClientError::Protocol(format!("exchange resolution encode failed: {error}"))
+        })?;
         match self
             .send_request(Request::ResolveToolExchange {
                 exchange_id,
-                resolution_json: serde_json::to_value(resolution).unwrap_or_else(|error| {
-                    serde_json::json!({
-                        "status": "failed",
-                        "code": "resolution_encode_failed",
-                        "message": error.to_string(),
-                    })
-                }),
+                resolution_json,
             })
             .await?
         {

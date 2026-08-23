@@ -82,11 +82,28 @@ pub async fn complete_pending_tool_exchange(
     true
 }
 
-/// Decode one serialized tool-exchange resolution without exposing serde failures.
+const MAX_TOOL_EXCHANGE_RESOLUTION_BYTES: usize = 64 * 1024;
+
+/// Decode one serialized client tool-exchange resolution without exposing serde failures.
 pub fn decode_tool_exchange_resolution(
     resolution_json: serde_json::Value,
 ) -> Result<ToolExchangeResolution, ResolveToolExchangeError> {
-    serde_json::from_value(resolution_json).map_err(|_| ResolveToolExchangeError::InvalidResolution)
+    let encoded = serde_json::to_vec(&resolution_json)
+        .map_err(|_| ResolveToolExchangeError::InvalidResolution)?;
+    if encoded.len() > MAX_TOOL_EXCHANGE_RESOLUTION_BYTES {
+        return Err(ResolveToolExchangeError::InvalidResolution);
+    }
+    let resolution = serde_json::from_value(resolution_json)
+        .map_err(|_| ResolveToolExchangeError::InvalidResolution)?;
+    match resolution {
+        ToolExchangeResolution::Responded { .. } | ToolExchangeResolution::Cancelled => {
+            Ok(resolution)
+        }
+        ToolExchangeResolution::TimedOut
+        | ToolExchangeResolution::NoCompatibleConsumer
+        | ToolExchangeResolution::ConsumerDetached
+        | ToolExchangeResolution::Failed { .. } => Err(ResolveToolExchangeError::InvalidResolution),
+    }
 }
 
 /// Resolve one pending exchange through canonical server-owned interaction state.

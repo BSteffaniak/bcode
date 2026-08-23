@@ -46307,6 +46307,19 @@ library = "test"
             })),
             Ok(ToolExchangeResolution::Cancelled)
         );
+        assert_eq!(
+            interaction_operations::decode_tool_exchange_resolution(serde_json::json!({
+                "status": "timed_out"
+            })),
+            Err(interaction_operations::ResolveToolExchangeError::InvalidResolution)
+        );
+        assert_eq!(
+            interaction_operations::decode_tool_exchange_resolution(serde_json::json!({
+                "status": "responded",
+                "payload": "x".repeat(64 * 1024),
+            })),
+            Err(interaction_operations::ResolveToolExchangeError::InvalidResolution)
+        );
     }
 
     #[tokio::test]

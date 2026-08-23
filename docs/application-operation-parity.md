@@ -216,7 +216,32 @@ The architecture guard requires every current variant below to remain named in t
 
 `Onboard`, `ArtifactId`, `Server`, `Session`, `Web`, `Plugin`, `Theme`, `Model`, `Auth`, `Login`, `Permission`, `Interaction`, `Worktree`, `Workflow`, `RuntimeWork`, `Cancel`, `Attach`, `Tui`, `Send`.
 
-## Maintenance rules
+### Top-level CLI ownership classification
+
+Every current top-level command family has one explicit primary owner. Subcommands may refine the classification only where noted in the detailed inventory.
+
+| Command | Primary classification | Owner and boundary |
+| --- | --- | --- |
+| `Onboard` | Frontend user state / credential custody | Local onboarding and settings orchestration; secure imports remain auth/vault-owned and do not mutate canonical sessions implicitly. |
+| `ArtifactId` | Offline/lifecycle | Local produced-artifact identity diagnostic. |
+| `Server` | Offline/lifecycle | Daemon lifecycle coordination; status and live control cross the typed daemon boundary, while startup/retirement owns local process coordination. |
+| `Session` | Shared application, with explicit maintenance subcommands | Routine lifecycle, bounded reads, configuration, search, import, and derivation are daemon-backed; doctor/repair/reindex/migration/reset/release diagnostics remain explicitly named maintenance. |
+| `Web` | Frontend local | HyperChad renderer startup and bind policy; it consumes shared semantics without owning product behavior. |
+| `Plugin` | Plugin development or shared application | List/check and non-daemon service execution are explicit offline plugin development; `--daemon` services/invoke/call/publish use the live plugin-host application boundary. |
+| `Theme` | Offline local artifact validation | Lists, validates, or copies declarative theme sources; interactive TUI theme selection remains frontend user state. |
+| `Model` | Shared application, with local declarative ignores | Catalog/status operations are daemon-backed; ignore-file management is explicitly local declarative state. |
+| `Auth` | Credential custody / shared application status | Login/profile/vault mutations remain auth-owned credential custody; daemon-backed pool/status/usage operations use typed application contracts. |
+| `Login` | Credential custody | Deprecated local compatibility adapter to `Auth` login ownership. |
+| `Permission` | Shared application | Pending inspection/resolution and policy-rule creation use typed daemon operations; configuration persistence remains policy-owner behavior behind the operation. |
+| `Interaction` | Shared application | Pending exchange inspection and schema-aware resolution use typed daemon operations; semantic-controller automation remains tracked work. |
+| `Worktree` | Shared application | Daemon-owned worktree operations and canonical session attachment. |
+| `Workflow` | Shared application, with local package validation | Runtime/authoring/import/export operations are daemon-backed; source-controlled package discovery/validation is explicit local artifact work. |
+| `RuntimeWork` | Shared application | Bounded runtime-work inspection, watch, and cancellation through the daemon API. |
+| `Cancel` | Shared application | Canonical turn cancellation through the daemon API. |
+| `Attach` | Shared application / TUI adapter | Opens a canonical daemon session in the TUI without owning session semantics. |
+| `Tui` | Frontend local adapter | Starts the terminal renderer over shared application semantics. |
+| `Send` | Shared application | Canonical turn admission through the typed daemon client, including placement and idempotency metadata. |
+
 
 * Add or update an inventory row whenever a shared semantic operation, renderer action, top-level CLI family, or ownership classification changes.
 * An IPC request alone is not parity. Verify the typed client API, owner, authorization, cancellation, CLI behavior, output contract, and observable result.
