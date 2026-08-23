@@ -143,9 +143,40 @@ for operation in \
   fi
 done
 
-if ! rg -Fq 'decode_tool_exchange_resolution' packages/server/src/interaction_operations.rs; then
-  fail "interaction operation boundary is missing typed exchange-resolution decoding"
+required_interaction_operations=(
+  abort_tool_exchange
+  add_permission_rule
+  cancel_pending_permission
+  cancel_pending_permissions_for_session
+  client_supports_exchange
+  decode_tool_exchange_resolution
+  has_exchange_consumer
+  list_pending_tool_exchanges
+  list_permissions
+  remembered_skill_tool_decision
+  register_pending_permission
+  register_pending_tool_exchange
+  request_tool_exchange
+  resolve_exchanges_without_consumers
+  resolve_permission
+  resolve_permission_batch
+  resolve_tool_exchange
+  wait_for_tool_exchange_resolution
+)
+for operation in "${required_interaction_operations[@]}"; do
+  if ! rg -q "^pub (async )?fn $operation\\b" packages/server/src/interaction_operations.rs; then
+    fail "interaction operation boundary is missing $operation"
+  fi
+done
+
+if rg -n '^(async )?fn (abort_tool_exchange|client_supports_exchange|has_exchange_consumer|request_tool_exchange|wait_for_tool_exchange_resolution|handle_(list_permissions|resolve_permission|resolve_permission_batch|list_pending_tool_exchanges|resolve_tool_exchange|add_permission_rule)|resolve_exchanges_without_consumers|resolve_pending_permission|take_pending_permission_for_individual|resolve_permission_batch_operation|cancel_pending_permissions_for_session|register_pending_(permission|tool_exchange)|append_permission_(requested|resolved)_event|remembered_skill_tool_decision|next_permission_(batch_)?id)\b' \
+  packages/server/src/lib.rs >/dev/null; then
+  fail "permission or interaction application behavior leaked back into server-root transport code"
 fi
+if ! rg -Fq 'PendingPermissionBatchRegistration::allocate' packages/server/src/lib.rs; then
+  fail "runtime permission batches bypass focused interaction lifecycle allocation"
+fi
+
 if rg -Fq 'serde_json::from_value(resolution_json)?' packages/server/src/lib.rs; then
   fail "tool-exchange resolution decoding leaked back into generic IPC dispatch"
 fi

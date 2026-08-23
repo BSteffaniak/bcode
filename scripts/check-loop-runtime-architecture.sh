@@ -561,12 +561,12 @@ if ! rg -U 'ResolvePermissionBatch \{[\s\S]{0,120}batch_id: String,[\s\S]{0,120}
   echo "Runtime architecture violation: safe batch permission resolution request was removed." >&2
   violations=1
 fi
-if ! rg -U 'batch_decision = batch\.decision\.lock\(\)\.await;[\s\S]{0,220}\*batch_decision = Some\(approved\)[\s\S]{0,900}batch\.batch_id == batch_id' packages/server/src/lib.rs >/dev/null; then
+if ! rg -U 'batch_decision = batch\.decision\.lock\(\)\.await;[\s\S]{0,220}\*batch_decision = Some\(approved\)[\s\S]{0,900}batch\.batch_id == batch_id' packages/server/src/interaction_operations.rs >/dev/null; then
   echo "Runtime architecture violation: batch permission resolution is not latched and batch-scoped." >&2
   violations=1
 fi
 
-if ! rg -U 'close_session_turn\(state, session_id\)\.await;[\s\S]{0,160}cancel_pending_permissions_for_session\(state, session_id\)\.await;[\s\S]{0,500}acknowledge_cancel_command' packages/server/src/lib.rs >/dev/null; then
+if ! rg -U 'close_session_turn\(state, session_id\)\.await;[\s\S]{0,220}interaction_operations::cancel_pending_permissions_for_session\(state, session_id\)\.await;[\s\S]{0,500}acknowledge_cancel_command' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: turn cancellation no longer closes permission checkpoints before acknowledgement." >&2
   violations=1
 fi

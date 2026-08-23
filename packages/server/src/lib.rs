@@ -115,7 +115,6 @@ use bcode_session_models::{
     TurnExecutionOptions, TurnOrigin, TurnPriority, TurnStructuredOutputRequest, TurnToolPolicy,
     WorkId,
 };
-use bcode_settings::SettingsStore;
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
     anchor_skill_source_roots, evaluate_skill_tool_call, format_skill_catalog_for_prompt,
@@ -123,8 +122,8 @@ use bcode_skill::{
 };
 use bcode_skill_models::{
     SkillContextResponse, SkillDiagnosticSeverity, SkillId, SkillModelRequest, SkillSource,
-    SkillToolDecision, SkillToolDecisionEntry, SkillToolDecisionKey, SkillToolDecisionScope,
-    SkillToolPolicyOutcome, SkillToolPolicyRequest, SkillToolPolicyTarget,
+    SkillToolDecision, SkillToolDecisionKey, SkillToolDecisionScope, SkillToolPolicyOutcome,
+    SkillToolPolicyRequest, SkillToolPolicyTarget,
 };
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL, PreparedToolInvocation,
@@ -679,7 +678,7 @@ impl WorkflowRunCancellationHandle {
 }
 
 #[derive(Debug, Default)]
-struct TurnCancelState {
+pub struct TurnCancelState {
     token: CancellationToken,
     marker_commit: Mutex<()>,
 }
@@ -702,7 +701,7 @@ impl TurnCancelState {
         self.token.is_cancelled()
     }
 
-    async fn cancelled(&self) {
+    pub async fn cancelled(&self) {
         self.token.cancelled().await;
     }
 }
@@ -1155,7 +1154,7 @@ impl WorkflowPermissionResolver<'_> {
         capability: WorkflowToolCapability,
         scope: &WorkflowGrantScope,
     ) -> Result<Option<WorkflowPolicyGrant>, WorkflowError> {
-        let permission_id = next_permission_id(self.state).await;
+        let permission_id = interaction_operations::next_permission_id(self.state).await;
         let tool_call_id = format!("workflow:{}:{}", scope.definition, scope.node);
         let arguments_json =
             serde_json::to_string(scope).map_err(|error| WorkflowError::Build {
@@ -1192,7 +1191,7 @@ impl WorkflowPermissionResolver<'_> {
             policy_source: Some("workflow_policy".to_string()),
             policy_reason: pending.summary.policy_reason.clone(),
         };
-        if register_pending_permission(self.state, &pending, event)
+        if interaction_operations::register_pending_permission(self.state, &pending, event)
             .await
             .is_err()
         {
@@ -1210,12 +1209,9 @@ impl WorkflowPermissionResolver<'_> {
             tokio::select! {
                 () = pending.notify.notified() => {}
                 () = self.cancellation.cancelled() => {
-                    self.state.pending_permissions.lock().await.remove(&permission_id);
-                    append_permission_resolved_event(
+                    interaction_operations::cancel_pending_permission(
                         self.state,
-                        self.session_id,
-                        permission_id.clone(),
-                        false,
+                        &permission_id,
                     ).await;
                     return Ok(None);
                 }
@@ -1249,53 +1245,16 @@ struct PendingPermission {
 }
 
 #[derive(Debug)]
-struct PendingPermissionBatch {
-    session_id: SessionId,
-    decision: Mutex<Option<bool>>,
-}
-
-impl PendingPermissionBatch {
-    fn new(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            decision: Mutex::new(None),
-        }
-    }
-}
-
-struct PendingPermissionBatchRegistration {
-    batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
-    batch_id: String,
-}
-
-impl PendingPermissionBatchRegistration {
-    fn register(
-        batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
-        batch_id: String,
-        batch: Arc<PendingPermissionBatch>,
-    ) -> Self {
-        batches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(batch_id.clone(), batch);
-        Self { batches, batch_id }
-    }
-}
-
-impl Drop for PendingPermissionBatchRegistration {
-    fn drop(&mut self) {
-        self.batches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.batch_id);
-    }
+pub struct PendingPermissionBatch {
+    pub session_id: SessionId,
+    pub decision: Mutex<Option<bool>>,
 }
 
 #[derive(Clone)]
-struct PendingToolExchange {
-    summary: bcode_ipc::PendingToolExchangeSummary,
-    resolution: Arc<Mutex<Option<ToolExchangeResolution>>>,
-    notify: Arc<Notify>,
+pub struct PendingToolExchange {
+    pub summary: bcode_ipc::PendingToolExchangeSummary,
+    pub resolution: Arc<Mutex<Option<ToolExchangeResolution>>>,
+    pub notify: Arc<Notify>,
 }
 
 impl std::fmt::Debug for PendingToolExchange {
@@ -1614,7 +1573,7 @@ impl ServerState {
     async fn unregister_client(&self, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
         self.client_runtime_contexts.lock().await.remove(&client_id);
-        self.resolve_exchanges_without_consumers().await;
+        interaction_operations::resolve_exchanges_without_consumers(self).await;
         self.client_session_namespaces
             .lock()
             .await
@@ -1625,31 +1584,6 @@ impl ServerState {
             .remove(&client_id);
         self.unregister_catalog_event_client(client_id).await;
         self.workflow_event_clients.lock().await.remove(&client_id);
-    }
-
-    async fn resolve_exchanges_without_consumers(&self) {
-        let contexts = self.client_runtime_contexts.lock().await;
-        let mut pending = self.pending_tool_exchanges.lock().await;
-        let entries = std::mem::take(&mut *pending);
-        let (retained, detached): (BTreeMap<_, _>, BTreeMap<_, _>) =
-            entries.into_iter().partition(|(_, exchange)| {
-                contexts.values().any(|context| {
-                    context.interaction_adapters.iter().any(|adapter| {
-                        adapter.producer_id == exchange.summary.request.producer_id
-                            && adapter.supports(
-                                &exchange.summary.request.schema,
-                                exchange.summary.request.schema_version,
-                            )
-                    })
-                })
-            });
-        *pending = retained;
-        drop(contexts);
-        drop(pending);
-        for exchange in detached.into_values() {
-            *exchange.resolution.lock().await = Some(ToolExchangeResolution::ConsumerDetached);
-            exchange.notify.notify_waiters();
-        }
     }
 
     async fn attach_client_session(&self, client_id: ClientId, session_id: SessionId) {
@@ -1822,7 +1756,7 @@ impl ServerState {
             contexts.remove(&client_id);
         }
         drop(contexts);
-        self.resolve_exchanges_without_consumers().await;
+        interaction_operations::resolve_exchanges_without_consumers(self).await;
     }
 
     async fn client_runtime_context(&self, client_id: ClientId) -> Option<ClientRuntimeContext> {
@@ -1880,36 +1814,6 @@ impl ServerState {
         self.client_runtime_context(client_id)
             .await
             .and_then(|context| context.working_directory)
-    }
-
-    async fn client_supports_exchange(
-        &self,
-        client_id: ClientId,
-        request: &ToolExchangeRequest,
-    ) -> bool {
-        self.client_runtime_contexts
-            .lock()
-            .await
-            .get(&client_id)
-            .is_some_and(|context| {
-                context.interaction_adapters.iter().any(|adapter| {
-                    adapter.supports(&request.schema, request.schema_version)
-                        && request.producer_id == adapter.producer_id
-                })
-            })
-    }
-
-    async fn has_exchange_consumer(&self, request: &ToolExchangeRequest) -> bool {
-        self.client_runtime_contexts
-            .lock()
-            .await
-            .values()
-            .any(|context| {
-                context.interaction_adapters.iter().any(|adapter| {
-                    adapter.supports(&request.schema, request.schema_version)
-                        && request.producer_id == adapter.producer_id
-                })
-            })
     }
 
     async fn set_client_session_namespace(&self, client_id: ClientId, namespace: String) {
@@ -6101,10 +6005,15 @@ async fn handle_agent_permission_plugin_request(
             pattern,
             action,
         } => {
-            handle_add_permission_rule(
-                request_id, state, writer, &agent_id, &category, pattern, &action,
-            )
-            .await
+            let response = match interaction_operations::add_permission_rule(
+                &agent_id, &category, pattern, &action,
+            ) {
+                Ok(path) => Response::Ok(ResponsePayload::PermissionRuleAdded {
+                    config_path: path.display().to_string(),
+                }),
+                Err(message) => Response::Err(ErrorResponse::new("config_error", message)),
+            };
+            send_response(writer, request_id, response).await
         }
         AgentSkillPluginRequest::ListPluginServices => {
             handle_list_plugin_services(request_id, state, writer).await
@@ -6152,59 +6061,100 @@ async fn handle_permission_interaction_request(
 ) -> Result<(), ServerError> {
     match request {
         PermissionInteractionRequest::ListPermissions => {
-            handle_list_permissions(request_id, state, writer).await
+            let permissions = interaction_operations::list_permissions(state).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PermissionList { permissions }),
+            )
+            .await
         }
         PermissionInteractionRequest::ResolvePermission {
             permission_id,
             approved,
             remember,
         } => {
-            handle_resolve_permission(
-                request_id,
+            let resolved = interaction_operations::resolve_permission(
                 state,
-                writer,
                 &permission_id,
                 approved,
                 remember,
             )
+            .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PermissionResolved { resolved }),
+            )
             .await
         }
         PermissionInteractionRequest::ResolvePermissionBatch { batch_id, approved } => {
-            handle_resolve_permission_batch(request_id, state, writer, &batch_id, approved).await
+            let resolved =
+                interaction_operations::resolve_permission_batch(state, &batch_id, approved).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PermissionBatchResolved { resolved }),
+            )
+            .await
         }
         PermissionInteractionRequest::ListPendingToolExchanges => {
-            handle_list_pending_tool_exchanges(request_id, state, writer).await
+            let exchanges = interaction_operations::list_pending_tool_exchanges(state).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PendingToolExchangeList { exchanges }),
+            )
+            .await
         }
         PermissionInteractionRequest::ResolveToolExchange {
             exchange_id,
             resolution_json,
-        } => match interaction_operations::decode_tool_exchange_resolution(resolution_json) {
-            Ok(resolution) => {
-                handle_resolve_tool_exchange(
-                    request_id,
-                    client_id,
-                    state,
-                    writer,
-                    &exchange_id,
-                    resolution,
-                )
-                .await
-            }
-            Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
-                send_response(
-                    writer,
-                    request_id,
-                    Response::Err(ErrorResponse::new(
-                        "invalid_exchange_resolution",
-                        "tool exchange resolution is malformed or unsupported",
-                    )),
-                )
-                .await
-            }
-            Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
-                unreachable!("decoding does not inspect consumer compatibility")
-            }
-        },
+        } => {
+            let resolution =
+                match interaction_operations::decode_tool_exchange_resolution(resolution_json) {
+                    Ok(resolution) => resolution,
+                    Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
+                        return send_response(
+                            writer,
+                            request_id,
+                            Response::Err(ErrorResponse::new(
+                                "invalid_exchange_resolution",
+                                "tool exchange resolution is malformed or unsupported",
+                            )),
+                        )
+                        .await;
+                    }
+                    Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
+                        unreachable!("decoding does not inspect consumer compatibility")
+                    }
+                };
+            let result = interaction_operations::resolve_tool_exchange(
+                state,
+                client_id,
+                &exchange_id,
+                resolution,
+            )
+            .await;
+            send_response(writer, request_id, tool_exchange_response(result)).await
+        }
+    }
+}
+
+fn tool_exchange_response(
+    result: Result<bool, interaction_operations::ResolveToolExchangeError>,
+) -> Response {
+    match result {
+        Ok(resolved) => Response::Ok(ResponsePayload::ToolExchangeResolved { resolved }),
+        Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
+            Response::Err(ErrorResponse::new(
+                "incompatible_exchange_consumer",
+                "client did not advertise a compatible exchange adapter",
+            ))
+        }
+        Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
+            unreachable!("typed resolution was decoded before operation dispatch")
+        }
     }
 }
 
@@ -11809,42 +11759,6 @@ async fn service_cancel_commands(
     }
 }
 
-async fn cancel_pending_permissions_for_session(state: &ServerState, session_id: SessionId) {
-    let batches = state
-        .pending_permission_batches
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .filter(|batch| batch.session_id == session_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    for batch in batches {
-        let mut decision = batch.decision.lock().await;
-        if decision.is_none() {
-            *decision = Some(false);
-        }
-    }
-
-    let permissions = {
-        let mut pending = state.pending_permissions.lock().await;
-        let permission_ids = pending
-            .iter()
-            .filter(|(_, permission)| permission.summary.session_id == session_id)
-            .map(|(permission_id, _)| permission_id.clone())
-            .collect::<Vec<_>>();
-        let mut permissions = Vec::with_capacity(permission_ids.len());
-        for permission_id in permission_ids {
-            if let Some(permission) = pending.remove(&permission_id) {
-                permissions.push(permission);
-            }
-        }
-        permissions
-    };
-    for permission in permissions {
-        resolve_pending_permission(state, permission, false, false).await;
-    }
-}
-
 async fn process_cancel_turn_command(
     state: &ServerState,
     session_id: SessionId,
@@ -11853,7 +11767,7 @@ async fn process_cancel_turn_command(
     command: CancelCommand,
 ) {
     let current_turn = close_session_turn(state, session_id).await;
-    cancel_pending_permissions_for_session(state, session_id).await;
+    interaction_operations::cancel_pending_permissions_for_session(state, session_id).await;
     if command.clear_queue {
         let cleared = drain_followup_commands(followup_commands);
         if cleared > 0 {
@@ -14498,252 +14412,6 @@ async fn handle_compact_session(
             .await
         }
     }
-}
-
-async fn handle_list_permissions(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let permissions = interaction_operations::list_permissions(state).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PermissionList { permissions }),
-    )
-    .await
-}
-
-async fn handle_list_pending_tool_exchanges(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-) -> Result<(), ServerError> {
-    let exchanges = interaction_operations::list_pending_tool_exchanges(state).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PendingToolExchangeList { exchanges }),
-    )
-    .await
-}
-
-async fn handle_resolve_tool_exchange(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    interaction_id: &str,
-    resolution: ToolExchangeResolution,
-) -> Result<(), ServerError> {
-    match interaction_operations::resolve_tool_exchange(
-        state,
-        client_id,
-        interaction_id,
-        resolution,
-    )
-    .await
-    {
-        Ok(resolved) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::ToolExchangeResolved { resolved }),
-            )
-            .await
-        }
-        Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "incompatible_exchange_consumer",
-                    "client did not advertise a compatible exchange adapter",
-                )),
-            )
-            .await
-        }
-        Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
-            unreachable!("typed resolution was decoded before operation dispatch")
-        }
-    }
-}
-
-async fn handle_add_permission_rule(
-    request_id: u64,
-    _state: &ServerState,
-    writer: &SharedWriter,
-    agent_id: &str,
-    category: &str,
-    pattern: String,
-    action: &str,
-) -> Result<(), ServerError> {
-    match bcode_config::upsert_agent_permission_rule(agent_id, category, pattern, action) {
-        Ok(path) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::PermissionRuleAdded {
-                    config_path: path.display().to_string(),
-                }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new("config_error", error.to_string())),
-            )
-            .await
-        }
-    }
-}
-
-async fn resolve_pending_permission(
-    state: &ServerState,
-    permission: PendingPermission,
-    approved: bool,
-    remember: bool,
-) {
-    if remember && let Some(key) = permission.skill_decision_key.clone() {
-        remember_skill_tool_decision(
-            key,
-            if approved {
-                SkillToolDecision::Allow
-            } else {
-                SkillToolDecision::Deny
-            },
-        );
-    }
-    *permission.decision.lock().await = Some(approved);
-    permission.notify.notify_waiters();
-    append_permission_resolved_event(
-        state,
-        permission.summary.session_id,
-        permission.summary.permission_id,
-        approved,
-    )
-    .await;
-}
-
-async fn take_pending_permission_for_individual(
-    state: &ServerState,
-    permission_id: &str,
-) -> Option<PendingPermission> {
-    let candidate = state
-        .pending_permissions
-        .lock()
-        .await
-        .get(permission_id)
-        .cloned()?;
-    let Some(correlation) = candidate.summary.batch.as_ref() else {
-        return state.pending_permissions.lock().await.remove(permission_id);
-    };
-    let batch = state
-        .pending_permission_batches
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&correlation.batch_id)
-        .cloned();
-    let Some(batch) = batch else {
-        state.pending_permissions.lock().await.remove(permission_id);
-        return None;
-    };
-    let batch_decision = batch.decision.lock().await;
-    if batch_decision.is_some() {
-        return None;
-    }
-    let permission = state.pending_permissions.lock().await.remove(permission_id);
-    drop(batch_decision);
-    permission
-}
-
-async fn handle_resolve_permission(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    permission_id: &str,
-    approved: bool,
-    remember: bool,
-) -> Result<(), ServerError> {
-    let resolved =
-        interaction_operations::resolve_permission(state, permission_id, approved, remember).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PermissionResolved { resolved }),
-    )
-    .await
-}
-
-async fn resolve_permission_batch_operation(
-    state: &ServerState,
-    batch_id: &str,
-    approved: bool,
-) -> usize {
-    let Some(batch) = state
-        .pending_permission_batches
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(batch_id)
-        .cloned()
-    else {
-        return 0;
-    };
-    let mut batch_decision = batch.decision.lock().await;
-    if batch_decision.is_some() {
-        return 0;
-    }
-    *batch_decision = Some(approved);
-    drop(batch_decision);
-
-    let permissions = {
-        let permission_ids = {
-            let pending = state.pending_permissions.lock().await;
-            pending
-                .iter()
-                .filter(|(_, permission)| {
-                    permission
-                        .summary
-                        .batch
-                        .as_ref()
-                        .is_some_and(|batch| batch.batch_id == batch_id)
-                })
-                .map(|(permission_id, _)| permission_id.clone())
-                .collect::<Vec<_>>()
-        };
-        let mut pending = state.pending_permissions.lock().await;
-        let mut permissions = Vec::with_capacity(permission_ids.len());
-        for permission_id in permission_ids {
-            if let Some(permission) = pending.remove(&permission_id) {
-                permissions.push(permission);
-            }
-        }
-        permissions
-    };
-    let resolved = permissions.len();
-    for permission in permissions {
-        resolve_pending_permission(state, permission, approved, false).await;
-    }
-    resolved
-}
-
-async fn handle_resolve_permission_batch(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    batch_id: &str,
-    approved: bool,
-) -> Result<(), ServerError> {
-    let resolved =
-        interaction_operations::resolve_permission_batch(state, batch_id, approved).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::PermissionBatchResolved { resolved }),
-    )
-    .await
 }
 
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -23502,7 +23170,10 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         } else if skill_requests_permission {
             let key =
                 skill_tool_decision_key(self.state, self.session_id, &request.call.name).await;
-            match key.as_ref().and_then(remembered_skill_tool_decision) {
+            match key
+                .as_ref()
+                .and_then(interaction_operations::remembered_skill_tool_decision)
+            {
                 Some(SkillToolDecision::Allow) => {
                     append_trace_event(
                         self.state,
@@ -23593,13 +23264,12 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
                 .await;
                 return Ok(decisions);
             }
-            let batch_id = next_permission_batch_id(self.state).await;
-            let batch_state = Arc::new(PendingPermissionBatch::new(self.session_id));
-            let _registration = PendingPermissionBatchRegistration::register(
-                Arc::clone(&self.state.pending_permission_batches),
-                batch_id.clone(),
-                batch_state,
-            );
+            let (batch_id, _registration) =
+                interaction_operations::PendingPermissionBatchRegistration::allocate(
+                    self.state,
+                    self.session_id,
+                )
+                .await;
             let decisions = futures::future::join_all(requests.iter().map(|request| {
                 self.authorize_one(
                     request,
@@ -24570,11 +24240,10 @@ async fn resolve_server_exchange(
             message: "exchange does not belong to the active tool invocation".to_string(),
         });
     }
-    if !state.has_exchange_consumer(&request).await {
+    if !interaction_operations::has_exchange_consumer(state, &request).await {
         return Ok(ToolExchangeResolution::NoCompatibleConsumer);
     }
-    let resolution = resolve_tool_exchange(state, session_id, call, &request, cancel_state).await?;
-    Ok(resolution)
+    interaction_operations::request_tool_exchange(state, session_id, &request, cancel_state).await
 }
 
 #[derive(Debug)]
@@ -25522,53 +25191,6 @@ async fn append_tool_contribution_event(
     Ok(())
 }
 
-async fn resolve_tool_exchange(
-    state: &ServerState,
-    session_id: SessionId,
-    _call: &bcode_model::ToolCall,
-    request: &ToolExchangeRequest,
-    cancel_state: &TurnCancelState,
-) -> Result<ToolExchangeResolution, String> {
-    let pending = PendingToolExchange {
-        summary: bcode_ipc::PendingToolExchangeSummary {
-            session_id,
-            request: request.clone(),
-        },
-        resolution: Arc::new(Mutex::new(None)),
-        notify: Arc::new(Notify::new()),
-    };
-    let resolution_slot = pending.resolution.clone();
-    let notify = pending.notify.clone();
-    {
-        let mut pending_interactions = state.pending_tool_exchanges.lock().await;
-        if pending_interactions.contains_key(&request.exchange_id) {
-            return Err(format!(
-                "duplicate interactive tool request id: {}",
-                request.exchange_id
-            ));
-        }
-        pending_interactions.insert(request.exchange_id.clone(), pending);
-    }
-    if !state.has_exchange_consumer(request).await {
-        let resolution = abort_tool_exchange(
-            state,
-            &request.exchange_id,
-            ToolExchangeResolution::ConsumerDetached,
-        )
-        .await;
-        return Ok(resolution);
-    }
-
-    Ok(wait_for_tool_exchange_resolution(
-        state,
-        &request.exchange_id,
-        &resolution_slot,
-        &notify,
-        cancel_state,
-    )
-    .await)
-}
-
 #[allow(clippy::too_many_lines)] // Validates and commits one complete active-artifact state transition.
 fn update_active_artifact(
     state: &ServerState,
@@ -25749,27 +25371,6 @@ async fn evaluate_agent_tool_policy_with_metadata(
             reason: None,
             shell: None,
         })
-}
-
-fn remembered_skill_tool_decision(key: &SkillToolDecisionKey) -> Option<SkillToolDecision> {
-    SettingsStore::default()
-        .skill_tool_decisions()
-        .ok()
-        .and_then(|state| state.decision_for(key).map(|entry| entry.decision))
-}
-
-fn remember_skill_tool_decision(key: SkillToolDecisionKey, decision: SkillToolDecision) {
-    let store = SettingsStore::default();
-    let Ok(mut state) = store.skill_tool_decisions() else {
-        return;
-    };
-    state.upsert(SkillToolDecisionEntry {
-        key,
-        decision,
-        remembered_at_ms: current_time_ms(),
-        reason: Some("remembered from permission dialog".to_string()),
-    });
-    let _ = store.save_skill_tool_decisions(&state, current_time_ms());
 }
 
 async fn skill_tool_decision_key(
@@ -25965,41 +25566,6 @@ struct PermissionPolicyContext {
     batch: Option<PermissionBatchCorrelation>,
 }
 
-async fn register_pending_permission(
-    state: &ServerState,
-    pending: &PendingPermission,
-    event: SessionEventKind,
-) -> Result<(), bool> {
-    let batch_state = pending.summary.batch.as_ref().and_then(|batch| {
-        state
-            .pending_permission_batches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&batch.batch_id)
-            .cloned()
-    });
-    if pending.summary.batch.is_some() && batch_state.is_none() {
-        return Err(false);
-    }
-    let batch_decision = if let Some(batch_state) = batch_state.as_ref() {
-        let decision = batch_state.decision.lock().await;
-        if let Some(decision) = *decision {
-            return Err(decision);
-        }
-        Some(decision)
-    } else {
-        None
-    };
-    state
-        .pending_permissions
-        .lock()
-        .await
-        .insert(pending.summary.permission_id.clone(), pending.clone());
-    append_permission_requested_event(state, pending.summary.session_id, event).await;
-    drop(batch_decision);
-    Ok(())
-}
-
 #[allow(clippy::too_many_lines)]
 async fn request_tool_permission(
     state: &ServerState,
@@ -26013,7 +25579,7 @@ async fn request_tool_permission(
     if cancel_state.is_cancelled() {
         return false;
     }
-    let permission_id = next_permission_id(state).await;
+    let permission_id = interaction_operations::next_permission_id(state).await;
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
     let agent_id = session_agent_selection(state, session_id).await;
     let pending = PendingPermission {
@@ -26043,7 +25609,9 @@ async fn request_tool_permission(
         policy_source: policy_context.source,
         policy_reason: policy_context.reason,
     };
-    if let Err(decision) = register_pending_permission(state, &pending, event).await {
+    if let Err(decision) =
+        interaction_operations::register_pending_permission(state, &pending, event).await
+    {
         return decision;
     }
     state.metrics.add_counter_with_labels(
@@ -26103,12 +25671,10 @@ async fn request_tool_permission(
         tokio::select! {
             () = pending.notify.notified() => {}
             () = cancel_state.cancelled() => {
-                let removed = state
-                    .pending_permissions
-                    .lock()
-                    .await
-                    .remove(&pending.summary.permission_id);
-                if removed.is_none() {
+                if !interaction_operations::cancel_pending_permission(
+                    state,
+                    &pending.summary.permission_id,
+                ).await {
                     continue;
                 }
                 let duration_ms = elapsed_ms(wait_start);
@@ -26135,13 +25701,6 @@ async fn request_tool_permission(
                     },
                 )
                 .await;
-                append_permission_resolved_event(
-                    state,
-                    session_id,
-                    pending.summary.permission_id.clone(),
-                    false,
-                )
-                .await;
                 return false;
             }
         }
@@ -26153,62 +25712,6 @@ fn tool_permission_metric_labels(tool_name: &str, outcome: &str) -> MetricLabels
     labels.insert("tool_name".to_owned(), tool_name.to_owned());
     labels.insert("outcome".to_owned(), outcome.to_owned());
     labels
-}
-
-#[cfg(test)]
-async fn permission_batch_decision(state: &ServerState, batch_id: &str) -> Option<bool> {
-    let batch = state
-        .pending_permission_batches
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(batch_id)
-        .cloned()?;
-    *batch.decision.lock().await
-}
-
-async fn next_permission_batch_id(state: &ServerState) -> String {
-    let mut next = state.next_permission_batch_id.lock().await;
-    let batch_id = format!("permission-batch-{}", *next);
-    *next += 1;
-    batch_id
-}
-
-async fn next_permission_id(state: &ServerState) -> String {
-    let mut next = state.next_permission_id.lock().await;
-    let permission_id = format!("perm-{}", *next);
-    *next += 1;
-    permission_id
-}
-
-async fn append_permission_requested_event(
-    state: &ServerState,
-    session_id: SessionId,
-    request: SessionEventKind,
-) {
-    match state
-        .sessions
-        .append_permission_requested(session_id, request)
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append permission request: {error}"),
-    }
-}
-
-async fn append_permission_resolved_event(
-    state: &ServerState,
-    session_id: SessionId,
-    permission_id: String,
-    approved: bool,
-) {
-    match state
-        .sessions
-        .append_permission_resolved(session_id, permission_id, approved)
-        .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append permission result: {error}"),
-    }
 }
 
 #[cfg(test)]
@@ -27140,46 +26643,6 @@ async fn append_runtime_work_cancel_requested_event(
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => tracing::warn!("failed to append runtime work cancel request: {error}"),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn wait_for_tool_exchange_resolution(
-    state: &ServerState,
-    interaction_id: &str,
-    resolution_slot: &Arc<Mutex<Option<ToolExchangeResolution>>>,
-    notify: &Arc<Notify>,
-    cancel_state: &TurnCancelState,
-) -> ToolExchangeResolution {
-    loop {
-        let value = resolution_slot.lock().await.clone();
-        if let Some(resolution) = value {
-            return resolution;
-        }
-        tokio::select! {
-            () = notify.notified() => {}
-            () = cancel_state.cancelled() => {
-                return abort_tool_exchange(
-                    state,
-                    interaction_id,
-                    ToolExchangeResolution::Cancelled,
-                )
-                .await;
-            }
-        }
-    }
-}
-
-async fn abort_tool_exchange(
-    state: &ServerState,
-    interaction_id: &str,
-    resolution: ToolExchangeResolution,
-) -> ToolExchangeResolution {
-    state
-        .pending_tool_exchanges
-        .lock()
-        .await
-        .remove(interaction_id);
-    resolution
 }
 
 fn service_tool_result_to_session(result: ServiceToolInvocationResult) -> ToolInvocationResult {
@@ -37324,16 +36787,18 @@ library = "test"
             payload: serde_json::json!({"opaque": true}),
             response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
         };
-        assert!(state.has_exchange_consumer(&request).await);
+        assert!(interaction_operations::has_exchange_consumer(&state, &request).await);
         assert!(
-            state
-                .client_supports_exchange(compatible_client, &request)
+            interaction_operations::client_supports_exchange(&state, compatible_client, &request,)
                 .await
         );
         assert!(
-            !state
-                .client_supports_exchange(incompatible_client, &request)
-                .await
+            !interaction_operations::client_supports_exchange(
+                &state,
+                incompatible_client,
+                &request,
+            )
+            .await
         );
 
         let pending = PendingToolExchange {
@@ -37353,7 +36818,7 @@ library = "test"
         state
             .set_client_runtime_context(compatible_client, None)
             .await;
-        state.resolve_exchanges_without_consumers().await;
+        interaction_operations::resolve_exchanges_without_consumers(&state).await;
 
         assert_eq!(
             *resolution.lock().await,
@@ -47535,7 +47000,13 @@ library = "test"
             .lock()
             .await
             .remove(&permission.summary.permission_id);
-        resolve_pending_permission(state, permission.clone(), true, false).await;
+        interaction_operations::resolve_permission(
+            state,
+            &permission.summary.permission_id,
+            true,
+            false,
+        )
+        .await;
     }
 
     fn pending_permission_for_batch(
@@ -47602,10 +47073,13 @@ library = "test"
         assert_eq!(*second.decision.lock().await, Some(true));
         assert_eq!(*unrelated.decision.lock().await, None);
         assert_eq!(
-            permission_batch_decision(&state, "batch-1").await,
+            interaction_operations::permission_batch_decision(&state, "batch-1").await,
             Some(true)
         );
-        assert_eq!(permission_batch_decision(&state, "batch-2").await, None);
+        assert_eq!(
+            interaction_operations::permission_batch_decision(&state, "batch-2").await,
+            None
+        );
         assert_eq!(
             interaction_operations::resolve_permission_batch(&state, "batch-1", false).await,
             0
@@ -47627,7 +47101,7 @@ library = "test"
             .await
             .insert("perm-4".to_string(), after_latch);
         assert!(
-            take_pending_permission_for_individual(&state, "perm-4")
+            interaction_operations::take_pending_permission_for_individual(&state, "perm-4")
                 .await
                 .is_none(),
             "batch latch must prevent a later per-call decision from winning"
@@ -47798,7 +47272,8 @@ library = "test"
         );
 
         cancel_state.close();
-        cancel_pending_permissions_for_session(state.as_ref(), target.id).await;
+        interaction_operations::cancel_pending_permissions_for_session(state.as_ref(), target.id)
+            .await;
 
         for task in tasks {
             assert!(!task.await.expect("permission waiter"));
@@ -48817,7 +48292,7 @@ library = "test"
             .batch_id
             .clone();
         assert_eq!(
-            resolve_permission_batch_operation(state.as_ref(), &batch_id, true).await,
+            interaction_operations::resolve_permission_batch(state.as_ref(), &batch_id, true).await,
             1
         );
 
@@ -58587,11 +58062,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::PermissionRequested { policy_source, .. }
                 if policy_source.as_deref() == Some("workflow_policy")
         ));
-        let pending =
-            take_pending_permission_for_individual(&state, &permission.summary.permission_id)
-                .await
-                .expect("pending permission");
-        resolve_pending_permission(&state, pending, true, false).await;
+        assert!(
+            interaction_operations::resolve_permission(
+                &state,
+                &permission.summary.permission_id,
+                true,
+                false,
+            )
+            .await
+        );
         let (effective, audit) = task.await.expect("join").expect("authorized");
         assert_eq!(effective, WorkflowToolCapability::Mutating);
         assert!(audit.contains(&format!("grant={}", permission.summary.permission_id)));
@@ -63986,7 +63465,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .lock()
             .await
             .remove(&permission.summary.permission_id);
-        resolve_pending_permission(state.as_ref(), permission, false, false).await;
+        interaction_operations::complete_pending_permission(
+            state.as_ref(),
+            permission,
+            false,
+            false,
+        )
+        .await;
         assert!(!permission_task.await.expect("permission task"));
         tokio::time::timeout(Duration::from_secs(1), async {
             while sessions.session_is_owned(session.id).await {
@@ -64044,7 +63529,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .lock()
             .await
             .remove(&permission.summary.permission_id);
-        resolve_pending_permission(state.as_ref(), permission, false, false).await;
+        interaction_operations::complete_pending_permission(
+            state.as_ref(),
+            permission,
+            false,
+            false,
+        )
+        .await;
         let approved = task.await.expect("permission task");
 
         assert!(!approved);
