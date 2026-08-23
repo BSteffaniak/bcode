@@ -203,6 +203,7 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 launch_start_pending: false,
                 launch_start_updates: None,
                 launch_start_error: None,
+                launch_form: None,
                 selected_run_id: None,
                 selected_node_id: None,
                 selected_wait_id: None,
@@ -374,6 +375,74 @@ struct WorkflowInputField {
     kind: WorkflowInputFieldKind,
     required: bool,
     editor: TextInputState,
+}
+
+#[derive(Debug)]
+struct WorkflowLaunchForm {
+    source: bcode_workflow::WorkflowLaunchSourceIdentity,
+    configuration_schema: bcode_workflow::ValueSchema,
+    input_schema: Option<bcode_workflow::ValueSchema>,
+    configuration: TextInputState,
+    input: Option<TextInputState>,
+    focused_editor: usize,
+    error: Option<String>,
+}
+
+impl WorkflowLaunchForm {
+    fn new(detail: &bcode_workflow::WorkflowLaunchDetail) -> Self {
+        let configuration = detail
+            .document
+            .configuration_defaults
+            .clone()
+            .unwrap_or_else(|| default_input_value(Some(&detail.item.configuration_schema.schema)));
+        let input_schema = matches!(
+            detail.item.source,
+            bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport { .. }
+        )
+        .then(|| detail.item.input_schema.clone());
+        let input = input_schema.as_ref().map(|schema| {
+            TextInputState::new(TextEditBuffer::from_text(pretty_json_value(
+                &default_input_value(Some(&schema.schema)),
+            )))
+        });
+        Self {
+            source: detail.item.source.clone(),
+            configuration_schema: detail.item.configuration_schema.clone(),
+            input_schema,
+            configuration: TextInputState::new(TextEditBuffer::from_text(pretty_json_value(
+                &configuration,
+            ))),
+            input,
+            focused_editor: 0,
+            error: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(serde_json::Value, Option<serde_json::Value>), String> {
+        let configuration = serde_json::from_str(self.configuration.buffer().text())
+            .map_err(|error| format!("Invalid configuration JSON: {error}"))?;
+        self.configuration_schema
+            .validate_value("launch.configuration", &configuration)
+            .map_err(|error| error.to_string())?;
+        let input = self
+            .input
+            .as_ref()
+            .zip(self.input_schema.as_ref())
+            .map(|(editor, schema)| {
+                let value = serde_json::from_str(editor.buffer().text())
+                    .map_err(|error| format!("Invalid input JSON: {error}"))?;
+                schema
+                    .validate_value("launch.input", &value)
+                    .map_err(|error| error.to_string())?;
+                Ok::<serde_json::Value, String>(value)
+            })
+            .transpose()?;
+        Ok((configuration, input))
+    }
+}
+
+fn pretty_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 #[derive(Debug)]
@@ -567,6 +636,7 @@ struct WorkflowStatusSurface {
         >,
     >,
     launch_start_error: Option<String>,
+    launch_form: Option<WorkflowLaunchForm>,
     selected_run_id: Option<String>,
     selected_node_id: Option<String>,
     selected_wait_id: Option<(String, String)>,
@@ -1264,11 +1334,12 @@ impl WorkflowStatusSurface {
                 && matches!(
                     detail.item.source,
                     bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport { .. }
+                        | bcode_workflow::WorkflowLaunchSourceIdentity::Template { .. }
                 )
         }) {
             lines.push(Line::from_spans(vec![
                 Span::styled("s", theme.focused),
-                Span::styled(" start exact published export", theme.text),
+                Span::styled(" configure and start exact target", theme.text),
             ]));
         }
         TextView::new(&lines)
@@ -2636,14 +2707,38 @@ impl WorkflowStatusSurface {
         self.request_launch_detail(host)
     }
 
-    fn start_selected_launch(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        let (Some(detail), Some(parent_session_id)) =
-            (self.launch_detail.as_ref(), self.parent_session_id)
-        else {
-            self.launch_start_error = Some(
-                "Starting requires an exact loaded workflow and active parent session".to_string(),
-            );
+    fn start_selected_launch(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let Some(detail) = self.launch_detail.as_ref() else {
+            self.launch_start_error =
+                Some("Starting requires an exact loaded workflow".to_string());
             return PluginTuiAction::Redraw;
+        };
+        if self.launch_form.as_ref().map(|form| &form.source) != Some(&detail.item.source) {
+            self.launch_form = Some(WorkflowLaunchForm::new(detail));
+        }
+        PluginTuiAction::Redraw
+    }
+
+    fn submit_launch_form(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let Some(parent_session_id) = self.parent_session_id else {
+            if let Some(form) = self.launch_form.as_mut() {
+                form.error = Some("Starting requires an active parent session".to_string());
+            }
+            return PluginTuiAction::Redraw;
+        };
+        let validated = self.launch_form.as_ref().map(WorkflowLaunchForm::validate);
+        let (configuration, input) = match validated {
+            Some(Ok(values)) => values,
+            Some(Err(error)) => {
+                if let Some(form) = self.launch_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return PluginTuiAction::Redraw;
+            }
+            None => return PluginTuiAction::None,
+        };
+        let Some(detail) = self.launch_detail.as_ref() else {
+            return PluginTuiAction::None;
         };
         let future = match &detail.item.source {
             bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
@@ -2677,8 +2772,8 @@ impl WorkflowStatusSurface {
                             .as_ref()
                             .map(|path| path.display().to_string()),
                         parent_session_generation: None,
-                        configuration: None,
-                        input: None,
+                        configuration: Some(configuration),
+                        input,
                     },
                 )
             }
@@ -2694,13 +2789,6 @@ impl WorkflowStatusSurface {
                         });
                     return PluginTuiAction::Redraw;
                 }
-                let configuration = detail
-                    .document
-                    .configuration_defaults
-                    .clone()
-                    .unwrap_or_else(|| {
-                        default_input_value(Some(&detail.document.configuration_schema.schema))
-                    });
                 host.start_workflow_template(
                     bcode_plugin_sdk::tui::PluginWorkflowTemplateStartRequest {
                         owner_plugin_id: owner_plugin_id.clone(),
@@ -2793,11 +2881,57 @@ impl WorkflowStatusSurface {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_discover_components(
         &mut self,
         event: &Event,
         host: &dyn PluginTuiHost,
     ) -> PluginTuiAction {
+        if self.launch_form.is_some() {
+            let Event::Key(key) = event else {
+                return PluginTuiAction::None;
+            };
+            if key.key == KeyCode::Escape {
+                self.launch_form = None;
+                return PluginTuiAction::Redraw;
+            }
+            if key.key == KeyCode::Enter && key.modifiers.ctrl {
+                return self.submit_launch_form(host);
+            }
+            let Some(form) = self.launch_form.as_mut() else {
+                return PluginTuiAction::None;
+            };
+            if key.key == KeyCode::Tab && form.input.is_some() {
+                form.focused_editor = usize::from(form.focused_editor == 0);
+                return PluginTuiAction::Redraw;
+            }
+            let editor = if form.focused_editor == 1 {
+                form.input
+                    .as_mut()
+                    .expect("input editor exists when focused")
+            } else {
+                &mut form.configuration
+            };
+            let area = if editor.content_area().is_empty() {
+                Rect::new(0, 0, 80, 8)
+            } else {
+                editor.content_area()
+            };
+            return match TextInputBox::new(TextInputPolicy::chat_composer())
+                .policy(TextInputBoxPolicy::bare().focused(true).rows(3, Some(12)))
+                .handle_event(area, editor, event)
+            {
+                TextInputBoxOutcome::Ignored => PluginTuiAction::None,
+                TextInputBoxOutcome::Edited
+                | TextInputBoxOutcome::Redraw
+                | TextInputBoxOutcome::Submitted
+                | TextInputBoxOutcome::EdgeUp
+                | TextInputBoxOutcome::EdgeDown => {
+                    form.error = None;
+                    PluginTuiAction::Redraw
+                }
+            };
+        }
         if let Some(action) = self.handle_launch_search(event, host) {
             return action;
         }
@@ -3426,6 +3560,122 @@ impl WorkflowStatusSurface {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn render_launch_form(
+        area: Rect,
+        frame: &mut Frame<'_>,
+        theme: WorkflowSurfaceTheme,
+        form: &WorkflowLaunchForm,
+    ) {
+        let pane = Pane::new()
+            .title(Line::from("Configure exact workflow launch"))
+            .padding(Insets::new(1, 1, 1, 1))
+            .styles(PaneStyles {
+                background: Some(theme.canvas),
+                border: theme.component.border,
+                focused_border: theme.focused,
+            });
+        let mut state = PaneState::new(area);
+        state.interaction = state.interaction.focused(true);
+        pane.render(&state, frame);
+        let inner = pane.inner_area(&state);
+        frame.write_line(
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            &Line::from_spans(vec![
+                Span::styled("Target: ", theme.muted),
+                Span::styled(format!("{:?}", form.source), theme.focused),
+            ]),
+        );
+        let footer_rows = u16::from(form.error.is_some()).saturating_add(1);
+        let available = inner.height.saturating_sub(1).saturating_sub(footer_rows);
+        let configuration_height = if form.input.is_some() {
+            available / 2
+        } else {
+            available
+        };
+        let styles = TextInputBoxStyles {
+            text: theme.text,
+            focused_text: theme.focused,
+            disabled_text: theme.muted,
+            placeholder: theme.muted,
+            selection: theme.selected,
+            border: theme.component.border,
+            focused_border: theme.focused,
+            background: theme.canvas,
+            focused_background: theme.canvas,
+            disabled_background: theme.canvas,
+        };
+        let mut configuration = form.configuration.clone();
+        TextInputBox::new(TextInputPolicy::chat_composer())
+            .label("Configuration JSON")
+            .required(true)
+            .help(&form.configuration_schema.type_name)
+            .policy(
+                TextInputBoxPolicy::field()
+                    .focused(form.focused_editor == 0)
+                    .rows(3, Some(configuration_height.max(3))),
+            )
+            .styles(styles)
+            .render(
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1),
+                    inner.width,
+                    configuration_height,
+                ),
+                &mut configuration,
+                frame,
+            );
+        if let (Some(input), Some(schema)) = (&form.input, &form.input_schema) {
+            let mut input = input.clone();
+            TextInputBox::new(TextInputPolicy::chat_composer())
+                .label("Workflow input JSON")
+                .required(true)
+                .help(&schema.type_name)
+                .policy(
+                    TextInputBoxPolicy::field()
+                        .focused(form.focused_editor == 1)
+                        .rows(
+                            3,
+                            Some(available.saturating_sub(configuration_height).max(3)),
+                        ),
+                )
+                .styles(styles)
+                .render(
+                    Rect::new(
+                        inner.x,
+                        inner
+                            .y
+                            .saturating_add(1)
+                            .saturating_add(configuration_height),
+                        inner.width,
+                        available.saturating_sub(configuration_height),
+                    ),
+                    &mut input,
+                    frame,
+                );
+        }
+        let mut footer_y = inner.bottom().saturating_sub(1);
+        if let Some(error) = &form.error {
+            footer_y = footer_y.saturating_sub(1);
+            frame.write_line(
+                Rect::new(inner.x, footer_y, inner.width, 1),
+                &Line::from_spans(vec![Span::styled(error, theme.error)]),
+            );
+        }
+        frame.write_line(
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            &Line::from_spans(vec![
+                Span::styled("Tab", theme.focused),
+                Span::styled(" switch  ", theme.text),
+                Span::styled("Ctrl+Enter", theme.focused),
+                Span::styled(" validate & start  ", theme.text),
+                Span::styled("Esc", theme.focused),
+                Span::styled(" cancel", theme.text),
+            ]),
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn render_input_form(
         area: Rect,
         frame: &mut Frame<'_>,
@@ -3627,6 +3877,10 @@ impl WorkflowStatusSurface {
             .set_selected(Some(self.session_activity_tab));
         self.action_row_state.interaction.focused =
             self.workspace_focus == WorkflowWorkspaceFocus::Actions;
+        if let Some(form) = &self.launch_form {
+            Self::render_launch_form(content, frame, theme, form);
+            return;
+        }
         if let Some(confirmation) = &self.pending_confirmation {
             Self::render_confirmation(content, frame, theme, confirmation);
             return;
@@ -3817,6 +4071,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             self.launch_start_pending = false;
             match result {
                 Ok(started) => {
+                    self.launch_form = None;
                     self.workspace_mode = WorkflowWorkspaceMode::Runs;
                     self.selected_run_id = Some(started.run_id.clone());
                     self.detail_loading_run_id = Some(started.run_id.clone());
@@ -6649,6 +6904,7 @@ mod tests {
             launch_start_pending: false,
             launch_start_updates: None,
             launch_start_error: None,
+            launch_form: None,
             selected_run_id: Some("run-1".to_string()),
             selected_node_id: Some("reviewer".to_string()),
             selected_wait_id: Some(("approval".to_string(), "approval-activation".to_string())),
@@ -8460,6 +8716,99 @@ mod tests {
         assert!(rendered.contains("Discovered workflow"));
         assert!(rendered.contains("Graph: 0 nodes"));
         assert!(rendered.contains("Input schema: input/v1"));
+    }
+
+    #[test]
+    fn launch_form_validates_and_retains_configuration_after_rejection() {
+        let document = bcode_workflow::WorkflowAuthoringDocument {
+            schema_version: bcode_workflow::WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+            workflow_id: "configured".to_string(),
+            metadata: bcode_workflow::WorkflowAuthoringMetadata {
+                title: "Configured".to_string(),
+                description: None,
+                labels: std::collections::BTreeMap::new(),
+            },
+            configuration_schema: bcode_workflow::ValueSchema {
+                type_name: "config/v1".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": { "name": { "type": "string" } }
+                }),
+            },
+            configuration_defaults: Some(serde_json::json!({"name": "review"})),
+            plugin_input_defaults: std::collections::BTreeMap::new(),
+            definition: bcode_workflow::WorkflowDefinition {
+                schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "configured".to_string(),
+                input: bcode_workflow::ValueSchema {
+                    type_name: "input/v1".to_string(),
+                    schema: serde_json::json!({"type": "string"}),
+                },
+                output: bcode_workflow::ValueSchema {
+                    type_name: "output/v1".to_string(),
+                    schema: serde_json::json!({}),
+                },
+                entries: Vec::new(),
+                exits: Vec::new(),
+                nodes: std::collections::BTreeMap::new(),
+                edges: Vec::new(),
+            },
+            bindings: Vec::new(),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            run_limits: bcode_workflow::WorkflowRunLimitPolicy::default(),
+            producer: bcode_workflow::WorkflowProducerProvenance {
+                kind: bcode_workflow::WorkflowProducerKind::Human,
+                producer_id: None,
+                source_revision: None,
+            },
+            presentation: None,
+        };
+        let item = bcode_workflow::WorkflowLaunchCatalogItem {
+            source: bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+                package_id: "package".to_string(),
+                export: "configured".to_string(),
+                manifest_path: std::path::PathBuf::from("workflow-package.toml"),
+            },
+            source_label: "package".to_string(),
+            precedence: 0,
+            title: "Configured".to_string(),
+            description: None,
+            readiness: bcode_workflow::WorkflowLaunchReadiness::Ready,
+            unavailable_reason: None,
+            package_lock_digest_sha256: Some("digest".to_string()),
+            publication: None,
+            actions: Vec::new(),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            permissions: bcode_workflow::WorkflowPermissionPreview::default(),
+            input_schema: document.definition.input.clone(),
+            configuration_schema: document.configuration_schema.clone(),
+            diagnostics: Vec::new(),
+        };
+        let detail = bcode_workflow::WorkflowLaunchDetail {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            item,
+            document,
+            package_plan: None,
+        };
+        let mut form = WorkflowLaunchForm::new(&detail);
+        assert_eq!(
+            form.validate().expect("valid defaults"),
+            (
+                serde_json::json!({"name": "review"}),
+                Some(serde_json::json!(""))
+            )
+        );
+        form.configuration = TextInputState::new(TextEditBuffer::from_text("{}".to_string()));
+        let entered = form.configuration.buffer().text().to_string();
+        form.error = Some(form.validate().expect_err("required field must fail"));
+        assert_eq!(form.configuration.buffer().text(), entered);
+        assert!(
+            form.error
+                .as_deref()
+                .is_some_and(|error| error.contains("name"))
+        );
     }
 
     #[test]
