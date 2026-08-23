@@ -2645,49 +2645,89 @@ impl WorkflowStatusSurface {
             );
             return PluginTuiAction::Redraw;
         };
-        let bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
-            package_id, export, ..
-        } = &detail.item.source
-        else {
-            self.launch_start_error =
-                Some("This source must be applied and published before it can start".to_string());
-            return PluginTuiAction::Redraw;
+        let future = match &detail.item.source {
+            bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+                package_id,
+                export,
+                ..
+            } => {
+                let Some(lock_digest) = detail.item.package_lock_digest_sha256.clone() else {
+                    self.launch_start_error =
+                        Some("Published package lock identity is missing".to_string());
+                    return PluginTuiAction::Redraw;
+                };
+                if detail.item.readiness != bcode_workflow::WorkflowLaunchReadiness::Ready {
+                    self.launch_start_error =
+                        detail.item.unavailable_reason.clone().or_else(|| {
+                            Some("Selected package export is not ready to start".to_string())
+                        });
+                    return PluginTuiAction::Redraw;
+                }
+                host.start_workflow_package_export(
+                    bcode_plugin_sdk::tui::PluginWorkflowPackageExportStartRequest {
+                        package_export: bcode_workflow::WorkflowPackageExportIdentity {
+                            package_id: package_id.clone(),
+                            export: export.clone(),
+                            package_lock_digest_sha256: Some(lock_digest),
+                        },
+                        run_id: None,
+                        parent_session_id,
+                        workspace_snapshot: self
+                            .launch_workspace
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                        parent_session_generation: None,
+                        configuration: None,
+                        input: None,
+                    },
+                )
+            }
+            bcode_workflow::WorkflowLaunchSourceIdentity::Template {
+                owner_plugin_id,
+                template_id,
+                template_version,
+            } => {
+                if detail.item.readiness != bcode_workflow::WorkflowLaunchReadiness::Ready {
+                    self.launch_start_error =
+                        detail.item.unavailable_reason.clone().or_else(|| {
+                            Some("Selected template is not ready to start".to_string())
+                        });
+                    return PluginTuiAction::Redraw;
+                }
+                let configuration = detail
+                    .document
+                    .configuration_defaults
+                    .clone()
+                    .unwrap_or_else(|| {
+                        default_input_value(Some(&detail.document.configuration_schema.schema))
+                    });
+                host.start_workflow_template(
+                    bcode_plugin_sdk::tui::PluginWorkflowTemplateStartRequest {
+                        owner_plugin_id: owner_plugin_id.clone(),
+                        template_id: template_id.clone(),
+                        template_version: *template_version,
+                        run_id: None,
+                        parent_session_id,
+                        workspace_snapshot: self
+                            .launch_workspace
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                        configuration,
+                        limits: detail.document.run_limits.clone(),
+                    },
+                )
+            }
+            _ => {
+                self.launch_start_error = Some(
+                    "This source must be applied and published before it can start".to_string(),
+                );
+                return PluginTuiAction::Redraw;
+            }
         };
-        let Some(lock_digest) = detail.item.package_lock_digest_sha256.clone() else {
-            self.launch_start_error =
-                Some("Published package lock identity is missing".to_string());
-            return PluginTuiAction::Redraw;
-        };
-        if detail.item.readiness != bcode_workflow::WorkflowLaunchReadiness::Ready {
-            self.launch_start_error = detail
-                .item
-                .unavailable_reason
-                .clone()
-                .or_else(|| Some("Selected package export is not ready to start".to_string()));
-            return PluginTuiAction::Redraw;
-        }
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         self.launch_start_updates = Some(receiver);
         self.launch_start_pending = true;
         self.launch_start_error = None;
-        let future = host.start_workflow_package_export(
-            bcode_plugin_sdk::tui::PluginWorkflowPackageExportStartRequest {
-                package_export: bcode_workflow::WorkflowPackageExportIdentity {
-                    package_id: package_id.clone(),
-                    export: export.clone(),
-                    package_lock_digest_sha256: Some(lock_digest),
-                },
-                run_id: None,
-                parent_session_id,
-                workspace_snapshot: self
-                    .launch_workspace
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                parent_session_generation: None,
-                configuration: None,
-                input: None,
-            },
-        );
         host.spawn(Box::pin(async move {
             let _ = sender.send(future.await).await;
         }));

@@ -359,6 +359,22 @@ pub struct PluginWorkflowTemplateInstantiationRequest {
     pub draft_id: String,
 }
 
+/// Renderer-neutral request to start one exact enabled workflow template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkflowTemplateStartRequest {
+    pub owner_plugin_id: String,
+    pub template_id: String,
+    pub template_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub parent_session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
+    pub configuration: serde_json::Value,
+    pub limits: bcode_workflow::WorkflowRunLimitPolicy,
+}
+
 /// Async workflow-authoring revision result.
 pub type PluginWorkflowAuthoringRevisionFuture = Pin<
     Box<
@@ -804,6 +820,18 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow package export start is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Start one exact enabled plugin-owned workflow template.
+    fn start_workflow_template(
+        &self,
+        _request: PluginWorkflowTemplateStartRequest,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow template start is not available from this host".to_string(),
             ))
         })
     }

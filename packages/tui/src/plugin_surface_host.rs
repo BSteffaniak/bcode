@@ -23,6 +23,7 @@ use bcode_plugin_sdk::tui::{
     PluginWorkflowPackageExportStartRequest, PluginWorkflowStartFuture, PluginWorkflowStartRequest,
     PluginWorkflowStartResponse, PluginWorkflowStatus, PluginWorkflowSummary,
     PluginWorkflowTemplateInstantiationFuture, PluginWorkflowTemplateInstantiationRequest,
+    PluginWorkflowTemplateStartRequest,
 };
 use bcode_session_models::SessionId;
 use bcode_session_view::SessionView;
@@ -81,6 +82,24 @@ fn workflow_package_export_start_request(
         parent_session_generation: request.parent_session_generation,
         configuration: request.configuration,
         input: request.input,
+    }
+}
+
+fn workflow_run_limits(
+    policy: bcode_workflow::WorkflowRunLimitPolicy,
+) -> bcode_workflow_store::WorkflowRunLimits {
+    bcode_workflow_store::WorkflowRunLimits {
+        deadline_at_ms: policy.maximum_duration_ms.map(|duration| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|now| u64::try_from(now.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or_default()
+                .saturating_add(duration)
+        }),
+        node_execution_cap: policy.node_execution_cap,
+        concurrency_cap: policy.concurrency_cap,
+        cycle_cap: policy.cycle_cap,
+        retry_cap: policy.retry_cap,
     }
 }
 
@@ -562,6 +581,32 @@ impl PluginTuiHost for BcodePluginTuiHost {
                 .map(|started| PluginWorkflowStartResponse {
                     run_id: started.started.started.run.run_id,
                     runtime_work_id: started.started.started.runtime_work_id.to_string(),
+                })
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn start_workflow_template(
+        &self,
+        request: PluginWorkflowTemplateStartRequest,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .start_workflow_template(bcode_ipc::WorkflowTemplateStartRequest {
+                    owner_plugin_id: request.owner_plugin_id,
+                    template_id: request.template_id,
+                    template_version: request.template_version,
+                    run_id: request.run_id,
+                    workspace_snapshot: request.workspace_snapshot,
+                    parent_session_id: request.parent_session_id,
+                    configuration: request.configuration,
+                    limits: workflow_run_limits(request.limits),
+                })
+                .await
+                .map(|started| PluginWorkflowStartResponse {
+                    run_id: started.run.run_id,
+                    runtime_work_id: started.runtime_work_id.to_string(),
                 })
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
         })
