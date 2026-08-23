@@ -393,6 +393,11 @@ enum DocumentError {
 }
 
 /// Extract a local PDF through the document capability without model participation.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot start, the path is not a readable PDF, native and
+/// fallback extraction fail, or extraction exceeds configured bounds.
 pub fn extract_document_path(path: &Path) -> Result<ExtractResponse, String> {
     let runtime = ProviderRuntime::new().map_err(|error| error.to_string())?;
     runtime
@@ -409,6 +414,12 @@ pub fn extract_document_path(path: &Path) -> Result<ExtractResponse, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Extract a PDF from the request's local path or URL.
+///
+/// # Errors
+///
+/// Returns an error for an invalid source, download or I/O failure, unsupported input, extraction
+/// failure, timeout, or configured size-limit violation.
 pub async fn extract_document(request: ExtractRequest) -> Result<ExtractResponse, String> {
     extract_async(request, None)
         .await

@@ -452,6 +452,12 @@ enum OcrError {
     BundledTesseract(String),
 }
 
+/// Extract text from a local image path without model participation.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot start, the path or working directory is unavailable,
+/// the input is invalid or oversized, or the selected OCR engine fails.
 pub fn extract_path(path: &Path) -> Result<ExtractResponse, String> {
     let runtime = ProviderRuntime::new().map_err(|error| error.to_string())?;
     runtime

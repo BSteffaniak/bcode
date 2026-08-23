@@ -23702,17 +23702,13 @@ fn auth_host_service_resolution(
     if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_INSPECT_SECURITY {
         return bcode_tool::ToolInvocationServiceResolution::Unsupported;
     }
-    let inspection = match serde_json::from_value::<
+    let Ok(inspection) = serde_json::from_value::<
         bcode_provider_auth_models::AuthSecurityInspectionRequest,
-    >(request.payload)
-    {
-        Ok(request) => request,
-        Err(_) => {
-            return bcode_tool::ToolInvocationServiceResolution::Failed {
-                code: "invalid_request".to_owned(),
-                message: "invalid provider-auth security inspection request".to_owned(),
-            };
-        }
+    >(request.payload) else {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "invalid_request".to_owned(),
+            message: "invalid provider-auth security inspection request".to_owned(),
+        };
     };
     let Some(provider) = state.plugins.auth_provider(&inspection.provider_id) else {
         return bcode_tool::ToolInvocationServiceResolution::Failed {
@@ -23726,14 +23722,11 @@ fn auth_host_service_resolution(
             message: "authentication provider is owned by another plugin".to_owned(),
         };
     }
-    let config = match bcode_config::load_config() {
-        Ok(config) => config,
-        Err(_) => {
-            return bcode_tool::ToolInvocationServiceResolution::Failed {
-                code: "auth_config_unavailable".to_owned(),
-                message: "authentication configuration is unavailable".to_owned(),
-            };
-        }
+    let Ok(config) = bcode_config::load_config() else {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_config_unavailable".to_owned(),
+            message: "authentication configuration is unavailable".to_owned(),
+        };
     };
     let runtime = bcode_config::load_runtime_auth_subscriptions();
     let resolved = match bcode_provider_auth::resolve_auth_provider_profile(
@@ -23756,13 +23749,13 @@ fn auth_host_service_resolution(
         &resolved,
         &inspection,
     ) {
-        Ok(response) => match serde_json::to_value(response) {
-            Ok(payload) => bcode_tool::ToolInvocationServiceResolution::Responded { payload },
-            Err(_) => bcode_tool::ToolInvocationServiceResolution::Failed {
+        Ok(response) => serde_json::to_value(response).map_or_else(
+            |_| bcode_tool::ToolInvocationServiceResolution::Failed {
                 code: "auth_response_encode_failed".to_owned(),
                 message: "authentication security response could not be encoded".to_owned(),
             },
-        },
+            |payload| bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+        ),
         Err(error) => bcode_tool::ToolInvocationServiceResolution::Failed {
             code: "auth_security_inspection_failed".to_owned(),
             message: error.to_string(),

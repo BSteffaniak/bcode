@@ -78,13 +78,15 @@ fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
     };
     match response {
         bcode_tool::ToolInvocationServiceResolution::Responded { payload } => {
-            match serde_json::from_value::<AuthSecurityInspectionResponse>(payload) {
-                Ok(response) => json_response(&response),
-                Err(_) => ServiceResponse::error(
-                    "host_contract_error",
-                    "provider-auth host returned an invalid inspection response",
-                ),
-            }
+            serde_json::from_value::<AuthSecurityInspectionResponse>(payload).map_or_else(
+                |_| {
+                    ServiceResponse::error(
+                        "host_contract_error",
+                        "provider-auth host returned an invalid inspection response",
+                    )
+                },
+                |response| json_response(&response),
+            )
         }
         bcode_tool::ToolInvocationServiceResolution::Cancelled => ServiceResponse::error(
             "cancelled",
@@ -647,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::items_after_statements)]
     fn provider_auth_security_block_routes_semantic_host_inspection() {
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");

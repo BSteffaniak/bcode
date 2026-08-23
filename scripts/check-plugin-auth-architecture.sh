@@ -71,6 +71,22 @@ if rg -n 'sshenv_vault\s*=' plugins --glob 'Cargo.toml' \
   violations=1
 fi
 
+if rg -n 'pub (api_key|access_token|refresh_token|id_token|secret|credential_value):' \
+  packages/provider-auth/models packages/config/src packages/ipc/src \
+  --glob '*.rs' >/tmp/bcode-auth-public-secret-fields.txt; then
+  echo "Auth architecture violation: public auth/config/IPC contracts contain a plaintext credential field." >&2
+  cat /tmp/bcode-auth-public-secret-fields.txt >&2
+  violations=1
+fi
+
+if rg -n '(tracing::|println!|eprintln!|dbg!)[^\n]*(api_key|access_token|refresh_token|id_token|credential_value)' \
+  packages/provider-auth packages/plugin-sdk packages/plugin packages/config/src packages/ipc/src plugins \
+  --glob '*.rs' >/tmp/bcode-auth-secret-logging.txt; then
+  echo "Auth architecture violation: auth credential fields appear in logging or debug output." >&2
+  cat /tmp/bcode-auth-secret-logging.txt >&2
+  violations=1
+fi
+
 if ! rg -n 'fn register_auth_providers' plugins/web-search-plugin/src/lib.rs >/dev/null ||
    ! rg -n 'fn register_auth_providers' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null; then
   echo "Auth architecture violation: bundled Exa/OpenAI/xAI providers must remain plugin-registered." >&2

@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 const RENDERER_NEUTRAL_SCAN_ROOTS: &[&str] = &["packages/session-view", "packages/hyperchad"];
 
 const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
-    "Commands::Worktree",
     "Commands::Ralph",
     "Commands::Metrics",
     "Commands::Provider",
@@ -17,7 +16,6 @@ const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
     "Commands::Review",
     "Commands::Blims",
     "Commands::Read",
-    "enum WorktreeCommand",
     "enum ProviderCommand",
     "enum SkillCommand",
     "enum EvalCommand",
@@ -25,7 +23,6 @@ const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
     "enum BlimsCommand",
     "enum ReadCommand",
     "struct ReadCli",
-    "handle_worktree_command",
     "handle_ralph_command",
     "handle_provider_command",
     "handle_skill_command",
@@ -35,6 +32,12 @@ const PLUGIN_OWNED_CORE_CLI_NEEDLES: &[&str] = &[
     "handle_read_command",
     "bcode.openai-compatible",
     "run_metrics_dashboard(repo, path)",
+];
+
+const HOST_OWNED_CORE_CLI_COMMANDS: &[&str] = &[
+    "Commands::Worktree",
+    "enum WorktreeCommand",
+    "handle_worktree_command",
 ];
 
 const BCODE_BROWSER_TRANSPORT_NEEDLES: &[&str] = &[
@@ -225,6 +228,12 @@ fn exa_provider_implementation_remains_plugin_owned() {
 #[test]
 fn plugin_owned_commands_do_not_return_to_core_cli() {
     let source = include_str!("../src/lib.rs");
+    for command in HOST_OWNED_CORE_CLI_COMMANDS {
+        assert!(
+            source.contains(command),
+            "host-owned Worktree command unexpectedly left the core CLI: {command}"
+        );
+    }
     let offenders = PLUGIN_OWNED_CORE_CLI_NEEDLES
         .iter()
         .filter(|needle| source.contains(**needle))
