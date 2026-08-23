@@ -1232,20 +1232,30 @@ impl WorkflowStatusSurface {
             area.width,
             area.height.saturating_sub(query_area.height),
         );
-        frame.write_line(
-            query_area,
-            &Line::from_spans(vec![Span::styled(
-                format!(
-                    "Search: {}  Source: {}  Readiness: {}",
-                    self.launch_search.as_deref().unwrap_or("all"),
-                    self.launch_source_filter
-                        .map_or_else(|| "all".to_string(), |value| format!("{value:?}")),
-                    self.launch_readiness_filter
-                        .map_or_else(|| "all".to_string(), |value| format!("{value:?}")),
-                ),
-                theme.muted,
-            )]),
-        );
+        if self.live_status.contains("unavailable") || self.live_status.contains("disconnected") {
+            frame.write_line(
+                query_area,
+                &Line::from_spans(vec![Span::styled(
+                    format!("Disconnected · {}", self.live_status),
+                    theme.error,
+                )]),
+            );
+        } else {
+            frame.write_line(
+                query_area,
+                &Line::from_spans(vec![Span::styled(
+                    format!(
+                        "Search: {}  Source: {}  Readiness: {}",
+                        self.launch_search.as_deref().unwrap_or("all"),
+                        self.launch_source_filter
+                            .map_or_else(|| "all".to_string(), |value| format!("{value:?}")),
+                        self.launch_readiness_filter
+                            .map_or_else(|| "all".to_string(), |value| format!("{value:?}")),
+                    ),
+                    theme.muted,
+                )]),
+            );
+        }
         let Some(page) = self.launch_catalog.as_ref() else {
             let message =
                 self.launch_catalog_error
@@ -4369,25 +4379,34 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                                     .first()
                                     .map(|approval| approval.approval_id.clone())
                             });
-                        self.selected_attempt_id = self
-                            .selected_attempt_id
-                            .take()
-                            .filter(|(node_id, activation_id, attempt)| {
-                                view.attempts.iter().any(|candidate| {
-                                    &candidate.node_id == node_id
-                                        && &candidate.activation_id == activation_id
-                                        && candidate.attempt == *attempt
+                        let previous_attempt = self.selected_attempt_id.take();
+                        self.selected_attempt_id = previous_attempt.as_ref().map_or_else(
+                            || {
+                                self.selected_node_id.as_deref().and_then(|selected_node| {
+                                    view.attempts
+                                        .iter()
+                                        .filter(|attempt| attempt.node_id == selected_node)
+                                        .max_by_key(|attempt| attempt.attempt)
+                                        .map(|attempt| {
+                                            (
+                                                attempt.node_id.clone(),
+                                                attempt.activation_id.clone(),
+                                                attempt.attempt,
+                                            )
+                                        })
                                 })
-                            })
-                            .or_else(|| {
-                                view.attempts.first().map(|attempt| {
-                                    (
-                                        attempt.node_id.clone(),
-                                        attempt.activation_id.clone(),
-                                        attempt.attempt,
-                                    )
-                                })
-                            });
+                            },
+                            |(node_id, activation_id, attempt)| {
+                                view.attempts
+                                    .iter()
+                                    .any(|candidate| {
+                                        &candidate.node_id == node_id
+                                            && &candidate.activation_id == activation_id
+                                            && candidate.attempt == *attempt
+                                    })
+                                    .then(|| (node_id.clone(), activation_id.clone(), *attempt))
+                            },
+                        );
                         self.selected_output_id = self
                             .selected_output_id
                             .take()
@@ -4534,6 +4553,7 @@ fn workflow_breadcrumb_line(surface: &WorkflowStatusSurface, theme: WorkflowSurf
     ])
 }
 
+#[allow(clippy::too_many_lines)]
 fn launch_item_lines(
     item: &bcode_workflow::WorkflowLaunchCatalogItem,
     theme: WorkflowSurfaceTheme,
@@ -4566,16 +4586,47 @@ fn launch_item_lines(
         lines.push(Line::from_spans(vec![Span::styled(reason, theme.warning)]));
     }
     lines.push(Line::from(format!(
-        "Requirements: {} plugins · {} blocks · {} agents",
+        "Requirements: {} capabilities · {} plugins · {} blocks · {} agents",
+        item.requirements.capabilities.len(),
         item.requirements.plugins.len(),
         item.requirements.blocks.len(),
         item.requirements.agents.len()
     )));
+    for (label, values) in [
+        ("Capabilities", &item.requirements.capabilities),
+        ("Plugins", &item.requirements.plugins),
+        ("Blocks", &item.requirements.blocks),
+        ("Agents/models", &item.requirements.agents),
+    ] {
+        if !values.is_empty() {
+            lines.push(Line::from(format!(
+                "  {label}: {}",
+                values.iter().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+    }
     lines.push(Line::from(format!(
-        "Capability: {:?} · resources: {}",
+        "Capability: {:?} · resources: {} · effects: {} · reconciliation: {}",
         item.effects.maximum_capability,
-        item.effects.resources.len()
+        item.effects.resources.len(),
+        item.effects.block_effects.len(),
+        item.effects.reconciliation.len()
     )));
+    lines.push(Line::from(format!(
+        "Permissions: {:?} · {} explicit grants · {} mutation approvals",
+        item.permissions.maximum_capability,
+        item.permissions.explicit_grant_nodes.len(),
+        item.permissions.mutation_approval_nodes.len()
+    )));
+    if !item.diagnostics.is_empty() {
+        lines.push(Line::from("Validation diagnostics:"));
+        lines.extend(item.diagnostics.iter().map(|diagnostic| {
+            Line::from(format!(
+                "  {:?} {} · {}",
+                diagnostic.severity, diagnostic.document_path, diagnostic.message
+            ))
+        }));
+    }
     if let Some(publication) = &item.publication {
         lines.push(Line::from(format!(
             "Published: {} revision {} · {} v{}",
@@ -4584,6 +4635,27 @@ fn launch_item_lines(
             publication.definition_identity.definition_id,
             publication.definition_identity.definition_version
         )));
+    }
+    if item.readiness != bcode_workflow::WorkflowLaunchReadiness::Ready {
+        let next = item
+            .actions
+            .iter()
+            .find(|action| action.enabled)
+            .map_or_else(
+                || {
+                    "No lifecycle action is currently available; resolve the diagnostics above"
+                        .to_string()
+                },
+                |action| format!("Next required action: {:?}", action.kind),
+            );
+        lines.push(Line::from_spans(vec![Span::styled(next, theme.warning)]));
+    } else if item.actions.iter().any(|action| {
+        action.kind == bcode_workflow::WorkflowLaunchActionKind::Start && action.enabled
+    }) {
+        lines.push(Line::from_spans(vec![Span::styled(
+            "Ready: configure and Start the exact immutable target",
+            theme.success,
+        )]));
     }
     lines.push(Line::from("Actions:"));
     lines.extend(item.actions.iter().map(|action| {
@@ -4607,6 +4679,8 @@ fn launch_detail_lines(
     let mut lines = launch_item_lines(&detail.item, theme);
     lines.extend([
         Line::from(""),
+        Line::from(format!("Provenance: {:?}", detail.document.producer.kind)),
+        Line::from(format!("Exact source: {:?}", detail.item.source)),
         Line::from(format!(
             "Graph: {} nodes · {} edges · {} entries · {} exits",
             detail.document.definition.nodes.len(),
@@ -4625,6 +4699,24 @@ fn launch_detail_lines(
     ]);
     for node in detail.document.definition.nodes.values() {
         lines.push(Line::from(format!("  • {} · {:?}", node.name, node.kind)));
+    }
+    for edge in &detail.document.definition.edges {
+        lines.push(Line::from(format!(
+            "    {} → {} · {:?}",
+            edge.from, edge.to, edge.kind
+        )));
+    }
+    if let Some(plan) = &detail.package_plan {
+        lines.push(Line::from(format!(
+            "Package closure: {} packages · entry {}",
+            plan.packages.len(),
+            plan.entry_package_id
+        )));
+        lines.extend(
+            plan.packages
+                .iter()
+                .map(|entry| Line::from(format!("  package {}", entry.package_id))),
+        );
     }
     lines
 }
@@ -7957,6 +8049,38 @@ mod tests {
     }
 
     #[test]
+    fn selected_attempt_never_silently_retargets_after_retry_or_removal() {
+        let mut surface = projected_surface();
+        surface.selected_node_id = Some("reviewer".to_string());
+        surface.selected_attempt_id = Some(("reviewer".to_string(), "activation-1".to_string(), 2));
+        let mut with_retry = surface.runs.get("run-1").expect("run").clone();
+        let mut retry = with_retry.attempts[0].clone();
+        retry.attempt = 3;
+        retry.dispatch_identity = "dispatch-3".to_string();
+        retry.status = "running".to_string();
+        retry.terminal_at_ms = None;
+        with_retry.attempts.insert(0, retry);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        surface.attach_updates(receiver);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(with_retry)))
+            .expect("retry update");
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert_eq!(
+            surface.selected_attempt_id,
+            Some(("reviewer".to_string(), "activation-1".to_string(), 2))
+        );
+
+        let mut removed = surface.runs.get("run-1").expect("run").clone();
+        removed.attempts.retain(|attempt| attempt.attempt != 2);
+        sender
+            .try_send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(removed)))
+            .expect("removal update");
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert!(surface.selected_attempt_id.is_none());
+    }
+
+    #[test]
     fn selected_run_refresh_preserves_exact_node_identity_after_reorder() {
         let mut surface = projected_surface();
         let mut view = surface.runs.get("run-1").expect("run").clone();
@@ -8670,6 +8794,70 @@ mod tests {
             PluginTuiAction::None
         );
         assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Graph);
+    }
+
+    #[test]
+    fn pointer_targets_exact_visible_run_node_tab_and_action_identities() {
+        let mut surface = projected_surface();
+        let _ = render_workspace_buffer(&mut surface, 132, 28);
+
+        let run_area = surface.workspace_areas.catalog_content;
+        let run_click = Event::Mouse(bmux_tui::event::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(run_area.x.saturating_add(1), run_area.y.saturating_add(2)),
+        ));
+        let _ = surface.handle_control_center_event(&run_click);
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-1"));
+        assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Catalog);
+
+        let graph_area = surface.workspace_areas.graph_content;
+        let layout = workflow_graph_layout(
+            surface.selected_run_view().expect("run"),
+            graph_area,
+            surface.selected_node_id.as_deref(),
+        );
+        let card = layout.cards.first().expect("visible graph card").clone();
+        let expected_node = surface.selected_run_view().expect("run").nodes[card.node_index]
+            .node_id
+            .clone();
+        let graph_click = Event::Mouse(bmux_tui::event::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(card.area.x.saturating_add(1), card.area.y.saturating_add(1)),
+        ));
+        assert_eq!(
+            surface.handle_control_center_event(&graph_click),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Graph);
+        assert_eq!(
+            surface.selected_node_id.as_deref(),
+            Some(expected_node.as_str())
+        );
+
+        surface.workspace_focus = WorkflowWorkspaceFocus::Inspector;
+        surface.active_detail_tab = 0;
+        let _ = render_workspace_buffer(&mut surface, 132, 28);
+        let tabs = surface.workspace_areas.inspector_tabs;
+        let tab_click = Event::Mouse(bmux_tui::event::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(tabs.right().saturating_sub(3), tabs.y),
+        ));
+        let _ = surface.handle_control_center_event(&tab_click);
+        assert!(surface.active_detail_tab < 7);
+
+        surface.workspace_focus = WorkflowWorkspaceFocus::Actions;
+        let _ = render_workspace_buffer(&mut surface, 132, 28);
+        let action_area = surface.workspace_areas.actions_content;
+        let action_click = Event::Mouse(bmux_tui::event::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(action_area.x.saturating_add(1), action_area.y),
+        ));
+        let action = surface.handle_control_center_event(&action_click);
+        assert!(matches!(
+            action,
+            PluginTuiAction::Redraw | PluginTuiAction::None
+        ));
+        assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Actions);
     }
 
     #[test]
