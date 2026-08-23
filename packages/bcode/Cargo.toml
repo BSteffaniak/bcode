@@ -56,6 +56,7 @@ bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true, optional = true }
 bcode_plugin_sdk                        = { workspace = true }
 bcode_provider_auth                     = { workspace = true, optional = true }
+bcode_provider_auth_models              = { workspace = true }
 bcode_session_models                    = { workspace = true }
 bcode_tool                              = { workspace = true }
 bcode_workflow                          = { workspace = true }

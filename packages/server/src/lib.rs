@@ -23692,11 +23692,92 @@ fn request_server_plugin_bridge(
     }
 }
 
+fn auth_host_service_resolution(
+    state: &ServerState,
+    caller_plugin_id: &str,
+    request: bcode_tool::ToolInvocationServiceRequest,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_INSPECT_SECURITY};
+
+    if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_INSPECT_SECURITY {
+        return bcode_tool::ToolInvocationServiceResolution::Unsupported;
+    }
+    let inspection = match serde_json::from_value::<
+        bcode_provider_auth_models::AuthSecurityInspectionRequest,
+    >(request.payload)
+    {
+        Ok(request) => request,
+        Err(_) => {
+            return bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "invalid_request".to_owned(),
+                message: "invalid provider-auth security inspection request".to_owned(),
+            };
+        }
+    };
+    let Some(provider) = state.plugins.auth_provider(&inspection.provider_id) else {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "unknown_provider".to_owned(),
+            message: "authentication provider is not registered".to_owned(),
+        };
+    };
+    if provider.plugin_id != caller_plugin_id {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_owner_mismatch".to_owned(),
+            message: "authentication provider is owned by another plugin".to_owned(),
+        };
+    }
+    let config = match bcode_config::load_config() {
+        Ok(config) => config,
+        Err(_) => {
+            return bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "auth_config_unavailable".to_owned(),
+                message: "authentication configuration is unavailable".to_owned(),
+            };
+        }
+    };
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let resolved = match bcode_provider_auth::resolve_auth_provider_profile(
+        &config,
+        &inspection.provider_id,
+        caller_plugin_id,
+        Some(&inspection.profile),
+        &runtime,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "auth_profile_unavailable".to_owned(),
+                message: error.to_string(),
+            };
+        }
+    };
+    match bcode_provider_auth::operations::inspect_security(
+        caller_plugin_id,
+        &resolved,
+        &inspection,
+    ) {
+        Ok(response) => match serde_json::to_value(response) {
+            Ok(payload) => bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+            Err(_) => bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "auth_response_encode_failed".to_owned(),
+                message: "authentication security response could not be encoded".to_owned(),
+            },
+        },
+        Err(error) => bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_security_inspection_failed".to_owned(),
+            message: error.to_string(),
+        },
+    }
+}
+
 fn server_workflow_plugin_bridge(
+    state: Arc<ServerState>,
     parent_session_id: SessionId,
     dispatch_identity: &str,
+    caller_plugin_id: &str,
 ) -> PluginInvocationBridge {
     let dispatch_identity = dispatch_identity.to_string();
+    let caller_plugin_id = caller_plugin_id.to_owned();
     PluginInvocationBridge::new(move |request, cancellation| match request {
         ServiceBridgeRequest::WriteArtifact(artifact)
             if artifact.invocation_id == dispatch_identity =>
@@ -23733,8 +23814,19 @@ fn server_workflow_plugin_bridge(
         ServiceBridgeRequest::ReceiveInput { .. } => Ok(ServiceBridgeResponse::Input(
             ToolInvocationInputResolution::Closed,
         )),
+        ServiceBridgeRequest::InvokeService(request)
+            if request.invocation_id == dispatch_identity =>
+        {
+            Ok(ServiceBridgeResponse::Service(
+                auth_host_service_resolution(&state, &caller_plugin_id, request),
+            ))
+        }
         ServiceBridgeRequest::InvokeService(_) => Ok(ServiceBridgeResponse::Service(
-            ToolInvocationServiceResolution::Unsupported,
+            ToolInvocationServiceResolution::Failed {
+                code: "invocation_id_mismatch".to_string(),
+                message: "service request does not belong to the workflow block invocation"
+                    .to_string(),
+            },
         )),
     })
 }
@@ -28334,8 +28426,10 @@ async fn dispatch_workflow_plugin_block(
             payload,
             PluginInvocationScope::session(parent_session_id.to_string()),
             Some(server_workflow_plugin_bridge(
+                Arc::clone(state),
                 parent_session_id,
                 &request.dispatch_identity,
+                &block.plugin_id,
             )),
         )
         .await
@@ -54954,7 +55048,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
     fn workflow_plugin_artifact_bridge_writes_bounded_opaque_reference() {
         let session_id = SessionId::new();
         let invocation_id = "workflow-artifact-test";
-        let bridge = server_workflow_plugin_bridge(session_id, invocation_id);
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let bridge = server_workflow_plugin_bridge(
+            Arc::clone(&state),
+            session_id,
+            invocation_id,
+            "bcode.test",
+        );
         let response = bridge
             .request(
                 ServiceBridgeRequest::WriteArtifact(ToolArtifactWriteRequest {

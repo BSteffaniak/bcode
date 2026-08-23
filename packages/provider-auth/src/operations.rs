@@ -60,7 +60,7 @@ pub fn update_credentials(
         context.caller_plugin_id,
         context.method,
     )?
-    .upsert(request.credentials)?;
+    .update(request.credentials)?;
     Ok(AuthCredentialUpdateResponse {
         schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
         updated_credentials,
@@ -195,6 +195,8 @@ mod tests {
                 ("access_token", "ACCESS_TOKEN"),
                 ("refresh_token", "REFRESH_TOKEN"),
                 ("expires_at", "EXPIRES_AT"),
+                ("id_token", "ID_TOKEN"),
+                ("account_id", "ACCOUNT_ID"),
             ]
             .into_iter()
             .map(|(credential_id, storage_key)| AuthCredentialStorage {
@@ -278,9 +280,9 @@ mod tests {
                 schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
                 profile: "openai".to_owned(),
                 credentials: BTreeMap::from([
-                    ("access_token".to_owned(), "access".to_owned()),
-                    ("refresh_token".to_owned(), "refresh".to_owned()),
-                    ("expires_at".to_owned(), "123".to_owned()),
+                    ("access_token".to_owned(), Some("access".to_owned())),
+                    ("refresh_token".to_owned(), Some("refresh".to_owned())),
+                    ("expires_at".to_owned(), Some("123".to_owned())),
                 ]),
             },
         )
@@ -293,6 +295,44 @@ mod tests {
         assert!(!encoded.contains("\"access\""));
         assert!(!encoded.contains("\"refresh\""));
         assert!(!encoded.contains("\"123\""));
+
+        let response = update_credentials(
+            AuthCredentialUpdateContext {
+                caller_plugin_id: "bcode.openai-compatible",
+                provider_id: "openai",
+                resolved: &owned_resolved,
+                method: &method,
+            },
+            AuthCredentialUpdateRequest {
+                schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                profile: "openai".to_owned(),
+                credentials: BTreeMap::from([
+                    ("access_token".to_owned(), Some("next-access".to_owned())),
+                    ("id_token".to_owned(), None),
+                    ("account_id".to_owned(), None),
+                ]),
+            },
+        )
+        .expect("atomic replacement and removal");
+        assert_eq!(
+            response.updated_credentials,
+            vec!["access_token", "account_id", "id_token"]
+        );
+        let values = AuthVaultLifecycle::new(
+            &owned_resolved,
+            "openai",
+            "bcode.openai-compatible",
+            &method,
+        )
+        .expect("lifecycle")
+        .read()
+        .expect("read updated credentials");
+        assert_eq!(
+            values.get("access_token").map(String::as_str),
+            Some("next-access")
+        );
+        assert!(!values.contains_key("id_token"));
+        assert!(!values.contains_key("account_id"));
 
         let invalid_vault = temp.path().join("must-not-exist");
         let invalid_resolved = resolved(&invalid_vault);
@@ -307,9 +347,10 @@ mod tests {
                 AuthCredentialUpdateRequest {
                     schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
                     profile: "openai".to_owned(),
-                    credentials: BTreeMap::from([
-                        ("access_token".to_owned(), "secret".to_owned(),)
-                    ]),
+                    credentials: BTreeMap::from([(
+                        "access_token".to_owned(),
+                        Some("secret".to_owned()),
+                    )]),
                 },
             )
             .is_err()
@@ -327,7 +368,7 @@ mod tests {
                 AuthCredentialUpdateRequest {
                     schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
                     profile: "openai".to_owned(),
-                    credentials: BTreeMap::from([("other".to_owned(), "secret".to_owned())]),
+                    credentials: BTreeMap::from([("other".to_owned(), Some("secret".to_owned()))]),
                 },
             )
             .is_err()

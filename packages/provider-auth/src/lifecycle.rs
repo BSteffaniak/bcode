@@ -209,6 +209,49 @@ impl<'a> AuthVaultLifecycle<'a> {
         self.reconcile_device_seal(Some(&recipient_key))
     }
 
+    /// Atomically replace or remove the specified credentials owned by the selected method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation for undeclared credentials, damaged vault/profile state,
+    /// write failure, or unsatisfied required device-seal policy.
+    pub fn update(
+        &self,
+        credentials: BTreeMap<String, Option<String>>,
+    ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
+        let storage_keys = self.credential_storage_keys()?;
+        for credential in credentials.keys() {
+            if !storage_keys.contains_key(credential) {
+                return Err(AuthVaultLifecycleError::UnknownCredential {
+                    method_id: self.method.method_id().to_owned(),
+                    credential_id: credential.clone(),
+                });
+            }
+        }
+        let (store, recipient_key) = self.open_or_initialize_store()?;
+        let mut values = match store.get_profile(self.storage_profile()) {
+            Ok(Some(values)) => values,
+            Ok(None) => BTreeMap::new(),
+            Err(error) => {
+                return Err(AuthVaultLifecycleError::ProfileUnavailable(
+                    error.to_string(),
+                ));
+            }
+        };
+        for (credential, value) in credentials {
+            let key = &storage_keys[&credential];
+            if let Some(value) = value {
+                values.insert(key.clone(), Zeroizing::new(value));
+            } else {
+                values.remove(key);
+            }
+        }
+        store
+            .replace_profile(self.storage_profile(), values)
+            .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))?;
+        self.reconcile_device_seal(Some(&recipient_key))
+    }
+
     /// Replace the complete credential set owned by the selected method.
     ///
     /// Credentials owned by other methods or integrations in the same profile are preserved.

@@ -9,6 +9,10 @@ use bcode_command::{
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
 };
 use bcode_plugin_sdk::prelude::*;
+use bcode_provider_auth_models::{
+    AUTH_HOST_INTERFACE_ID, AUTH_SECURITY_INSPECTION_SCHEMA_VERSION, AuthSecurityInspectionRequest,
+    AuthSecurityInspectionResponse, OP_INSPECT_SECURITY,
+};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
@@ -18,24 +22,25 @@ use bmux_tui::text::{Line, Span};
 use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
 use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthSecurityInspectRequest {
-    vault_path: PathBuf,
+    provider_id: String,
     profile: String,
-    policy: String,
 }
 
-fn invoke_workflow_block(request: &ServiceRequest) -> ServiceResponse {
-    if request.operation != "provider_auth.security.inspect" {
+fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.operation != "provider_auth.security.inspect" {
         return ServiceResponse::error(
             "unsupported_operation",
             "unsupported provider-auth security workflow block operation",
         );
     }
-    let invocation = match request.payload_json::<bcode_workflow::WorkflowBlockInvocation>() {
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
         Ok(invocation) => invocation,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
@@ -43,28 +48,56 @@ fn invoke_workflow_block(request: &ServiceRequest) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return ServiceResponse::error("invalid_request", error),
     };
-    if request.profile.trim().is_empty() || !request.vault_path.is_absolute() {
-        return ServiceResponse::error(
-            "invalid_request",
-            "security inspection requires an absolute vault path and non-empty profile",
-        );
-    }
-    let policy = match request.policy.as_str() {
-        "off" => bcode_provider_auth::security::AuthDeviceSealPolicy::Off,
-        "preferred" => bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
-        "required" => bcode_provider_auth::security::AuthDeviceSealPolicy::Required,
-        _ => {
+    let host_request = AuthSecurityInspectionRequest {
+        schema_version: AUTH_SECURITY_INSPECTION_SCHEMA_VERSION,
+        provider_id: request.provider_id,
+        profile: request.profile,
+    };
+    let payload = match serde_json::to_value(&host_request) {
+        Ok(payload) => payload,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let response = match context.bridge.request(&ServiceBridgeRequest::InvokeService(
+        bcode_tool::ToolInvocationServiceRequest {
+            invocation_id: invocation.dispatch_identity,
+            request_id: "provider-auth-security-inspection".to_owned(),
+            route_id: None,
+            interface_id: AUTH_HOST_INTERFACE_ID.to_owned(),
+            operation: OP_INSPECT_SECURITY.to_owned(),
+            payload,
+        },
+    )) {
+        Ok(ServiceBridgeResponse::Service(response)) => response,
+        Ok(_) => {
             return ServiceResponse::error(
-                "invalid_request",
-                "security policy must be off, preferred, or required",
+                "host_contract_error",
+                "provider-auth host returned an unexpected response",
             );
         }
+        Err(error) => return ServiceResponse::error("host_operation_failed", error.to_string()),
     };
-    json_response(&bcode_provider_auth::security::inspect_auth_vault_security(
-        &request.vault_path,
-        &request.profile,
-        policy,
-    ))
+    match response {
+        bcode_tool::ToolInvocationServiceResolution::Responded { payload } => {
+            match serde_json::from_value::<AuthSecurityInspectionResponse>(payload) {
+                Ok(response) => json_response(&response),
+                Err(_) => ServiceResponse::error(
+                    "host_contract_error",
+                    "provider-auth host returned an invalid inspection response",
+                ),
+            }
+        }
+        bcode_tool::ToolInvocationServiceResolution::Cancelled => ServiceResponse::error(
+            "cancelled",
+            "provider-auth security inspection was cancelled",
+        ),
+        bcode_tool::ToolInvocationServiceResolution::Unsupported => ServiceResponse::error(
+            "unsupported_operation",
+            "provider-auth security inspection is not supported by this host",
+        ),
+        bcode_tool::ToolInvocationServiceResolution::Failed { code, message } => {
+            ServiceResponse::error(code, message)
+        }
+    }
 }
 
 /// model command plugin.
@@ -83,7 +116,7 @@ impl RustPlugin for ModelPlugin {
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
-            return invoke_workflow_block(&context.request);
+            return invoke_workflow_block(&context);
         }
         if context.request.interface_id != COMMAND_INTERFACE_ID {
             return ServiceResponse::error(
@@ -614,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_auth_security_block_is_read_only_and_reports_missing_vault() {
+    fn provider_auth_security_block_routes_semantic_host_inspection() {
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
         let block = &manifest.services[0].workflow_blocks[0];
@@ -624,37 +657,85 @@ mod tests {
             block.authorization.capability,
             bcode_workflow::WorkflowToolCapability::Disabled
         );
-        let missing = std::env::temp_dir().join(format!(
-            "bcode-missing-auth-vault-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let response = invoke_workflow_block(&ServiceRequest {
-            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
-            operation: "provider_auth.security.inspect".to_string(),
-            payload: serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
-                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
-                dispatch_identity: "test-dispatch".to_string(),
-                workspace_root: std::env::temp_dir(),
-                input: serde_json::json!({
-                    "vault_path": missing,
-                    "profile": "openai",
-                    "policy": "required",
-                }),
-                preparation: None,
-            })
-            .expect("request"),
-        });
+        let expected = AuthSecurityInspectionResponse {
+            schema_version: AUTH_SECURITY_INSPECTION_SCHEMA_VERSION,
+            provider_id: "openai".to_owned(),
+            profile: "openai".to_owned(),
+            policy: "required".to_owned(),
+            vault_exists: false,
+            profile_keys_enabled: false,
+            profile_exists: false,
+            profile_device_sealed: false,
+            policy_satisfied: false,
+            diagnostics: Vec::new(),
+        };
+        extern "C" fn inspection_bridge(
+            request_ptr: *const u8,
+            request_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+            user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+            let request: ServiceBridgeRequest =
+                serde_json::from_slice(request).expect("bridge request");
+            let ServiceBridgeRequest::InvokeService(request) = request else {
+                panic!("expected nested service request");
+            };
+            assert_eq!(request.invocation_id, "test-dispatch");
+            assert_eq!(request.interface_id, AUTH_HOST_INTERFACE_ID);
+            assert_eq!(request.operation, OP_INSPECT_SECURITY);
+            let inspection: AuthSecurityInspectionRequest =
+                serde_json::from_value(request.payload).expect("inspection request");
+            assert_eq!(inspection.provider_id, "openai");
+            assert_eq!(inspection.profile, "openai");
+            let response = unsafe { &*user_data.cast::<AuthSecurityInspectionResponse>() };
+            let encoded = serde_json::to_vec(&ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Responded {
+                    payload: serde_json::to_value(response).expect("response"),
+                },
+            ))
+            .expect("bridge response");
+            assert!(encoded.len() <= output_capacity);
+            unsafe {
+                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+                *output_len = encoded.len();
+            }
+            0
+        }
+        let context = NativeServiceContext {
+            plugin_id: "bcode.model".to_owned(),
+            request: ServiceRequest {
+                interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+                operation: "provider_auth.security.inspect".to_string(),
+                payload: serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
+                    version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                    dispatch_identity: "test-dispatch".to_string(),
+                    workspace_root: std::env::temp_dir(),
+                    input: serde_json::json!({
+                        "provider_id": "openai",
+                        "profile": "openai",
+                    }),
+                    preparation: None,
+                })
+                .expect("request"),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: ServiceEventEmitter::default(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: ServiceBridge::new(
+                Some(inspection_bridge),
+                (&raw const expected).cast_mut().cast::<std::ffi::c_void>(),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            transient_progress_limits: TransientProgressLimits::default(),
+        };
+        let response = invoke_workflow_block(&context);
         assert_eq!(response.error, None);
-        let status: bcode_provider_auth::security::AuthSecurityStatus =
+        let status: AuthSecurityInspectionResponse =
             serde_json::from_slice(&response.payload).expect("status");
-        assert!(!status.vault_exists);
-        assert!(!status.policy_satisfied);
-        assert!(status.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "auth_vault_missing"
-                && diagnostic.severity
-                    == bcode_provider_auth::security::AuthSecurityDiagnosticSeverity::Warning
-        }));
+        assert_eq!(status, expected);
     }
 
     #[test]

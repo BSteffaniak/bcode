@@ -20,19 +20,15 @@ timeout_ms             = 5000
 
 [services.workflow_blocks.input]
 schema = { type = "object", required = [
-    "vault_path",
+    "provider_id",
     "profile",
-    "policy",
-], properties = { vault_path = { type = "string" }, profile = { type = "string" }, policy = { type = "string", enum = [
-    "off",
-    "preferred",
-    "required",
-] } } }
+], properties = { provider_id = { type = "string" }, profile = { type = "string" } } }
 type_name = "bcode.provider-auth.security-inspect-request/v1"
 
 [services.workflow_blocks.output]
 schema = { type = "object", required = [
-    "vault_path",
+    "schema_version",
+    "provider_id",
     "profile",
     "policy",
     "vault_exists",

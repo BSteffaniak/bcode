@@ -72,7 +72,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use zeroize::Zeroizing;
 
 mod context_compaction;
 
@@ -1195,7 +1194,7 @@ impl OpenAiCompatibleProviderPlugin {
             OP_AUTH_RESET_CREDIT_CONSUME => self.auth_reset_credit_consume(&context.request),
             OP_NATIVE_WEB_SEARCH => self.native_web_search(&context.request),
             OP_START_TURN => self.start_turn(
-                &context.request,
+                context,
                 context.request.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2,
             ),
             OP_RUN_TURN => self.run_turn(context),
@@ -1350,11 +1349,54 @@ impl OpenAiCompatibleProviderPlugin {
         }
     }
 
-    fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
-        let request = match request.payload_json::<ModelTurnRequest>() {
+    fn start_turn(
+        &self,
+        context: &NativeServiceContext,
+        positioned_output: bool,
+    ) -> ServiceResponse {
+        let mut request = match context.request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
+        let mut settings = settings_for_context(&request.provider_context);
+        let refresh = match &self.runtime {
+            Ok(runtime) => {
+                let mut refresh_settings = settings.clone();
+                runtime.block_on(async move {
+                    let refreshed = refresh_chatgpt_auth_if_needed(&mut refresh_settings).await?;
+                    Ok::<_, ProviderError>((refresh_settings, refreshed))
+                })
+            }
+            Err(error) => return ServiceResponse::error("runtime_error", error),
+        };
+        match refresh {
+            Ok(Ok((refreshed_settings, Some(refreshed)))) => {
+                settings = refreshed_settings;
+                let Some(profile) = request
+                    .provider_context
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.profile.as_deref())
+                else {
+                    return ServiceResponse::error(
+                        "token_refresh_persist_failed",
+                        "refreshed credentials require an owned auth profile",
+                    );
+                };
+                if let Err(error) = persist_refreshed_chatgpt_auth(
+                    &context.bridge,
+                    &request.turn_id,
+                    profile,
+                    refreshed,
+                ) {
+                    return ServiceResponse::error(error.code, error.message);
+                }
+                apply_settings_auth_to_context(&settings, &mut request.provider_context);
+            }
+            Ok(Ok((_, None))) => {}
+            Ok(Err(error)) => return ServiceResponse::error(error.code, error.message),
+            Err(error) => return ServiceResponse::error("runtime_error", error.to_string()),
+        }
         let mut state = self
             .state
             .lock()
@@ -1389,7 +1431,7 @@ impl OpenAiCompatibleProviderPlugin {
     /// and turn state is removed as this call unwinds, so no separate cancel or finish operation is
     /// needed on the push path.
     fn run_turn(&self, context: &NativeServiceContext) -> ServiceResponse {
-        let start = self.start_turn(&context.request, true);
+        let start = self.start_turn(context, true);
         if start.error.is_some() {
             return start;
         }
@@ -1621,8 +1663,6 @@ enum AuthSettings {
         expires_at: Option<u64>,
         account_id: Option<String>,
         profile: Option<String>,
-        vault: Option<std::path::PathBuf>,
-        storage: BTreeMap<String, bcode_model::ProviderAuthStorageRef>,
     },
 }
 
@@ -7271,11 +7311,6 @@ fn semantic_chatgpt_auth_settings(
     auth: &bcode_model::ProviderAuthContext,
 ) -> (AuthSettings, AuthDiagnostics) {
     let profile = auth.profile.clone();
-    let vault = auth
-        .storage
-        .values()
-        .find_map(|storage| storage.vault.as_ref())
-        .map(std::path::PathBuf::from);
     let Some(access_token) = auth
         .credentials
         .get("access_token")
@@ -7318,8 +7353,6 @@ fn semantic_chatgpt_auth_settings(
                 .and_then(|credential| credential.value.parse().ok()),
             account_id,
             profile: profile.clone(),
-            vault,
-            storage: auth.storage.clone(),
         },
         AuthDiagnostics {
             source: "runtime_auth".to_string(),
@@ -7337,8 +7370,6 @@ fn context_chatgpt_auth_settings(
 ) -> (AuthSettings, AuthDiagnostics) {
     let profile = context_auth_env_value(context, "BCODE_OPENAI_AUTH_PROFILE")
         .or_else(|| context.auth_profile.clone());
-    let vault =
-        context_auth_env_value(context, "BCODE_OPENAI_AUTH_VAULT").map(std::path::PathBuf::from);
     let Some(access_token) = context_auth_env_value(context, "BCODE_OPENAI_CODEX_ACCESS_TOKEN")
     else {
         return (
@@ -7371,8 +7402,6 @@ fn context_chatgpt_auth_settings(
                 .and_then(|value| value.parse().ok()),
             account_id,
             profile: profile.clone(),
-            vault,
-            storage: BTreeMap::new(),
         },
         AuthDiagnostics {
             source: "runtime_context".to_string(),
@@ -7471,8 +7500,6 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
                 .and_then(|value| value.parse().ok()),
             account_id,
             profile: saved.profile.clone(),
-            vault: saved.vault.clone(),
-            storage: BTreeMap::new(),
         },
         saved_auth_diagnostics(saved, "chatgpt", "saved sshenv ChatGPT/Codex auth"),
     )
@@ -7537,7 +7564,7 @@ impl OpenAiCompatibleProviderPlugin {
                     .block_on(async move {
                         refresh_chatgpt_auth_if_needed(&mut refreshed_settings)
                             .await
-                            .map(|()| refreshed_settings)
+                            .map(|_| refreshed_settings)
                     })
                     .map_err(|error| {
                         provider_error(
@@ -7553,23 +7580,72 @@ impl OpenAiCompatibleProviderPlugin {
     }
 }
 
-async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), ProviderError> {
+fn apply_settings_auth_to_context(settings: &Settings, context: &mut ProviderRequestContext) {
+    let AuthSettings::ChatGpt {
+        access_token,
+        refresh_token,
+        expires_at,
+        account_id,
+        ..
+    } = &settings.auth
+    else {
+        return;
+    };
+    let Some(auth) = context.auth.as_mut() else {
+        return;
+    };
+    auth.credentials.insert(
+        "access_token".to_owned(),
+        bcode_model::ProviderAuthCredential {
+            value: access_token.clone(),
+            source: None,
+        },
+    );
+    for (credential_id, value) in [
+        ("refresh_token", refresh_token.clone()),
+        ("expires_at", expires_at.map(|value| value.to_string())),
+        ("account_id", account_id.clone()),
+    ] {
+        if let Some(value) = value {
+            auth.credentials.insert(
+                credential_id.to_owned(),
+                bcode_model::ProviderAuthCredential {
+                    value,
+                    source: None,
+                },
+            );
+        } else {
+            auth.credentials.remove(credential_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RefreshedChatGptAuth {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+    id_token: Option<String>,
+    account_id: Option<String>,
+}
+
+async fn refresh_chatgpt_auth_if_needed(
+    settings: &mut Settings,
+) -> Result<Option<RefreshedChatGptAuth>, ProviderError> {
     let AuthSettings::ChatGpt {
         refresh_token: Some(refresh_token),
         expires_at,
         profile,
-        vault,
-        storage,
         ..
     } = &settings.auth
     else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(expires_at) = expires_at else {
-        return Ok(());
+        return Ok(None);
     };
     if *expires_at > unix_timestamp() + 60 {
-        return Ok(());
+        return Ok(None);
     }
     let refreshed = refresh_openai_codex_token(refresh_token).await?;
     let next_refresh_token = refreshed
@@ -7583,111 +7659,103 @@ async fn refresh_chatgpt_auth_if_needed(settings: &mut Settings) -> Result<(), P
         .as_deref()
         .and_then(chatgpt_account_id_from_access_token)
         .or_else(|| chatgpt_account_id_from_access_token(&refreshed.access_token));
-    if let (Some(profile), Some(vault)) = (profile, vault) {
-        store_refreshed_chatgpt_auth(
-            profile,
-            vault,
-            storage,
-            &refreshed,
-            &next_refresh_token,
-            next_expires_at,
-            account_id.as_deref(),
-        )?;
-    }
+    let update = RefreshedChatGptAuth {
+        access_token: refreshed.access_token.clone(),
+        refresh_token: next_refresh_token.clone(),
+        expires_at: next_expires_at,
+        id_token: refreshed.id_token,
+        account_id: account_id.clone(),
+    };
     settings.auth = AuthSettings::ChatGpt {
         access_token: refreshed.access_token,
         refresh_token: Some(next_refresh_token),
         expires_at: Some(next_expires_at),
         account_id,
         profile: profile.clone(),
-        vault: vault.clone(),
-        storage: storage.clone(),
     };
-    Ok(())
+    Ok(Some(update))
 }
 
-fn store_refreshed_chatgpt_auth(
+fn persist_refreshed_chatgpt_auth(
+    bridge: &ServiceBridge,
+    invocation_id: &str,
     profile: &str,
-    vault: &std::path::Path,
-    storage: &BTreeMap<String, bcode_model::ProviderAuthStorageRef>,
-    refreshed: &OpenAiOauthTokenResponse,
-    next_refresh_token: &str,
-    next_expires_at: u64,
-    account_id: Option<&str>,
+    refreshed: RefreshedChatGptAuth,
 ) -> Result<(), ProviderError> {
-    let store = sshenv_vault::SshenvStore::new(
-        sshenv_vault::SshenvStoreConfig::new(vault).with_private_key_paths(
-            bcode_provider_auth::security::vault_private_key_paths(vault),
-        ),
-    );
-    set_codex_secret(
-        &store,
-        profile,
-        chatgpt_storage_key(storage, "access_token", "BCODE_OPENAI_CODEX_ACCESS_TOKEN"),
-        refreshed.access_token.clone(),
-    )?;
-    if let Some(id_token) = &refreshed.id_token {
-        set_codex_secret(
-            &store,
-            profile,
-            chatgpt_storage_key(storage, "id_token", "BCODE_OPENAI_CODEX_ID_TOKEN"),
-            id_token.clone(),
-        )?;
-    }
-    set_codex_secret(
-        &store,
-        profile,
-        chatgpt_storage_key(storage, "refresh_token", "BCODE_OPENAI_CODEX_REFRESH_TOKEN"),
-        next_refresh_token.to_string(),
-    )?;
-    set_codex_secret(
-        &store,
-        profile,
-        chatgpt_storage_key(storage, "expires_at", "BCODE_OPENAI_CODEX_EXPIRES_AT"),
-        next_expires_at.to_string(),
-    )?;
-    if let Some(account_id) = account_id {
-        set_codex_secret(
-            &store,
-            profile,
-            chatgpt_storage_key(storage, "account_id", "BCODE_OPENAI_CODEX_ACCOUNT_ID"),
-            account_id.to_string(),
-        )?;
-    }
-    Ok(())
-}
-
-fn chatgpt_storage_key<'a>(
-    storage: &'a BTreeMap<String, bcode_model::ProviderAuthStorageRef>,
-    credential: &str,
-    fallback: &'a str,
-) -> &'a str {
-    storage
-        .get(credential)
-        .map_or(fallback, |storage| storage.key.as_str())
-}
-
-fn set_codex_secret(
-    store: &sshenv_vault::SshenvStore,
-    profile: &str,
-    key: &str,
-    value: String,
-) -> Result<(), ProviderError> {
-    store
-        .set_secret(profile, key, Zeroizing::new(value))
-        .map_err(|error| {
+    let request = bcode_provider_auth_models::AuthCredentialUpdateRequest {
+        schema_version: bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+        profile: profile.to_owned(),
+        credentials: BTreeMap::from([
+            ("access_token".to_owned(), Some(refreshed.access_token)),
+            ("refresh_token".to_owned(), Some(refreshed.refresh_token)),
+            (
+                "expires_at".to_owned(),
+                Some(refreshed.expires_at.to_string()),
+            ),
+            ("id_token".to_owned(), refreshed.id_token),
+            ("account_id".to_owned(), refreshed.account_id),
+        ]),
+    };
+    let payload = serde_json::to_value(request).map_err(|_| {
+        provider_error(
+            "token_refresh_persist_failed",
+            ProviderErrorCategory::ProviderInternal,
+            "refreshed credential update could not be encoded",
+        )
+    })?;
+    let response = bridge
+        .request(&ServiceBridgeRequest::InvokeService(
+            bcode_tool::ToolInvocationServiceRequest {
+                invocation_id: invocation_id.to_owned(),
+                request_id: format!("{invocation_id}-credential-refresh"),
+                route_id: None,
+                interface_id: bcode_provider_auth_models::AUTH_HOST_INTERFACE_ID.to_owned(),
+                operation: bcode_provider_auth_models::OP_UPDATE_CREDENTIALS.to_owned(),
+                payload,
+            },
+        ))
+        .map_err(|_| {
             provider_error(
-                "token_store_failed",
+                "token_refresh_persist_failed",
                 ProviderErrorCategory::Auth,
-                error.to_string(),
+                "host credential update failed",
             )
-            .with_failure(openai_failure_context_for_source(
-                bcode_model::ProviderFailureCapability::CredentialStorage,
-                bcode_model::ProviderFailureSourceKind::CredentialStore,
-                format!("sshenv:{profile}:{key}"),
-                "unlock or repair the credential store, then run `bcode auth login openai --method chatgpt` again",
+        })?;
+    match response {
+        ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+        ) => serde_json::from_value::<bcode_provider_auth_models::AuthCredentialUpdateResponse>(
+            payload,
+        )
+        .map(|_| ())
+        .map_err(|_| {
+            provider_error(
+                "token_refresh_persist_failed",
+                ProviderErrorCategory::ProviderInternal,
+                "host returned an invalid credential update response",
+            )
+        }),
+        ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Failed {
+            message,
+            ..
+        }) => Err(provider_error(
+            "token_refresh_persist_failed",
+            ProviderErrorCategory::Auth,
+            message,
+        )),
+        ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Cancelled) => {
+            Err(provider_error(
+                "token_refresh_persist_cancelled",
+                ProviderErrorCategory::Auth,
+                "host credential update was cancelled",
             ))
-        })
+        }
+        _ => Err(provider_error(
+            "token_refresh_persist_failed",
+            ProviderErrorCategory::Auth,
+            "host credential update is unavailable",
+        )),
+    }
 }
 
 async fn refresh_openai_codex_token(
@@ -9748,8 +9816,6 @@ mod tests {
             expires_at: None,
             account_id: None,
             profile: None,
-            vault: None,
-            storage: BTreeMap::new(),
         }
     }
 
@@ -9860,17 +9926,12 @@ mod tests {
                 refresh_token,
                 expires_at,
                 profile,
-                vault,
                 ..
             } => {
                 assert_eq!(access_token, "access-token");
                 assert_eq!(refresh_token.as_deref(), Some("refresh-token"));
                 assert_eq!(expires_at, Some(12_345));
                 assert_eq!(profile.as_deref(), Some("openai"));
-                assert_eq!(
-                    vault.as_deref(),
-                    Some(std::path::Path::new("/tmp/bcode-auth-vault"))
-                );
             }
             AuthSettings::Missing | AuthSettings::ApiKey(_) => panic!("expected ChatGPT auth"),
         }

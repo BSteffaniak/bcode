@@ -106,7 +106,8 @@ pub const OP_UPDATE_CREDENTIALS: &str = "update_credentials";
 pub struct AuthCredentialUpdateRequest {
     pub schema_version: u16,
     pub profile: String,
-    pub credentials: BTreeMap<String, String>,
+    /// Credential replacements. `None` removes an optional credential atomically with updates.
+    pub credentials: BTreeMap<String, Option<String>>,
 }
 
 impl AuthCredentialUpdateRequest {
@@ -135,7 +136,9 @@ impl AuthCredentialUpdateRequest {
         )?;
         for (credential_id, value) in &self.credentials {
             validate_id("credential_id", credential_id)?;
-            validate_text("credential_value", value, MAX_AUTH_FLOW_STATE_BYTES)?;
+            if let Some(value) = value {
+                validate_text("credential_value", value, MAX_AUTH_FLOW_STATE_BYTES)?;
+            }
         }
         Ok(())
     }

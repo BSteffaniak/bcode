@@ -36,6 +36,32 @@ if rg -n 'bcode_provider_auth\s*=|sshenv_vault\s*=' plugins/web-search-plugin/Ca
   violations=1
 fi
 
+if rg -n 'bcode_provider_auth\s*=|sshenv_vault\s*=' plugins/model-plugin/Cargo.toml \
+  >/tmp/bcode-model-auth-custody.txt; then
+  echo "Auth architecture violation: model-plugin must use portable host auth operations instead of provider-auth or vault implementation crates." >&2
+  cat /tmp/bcode-model-auth-custody.txt >&2
+  violations=1
+fi
+
+if rg -n 'vault_path|inspect_auth_vault_security|vault_private_key_paths' \
+  plugins/model-plugin --glob '*.rs' --glob '*.toml' \
+  >/tmp/bcode-model-auth-inspection-bypass.txt; then
+  echo "Auth architecture violation: model-plugin security inspection must be semantic and host-owned." >&2
+  cat /tmp/bcode-model-auth-inspection-bypass.txt >&2
+  violations=1
+fi
+
+openai_production_source="$(sed '/^#\[cfg(test)\]/,$d' plugins/openai-compatible-provider-plugin/src/lib.rs)"
+if rg -n 'sshenv_vault|ProviderAuthStorageRef|vault_private_key_paths|SshenvStore' \
+  plugins/openai-compatible-provider-plugin/Cargo.toml \
+  >/tmp/bcode-openai-auth-custody.txt || \
+  rg -n 'sshenv_vault|ProviderAuthStorageRef|vault_private_key_paths|SshenvStore' \
+    <<<"$openai_production_source" >>/tmp/bcode-openai-auth-custody.txt; then
+  echo "Auth architecture violation: OpenAI-compatible must use semantic host auth operations instead of direct vault custody." >&2
+  cat /tmp/bcode-openai-auth-custody.txt >&2
+  violations=1
+fi
+
 if ! rg -n 'fn register_auth_providers' plugins/web-search-plugin/src/lib.rs >/dev/null ||
    ! rg -n 'fn register_auth_providers' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null; then
   echo "Auth architecture violation: bundled Exa/OpenAI/xAI providers must remain plugin-registered." >&2

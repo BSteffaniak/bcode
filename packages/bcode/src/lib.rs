@@ -3726,6 +3726,126 @@ async fn route_plugin_bridge_request(
     })
 }
 
+#[cfg(all(feature = "embedded-plugins", feature = "config"))]
+fn provider_auth_bridge_resolution(
+    plugins: &bcode_plugin::PluginRuntimeHost,
+    caller_plugin_id: &str,
+    request: bcode_tool::ToolInvocationServiceRequest,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_UPDATE_CREDENTIALS};
+
+    if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_UPDATE_CREDENTIALS
+    {
+        return bcode_tool::ToolInvocationServiceResolution::Unsupported;
+    }
+    let Ok(update) = serde_json::from_value::<
+        bcode_provider_auth_models::AuthCredentialUpdateRequest,
+    >(request.payload) else {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "invalid_request".to_owned(),
+            message: "invalid provider-auth credential update request".to_owned(),
+        };
+    };
+    let Ok(config) = bcode_config::load_config() else {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_config_unavailable".to_owned(),
+            message: "authentication configuration is unavailable".to_owned(),
+        };
+    };
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let Some((provider_id, registered)) = plugins
+        .auth_provider_registry()
+        .providers()
+        .into_iter()
+        .find(|provider| provider.plugin_id == caller_plugin_id)
+        .map(|provider| (provider.contribution.provider_id.clone(), provider))
+    else {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_owner_unregistered".to_owned(),
+            message: "plugin does not own a registered authentication provider".to_owned(),
+        };
+    };
+    let resolved = match bcode_provider_auth::resolve_auth_provider_profile(
+        &config,
+        &provider_id,
+        caller_plugin_id,
+        Some(&update.profile),
+        &runtime,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "auth_profile_unavailable".to_owned(),
+                message: error.to_string(),
+            };
+        }
+    };
+    let method = registered
+        .contribution
+        .methods
+        .iter()
+        .find(|method| resolved.profile.scheme.as_deref() == Some(method.method_id()));
+    let Some(method) = method else {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_method_unavailable".to_owned(),
+            message: "owned auth profile method is not registered".to_owned(),
+        };
+    };
+    match bcode_provider_auth::operations::update_credentials(
+        bcode_provider_auth::operations::AuthCredentialUpdateContext {
+            caller_plugin_id,
+            provider_id: &provider_id,
+            resolved: &resolved,
+            method,
+        },
+        update,
+    ) {
+        Ok(response) => serde_json::to_value(response).map_or_else(
+            |_| bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "auth_response_encode_failed".to_owned(),
+                message: "credential update response could not be encoded".to_owned(),
+            },
+            |payload| bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+        ),
+        Err(error) => bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_credential_update_failed".to_owned(),
+            message: error.to_string(),
+        },
+    }
+}
+
+#[cfg(feature = "embedded-plugins")]
+fn provider_invocation_bridge(
+    plugins: bcode_plugin::PluginRuntimeHost,
+    caller_plugin_id: String,
+    invocation_id: String,
+) -> bcode_plugin::PluginInvocationBridge {
+    bcode_plugin::PluginInvocationBridge::new(move |request, _| {
+        let ServiceBridgeRequest::InvokeService(request) = request else {
+            return Ok(ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Unsupported,
+            ));
+        };
+        if request.invocation_id != invocation_id {
+            return Ok(ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Failed {
+                    code: "invocation_id_mismatch".to_owned(),
+                    message: "service request does not belong to the provider invocation"
+                        .to_owned(),
+                },
+            ));
+        }
+        #[cfg(feature = "config")]
+        let resolution = provider_auth_bridge_resolution(&plugins, &caller_plugin_id, request);
+        #[cfg(not(feature = "config"))]
+        let resolution = {
+            let _ = (&plugins, &caller_plugin_id, request);
+            bcode_tool::ToolInvocationServiceResolution::Unsupported
+        };
+        Ok(ServiceBridgeResponse::Service(resolution))
+    })
+}
+
 /// Provider invoker backed by a loaded Bcode plugin runtime.
 #[cfg(feature = "embedded-plugins")]
 #[derive(Debug, Clone)]
@@ -3768,15 +3888,41 @@ impl ModelProviderInvoker for PluginModelProviderInvoker {
     ) -> RuntimeFuture<'a, StartTurnResponse> {
         Box::pin(async move {
             let provider_plugin_id = self.resolve_provider(provider_plugin_id)?;
-            self.plugins
-                .invoke_service_json_scoped(
+            let payload = serde_json::to_vec(request)
+                .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))?;
+            let bridge = provider_invocation_bridge(
+                self.plugins.clone(),
+                provider_plugin_id.clone(),
+                request.turn_id.clone(),
+            );
+            let mut invocation = self
+                .plugins
+                .invoke_service_with_events_and_bridge_scoped(
                     &provider_plugin_id,
                     MODEL_PROVIDER_INTERFACE_ID,
                     OP_START_TURN,
-                    request,
+                    payload,
                     bcode_plugin::PluginInvocationScope::Global,
+                    Some(bridge),
                 )
                 .await
+                .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))?;
+            let response = loop {
+                match invocation
+                    .next_event()
+                    .await
+                    .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))?
+                {
+                    bcode_plugin::StreamingServiceInvocationEvent::Event(_) => {}
+                    bcode_plugin::StreamingServiceInvocationEvent::Response(response) => {
+                        break response.map_err(|error| {
+                            RuntimeError::ProviderInvocation(error.to_string())
+                        })?;
+                    }
+                }
+            };
+            response
+                .payload_json()
                 .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))
         })
     }
