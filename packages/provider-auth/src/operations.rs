@@ -227,7 +227,24 @@ mod tests {
                 provider_id: Some("openai".to_owned()),
                 owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
                 scheme: Some("chatgpt".to_owned()),
-                map: BTreeMap::new(),
+                map: [
+                    ("access_token", "ACCESS_TOKEN"),
+                    ("refresh_token", "REFRESH_TOKEN"),
+                    ("expires_at", "EXPIRES_AT"),
+                    ("id_token", "ID_TOKEN"),
+                    ("account_id", "ACCOUNT_ID"),
+                ]
+                .into_iter()
+                .map(|(credential, key)| {
+                    (
+                        credential.to_owned(),
+                        bcode_config::AuthCredentialMapping {
+                            env: None,
+                            key: Some(key.to_owned()),
+                        },
+                    )
+                })
+                .collect(),
                 settings: BTreeMap::from([
                     ("profile".to_owned(), "openai".to_owned()),
                     ("vault".to_owned(), vault.display().to_string()),
@@ -272,6 +289,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn update_is_owner_bound_and_rejects_undeclared_credentials_before_mutation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");
@@ -344,6 +362,17 @@ mod tests {
         );
         assert!(!values.contains_key("id_token"));
         assert!(!values.contains_key("account_id"));
+        let rematerialized = crate::resolve_auth_profile("openai", &owned_resolved.profile);
+        assert_eq!(
+            rematerialized
+                .auth
+                .credentials
+                .get("access_token")
+                .map(|credential| credential.value.as_str()),
+            Some("next-access")
+        );
+        assert!(!rematerialized.auth.credentials.contains_key("id_token"));
+        assert!(!rematerialized.auth.credentials.contains_key("account_id"));
 
         let invalid_vault = temp.path().join("must-not-exist");
         let invalid_resolved = resolved(&invalid_vault);

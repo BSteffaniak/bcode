@@ -7639,6 +7639,13 @@ struct RefreshedChatGptAuth {
 async fn refresh_chatgpt_auth_if_needed(
     settings: &mut Settings,
 ) -> Result<Option<RefreshedChatGptAuth>, ProviderError> {
+    refresh_chatgpt_auth_if_needed_at(settings, OPENAI_CODEX_TOKEN_URL).await
+}
+
+async fn refresh_chatgpt_auth_if_needed_at(
+    settings: &mut Settings,
+    token_url: &str,
+) -> Result<Option<RefreshedChatGptAuth>, ProviderError> {
     let AuthSettings::ChatGpt {
         refresh_token: Some(refresh_token),
         expires_at,
@@ -7654,7 +7661,7 @@ async fn refresh_chatgpt_auth_if_needed(
     if *expires_at > unix_timestamp() + 60 {
         return Ok(None);
     }
-    let refreshed = refresh_openai_codex_token(refresh_token).await?;
+    let refreshed = refresh_openai_codex_token_at(token_url, refresh_token).await?;
     let next_refresh_token = refreshed
         .refresh_token
         .clone()
@@ -7767,7 +7774,8 @@ fn persist_refreshed_chatgpt_auth(
     }
 }
 
-async fn refresh_openai_codex_token(
+async fn refresh_openai_codex_token_at(
+    token_url: &str,
     refresh_token: &str,
 ) -> Result<OpenAiOauthTokenResponse, ProviderError> {
     let params = [
@@ -7776,7 +7784,7 @@ async fn refresh_openai_codex_token(
         ("refresh_token", refresh_token),
     ];
     let response = Client::new()
-        .post(OPENAI_CODEX_TOKEN_URL)
+        .post(token_url)
         .form(&params)
         .send()
         .await
@@ -8826,6 +8834,75 @@ mod tests {
             .expect_err("device timeout");
         assert!(error.contains("timed out"));
         assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
+    #[test]
+    fn forced_expiry_refresh_updates_current_auth_and_emits_complete_host_update() {
+        let server = AuthMockServer::start(vec![(
+            "200 OK",
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","id_token":"new-id","expires_in":3600}"#,
+        )]);
+        let settings = settings_for_context(&ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext {
+                profile: Some("openai".to_owned()),
+                scheme: Some("chatgpt".to_owned()),
+                credentials: BTreeMap::from([
+                    (
+                        "access_token".to_owned(),
+                        bcode_model::ProviderAuthCredential {
+                            value: "expired-access".to_owned(),
+                            source: None,
+                        },
+                    ),
+                    (
+                        "refresh_token".to_owned(),
+                        bcode_model::ProviderAuthCredential {
+                            value: "old-refresh".to_owned(),
+                            source: None,
+                        },
+                    ),
+                    (
+                        "expires_at".to_owned(),
+                        bcode_model::ProviderAuthCredential {
+                            value: "1".to_owned(),
+                            source: None,
+                        },
+                    ),
+                ]),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            ..ProviderRequestContext::default()
+        });
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let endpoint = server.endpoint("/token");
+        let (settings, refreshed) = runtime
+            .block_on(async move {
+                let mut settings = settings;
+                let refreshed = refresh_chatgpt_auth_if_needed_at(&mut settings, &endpoint).await?;
+                Ok::<_, ProviderError>((settings, refreshed))
+            })
+            .expect("runtime")
+            .expect("refresh");
+        let refreshed = refreshed.expect("forced refresh");
+        server.finish();
+
+        let AuthSettings::ChatGpt {
+            access_token,
+            refresh_token,
+            expires_at,
+            ..
+        } = &settings.auth
+        else {
+            panic!("expected ChatGPT auth");
+        };
+        assert_eq!(access_token, "new-access");
+        assert_eq!(refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(*expires_at, Some(refreshed.expires_at));
+        assert_eq!(refreshed.access_token, "new-access");
+        assert_eq!(refreshed.refresh_token, "new-refresh");
+        assert_eq!(refreshed.id_token.as_deref(), Some("new-id"));
+        let request = server.requests.lock().expect("requests")[0].clone();
+        assert!(request.contains("refresh_token=old-refresh"));
     }
 
     #[test]
