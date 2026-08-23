@@ -15,7 +15,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Maximum package or standalone candidates inspected by one discovery request.
-pub const MAX_DISCOVERY_RESULTS: usize = bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE;
+///
+/// Application catalog projection may request one additional candidate to determine whether a
+/// public page capped at [`bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE`] has a
+/// continuation.
+pub const MAX_DISCOVERY_RESULTS: usize = bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE + 1;
 
 /// Errors returned before a bounded discovery result can be produced.
 #[derive(Debug, Error)]

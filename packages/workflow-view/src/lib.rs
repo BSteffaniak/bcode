@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 
 use bcode_workflow_view_models::{
     WORKFLOW_VIEW_VERSION, WorkflowActionAffordance, WorkflowActionKind, WorkflowActionTarget,
-    WorkflowAttemptView, WorkflowCatalogView, WorkflowChildSessionView, WorkflowDescendantRunView,
-    WorkflowEdgeView, WorkflowFailureDiagnostic, WorkflowMutationApprovalView, WorkflowNodeKind,
-    WorkflowNodeStatus, WorkflowNodeView, WorkflowOutputValue, WorkflowOutputView,
-    WorkflowProjectionHealth, WorkflowRunListItem, WorkflowRunStatus, WorkflowRunView,
-    WorkflowTerminalView, WorkflowWaitKind, WorkflowWaitView,
+    WorkflowActivationView, WorkflowAttemptView, WorkflowCatalogView, WorkflowChildSessionView,
+    WorkflowDescendantRunView, WorkflowEdgeView, WorkflowFailureDiagnostic, WorkflowInputSummary,
+    WorkflowMutationApprovalView, WorkflowNodeKind, WorkflowNodeStatus, WorkflowNodeView,
+    WorkflowOutputValue, WorkflowOutputView, WorkflowProjectionHealth, WorkflowRetryScheduleView,
+    WorkflowRunListItem, WorkflowRunStatus, WorkflowRunView, WorkflowTerminalView,
+    WorkflowWaitKind, WorkflowWaitView,
 };
 
 /// Portable definition source needed to project a workflow graph.
@@ -26,7 +27,11 @@ pub struct WorkflowDefinitionProjectionInput {
 pub struct WorkflowActivationProjectionInput {
     pub node_id: String,
     pub activation_id: String,
+    pub dependency_generation: u64,
     pub status: String,
+    pub has_output: bool,
+    pub input_summary: WorkflowInputSummary,
+    pub created_at_ms: u64,
 }
 
 /// Canonical validated output supplied by the application boundary.
@@ -62,6 +67,7 @@ pub struct WorkflowRunProjectionInput {
     pub waits: Vec<WorkflowWaitView>,
     pub mutation_approvals: Vec<WorkflowMutationApprovalView>,
     pub attempts: Vec<WorkflowAttemptView>,
+    pub retry_schedules: Vec<WorkflowRetryScheduleView>,
     pub outputs: Vec<WorkflowOutputProjectionInput>,
     pub failure_events: Vec<WorkflowFailureEventProjectionInput>,
     pub descendant_runs: Vec<WorkflowDescendantRunView>,
@@ -151,7 +157,8 @@ pub fn project_run(input: WorkflowRunProjectionInput) -> WorkflowRunView {
                 .map(|edge| WorkflowEdgeView {
                     from: edge.from.clone(),
                     to: edge.to.clone(),
-                    kind: format!("{:?}", edge.kind).to_ascii_lowercase(),
+                    kind: bcode_workflow::workflow_edge_kind_name(edge.kind.capability_kind())
+                        .to_string(),
                 })
                 .collect();
             (nodes, edges, WorkflowProjectionHealth::Current)
@@ -178,10 +185,24 @@ pub fn project_run(input: WorkflowRunProjectionInput) -> WorkflowRunView {
         version: WORKFLOW_VIEW_VERSION,
         run: input.run,
         nodes,
+        activations: input
+            .activations
+            .into_iter()
+            .map(|activation| WorkflowActivationView {
+                node_id: activation.node_id,
+                activation_id: activation.activation_id,
+                dependency_generation: activation.dependency_generation,
+                status: project_node_status(&activation.status),
+                has_output: activation.has_output,
+                input_summary: activation.input_summary,
+                created_at_ms: activation.created_at_ms,
+            })
+            .collect(),
         edges,
         waits: input.waits,
         mutation_approvals: input.mutation_approvals,
         attempts: input.attempts,
+        retry_schedules: input.retry_schedules,
         outputs: input
             .outputs
             .into_iter()
@@ -601,6 +622,7 @@ mod tests {
             }],
             mutation_approvals: Vec::new(),
             attempts: Vec::new(),
+            retry_schedules: Vec::new(),
             outputs: vec![WorkflowOutputProjectionInput {
                 output_id: "output-1".to_string(),
                 node_id: "review".to_string(),

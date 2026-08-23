@@ -194,7 +194,9 @@ fi
 
 if ! rg -q 'plan_workflow_package_closure' packages/workflow/src/lib.rs packages/server/src/lib.rs \
   || ! rg -q 'read_workflow_package_closure' packages/cli/src/lib.rs \
-  || ! rg -q 'discover_workflows' packages/cli/src/lib.rs packages/server/src/workflow_operations.rs \
+  || ! rg -q 'discover_workflows' packages/cli/src/lib.rs \
+  || ! rg -q 'discover_workflows' packages/server/src/workflow_operations.rs \
+  || ! rg -q 'workflow_launch_catalog' packages/client/src/lib.rs \
   || ! rg -q 'WorkflowsConfig' packages/config/src/lib.rs \
   || ! rg -q 'workflow_package_publications' packages/workflow-store/src/lib.rs \
   || ! rg -q 'WorkflowPackagePublicationReceipt' packages/workflow/src/lib.rs \

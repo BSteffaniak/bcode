@@ -47,6 +47,8 @@ pub const AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 512;
 const MAX_DISPLAY_LABEL_BYTES: usize = 512;
 const MAX_INLINE_JSON_BYTES: usize = 1_048_576;
+/// Maximum canonical activation input copied into one normal workflow-view summary.
+pub const WORKFLOW_ACTIVATION_INPUT_SUMMARY_MAX_BYTES: usize = 4_096;
 
 /// One bounded internal authored-list page with stable continuation knowledge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +352,15 @@ pub struct WaitingActivation {
     pub requested_at_ms: u64,
 }
 
+/// Bounded canonical activation input available to normal status projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum WorkflowActivationInputSummary {
+    Absent,
+    Inline { value: serde_json::Value },
+    Omitted { byte_count: usize },
+}
+
 /// Bounded activation summary for workflow status and next-action projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowActivationSummary {
@@ -359,6 +370,7 @@ pub struct WorkflowActivationSummary {
     pub dependency_generation: u64,
     pub status: String,
     pub has_output: bool,
+    pub input_summary: WorkflowActivationInputSummary,
     pub created_at_ms: u64,
 }
 
@@ -8973,11 +8985,32 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT node_id, activation_id, dependency_generation, status, output_id IS NOT NULL, \
-             created_at_ms FROM workflow_activations WHERE run_id = ?1 \
+             input_json, created_at_ms FROM workflow_activations WHERE run_id = ?1 \
              ORDER BY dependency_generation DESC, created_at_ms DESC, node_id LIMIT ?2",
         )?;
         statement
             .query_map((run_id, limit), |row| {
+                let input_json = row.get::<_, Option<String>>(5)?;
+                let input_summary = input_json.map_or(
+                    Ok(WorkflowActivationInputSummary::Absent),
+                    |input_json| {
+                        if input_json.len() > WORKFLOW_ACTIVATION_INPUT_SUMMARY_MAX_BYTES {
+                            Ok(WorkflowActivationInputSummary::Omitted {
+                                byte_count: input_json.len(),
+                            })
+                        } else {
+                            serde_json::from_str(&input_json)
+                                .map(|value| WorkflowActivationInputSummary::Inline { value })
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        5,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })
+                        }
+                    },
+                )?;
                 Ok(WorkflowActivationSummary {
                     run_id: run_id.to_string(),
                     node_id: row.get(0)?,
@@ -8985,7 +9018,8 @@ impl WorkflowStore {
                     dependency_generation: row.get(2)?,
                     status: row.get(3)?,
                     has_output: row.get(4)?,
-                    created_at_ms: row.get(5)?,
+                    input_summary,
+                    created_at_ms: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -15965,6 +15999,50 @@ mod tests {
             })
             .expect("receipt");
         identity
+    }
+
+    #[test]
+    fn activation_summaries_inline_small_inputs_and_omit_large_values() {
+        let (_temp, store) = initialized_store();
+        let large_input =
+            serde_json::Value::String("x".repeat(WORKFLOW_ACTIVATION_INPUT_SUMMARY_MAX_BYTES + 1));
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET input_json = ?1 \
+                 WHERE run_id = 'run-1' AND node_id = 'review' AND activation_id = ?2",
+                (
+                    serde_json::to_string(&large_input).expect("large JSON"),
+                    activation_id(),
+                ),
+            )
+            .expect("replace canonical input fixture");
+
+        let activations = store.activations_for_run("run-1", 10).expect("summaries");
+        assert_eq!(activations.len(), 1);
+        assert!(matches!(
+            activations[0].input_summary,
+            WorkflowActivationInputSummary::Omitted { byte_count }
+                if byte_count == serde_json::to_string(&large_input).expect("large JSON").len()
+        ));
+
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET input_json = '1' \
+                 WHERE run_id = 'run-1' AND node_id = 'review' AND activation_id = ?1",
+                [activation_id()],
+            )
+            .expect("replace small canonical input fixture");
+        let activations = store
+            .activations_for_run("run-1", 10)
+            .expect("small summary");
+        assert_eq!(
+            activations[0].input_summary,
+            WorkflowActivationInputSummary::Inline {
+                value: serde_json::json!(1)
+            }
+        );
     }
 
     #[tokio::test]

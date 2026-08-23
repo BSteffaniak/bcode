@@ -1824,12 +1824,29 @@ impl WorkflowStatusSurface {
                 &Line::from_spans(vec![Span::styled("Loading selected run…", theme.muted)]),
             );
         } else if let Some(run) = self.selected_run_view() {
-            let layout = workflow_graph_layout(run, area, self.selected_node_id.as_deref());
+            let nested_height =
+                if run.descendant_runs.is_empty() && run.child_sessions.is_empty() {
+                    0
+                } else if self.descendants_expanded {
+                    u16::try_from(run.descendant_runs.len().saturating_add(1))
+                        .unwrap_or(u16::MAX)
+                        .min(5)
+                } else {
+                    1
+                }
+                .min(area.height.saturating_sub(1));
+            let graph_area = Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                area.height.saturating_sub(nested_height),
+            );
+            let layout = workflow_graph_layout(run, graph_area, self.selected_node_id.as_deref());
             if layout.linear_fallback {
                 render_workflow_tree_fallback(
                     run,
                     self.selected_node_id.as_deref(),
-                    area,
+                    graph_area,
                     frame,
                     theme,
                     &self.graph_tree_state,
@@ -1838,7 +1855,21 @@ impl WorkflowStatusSurface {
                 let _ = render_workflow_pipeline(
                     run,
                     self.selected_node_id.as_deref(),
-                    area,
+                    graph_area,
+                    frame,
+                    theme,
+                );
+            }
+            if nested_height > 0 {
+                render_nested_workflows(
+                    run,
+                    self.descendants_expanded,
+                    Rect::new(
+                        area.x,
+                        area.bottom().saturating_sub(nested_height),
+                        area.width,
+                        nested_height,
+                    ),
                     frame,
                     theme,
                 );
@@ -5376,6 +5407,8 @@ struct WorkflowGraphCard {
 struct WorkflowGraphConnector {
     from: Point,
     to: Point,
+    from_node_index: usize,
+    to_node_index: usize,
     kind: String,
 }
 
@@ -5499,6 +5532,8 @@ fn workflow_graph_layout(
                     from.area.y.saturating_add(from.area.height / 2),
                 ),
                 to: Point::new(to.area.x, to.area.y.saturating_add(to.area.height / 2)),
+                from_node_index: from_index,
+                to_node_index: to_index,
                 kind: edge.kind.clone(),
             })
         })
@@ -5531,14 +5566,25 @@ fn workflow_node_card_detail(
         .iter()
         .filter(|diagnostic| diagnostic.node_id.as_deref() == Some(node.node_id.as_str()))
         .count();
+    let retries = run
+        .retry_schedules
+        .iter()
+        .filter(|retry| retry.node_id == node.node_id)
+        .count();
     let sessions = run
         .child_sessions
         .iter()
         .filter(|session| session.node_id == node.node_id)
         .count();
+    let descendants = run
+        .descendant_runs
+        .iter()
+        .filter(|descendant| descendant.parent_node_id == node.node_id)
+        .count();
     format!(
-        "│ {} · a{attempts} w{waits} f{failures} s{sessions}",
-        workflow_node_kind_label(node.kind)
+        "│ {} · a{attempts} r{retries} w{waits} !{failures} ↳{}",
+        workflow_node_kind_label(node.kind),
+        descendants.saturating_add(sessions)
     )
 }
 
@@ -5592,6 +5638,95 @@ fn render_workflow_tree_fallback(
         .render(area, &render_state, frame);
 }
 
+fn workflow_connector_presentation(
+    run: &bcode_workflow_view_models::WorkflowRunView,
+    connector: &WorkflowGraphConnector,
+) -> (&'static str, &'static str) {
+    if connector.kind == "conditional" {
+        return ("?", "branch");
+    }
+    if connector.kind == "back" {
+        return ("↶", "repeat");
+    }
+    if connector.kind == "retry" {
+        return ("↻", "retry");
+    }
+    let from_kind = run.nodes[connector.from_node_index].kind;
+    let to_has_multiple_incoming = run
+        .edges
+        .iter()
+        .filter(|edge| edge.to == run.nodes[connector.to_node_index].node_id)
+        .count()
+        > 1;
+    if to_has_multiple_incoming {
+        return ("⋈", "join");
+    }
+    match from_kind {
+        bcode_workflow_view_models::WorkflowNodeKind::Parallel => ("∥", "parallel"),
+        bcode_workflow_view_models::WorkflowNodeKind::FanOut => ("⇉", "fan-out"),
+        bcode_workflow_view_models::WorkflowNodeKind::WorkflowCall => ("↳", "workflow"),
+        _ => ("▶", "direct"),
+    }
+}
+
+fn render_nested_workflows(
+    run: &bcode_workflow_view_models::WorkflowRunView,
+    expanded: bool,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    theme: WorkflowSurfaceTheme,
+) {
+    if area.is_empty() {
+        return;
+    }
+    frame.write_line(
+        Rect::new(area.x, area.y, area.width, 1),
+        &Line::from_spans(vec![Span::styled(
+            format!(
+                "{} Nested workflows · {} runs · {} sessions",
+                if expanded { "▾" } else { "▸" },
+                run.descendant_runs.len(),
+                run.child_sessions.len()
+            ),
+            theme.focused,
+        )]),
+    );
+    if !expanded {
+        return;
+    }
+    for (index, descendant) in run
+        .descendant_runs
+        .iter()
+        .take(usize::from(area.height.saturating_sub(1)))
+        .enumerate()
+    {
+        frame.write_line(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX) + 1),
+                area.width,
+                1,
+            ),
+            &Line::from_spans(vec![
+                Span::styled(
+                    format!("{}↳ ", "  ".repeat(descendant.depth as usize)),
+                    theme.component.border,
+                ),
+                Span::styled(
+                    format!(
+                        "{} · {:?} · parent {}",
+                        descendant.run.display_title,
+                        descendant.run.status,
+                        descendant.parent_node_id
+                    ),
+                    workflow_run_style(descendant.run.status, theme),
+                ),
+            ]),
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_workflow_pipeline(
     run: &bcode_workflow_view_models::WorkflowRunView,
@@ -5634,9 +5769,15 @@ fn render_workflow_pipeline(
                 );
             }
         }
+        let (connector_glyph, connector_label) = workflow_connector_presentation(run, connector);
+        let connector_style = if matches!(connector.kind.as_str(), "back" | "retry") {
+            theme.warning
+        } else {
+            theme.component.border
+        };
         frame.write_line(
             Rect::new(to.x.saturating_sub(1), to.y, 1, 1),
-            &Line::from_spans(vec![Span::styled("▶", theme.component.border)]),
+            &Line::from_spans(vec![Span::styled(connector_glyph, connector_style)]),
         );
         if connector.kind != "direct" && to.x.saturating_sub(from.x) > 4 {
             frame.write_line(
@@ -5646,7 +5787,7 @@ fn render_workflow_pipeline(
                     to.x.saturating_sub(from.x).saturating_sub(2),
                     1,
                 ),
-                &Line::from_spans(vec![Span::styled(connector.kind.clone(), theme.muted)]),
+                &Line::from_spans(vec![Span::styled(connector_label, connector_style)]),
             );
         }
     }
@@ -5792,14 +5933,20 @@ fn workflow_graph_lines(
                 ),
             ]));
             for edge in run.edges.iter().filter(|edge| edge.from == node.node_id) {
-                let connector = match edge.kind.as_str() {
-                    "conditional" => "├?→",
-                    "back" => "↶",
-                    "retry" => "↻",
-                    _ => "└→",
+                let connector = WorkflowGraphConnector {
+                    from: Point::new(0, 0),
+                    to: Point::new(1, 0),
+                    from_node_index: *index,
+                    to_node_index: run
+                        .nodes
+                        .iter()
+                        .position(|candidate| candidate.node_id == edge.to)
+                        .unwrap_or(*index),
+                    kind: edge.kind.clone(),
                 };
+                let (connector, label) = workflow_connector_presentation(run, &connector);
                 lines.push(Line::from_spans(vec![Span::styled(
-                    format!("    {connector} {} ({})", edge.to, edge.kind),
+                    format!("    {connector}→ {} ({label})", edge.to),
                     if matches!(edge.kind.as_str(), "back" | "retry") {
                         theme.warning
                     } else {
@@ -5998,17 +6145,49 @@ fn selected_node_detail_lines(
     if let Some(node) = &detail.node {
         lines.push(Line::from(format!("{:?} · {:?}", node.kind, node.status)));
     }
+    lines.extend(detail.activations.iter().map(|activation| {
+        let input = match &activation.input_summary {
+            bcode_workflow_view_models::WorkflowInputSummary::Absent => "none".to_string(),
+            bcode_workflow_view_models::WorkflowInputSummary::Inline { value } => value.to_string(),
+            bcode_workflow_view_models::WorkflowInputSummary::Omitted { byte_count } => {
+                format!("omitted ({byte_count} bytes)")
+            }
+        };
+        Line::from(format!(
+            "Activation {} · generation {} · {:?} · created {} · output {} · input {}",
+            activation.activation_id,
+            activation.dependency_generation,
+            activation.status,
+            activation.created_at_ms,
+            activation.has_output,
+            input
+        ))
+    }));
     lines.extend(detail.attempts.iter().map(|attempt| {
         Line::from(format!(
-            "Attempt {} · {} · dispatch {} · receipt {} · prepared {} · terminal {}",
+            "Attempt {} · {} · dispatch {} · receipt {} · prepared {} · admitted {} · terminal {}",
             attempt.attempt,
             attempt.status,
             attempt.dispatch_identity,
             attempt.has_receipt,
             attempt.prepared_at_ms,
             attempt
+                .admitted_at_ms
+                .map_or_else(|| "not admitted".to_string(), |value| value.to_string()),
+            attempt
                 .terminal_at_ms
                 .map_or_else(|| "running".to_string(), |value| value.to_string())
+        ))
+    }));
+    lines.extend(detail.retry_schedules.iter().map(|retry| {
+        Line::from(format!(
+            "Retry {} → {} · {:?} · backoff {} ms · due {} · scheduled {}",
+            retry.failed_attempt,
+            retry.next_attempt,
+            retry.failure_kind,
+            retry.backoff_ms,
+            retry.next_attempt_at_ms,
+            retry.scheduled_at_ms
         ))
     }));
     lines.extend(detail.failures.iter().map(|failure| {
@@ -7323,6 +7502,17 @@ mod tests {
                 activation_id: Some("activation-1".to_string()),
                 status: bcode_workflow_view_models::WorkflowNodeStatus::Failed,
             }],
+            activations: vec![bcode_workflow_view_models::WorkflowActivationView {
+                node_id: "reviewer".to_string(),
+                activation_id: "activation-1".to_string(),
+                dependency_generation: 1,
+                status: bcode_workflow_view_models::WorkflowNodeStatus::Failed,
+                has_output: true,
+                input_summary: bcode_workflow_view_models::WorkflowInputSummary::Inline {
+                    value: serde_json::json!({"change":"review this patch"}),
+                },
+                created_at_ms: 1,
+            }],
             edges: Vec::new(),
             waits: vec![bcode_workflow_view_models::WorkflowWaitView {
                 node_id: "approval".to_string(),
@@ -7342,7 +7532,19 @@ mod tests {
                 status: "failed".to_string(),
                 has_receipt: true,
                 prepared_at_ms: 2,
+                admitted_at_ms: Some(2),
                 terminal_at_ms: Some(3),
+            }],
+            retry_schedules: vec![bcode_workflow_view_models::WorkflowRetryScheduleView {
+                node_id: "reviewer".to_string(),
+                activation_id: "activation-1".to_string(),
+                failed_attempt: 2,
+                next_attempt: 3,
+                failure_kind:
+                    bcode_workflow_view_models::WorkflowRetryFailureKind::OwnerReportedRetryable,
+                backoff_ms: 500,
+                next_attempt_at_ms: 503,
+                scheduled_at_ms: 3,
             }],
             outputs: vec![bcode_workflow_view_models::WorkflowOutputView {
                 output_id: "output-1".to_string(),
@@ -8525,7 +8727,10 @@ mod tests {
             inspector_lines(
                 Some(run),
                 tab,
-                InspectorSelection::default(),
+                InspectorSelection {
+                    selected_node: Some("reviewer"),
+                    ..InspectorSelection::default()
+                },
                 WorkflowSurfaceTheme::resolve(None),
             )
             .into_iter()
@@ -8538,6 +8743,10 @@ mod tests {
             .collect::<String>()
         };
         assert!(rendered(0).contains("descendants"));
+        assert!(rendered(0).contains("input {\"change\":\"review this patch\"}"));
+        assert!(rendered(0).contains("admitted 2"));
+        assert!(rendered(0).contains("Retry 2 → 3"));
+        assert!(rendered(0).contains("backoff 500 ms"));
         assert!(rendered(1).contains("Expected schema"));
         assert!(rendered(2).contains("Verdict"));
         assert!(rendered(2).contains("Findings (1)"));
@@ -8588,6 +8797,22 @@ mod tests {
         };
         assert!(text(collapsed).contains("▸ Nested"));
         assert!(text(expanded).contains("▾ Nested"));
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        render_nested_workflows(
+            run,
+            true,
+            area,
+            &mut Frame::new(&mut buffer),
+            WorkflowSurfaceTheme::resolve(None),
+        );
+        let rendered_nested = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(rendered_nested.contains("Nested workflows"));
+        assert!(rendered_nested.contains("parent reviewer"));
         assert_eq!(
             surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
                 KeyCode::Char('n')
@@ -8656,8 +8881,8 @@ mod tests {
         })
         .collect::<String>();
         assert!(rendered.contains("Stage 1"));
-        assert!(rendered.contains("├?→ publish (conditional)"));
-        assert!(rendered.contains("↻ branch (retry)"));
+        assert!(rendered.contains("?→ publish (branch)"));
+        assert!(rendered.contains("↻→ branch (retry)"));
         assert!(rendered.contains("▶ ● Branch"));
     }
 
@@ -8736,14 +8961,7 @@ mod tests {
         .flat_map(|line| line.spans.into_iter().map(|span| span.content))
         .collect::<String>();
         for expected in [
-            "fan-out",
-            "parallel",
-            "Join",
-            "repeat",
-            "retry",
-            "conditional",
-            "back",
-            "Nested",
+            "fan-out", "parallel", "Join", "repeat", "retry", "branch", "repeat", "Nested",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -9306,8 +9524,9 @@ mod tests {
             .expect("node");
         let detail = workflow_node_card_detail(run, node);
         assert!(detail.contains("a1"));
-        assert!(detail.contains("f1"));
-        assert!(detail.contains("s1"));
+        assert!(detail.contains("r1"));
+        assert!(detail.contains("!1"));
+        assert!(detail.contains("↳1"));
     }
 
     #[test]
@@ -9499,6 +9718,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retained_product_path_walks_discover_start_run_and_sessionless_detail_responsively() {
+        let mut surface = projected_surface();
+        surface.workspace_mode = WorkflowWorkspaceMode::Discover;
+        assert!(render_workspace_text(&mut surface, 132, 28).contains("Discover"));
+
+        let (start_sender, start_receiver) = tokio::sync::mpsc::channel(1);
+        surface.launch_start_updates = Some(start_receiver);
+        surface.launch_start_pending = true;
+        start_sender
+            .send(Ok(bcode_plugin_sdk::tui::PluginWorkflowStartResponse {
+                run_id: "run-walkthrough".to_string(),
+                runtime_work_id: "runtime-walkthrough".to_string(),
+            }))
+            .await
+            .expect("start result");
+        assert_eq!(
+            surface.poll(&TestHost),
+            PluginTuiAction::SelectWorkflowRun {
+                run_id: "run-walkthrough".to_string()
+            }
+        );
+        assert_eq!(surface.workspace_mode, WorkflowWorkspaceMode::Runs);
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-walkthrough"));
+
+        let mut started = surface.runs.get("run-1").expect("fixture run").clone();
+        started.run.run_id = "run-walkthrough".to_string();
+        started.run.display_title = "Walkthrough workflow".to_string();
+        started.child_sessions.clear();
+        started.actions.retain(|action| {
+            !matches!(
+                action.kind,
+                bcode_workflow_view_models::WorkflowActionKind::OpenSession
+            )
+        });
+        started.outputs[0].artifact_reference = Some("artifact://review/result".to_string());
+        let (update_sender, update_receiver) = tokio::sync::mpsc::channel(2);
+        surface.attach_updates(update_receiver);
+        update_sender
+            .send(PluginTuiSurfaceUpdate::WorkflowRun(Box::new(started)))
+            .await
+            .expect("authoritative run");
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-walkthrough"));
+        assert_eq!(surface.selected_node_id.as_deref(), Some("reviewer"));
+
+        let wide = render_workspace_text(&mut surface, 132, 28);
+        assert!(wide.contains("Walkthrough workflow"));
+        assert!(wide.contains("Execution graph"));
+        assert!(wide.contains("Failure: attempt_failed"));
+        let selected_detail = selected_node_detail_lines(
+            surface.selected_run_view().expect("selected run"),
+            surface.selected_node_id.as_deref(),
+            surface.selected_attempt_id.as_ref(),
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(selected_detail.contains("sessions 0"));
+        let outputs = inspector_output_lines(
+            surface.selected_run_view().expect("selected run"),
+            surface.selected_output_id.as_deref(),
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(outputs.contains("artifact://review/result"));
+
+        surface.workspace_focus = WorkflowWorkspaceFocus::Graph;
+        let medium = render_workspace_text(&mut surface, 88, 26);
+        assert!(medium.contains("Walkthrough workflow"));
+        assert!(medium.contains("Reviewer"));
+
+        let _ = surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+            KeyCode::Char('2'),
+        )));
+        let narrow_graph = render_workspace_text(&mut surface, 62, 24);
+        assert!(narrow_graph.contains("Execution graph"));
+        assert!(narrow_graph.contains("Reviewer"));
+        let _ = surface.handle_control_center_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+            KeyCode::Char('3'),
+        )));
+        let narrow_node = render_workspace_text(&mut surface, 62, 24);
+        assert!(narrow_node.contains("Failure: attempt_failed"));
+        assert_eq!(surface.selected_run_id.as_deref(), Some("run-walkthrough"));
+        assert_eq!(surface.selected_node_id.as_deref(), Some("reviewer"));
+    }
+
     #[test]
     fn responsive_workspace_uses_explicit_narrow_pages_and_bordered_panes() {
         let mut surface = projected_surface();
@@ -9618,6 +9929,167 @@ mod tests {
             1,
             "pagination does not load row details"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn prompt_node_semantic_snapshot_walks_reasoning_tools_permission_completion_and_escape_hatch()
+    {
+        let mut surface = projected_surface();
+        let session_id = "00000000-0000-0000-0000-000000000001";
+        surface.active_detail_tab = 5;
+        surface.selected_child_session_id = Some(session_id.to_string());
+        surface.observed_session_id = Some(session_id.to_string());
+
+        let reasoning = bcode_session_view_models::ReasoningActivityView {
+            turn_id: "turn-1".to_string(),
+            activity_id: "reasoning-1".to_string(),
+            order: 0,
+            status: bcode_session_models::ReasoningActivityStatus::Completed,
+            parts: vec![bcode_session_models::ReasoningPart {
+                part_id: "summary-1".to_string(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                order: 0,
+                text: "Inspect the repository before editing".to_string(),
+            }],
+            opaque: false,
+            readable_parts_filtered: false,
+        };
+        let running_tool = bcode_session_view_models::ToolInvocationView {
+            tool_call_id: "call-1".to_string(),
+            producer_plugin_id: Some("bcode.shell".to_string()),
+            tool_name: Some("shell.run".to_string()),
+            arguments_json: Some("{\"command\":\"cargo check\"}".to_string()),
+            working_directory: None,
+            request_draft: None,
+            status: bcode_session_view_models::ToolInvocationViewStatus::Waiting,
+            result_text: None,
+            is_error: None,
+            result: None,
+            presentation: None,
+            timing: bcode_session_view_models::ToolTimingView::default(),
+        };
+        let waiting_permission = bcode_session_view_models::PermissionView {
+            permission_id: "permission-1".to_string(),
+            session_id: Some(session_id.parse().expect("session id")),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "shell.run".to_string(),
+            arguments_json: "{\"command\":\"cargo check\"}".to_string(),
+            batch: None,
+            agent_id: "build".to_string(),
+            title: Some("Allow cargo check".to_string()),
+            policy_source: Some("tool-policy".to_string()),
+            detail: Some("Workflow progress is waiting for permission".to_string()),
+            resolved: false,
+            approved: None,
+            can_remember: false,
+        };
+        let mut active = bcode_session_view_models::SessionViewSnapshot::empty();
+        active.session_id = Some(session_id.parse().expect("session id"));
+        active.revision = 1;
+        active.transcript.revision = 1;
+        active.transcript.items = vec![
+            bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::reasoning(
+                    "turn-1",
+                    "reasoning-1",
+                ),
+                revision: 1,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                output_location: None,
+                streaming: false,
+                kind: bcode_session_view_models::TranscriptViewItemKind::ReasoningActivity {
+                    activity: reasoning,
+                },
+            },
+            bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::tool("call-1"),
+                revision: 1,
+                sequence: Some(2),
+                timestamp_ms: Some(2),
+                output_location: None,
+                streaming: true,
+                kind: bcode_session_view_models::TranscriptViewItemKind::ToolInvocation {
+                    tool: Box::new(running_tool.clone()),
+                },
+            },
+        ];
+        active.tools.insert("call-1".to_string(), running_tool);
+        active.permissions.push(waiting_permission);
+        surface.session_snapshot = Some(active);
+
+        let activity = session_activity_tab_lines(
+            0,
+            surface.session_snapshot.as_ref(),
+            surface.selected_run_view(),
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(activity.contains("Inspect the repository before editing"));
+        assert!(activity.contains("shell.run"));
+        let permissions = session_activity_tab_lines(
+            3,
+            surface.session_snapshot.as_ref(),
+            surface.selected_run_view(),
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(permissions.contains("waiting"));
+        assert!(permissions.contains("Workflow progress is waiting for permission"));
+
+        let mut completed = surface.session_snapshot.clone().expect("active snapshot");
+        completed.revision = 2;
+        completed.transcript.revision = 2;
+        completed.permissions[0].resolved = true;
+        completed.permissions[0].approved = Some(true);
+        let tool = completed.tools.get_mut("call-1").expect("tool");
+        tool.status = bcode_session_view_models::ToolInvocationViewStatus::Finished;
+        tool.result_text = Some("cargo check passed".to_string());
+        tool.is_error = Some(false);
+        completed.transcript.items[1].streaming = false;
+        completed.transcript.items[1].revision = 2;
+        completed.transcript.items[1].kind =
+            bcode_session_view_models::TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(tool.clone()),
+            };
+        surface.session_snapshot = Some(completed);
+        let tools = session_activity_tab_lines(
+            2,
+            surface.session_snapshot.as_ref(),
+            surface.selected_run_view(),
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(tools.contains("Finished"));
+        assert!(tools.contains("cargo check passed"));
+        let permissions = session_activity_tab_lines(
+            3,
+            surface.session_snapshot.as_ref(),
+            surface.selected_run_view(),
+            WorkflowSurfaceTheme::resolve(None),
+        )
+        .into_iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(permissions.contains("approved"));
+        assert!(matches!(
+            surface.handle_control_center_event(&Event::Key(
+                bmux_keyboard::KeyStroke::simple(KeyCode::Char('o'))
+            )),
+            PluginTuiAction::OpenSession { session_id: opened } if opened.to_string() == session_id
+        ));
     }
 
     #[test]

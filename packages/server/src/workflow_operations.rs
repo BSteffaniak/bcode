@@ -767,6 +767,21 @@ pub fn run_view(
         let waits = store.waiting_activations(run_id, limit)?;
         let mutation_approvals = store.pending_mutation_approvals(run_id, limit)?;
         let attempts = store.attempt_history(run_id, None, limit)?;
+        let retry_schedules = attempts
+            .iter()
+            .map(|attempt| {
+                store.automatic_retry_schedule(run_id, &attempt.node_id, &attempt.activation_id)
+            })
+            .collect::<Result<Vec<_>, bcode_workflow_store::WorkflowStoreError>>()?
+            .into_iter()
+            .flatten()
+            .map(|schedule| {
+                (
+                    (schedule.node_id.clone(), schedule.activation_id.clone()),
+                    schedule,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let failure_events = store.failure_history(run_id, limit)?;
         let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
         let child_sessions = store.execution_session_links_for_run(run_id, limit)?;
@@ -874,7 +889,23 @@ pub fn run_view(
                     |activation| bcode_workflow_view::WorkflowActivationProjectionInput {
                         node_id: activation.node_id,
                         activation_id: activation.activation_id,
+                        dependency_generation: activation.dependency_generation,
                         status: activation.status,
+                        has_output: activation.has_output,
+                        input_summary: match activation.input_summary {
+                            bcode_workflow_store::WorkflowActivationInputSummary::Absent => {
+                                bcode_workflow_view_models::WorkflowInputSummary::Absent
+                            }
+                            bcode_workflow_store::WorkflowActivationInputSummary::Inline {
+                                value,
+                            } => bcode_workflow_view_models::WorkflowInputSummary::Inline { value },
+                            bcode_workflow_store::WorkflowActivationInputSummary::Omitted {
+                                byte_count,
+                            } => bcode_workflow_view_models::WorkflowInputSummary::Omitted {
+                                byte_count,
+                            },
+                        },
+                        created_at_ms: activation.created_at_ms,
                     },
                 )
                 .collect(),
@@ -890,7 +921,30 @@ pub fn run_view(
                     status: attempt.status,
                     has_receipt: attempt.has_receipt,
                     prepared_at_ms: attempt.prepared_at_ms,
+                    admitted_at_ms: attempt.admitted_at_ms,
                     terminal_at_ms: attempt.terminal_at_ms,
+                })
+                .collect(),
+            retry_schedules: retry_schedules
+                .into_values()
+                .map(|schedule| bcode_workflow_view_models::WorkflowRetryScheduleView {
+                    node_id: schedule.node_id,
+                    activation_id: schedule.activation_id,
+                    failed_attempt: schedule.failed_attempt,
+                    next_attempt: schedule.next_attempt,
+                    failure_kind: match schedule.failure_kind {
+                        bcode_workflow::AutomaticRetryFailureKind::OwnerUnavailableBeforeAcceptance => bcode_workflow_view_models::WorkflowRetryFailureKind::OwnerUnavailableBeforeAcceptance,
+                        bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable => bcode_workflow_view_models::WorkflowRetryFailureKind::OwnerReportedRetryable,
+                        bcode_workflow::AutomaticRetryFailureKind::Cancellation => bcode_workflow_view_models::WorkflowRetryFailureKind::Cancellation,
+                        bcode_workflow::AutomaticRetryFailureKind::TerminalTimeout => bcode_workflow_view_models::WorkflowRetryFailureKind::TerminalTimeout,
+                        bcode_workflow::AutomaticRetryFailureKind::ApprovalDenied => bcode_workflow_view_models::WorkflowRetryFailureKind::ApprovalDenied,
+                        bcode_workflow::AutomaticRetryFailureKind::SchemaFailure => bcode_workflow_view_models::WorkflowRetryFailureKind::SchemaFailure,
+                        bcode_workflow::AutomaticRetryFailureKind::AmbiguousMutation => bcode_workflow_view_models::WorkflowRetryFailureKind::AmbiguousMutation,
+                        bcode_workflow::AutomaticRetryFailureKind::TerminalFailure => bcode_workflow_view_models::WorkflowRetryFailureKind::TerminalFailure,
+                    },
+                    backoff_ms: schedule.backoff_ms,
+                    next_attempt_at_ms: schedule.next_attempt_at_ms,
+                    scheduled_at_ms: schedule.scheduled_at_ms,
                 })
                 .collect(),
             outputs: outputs
@@ -1883,7 +1937,13 @@ pub async fn launch_catalog(
             }
         }
     }
-    for template in list_templates(state, request.limit.saturating_add(1))? {
+    for template in list_templates(
+        state,
+        request
+            .limit
+            .saturating_add(1)
+            .min(bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE),
+    )? {
         let Some(document) = template.authoring_document else {
             continue;
         };

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current workflow projection schema version.
-pub const WORKFLOW_VIEW_VERSION: u32 = 3;
+pub const WORKFLOW_VIEW_VERSION: u32 = 4;
 
 /// Current workflow live-event contract version.
 pub const WORKFLOW_LIVE_EVENT_VERSION: u32 = 1;
@@ -419,7 +419,9 @@ pub struct WorkflowSelectedNodeDetail {
     pub definition_id: String,
     pub definition_version: u32,
     pub node: Option<WorkflowNodeView>,
+    pub activations: Vec<WorkflowActivationView>,
     pub attempts: Vec<WorkflowAttemptView>,
+    pub retry_schedules: Vec<WorkflowRetryScheduleView>,
     pub waits: Vec<WorkflowWaitView>,
     pub mutation_approvals: Vec<WorkflowMutationApprovalView>,
     pub outputs: Vec<WorkflowOutputView>,
@@ -436,10 +438,12 @@ pub struct WorkflowRunView {
     pub version: u32,
     pub run: WorkflowRunListItem,
     pub nodes: Vec<WorkflowNodeView>,
+    pub activations: Vec<WorkflowActivationView>,
     pub edges: Vec<WorkflowEdgeView>,
     pub waits: Vec<WorkflowWaitView>,
     pub mutation_approvals: Vec<WorkflowMutationApprovalView>,
     pub attempts: Vec<WorkflowAttemptView>,
+    pub retry_schedules: Vec<WorkflowRetryScheduleView>,
     pub outputs: Vec<WorkflowOutputView>,
     /// Bounded canonical diagnostics explaining terminal or node failure.
     pub failure_diagnostics: Vec<WorkflowFailureDiagnostic>,
@@ -543,7 +547,25 @@ impl WorkflowRunView {
             definition_id: self.run.definition_id.clone(),
             definition_version: self.run.definition_version,
             node,
+            activations: self
+                .activations
+                .iter()
+                .filter(|item| {
+                    item.node_id == key.node_id && matches_activation(&item.activation_id)
+                })
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
             attempts,
+            retry_schedules: self
+                .retry_schedules
+                .iter()
+                .filter(|item| {
+                    item.node_id == key.node_id && matches_activation(&item.activation_id)
+                })
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
             waits: self
                 .waits
                 .iter()
@@ -658,6 +680,28 @@ pub enum WorkflowNodeStatus {
     Unknown(String),
 }
 
+/// Bounded canonical activation input summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum WorkflowInputSummary {
+    Absent,
+    Inline { value: serde_json::Value },
+    Omitted { byte_count: usize },
+}
+
+/// Renderer-neutral bounded activation state for one exact workflow node activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowActivationView {
+    pub node_id: String,
+    pub activation_id: String,
+    pub dependency_generation: u64,
+    pub status: WorkflowNodeStatus,
+    pub has_output: bool,
+    pub input_summary: WorkflowInputSummary,
+    pub created_at_ms: u64,
+}
+
 /// Portable graph edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -726,6 +770,34 @@ pub struct WorkflowMutationApprovalView {
     pub expires_at_ms: Option<u64>,
 }
 
+/// Owner-neutral classification for a pending automatic retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRetryFailureKind {
+    OwnerUnavailableBeforeAcceptance,
+    OwnerReportedRetryable,
+    Cancellation,
+    TerminalTimeout,
+    ApprovalDenied,
+    SchemaFailure,
+    AmbiguousMutation,
+    TerminalFailure,
+}
+
+/// Durable, renderer-neutral automatic-retry schedule for one exact activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRetryScheduleView {
+    pub node_id: String,
+    pub activation_id: String,
+    pub failed_attempt: u32,
+    pub next_attempt: u32,
+    pub failure_kind: WorkflowRetryFailureKind,
+    pub backoff_ms: u64,
+    pub next_attempt_at_ms: u64,
+    pub scheduled_at_ms: u64,
+}
+
 /// Bounded dispatch attempt state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -737,6 +809,7 @@ pub struct WorkflowAttemptView {
     pub status: String,
     pub has_receipt: bool,
     pub prepared_at_ms: u64,
+    pub admitted_at_ms: Option<u64>,
     pub terminal_at_ms: Option<u64>,
 }
 
@@ -889,10 +962,12 @@ mod live_event_tests {
                 updated_at_ms: 2,
             },
             nodes: Vec::new(),
+            activations: Vec::new(),
             edges: Vec::new(),
             waits: Vec::new(),
             mutation_approvals: Vec::new(),
             attempts: Vec::new(),
+            retry_schedules: Vec::new(),
             outputs: Vec::new(),
             failure_diagnostics: Vec::new(),
             descendant_runs: Vec::new(),
@@ -936,6 +1011,52 @@ mod live_event_tests {
             decoded.actions[0].unavailable_reason.as_deref(),
             Some("authoritative state changed")
         );
+    }
+
+    #[test]
+    fn selected_node_detail_preserves_attempt_timing_and_exact_retry_schedule() {
+        let mut view = run_view(WORKFLOW_VIEW_VERSION);
+        view.nodes.push(WorkflowNodeView {
+            node_id: "reviewer".to_string(),
+            name: "Reviewer".to_string(),
+            kind: WorkflowNodeKind::Agent,
+            activation_id: Some("activation-2".to_string()),
+            status: WorkflowNodeStatus::Failed,
+        });
+        view.attempts.push(WorkflowAttemptView {
+            node_id: "reviewer".to_string(),
+            activation_id: "activation-2".to_string(),
+            attempt: 4,
+            dispatch_identity: "dispatch-4".to_string(),
+            status: "failed".to_string(),
+            has_receipt: true,
+            prepared_at_ms: 10,
+            admitted_at_ms: Some(11),
+            terminal_at_ms: Some(12),
+        });
+        view.retry_schedules.push(WorkflowRetryScheduleView {
+            node_id: "reviewer".to_string(),
+            activation_id: "activation-2".to_string(),
+            failed_attempt: 4,
+            next_attempt: 5,
+            failure_kind: WorkflowRetryFailureKind::OwnerReportedRetryable,
+            backoff_ms: 500,
+            next_attempt_at_ms: 512,
+            scheduled_at_ms: 12,
+        });
+
+        let detail = view.selected_node_detail(&WorkflowSelectedNodeKey {
+            run_id: "run-1".to_string(),
+            node_id: "reviewer".to_string(),
+            activation_id: Some("activation-2".to_string()),
+            attempt: Some(4),
+        });
+
+        assert_eq!(detail.attempts[0].admitted_at_ms, Some(11));
+        assert_eq!(detail.attempts[0].terminal_at_ms, Some(12));
+        assert_eq!(detail.retry_schedules.len(), 1);
+        assert_eq!(detail.retry_schedules[0].next_attempt, 5);
+        assert_eq!(detail.retry_schedules[0].next_attempt_at_ms, 512);
     }
 
     #[test]

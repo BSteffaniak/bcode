@@ -33918,6 +33918,87 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn workflow_launch_catalog_keeps_cli_and_tui_parity_for_real_confined_source() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workflow_root = workspace.path().join("workflows");
+        std::fs::create_dir_all(&workflow_root).expect("workflow root");
+        std::fs::write(
+            workflow_root.join("concise-run.workflow.yaml"),
+            include_str!("../../../fixtures/workflows/concise-run.workflow.yaml"),
+        )
+        .expect("workflow source");
+        let state = test_server_state_with_shell_plugin(SessionManager::default());
+        let cli_request = bcode_workflow::WorkflowLaunchCatalogRequest {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            workspace: workspace.path().to_path_buf(),
+            limit: 100,
+            cursor: None,
+            search: None,
+            source_kind: None,
+            readiness: None,
+        };
+        let tui_request = bcode_workflow::WorkflowLaunchCatalogRequest {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            workspace: workspace.path().to_path_buf(),
+            limit: 100,
+            cursor: None,
+            search: None,
+            source_kind: None,
+            readiness: None,
+        };
+
+        let cli_page = workflow_operations::launch_catalog(&state, &cli_request)
+            .await
+            .expect("CLI-shaped catalog request");
+        let tui_page = workflow_operations::launch_catalog(&state, &tui_request)
+            .await
+            .expect("TUI-shaped catalog request");
+        assert_eq!(cli_page, tui_page);
+        assert_eq!(cli_page.items.len(), 1);
+        let item = &cli_page.items[0];
+        assert_eq!(item.title, "Concise run");
+        let bcode_workflow::WorkflowLaunchSourceIdentity::StandaloneSource {
+            workflow_id,
+            source_path,
+            source_format,
+        } = &item.source
+        else {
+            panic!("expected standalone source, got {:?}", item.source);
+        };
+        assert_eq!(workflow_id, "example/concise-run");
+        assert_eq!(*source_format, bcode_workflow::WorkflowSourceFormat::Yaml);
+        assert_eq!(
+            source_path.canonicalize().expect("catalog source path"),
+            workflow_root
+                .join("concise-run.workflow.yaml")
+                .canonicalize()
+                .expect("fixture source path")
+        );
+        let detail = workflow_operations::launch_detail(
+            &state,
+            &bcode_workflow::WorkflowLaunchDetailRequest {
+                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                workspace: workspace.path().to_path_buf(),
+                source: item.source.clone(),
+            },
+        )
+        .await
+        .expect("exact launch detail");
+        assert_eq!(detail.item, *item);
+        assert_eq!(detail.document.workflow_id, "example/concise-run");
+        assert_eq!(detail.document.definition.nodes.len(), 2);
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_runs(10)
+                .expect("runs")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn apply_workflow_source_creates_then_updates_one_canonical_draft_over_ipc() {
         let state = Arc::new(test_server_state_with_shell_plugin(
             SessionManager::default(),
