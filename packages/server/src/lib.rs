@@ -58424,6 +58424,70 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn runtime_work_list_and_history_match_real_ipc_results() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions =
+            SessionManager::persistent(session_root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(Some("runtime IPC".to_owned()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let work_id = WorkId::new("runtime-ipc-work");
+        register_runtime_work(
+            state.as_ref(),
+            session.id,
+            RuntimeWorkSpec::new(
+                work_id.clone(),
+                RuntimeWorkKind::PluginInvocation,
+                "runtime IPC work".to_owned(),
+                CancellationHandle::Test(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        let direct_list = runtime_work_operations::list(state.as_ref(), session.id).await;
+        let direct_history = runtime_work_operations::history(state.as_ref(), session.id, 10)
+            .await
+            .expect("direct history");
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        assert_eq!(
+            client
+                .list_runtime_work(session.id)
+                .await
+                .expect("IPC runtime list"),
+            direct_list
+        );
+        assert_eq!(
+            client
+                .runtime_work_history(session.id, 10)
+                .await
+                .expect("IPC runtime history"),
+            direct_history
+        );
+        assert!(
+            client
+                .cancel_runtime_work(session.id, work_id)
+                .await
+                .expect("IPC runtime cancellation")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn workflow_cancellation_routes_exact_dispatch_to_runtime_owner() {
         let sessions = SessionManager::default();
         let session = sessions

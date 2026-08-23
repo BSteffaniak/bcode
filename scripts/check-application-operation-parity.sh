@@ -184,7 +184,9 @@ required_interaction_operation_tests=(
   permission_resolution_crosses_real_ipc_and_persists_resolution
   plugin_inventory_operations_run_without_transport_writing
   plugin_service_operations_match_real_ipc_results
+  runtime_work_list_and_history_match_real_ipc_results
   runtime_work_operations_cancel_parent_and_node_without_transport_writing
+  session_operations_lifecycle_without_transport_writing
   server_question_exchange_completes_original_plugin_invocation
 )
 for test_name in "${required_interaction_operation_tests[@]}"; do
