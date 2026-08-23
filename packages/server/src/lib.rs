@@ -4850,8 +4850,14 @@ async fn handle_turn_workflow_model_request(
             session_id,
             work_id,
         } => {
-            handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
-                .await
+            let cancelled =
+                runtime_work_operations::cancel(state, session_id, work_id, Some(client_id)).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RuntimeWorkCancellationRequested { cancelled }),
+            )
+            .await
         }
         SessionTurnRequest::ApplyWorkflowSource(request) => {
             let result = workflow_operations::apply_source(client_id, state, request).await?;
@@ -5863,10 +5869,22 @@ async fn handle_core_runtime_request(
 ) -> Result<(), ServerError> {
     match request {
         CoreRuntimeRequest::ListRuntimeWork { session_id } => {
-            handle_list_runtime_work(request_id, state, writer, session_id).await
+            let work = runtime_work_operations::list(state, session_id).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RuntimeWorkList { work }),
+            )
+            .await
         }
         CoreRuntimeRequest::RuntimeWorkHistory { session_id, limit } => {
-            handle_runtime_work_history(request_id, state, writer, session_id, limit).await
+            let events = runtime_work_operations::history(state, session_id, limit).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RuntimeWorkHistory { events }),
+            )
+            .await
         }
         CoreRuntimeRequest::SubscribeRuntimeWork { session_id } => {
             handle_subscribe_runtime_work(request_id, client_id, state, writer, session_id).await
@@ -6039,27 +6057,31 @@ async fn handle_agent_permission_plugin_request(
             operation,
             payload,
         } => {
-            Box::pin(handle_invoke_plugin_service(
-                request_id,
+            let result = Box::pin(plugin_operations::invoke_service(
                 state,
-                writer,
                 &plugin_id,
                 &interface_id,
                 operation,
                 payload,
             ))
-            .await
+            .await;
+            send_response(writer, request_id, plugin_service_response(result)).await
         }
         AgentSkillPluginRequest::CallPluginService {
             interface_id,
             operation,
             payload,
         } => {
-            handle_call_plugin_service(request_id, state, writer, &interface_id, operation, payload)
-                .await
+            let result =
+                plugin_operations::call_service(state, &interface_id, operation, payload).await;
+            send_response(writer, request_id, plugin_service_response(result)).await
         }
         AgentSkillPluginRequest::PublishPluginEvent { topic, payload } => {
-            handle_publish_plugin_event(request_id, state, writer, &topic, &payload).await
+            let response = match plugin_operations::publish_event(state, &topic, &payload).await {
+                Ok(delivered) => Response::Ok(ResponsePayload::PluginEventPublished { delivered }),
+                Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
+            };
+            send_response(writer, request_id, response).await
         }
     }
 }
@@ -14167,55 +14189,6 @@ async fn drive_workflow_run_and_parents(
             .map(|link| link.parent_run_id);
     }
     Ok(())
-}
-
-async fn handle_cancel_runtime_work(
-    request_id: u64,
-    client_id: ClientId,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    work_id: WorkId,
-) -> Result<(), ServerError> {
-    let cancelled =
-        runtime_work_operations::cancel(state, session_id, work_id, Some(client_id)).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::RuntimeWorkCancellationRequested { cancelled }),
-    )
-    .await
-}
-
-async fn handle_list_runtime_work(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-) -> Result<(), ServerError> {
-    let work = runtime_work_operations::list(state, session_id).await;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::RuntimeWorkList { work }),
-    )
-    .await
-}
-
-async fn handle_runtime_work_history(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    session_id: SessionId,
-    limit: usize,
-) -> Result<(), ServerError> {
-    let events = runtime_work_operations::history(state, session_id, limit).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::RuntimeWorkHistory { events }),
-    )
-    .await
 }
 
 fn runtime_work_projection_to_events(
@@ -30156,66 +30129,6 @@ async fn derive_with_invocation_cancellation(
     }
 }
 
-async fn handle_invoke_plugin_service(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    plugin_id: &str,
-    interface_id: &str,
-    operation: String,
-    payload: Vec<u8>,
-) -> Result<(), ServerError> {
-    let response = Box::pin(plugin_operations::invoke_service(
-        state,
-        plugin_id,
-        interface_id,
-        operation,
-        payload,
-    ))
-    .await;
-    send_plugin_service_response(writer, request_id, response).await
-}
-
-async fn handle_call_plugin_service(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    interface_id: &str,
-    operation: String,
-    payload: Vec<u8>,
-) -> Result<(), ServerError> {
-    let response = plugin_operations::call_service(state, interface_id, operation, payload).await;
-    send_plugin_service_response(writer, request_id, response).await
-}
-
-async fn handle_publish_plugin_event(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    topic: &str,
-    payload: &[u8],
-) -> Result<(), ServerError> {
-    let response = plugin_operations::publish_event(state, topic, payload).await;
-    match response {
-        Ok(delivered) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::PluginEventPublished { delivered }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code, error.message)),
-            )
-            .await
-        }
-    }
-}
-
 fn plugin_event_metric_labels(topic: &str) -> MetricLabels {
     let mut labels = MetricLabels::new();
     labels.insert("topic".to_owned(), topic.to_owned());
@@ -30236,24 +30149,24 @@ fn plugin_service_metric_labels(
     labels
 }
 
-async fn send_plugin_service_response(
-    writer: &SharedWriter,
-    request_id: u64,
-    response: Result<bcode_plugin::ServiceResponse, plugin_operations::PublicPluginError>,
-) -> Result<(), ServerError> {
-    let response = match response {
-        Ok(response) => Response::Ok(ResponsePayload::PluginServiceResult {
-            response: PluginServiceResponse {
-                payload: response.payload,
-                error: response.error.map(|error| PluginServiceError {
-                    code: error.code,
-                    message: error.message,
-                }),
-            },
-        }),
+fn plugin_service_response(
+    result: Result<bcode_plugin::ServiceResponse, plugin_operations::PublicPluginError>,
+) -> Response {
+    match result {
+        Ok(response) => {
+            let response = plugin_operations::project_service_response(response);
+            Response::Ok(ResponsePayload::PluginServiceResult {
+                response: PluginServiceResponse {
+                    payload: response.payload,
+                    error: response.error.map(|error| PluginServiceError {
+                        code: error.code,
+                        message: error.message,
+                    }),
+                },
+            })
+        }
         Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
-    };
-    send_response(writer, request_id, response).await
+    }
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
@@ -46354,9 +46267,16 @@ library = "test"
         ))
         .await
         .expect("invoke shell service in process");
+        let projected = plugin_operations::project_service_response(response);
         assert_eq!(
-            response.error.as_ref().map(|error| error.code.as_str()),
+            projected.error.as_ref().map(|error| error.code.as_str()),
             Some("unsupported_operation")
+        );
+        assert!(
+            projected
+                .error
+                .as_ref()
+                .is_none_or(|error| !error.message.contains("secret-provider-detail"))
         );
 
         let contributions = plugin_operations::list_contributions(&state);
@@ -46374,6 +46294,63 @@ library = "test"
         let public = plugin_operations::normalize_error(&private);
         assert_eq!(public.code, "plugin_error");
         assert!(!public.message.contains("secret-provider-detail"));
+    }
+
+    #[tokio::test]
+    async fn plugin_service_operations_match_real_ipc_results() {
+        let state = Arc::new(test_server_state_with_shell_plugin(
+            SessionManager::default(),
+        ));
+        let direct_services = plugin_operations::list_services(state.as_ref());
+        let direct = plugin_operations::project_service_response(
+            Box::pin(plugin_operations::invoke_service(
+                state.as_ref(),
+                "bcode.shell",
+                bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+                "unsupported-operation".to_owned(),
+                Vec::new(),
+            ))
+            .await
+            .expect("direct plugin operation"),
+        );
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        assert_eq!(
+            client.plugin_services().await.expect("IPC services"),
+            direct_services
+        );
+        let ipc = client
+            .invoke_plugin_service(
+                "bcode.shell".to_owned(),
+                bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_owned(),
+                "unsupported-operation".to_owned(),
+                Vec::new(),
+            )
+            .await
+            .expect("IPC plugin operation");
+        assert_eq!(ipc.payload, direct.payload);
+        assert_eq!(
+            ipc.error.as_ref().map(|error| error.code.as_str()),
+            direct.error.as_ref().map(|error| error.code.as_str())
+        );
+        assert_eq!(
+            ipc.error.as_ref().map(|error| error.message.as_str()),
+            direct.error.as_ref().map(|error| error.message.as_str())
+        );
+        server.abort();
     }
 
     #[tokio::test]

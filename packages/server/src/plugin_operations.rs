@@ -167,7 +167,38 @@ pub fn enqueue_invocation_input(
     })
 }
 
-/// Invoke one exact plugin service with the server's bounded application-service bridge.
+/// Portable normalized plugin service result projected at the transport boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginServiceOperationResult {
+    /// Opaque plugin-owned response payload.
+    pub payload: Vec<u8>,
+    /// Optional normalized plugin service error.
+    pub error: Option<PluginServiceOperationError>,
+}
+
+/// Normalized plugin service error without implementation details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginServiceOperationError {
+    /// Stable plugin-owned error code.
+    pub code: String,
+    /// Secret-safe public error message.
+    pub message: String,
+}
+
+/// Convert one internal plugin response into the normalized operation result.
+#[must_use]
+pub fn project_service_response(
+    response: bcode_plugin::ServiceResponse,
+) -> PluginServiceOperationResult {
+    PluginServiceOperationResult {
+        payload: response.payload,
+        error: response.error.map(|error| PluginServiceOperationError {
+            code: error.code,
+            message: error.message,
+        }),
+    }
+}
+
 pub async fn invoke_service(
     state: &ServerState,
     plugin_id: &str,

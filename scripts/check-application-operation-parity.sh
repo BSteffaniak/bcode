@@ -182,6 +182,9 @@ required_interaction_operation_tests=(
   cancellation_while_waiting_for_permission_resolves_denied_without_tool_start
   bypass_authorization_preserves_structural_checks_without_permission_state
   permission_resolution_crosses_real_ipc_and_persists_resolution
+  plugin_inventory_operations_run_without_transport_writing
+  plugin_service_operations_match_real_ipc_results
+  runtime_work_operations_cancel_parent_and_node_without_transport_writing
   server_question_exchange_completes_original_plugin_invocation
 )
 for test_name in "${required_interaction_operation_tests[@]}"; do
@@ -200,6 +203,55 @@ fi
 
 if rg -Fq 'serde_json::from_value(resolution_json)?' packages/server/src/lib.rs; then
   fail "tool-exchange resolution decoding leaked back into generic IPC dispatch"
+fi
+
+required_plugin_operations=(
+  call_service
+  invoke_service
+  list_contributions
+  list_services
+  publish_event
+  project_service_response
+)
+for operation in "${required_plugin_operations[@]}"; do
+  if ! rg -q "^pub (async )?fn $operation\\b" packages/server/src/plugin_operations.rs; then
+    fail "plugin operation boundary is missing $operation"
+  fi
+done
+
+required_plugin_client_methods=(
+  call_plugin_service
+  invoke_plugin_service
+  plugin_contributions
+  plugin_services
+  publish_plugin_event
+)
+for method in "${required_plugin_client_methods[@]}"; do
+  if ! rg -q "pub async fn $method\\b" packages/client/src/lib.rs; then
+    fail "typed client boundary is missing $method"
+  fi
+done
+
+required_runtime_work_client_methods=(
+  cancel_runtime_work
+  list_runtime_work
+  runtime_work_history
+  watch_runtime_work
+)
+for method in "${required_runtime_work_client_methods[@]}"; do
+  if ! rg -q "pub async fn $method\\b" packages/client/src/lib.rs; then
+    fail "typed client boundary is missing $method"
+  fi
+done
+
+if rg -n '^async fn handle_(cancel_runtime_work|list_runtime_work|runtime_work_history)\b' \
+  packages/server/src/lib.rs >/dev/null; then
+  fail "runtime-work application behavior leaked back into response-writing helpers"
+fi
+
+if rg -n '^async fn handle_(list_plugin_services|list_plugin_contributions|invoke_plugin_service|call_plugin_service|publish_plugin_event|send_plugin_service_response)\b' \
+  packages/server/src/lib.rs >/dev/null; then
+  fail "plugin application behavior leaked back into response-writing helpers"
 fi
 
 raw_ipc_callers="$(
