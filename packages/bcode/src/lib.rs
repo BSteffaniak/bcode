@@ -6904,6 +6904,13 @@ impl fmt::Debug for Agent {
 }
 
 impl Agent {
+    /// Replace the nonblocking runtime event sink for subsequent turns.
+    #[must_use]
+    pub fn with_invocation_event_sink(mut self, sink: Arc<dyn TurnEventSink>) -> Self {
+        self.invocation_event_sink = sink;
+        self
+    }
+
     /// Start building an agent.
     #[must_use]
     pub fn builder() -> AgentBuilder {
