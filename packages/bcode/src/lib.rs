@@ -4301,12 +4301,19 @@ impl ProviderRegistry {
                 OP_MODELS,
                 &bcode_model::ModelListRequest {
                     provider_context,
-                    selected_model_id,
+                    selected_model_id: selected_model_id.clone(),
                 },
                 bcode_plugin::PluginInvocationScope::Global,
             )
             .await
             .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))?;
+        let models = bcode_model_catalog::ModelCatalogResolver::embedded()
+            .resolve_selection(
+                models,
+                selected_model_id.as_deref(),
+                selected_model_id.as_deref(),
+            )
+            .await;
         self = self
             .discovered_provider(&provider_plugin_id)
             .provider_capabilities(capabilities)

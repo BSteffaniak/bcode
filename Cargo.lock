@@ -1295,6 +1295,7 @@ dependencies = [
  "bcode_mermaid_render",
  "bcode_metrics",
  "bcode_model",
+ "bcode_model_catalog",
  "bcode_model_provider_runtime",
  "bcode_openai_compatible_provider_plugin",
  "bcode_plugin",
