@@ -402,6 +402,15 @@ pub type PluginWorkflowAuthoringValidationFuture = Pin<
     >,
 >;
 
+/// Async workflow-source apply result.
+pub type PluginWorkflowAuthoringApplyFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_workflow::WorkflowSourceApplyResult, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Async workflow-authoring preview result.
 pub type PluginWorkflowAuthoringPreviewFuture = Pin<
     Box<
@@ -764,6 +773,20 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow authoring is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Apply one exact source document through the canonical source-aware lifecycle.
+    fn apply_workflow_source(
+        &self,
+        _source_format: bcode_workflow::WorkflowSourceFormat,
+        _source: String,
+        _draft_id: String,
+    ) -> PluginWorkflowAuthoringApplyFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow source apply is not available from this host".to_string(),
             ))
         })
     }

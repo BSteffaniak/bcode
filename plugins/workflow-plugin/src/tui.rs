@@ -208,6 +208,9 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 launch_lifecycle_pending: None,
                 launch_lifecycle_result: None,
                 launch_lifecycle_updates: None,
+                applied_workflow_id: None,
+                applied_draft_id: None,
+                applied_generation: None,
                 launch_form: None,
                 selected_run_id: None,
                 selected_node_id: None,
@@ -646,6 +649,9 @@ struct WorkflowStatusSurface {
     launch_lifecycle_updates: Option<
         tokio::sync::mpsc::Receiver<Result<String, bcode_plugin_sdk::tui::PluginTuiHostError>>,
     >,
+    applied_workflow_id: Option<String>,
+    applied_draft_id: Option<String>,
+    applied_generation: Option<u64>,
     launch_form: Option<WorkflowLaunchForm>,
     selected_run_id: Option<String>,
     selected_node_id: Option<String>,
@@ -1907,6 +1913,7 @@ impl WorkflowStatusSurface {
                 self.selected_run_view(),
                 self.active_detail_tab,
                 InspectorSelection {
+                    selected_node: self.selected_node_id.as_deref(),
                     input_wait: self.selected_input_wait_id.as_ref(),
                     output: self.selected_output_id.as_deref(),
                     attempt: self.selected_attempt_id.as_ref(),
@@ -2944,6 +2951,7 @@ impl WorkflowStatusSurface {
         PluginTuiAction::Redraw
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_selected_launch_lifecycle(
         &mut self,
         kind: bcode_workflow::WorkflowLaunchActionKind,
@@ -3022,13 +3030,57 @@ impl WorkflowStatusSurface {
                     options: serde_json::json!({"document": detail.document}),
                 };
             }
-            bcode_workflow::WorkflowLaunchActionKind::Apply
-            | bcode_workflow::WorkflowLaunchActionKind::Publish
-            | bcode_workflow::WorkflowLaunchActionKind::OpenSource => {
-                self.launch_lifecycle_result = Some(format!(
-                    "{kind:?} requires the exact source lifecycle operation"
-                ));
-                return PluginTuiAction::Redraw;
+            bcode_workflow::WorkflowLaunchActionKind::Apply => {
+                let source = serde_json::to_string(&detail.document)
+                    .expect("validated authoring document serializes");
+                let future = host.apply_workflow_source(
+                    bcode_workflow::WorkflowSourceFormat::Json,
+                    source,
+                    bcode_workflow::DEFAULT_WORKFLOW_SOURCE_DRAFT_ID.to_string(),
+                );
+                Box::pin(async move {
+                    future.await.map(|result| {
+                        serde_json::to_string(&result).expect("apply result serializes")
+                    })
+                })
+            }
+            bcode_workflow::WorkflowLaunchActionKind::Publish => {
+                let (Some(workflow_id), Some(draft_id), Some(generation)) = (
+                    self.applied_workflow_id.clone(),
+                    self.applied_draft_id.clone(),
+                    self.applied_generation,
+                ) else {
+                    self.launch_lifecycle_result =
+                        Some("Apply the exact source draft before publishing".to_string());
+                    return PluginTuiAction::Redraw;
+                };
+                let future =
+                    host.publish_workflow_authoring_draft(workflow_id, draft_id, generation, true);
+                Box::pin(async move { future.await.map(|result| format!("Publish {result:?}")) })
+            }
+            bcode_workflow::WorkflowLaunchActionKind::OpenSource => {
+                let source_path = match &detail.item.source {
+                    bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+                        manifest_path,
+                        ..
+                    } => manifest_path,
+                    bcode_workflow::WorkflowLaunchSourceIdentity::StandaloneSource {
+                        source_path,
+                        ..
+                    }
+                    | bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource {
+                        source_path,
+                        ..
+                    } => source_path,
+                    bcode_workflow::WorkflowLaunchSourceIdentity::Template { .. } => {
+                        self.launch_lifecycle_result =
+                            Some("This template has no filesystem source path".to_string());
+                        return PluginTuiAction::Redraw;
+                    }
+                };
+                return PluginTuiAction::RunCommand {
+                    command: format!("$EDITOR {}", shell_quote_path(source_path)),
+                };
             }
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
@@ -3180,6 +3232,24 @@ impl WorkflowStatusSurface {
                 KeyCode::Char('p') => {
                     return self.run_selected_launch_lifecycle(
                         bcode_workflow::WorkflowLaunchActionKind::Preview,
+                        host,
+                    );
+                }
+                KeyCode::Char('a') => {
+                    return self.run_selected_launch_lifecycle(
+                        bcode_workflow::WorkflowLaunchActionKind::Apply,
+                        host,
+                    );
+                }
+                KeyCode::Char('b') => {
+                    return self.run_selected_launch_lifecycle(
+                        bcode_workflow::WorkflowLaunchActionKind::Publish,
+                        host,
+                    );
+                }
+                KeyCode::Char('e') => {
+                    return self.run_selected_launch_lifecycle(
+                        bcode_workflow::WorkflowLaunchActionKind::OpenSource,
                         host,
                     );
                 }
@@ -4311,11 +4381,28 @@ impl PluginTuiSurface for WorkflowStatusSurface {
         if let Some(receiver) = self.launch_lifecycle_updates.as_mut()
             && let Ok(result) = receiver.try_recv()
         {
-            self.launch_lifecycle_pending = None;
             self.launch_lifecycle_result = Some(match result {
-                Ok(message) => message,
+                Ok(message) => {
+                    if self.launch_lifecycle_pending
+                        == Some(bcode_workflow::WorkflowLaunchActionKind::Apply)
+                        && let Ok(applied) = serde_json::from_str::<
+                            bcode_workflow::WorkflowSourceApplyResult,
+                        >(&message)
+                    {
+                        self.applied_workflow_id = Some(applied.workflow_id.clone());
+                        self.applied_draft_id = Some(applied.draft_id.clone());
+                        self.applied_generation = Some(applied.generation);
+                        format!(
+                            "Apply {:?} · draft {} generation {}",
+                            applied.outcome, applied.draft_id, applied.generation
+                        )
+                    } else {
+                        message
+                    }
+                }
                 Err(error) => error.to_string(),
             });
+            self.launch_lifecycle_pending = None;
             return PluginTuiAction::Redraw;
         }
         if let Some(receiver) = self.launch_start_updates.as_mut()
@@ -4672,6 +4759,10 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             _ => PluginTuiAction::None,
         }
     }
+}
+
+fn shell_quote_path(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 fn workflow_breadcrumb_line(surface: &WorkflowStatusSurface, theme: WorkflowSurfaceTheme) -> Line {
@@ -5834,6 +5925,7 @@ fn adjacent_identity<T: Clone + PartialEq>(
 
 #[derive(Clone, Copy, Default)]
 struct InspectorSelection<'a> {
+    selected_node: Option<&'a str>,
     input_wait: Option<&'a (String, String)>,
     output: Option<&'a str>,
     attempt: Option<&'a (String, String, u32)>,
@@ -5852,7 +5944,12 @@ fn inspector_lines(
         return vec![Line::from("Loading selected run…")];
     };
     match tab {
-        0 => inspector_overview_lines(run),
+        0 => {
+            let mut lines =
+                selected_node_detail_lines(run, selection.selected_node, selection.attempt, theme);
+            lines.extend(inspector_overview_lines(run));
+            lines
+        }
         1 => inspector_input_lines(run, selection.input_wait, theme),
         2 => inspector_output_lines(run, selection.output, theme),
         3 => inspector_attempt_lines(run, selection.attempt, theme),
@@ -5865,6 +5962,70 @@ fn inspector_lines(
         5 => inspector_session_lines(run, selection.child_session, theme),
         _ => inspector_definition_lines(run),
     }
+}
+
+fn selected_node_detail_lines(
+    run: &bcode_workflow_view_models::WorkflowRunView,
+    selected_node_id: Option<&str>,
+    selected_attempt: Option<&(String, String, u32)>,
+    theme: WorkflowSurfaceTheme,
+) -> Vec<Line> {
+    let Some(node_id) = selected_node_id else {
+        return vec![Line::from("Select a graph node")];
+    };
+    let key = bcode_workflow_view_models::WorkflowSelectedNodeKey {
+        run_id: run.run.run_id.clone(),
+        node_id: node_id.to_string(),
+        activation_id: selected_attempt
+            .map(|(_, activation_id, _)| activation_id.clone())
+            .or_else(|| {
+                run.nodes
+                    .iter()
+                    .find(|node| node.node_id == node_id)
+                    .and_then(|node| node.activation_id.clone())
+            }),
+        attempt: selected_attempt.map(|(_, _, attempt)| *attempt),
+    };
+    let detail = run.selected_node_detail(&key);
+    let mut lines = vec![Line::from_spans(vec![
+        Span::styled(
+            format!("{} v{}", detail.definition_id, detail.definition_version),
+            theme.muted,
+        ),
+        Span::styled(format!(" · {}", detail.key.node_id), theme.focused),
+        Span::styled(format!(" · {:?}", detail.availability), theme.text),
+    ])];
+    if let Some(node) = &detail.node {
+        lines.push(Line::from(format!("{:?} · {:?}", node.kind, node.status)));
+    }
+    lines.extend(detail.attempts.iter().map(|attempt| {
+        Line::from(format!(
+            "Attempt {} · {} · dispatch {} · receipt {} · prepared {} · terminal {}",
+            attempt.attempt,
+            attempt.status,
+            attempt.dispatch_identity,
+            attempt.has_receipt,
+            attempt.prepared_at_ms,
+            attempt
+                .terminal_at_ms
+                .map_or_else(|| "running".to_string(), |value| value.to_string())
+        ))
+    }));
+    lines.extend(detail.failures.iter().map(|failure| {
+        Line::from_spans(vec![Span::styled(
+            format!("Failure: {} · {}", failure.kind, failure.message),
+            theme.error,
+        )])
+    }));
+    lines.push(Line::from(format!(
+        "Waits {} · approvals {} · outputs {} · descendants {} · sessions {}",
+        detail.waits.len(),
+        detail.mutation_approvals.len(),
+        detail.outputs.len(),
+        detail.descendants.len(),
+        detail.execution_sessions.len()
+    )));
+    lines
 }
 
 fn inspector_overview_lines(run: &bcode_workflow_view_models::WorkflowRunView) -> Vec<Line> {
@@ -7291,6 +7452,9 @@ mod tests {
             launch_lifecycle_pending: None,
             launch_lifecycle_result: None,
             launch_lifecycle_updates: None,
+            applied_workflow_id: None,
+            applied_draft_id: None,
+            applied_generation: None,
             launch_form: None,
             selected_run_id: Some("run-1".to_string()),
             selected_node_id: Some("reviewer".to_string()),

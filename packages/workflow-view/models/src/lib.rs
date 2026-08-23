@@ -365,6 +365,70 @@ pub struct WorkflowActionAffordance {
     pub unavailable_reason: Option<String>,
 }
 
+/// Maximum bounded activations/attempts retained in one selected-node detail projection.
+pub const WORKFLOW_SELECTED_NODE_HISTORY_LIMIT: usize = 64;
+
+/// Exact renderer-neutral identity for one selected workflow node activation/attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSelectedNodeKey {
+    pub run_id: String,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+}
+
+/// Availability of exact selected-node semantic detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkflowSelectedNodeAvailability {
+    Available,
+    Unavailable { reason: String },
+    Degraded { reason: String },
+    Unsupported { version: u32 },
+}
+
+/// Owner-neutral lifecycle facts for a non-session-backed selected-node attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOwnerNeutralActivity {
+    pub node_id: String,
+    pub activation_id: String,
+    pub attempt: u32,
+    pub lifecycle: String,
+    pub receipt_available: bool,
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    pub artifact_references: Vec<String>,
+}
+
+///
+/// This projection contains workflow-owned summaries and opaque links only. Session transcripts,
+/// shell output, and artifact bytes remain with their canonical owners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSelectedNodeDetail {
+    pub version: u32,
+    pub key: WorkflowSelectedNodeKey,
+    pub availability: WorkflowSelectedNodeAvailability,
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub node: Option<WorkflowNodeView>,
+    pub attempts: Vec<WorkflowAttemptView>,
+    pub waits: Vec<WorkflowWaitView>,
+    pub mutation_approvals: Vec<WorkflowMutationApprovalView>,
+    pub outputs: Vec<WorkflowOutputView>,
+    pub failures: Vec<WorkflowFailureDiagnostic>,
+    pub descendants: Vec<WorkflowDescendantRunView>,
+    pub owner_activity: Vec<WorkflowOwnerNeutralActivity>,
+    pub execution_sessions: Vec<WorkflowChildSessionView>,
+}
+
 /// Bounded semantic projection of one workflow run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,6 +451,151 @@ pub struct WorkflowRunView {
 }
 
 impl WorkflowRunView {
+    /// Project bounded semantic detail for one exact selected node/activation/attempt.
+    #[allow(clippy::too_many_lines)]
+    #[must_use]
+    pub fn selected_node_detail(
+        &self,
+        key: &WorkflowSelectedNodeKey,
+    ) -> WorkflowSelectedNodeDetail {
+        let matches_activation = |activation_id: &str| {
+            key.activation_id
+                .as_deref()
+                .is_none_or(|selected| selected == activation_id)
+        };
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.node_id == key.node_id)
+            .cloned();
+        let availability = match (&node, &self.health) {
+            (_, WorkflowProjectionHealth::UnsupportedVersion { version }) => {
+                WorkflowSelectedNodeAvailability::Unsupported { version: *version }
+            }
+            (
+                _,
+                WorkflowProjectionHealth::Degraded { reason }
+                | WorkflowProjectionHealth::RepairRequired { reason },
+            ) => WorkflowSelectedNodeAvailability::Degraded {
+                reason: reason.clone(),
+            },
+            (None, _) => WorkflowSelectedNodeAvailability::Unavailable {
+                reason: "selected node is not present in this bounded run projection".to_string(),
+            },
+            (Some(_), WorkflowProjectionHealth::Current) => {
+                WorkflowSelectedNodeAvailability::Available
+            }
+        };
+        let attempts: Vec<WorkflowAttemptView> = self
+            .attempts
+            .iter()
+            .filter(|item| {
+                item.node_id == key.node_id
+                    && matches_activation(&item.activation_id)
+                    && key.attempt.is_none_or(|selected| selected == item.attempt)
+            })
+            .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+            .cloned()
+            .collect();
+        let filter_activation = |node_id: &str, activation_id: &str| {
+            node_id == key.node_id && matches_activation(activation_id)
+        };
+        let owner_activity = attempts
+            .iter()
+            .map(|attempt| {
+                let artifact_references = self
+                    .outputs
+                    .iter()
+                    .filter(|output| {
+                        output.node_id == attempt.node_id
+                            && output.activation_id == attempt.activation_id
+                    })
+                    .filter_map(|output| output.artifact_reference.clone())
+                    .collect();
+                let diagnostic = self
+                    .failure_diagnostics
+                    .iter()
+                    .rev()
+                    .find(|failure| {
+                        failure.dispatch_identity.as_deref()
+                            == Some(attempt.dispatch_identity.as_str())
+                            || failure.activation_id.as_deref()
+                                == Some(attempt.activation_id.as_str())
+                    })
+                    .map(|failure| failure.message.clone());
+                WorkflowOwnerNeutralActivity {
+                    node_id: attempt.node_id.clone(),
+                    activation_id: attempt.activation_id.clone(),
+                    attempt: attempt.attempt,
+                    lifecycle: attempt.status.clone(),
+                    receipt_available: attempt.has_receipt,
+                    cancelled: attempt.status.eq_ignore_ascii_case("cancelled"),
+                    progress: None,
+                    diagnostic,
+                    artifact_references,
+                }
+            })
+            .collect();
+        WorkflowSelectedNodeDetail {
+            version: self.version,
+            key: key.clone(),
+            availability,
+            definition_id: self.run.definition_id.clone(),
+            definition_version: self.run.definition_version,
+            node,
+            attempts,
+            waits: self
+                .waits
+                .iter()
+                .filter(|item| filter_activation(&item.node_id, &item.activation_id))
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
+            mutation_approvals: self
+                .mutation_approvals
+                .iter()
+                .filter(|item| filter_activation(&item.node_id, &item.activation_id))
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
+            outputs: self
+                .outputs
+                .iter()
+                .filter(|item| filter_activation(&item.node_id, &item.activation_id))
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
+            failures: self
+                .failure_diagnostics
+                .iter()
+                .filter(|item| {
+                    item.node_id.as_deref() == Some(key.node_id.as_str())
+                        && item.activation_id.as_deref().is_none_or(matches_activation)
+                })
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
+            descendants: self
+                .descendant_runs
+                .iter()
+                .filter(|item| item.parent_node_id == key.node_id)
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
+            owner_activity,
+            execution_sessions: self
+                .child_sessions
+                .iter()
+                .filter(|item| {
+                    filter_activation(&item.node_id, &item.activation_id)
+                        && key.attempt.is_none_or(|selected| selected == item.attempt)
+                })
+                .take(WORKFLOW_SELECTED_NODE_HISTORY_LIMIT)
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Reject projections that do not use the exact supported contract version.
     ///
     /// # Errors
