@@ -46453,6 +46453,12 @@ library = "test"
             .await
             .expect("direct plugin operation"),
         );
+        assert_eq!(
+            plugin_operations::publish_event(state.as_ref(), "example.unsubscribed", b"payload")
+                .await
+                .expect("direct plugin event"),
+            0
+        );
 
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
@@ -46489,6 +46495,13 @@ library = "test"
         assert_eq!(
             ipc.error.as_ref().map(|error| error.message.as_str()),
             direct.error.as_ref().map(|error| error.message.as_str())
+        );
+        assert_eq!(
+            client
+                .publish_plugin_event("example.unsubscribed".to_owned(), b"payload".to_vec())
+                .await
+                .expect("IPC plugin event"),
+            0
         );
         server.abort();
     }
@@ -58618,12 +58631,37 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("IPC runtime history"),
             direct_history
         );
+        let mut watcher = client
+            .watch_runtime_work(session.id)
+            .await
+            .expect("IPC runtime watcher");
+        let initial_event = tokio::time::timeout(Duration::from_secs(1), watcher.next_event())
+            .await
+            .expect("runtime watch event")
+            .expect("decoded runtime watch event");
+        let expected_work_id = work_id.clone();
+        assert!(matches!(
+            initial_event.kind,
+            SessionEventKind::RuntimeWorkStarted { work_id, .. }
+                if work_id == expected_work_id
+        ));
         assert!(
             client
-                .cancel_runtime_work(session.id, work_id)
+                .cancel_runtime_work(session.id, work_id.clone())
                 .await
                 .expect("IPC runtime cancellation")
         );
+        let cancel_event = tokio::time::timeout(Duration::from_secs(1), watcher.next_event())
+            .await
+            .expect("runtime cancellation watch event")
+            .expect("decoded runtime cancellation event");
+        assert!(matches!(
+            cancel_event.kind,
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id: cancelled_work_id,
+                ..
+            } if cancelled_work_id == work_id
+        ));
         server.abort();
     }
 
