@@ -86,7 +86,7 @@ fn workflow_package_export_start_request(
 }
 
 fn workflow_run_limits(
-    policy: bcode_workflow::WorkflowRunLimitPolicy,
+    policy: &bcode_workflow::WorkflowRunLimitPolicy,
 ) -> bcode_workflow_store::WorkflowRunLimits {
     bcode_workflow_store::WorkflowRunLimits {
         deadline_at_ms: policy.maximum_duration_ms.map(|duration| {
@@ -601,7 +601,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     workspace_snapshot: request.workspace_snapshot,
                     parent_session_id: request.parent_session_id,
                     configuration: request.configuration,
-                    limits: workflow_run_limits(request.limits),
+                    limits: workflow_run_limits(&request.limits),
                 })
                 .await
                 .map(|started| PluginWorkflowStartResponse {
