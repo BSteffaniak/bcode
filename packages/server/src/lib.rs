@@ -6152,19 +6152,13 @@ async fn handle_permission_interaction_request(
             let resolution =
                 match interaction_operations::decode_tool_exchange_resolution(resolution_json) {
                     Ok(resolution) => resolution,
-                    Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
+                    Err(error) => {
                         return send_response(
                             writer,
                             request_id,
-                            Response::Err(ErrorResponse::new(
-                                "invalid_exchange_resolution",
-                                "tool exchange resolution is malformed or unsupported",
-                            )),
+                            Response::Err(ErrorResponse::new(error.code(), error.message())),
                         )
                         .await;
-                    }
-                    Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
-                        unreachable!("decoding does not inspect consumer compatibility")
                     }
                 };
             let result = interaction_operations::resolve_tool_exchange(
@@ -6184,15 +6178,7 @@ fn tool_exchange_response(
 ) -> Response {
     match result {
         Ok(resolved) => Response::Ok(ResponsePayload::ToolExchangeResolved { resolved }),
-        Err(interaction_operations::ResolveToolExchangeError::IncompatibleConsumer) => {
-            Response::Err(ErrorResponse::new(
-                "incompatible_exchange_consumer",
-                "client did not advertise a compatible exchange adapter",
-            ))
-        }
-        Err(interaction_operations::ResolveToolExchangeError::InvalidResolution) => {
-            unreachable!("typed resolution was decoded before operation dispatch")
-        }
+        Err(error) => Response::Err(ErrorResponse::new(error.code(), error.message())),
     }
 }
 
@@ -45492,6 +45478,26 @@ library = "test"
             },
             resolution: Arc::new(Mutex::new(None)),
             notify: Arc::new(Notify::new()),
+        }
+    }
+
+    #[test]
+    fn exchange_errors_are_stable_and_secret_safe() {
+        for (error, code, message) in [
+            (
+                interaction_operations::ResolveToolExchangeError::InvalidResolution,
+                "invalid_exchange_resolution",
+                "tool exchange resolution is malformed or unsupported",
+            ),
+            (
+                interaction_operations::ResolveToolExchangeError::IncompatibleConsumer,
+                "incompatible_exchange_consumer",
+                "client did not advertise a compatible exchange adapter",
+            ),
+        ] {
+            assert_eq!(error.code(), code);
+            assert_eq!(error.message(), message);
+            assert!(!error.message().contains("secret-exchange-payload"));
         }
     }
 

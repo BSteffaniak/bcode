@@ -22,6 +22,26 @@ pub enum ResolveToolExchangeError {
     InvalidResolution,
 }
 
+impl ResolveToolExchangeError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::IncompatibleConsumer => "incompatible_exchange_consumer",
+            Self::InvalidResolution => "invalid_exchange_resolution",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::IncompatibleConsumer => "client did not advertise a compatible exchange adapter",
+            Self::InvalidResolution => "tool exchange resolution is malformed or unsupported",
+        }
+    }
+}
+
 async fn append_permission_requested_event(
     state: &ServerState,
     session_id: SessionId,
