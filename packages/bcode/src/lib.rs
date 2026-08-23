@@ -86,8 +86,8 @@ pub use bcode_model::{
     PromptCacheFeature, ProviderCapabilities, ProviderError, ProviderErrorCategory,
     ProviderErrorSource, ProviderRequestContext, ProviderRequestExtension,
     ProviderRequestProjection, ProviderRetryHint, ProviderTurnEvent, RequestedModelFeature,
-    StopReason, StructuredOutputMode, TokenUsage, ToolCall, ToolChoice, ToolChoiceMode, ToolResult,
-    ToolResultContent,
+    StopReason, StructuredOutputMode, StructuredOutputRequest, TokenUsage, ToolCall, ToolChoice,
+    ToolChoiceMode, ToolResult, ToolResultContent,
 };
 #[cfg(feature = "evaluation")]
 pub mod evaluation;
@@ -6894,6 +6894,7 @@ impl Agent {
         options: StructuredOutputOptions,
         cancellation: CancellationToken,
         timeout: Duration,
+        metadata: BTreeMap<String, String>,
     ) -> Result<T>
     where
         T: DeserializeOwned,
@@ -6910,6 +6911,7 @@ impl Agent {
             )?;
         let agent = Agent {
             timeout,
+            metadata,
             ..self.clone()
         };
         agent
