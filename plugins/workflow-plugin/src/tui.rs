@@ -1335,6 +1335,19 @@ impl WorkflowStatusSurface {
             vec![Line::from("Select a discovered workflow")]
         };
         let mut lines = lines;
+        lines.push(Line::from_spans(vec![
+            Span::styled("Keys: ", theme.muted),
+            Span::styled("/", theme.focused),
+            Span::styled(" search  ", theme.text),
+            Span::styled("f/r", theme.focused),
+            Span::styled(" filters  ", theme.text),
+            Span::styled("u", theme.focused),
+            Span::styled(" refresh  ", theme.text),
+            Span::styled("m", theme.focused),
+            Span::styled(" more  ", theme.text),
+            Span::styled("s", theme.focused),
+            Span::styled(" configure/start", theme.text),
+        ]));
         if let Some(source) = self.selected_launch_source.as_ref() {
             lines.insert(
                 0,
@@ -1474,13 +1487,20 @@ impl WorkflowStatusSurface {
                 catalog,
                 self.workspace_focus == WorkflowWorkspaceFocus::Catalog,
             );
-            self.render_inspector_pane(
-                detail_area,
-                frame,
-                theme,
-                true,
-                self.workspace_focus != WorkflowWorkspaceFocus::Catalog,
-            );
+            match self.workspace_focus {
+                WorkflowWorkspaceFocus::Graph => {
+                    self.render_graph_pane(detail_area, frame, theme, true);
+                }
+                _ => {
+                    self.render_inspector_pane(
+                        detail_area,
+                        frame,
+                        theme,
+                        true,
+                        self.workspace_focus == WorkflowWorkspaceFocus::Inspector,
+                    );
+                }
+            }
         } else {
             self.render_narrow_page(body, frame, theme, catalog);
         }
@@ -3946,6 +3966,8 @@ impl WorkflowStatusSurface {
         self.launch_table_state.set_selected(selected_launch);
         self.launch_table_state.interaction.focused =
             self.workspace_mode == WorkflowWorkspaceMode::Discover;
+        self.workspace_mode_state
+            .set_focused(self.workspace_mode == WorkflowWorkspaceMode::Discover);
         self.session_activity_tab_state
             .set_selected(Some(self.session_activity_tab));
         self.action_row_state.interaction.focused =
