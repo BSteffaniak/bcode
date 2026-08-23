@@ -80,5 +80,19 @@ rg -q 'WorkflowLaunchCatalog' packages/ipc/src/lib.rs \
     || fail 'IPC lacks portable workflow launch-catalog contracts'
 rg -q 'discover_workflows' packages/server/src/workflow_operations.rs \
     || fail 'application operations do not own workflow discovery orchestration'
+rg -q 'SessionViewSnapshot' plugins/workflow-plugin/src/tui.rs \
+    || fail 'workflow session drill-down does not consume renderer-neutral session snapshots'
+rg -q 'subscribe_session_view' plugins/workflow-plugin/src/tui.rs \
+    || fail 'workflow session drill-down does not use the bounded plugin host subscription'
+rg -q 'workflow_session_projection_request' plugins/workflow-plugin/src/tui.rs \
+    || fail 'workflow session drill-down lacks a fixed bounded projection request'
+rg -q 'const WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE: usize = 100;' plugins/workflow-plugin/src/tui.rs \
+    || fail 'workflow launch catalog lacks a fixed renderer request bound'
+rg -q 'fn workflow_graph_layout' plugins/workflow-plugin/src/tui.rs \
+    || fail 'workflow graph geometry is not renderer-owned'
+if rg -n 'WorkflowGraphLayout|WorkflowNodeCard|Rect|Point' packages/workflow/src/lib.rs \
+    packages/workflow-view/models/src/lib.rs | rg 'WorkflowLaunch|WorkflowRunView|WorkflowNodeView' >/dev/null; then
+    fail 'portable workflow contracts contain renderer graph geometry'
+fi
 
 printf 'workflow-view architecture check passed\n'

@@ -13,6 +13,42 @@ The surface subscribes to durable workflow notifications and performs bounded se
 
 Wide terminals use Runs, Graph, and Inspector panes. Medium terminals combine the run catalog with tabbed detail. Narrow terminals expose explicit Runs, Graph, Inspector, and Actions pages.
 
+## Discover and launch
+
+`/workflow` opens in **Discover**. Discovery is a bounded read-only application operation shared
+with `bcode workflow package discover`; neither the CLI nor terminal renderer owns filesystem
+scanning policy. The catalog contains configured package exports, standalone
+`*.workflow.{json,yaml,yml,toml}` files that are not package members, and enabled plugin templates.
+
+Repository roots are checked in deterministic precedence order (`.bcode/workflows`, then
+`workflows`, followed by configured repository and user roots). Equal-precedence ambiguity and
+malformed, escaped, unsupported, missing, unpublished, or drifted sources are shown as explicit
+non-runnable states rather than guessed. Files outside automatic roots remain available only through
+the explicit path inspection/import contract; automatic discovery never expands into a repository-wide
+recursive scan.
+
+Use `/` to search, `f` to cycle source kind, `r` to cycle readiness, `m` to request the next bounded
+page, and `R` to refresh. Selecting a row loads exact portable detail: provenance and package/export
+identity, diagnostics, requirements, effects and permission preview, input/configuration schemas,
+and semantic definition nodes and edges. Ready package exports and templates use `s` to open the
+retained schema-driven configuration form. Local validation is advisory; canonical application
+validation remains authoritative, and rejected values stay available for correction. Discovery never
+silently applies, publishes, starts, repairs, or grants authority.
+
+## Execution graph and node activity
+
+The Runs workspace adapts renderer-neutral workflow nodes and edges into TUI-owned deterministic
+layout, viewport, connector geometry, hit regions, and a narrow terminal tree fallback. Geometry is
+ephemeral presentation state and never changes dispatch, authorization, or persisted outcomes.
+
+Selecting a node retains its exact run, node, activation, attempt, and child-session identities. The
+Sessions inspector subscribes through the bounded `SessionViewSnapshot` host contract and replaces
+state only for the selected session at a non-regressive revision. It never decodes raw session events
+or copies transcripts into workflow storage. Activity, Transcript, Tools, Permissions, Outputs, and
+Attempts remain renderer-neutral semantic views; tool rows correlate exact tool-call IDs with their
+session-owned permission checkpoints. `o` opens the exact full child session when deeper interaction
+is needed. Workflow actions and session permission decisions remain separate canonical operations.
+
 ## Navigation
 
 Keyboard navigation is scoped to the focused pane. `Tab` changes pane focus; clicking a pane focuses

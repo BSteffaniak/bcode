@@ -132,6 +132,16 @@ Product-facing packages live under `examples/workflows/packages`. Each package d
 
 For discovery precedence, confinement, package locks, publication, restart, cancellation, waits, repair, and the complete public lifecycle, see [`workflow-package-lifecycle.md`](workflow-package-lifecycle.md).
 
+Supported source files placed directly under configured workflow roots are standalone launch-catalog
+entries unless a package manifest owns them as members. JSON, YAML, YML, and TOML suffixes use the
+same source-v3 lowering and diagnostics as explicit authoring commands. Outside-root files are never
+found by broad scanning: clients must request exact explicit-path inspection and then separately
+choose whether to apply/import, publish, or start through canonical lifecycle operations.
+
+`bcode workflow package discover` exposes the same bounded renderer-neutral launch catalog used by
+`/workflow`, including package exports, standalone sources, and plugin templates. It is a read-only
+parity entry point, not a second discovery implementation.
+
 ## CLI lifecycle
 
 ```text

@@ -33,6 +33,8 @@ use bmux_tui_components::tree_view::{TreeView, TreeViewItem, TreeViewState, Tree
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+const WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE: usize = 100;
+
 pub const WORKFLOW_STATUS_SURFACE_KIND: &str = "workflow.status";
 pub const WORKFLOW_AUTHOR_SURFACE_KIND: &str = "workflow.author";
 
@@ -842,6 +844,15 @@ impl WorkflowStatusSurface {
             target,
         });
         PluginTuiAction::Redraw
+    }
+
+    #[cfg(test)]
+    fn select_session_target(&mut self, session_id: String, node_id: String) {
+        self.selected_node_id = Some(node_id);
+        self.selected_child_session_id = Some(session_id);
+        self.active_detail_tab = 5;
+        self.session_activity_tab = 0;
+        self.workspace_focus = WorkflowWorkspaceFocus::Inspector;
     }
 
     fn selected_run_view(&self) -> Option<&bcode_workflow_view_models::WorkflowRunView> {
@@ -1883,7 +1894,7 @@ impl WorkflowStatusSurface {
             area.width,
             area.height.saturating_sub(tab_area.height),
         );
-        let lines = self.session_activity_error.as_ref().map_or_else(
+        let mut lines = self.session_activity_error.as_ref().map_or_else(
             || {
                 session_activity_tab_lines(
                     self.session_activity_tab,
@@ -1894,6 +1905,12 @@ impl WorkflowStatusSurface {
             },
             |error| vec![Line::from_spans(vec![Span::styled(error, theme.error)])],
         );
+        if let Some(session_id) = self.selected_child_session_id.as_deref() {
+            lines.push(Line::from_spans(vec![
+                Span::styled("o", theme.focused),
+                Span::styled(format!(" open full session · {session_id}"), theme.text),
+            ]));
+        }
         TextView::new(&lines)
             .policy(TextViewPolicy::scrollable())
             .styles(TextViewStyles {
@@ -2581,7 +2598,7 @@ impl WorkflowStatusSurface {
             }
         }
         if self.workspace_focus == WorkflowWorkspaceFocus::Inspector
-            && !self.workspace_areas.inspector_tabs.is_empty()
+            && !self.workspace_areas.inspector_content.is_empty()
         {
             let tabs = [
                 TabItem::new("overview", "Overview"),
@@ -2603,6 +2620,46 @@ impl WorkflowStatusSurface {
                 }
                 TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
                 TabBarOutcome::Ignored => {}
+            }
+            if self.active_detail_tab == 5 {
+                let outer_tab_height = u16::from(
+                    !self.workspace_areas.inspector_tabs.is_empty()
+                        || self.workspace_areas.inspector_content.width < 44,
+                );
+                let session_tabs = Rect::new(
+                    self.workspace_areas.inspector_content.x,
+                    self.workspace_areas
+                        .inspector_content
+                        .y
+                        .saturating_add(outer_tab_height),
+                    self.workspace_areas.inspector_content.width,
+                    1.min(
+                        self.workspace_areas
+                            .inspector_content
+                            .height
+                            .saturating_sub(outer_tab_height),
+                    ),
+                );
+                let tabs = [
+                    TabItem::new("activity", "Activity"),
+                    TabItem::new("transcript", "Transcript"),
+                    TabItem::new("tools", "Tools"),
+                    TabItem::new("permissions", "Permissions"),
+                    TabItem::new("outputs", "Outputs"),
+                    TabItem::new("attempts", "Attempts"),
+                ];
+                match TabBar::new(&tabs).handle_event(
+                    session_tabs,
+                    &mut self.session_activity_tab_state,
+                    event,
+                ) {
+                    TabBarOutcome::Selected(index) => {
+                        self.session_activity_tab = index;
+                        return PluginTuiAction::Redraw;
+                    }
+                    TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
+                    TabBarOutcome::Ignored => {}
+                }
             }
             if let Event::Mouse(mouse) = event
                 && self
@@ -2654,7 +2711,7 @@ impl WorkflowStatusSurface {
         let request = bcode_workflow::WorkflowLaunchCatalogRequest {
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             workspace,
-            limit: 100,
+            limit: WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE,
             cursor,
             search: self.launch_search.clone(),
             source_kind: self.launch_source_filter,
@@ -3963,7 +4020,11 @@ impl WorkflowStatusSurface {
                 PluginSessionViewUpdate::Snapshot(snapshot) => {
                     if snapshot.session_id.is_some_and(|session_id| {
                         Some(session_id.to_string()) == self.observed_session_id
-                    }) {
+                    }) && self
+                        .session_snapshot
+                        .as_ref()
+                        .is_none_or(|current| snapshot.revision >= current.revision)
+                    {
                         self.session_snapshot = Some(*snapshot);
                         self.session_activity_error = None;
                     }
@@ -4670,6 +4731,23 @@ fn session_tool_lines(
             } else {
                 theme.info
             };
+            let permissions = snapshot
+                .permissions
+                .iter()
+                .filter(|permission| permission.tool_call_id == tool.tool_call_id)
+                .map(|permission| {
+                    let state = if permission.resolved {
+                        if permission.approved == Some(true) {
+                            "approved"
+                        } else {
+                            "denied"
+                        }
+                    } else {
+                        "waiting"
+                    };
+                    format!("{} ({state})", permission.permission_id)
+                })
+                .collect::<Vec<_>>();
             [
                 Line::from_spans(vec![
                     Span::styled(
@@ -4678,6 +4756,15 @@ fn session_tool_lines(
                     ),
                     Span::styled(format!("{:?}", tool.status), style),
                 ]),
+                Line::from(format!("  call: {}", tool.tool_call_id)),
+                Line::from(format!(
+                    "  permission: {}",
+                    if permissions.is_empty() {
+                        "none requested".to_string()
+                    } else {
+                        permissions.join(", ")
+                    }
+                )),
                 Line::from(format!(
                     "  args: {}",
                     tool.arguments_json.as_deref().map_or_else(
@@ -8930,6 +9017,127 @@ mod tests {
             1,
             "pagination does not load row details"
         );
+    }
+
+    #[test]
+    fn session_activity_replaces_by_revision_and_ignores_stale_or_foreign_snapshots() {
+        let mut surface = projected_surface();
+        let selected_id = "00000000-0000-0000-0000-000000000001";
+        surface.observed_session_id = Some(selected_id.to_string());
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        surface.session_subscription = Some(PluginSessionViewSubscription { receiver });
+
+        let mut current = bcode_session_view_models::SessionViewSnapshot::empty();
+        current.session_id = Some(selected_id.parse().expect("session id"));
+        current.revision = 7;
+        sender
+            .try_send(PluginSessionViewUpdate::Snapshot(Box::new(current)))
+            .expect("current snapshot");
+        assert!(surface.poll_session_activity());
+        assert_eq!(
+            surface.session_snapshot.as_ref().map(|view| view.revision),
+            Some(7)
+        );
+
+        sender
+            .try_send(PluginSessionViewUpdate::Disconnected {
+                message: "reconnecting".to_string(),
+            })
+            .expect("disconnect");
+        let mut stale = bcode_session_view_models::SessionViewSnapshot::empty();
+        stale.session_id = Some(selected_id.parse().expect("session id"));
+        stale.revision = 6;
+        sender
+            .try_send(PluginSessionViewUpdate::Snapshot(Box::new(stale)))
+            .expect("stale snapshot");
+        let mut foreign = bcode_session_view_models::SessionViewSnapshot::empty();
+        foreign.session_id = Some(
+            "00000000-0000-0000-0000-000000000002"
+                .parse()
+                .expect("session id"),
+        );
+        foreign.revision = 99;
+        sender
+            .try_send(PluginSessionViewUpdate::Snapshot(Box::new(foreign)))
+            .expect("foreign snapshot");
+        assert!(surface.poll_session_activity());
+        assert_eq!(
+            surface.session_snapshot.as_ref().map(|view| view.revision),
+            Some(7)
+        );
+        assert_eq!(
+            surface.session_activity_error.as_deref(),
+            Some("reconnecting")
+        );
+
+        let mut replacement = bcode_session_view_models::SessionViewSnapshot::empty();
+        replacement.session_id = Some(selected_id.parse().expect("session id"));
+        replacement.revision = 8;
+        sender
+            .try_send(PluginSessionViewUpdate::Snapshot(Box::new(replacement)))
+            .expect("replacement snapshot");
+        assert!(surface.poll_session_activity());
+        assert_eq!(
+            surface.session_snapshot.as_ref().map(|view| view.revision),
+            Some(8)
+        );
+        assert!(surface.session_activity_error.is_none());
+    }
+
+    #[test]
+    fn bounded_session_updates_retain_only_the_latest_complete_snapshot() {
+        let mut surface = projected_surface();
+        let selected_id = "00000000-0000-0000-0000-000000000001";
+        surface.observed_session_id = Some(selected_id.to_string());
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        surface.session_subscription = Some(PluginSessionViewSubscription { receiver });
+        for revision in 1..=64 {
+            let mut snapshot = bcode_session_view_models::SessionViewSnapshot::empty();
+            snapshot.session_id = Some(selected_id.parse().expect("session id"));
+            snapshot.revision = revision;
+            sender
+                .try_send(PluginSessionViewUpdate::Snapshot(Box::new(snapshot)))
+                .expect("bounded snapshot");
+        }
+        assert!(surface.poll_session_activity());
+        assert_eq!(
+            surface.session_snapshot.as_ref().map(|view| view.revision),
+            Some(64)
+        );
+        assert!(
+            surface
+                .session_subscription
+                .as_mut()
+                .is_some_and(|subscription| subscription.receiver.try_recv().is_err())
+        );
+    }
+
+    #[test]
+    fn exact_session_selection_retargets_embedded_activity_without_retaining_prior_state() {
+        let mut surface = projected_surface();
+        surface.session_snapshot = Some(bcode_session_view_models::SessionViewSnapshot::empty());
+        surface.session_activity_error = Some("old connection".to_string());
+        surface.select_session_target(
+            "00000000-0000-0000-0000-000000000001".to_string(),
+            "reviewer".to_string(),
+        );
+        assert_eq!(surface.selected_node_id.as_deref(), Some("reviewer"));
+        assert_eq!(
+            surface.selected_child_session_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(surface.active_detail_tab, 5);
+        assert_eq!(surface.session_activity_tab, 0);
+        assert_eq!(surface.workspace_focus, WorkflowWorkspaceFocus::Inspector);
+
+        surface.observed_session_id = Some("00000000-0000-0000-0000-000000000002".to_string());
+        assert!(surface.reconcile_session_subscription(&TestHost));
+        assert_eq!(
+            surface.observed_session_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert!(surface.session_snapshot.is_none());
+        assert!(surface.session_activity_error.is_some());
     }
 
     #[test]

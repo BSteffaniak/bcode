@@ -12,6 +12,17 @@ contract. The bounded catalog includes package exports, standalone `*.workflow.{
 sources not owned as package members, and available plugin templates. Discovery itself is read-only:
 it does not apply drafts, publish revisions, grant authority, repair state, or start runs.
 
+An explicit source path is resolved through the same application operation but is not added to the
+automatic catalog. The exact file is canonicalized, must be a supported workflow source, and is
+confined as one requested source rather than used as a root for adjacent traversal. This keeps
+outside-root workflows usable without turning a path selection into repository-wide discovery or a
+persistent import. Apply/import remains a separate explicit lifecycle operation.
+
+The CLI's `bcode workflow package discover` command and `/workflow` both request this same catalog;
+they do not maintain independent precedence, package-member suppression, ambiguity, or confinement
+rules. CLI output is the renderer-neutral catalog JSON, including stable source identity, readiness,
+diagnostics, schemas, requirements, effects, permissions, and pagination cursor.
+
 Manifests and members are canonicalized and confined to their authorized package root. Import paths are relative normal-component JSON, YAML, or TOML paths. Absolute paths, parent traversal, symlink escape, duplicate canonical manifests, cycles, excessive closure depth, and unreachable closure members are rejected.
 
 ## Imports, locks, publication, and drift
