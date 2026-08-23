@@ -4581,6 +4581,40 @@ impl Bcode {
             .build())
     }
 
+    /// Build an embedded SDK handle from layered configuration and caller-provided static plugins,
+    /// then discover the configured provider's granular capabilities and selected-model metadata.
+    ///
+    /// This is the application-facing setup path for embedded callers that need capability-
+    /// negotiated model operations such as structured output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if configuration, plugin loading, provider discovery, or model discovery
+    /// fails.
+    #[cfg(all(feature = "config", feature = "embedded-plugins"))]
+    pub async fn configured_embedded_discovered_with_static_bundled(
+        static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    ) -> Result<Self> {
+        let bcode = Self::configured_embedded_with_static_bundled(static_plugins)?;
+        let selector = bcode
+            .default_model_selector()
+            .cloned()
+            .ok_or_else(|| BcodeError::ProviderConfiguration("no configured model".to_owned()))?;
+        let provider_plugin_id = selector.provider_plugin_id().ok_or_else(|| {
+            BcodeError::ProviderConfiguration(
+                "configured model does not select a provider plugin".to_owned(),
+            )
+        })?;
+        let provider_context = bcode.provider_context().clone();
+        bcode
+            .discover_provider(
+                provider_plugin_id.to_owned(),
+                provider_context,
+                Some(selector.model_id().to_owned()),
+            )
+            .await
+    }
+
     /// Discover one embedded provider into this SDK's registry.
     ///
     /// # Errors
