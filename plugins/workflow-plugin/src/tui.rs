@@ -205,6 +205,9 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 launch_start_pending: false,
                 launch_start_updates: None,
                 launch_start_error: None,
+                launch_lifecycle_pending: None,
+                launch_lifecycle_result: None,
+                launch_lifecycle_updates: None,
                 launch_form: None,
                 selected_run_id: None,
                 selected_node_id: None,
@@ -638,6 +641,11 @@ struct WorkflowStatusSurface {
         >,
     >,
     launch_start_error: Option<String>,
+    launch_lifecycle_pending: Option<bcode_workflow::WorkflowLaunchActionKind>,
+    launch_lifecycle_result: Option<String>,
+    launch_lifecycle_updates: Option<
+        tokio::sync::mpsc::Receiver<Result<String, bcode_plugin_sdk::tui::PluginTuiHostError>>,
+    >,
     launch_form: Option<WorkflowLaunchForm>,
     selected_run_id: Option<String>,
     selected_node_id: Option<String>,
@@ -1345,6 +1353,15 @@ impl WorkflowStatusSurface {
             vec![Line::from("Select a discovered workflow")]
         };
         let mut lines = lines;
+        if let Some(action) = self.launch_lifecycle_pending {
+            lines.push(Line::from_spans(vec![Span::styled(
+                format!("Running exact {action:?}…"),
+                theme.info,
+            )]));
+        }
+        if let Some(result) = &self.launch_lifecycle_result {
+            lines.push(Line::from_spans(vec![Span::styled(result, theme.info)]));
+        }
         lines.push(Line::from_spans(vec![
             Span::styled("Keys: ", theme.muted),
             Span::styled("/", theme.focused),
@@ -1355,6 +1372,8 @@ impl WorkflowStatusSurface {
             Span::styled(" refresh  ", theme.text),
             Span::styled("m", theme.focused),
             Span::styled(" more  ", theme.text),
+            Span::styled("v/p/o", theme.focused),
+            Span::styled(" validate/preview/open  ", theme.text),
             Span::styled("s", theme.focused),
             Span::styled(" configure/start", theme.text),
         ]));
@@ -2925,6 +2944,103 @@ impl WorkflowStatusSurface {
         PluginTuiAction::Redraw
     }
 
+    fn run_selected_launch_lifecycle(
+        &mut self,
+        kind: bcode_workflow::WorkflowLaunchActionKind,
+        host: &dyn PluginTuiHost,
+    ) -> PluginTuiAction {
+        let Some(detail) = self.launch_detail.as_ref() else {
+            self.launch_lifecycle_result = Some("Load exact workflow detail first".to_string());
+            return PluginTuiAction::Redraw;
+        };
+        let Some(affordance) = detail
+            .item
+            .actions
+            .iter()
+            .find(|action| action.kind == kind)
+        else {
+            self.launch_lifecycle_result = Some(format!("{kind:?} is not offered for this target"));
+            return PluginTuiAction::Redraw;
+        };
+        if !affordance.enabled {
+            self.launch_lifecycle_result = Some(
+                affordance
+                    .unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| format!("{kind:?} is unavailable")),
+            );
+            return PluginTuiAction::Redraw;
+        }
+        let document = detail.document.clone();
+        let configuration = detail.document.configuration_defaults.clone();
+        let future = match kind {
+            bcode_workflow::WorkflowLaunchActionKind::Validate => {
+                let future = host.validate_workflow_authoring(document);
+                Box::pin(async move {
+                    future.await.map(|report| {
+                        format!(
+                            "Validation {} · {} diagnostics",
+                            if report.valid { "passed" } else { "failed" },
+                            report.diagnostics.len()
+                        )
+                    })
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<
+                                        String,
+                                        bcode_plugin_sdk::tui::PluginTuiHostError,
+                                    >,
+                                > + Send,
+                        >,
+                    >
+            }
+            bcode_workflow::WorkflowLaunchActionKind::Preview => {
+                let future = host.preview_workflow_authoring(document, configuration);
+                Box::pin(async move {
+                    future.await.map(|preview| {
+                        format!(
+                            "Preview {} · {} diagnostics",
+                            if preview.validation.valid {
+                                "passed"
+                            } else {
+                                "failed"
+                            },
+                            preview.validation.diagnostics.len()
+                        )
+                    })
+                })
+            }
+            bcode_workflow::WorkflowLaunchActionKind::Start => {
+                return self.start_selected_launch(host);
+            }
+            bcode_workflow::WorkflowLaunchActionKind::OpenAuthoring => {
+                return PluginTuiAction::OpenSurface {
+                    plugin_id: "bcode.workflow".to_string(),
+                    surface_id: WORKFLOW_AUTHOR_SURFACE_KIND.to_string(),
+                    options: serde_json::json!({"document": detail.document}),
+                };
+            }
+            bcode_workflow::WorkflowLaunchActionKind::Apply
+            | bcode_workflow::WorkflowLaunchActionKind::Publish
+            | bcode_workflow::WorkflowLaunchActionKind::OpenSource => {
+                self.launch_lifecycle_result = Some(format!(
+                    "{kind:?} requires the exact source lifecycle operation"
+                ));
+                return PluginTuiAction::Redraw;
+            }
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        self.launch_lifecycle_updates = Some(receiver);
+        self.launch_lifecycle_pending = Some(kind);
+        self.launch_lifecycle_result = None;
+        host.spawn(Box::pin(async move {
+            let _ = sender.send(future.await).await;
+        }));
+        PluginTuiAction::Redraw
+    }
+
     fn cycle_launch_source_filter(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         self.launch_source_filter = match self.launch_source_filter {
             None => Some(bcode_workflow::WorkflowLaunchSourceKind::PackageExport),
@@ -3055,6 +3171,24 @@ impl WorkflowStatusSurface {
                 KeyCode::Char('f') => return self.cycle_launch_source_filter(host),
                 KeyCode::Char('r') => return self.cycle_launch_readiness_filter(host),
                 KeyCode::Char('u') => return self.request_launch_catalog(host, None, false),
+                KeyCode::Char('v') => {
+                    return self.run_selected_launch_lifecycle(
+                        bcode_workflow::WorkflowLaunchActionKind::Validate,
+                        host,
+                    );
+                }
+                KeyCode::Char('p') => {
+                    return self.run_selected_launch_lifecycle(
+                        bcode_workflow::WorkflowLaunchActionKind::Preview,
+                        host,
+                    );
+                }
+                KeyCode::Char('o') => {
+                    return self.run_selected_launch_lifecycle(
+                        bcode_workflow::WorkflowLaunchActionKind::OpenAuthoring,
+                        host,
+                    );
+                }
                 KeyCode::Char('s') => return self.start_selected_launch(host),
                 KeyCode::Char('m') => {
                     let cursor = self
@@ -4172,6 +4306,16 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                 }
                 Err(error) => self.launch_catalog_error = Some(error.to_string()),
             }
+            return PluginTuiAction::Redraw;
+        }
+        if let Some(receiver) = self.launch_lifecycle_updates.as_mut()
+            && let Ok(result) = receiver.try_recv()
+        {
+            self.launch_lifecycle_pending = None;
+            self.launch_lifecycle_result = Some(match result {
+                Ok(message) => message,
+                Err(error) => error.to_string(),
+            });
             return PluginTuiAction::Redraw;
         }
         if let Some(receiver) = self.launch_start_updates.as_mut()
@@ -7144,6 +7288,9 @@ mod tests {
             launch_start_pending: false,
             launch_start_updates: None,
             launch_start_error: None,
+            launch_lifecycle_pending: None,
+            launch_lifecycle_result: None,
+            launch_lifecycle_updates: None,
             launch_form: None,
             selected_run_id: Some("run-1".to_string()),
             selected_node_id: Some("reviewer".to_string()),
