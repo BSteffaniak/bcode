@@ -572,6 +572,7 @@ async fn open_surface(
         let request = PluginTuiSurfaceOpenRequest {
             instance_id: interaction_id.to_owned(),
             repo_path: None,
+            session_id: None,
             target: None,
             options,
         };

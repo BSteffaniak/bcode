@@ -87,6 +87,7 @@ async fn run_surface<W: Write>(
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id,
             repo_path: Some(repo_path),
+            session_id: None,
             target: None,
             options,
         },

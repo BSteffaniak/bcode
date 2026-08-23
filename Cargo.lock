@@ -2950,6 +2950,7 @@ dependencies = [
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_session_view_models",
  "bcode_workflow",
  "bcode_workflow_store",
  "bcode_workflow_view_models",

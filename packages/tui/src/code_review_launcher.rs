@@ -45,6 +45,7 @@ pub async fn run_home<W: Write>(
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id: "code-review-home".to_string(),
             repo_path: Some(repo_path),
+            session_id: None,
             target: None,
             options: serde_json::Value::Null,
         },
@@ -117,6 +118,7 @@ async fn run_with_workspace<W: Write>(
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id: "code-review".to_string(),
             repo_path: Some(repo_path),
+            session_id: None,
             target: None,
             options,
         },

@@ -1732,6 +1732,9 @@ pub struct PluginTuiSurfaceOpenRequest {
     pub instance_id: String,
     /// Repository path or workspace path associated with the surface.
     pub repo_path: Option<PathBuf>,
+    /// Active trusted session associated with the invocation, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     /// Plugin-defined target identifier.
     pub target: Option<String>,
     /// Plugin-defined JSON options.

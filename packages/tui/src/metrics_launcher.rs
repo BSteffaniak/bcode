@@ -30,6 +30,7 @@ pub async fn run_dashboard<W: Write>(
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id: "metrics-dashboard".to_string(),
             repo_path: Some(repo_path),
+            session_id: None,
             target: None,
             options: serde_json::json!({ "metrics_path": metrics_path }),
         },

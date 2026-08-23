@@ -1748,6 +1748,7 @@ impl TuiEffect {
                         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
                             instance_id,
                             repo_path: Some(working_directory),
+                            session_id,
                             target: None,
                             options,
                         },

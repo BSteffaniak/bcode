@@ -84,6 +84,7 @@ async fn open_ralph_home_surface(
         bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
             instance_id: "ralph-home".to_string(),
             repo_path: Some(repo_path),
+            session_id: None,
             target: None,
             options,
         },
