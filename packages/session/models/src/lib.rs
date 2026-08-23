@@ -805,6 +805,32 @@ pub struct ExecutionSessionSummary {
     pub visibility: SessionVisibility,
 }
 
+/// Origin of a session within aggregated multi-location discovery.
+///
+/// Aggregated discovery confers no authority: this identifies which state location owns a
+/// session's canonical storage so a renderer can label it and so callers can refuse
+/// cross-location mutation. It intentionally carries a stable identity and an optional
+/// human label rather than an absolute host path, so public frontend contracts do not leak
+/// filesystem layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLocationSummary {
+    /// Stable identity of the owning state location.
+    #[serde(default)]
+    pub location_id: String,
+    /// Configured profile name, when the location came from a named profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Whether this location is the primary write location for this process.
+    #[serde(default)]
+    pub primary: bool,
+    /// Whether more than one readable location claims this session ID.
+    ///
+    /// An ambiguous session is listed for visibility but must not be opened as
+    /// authoritative until an explicit maintenance operation resolves the conflict.
+    #[serde(default)]
+    pub ambiguous: bool,
+}
+
 /// Session summary used by list/select flows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -825,6 +851,9 @@ pub struct SessionSummary {
     pub import: Option<SessionImportSummary>,
     #[serde(default)]
     pub execution: Option<Box<ExecutionSessionSummary>>,
+    /// Owning state location, when aggregated discovery spans more than one location.
+    #[serde(default)]
+    pub location: Option<SessionLocationSummary>,
 }
 
 impl SessionSummary {

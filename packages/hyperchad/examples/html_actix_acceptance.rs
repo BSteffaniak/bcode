@@ -68,6 +68,7 @@ fn acceptance_session(session_id: SessionId) -> SessionSummary {
         working_directory: "/workspace/renderer-acceptance".into(),
         import: None,
         execution: None,
+        location: None,
     }
 }
 

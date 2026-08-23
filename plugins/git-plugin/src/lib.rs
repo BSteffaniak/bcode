@@ -12,7 +12,6 @@ use bcode_tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
@@ -547,23 +546,7 @@ fn sanitize_path_component(component: &str) -> String {
 }
 
 fn default_global_artifact_dir() -> PathBuf {
-    default_state_dir().join("artifacts")
-}
-
-fn default_state_dir() -> PathBuf {
-    if let Ok(path) = env::var("BCODE_STATE_DIR") {
-        return PathBuf::from(path);
-    }
-    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state_home).join("bcode");
-    }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("bcode");
-    }
-    env::temp_dir().join("bcode")
+    bcode_config::default_state_dir().join("artifacts")
 }
 
 fn clone_tool_definition() -> ToolDefinition {

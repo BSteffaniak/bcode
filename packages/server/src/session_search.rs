@@ -3770,6 +3770,7 @@ pub(crate) mod tests {
                 imported_at_ms: 30,
             }),
             execution: None,
+            location: None,
         };
         let record = bcode_session_search::SessionSearchRecord {
             schema_version: CURRENT_SEARCH_RECORD_VERSION,
@@ -3834,6 +3835,7 @@ pub(crate) mod tests {
             working_directory: std::path::PathBuf::new(),
             import: None,
             execution: None,
+            location: None,
         };
         let native = canonical_generation_fingerprint(&summary);
         summary.updated_at_ms = 999;
@@ -4076,6 +4078,7 @@ pub(crate) mod tests {
             working_directory: "/tmp".into(),
             import: None,
             execution: None,
+            location: None,
         };
         let second = bcode_session_models::SessionSummary {
             id: SessionId::new(),
@@ -4089,6 +4092,7 @@ pub(crate) mod tests {
             working_directory: "/tmp".into(),
             import: None,
             execution: None,
+            location: None,
         };
         let results = vec![
             SessionSearchBackfillSessionResult {

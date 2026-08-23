@@ -1652,6 +1652,7 @@ dependencies = [
  "hyperchad_docs_config_derive",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
@@ -1836,6 +1837,7 @@ dependencies = [
 name = "bcode_git_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_config",
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_tool",
@@ -1918,6 +1920,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
+ "bcode_config",
  "bcode_metrics",
  "bcode_model",
  "bcode_plugin",
@@ -1947,6 +1950,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
  "bcode_command",
+ "bcode_config",
  "bcode_ipc",
  "bcode_model_schema",
  "bcode_plugin_sdk",

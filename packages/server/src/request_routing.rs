@@ -50,6 +50,7 @@ pub enum SessionLifecycleRequest {
         daemon_namespace: String,
         artifact_id: Option<ArtifactId>,
         build_fingerprint: String,
+        state_location_id: Option<String>,
     },
     UpdateClientRuntimeContext {
         runtime_context: Option<ClientRuntimeContext>,
@@ -730,7 +731,7 @@ pub enum AgentSkillPluginRequest {
 /// A request bound to the domain that owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedRequest {
-    SessionLifecycle(SessionLifecycleRequest),
+    SessionLifecycle(Box<SessionLifecycleRequest>),
     SessionSearchAttach(SessionSearchAttachRequest),
     SessionTurn(SessionTurnRequest),
     WorkflowMutation(Box<WorkflowMutationRequest>),
@@ -758,44 +759,57 @@ impl RoutedRequest {
                 daemon_namespace,
                 artifact_id,
                 build_fingerprint,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::Hello {
+                state_location_id,
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::Hello {
                 client_name,
                 runtime_context,
                 daemon_namespace,
                 artifact_id,
                 build_fingerprint,
-            }),
-            Request::Ping => Self::SessionLifecycle(SessionLifecycleRequest::Ping),
+                state_location_id,
+            })),
+            Request::Ping => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::Ping)),
             Request::ServerStatus { working_directory } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ServerStatus { working_directory })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ServerStatus {
+                    working_directory,
+                }))
             }
             Request::ServerStop { mode } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ServerStop { mode })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ServerStop { mode }))
             }
             Request::CreateSession {
                 name,
                 working_directory,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::CreateSession {
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CreateSession {
                 name,
                 working_directory,
-            }),
+            })),
             Request::ListSessions { working_directory } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ListSessions { working_directory })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ListSessions {
+                    working_directory,
+                }))
             }
             Request::RenameSession { session_id, name } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::RenameSession { session_id, name })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RenameSession {
+                    session_id,
+                    name,
+                }))
             }
             Request::DeleteSession { session_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::DeleteSession { session_id })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::DeleteSession {
+                    session_id,
+                }))
             }
             Request::SessionHistory { session_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionHistory { session_id })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionHistory {
+                    session_id,
+                }))
             }
             Request::SessionHistoryPage { session_id, query } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionHistoryPage {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionHistoryPage {
                     session_id,
                     query,
-                })
+                }))
             }
             Request::AttachSession { session_id } => {
                 Self::SessionSearchAttach(SessionSearchAttachRequest::AttachSession { session_id })
@@ -1321,10 +1335,10 @@ impl RoutedRequest {
                 agent_id,
             }),
             Request::SessionHistoryAround { session_id, query } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionHistoryAround {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionHistoryAround {
                     session_id,
                     query,
-                })
+                }))
             }
             Request::ListPermissions => {
                 Self::PermissionInteraction(PermissionInteractionRequest::ListPermissions)
@@ -1381,72 +1395,72 @@ impl RoutedRequest {
                     payload,
                 })
             }
-            Request::UpdateClientRuntimeContext { runtime_context } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::UpdateClientRuntimeContext {
-                    runtime_context,
-                })
-            }
+            Request::UpdateClientRuntimeContext { runtime_context } => Self::SessionLifecycle(
+                Box::new(SessionLifecycleRequest::UpdateClientRuntimeContext { runtime_context }),
+            ),
             Request::ChangeSessionWorkingDirectory {
                 session_id,
                 working_directory,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::ChangeSessionWorkingDirectory {
-                session_id,
-                working_directory,
-            }),
+            } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::ChangeSessionWorkingDirectory {
+                    session_id,
+                    working_directory,
+                },
+            )),
             Request::ListWorktrees(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ListWorktrees(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ListWorktrees(payload)))
             }
             Request::WorktreeCreateStart {
                 operation_id,
                 request,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::WorktreeCreateStart {
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::WorktreeCreateStart {
                 operation_id,
                 request,
-            }),
+            })),
             Request::WorktreeCreateStatus { operation_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::WorktreeCreateStatus {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::WorktreeCreateStatus {
                     operation_id,
-                })
+                }))
             }
             Request::WorktreeCreateWait {
                 operation_id,
                 after_revision,
                 timeout_ms,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::WorktreeCreateWait {
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::WorktreeCreateWait {
                 operation_id,
                 after_revision,
                 timeout_ms,
-            }),
+            })),
             Request::RemoveWorktree(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::RemoveWorktree(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RemoveWorktree(payload)))
             }
             Request::RalphStatus(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::RalphStatus(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RalphStatus(payload)))
             }
             Request::RunRalphLoop(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::RunRalphLoop(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RunRalphLoop(payload)))
             }
             Request::CancelRalphLoop(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::CancelRalphLoop(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CancelRalphLoop(payload)))
             }
             Request::ListRalphRuns(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ListRalphRuns(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ListRalphRuns(payload)))
             }
-            Request::ListRalphIterations(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ListRalphIterations(payload))
-            }
+            Request::ListRalphIterations(payload) => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::ListRalphIterations(payload),
+            )),
             Request::ResumeRalphRun(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ResumeRalphRun(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ResumeRalphRun(payload)))
             }
             Request::ApproveRalphRun(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ApproveRalphRun(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ApproveRalphRun(payload)))
             }
             Request::RalphRunStatus(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::RalphRunStatus(payload))
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RalphRunStatus(payload)))
             }
-            Request::RecordRalphLifecycle(payload) => {
-                Self::SessionLifecycle(SessionLifecycleRequest::RecordRalphLifecycle(payload))
-            }
+            Request::RecordRalphLifecycle(payload) => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::RecordRalphLifecycle(payload),
+            )),
             Request::PrepareSessionOpen { session_id } => {
                 Self::SessionSearchAttach(SessionSearchAttachRequest::PrepareSessionOpen {
                     session_id,
@@ -1472,29 +1486,24 @@ impl RoutedRequest {
                 external_session_id,
                 working_directory,
             }),
-            Request::SessionDerivationSnapshot { session_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionDerivationSnapshot {
-                    session_id,
-                })
-            }
-            Request::SessionDerivationPrompts { session_id, query } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionDerivationPrompts {
-                    session_id,
-                    query,
-                })
-            }
+            Request::SessionDerivationSnapshot { session_id } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::SessionDerivationSnapshot { session_id },
+            )),
+            Request::SessionDerivationPrompts { session_id, query } => Self::SessionLifecycle(
+                Box::new(SessionLifecycleRequest::SessionDerivationPrompts { session_id, query }),
+            ),
             Request::DeriveSession { request } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::DeriveSession { request })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::DeriveSession { request }))
             }
             Request::SessionDerivationStatus { operation_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionDerivationStatus {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionDerivationStatus {
                     operation_id,
-                })
+                }))
             }
             Request::CancelSessionDerivation { operation_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::CancelSessionDerivation {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CancelSessionDerivation {
                     operation_id,
-                })
+                }))
             }
             Request::RefreshSessionCatalog {
                 working_directory,
@@ -1521,7 +1530,7 @@ impl RoutedRequest {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::SubscribeWorkflowRuns))
             }
             Request::SubscribeCatalogUpdates => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SubscribeCatalogUpdates)
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SubscribeCatalogUpdates))
             }
             Request::AttachSessionProjectionWindow {
                 session_id,
@@ -1533,10 +1542,13 @@ impl RoutedRequest {
                 },
             ),
             Request::SetComposerDraft { scope, text } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SetComposerDraft { scope, text })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SetComposerDraft {
+                    scope,
+                    text,
+                }))
             }
             Request::ComposerDraft { scope } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ComposerDraft { scope })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ComposerDraft { scope }))
             }
             Request::ListPendingToolExchanges => {
                 Self::PermissionInteraction(PermissionInteractionRequest::ListPendingToolExchanges)
@@ -1549,7 +1561,7 @@ impl RoutedRequest {
                 resolution_json,
             }),
             Request::ModelCatalogDiagnostics => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ModelCatalogDiagnostics)
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ModelCatalogDiagnostics))
             }
             Request::ReadSessionArtifact {
                 session_id,
@@ -1557,18 +1569,18 @@ impl RoutedRequest {
                 reference_key,
                 offset,
                 length,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::ReadSessionArtifact {
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ReadSessionArtifact {
                 session_id,
                 artifact_id,
                 reference_key,
                 offset,
                 length,
-            }),
+            })),
             Request::InvocationInput { session_id, input } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::InvocationInput {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::InvocationInput {
                     session_id,
                     input,
-                })
+                }))
             }
             Request::ResolvePermissionBatch { batch_id, approved } => {
                 Self::PermissionInteraction(PermissionInteractionRequest::ResolvePermissionBatch {
@@ -1577,7 +1589,9 @@ impl RoutedRequest {
                 })
             }
             Request::IngestClientMetrics { batch } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::IngestClientMetrics { batch })
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::IngestClientMetrics {
+                    batch,
+                }))
             }
             Request::AuthPoolList => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AuthPoolList)),
             Request::SetAuthPoolPreference { pool, profile } => {
@@ -1587,15 +1601,15 @@ impl RoutedRequest {
                 }))
             }
             Request::ReleaseSessionOwnership { session_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::ReleaseSessionOwnership {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ReleaseSessionOwnership {
                     session_id,
-                })
+                }))
             }
             Request::SessionInspection { session_id, query } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionInspection {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionInspection {
                     session_id,
                     query,
-                })
+                }))
             }
             Request::SessionSearch {
                 request,
@@ -1666,35 +1680,29 @@ impl RoutedRequest {
                     request,
                 })
             }
-            Request::SessionCompatibilityInventory { request } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionCompatibilityInventory {
-                    request,
-                })
-            }
-            Request::SessionBulkMigrationStart { request } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionBulkMigrationStart {
-                    request,
-                })
-            }
-            Request::SessionBulkMigrationStatus { operation_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionBulkMigrationStatus {
-                    operation_id,
-                })
-            }
+            Request::SessionCompatibilityInventory { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::SessionCompatibilityInventory { request },
+            )),
+            Request::SessionBulkMigrationStart { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::SessionBulkMigrationStart { request },
+            )),
+            Request::SessionBulkMigrationStatus { operation_id } => Self::SessionLifecycle(
+                Box::new(SessionLifecycleRequest::SessionBulkMigrationStatus { operation_id }),
+            ),
             Request::SessionBulkMigrationWait {
                 operation_id,
                 after_revision,
                 timeout_ms,
-            } => Self::SessionLifecycle(SessionLifecycleRequest::SessionBulkMigrationWait {
-                operation_id,
-                after_revision,
-                timeout_ms,
-            }),
-            Request::SessionBulkMigrationCancel { operation_id } => {
-                Self::SessionLifecycle(SessionLifecycleRequest::SessionBulkMigrationCancel {
+            } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::SessionBulkMigrationWait {
                     operation_id,
-                })
-            }
+                    after_revision,
+                    timeout_ms,
+                },
+            )),
+            Request::SessionBulkMigrationCancel { operation_id } => Self::SessionLifecycle(
+                Box::new(SessionLifecycleRequest::SessionBulkMigrationCancel { operation_id }),
+            ),
             Request::AppendPresentationNote {
                 session_id,
                 source_id,

@@ -2325,6 +2325,7 @@ fn daemon_status_from_record(record: &bcode_daemon_lifecycle::DaemonRecord) -> D
         build_fingerprint: record.build_fingerprint.clone(),
         executable_digest: record.executable_digest.clone(),
         storage_writer_epoch: record.storage_writer_epoch,
+        state_location_id: record.state_location_id.clone(),
         session_event_schema_version: Some(
             bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
         ),
@@ -3453,6 +3454,7 @@ async fn run_with_static_bundled_inner(
             session_event_schema_version: Some(
                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             ),
+            state_location_id: Some(bcode_ipc::state_location_id()),
             ..DaemonStatus::default()
         },
         daemon_status_from_record,
@@ -4173,7 +4175,7 @@ async fn dispatch_routed_request(
     match request {
         RoutedRequest::SessionLifecycle(request) => {
             Box::pin(handle_request_inner(
-                request, request_id, client_id, state, writer,
+                *request, request_id, client_id, state, writer,
             ))
             .await
         }
@@ -4285,6 +4287,7 @@ async fn handle_request_inner(
             daemon_namespace,
             artifact_id,
             build_fingerprint,
+            state_location_id,
         } => {
             handle_hello(
                 request_id,
@@ -4297,6 +4300,7 @@ async fn handle_request_inner(
                     daemon_namespace,
                     artifact_id,
                     build_fingerprint,
+                    state_location_id,
                 },
             )
             .await
@@ -6258,6 +6262,26 @@ struct ClientHello {
     daemon_namespace: String,
     artifact_id: Option<bcode_ipc::ArtifactId>,
     build_fingerprint: String,
+    state_location_id: Option<String>,
+}
+
+/// Reject a client that resolved a different durable state location.
+///
+/// Endpoint scoping already separates locations, but a client can be pointed at an
+/// explicit endpoint. Verifying here keeps the daemon from mutating canonical
+/// session storage on behalf of a client that resolved another location. A client
+/// that advertises no identity is unverifiable, not assumed local.
+fn validate_client_state_location(state_location_id: Option<&str>) -> Result<(), String> {
+    let expected = bcode_ipc::state_location_id();
+    match state_location_id {
+        Some(state_location_id) if state_location_id == expected => Ok(()),
+        Some(state_location_id) => Err(format!(
+            "client state location {state_location_id} does not match daemon state location {expected}"
+        )),
+        None => Err(format!(
+            "client did not advertise a state location; daemon serves {expected}"
+        )),
+    }
 }
 
 fn validate_client_artifact_id(artifact_id: Option<&bcode_ipc::ArtifactId>) -> Result<(), String> {
@@ -6301,6 +6325,14 @@ async fn handle_hello(
             writer,
             request_id,
             Response::Err(ErrorResponse::new("incompatible_build", message)),
+        )
+        .await;
+    }
+    if let Err(message) = validate_client_state_location(hello.state_location_id.as_deref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("incompatible_state_location", message)),
         )
         .await;
     }
@@ -10703,6 +10735,31 @@ fn database_error_requires_repair(error: &bcode_session::db::SessionDbError) -> 
         || message.contains("file is not a database")
 }
 
+/// Build a refusal response when a session ID is claimed by multiple state locations.
+///
+/// Returns `None` when the session is unambiguous. Reads already-loaded catalog state only,
+/// so it starts no discovery and opens no canonical storage.
+async fn ambiguous_session_location_response(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Option<Response> {
+    let locations = state
+        .session_catalog
+        .ambiguous_location_ids(session_id)
+        .await;
+    if locations.is_empty() {
+        return None;
+    }
+    Some(Response::Err(ErrorResponse::new(
+        "session_location_ambiguous",
+        format!(
+            "session {session_id} is claimed by {} state locations ({}); no location is opened as authoritative until an explicit maintenance operation resolves the conflict",
+            locations.len(),
+            locations.join(", ")
+        ),
+    )))
+}
+
 async fn handle_attach_session(
     request_id: u64,
     client_id: ClientId,
@@ -10711,6 +10768,12 @@ async fn handle_attach_session(
     attached_session: &mut Option<SessionId>,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
+    // Ambiguity is checked before any activation or attach side effect: when more than one
+    // readable state location claims this session ID, no location may be opened as
+    // authoritative until explicit maintenance resolves the conflict.
+    if let Some(response) = ambiguous_session_location_response(state, session_id).await {
+        return send_response(writer, request_id, response).await;
+    }
     recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let client_namespace = state.client_session_namespace(client_id).await;
     if let Err(active_namespace) = state
@@ -10779,6 +10842,9 @@ async fn handle_attach_session_recent(
     state
         .metrics
         .record_histogram("server.attach_recent.limit", usize_to_u64(limit));
+    if let Some(response) = ambiguous_session_location_response(state, session_id).await {
+        return send_response(writer, request_id, response).await;
+    }
     recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;
@@ -31472,10 +31538,21 @@ fn remove_session_artifact_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Return the artifact root for one session.
+///
+/// Session artifacts are session-owned durable state that can be large, so they
+/// follow the canonical session store root rather than the daemon-local state
+/// root. This keeps a session and its artifacts on the same volume.
+///
+/// Artifacts live in a `session-artifacts` sibling directory rather than inside
+/// the canonical `<session-id>/` directory: that directory is walked recursively
+/// by migration backup, and nesting bulk artifact bytes inside it would make
+/// every canonical backup copy them. Canonical session discovery only accepts
+/// directory names that parse as a session ID, so this sibling is ignored by
+/// catalog scans.
 fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
-    bcode_config::default_state_dir()
-        .join("artifacts")
-        .join("sessions")
+    bcode_config::default_session_store_dir()
+        .join("session-artifacts")
         .join(session_id.to_string())
 }
 
@@ -31883,6 +31960,7 @@ mod tests {
             working_directory: workspace.path().to_path_buf(),
             import: None,
             execution: None,
+            location: None,
         };
         assert_eq!(
             classify_session_compatibility(Some(root.path()), &missing)
@@ -37306,11 +37384,60 @@ library = "test"
 
     #[test]
     fn canonical_session_store_path_comes_from_config() {
+        // The canonical session root is resolved only by bcode_config. Its final
+        // component is `sessions` for the default XDG-derived layout, but an
+        // explicit session-root override may name any absolute directory, so the
+        // assertion is scoped to the default resolution path.
+        let default_root = bcode_config::default_state_dir_with_environment(
+            &bcode_config::ProcessConfigEnvironment,
+        )
+        .join("sessions");
         assert_eq!(
-            bcode_config::default_session_store_dir()
-                .file_name()
-                .and_then(|name| name.to_str()),
+            default_root.file_name().and_then(|name| name.to_str()),
             Some("sessions")
+        );
+    }
+
+    #[test]
+    fn client_state_location_validation_fails_closed() {
+        let expected = bcode_ipc::state_location_id();
+
+        assert!(
+            super::validate_client_state_location(Some(expected.as_str())).is_ok(),
+            "a client resolving the same state location must be accepted"
+        );
+
+        let foreign = super::validate_client_state_location(Some("some-other-location"))
+            .expect_err("a client resolving another state location must be rejected");
+        assert!(foreign.contains("some-other-location"), "{foreign}");
+        assert!(foreign.contains(&expected), "{foreign}");
+
+        let unverifiable = super::validate_client_state_location(None)
+            .expect_err("a client advertising no state location is unverifiable, not compatible");
+        assert!(unverifiable.contains(&expected), "{unverifiable}");
+    }
+
+    #[test]
+    fn session_artifacts_follow_the_canonical_session_root() {
+        let session_id = SessionId::new();
+        let artifact_dir = super::default_session_artifact_dir(session_id);
+        let sessions_root = bcode_config::default_session_store_dir();
+
+        assert!(
+            artifact_dir.starts_with(&sessions_root),
+            "session artifacts must live under the canonical session root so they \
+             share a volume with the session: {} not under {}",
+            artifact_dir.display(),
+            sessions_root.display()
+        );
+        assert!(
+            !artifact_dir.starts_with(sessions_root.join(session_id.to_string())),
+            "artifacts must not nest inside the canonical session directory, which \
+             migration backup walks recursively"
+        );
+        assert_eq!(
+            artifact_dir.file_name().and_then(|name| name.to_str()),
+            Some(session_id.to_string().as_str())
         );
     }
 
@@ -53099,6 +53226,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     session_event_schema_version: Some(
                         bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                     ),
+                    state_location_id: Some(bcode_ipc::state_location_id()),
                     instance_id: "test-workflow-daemon".to_string(),
                     ..DaemonStatus::default()
                 },

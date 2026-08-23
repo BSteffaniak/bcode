@@ -28,7 +28,13 @@ use thiserror::Error;
 pub const BCODE_EXECUTABLE_DIGEST_ENV: &str = "BCODE_EXECUTABLE_DIGEST";
 
 /// Current daemon registry record schema version.
-pub const DAEMON_RECORD_SCHEMA_VERSION: u32 = 3;
+///
+/// Version 4 adds `state_location_id`. The field is optional so version 3 records
+/// still decode; a record without it is unverifiable rather than assumed local.
+/// Version 5 widens that identity to the runtime scope pair
+/// `(state root, config directory)`, so a version 4 record's narrower identity no
+/// longer matches a current daemon and is treated as foreign rather than local.
+pub const DAEMON_RECORD_SCHEMA_VERSION: u32 = 5;
 
 /// Errors returned by daemon lifecycle registry operations.
 #[derive(Debug, Error)]
@@ -119,6 +125,14 @@ pub struct DaemonRecord {
     /// Durable session-storage writer epoch supported by this daemon, when known.
     #[serde(default)]
     pub storage_writer_epoch: Option<u32>,
+    /// Identity of the durable state location this daemon serves.
+    ///
+    /// Records already live under the state location they describe, so this is
+    /// corroborating evidence rather than the routing key. It lets classification
+    /// surface a record copied or inherited from another location instead of
+    /// silently treating it as local.
+    #[serde(default)]
+    pub state_location_id: Option<String>,
     /// Process identifier, when available.
     pub pid: Option<u32>,
     /// IPC endpoint for this daemon.
@@ -183,6 +197,7 @@ impl DaemonRecord {
             artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: BUILD_FINGERPRINT.to_string(),
             storage_writer_epoch: None,
+            state_location_id: Some(bcode_ipc::state_location_id()),
             pid: Some(std::process::id()),
             endpoint: endpoint_record(endpoint),
             log_path,
@@ -317,6 +332,7 @@ async fn probe_daemon_status(endpoint: &IpcEndpoint) -> Option<bcode_ipc::Daemon
             daemon_namespace: daemon_namespace(),
             artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: BUILD_FINGERPRINT.to_owned(),
+            state_location_id: Some(bcode_ipc::state_location_id()),
         },
     )
     .ok()?;
@@ -1456,6 +1472,7 @@ mod tests {
             artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: "test-build".to_string(),
             storage_writer_epoch,
+            state_location_id: Some(bcode_ipc::state_location_id()),
             pid: Some(std::process::id()),
             endpoint: DaemonEndpointRecord::Unknown {
                 debug: "test".to_string(),
@@ -1741,6 +1758,27 @@ mod tests {
     }
 
     #[test]
+    fn daemon_config_home_reproduces_the_resolved_config_directory() {
+        // A spawned daemon resolves `<XDG_CONFIG_HOME>/bcode`, so the parent must be
+        // passed for the child to land on the same directory the client resolved.
+        assert_eq!(
+            super::config_home_for_daemon(Path::new("/home/user/.config/bcode")),
+            PathBuf::from("/home/user/.config")
+        );
+        assert_eq!(
+            super::config_home_for_daemon(Path::new("/opt/custom/bcode")),
+            PathBuf::from("/opt/custom")
+        );
+        // A directory that is not the expected `bcode` leaf is passed through rather
+        // than guessed, so a mismatch surfaces at the handshake instead of silently
+        // redirecting the daemon's config.
+        assert_eq!(
+            super::config_home_for_daemon(Path::new("/tmp/unexpected")),
+            PathBuf::from("/tmp/unexpected")
+        );
+    }
+
+    #[test]
     fn daemon_record_identity_fields_are_independently_validated() {
         let record = record_with_writer_epoch(Some(2));
         let exact = bcode_ipc::DaemonStatus {
@@ -1750,6 +1788,7 @@ mod tests {
             build_fingerprint: record.build_fingerprint.clone(),
             executable_digest: record.executable_digest.clone(),
             storage_writer_epoch: record.storage_writer_epoch,
+            state_location_id: record.state_location_id.clone(),
             session_event_schema_version: None,
             pid: record.pid,
             instance_id: record.instance_id.clone(),
@@ -1813,6 +1852,7 @@ mod tests {
             build_fingerprint: current.build_fingerprint.clone(),
             executable_digest: current.executable_digest.clone(),
             storage_writer_epoch: current.storage_writer_epoch,
+            state_location_id: current.state_location_id.clone(),
             session_event_schema_version: None,
             pid: current.pid,
             instance_id: current.instance_id.clone(),
@@ -2137,6 +2177,23 @@ impl DaemonStartError {
     }
 }
 
+/// Return the `XDG_CONFIG_HOME` value that reproduces `config_dir` in a child process.
+///
+/// `bcode_config::default_config_dir()` resolves to `<config-home>/bcode`, so the
+/// daemon must inherit the parent of that directory for its own resolution to land on
+/// the same path. When the resolved directory has no parent — or is not the expected
+/// `bcode` leaf, which can happen for a temp-dir fallback — the directory is passed
+/// through unchanged rather than guessing, so a mismatch surfaces at the handshake
+/// instead of silently redirecting the daemon's config.
+fn config_home_for_daemon(config_dir: &Path) -> PathBuf {
+    if config_dir.file_name().and_then(|name| name.to_str()) == Some("bcode")
+        && let Some(parent) = config_dir.parent()
+    {
+        return parent.to_path_buf();
+    }
+    config_dir.to_path_buf()
+}
+
 /// Ensure the current namespace daemon is running, starting it when needed.
 ///
 /// # Errors
@@ -2190,6 +2247,24 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 .env(
                     bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV,
                     bcode_ipc::daemon_namespace(),
+                )
+                // The daemon must serve the runtime scope this client resolved — both the
+                // state location and the config directory — not whatever it would infer
+                // from inherited environment. An explicit command-line `--state-root`
+                // selection is process-scoped and would otherwise be lost across the
+                // process boundary, silently starting a daemon on a different canonical
+                // session root or under different plugin/permission policy.
+                .env(
+                    bcode_config::BCODE_STATE_DIR_ENV,
+                    bcode_config::default_state_dir(),
+                )
+                .env(
+                    bcode_config::BCODE_SESSION_STORE_DIR_ENV,
+                    bcode_config::default_session_store_dir(),
+                )
+                .env(
+                    "XDG_CONFIG_HOME",
+                    config_home_for_daemon(&bcode_config::default_config_dir()),
                 )
                 .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
                 .env("BCODE_DAEMON_LOG", &log_path)

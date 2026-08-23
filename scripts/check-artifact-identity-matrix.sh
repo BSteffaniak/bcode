@@ -125,6 +125,20 @@ BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
     "${workdir}/debug-a" server start >/dev/null
 session_id="$(BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
     "${workdir}/debug-a" session create cross-artifact-session)"
+
+# BCODE_SESSION_STORE_DIR must actually relocate canonical session storage. Without
+# this assertion the surrounding cross-artifact ownership checks would still pass
+# while every session silently lived under the default <state>/sessions root.
+if [[ ! -f "${session_root}/${session_id}/session.db" ]]; then
+    echo "canonical session storage did not honor BCODE_SESSION_STORE_DIR" >&2
+    echo "expected ${session_root}/${session_id}/session.db" >&2
+    find "${session_root}" "${session_state}" -name 'session.db' -print >&2 2>/dev/null || true
+    exit 1
+fi
+if [[ -e "${session_state}/sessions/${session_id}" ]]; then
+    echo "session storage leaked into the state-dir default root despite an explicit session root" >&2
+    exit 1
+fi
 BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
     "${workdir}/debug-a" attach "${session_id}" >"${workdir}/session-owner-attach.log" 2>&1 &
 owner_attach_pid="$!"

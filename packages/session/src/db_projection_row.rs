@@ -59,6 +59,7 @@ pub fn session_summary_from_catalog_row(
         working_directory,
         import: None,
         execution: None,
+        location: None,
     })
 }
 

@@ -8,7 +8,7 @@ use crate::{
 use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{SessionId, SessionSummary};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -56,6 +56,38 @@ impl SessionStore {
             metrics,
             lease_owner: SessionLeaseOwnerContext::default(),
         }
+    }
+
+    /// Discover bounded session summaries for read-only aggregated catalog display.
+    ///
+    /// This is the discovery path for a state location this process does not own. It
+    /// reads only derived per-session manifests plus canonical directory presence, so it
+    /// opens no canonical database, acquires no lease or lock, and performs no maintenance
+    /// or history replay. Aggregated discovery confers no authority: a session's
+    /// mutations and ownership still belong to the location that owns its canonical
+    /// storage.
+    ///
+    /// A missing root yields an empty list rather than an error, so an unmounted volume
+    /// is reported as an empty or degraded source instead of failing the whole catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root exists but cannot be enumerated.
+    pub fn discover_readable_session_summaries(
+        &self,
+    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let mut summaries = self.load_session_manifests()?;
+        let manifested = summaries
+            .iter()
+            .map(|summary| summary.id)
+            .collect::<BTreeSet<_>>();
+        for summary in self.discover_canonical_session_summaries()? {
+            if !manifested.contains(&summary.id) {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
+        Ok(summaries)
     }
 
     pub(crate) fn load_catalog(
@@ -145,6 +177,7 @@ impl SessionStore {
                 working_directory: self.root.clone(),
                 import: None,
                 execution: None,
+                location: None,
             });
         }
         Ok(summaries)
@@ -319,5 +352,101 @@ impl SessionStore {
 
     pub(crate) const fn lease_owner(&self) -> &SessionLeaseOwnerContext {
         &self.lease_owner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionStore;
+    use bcode_session_models::SessionId;
+
+    #[test]
+    fn readable_discovery_of_a_missing_root_is_empty_and_non_fatal() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let absent = temp.path().join("unmounted-volume").join("sessions");
+        let store = SessionStore::new(&absent);
+
+        let summaries = store
+            .discover_readable_session_summaries()
+            .expect("a missing root is reported as empty, not as an error");
+
+        assert!(summaries.is_empty());
+        assert!(
+            !absent.exists(),
+            "read-only discovery must not create the root it inspects"
+        );
+    }
+
+    #[test]
+    fn readable_discovery_finds_canonical_sessions_without_opening_or_mutating_them() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("sessions");
+        let session_id = SessionId::new();
+        let session_dir = root.join(session_id.to_string());
+        std::fs::create_dir_all(&session_dir).expect("session directory");
+        let database = session_dir.join("session.db");
+        std::fs::write(&database, b"canonical-bytes").expect("session database");
+        let before = std::fs::read(&database).expect("read database");
+
+        let store = SessionStore::new(&root);
+        let summaries = store
+            .discover_readable_session_summaries()
+            .expect("discovery succeeds");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, session_id);
+        assert_eq!(
+            std::fs::read(&database).expect("read database after discovery"),
+            before,
+            "discovery must not rewrite or otherwise mutate canonical storage"
+        );
+        assert!(
+            !root.join("catalog.db").exists(),
+            "discovery must not create a derived catalog in a location it does not own"
+        );
+        assert!(
+            !root.join("leases").exists() && !root.join("locks").exists(),
+            "discovery must not take leases or locks in a foreign location"
+        );
+    }
+
+    #[test]
+    fn readable_discovery_ignores_directories_that_are_not_session_ids() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("sessions");
+        let session_id = SessionId::new();
+        std::fs::create_dir_all(root.join(session_id.to_string())).expect("session directory");
+        std::fs::write(root.join(session_id.to_string()).join("session.db"), b"db")
+            .expect("session database");
+        // Sibling directories such as session artifacts must not be mistaken for sessions.
+        std::fs::create_dir_all(root.join("session-artifacts").join(session_id.to_string()))
+            .expect("artifact directory");
+        std::fs::create_dir_all(root.join("leases")).expect("leases");
+
+        let store = SessionStore::new(&root);
+        let summaries = store
+            .discover_readable_session_summaries()
+            .expect("discovery succeeds");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, session_id);
+    }
+
+    #[test]
+    fn readable_discovery_skips_session_directories_without_canonical_storage() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("sessions");
+        let session_id = SessionId::new();
+        std::fs::create_dir_all(root.join(session_id.to_string())).expect("session directory");
+
+        let store = SessionStore::new(&root);
+        let summaries = store
+            .discover_readable_session_summaries()
+            .expect("discovery succeeds");
+
+        assert!(
+            summaries.is_empty(),
+            "a directory without session.db is not a discoverable session"
+        );
     }
 }

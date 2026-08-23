@@ -72,12 +72,55 @@ struct SourceDiagnostics {}
 
 #[derive(Debug, Clone)]
 enum CatalogSourcePlan {
-    Native,
+    /// Canonical sessions owned by one resolved state location.
+    ///
+    /// The primary location is loaded through the owning `SessionManager`. Additional
+    /// readable locations are discovered read-only: no canonical database is opened, no
+    /// lease or lock is taken, and nothing is migrated or repaired. Aggregated discovery
+    /// confers no authority.
+    Native { location: NativeLocation },
     Import {
         plugin_id: String,
         source_id: String,
         working_directory: PathBuf,
     },
+}
+
+/// One state location participating in aggregated native discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLocation {
+    location_id: String,
+    profile: Option<String>,
+    sessions_root: PathBuf,
+    primary: bool,
+}
+
+impl NativeLocation {
+    fn source_id(&self) -> String {
+        if self.primary {
+            NATIVE_SOURCE_ID.to_owned()
+        } else {
+            format!("{NATIVE_SOURCE_ID}:{}", self.location_id)
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match (&self.profile, self.primary) {
+            (Some(profile), true) => format!("{NATIVE_DISPLAY_NAME} [{profile}]"),
+            (Some(profile), false) => format!("Bcode sessions [{profile}]"),
+            (None, true) => NATIVE_DISPLAY_NAME.to_owned(),
+            (None, false) => format!("Bcode sessions [{}]", self.location_id),
+        }
+    }
+
+    fn summary(&self) -> bcode_session_models::SessionLocationSummary {
+        bcode_session_models::SessionLocationSummary {
+            location_id: self.location_id.clone(),
+            profile: self.profile.clone(),
+            primary: self.primary,
+            ambiguous: false,
+        }
+    }
 }
 
 /// Point-in-time catalog response for one working directory.
@@ -125,9 +168,41 @@ impl SessionCatalog {
         snapshot_locked(&inner, &working_directory)
     }
 
-    /// Replace the native source with a fresh view from the session manager.
+    /// Return whether more than one readable state location claims this session ID.
+    ///
+    /// Ambiguity is reported from already-loaded catalog state only; this never triggers
+    /// discovery, opens canonical storage, or takes a lease. Callers must refuse to open an
+    /// ambiguous session as authoritative until explicit maintenance resolves the conflict.
+    pub async fn ambiguous_location_ids(&self, session_id: SessionId) -> Vec<String> {
+        let mut locations = BTreeSet::new();
+        {
+            let inner = self.inner.lock().await;
+            for source in inner.sources.values() {
+                for session in source.sessions() {
+                    if session.id == session_id
+                        && let Some(location) = &session.location
+                    {
+                        locations.insert(location.location_id.clone());
+                    }
+                }
+            }
+        }
+        if locations.len() > 1 {
+            locations.into_iter().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Replace the primary native source with a fresh view from the session manager.
     pub async fn refresh_native_now(&self, state: &ServerState) {
-        let result = load_native_source(state).await;
+        let Some(location) = native_locations()
+            .into_iter()
+            .find(|location| location.primary)
+        else {
+            return;
+        };
+        let result = load_native_source(state, &location).await;
         self.apply_source_result(native_source_key(), native_metadata(), result)
             .await;
     }
@@ -335,7 +410,10 @@ struct SourceLoadResult {
 impl CatalogSourcePlan {
     fn key(&self) -> CatalogSourceKey {
         match self {
-            Self::Native => native_source_key(),
+            Self::Native { location } => CatalogSourceKey {
+                source_id: location.source_id(),
+                scope: CatalogSourceScope::Global,
+            },
             Self::Import {
                 source_id,
                 working_directory,
@@ -349,7 +427,9 @@ impl CatalogSourcePlan {
 
     fn metadata(&self) -> SourceMetadata {
         match self {
-            Self::Native => native_metadata(),
+            Self::Native { location } => SourceMetadata {
+                display_name: location.display_name(),
+            },
             Self::Import { source_id, .. } => SourceMetadata {
                 display_name: format!("Imported [{source_id}] sessions"),
             },
@@ -383,8 +463,61 @@ fn native_metadata() -> SourceMetadata {
     }
 }
 
+/// Resolve the state locations that participate in aggregated native discovery.
+///
+/// The primary location always participates. Additional readable locations come from
+/// `[state] readable_profiles`. Resolution failures are skipped rather than propagated: a
+/// location that cannot be resolved must not prevent the rest of the catalog from loading
+/// (`Domain-local durable failures remain isolated`).
+fn native_locations() -> Vec<NativeLocation> {
+    let primary_sessions_root = bcode_config::default_session_store_dir();
+    let primary_root = bcode_config::default_state_dir();
+    let primary_id = bcode_config::StateLocationId::from_canonical_root(&primary_root)
+        .as_str()
+        .to_owned();
+    let mut locations = vec![NativeLocation {
+        location_id: primary_id.clone(),
+        profile: None,
+        sessions_root: primary_sessions_root,
+        primary: true,
+    }];
+
+    let Ok(config) = bcode_config::load_config() else {
+        return locations;
+    };
+    if config.state.readable_profiles.is_empty() {
+        return locations;
+    }
+    let Ok(resolved) = bcode_config::resolve_state_location_set(
+        &config.state,
+        &bcode_config::StateLocationSelection::default(),
+    ) else {
+        return locations;
+    };
+    for location in resolved.readable() {
+        let location_id = location.id().as_str().to_owned();
+        if location_id == primary_id
+            || locations
+                .iter()
+                .any(|existing| existing.location_id == location_id)
+        {
+            continue;
+        }
+        locations.push(NativeLocation {
+            location_id,
+            profile: location.profile().map(str::to_owned),
+            sessions_root: location.sessions_root().to_path_buf(),
+            primary: false,
+        });
+    }
+    locations
+}
+
 async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<CatalogSourcePlan> {
-    let mut plans = vec![CatalogSourcePlan::Native];
+    let mut plans = native_locations()
+        .into_iter()
+        .map(|location| CatalogSourcePlan::Native { location })
+        .collect::<Vec<_>>();
     if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
         return plans;
     }
@@ -412,7 +545,13 @@ async fn load_source(
     plan: &CatalogSourcePlan,
 ) -> Result<SourceLoadResult, String> {
     match plan {
-        CatalogSourcePlan::Native => load_native_source(state).await,
+        CatalogSourcePlan::Native { location } => {
+            if location.primary {
+                load_native_source(state, location).await
+            } else {
+                load_foreign_native_source(location).await
+            }
+        }
         CatalogSourcePlan::Import {
             plugin_id,
             source_id,
@@ -421,7 +560,39 @@ async fn load_source(
     }
 }
 
-async fn load_native_source(state: &ServerState) -> Result<SourceLoadResult, String> {
+/// Discover sessions in a state location this daemon does not own.
+///
+/// Bounded and non-mutating by construction: it reads derived manifests plus canonical
+/// directory presence through `SessionStore::discover_readable_session_summaries`, so it
+/// opens no canonical database and takes no lease. An unavailable root (for example an
+/// unmounted volume) yields a degraded source rather than failing the whole catalog.
+async fn load_foreign_native_source(location: &NativeLocation) -> Result<SourceLoadResult, String> {
+    let sessions_root = location.sessions_root.clone();
+    let location_summary = location.summary();
+    tokio::task::spawn_blocking(move || {
+        let store = bcode_session::SessionStore::new(&sessions_root);
+        let sessions = store
+            .discover_readable_session_summaries()
+            .map_err(|error| error.to_string())?;
+        Ok(SourceLoadResult {
+            sessions: sessions
+                .into_iter()
+                .map(|mut summary| {
+                    summary.location = Some(location_summary.clone());
+                    summary
+                })
+                .collect(),
+            diagnostics: SourceDiagnostics::default(),
+        })
+    })
+    .await
+    .map_err(|error| format!("foreign session discovery task failed: {error}"))?
+}
+
+async fn load_native_source(
+    state: &ServerState,
+    location: &NativeLocation,
+) -> Result<SourceLoadResult, String> {
     state
         .sessions
         .wait_catalog_loaded()
@@ -429,8 +600,16 @@ async fn load_native_source(state: &ServerState) -> Result<SourceLoadResult, Str
         .map_err(|error| error.to_string())?;
     let entries = state.sessions.all_session_catalog_entries().await;
     let diagnostics = native_source_diagnostics(&entries);
+    let location_summary = location.summary();
     Ok(SourceLoadResult {
-        sessions: entries.into_iter().map(|entry| entry.summary).collect(),
+        sessions: entries
+            .into_iter()
+            .map(|entry| {
+                let mut summary = entry.summary;
+                summary.location = Some(location_summary.clone());
+                summary
+            })
+            .collect(),
         diagnostics,
     })
 }
@@ -466,11 +645,24 @@ fn snapshot_locked(
         }
         sources.push(source_status(key, source));
         match &key.scope {
+            // Native/global sources are filtered to the caller's working directory. Foreign
+            // readable locations are discovered from derived manifests, where a session
+            // without manifest metadata falls back to the store root as its working
+            // directory, so those entries cannot be working-directory filtered without
+            // hiding them entirely. Retain foreign sessions that carry no usable working
+            // directory, and filter the ones that do.
             CatalogSourceScope::Global => sessions.extend(
                 source
                     .sessions()
                     .iter()
                     .filter(|session| {
+                        let is_foreign = session
+                            .location
+                            .as_ref()
+                            .is_some_and(|location| !location.primary);
+                        if is_foreign && session.updated_at_ms == 0 {
+                            return true;
+                        }
                         normalize_path(&session.working_directory) == working_directory
                     })
                     .cloned(),
@@ -494,11 +686,38 @@ fn snapshot_locked(
     }
 
     sort_sessions(&mut sessions);
+    mark_ambiguous_locations(&mut sessions);
     SessionCatalogSnapshot {
         status: aggregate_status(sources.iter().map(|source| &source.status)),
         sessions,
         sources,
         revision: inner.revision,
+    }
+}
+
+/// Flag sessions whose ID is claimed by more than one readable state location.
+///
+/// Duplicate canonical roots are never merged automatically. Every claim is retained and
+/// marked ambiguous so the conflict is visible; callers must refuse to open an ambiguous
+/// session as authoritative until an explicit maintenance operation resolves it
+/// (`Canonical history is never silently merged`, `Sensitive ambiguity fails closed`).
+fn mark_ambiguous_locations(sessions: &mut [SessionSummary]) {
+    let mut claims: BTreeMap<SessionId, BTreeSet<String>> = BTreeMap::new();
+    for session in sessions.iter() {
+        if let Some(location) = &session.location {
+            claims
+                .entry(session.id)
+                .or_default()
+                .insert(location.location_id.clone());
+        }
+    }
+    for session in sessions.iter_mut() {
+        let ambiguous = claims
+            .get(&session.id)
+            .is_some_and(|locations| locations.len() > 1);
+        if ambiguous && let Some(location) = session.location.as_mut() {
+            location.ambiguous = true;
+        }
     }
 }
 
@@ -676,6 +895,9 @@ fn importable_to_summary(
             imported_at_ms: 0,
         }),
         execution: None,
+        // Importable external sessions are not owned by a Bcode state location until they
+        // are imported, so they carry no owning-location label.
+        location: None,
     }
 }
 
@@ -716,4 +938,125 @@ fn current_unix_millis() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NativeLocation, mark_ambiguous_locations};
+    use bcode_session_models::{
+        SessionId, SessionLocationSummary, SessionSummary, SessionTitleSource,
+    };
+    use std::path::PathBuf;
+
+    fn location(location_id: &str, profile: Option<&str>, primary: bool) -> NativeLocation {
+        NativeLocation {
+            location_id: location_id.to_owned(),
+            profile: profile.map(str::to_owned),
+            sessions_root: PathBuf::from("/tmp").join(location_id),
+            primary,
+        }
+    }
+
+    fn summary(id: SessionId, location: Option<SessionLocationSummary>) -> SessionSummary {
+        SessionSummary {
+            id,
+            name: None,
+            explicit_name: None,
+            derived_title: None,
+            title_source: SessionTitleSource::EmptyDraft,
+            client_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            working_directory: PathBuf::from("/tmp/workspace"),
+            import: None,
+            execution: None,
+            location,
+        }
+    }
+
+    #[test]
+    fn primary_location_keeps_the_stable_native_source_identity() {
+        let primary = location("aaaa", None, true);
+        let foreign = location("bbbb", Some("big"), false);
+
+        assert_eq!(primary.source_id(), "native");
+        assert_eq!(foreign.source_id(), "native:bbbb");
+        assert_ne!(primary.source_id(), foreign.source_id());
+    }
+
+    #[test]
+    fn location_display_names_prefer_profile_labels_without_leaking_paths() {
+        assert_eq!(
+            location("aaaa", None, true).display_name(),
+            "Native Bcode sessions"
+        );
+        assert_eq!(
+            location("bbbb", Some("big"), false).display_name(),
+            "Bcode sessions [big]"
+        );
+
+        // An unnamed foreign location falls back to its opaque identity, never its root path.
+        let unnamed = location("cccc", None, false);
+        let display = unnamed.display_name();
+        assert!(display.contains("cccc"), "{display}");
+        assert!(!display.contains("/tmp"), "{display}");
+    }
+
+    #[test]
+    fn duplicate_session_ids_across_locations_are_marked_ambiguous_not_merged() {
+        let shared = SessionId::new();
+        let unique = SessionId::new();
+        let mut sessions = vec![
+            summary(shared, Some(location("aaaa", None, true).summary())),
+            summary(shared, Some(location("bbbb", Some("big"), false).summary())),
+            summary(unique, Some(location("aaaa", None, true).summary())),
+        ];
+
+        mark_ambiguous_locations(&mut sessions);
+
+        assert_eq!(
+            sessions.len(),
+            3,
+            "duplicate claims must be retained rather than merged"
+        );
+        let ambiguous = sessions
+            .iter()
+            .filter(|session| session.id == shared)
+            .collect::<Vec<_>>();
+        assert_eq!(ambiguous.len(), 2);
+        assert!(
+            ambiguous
+                .iter()
+                .all(|session| session.location.as_ref().is_some_and(|l| l.ambiguous)),
+            "every claim on a duplicated session ID must be flagged ambiguous"
+        );
+        let unaffected = sessions
+            .iter()
+            .find(|session| session.id == unique)
+            .expect("unique session");
+        assert!(
+            !unaffected.location.as_ref().expect("location").ambiguous,
+            "an unambiguous session must not be flagged"
+        );
+    }
+
+    #[test]
+    fn one_location_claiming_a_session_is_never_ambiguous() {
+        let id = SessionId::new();
+        let mut sessions = vec![summary(id, Some(location("aaaa", None, true).summary()))];
+
+        mark_ambiguous_locations(&mut sessions);
+
+        assert!(!sessions[0].location.as_ref().expect("location").ambiguous);
+    }
+
+    #[test]
+    fn sessions_without_location_metadata_are_left_untouched() {
+        let id = SessionId::new();
+        let mut sessions = vec![summary(id, None), summary(id, None)];
+
+        mark_ambiguous_locations(&mut sessions);
+
+        assert!(sessions.iter().all(|session| session.location.is_none()));
+    }
 }

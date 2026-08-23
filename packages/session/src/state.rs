@@ -193,6 +193,7 @@ impl SessionState {
                         visibility: state.visibility,
                     })
                 }),
+                location: None,
             },
             working_directory,
             clients: BTreeSet::new(),

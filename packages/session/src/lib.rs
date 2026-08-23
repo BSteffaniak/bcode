@@ -1415,6 +1415,7 @@ impl SessionManager {
                     visibility: SessionVisibility::Background,
                 })
             }),
+            location: None,
         };
         let state = SessionState {
             summary: summary.clone(),
@@ -3226,6 +3227,7 @@ mod tests {
             working_directory: test_working_directory(),
             import: None,
             execution: None,
+            location: None,
         };
         coordinator.delete(session_id, 20).await;
         coordinator.schedule(summary).await;
@@ -3264,6 +3266,7 @@ mod tests {
             working_directory: test_working_directory(),
             import: None,
             execution: None,
+            location: None,
         };
         let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
             .await

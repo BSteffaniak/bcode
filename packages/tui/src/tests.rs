@@ -440,6 +440,7 @@ fn session_summary(session_id: SessionId) -> SessionSummary {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         execution: None,
+        location: None,
     }
 }
 
@@ -1549,6 +1550,7 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         execution: None,
+        location: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
     let mut frame = Frame::new(&mut buffer);
@@ -1575,6 +1577,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         execution: None,
+        location: None,
     });
     app.apply_model_status(bcode_ipc::SessionModelStatus {
         provider_plugin_id: Some("very-long-provider-plugin-id".to_owned()),
@@ -1790,6 +1793,7 @@ fn live_session_rename_overrides_attach_summary_title() {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         execution: None,
+        location: None,
     });
 
     app.absorb_session_event(&event(
@@ -6664,6 +6668,7 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
                             session_event_schema_version: Some(
                                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                             ),
+                            state_location_id: Some(bcode_ipc::state_location_id()),
                             ..bcode_ipc::DaemonStatus::default()
                         },
                     })

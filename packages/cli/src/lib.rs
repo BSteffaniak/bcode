@@ -244,6 +244,7 @@ pub async fn run_with_static_bundled(
     command = command.version(build_info().display_version());
     let matches = command.get_matches();
     let _config_override = config_override_from_matches(&matches);
+    let _state_location = state_location_from_matches(&matches)?;
     let exceptional_execution_mode = matches.get_flag("dangerously_bypass_all_permissions")
         || matches.get_flag("disable_all_tools");
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
@@ -339,8 +340,27 @@ fn config_override_from_matches(
     ))
 }
 
+fn state_location_from_matches(
+    matches: &clap::ArgMatches,
+) -> Result<Option<bcode_config::StateLocationGuard>, CliError> {
+    let selection = bcode_config::StateLocationSelection {
+        root: matches.get_one::<PathBuf>("state_root").cloned(),
+        profile: matches.get_one::<String>("state_profile").cloned(),
+    };
+    if selection.is_empty() {
+        return Ok(None);
+    }
+    let config = bcode_config::load_config()?;
+    let resolved = bcode_config::resolve_state_location_set(&config.state, &selection)
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    Ok(Some(bcode_config::push_process_state_location(
+        resolved.primary(),
+    )))
+}
+
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     let _ = (&cli.profile, cli.request_timeout_secs);
+    let _ = (&cli.state_root, &cli.state_profile);
     let launch_options = cli.launch_options();
     if launch_options != bcode_tui::TuiLaunchOptions::default() && !cli.supports_execution_mode() {
         return Err(CliError::InvalidArguments(
@@ -2578,6 +2598,17 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     request_timeout_secs: Option<u64>,
+    /// Use an explicit absolute durable state root for this invocation.
+    #[arg(
+        long = "state-root",
+        global = true,
+        value_name = "DIR",
+        conflicts_with = "state_profile"
+    )]
+    state_root: Option<PathBuf>,
+    /// Select a named `[state.profile.<name>]` durable state location.
+    #[arg(long = "state-profile", global = true, value_name = "PROFILE")]
+    state_profile: Option<String>,
     /// Force the onboarding/setup-map flow.
     #[arg(long = "onboard", global = true)]
     onboard: bool,
@@ -16555,6 +16586,7 @@ mod web_command_tests {
                 path: PathBuf::from("/tmp/owner.sock"),
             },
             storage_writer_epoch: Some(5),
+            state_location_id: Some(bcode_ipc::state_location_id()),
             pid: Some(42),
             instance_id: "instance".to_owned(),
             log_path: PathBuf::from("/tmp/owner.log"),
@@ -16569,6 +16601,7 @@ mod web_command_tests {
             build_fingerprint: "build".to_owned(),
             executable_digest: Some("digest".to_owned()),
             storage_writer_epoch: Some(5),
+            state_location_id: Some(bcode_ipc::state_location_id()),
             session_event_schema_version: Some(
                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             ),
@@ -16662,6 +16695,7 @@ mod web_command_tests {
             artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: "build".to_string(),
             storage_writer_epoch: Some(2),
+            state_location_id: Some(bcode_ipc::state_location_id()),
             pid: Some(1),
             endpoint: bcode_daemon_lifecycle::DaemonEndpointRecord::Unknown {
                 debug: "test".to_string(),
@@ -16680,6 +16714,7 @@ mod web_command_tests {
             build_fingerprint: "build".to_string(),
             executable_digest: Some("digest".to_string()),
             storage_writer_epoch: Some(2),
+            state_location_id: Some(bcode_ipc::state_location_id()),
             session_event_schema_version: Some(38),
             pid: Some(1),
             instance_id: "instance".to_string(),
@@ -18984,6 +19019,48 @@ mod client_timeout_cli_tests {
             .expect("positive timeout should parse");
 
         assert_eq!(cli.request_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn state_location_flags_parse_and_are_mutually_exclusive() {
+        let root = Cli::try_parse_from(["bcode", "--state-root", "/volumes/big/bcode-state"])
+            .expect("state root should parse");
+        assert_eq!(
+            root.state_root.as_deref(),
+            Some(std::path::Path::new("/volumes/big/bcode-state"))
+        );
+        assert_eq!(root.state_profile, None);
+
+        let profile = Cli::try_parse_from(["bcode", "--state-profile", "big"])
+            .expect("state profile should parse");
+        assert_eq!(profile.state_profile.as_deref(), Some("big"));
+        assert_eq!(profile.state_root, None);
+
+        Cli::try_parse_from([
+            "bcode",
+            "--state-root",
+            "/volumes/big/bcode-state",
+            "--state-profile",
+            "big",
+        ])
+        .expect_err("state root and state profile must be mutually exclusive");
+    }
+
+    #[test]
+    fn state_location_flags_are_global_for_subcommands() {
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "list",
+            "--state-root",
+            "/volumes/big/bcode-state",
+        ])
+        .expect("global state root should parse after a subcommand");
+
+        assert_eq!(
+            cli.state_root.as_deref(),
+            Some(std::path::Path::new("/volumes/big/bcode-state"))
+        );
     }
 
     #[test]

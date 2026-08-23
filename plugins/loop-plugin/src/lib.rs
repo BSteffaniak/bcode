@@ -1400,15 +1400,7 @@ fn legacy_state_path(session_id: SessionId) -> PathBuf {
 }
 
 fn legacy_state_root() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME").map_or_else(
-        || {
-            std::env::var_os("HOME").map_or_else(
-                || PathBuf::from(".bcode-loop"),
-                |home| PathBuf::from(home).join(".local/state/bcode/loop"),
-            )
-        },
-        |root| PathBuf::from(root).join("bcode/loop"),
-    )
+    bcode_config::default_state_dir().join("loop")
 }
 
 #[cfg(test)]

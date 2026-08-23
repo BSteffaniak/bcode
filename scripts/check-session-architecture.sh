@@ -707,6 +707,18 @@ if sed -n '/async fn legacy_session_migrates_across_real_attach_and_send_ipc/,/^
   violations=1
 fi
 
+# Multi-location canonical-storage semantics must stay cataloged and documented together.
+# The invariant text is the acceptance criterion; the architecture doc explains the mechanics.
+if ! rg -q "^\* \*\*Aggregated session discovery does not confer authority\.\*\*" INVARIANTS.md \
+  || ! rg -q "Exactly one state location owns a session's canonical storage" INVARIANTS.md \
+  || ! rg -q 'an unavailable or unverifiable location must not resolve to a substitute location' INVARIANTS.md \
+  || ! rg -q 'no location is opened as authoritative until an explicit maintenance operation' INVARIANTS.md \
+  || ! rg -q 'confers no authority' docs/session-persistence-architecture.md \
+  || ! rg -q 'docs/state-locations.md|\[State Locations\]\(state-locations\.md\)' docs/session-persistence-architecture.md; then
+  echo "Session state-location documentation violation: multi-location canonical ownership, no-substitute resolution, ambiguity handling, and read-only aggregation must remain explicit." >&2
+  violations=1
+fi
+
 if ! scripts/check-no-normal-full-scans.sh; then
   violations=1
 fi

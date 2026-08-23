@@ -21,10 +21,35 @@ The exact produced-artifact identity is distinct from:
 * IPC protocol version;
 * session event schema version;
 * storage writer epoch;
+* durable runtime scope identity — the `(state root, config directory)` pair;
 * executable SHA-256;
 * daemon process instance identity.
 
-Default namespaces and endpoints derive from protocol version plus exact artifact ID. Endpoint discovery is O(1) and does not inspect executable bytes. `Hello` advertises the intended artifact ID, and both peers reject a mismatch. Build fingerprints and compatibility epochs remain independently checked rather than serving as artifact identity.
+Default namespaces derive from protocol version plus exact artifact ID. Default endpoints derive from
+protocol version, exact artifact ID, and the identity of the resolved **runtime scope** — the pair
+`(state root, config directory)` — so daemons serving different scopes coexist without sharing
+endpoints, registries, or coordination state. Endpoint discovery is O(1) and does not inspect
+executable bytes. `Hello` advertises the intended artifact ID and runtime scope identity, and both
+peers reject a mismatch. Build fingerprints and compatibility epochs remain independently checked
+rather than serving as artifact identity.
+
+Runtime scope identity is a digest of the canonicalized state root and config directory. Config
+directory participates because it selects plugins, permissions, and model policy, so two config
+directories must not share a daemon process. Verifying the identity on both sides is required rather
+than redundant: endpoint scoping alone can be bypassed with an explicit `BCODE_IPC_ENDPOINT` or
+`BCODE_SOCKET` override, and connecting across scopes would let a client mutate canonical session
+storage it does not own or apply the wrong permission policy. A peer advertising no scope identity is
+unverifiable and refused rather than assumed local. See [State Locations](state-locations.md).
+
+Because a daemon owns exactly one runtime scope, it never opens a session belonging to another scope;
+a session outside the current scope is served by starting a separate daemon that owns its own leases
+and locks.
+
+Daemon registry records live under the state location they describe and also carry that identity, so a
+record copied or inherited from another scope is surfaced rather than silently treated as local.
+
+A spawned daemon receives its state root, session root, and config directory explicitly rather than
+inheriting them, so an explicit command-line selection is not lost across the process boundary.
 
 Executable SHA-256 remains cold-path integrity and process evidence. It is not a routing key.
 

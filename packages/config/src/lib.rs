@@ -244,6 +244,9 @@ pub struct BcodeConfig {
     pub session_import: SessionImportConfig,
     #[serde(default)]
     pub session_search: SessionSearchConfig,
+    /// Durable state location selection.
+    #[serde(default)]
+    pub state: StateConfig,
     #[serde(default)]
     pub client: ClientConfig,
     #[serde(default)]
@@ -275,6 +278,7 @@ impl Default for BcodeConfig {
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
             session_search: SessionSearchConfig::default(),
+            state: StateConfig::default(),
             client: ClientConfig::default(),
             daemon: DaemonConfig::default(),
             worktree: WorktreeConfig::default(),
@@ -349,6 +353,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<SessionSearchConfig>(
                 "session_search",
                 "Global derived session-search enablement.",
+            ),
+            schema_section_doc::<StateConfig>(
+                "state",
+                "Durable state location roots, named profiles, and aggregated discovery selection.",
             ),
             schema_section_doc::<ClientConfig>("client", "Client connection and request settings."),
             schema_section_doc::<DaemonConfig>(
@@ -1858,6 +1866,43 @@ impl Default for SessionSearchConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+/// Durable state location configuration.
+///
+/// Declares where Bcode keeps durable state. Exactly one location is the primary
+/// write location; additional named profiles may be listed as readable locations
+/// for aggregated session discovery. Selection precedence is documented on
+/// [`resolve_state_location_set_with_environment`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "state")]
+#[serde(default)]
+pub struct StateConfig {
+    /// Absolute primary state root. When unset, the XDG-derived default applies.
+    pub root: Option<PathBuf>,
+    /// Absolute canonical session store root. When unset, `<root>/sessions` applies.
+    pub sessions_root: Option<PathBuf>,
+    /// Named state locations keyed by profile name.
+    #[config_doc(nested, map_key = "<profile>")]
+    pub profile: BTreeMap<String, StateProfileConfig>,
+    /// Profile name selected when no explicit CLI or environment selection is present.
+    pub default_profile: Option<String>,
+    /// Profile names whose sessions participate in aggregated discovery.
+    ///
+    /// Aggregated discovery never confers canonical authority: a session's mutations,
+    /// ownership, and repair apply only to the location that owns its canonical storage.
+    pub readable_profiles: Vec<String>,
+}
+
+/// One named durable state location.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "state_profile")]
+#[serde(default)]
+pub struct StateProfileConfig {
+    /// Absolute state root for this profile.
+    pub root: Option<PathBuf>,
+    /// Absolute canonical session store root for this profile.
+    pub sessions_root: Option<PathBuf>,
 }
 
 /// Client connection configuration.
@@ -4913,15 +4958,41 @@ pub fn default_state_dir() -> PathBuf {
 }
 
 /// Return the canonical default Bcode session store directory.
+///
+/// Resolution precedence:
+///
+/// * `$BCODE_SESSION_STORE_DIR` if set.
+/// * Otherwise `<default_state_dir>/sessions`.
 #[must_use]
 pub fn default_session_store_dir() -> PathBuf {
-    default_state_dir().join("sessions")
+    default_session_store_dir_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return the canonical default Bcode session store directory for an explicit environment.
+#[must_use]
+pub fn default_session_store_dir_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
+    if let Some(sessions_root) = process_state_sessions_root() {
+        return sessions_root;
+    }
+    if let Some(path) = environment.var(BCODE_SESSION_STORE_DIR_ENV) {
+        return PathBuf::from(path);
+    }
+    default_state_dir_with_environment(environment).join("sessions")
 }
 
 /// Return the default Bcode state directory for an explicit environment.
+///
+/// Selection precedence matches [`resolve_state_location_set_with_environment`]:
+/// a process-scoped explicit selection outranks `BCODE_STATE_DIR`, which outranks
+/// the XDG-derived default chain. This function performs no validation; callers
+/// that must fail closed on an unavailable location use
+/// [`resolve_state_location_set`].
 #[must_use]
 pub fn default_state_dir_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
-    if let Some(path) = environment.var("BCODE_STATE_DIR") {
+    if let Some(root) = process_state_location_root() {
+        return root;
+    }
+    if let Some(path) = environment.var(BCODE_STATE_DIR_ENV) {
         return PathBuf::from(path);
     }
     if let Some(state_home) = environment.var("XDG_STATE_HOME") {
@@ -4934,6 +5005,566 @@ pub fn default_state_dir_with_environment(environment: &impl ConfigEnvironment) 
             .join("bcode");
     }
     env::temp_dir().join("bcode")
+}
+
+/// Process-scoped explicit state selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessStateSelection {
+    root: PathBuf,
+    sessions_root: Option<PathBuf>,
+}
+
+fn process_state_selection() -> &'static std::sync::RwLock<Option<ProcessStateSelection>> {
+    static SELECTION: std::sync::OnceLock<std::sync::RwLock<Option<ProcessStateSelection>>> =
+        std::sync::OnceLock::new();
+    SELECTION.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn process_state_location_root() -> Option<PathBuf> {
+    process_state_selection()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|selection| selection.root.clone())
+}
+
+fn process_state_sessions_root() -> Option<PathBuf> {
+    process_state_selection()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|selection| selection.sessions_root.clone())
+}
+
+/// Guard that restores the prior process-scoped state selection when dropped.
+#[derive(Debug)]
+pub struct StateLocationGuard {
+    previous: Option<ProcessStateSelection>,
+}
+
+impl Drop for StateLocationGuard {
+    fn drop(&mut self) {
+        let mut guard = process_state_selection()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (*guard).clone_from(&self.previous);
+    }
+}
+
+/// Apply a resolved state location process-wide until the returned guard drops.
+///
+/// This lets an explicit command-line selection take precedence over
+/// `BCODE_STATE_DIR` for every durable-path consumer without threading the
+/// location through unrelated call sites. It never changes which location owns a
+/// session's canonical storage; it only selects which location this process uses.
+#[must_use]
+pub fn push_process_state_location(location: &StateLocation) -> StateLocationGuard {
+    let sessions_root = (location.sessions_root() != location.root().join("sessions"))
+        .then(|| location.sessions_root().to_path_buf());
+    let mut guard = process_state_selection()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = guard.clone();
+    *guard = Some(ProcessStateSelection {
+        root: location.root().to_path_buf(),
+        sessions_root,
+    });
+    drop(guard);
+    StateLocationGuard { previous }
+}
+
+/// Environment variable selecting the primary durable state root.
+pub const BCODE_STATE_DIR_ENV: &str = "BCODE_STATE_DIR";
+/// Environment variable selecting the canonical session store root.
+pub const BCODE_SESSION_STORE_DIR_ENV: &str = "BCODE_SESSION_STORE_DIR";
+
+/// How a state location was selected.
+///
+/// Provenance is diagnostic and ordering metadata. It never selects canonical
+/// storage for a session: the owning location does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateLocationProvenance {
+    /// Selected by an explicit command-line argument.
+    Cli,
+    /// Selected by an environment variable.
+    Env,
+    /// Selected by a named `[state.profile.<name>]` entry.
+    ConfigProfile,
+    /// Selected by `[state] root`.
+    Config,
+    /// Derived from the XDG-style default chain.
+    XdgDefault,
+}
+
+impl StateLocationProvenance {
+    /// Return a stable lowercase identifier for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::ConfigProfile => "config_profile",
+            Self::Config => "config",
+            Self::XdgDefault => "xdg_default",
+        }
+    }
+}
+
+/// Stable identity of one durable state location.
+///
+/// Derived only from the canonicalized state root, so two clients resolving the
+/// same directory agree on the identity regardless of how they selected it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StateLocationId(String);
+
+impl StateLocationId {
+    /// Derive a location identity from an already-canonicalized root.
+    #[must_use]
+    pub fn from_canonical_root(root: &Path) -> Self {
+        use sha2::{Digest as _, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(root.as_os_str().as_encoded_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        Self(digest[..32].to_owned())
+    }
+
+    /// Return the identity as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StateLocationId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Derive the stable identity of a daemon runtime scope.
+///
+/// A runtime scope is the pair `(state root, config directory)`. Both determine
+/// daemon behavior: the state root selects which canonical session storage the
+/// daemon owns, and the config directory selects which plugins, permissions, and
+/// model policy it applies. Daemons are fingerprinted by this pair so a client
+/// reaches only a daemon that resolved the same pair, and opening a session under a
+/// different state root *or* a different config directory starts a separate daemon.
+///
+/// Paths are canonicalized when they exist so two clients naming the same directory
+/// through different but equivalent paths agree on the identity. A path that cannot
+/// be canonicalized is used as given rather than failing, because identity
+/// derivation must stay infallible on routing paths; resolution and validation of a
+/// usable location is owned by [`resolve_state_location_set`].
+#[must_use]
+pub fn runtime_scope_id(state_root: &Path, config_dir: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let state_root = fs::canonicalize(state_root).unwrap_or_else(|_| state_root.to_path_buf());
+    let config_dir = fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(state_root.as_os_str().as_encoded_bytes());
+    hasher.update([0]);
+    hasher.update(config_dir.as_os_str().as_encoded_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..32].to_owned()
+}
+
+/// One resolved, validated durable state location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateLocation {
+    root: PathBuf,
+    sessions_root: PathBuf,
+    id: StateLocationId,
+    provenance: StateLocationProvenance,
+    profile: Option<String>,
+}
+
+impl StateLocation {
+    /// Return the canonicalized state root.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Return the canonical session store root for this location.
+    #[must_use]
+    pub fn sessions_root(&self) -> &Path {
+        &self.sessions_root
+    }
+
+    /// Return the stable identity of this location.
+    #[must_use]
+    pub const fn id(&self) -> &StateLocationId {
+        &self.id
+    }
+
+    /// Return how this location was selected.
+    #[must_use]
+    pub const fn provenance(&self) -> StateLocationProvenance {
+        self.provenance
+    }
+
+    /// Return the profile name when this location came from a named profile.
+    #[must_use]
+    pub fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+}
+
+/// Resolved primary and readable durable state locations.
+///
+/// The primary location owns new session creation and non-session durable state.
+/// Readable locations participate in aggregated discovery only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateLocationSet {
+    primary: StateLocation,
+    readable: Vec<StateLocation>,
+}
+
+impl StateLocationSet {
+    /// Return the primary write location.
+    #[must_use]
+    pub const fn primary(&self) -> &StateLocation {
+        &self.primary
+    }
+
+    /// Return every readable location, including the primary, in stable order.
+    #[must_use]
+    pub fn readable(&self) -> &[StateLocation] {
+        &self.readable
+    }
+}
+
+/// Failure to resolve a durable state location.
+///
+/// Resolution never falls back to a different location on failure, because a
+/// substitute location would manufacture a second canonical storage path for the
+/// same session IDs.
+#[derive(Debug, Error)]
+pub enum StateLocationError {
+    /// A configured or requested root was not absolute.
+    #[error("state location {source_label} must be an absolute path, got {path}")]
+    NotAbsolute {
+        /// Where the rejected value came from.
+        source_label: String,
+        /// The rejected path.
+        path: PathBuf,
+    },
+    /// A named profile was requested but not declared.
+    #[error("state profile {profile} is not declared in [state.profile]")]
+    UnknownProfile {
+        /// Requested profile name.
+        profile: String,
+    },
+    /// A declared profile had no usable root.
+    #[error("state profile {profile} declares no root")]
+    ProfileMissingRoot {
+        /// Requested profile name.
+        profile: String,
+    },
+    /// The location could not be created or reached.
+    #[error("state location {source_label} at {path} is unavailable: {message}")]
+    Unavailable {
+        /// Where the rejected value came from.
+        source_label: String,
+        /// The rejected path.
+        path: PathBuf,
+        /// Normalized failure description.
+        message: String,
+    },
+    /// The location exists but is not a directory.
+    #[error("state location {source_label} at {path} is not a directory")]
+    NotADirectory {
+        /// Where the rejected value came from.
+        source_label: String,
+        /// The rejected path.
+        path: PathBuf,
+    },
+    /// The location is not writable by this process.
+    #[error("state location {source_label} at {path} is not writable: {message}")]
+    NotWritable {
+        /// Where the rejected value came from.
+        source_label: String,
+        /// The rejected path.
+        path: PathBuf,
+        /// Normalized failure description.
+        message: String,
+    },
+}
+
+/// Explicit caller-supplied state location selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateLocationSelection {
+    /// Explicit root supplied on the command line.
+    pub root: Option<PathBuf>,
+    /// Explicit profile name supplied on the command line.
+    pub profile: Option<String>,
+}
+
+impl StateLocationSelection {
+    /// Return whether no explicit selection was supplied.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.root.is_none() && self.profile.is_none()
+    }
+}
+
+/// Resolve the durable state location set for the current process.
+///
+/// # Errors
+///
+/// Returns an error when a selected location is relative, undeclared, missing,
+/// not a directory, or not writable. Resolution never substitutes a different
+/// location.
+pub fn resolve_state_location_set(
+    config: &StateConfig,
+    selection: &StateLocationSelection,
+) -> Result<StateLocationSet, StateLocationError> {
+    resolve_state_location_set_with_environment(config, selection, &ProcessConfigEnvironment)
+}
+
+/// Resolve the durable state location set for an explicit environment.
+///
+/// Primary selection precedence, highest first:
+///
+/// * `--state-root` command-line value.
+/// * `--state-profile` command-line value resolved through `[state.profile]`.
+/// * `BCODE_STATE_DIR` environment variable.
+/// * `[state] default_profile` resolved through `[state.profile]`.
+/// * `[state] root`.
+/// * XDG-derived default chain.
+///
+/// Session-root selection precedence, highest first:
+///
+/// * `BCODE_SESSION_STORE_DIR` environment variable.
+/// * The selected profile's `sessions_root`.
+/// * `[state] sessions_root`.
+/// * `<primary root>/sessions`.
+///
+/// # Errors
+///
+/// Returns an error when a selected location is relative, undeclared, missing,
+/// not a directory, or not writable.
+pub fn resolve_state_location_set_with_environment(
+    config: &StateConfig,
+    selection: &StateLocationSelection,
+    environment: &impl ConfigEnvironment,
+) -> Result<StateLocationSet, StateLocationError> {
+    let primary = resolve_primary_state_location(config, selection, environment)?;
+    let mut readable = vec![primary.clone()];
+    for profile_name in &config.readable_profiles {
+        if Some(profile_name.as_str()) == primary.profile() {
+            continue;
+        }
+        let location = resolve_profile_state_location(config, profile_name, environment)?;
+        if location.id() == primary.id()
+            || readable
+                .iter()
+                .any(|existing| existing.id() == location.id())
+        {
+            continue;
+        }
+        readable.push(location);
+    }
+    Ok(StateLocationSet { primary, readable })
+}
+
+fn resolve_primary_state_location(
+    config: &StateConfig,
+    selection: &StateLocationSelection,
+    environment: &impl ConfigEnvironment,
+) -> Result<StateLocation, StateLocationError> {
+    let sessions_override = environment
+        .var(BCODE_SESSION_STORE_DIR_ENV)
+        .map(PathBuf::from);
+
+    if let Some(root) = &selection.root {
+        return build_state_location(
+            root,
+            sessions_override,
+            None,
+            StateLocationProvenance::Cli,
+            None,
+            "--state-root",
+        );
+    }
+    if let Some(profile) = &selection.profile {
+        return resolve_named_profile_location(
+            config,
+            profile,
+            sessions_override,
+            StateLocationProvenance::Cli,
+            &format!("--state-profile {profile}"),
+        );
+    }
+    if let Some(root) = environment.var(BCODE_STATE_DIR_ENV) {
+        return build_state_location(
+            Path::new(&root),
+            sessions_override,
+            None,
+            StateLocationProvenance::Env,
+            None,
+            BCODE_STATE_DIR_ENV,
+        );
+    }
+    if let Some(profile) = &config.default_profile {
+        return resolve_named_profile_location(
+            config,
+            profile,
+            sessions_override,
+            StateLocationProvenance::ConfigProfile,
+            &format!("[state] default_profile = {profile}"),
+        );
+    }
+    if let Some(root) = &config.root {
+        return build_state_location(
+            root,
+            sessions_override,
+            config.sessions_root.clone(),
+            StateLocationProvenance::Config,
+            None,
+            "[state] root",
+        );
+    }
+    build_state_location(
+        &default_state_dir_with_environment(environment),
+        sessions_override,
+        config.sessions_root.clone(),
+        StateLocationProvenance::XdgDefault,
+        None,
+        "default state directory",
+    )
+}
+
+fn resolve_profile_state_location(
+    config: &StateConfig,
+    profile: &str,
+    environment: &impl ConfigEnvironment,
+) -> Result<StateLocation, StateLocationError> {
+    let _ = environment;
+    resolve_named_profile_location(
+        config,
+        profile,
+        None,
+        StateLocationProvenance::ConfigProfile,
+        &format!("[state.profile.{profile}]"),
+    )
+}
+
+fn resolve_named_profile_location(
+    config: &StateConfig,
+    profile: &str,
+    sessions_override: Option<PathBuf>,
+    provenance: StateLocationProvenance,
+    source_label: &str,
+) -> Result<StateLocation, StateLocationError> {
+    let declared =
+        config
+            .profile
+            .get(profile)
+            .ok_or_else(|| StateLocationError::UnknownProfile {
+                profile: profile.to_owned(),
+            })?;
+    let root = declared
+        .root
+        .clone()
+        .ok_or_else(|| StateLocationError::ProfileMissingRoot {
+            profile: profile.to_owned(),
+        })?;
+    build_state_location(
+        &root,
+        sessions_override,
+        declared.sessions_root.clone(),
+        provenance,
+        Some(profile.to_owned()),
+        source_label,
+    )
+}
+
+fn build_state_location(
+    root: &Path,
+    sessions_override: Option<PathBuf>,
+    configured_sessions_root: Option<PathBuf>,
+    provenance: StateLocationProvenance,
+    profile: Option<String>,
+    source_label: &str,
+) -> Result<StateLocation, StateLocationError> {
+    let canonical_root = prepare_state_directory(root, source_label)?;
+    let sessions_root = match sessions_override.or(configured_sessions_root) {
+        Some(explicit) => {
+            let label = format!("{source_label} sessions root");
+            prepare_state_directory(&explicit, &label)?
+        }
+        None => canonical_root.join("sessions"),
+    };
+    let id = StateLocationId::from_canonical_root(&canonical_root);
+    Ok(StateLocation {
+        root: canonical_root,
+        sessions_root,
+        id,
+        provenance,
+        profile,
+    })
+}
+
+fn prepare_state_directory(path: &Path, source_label: &str) -> Result<PathBuf, StateLocationError> {
+    if !path.is_absolute() {
+        return Err(StateLocationError::NotAbsolute {
+            source_label: source_label.to_owned(),
+            path: path.to_path_buf(),
+        });
+    }
+    if let Err(source) = fs::create_dir_all(path) {
+        return Err(StateLocationError::Unavailable {
+            source_label: source_label.to_owned(),
+            path: path.to_path_buf(),
+            message: source.to_string(),
+        });
+    }
+    let canonical = fs::canonicalize(path).map_err(|source| StateLocationError::Unavailable {
+        source_label: source_label.to_owned(),
+        path: path.to_path_buf(),
+        message: source.to_string(),
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|source| StateLocationError::Unavailable {
+        source_label: source_label.to_owned(),
+        path: canonical.clone(),
+        message: source.to_string(),
+    })?;
+    if !metadata.is_dir() {
+        return Err(StateLocationError::NotADirectory {
+            source_label: source_label.to_owned(),
+            path: canonical,
+        });
+    }
+    verify_state_directory_writable(&canonical, source_label)?;
+    Ok(canonical)
+}
+
+fn verify_state_directory_writable(
+    path: &Path,
+    source_label: &str,
+) -> Result<(), StateLocationError> {
+    let probe = path.join(".bcode-write-probe");
+    match fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(source) => Err(StateLocationError::NotWritable {
+            source_label: source_label.to_owned(),
+            path: path.to_path_buf(),
+            message: source.to_string(),
+        }),
+    }
 }
 
 /// Return the default Bcode auth vault path.
@@ -5523,8 +6154,68 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_presentation_toml(&mut output, config.presentation);
     write_tui_toml(&mut output, &config.tui);
     write_client_toml(&mut output, &config.client);
+    write_state_toml(&mut output, &config.state);
     write_domain_toml(&mut output, "web_search", &config.web_search);
     output
+}
+
+fn write_state_toml(output: &mut String, state: &StateConfig) {
+    if state == &StateConfig::default() {
+        return;
+    }
+    output.push_str("[state]\n");
+    if let Some(root) = &state.root {
+        writeln!(
+            output,
+            "root = {}",
+            toml_string(&root.display().to_string())
+        )
+        .expect("writing to string should not fail");
+    }
+    if let Some(sessions_root) = &state.sessions_root {
+        writeln!(
+            output,
+            "sessions_root = {}",
+            toml_string(&sessions_root.display().to_string())
+        )
+        .expect("writing to string should not fail");
+    }
+    if let Some(default_profile) = &state.default_profile {
+        writeln!(output, "default_profile = {}", toml_string(default_profile))
+            .expect("writing to string should not fail");
+    }
+    if !state.readable_profiles.is_empty() {
+        let entries = state
+            .readable_profiles
+            .iter()
+            .map(|profile| toml_string(profile))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(output, "readable_profiles = [{entries}]")
+            .expect("writing to string should not fail");
+    }
+    output.push('\n');
+    for (name, profile) in &state.profile {
+        writeln!(output, "[state.profile.{}]", toml_table_key(name))
+            .expect("writing to string should not fail");
+        if let Some(root) = &profile.root {
+            writeln!(
+                output,
+                "root = {}",
+                toml_string(&root.display().to_string())
+            )
+            .expect("writing to string should not fail");
+        }
+        if let Some(sessions_root) = &profile.sessions_root {
+            writeln!(
+                output,
+                "sessions_root = {}",
+                toml_string(&sessions_root.display().to_string())
+            )
+            .expect("writing to string should not fail");
+        }
+        output.push('\n');
+    }
 }
 
 fn write_client_toml(output: &mut String, client: &ClientConfig) {
@@ -9212,6 +9903,431 @@ on_timeout = "deterministic"
 
         assert!(rendered.contains("[client]"), "{rendered}");
         assert!(rendered.contains("request_timeout_secs = 60"), "{rendered}");
+    }
+
+    #[test]
+    fn state_config_round_trips_and_is_documented() {
+        let mut config = BcodeConfig::default();
+        config.state.root = Some(PathBuf::from("/volumes/big/bcode-state"));
+        config.state.sessions_root = Some(PathBuf::from("/volumes/big/bcode-sessions"));
+        config.state.default_profile = Some("big".to_owned());
+        config.state.readable_profiles = vec!["big".to_owned(), "local".to_owned()];
+        config.state.profile.insert(
+            "big".to_owned(),
+            super::StateProfileConfig {
+                root: Some(PathBuf::from("/volumes/big/bcode-state")),
+                sessions_root: None,
+            },
+        );
+
+        let rendered = super::config_to_toml(&config);
+        let decoded: BcodeConfig = toml::from_str(&rendered).expect("decode rendered config");
+
+        assert_eq!(decoded.state, config.state, "{rendered}");
+        assert!(rendered.contains("[state]"), "{rendered}");
+        assert!(rendered.contains("[state.profile.big]"), "{rendered}");
+        assert!(
+            rendered.contains("readable_profiles = [\"big\", \"local\"]"),
+            "{rendered}"
+        );
+        assert!(
+            BcodeConfig::field_docs()
+                .iter()
+                .any(|field| field.toml_key == "state"),
+            "state section must be documented"
+        );
+    }
+
+    fn state_environment(root: &std::path::Path) -> ConfigEnvironmentSnapshot {
+        let mut environment = ConfigEnvironmentSnapshot::isolated(root);
+        environment.set_var("HOME", root.join("home").into_os_string());
+        environment
+    }
+
+    #[test]
+    fn cli_root_outranks_env_and_config_selection() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let cli_root = temp.path().join("cli");
+        let env_root = temp.path().join("env");
+        let config_root = temp.path().join("config-root");
+        std::fs::create_dir_all(&cli_root).expect("cli root");
+        std::fs::create_dir_all(&env_root).expect("env root");
+        std::fs::create_dir_all(&config_root).expect("config root");
+
+        let mut environment = state_environment(temp.path());
+        environment.set_var(super::BCODE_STATE_DIR_ENV, env_root.as_os_str());
+        let config = super::StateConfig {
+            root: Some(config_root),
+            ..super::StateConfig::default()
+        };
+        let selection = super::StateLocationSelection {
+            root: Some(cli_root.clone()),
+            profile: None,
+        };
+
+        let resolved =
+            super::resolve_state_location_set_with_environment(&config, &selection, &environment)
+                .expect("cli selection resolves");
+
+        assert_eq!(
+            resolved.primary().root(),
+            std::fs::canonicalize(&cli_root)
+                .expect("canonical cli root")
+                .as_path()
+        );
+        assert_eq!(
+            resolved.primary().provenance(),
+            super::StateLocationProvenance::Cli
+        );
+        assert_eq!(
+            resolved.primary().sessions_root(),
+            std::fs::canonicalize(&cli_root)
+                .expect("canonical cli root")
+                .join("sessions")
+        );
+    }
+
+    #[test]
+    fn env_state_dir_outranks_config_root() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let env_root = temp.path().join("env");
+        let config_root = temp.path().join("config-root");
+        std::fs::create_dir_all(&env_root).expect("env root");
+        std::fs::create_dir_all(&config_root).expect("config root");
+
+        let mut environment = state_environment(temp.path());
+        environment.set_var(super::BCODE_STATE_DIR_ENV, env_root.as_os_str());
+        let config = super::StateConfig {
+            root: Some(config_root),
+            ..super::StateConfig::default()
+        };
+
+        let resolved = super::resolve_state_location_set_with_environment(
+            &config,
+            &super::StateLocationSelection::default(),
+            &environment,
+        )
+        .expect("env selection resolves");
+
+        assert_eq!(
+            resolved.primary().root(),
+            std::fs::canonicalize(&env_root)
+                .expect("canonical env root")
+                .as_path()
+        );
+        assert_eq!(
+            resolved.primary().provenance(),
+            super::StateLocationProvenance::Env
+        );
+    }
+
+    #[test]
+    fn session_store_env_overrides_sessions_root() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("state");
+        let sessions = temp.path().join("external-sessions");
+        std::fs::create_dir_all(&root).expect("state root");
+        std::fs::create_dir_all(&sessions).expect("sessions root");
+
+        let mut environment = state_environment(temp.path());
+        environment.set_var(super::BCODE_STATE_DIR_ENV, root.as_os_str());
+        environment.set_var(super::BCODE_SESSION_STORE_DIR_ENV, sessions.clone());
+
+        let resolved = super::resolve_state_location_set_with_environment(
+            &super::StateConfig::default(),
+            &super::StateLocationSelection::default(),
+            &environment,
+        )
+        .expect("resolution succeeds");
+
+        assert_eq!(
+            resolved.primary().sessions_root(),
+            std::fs::canonicalize(&sessions)
+                .expect("canonical sessions root")
+                .as_path()
+        );
+        assert_eq!(
+            super::default_session_store_dir_with_environment(&environment),
+            sessions
+        );
+    }
+
+    #[test]
+    fn named_profile_selection_resolves_declared_root() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let big_root = temp.path().join("big");
+        std::fs::create_dir_all(&big_root).expect("profile root");
+
+        let environment = state_environment(temp.path());
+        let mut config = super::StateConfig::default();
+        config.profile.insert(
+            "big".to_owned(),
+            super::StateProfileConfig {
+                root: Some(big_root.clone()),
+                sessions_root: None,
+            },
+        );
+        let selection = super::StateLocationSelection {
+            root: None,
+            profile: Some("big".to_owned()),
+        };
+
+        let resolved =
+            super::resolve_state_location_set_with_environment(&config, &selection, &environment)
+                .expect("profile resolves");
+
+        assert_eq!(resolved.primary().profile(), Some("big"));
+        assert_eq!(
+            resolved.primary().root(),
+            std::fs::canonicalize(&big_root)
+                .expect("canonical profile root")
+                .as_path()
+        );
+    }
+
+    #[test]
+    fn readable_profiles_aggregate_without_duplicating_primary() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let primary_root = temp.path().join("primary");
+        let other_root = temp.path().join("other");
+        std::fs::create_dir_all(&primary_root).expect("primary root");
+        std::fs::create_dir_all(&other_root).expect("other root");
+
+        let environment = state_environment(temp.path());
+        let mut config = super::StateConfig {
+            default_profile: Some("primary".to_owned()),
+            readable_profiles: vec!["primary".to_owned(), "other".to_owned()],
+            ..super::StateConfig::default()
+        };
+        config.profile.insert(
+            "primary".to_owned(),
+            super::StateProfileConfig {
+                root: Some(primary_root),
+                sessions_root: None,
+            },
+        );
+        config.profile.insert(
+            "other".to_owned(),
+            super::StateProfileConfig {
+                root: Some(other_root),
+                sessions_root: None,
+            },
+        );
+
+        let resolved = super::resolve_state_location_set_with_environment(
+            &config,
+            &super::StateLocationSelection::default(),
+            &environment,
+        )
+        .expect("aggregate resolves");
+
+        assert_eq!(resolved.readable().len(), 2);
+        assert_eq!(resolved.readable()[0].id(), resolved.primary().id());
+        assert_ne!(resolved.readable()[1].id(), resolved.primary().id());
+    }
+
+    #[test]
+    fn runtime_scope_identity_separates_state_roots_and_config_directories() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let state_a = temp.path().join("state-a");
+        let state_b = temp.path().join("state-b");
+        let config_a = temp.path().join("config-a");
+        let config_b = temp.path().join("config-b");
+        for path in [&state_a, &state_b, &config_a, &config_b] {
+            std::fs::create_dir_all(path).expect("scope directory");
+        }
+
+        let baseline = super::runtime_scope_id(&state_a, &config_a);
+
+        assert_eq!(
+            baseline,
+            super::runtime_scope_id(&state_a, &config_a),
+            "identity must be deterministic for one scope"
+        );
+        assert_ne!(
+            baseline,
+            super::runtime_scope_id(&state_b, &config_a),
+            "a different state root must produce a different daemon scope"
+        );
+        assert_ne!(
+            baseline,
+            super::runtime_scope_id(&state_a, &config_b),
+            "a different config directory must produce a different daemon scope, \
+             because config selects plugins and permission policy"
+        );
+        assert_ne!(
+            super::runtime_scope_id(&state_a, &config_b),
+            super::runtime_scope_id(&state_b, &config_a),
+            "the two scope dimensions must not collide with each other"
+        );
+    }
+
+    #[test]
+    fn runtime_scope_identity_is_stable_across_equivalent_paths() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let state = temp.path().join("state");
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(&state).expect("state root");
+        std::fs::create_dir_all(&config).expect("config dir");
+
+        let direct = super::runtime_scope_id(&state, &config);
+        let indirect = super::runtime_scope_id(&temp.path().join("state").join("."), &config);
+
+        assert_eq!(
+            direct, indirect,
+            "two clients naming the same directory must agree on the scope identity"
+        );
+    }
+
+    #[test]
+    fn runtime_scope_identity_is_infallible_for_absent_paths() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let absent_state = temp.path().join("unmounted").join("state");
+        let absent_config = temp.path().join("unmounted").join("config");
+
+        // Identity derivation sits on routing paths and must not fail; validation of a
+        // usable location is owned by resolve_state_location_set instead.
+        let first = super::runtime_scope_id(&absent_state, &absent_config);
+        let second = super::runtime_scope_id(&absent_state, &absent_config);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert!(
+            !absent_state.exists(),
+            "identity must not create directories"
+        );
+    }
+
+    #[test]
+    fn location_identity_derives_only_from_canonical_root() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("shared");
+        std::fs::create_dir_all(&root).expect("shared root");
+        let canonical = std::fs::canonicalize(&root).expect("canonical root");
+
+        let environment = state_environment(temp.path());
+        let via_cli = super::resolve_state_location_set_with_environment(
+            &super::StateConfig::default(),
+            &super::StateLocationSelection {
+                root: Some(root.clone()),
+                profile: None,
+            },
+            &environment,
+        )
+        .expect("cli resolves");
+
+        let mut env_environment = state_environment(temp.path());
+        env_environment.set_var(super::BCODE_STATE_DIR_ENV, root);
+        let via_env = super::resolve_state_location_set_with_environment(
+            &super::StateConfig::default(),
+            &super::StateLocationSelection::default(),
+            &env_environment,
+        )
+        .expect("env resolves");
+
+        assert_eq!(via_cli.primary().id(), via_env.primary().id());
+        assert_eq!(
+            via_cli.primary().id(),
+            &super::StateLocationId::from_canonical_root(&canonical)
+        );
+        assert_ne!(
+            via_cli.primary().provenance(),
+            via_env.primary().provenance()
+        );
+    }
+
+    #[test]
+    fn relative_root_is_rejected_without_fallback() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let environment = state_environment(temp.path());
+
+        let error = super::resolve_state_location_set_with_environment(
+            &super::StateConfig::default(),
+            &super::StateLocationSelection {
+                root: Some(PathBuf::from("relative/state")),
+                profile: None,
+            },
+            &environment,
+        )
+        .expect_err("relative root must be rejected");
+
+        assert!(
+            matches!(error, super::StateLocationError::NotAbsolute { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unknown_profile_is_rejected_without_fallback() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let environment = state_environment(temp.path());
+
+        let error = super::resolve_state_location_set_with_environment(
+            &super::StateConfig::default(),
+            &super::StateLocationSelection {
+                root: None,
+                profile: Some("missing".to_owned()),
+            },
+            &environment,
+        )
+        .expect_err("unknown profile must be rejected");
+
+        assert!(
+            matches!(error, super::StateLocationError::UnknownProfile { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn file_at_state_root_is_rejected_as_not_a_directory() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let file = temp.path().join("not-a-dir");
+        std::fs::write(&file, b"content").expect("write file");
+        let environment = state_environment(temp.path());
+
+        let error = super::resolve_state_location_set_with_environment(
+            &super::StateConfig::default(),
+            &super::StateLocationSelection {
+                root: Some(file),
+                profile: None,
+            },
+            &environment,
+        )
+        .expect_err("file root must be rejected");
+
+        assert!(
+            matches!(
+                error,
+                super::StateLocationError::Unavailable { .. }
+                    | super::StateLocationError::NotADirectory { .. }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn declared_profile_without_root_is_rejected() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let environment = state_environment(temp.path());
+        let mut config = super::StateConfig::default();
+        config
+            .profile
+            .insert("empty".to_owned(), super::StateProfileConfig::default());
+
+        let error = super::resolve_state_location_set_with_environment(
+            &config,
+            &super::StateLocationSelection {
+                root: None,
+                profile: Some("empty".to_owned()),
+            },
+            &environment,
+        )
+        .expect_err("profile without root must be rejected");
+
+        assert!(
+            matches!(error, super::StateLocationError::ProfileMissingRoot { .. }),
+            "{error}"
+        );
     }
 
     #[test]

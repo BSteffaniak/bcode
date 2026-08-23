@@ -2,11 +2,15 @@
 
 ## Canonical storage and authority
 
-A Bcode session id maps to exactly one canonical database:
+A Bcode session id maps to exactly one canonical database within the state location that owns it:
 
 ```text
-<state-dir>/sessions/<session-id>/session.db
+<sessions-root>/<session-id>/session.db
 ```
+
+`<sessions-root>` is the canonical session store root of one resolved state location. See
+[State Locations](state-locations.md) for selection precedence. Exactly one state location owns a
+session's canonical storage, and the path within that location derives only from the session ID.
 
 The `events` table in that database is the authoritative ordered session history. Canonical event
 rows are append-only and sequence-contiguous. Writer epochs, daemon namespaces, exact produced-artifact
@@ -15,6 +19,14 @@ and build fingerprints never select a different session root, directory, databas
 They are compatibility and routing metadata only. Exact artifact identity chooses a matching daemon
 endpoint, never a different session database. Multiple artifact versions therefore share canonical
 session storage while runtime leases prevent conflicting ownership.
+
+A state location is likewise not selected by writer, build, process, or frontend identity, and an
+unavailable or unverifiable location is never resolved to a substitute location: substituting one
+would manufacture a second canonical storage path for the same session IDs. Aggregated discovery may
+span locations, but it confers no authority — a session's mutations, ownership, and repair apply only
+to the location that owns its canonical storage. When more than one location claims the same session
+ID, the conflict is surfaced and no location is opened as authoritative until an explicit maintenance
+operation resolves it.
 
 Other authoritative session-owned state, such as composer drafts, lives in explicitly designated
 tables in the same per-session database. It is authoritative for that state but is not transcript
@@ -104,12 +116,14 @@ drops every preview while durable request/result history remains authoritative.
 ## On-disk layout
 
 ```text
-<state-dir>/sessions/
+<sessions-root>/
   <session-id>/
     session.db             # authoritative database
     session.db-wal         # database implementation sidecar
     session.db-shm         # database implementation sidecar
     manifest.json          # derived discovery/display cache
+  session-artifacts/
+    <session-id>/          # session-owned tool artifacts, sibling of canonical storage
   catalog.db               # global summary cache and draft-session state
   catalogs/
     <build-namespace>/
@@ -117,6 +131,16 @@ drops every preview while durable request/result history remains authoritative.
   locks/                   # cross-process coordination
   leases/                  # live compatibility-owner metadata
 ```
+
+`<sessions-root>` belongs to one resolved state location and may be placed on a different volume from
+the state root. Non-session durable state — the daemon registry, daemon images, logs, settings,
+runtime permissions, workflows, traces, and derived data — stays under `<state-root>` and is not moved
+by a session-root override. See [State Locations](state-locations.md).
+
+Session artifacts are a sibling of the canonical `<session-id>/` directory rather than nested inside
+it, because migration backup walks the canonical directory recursively and nesting bulk artifact bytes
+would make every canonical backup copy them. Canonical discovery only accepts directory names that
+parse as a session ID, so the named sibling is ignored by catalog scans.
 
 Classification:
 

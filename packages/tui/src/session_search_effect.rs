@@ -437,6 +437,7 @@ mod tests {
             working_directory: std::path::PathBuf::new(),
             import: None,
             execution: None,
+            location: None,
         };
         let presentation = completion.presentation_with_summaries(std::slice::from_ref(&summary));
         summary.name = Some("Changed later".to_owned());

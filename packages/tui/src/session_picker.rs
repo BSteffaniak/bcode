@@ -515,13 +515,42 @@ fn session_item(session: &SessionSummary, muted: Style) -> ListItem {
     );
     let id = session.id.to_string();
     let cwd = display_from_current_dir(&session.working_directory).to_string();
-    ListItem::new(Line::from_spans(vec![
+    let mut spans = vec![
         Span::styled(display_name, Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(id, muted),
         Span::raw("  "),
         Span::styled(cwd, muted),
-    ]))
+    ];
+    if let Some(label) = session_location_label(session) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(label, muted));
+    }
+    ListItem::new(Line::from_spans(spans))
+}
+
+/// Render the owning state location for a session, when aggregated discovery spans more
+/// than one location.
+///
+/// The primary location is not labeled, because labeling every row would be noise in the
+/// common single-location case. Ambiguity is always labeled: a session claimed by more than
+/// one location cannot be opened until explicit maintenance resolves the conflict, so the
+/// picker must say so rather than silently offering one claim.
+fn session_location_label(session: &SessionSummary) -> Option<String> {
+    let location = session.location.as_ref()?;
+    if location.ambiguous {
+        return Some("(ambiguous location — needs maintenance)".to_owned());
+    }
+    if location.primary {
+        return None;
+    }
+    Some(format!(
+        "({})",
+        location
+            .profile
+            .clone()
+            .unwrap_or_else(|| location.location_id.clone())
+    ))
 }
 
 fn session_matches(session: &SessionSummary, query: &str) -> bool {
@@ -541,6 +570,13 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
             .to_string()
             .to_ascii_lowercase()
             .contains(query)
+        || session.location.as_ref().is_some_and(|location| {
+            location
+                .profile
+                .as_ref()
+                .is_some_and(|profile| profile.to_ascii_lowercase().contains(query))
+                || location.location_id.to_ascii_lowercase().contains(query)
+        })
 }
 
 fn empty_item(message: &str, muted: Style) -> ListItem {
@@ -567,7 +603,63 @@ mod tests {
             working_directory: working_directory.into(),
             import: None,
             execution: None,
+            location: None,
         }
+    }
+
+    fn located_summary(
+        title: &str,
+        profile: Option<&str>,
+        primary: bool,
+        ambiguous: bool,
+    ) -> SessionSummary {
+        let mut session = summary(title, "/tmp/workspace");
+        session.location = Some(bcode_session_models::SessionLocationSummary {
+            location_id: "abcd1234".to_owned(),
+            profile: profile.map(str::to_owned),
+            primary,
+            ambiguous,
+        });
+        session
+    }
+
+    #[test]
+    fn primary_location_is_not_labeled_but_foreign_locations_are() {
+        assert_eq!(
+            super::session_location_label(&located_summary("a", None, true, false)),
+            None,
+            "the common single-location case must not be labeled"
+        );
+        assert_eq!(
+            super::session_location_label(&located_summary("b", Some("big"), false, false)),
+            Some("(big)".to_owned())
+        );
+        assert_eq!(
+            super::session_location_label(&located_summary("c", None, false, false)),
+            Some("(abcd1234)".to_owned()),
+            "an unnamed foreign location falls back to its opaque identity"
+        );
+        assert_eq!(
+            super::session_location_label(&summary("d", "/tmp/workspace")),
+            None
+        );
+    }
+
+    #[test]
+    fn ambiguous_locations_are_always_labeled_even_when_primary() {
+        let label = super::session_location_label(&located_summary("a", None, true, true))
+            .expect("ambiguity must always be surfaced");
+        assert!(label.contains("ambiguous"), "{label}");
+        assert!(label.contains("maintenance"), "{label}");
+    }
+
+    #[test]
+    fn session_filter_matches_location_profile_and_identity() {
+        let session = located_summary("unrelated title", Some("bigdrive"), false, false);
+
+        assert!(super::session_matches(&session, "bigdrive"));
+        assert!(super::session_matches(&session, "abcd1234"));
+        assert!(!super::session_matches(&session, "nomatch"));
     }
 
     fn sample_search_result(

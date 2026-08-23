@@ -1153,18 +1153,23 @@ impl BcodeClient {
         let expected_artifact_id = bcode_ipc::ArtifactId::current();
         let expected_writer_epoch = bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
         let expected_event_schema = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
+        let expected_state_location = bcode_ipc::state_location_id();
         if status.namespace == expected_namespace
             && status.protocol_version == expected_protocol
             && status.artifact_id.as_ref() == Some(&expected_artifact_id)
             && status.build_fingerprint == bcode_ipc::BUILD_FINGERPRINT
             && status.storage_writer_epoch == Some(expected_writer_epoch)
             && status.session_event_schema_version == Some(expected_event_schema)
+            // A daemon that does not advertise a state location is unverifiable, not
+            // assumed compatible: connecting anyway would let this client mutate a
+            // different location's canonical session storage.
+            && status.state_location_id.as_deref() == Some(expected_state_location.as_str())
         {
             return Ok(());
         }
         Err(ClientError::IncompatibleDaemon {
             message: format!(
-                "client expects namespace={expected_namespace} artifact={expected_artifact_id} protocol={expected_protocol} build={} session_event_schema={expected_event_schema} storage_writer_epoch={expected_writer_epoch}; daemon reported namespace={} artifact={} protocol={} build={} executable={} session_event_schema={} storage_writer_epoch={}",
+                "client expects namespace={expected_namespace} artifact={expected_artifact_id} protocol={expected_protocol} build={} session_event_schema={expected_event_schema} storage_writer_epoch={expected_writer_epoch} state_location={expected_state_location}; daemon reported namespace={} artifact={} protocol={} build={} executable={} session_event_schema={} storage_writer_epoch={} state_location={}",
                 bcode_ipc::BUILD_FINGERPRINT,
                 status.namespace,
                 status
@@ -1180,6 +1185,7 @@ impl BcodeClient {
                 status
                     .storage_writer_epoch
                     .map_or_else(|| "<unknown>".to_owned(), |value| value.to_string()),
+                status.state_location_id.as_deref().unwrap_or("<unknown>"),
             ),
         })
     }
@@ -4834,6 +4840,7 @@ impl BcodeClient {
                 daemon_namespace: bcode_ipc::daemon_namespace(),
                 artifact_id: Some(bcode_ipc::ArtifactId::current()),
                 build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                state_location_id: Some(bcode_ipc::state_location_id()),
             })
             .await?
         {
@@ -5547,6 +5554,7 @@ mod client_timeout_tests {
             session_event_schema_version: Some(
                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             ),
+            state_location_id: Some(bcode_ipc::state_location_id()),
             ..bcode_ipc::DaemonStatus::default()
         }
     }
@@ -5586,6 +5594,17 @@ mod client_timeout_tests {
             },
             bcode_ipc::DaemonStatus {
                 storage_writer_epoch: matching.storage_writer_epoch.map(|value| value + 1),
+                ..matching.clone()
+            },
+            // A daemon serving a different state location must be refused: connecting
+            // would let this client mutate another location's canonical session storage.
+            bcode_ipc::DaemonStatus {
+                state_location_id: Some("other-state-location".to_owned()),
+                ..matching.clone()
+            },
+            // A daemon that advertises no state location is unverifiable, not assumed local.
+            bcode_ipc::DaemonStatus {
+                state_location_id: None,
                 ..matching.clone()
             },
             bcode_ipc::DaemonStatus {

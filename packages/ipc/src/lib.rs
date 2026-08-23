@@ -87,7 +87,19 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 29;
+///
+/// Version 30 adds `state_location_id` to `Request::Hello` and `DaemonStatus` so a
+/// client can only reach a daemon serving the state location it resolved. The field
+/// is `Option` for decode compatibility; a daemon that does not advertise an
+/// identity is treated as unverifiable and rejected rather than assumed to match.
+///
+/// Version 31 widens that identity from the state root alone to the runtime scope
+/// pair `(state root, config directory)`. Two config directories can select
+/// different plugins and permission policy, so they must not share a daemon. The
+/// field name is unchanged; only its derivation widened, and a stale peer computing
+/// the narrower identity now mismatches and is refused rather than silently sharing
+/// a daemon across config directories.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 31;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -455,6 +467,9 @@ pub enum Request {
         artifact_id: Option<ArtifactId>,
         #[serde(default)]
         build_fingerprint: String,
+        /// Identity of the durable state location this client resolved.
+        #[serde(default)]
+        state_location_id: Option<String>,
     },
     Ping,
     ServerStatus {
@@ -1262,6 +1277,9 @@ pub struct DaemonStatus {
     /// Durable session-storage writer epoch supported by this daemon.
     #[serde(default)]
     pub storage_writer_epoch: Option<u32>,
+    /// Identity of the durable state location this daemon serves.
+    #[serde(default)]
+    pub state_location_id: Option<String>,
     /// Highest persisted session-event schema version understood by this daemon.
     #[serde(default)]
     pub session_event_schema_version: Option<u16>,
@@ -3857,6 +3875,30 @@ pub fn daemon_namespace_for(artifact_id: &ArtifactId) -> String {
     format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{artifact_id}")
 }
 
+/// Return the stable identity of the durable runtime scope this process uses.
+///
+/// The scope is the pair of resolved locations that determine a daemon's behavior:
+/// the durable **state root** (which canonical session storage it owns) and the
+/// **config directory** (which plugins, permissions, and model policy it applies).
+/// Endpoint routing, daemon registry scoping, and handshake verification all use
+/// this identity, so a client reaches only a daemon serving the same pair it
+/// resolved. Opening a session under a different state root or a different config
+/// directory therefore starts a separate daemon rather than reusing this one.
+///
+/// Including the config directory matters for correctness, not just tidiness: two
+/// config directories can select different plugins and permission policy, so a
+/// shared daemon would apply the wrong policy to one of them.
+///
+/// It is derived only from those resolved paths, never from writer, build, or
+/// process identity.
+#[must_use]
+pub fn state_location_id() -> String {
+    bcode_config::runtime_scope_id(
+        &bcode_config::default_state_dir(),
+        &bcode_config::default_config_dir(),
+    )
+}
+
 /// Return the default local IPC endpoint.
 #[must_use]
 pub fn default_endpoint() -> IpcEndpoint {
@@ -3875,8 +3917,9 @@ pub fn default_endpoint() -> IpcEndpoint {
     {
         let user_scope = current_windows_user_scope();
         IpcEndpoint::windows_named_pipe(format!(
-            r"\\.\pipe\bcode-{user_scope}-{}",
-            daemon_namespace()
+            r"\\.\pipe\bcode-{user_scope}-{}-{}",
+            daemon_namespace(),
+            state_location_id()
         ))
     }
 }
@@ -4023,7 +4066,7 @@ fn default_socket_path(endpoint_override_allowed: bool) -> PathBuf {
     }
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
     let namespace = daemon_namespace();
-    let digest = socket_scope_digest(&user, &namespace);
+    let digest = socket_scope_digest(&user, &namespace, &state_location_id());
     socket_path_with_digest(&env::temp_dir(), &digest).unwrap_or_else(|| {
         socket_path_with_digest(Path::new("/tmp"), &digest)
             .expect("/tmp can hold a bcode socket path")
@@ -4031,11 +4074,13 @@ fn default_socket_path(endpoint_override_allowed: bool) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn socket_scope_digest(user: &str, namespace: &str) -> String {
+fn socket_scope_digest(user: &str, namespace: &str, state_location_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(user.as_bytes());
     hasher.update([0]);
     hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(state_location_id.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
     digest[..SOCKET_SCOPE_HEX_BYTES].to_owned()
 }
@@ -4084,8 +4129,10 @@ mod tests {
     fn generated_socket_paths_are_bounded_and_namespace_scoped() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let first_digest = socket_scope_digest("example-user", "ipc-v26-artifact-a");
-        let second_digest = socket_scope_digest("example-user", "ipc-v26-artifact-b");
+        let first_digest =
+            socket_scope_digest("example-user", "ipc-v26-artifact-a", "state-location-a");
+        let second_digest =
+            socket_scope_digest("example-user", "ipc-v26-artifact-b", "state-location-a");
         let path = socket_path_with_digest(Path::new("/tmp"), &first_digest)
             .expect("representable socket path");
 
@@ -4097,8 +4144,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn socket_scope_separates_distinct_state_locations() {
+        let first = socket_scope_digest("example-user", "ipc-v30-artifact-a", "state-location-a");
+        let second = socket_scope_digest("example-user", "ipc-v30-artifact-a", "state-location-b");
+
+        assert_ne!(
+            first, second,
+            "two state locations must not share one daemon endpoint"
+        );
+        assert_eq!(
+            first,
+            socket_scope_digest("example-user", "ipc-v30-artifact-a", "state-location-a"),
+            "endpoint scoping must be deterministic for one location"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn generated_socket_path_rejects_an_overlong_base() {
-        let digest = socket_scope_digest("user", "namespace");
+        let digest = socket_scope_digest("user", "namespace", "state-location");
         let base = PathBuf::from("/").join("x".repeat(MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES));
         assert!(socket_path_with_digest(&base, &digest).is_none());
     }
@@ -5455,6 +5519,7 @@ mod tests {
                 working_directory: "/tmp/bcode-window-test".into(),
                 import: None,
                 execution: None,
+                location: None,
             },
             history: Vec::new(),
             input_history: Vec::new(),
@@ -5494,6 +5559,7 @@ mod tests {
             working_directory: "/tmp/bcode-ipc-test".into(),
             import: None,
             execution: None,
+            location: None,
         };
         let response = Response::Ok(ResponsePayload::Attached {
             session_id,
@@ -5811,6 +5877,7 @@ mod tests {
             working_directory: "/tmp/bcode-ipc-test".into(),
             import: None,
             execution: None,
+            location: None,
         }
     }
 
@@ -5851,6 +5918,7 @@ mod tests {
             daemon_namespace: daemon_namespace(),
             artifact_id: Some(ArtifactId::current()),
             build_fingerprint: BUILD_FINGERPRINT.to_owned(),
+            state_location_id: Some(state_location_id()),
             runtime_context: Some(ClientRuntimeContext {
                 working_directory: Some(PathBuf::from("/tmp/client")),
                 effective_config_toml: None,
@@ -5941,6 +6009,7 @@ mod tests {
                         build_fingerprint: "test-build".to_string(),
                         executable_digest: Some("digest".to_string()),
                         storage_writer_epoch: Some(2),
+                        state_location_id: Some("state-location".to_string()),
                         session_event_schema_version: Some(38),
                         pid: Some(123),
                         instance_id: "instance".to_string(),
