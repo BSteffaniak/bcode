@@ -746,7 +746,9 @@ pub enum SessionSearchExecutionClass {
 pub struct SessionSearchPlanPolicy {
     #[serde(default)]
     pub execution_class: SessionSearchExecutionClass,
-    /// Maximum age of an incomplete/catching-up checkpoint accepted for indexed providers.
+    /// Maximum age of incomplete/catching-up checkpoints accepted before excluding a provider
+    /// that has no fresh searchable coverage. One stale session does not suppress otherwise fresh
+    /// provider results; aggregate coverage remains explicitly incomplete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_staleness_sequences: Option<u64>,
     /// Whether a remote provider is explicitly authorized to receive projected session content.
@@ -1214,12 +1216,12 @@ fn coverage_exceeds_staleness(
     let Some(maximum) = maximum_staleness_sequences else {
         return false;
     };
-    status.coverage.iter().any(|coverage| {
+    status.coverage.iter().all(|coverage| {
         coverage.generation.last_sequence.is_some_and(|tail| {
             let indexed = coverage.indexed_through_sequence.unwrap_or_default();
             tail.saturating_sub(indexed) > maximum
         })
-    })
+    }) && !status.coverage.is_empty()
 }
 
 fn planning_failure(
@@ -2955,6 +2957,55 @@ mod tests {
         };
         let plan = plan_session_search_with_policy_and_routes(&request, discovery, &remote, &[]);
         assert!(plan.failures.is_empty());
+    }
+
+    #[test]
+    fn mixed_fresh_and_stale_coverage_remains_searchable() {
+        let session_id = SessionId::new();
+        let stale_session_id = SessionId::new();
+        let status = SessionSearchStatus {
+            provider_id: "mixed".to_owned(),
+            state: SearchProviderState::Ready,
+            record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+            normalization_version: CURRENT_NORMALIZATION_VERSION,
+            policy_version: CURRENT_SEARCH_POLICY_VERSION,
+            index_bytes: 0,
+            quota_bytes: 1024,
+            document_count: 1,
+            pending_sessions: 1,
+            coverage: vec![
+                SessionSearchCoverage {
+                    generation: SearchCanonicalGeneration {
+                        session_id,
+                        fingerprint: "fresh".to_owned(),
+                        last_sequence: Some(10),
+                    },
+                    content_kinds: BTreeSet::new(),
+                    indexed_through_sequence: Some(10),
+                    complete: true,
+                    indexed_text_bytes: 1,
+                    skipped_records: 0,
+                    truncated_records: 0,
+                    exclusions: Vec::new(),
+                },
+                SessionSearchCoverage {
+                    generation: SearchCanonicalGeneration {
+                        session_id: stale_session_id,
+                        fingerprint: "stale".to_owned(),
+                        last_sequence: Some(100),
+                    },
+                    content_kinds: BTreeSet::new(),
+                    indexed_through_sequence: Some(1),
+                    complete: false,
+                    indexed_text_bytes: 1,
+                    skipped_records: 0,
+                    truncated_records: 0,
+                    exclusions: Vec::new(),
+                },
+            ],
+            degraded_reason: None,
+        };
+        assert!(!coverage_exceeds_staleness(&status, Some(0)));
     }
 
     #[test]

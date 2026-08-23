@@ -187,6 +187,47 @@ fn complete_backfill_progress(
     }
 }
 
+fn terminal_complete_backfill_response(
+    provider_ids: &[String],
+    revision_started: u64,
+    revision_completed: u64,
+    convergence_passes: usize,
+    cancelled: bool,
+    mut providers: Vec<bcode_session_search::CompleteSessionSearchBackfillProviderResult>,
+) -> bcode_session_search::CompleteSessionSearchBackfillResponse {
+    if cancelled {
+        let completed_ids = providers
+            .iter()
+            .map(|provider| provider.provider_id.clone())
+            .collect::<BTreeSet<_>>();
+        providers.extend(
+            provider_ids
+                .iter()
+                .filter(|provider_id| !completed_ids.contains(*provider_id))
+                .map(|provider_id| {
+                    bcode_session_search::CompleteSessionSearchBackfillProviderResult {
+                        provider_id: provider_id.clone(),
+                        selected_sessions: 0,
+                        completed_sessions: 0,
+                        incomplete_sessions: 0,
+                        failed_sessions: 0,
+                        catalog_pages: 0,
+                        issues: Vec::new(),
+                        error: None,
+                    }
+                }),
+        );
+    }
+    bcode_session_search::CompleteSessionSearchBackfillResponse {
+        provider_ids: provider_ids.to_vec(),
+        catalog_revision_started: revision_started,
+        catalog_revision_completed: revision_completed,
+        convergence_passes,
+        cancelled,
+        providers,
+    }
+}
+
 fn backfill_continuation_cursor(
     starting_cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
     summaries: &[bcode_session_models::SessionSummary],
@@ -334,6 +375,10 @@ pub async fn complete_backfill(
                 issues: Vec::new(),
                 error: None,
             };
+            let mut selected_session_ids = BTreeSet::new();
+            let mut completed_session_ids = BTreeSet::new();
+            let mut incomplete_session_ids = BTreeSet::new();
+            let mut failed_session_ids = BTreeSet::new();
             loop {
                 if cancellation.is_cancelled() {
                     break;
@@ -358,25 +403,40 @@ pub async fn complete_backfill(
                 }
                 match response {
                     Ok(response) => {
-                        aggregate.selected_sessions = aggregate
-                            .selected_sessions
-                            .saturating_add(response.completed_sessions)
-                            .saturating_add(response.failed_sessions);
-                        aggregate.completed_sessions = aggregate
-                            .completed_sessions
-                            .saturating_add(response.completed_sessions);
-                        aggregate.failed_sessions = aggregate
-                            .failed_sessions
-                            .saturating_add(response.failed_sessions);
-                        aggregate.incomplete_sessions = response.incomplete_sessions;
+                        for session in &response.sessions {
+                            selected_session_ids.insert(session.session_id);
+                            match session.outcome {
+                                SessionSearchBackfillOutcome::Complete => {
+                                    completed_session_ids.insert(session.session_id);
+                                    incomplete_session_ids.remove(&session.session_id);
+                                    failed_session_ids.remove(&session.session_id);
+                                }
+                                SessionSearchBackfillOutcome::Incomplete => {
+                                    if !completed_session_ids.contains(&session.session_id) {
+                                        incomplete_session_ids.insert(session.session_id);
+                                    }
+                                    failed_session_ids.remove(&session.session_id);
+                                }
+                                SessionSearchBackfillOutcome::Failed => {
+                                    if !completed_session_ids.contains(&session.session_id) {
+                                        failed_session_ids.insert(session.session_id);
+                                    }
+                                    incomplete_session_ids.remove(&session.session_id);
+                                }
+                            }
+                        }
+                        aggregate.selected_sessions = selected_session_ids.len();
+                        aggregate.completed_sessions = completed_session_ids.len();
+                        aggregate.incomplete_sessions = incomplete_session_ids.len();
+                        aggregate.failed_sessions = failed_session_ids.len();
                         merge_complete_backfill_issues(&mut aggregate.issues, &response.sessions);
                         aggregate.catalog_pages = aggregate.catalog_pages.saturating_add(1);
                         let needs_continuation = response.next_cursor.is_some()
                             || response.deadline_reached
                             || response.incomplete_sessions > 0;
                         let made_progress = response.sessions.iter().any(|session| {
-                            session.outcome != SessionSearchBackfillOutcome::Incomplete
-                                || session.batches_applied > 0
+                            session.batches_applied > 0
+                                || matches!(session.outcome, SessionSearchBackfillOutcome::Complete)
                         });
                         cursor = response.next_cursor;
                         if needs_continuation && !made_progress {
@@ -459,14 +519,14 @@ pub async fn complete_backfill(
                     });
                 }
             }
-            let response = bcode_session_search::CompleteSessionSearchBackfillResponse {
-                provider_ids,
-                catalog_revision_started: revision_started,
-                catalog_revision_completed: revision_completed,
+            let response = terminal_complete_backfill_response(
+                &provider_ids,
+                revision_started,
+                revision_completed,
                 convergence_passes,
-                cancelled: cancellation.is_cancelled(),
+                cancellation.is_cancelled(),
                 providers,
-            };
+            );
             response
                 .validate()
                 .map_err(|error| SessionSearchServiceError {
@@ -729,6 +789,35 @@ pub async fn backfill_provider_with_cancellation(
                 canonical_tail_sequence: progress.canonical_tail_sequence,
                 error: None,
             },
+            Err(error) if error.deadline_reached() => {
+                let indexed_before = provider
+                    .status
+                    .coverage
+                    .iter()
+                    .find(|coverage| coverage.generation.session_id == session_id)
+                    .and_then(|coverage| coverage.indexed_through_sequence);
+                let indexed_after = provider_status(state, &request.provider_id)
+                    .await
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .coverage
+                            .into_iter()
+                            .find(|coverage| coverage.generation.session_id == session_id)
+                            .and_then(|coverage| coverage.indexed_through_sequence)
+                    });
+                SessionSearchBackfillSessionResult {
+                    session_id,
+                    outcome: SessionSearchBackfillOutcome::Incomplete,
+                    batches_applied: usize::from(indexed_after > indexed_before),
+                    indexed_through_sequence: indexed_after.or(indexed_before),
+                    canonical_tail_sequence: canonical_session_tail(state, session_id)
+                        .await
+                        .ok()
+                        .flatten(),
+                    error: None,
+                }
+            }
             Err(error) => SessionSearchBackfillSessionResult {
                 session_id,
                 outcome: SessionSearchBackfillOutcome::Failed,
@@ -741,13 +830,13 @@ pub async fn backfill_provider_with_cancellation(
                     .and_then(|coverage| coverage.indexed_through_sequence),
                 canonical_tail_sequence: None,
                 error: Some(SessionSearchServiceError {
-                    code: if error.retryable {
+                    code: if error.retryable_error() {
                         SearchErrorCode::ProviderUnavailable
                     } else {
                         SearchErrorCode::InvalidRequest
                     },
                     message: bounded_message(&error.to_string()),
-                    retryable: error.retryable,
+                    retryable: error.retryable_error(),
                 }),
             },
         };
@@ -1108,25 +1197,50 @@ impl SessionSearchDirtyQueue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestionErrorKind {
+    Retryable,
+    Permanent,
+    Deadline,
+}
+
 #[derive(Debug)]
 struct IngestionError {
     message: String,
-    retryable: bool,
+    kind: IngestionErrorKind,
 }
 
 impl IngestionError {
     fn retryable(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
-            retryable: true,
+            kind: IngestionErrorKind::Retryable,
         }
     }
 
     fn permanent(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
-            retryable: false,
+            kind: IngestionErrorKind::Permanent,
         }
+    }
+
+    fn deadline(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            kind: IngestionErrorKind::Deadline,
+        }
+    }
+
+    const fn retryable_error(&self) -> bool {
+        matches!(
+            self.kind,
+            IngestionErrorKind::Retryable | IngestionErrorKind::Deadline
+        )
+    }
+
+    const fn deadline_reached(&self) -> bool {
+        matches!(self.kind, IngestionErrorKind::Deadline)
     }
 }
 
@@ -1138,6 +1252,9 @@ impl std::fmt::Display for IngestionError {
 
 fn classify_ingestion_call_error(error: bcode_plugin::PluginServiceCallError) -> IngestionError {
     match &error {
+        bcode_plugin::PluginServiceCallError::Invoke(
+            bcode_plugin::PluginLoadError::ServiceInvocationTimeout { .. },
+        ) => IngestionError::deadline(error),
         bcode_plugin::PluginServiceCallError::Service { code, .. }
             if matches!(
                 code.as_str(),
@@ -1180,11 +1297,11 @@ pub(crate) async fn process_dirty_sessions(state: &ServerState) {
                 tracing::warn!(
                     target: "bcode_server::session_search",
                     %session_id,
-                    retryable = error.retryable,
+                    retryable = error.retryable_error(),
                     error = %bounded_message(&error.to_string()),
                     "asynchronous session-search ingestion failed"
                 );
-                if error.retryable {
+                if error.retryable_error() {
                     tokio::time::sleep(INCREMENTAL_RETRY_DELAY).await;
                     state.session_search_dirty.mark_committed(session_id).await;
                     state.metrics.increment_counter(
@@ -1577,7 +1694,7 @@ async fn invoke_apply_batch(
 ) -> Result<ApplySearchRecordsResponse, IngestionError> {
     let response = if let Some(deadline) = deadline {
         let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(IngestionError::retryable(
+            return Err(IngestionError::deadline(
                 "historical backfill deadline reached",
             ));
         };
@@ -4001,6 +4118,16 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn cancellation_before_first_provider_produces_valid_terminal_aggregates() {
+        let provider_ids = vec!["first".to_owned(), "second".to_owned()];
+        let response =
+            terminal_complete_backfill_response(&provider_ids, 1, 1, 1, true, Vec::new());
+        assert!(response.cancelled);
+        assert_eq!(response.providers.len(), 2);
+        assert!(response.validate().is_ok());
+    }
+
     #[tokio::test]
     async fn maintenance_scheduler_yields_to_waiting_ordinary_work_between_slices() {
         let scheduler = std::sync::Arc::new(SessionSearchWorkScheduler::default());
@@ -4625,11 +4752,14 @@ pub(crate) mod tests {
 
         assert!(SLOW_APPLY_STARTED.load(Ordering::SeqCst));
         assert!(SLOW_APPLY_CANCELLED.load(Ordering::SeqCst));
-        assert_eq!(response.failed_sessions, 1);
+        assert_eq!(response.failed_sessions, 0);
+        assert_eq!(response.incomplete_sessions, 1);
         assert!(response.deadline_reached);
-        let error = response.sessions[0].error.as_ref().expect("deadline error");
-        assert!(error.retryable);
-        assert_eq!(error.code, SearchErrorCode::ProviderUnavailable);
+        assert_eq!(
+            response.sessions[0].outcome,
+            SessionSearchBackfillOutcome::Incomplete
+        );
+        assert!(response.sessions[0].error.is_none());
     }
 
     #[tokio::test]
@@ -4791,7 +4921,7 @@ pub(crate) mod tests {
         .await
         .expect_err("checkpoint ahead of canonical tail must fail closed");
 
-        assert!(!error.retryable);
+        assert!(!error.retryable_error());
         assert!(
             error
                 .message

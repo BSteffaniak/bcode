@@ -11425,6 +11425,19 @@ async fn session_search_backfill_operation(
     print_session_search_backfill_operation(&status, json)
 }
 
+fn print_session_search_backfill_operation_if_changed(
+    status: &bcode_session_search::SessionSearchBackfillOperationStatus,
+    json: bool,
+    last_printed_revision: &mut Option<u64>,
+) -> Result<(), CliError> {
+    if last_printed_revision.is_some_and(|revision| revision == status.revision) {
+        return Ok(());
+    }
+    print_session_search_backfill_operation(status, json)?;
+    *last_printed_revision = Some(status.revision);
+    Ok(())
+}
+
 fn print_session_search_backfill_operation(
     status: &bcode_session_search::SessionSearchBackfillOperationStatus,
     json: bool,
@@ -11628,6 +11641,7 @@ async fn session_search_backfill(
         )
         .await?;
     let mut revision = 0;
+    let mut last_printed_revision = None;
     loop {
         let wait = session_search_backfill_wait_recovering(
             &client,
@@ -11643,7 +11657,11 @@ async fn session_search_backfill(
                 let status = client
                     .session_search_backfill_cancel(started.operation_id.clone())
                     .await?;
-                print_session_search_backfill_operation(&status, json)?;
+                print_session_search_backfill_operation_if_changed(
+                    &status,
+                    json,
+                    &mut last_printed_revision,
+                )?;
                 return Err(CliError::InvalidArguments(
                     "session-search backfill cancelled".to_owned(),
                 ));
@@ -11657,11 +11675,19 @@ async fn session_search_backfill(
                 | bcode_session_search::SessionSearchBackfillOperationState::Cancelled
                 | bcode_session_search::SessionSearchBackfillOperationState::Failed
         ) {
-            print_session_search_backfill_operation(&status, json)?;
+            print_session_search_backfill_operation_if_changed(
+                &status,
+                json,
+                &mut last_printed_revision,
+            )?;
             return complete_backfill_terminal_result(&status);
         }
         if !json {
-            print_session_search_backfill_operation(&status, false)?;
+            print_session_search_backfill_operation_if_changed(
+                &status,
+                false,
+                &mut last_printed_revision,
+            )?;
         }
     }
 }
@@ -16007,6 +16033,35 @@ mod web_command_tests {
             classify_session_backfill_wait_recovery(&completed, "daemon-a", Some("daemon-b")),
             SessionBackfillWaitRecovery::ReturnWait
         );
+    }
+
+    #[test]
+    fn unchanged_backfill_revision_is_not_printed_twice() {
+        let mut last_printed_revision = None;
+        let status = bcode_session_search::SessionSearchBackfillOperationStatus {
+            operation_id: "operation".to_owned(),
+            provider_id: "provider".to_owned(),
+            revision: 3,
+            state: bcode_session_search::SessionSearchBackfillOperationState::Running,
+            response: None,
+            complete_progress: None,
+            complete_response: None,
+            error: None,
+        };
+        print_session_search_backfill_operation_if_changed(
+            &status,
+            true,
+            &mut last_printed_revision,
+        )
+        .expect("first revision prints");
+        assert_eq!(last_printed_revision, Some(3));
+        print_session_search_backfill_operation_if_changed(
+            &status,
+            true,
+            &mut last_printed_revision,
+        )
+        .expect("duplicate revision is ignored");
+        assert_eq!(last_printed_revision, Some(3));
     }
 
     #[test]
