@@ -186,6 +186,7 @@ required_interaction_operation_tests=(
   plugin_service_operations_match_real_ipc_results
   runtime_work_list_and_history_match_real_ipc_results
   runtime_work_operations_cancel_parent_and_node_without_transport_writing
+  session_create_rename_and_delete_match_real_ipc_results
   session_operations_lifecycle_without_transport_writing
   server_question_exchange_completes_original_plugin_invocation
 )
@@ -229,6 +230,21 @@ required_plugin_client_methods=(
   publish_plugin_event
 )
 for method in "${required_plugin_client_methods[@]}"; do
+  if ! rg -q "pub async fn $method\\b" packages/client/src/lib.rs; then
+    fail "typed client boundary is missing $method"
+  fi
+done
+
+required_session_client_methods=(
+  create_session_in_working_directory
+  change_session_working_directory
+  delete_session
+  rename_session
+  session_history
+  session_history_around
+  session_history_page
+)
+for method in "${required_session_client_methods[@]}"; do
   if ! rg -q "pub async fn $method\\b" packages/client/src/lib.rs; then
     fail "typed client boundary is missing $method"
   fi

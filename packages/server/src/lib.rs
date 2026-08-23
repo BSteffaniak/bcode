@@ -45607,6 +45607,76 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn session_create_rename_and_delete_match_real_ipc_results() {
+        let sessions = SessionManager::default();
+        let state = Arc::new(test_server_state(sessions));
+        let working_directory = test_working_directory();
+        let direct = session_operations::create(
+            state.as_ref(),
+            Some("direct session".to_owned()),
+            working_directory.clone(),
+        )
+        .await
+        .expect("direct create");
+        assert_eq!(
+            session_operations::rename(
+                state.as_ref(),
+                direct.id,
+                Some("direct renamed".to_owned()),
+            )
+            .await
+            .expect("direct rename")
+            .name
+            .as_deref(),
+            Some("direct renamed")
+        );
+        assert_eq!(
+            session_operations::delete(state.as_ref(), direct.id)
+                .await
+                .expect("direct delete")
+                .id,
+            direct.id
+        );
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let ipc = client
+            .create_session_in_working_directory(
+                Some("IPC session".to_owned()),
+                working_directory.clone(),
+            )
+            .await
+            .expect("IPC create");
+        assert_eq!(ipc.working_directory, working_directory);
+        assert_eq!(
+            client
+                .rename_session(ipc.id, Some("IPC renamed".to_owned()))
+                .await
+                .expect("IPC rename")
+                .name
+                .as_deref(),
+            Some("IPC renamed")
+        );
+        assert_eq!(
+            client.delete_session(ipc.id).await.expect("IPC delete").id,
+            ipc.id
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn interaction_operations_list_and_resolve_permissions_without_transport_writing() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
