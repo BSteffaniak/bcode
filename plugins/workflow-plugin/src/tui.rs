@@ -1335,6 +1335,16 @@ impl WorkflowStatusSurface {
             vec![Line::from("Select a discovered workflow")]
         };
         let mut lines = lines;
+        if let Some(source) = self.selected_launch_source.as_ref() {
+            lines.insert(
+                0,
+                Line::from_spans(vec![
+                    Span::styled("Discover", theme.muted),
+                    Span::styled(" › ", theme.component.border),
+                    Span::styled(format!("{source:?}"), theme.focused),
+                ]),
+            );
+        }
         if self.parent_session_id.is_none() {
             lines.push(Line::from_spans(vec![Span::styled(
                 "Start unavailable: open /workflow from an active session",
@@ -1388,7 +1398,7 @@ impl WorkflowStatusSurface {
             return;
         };
         let header_height = u16::from(self.has_workspace_notice())
-            .saturating_add(2)
+            .saturating_add(3)
             .min(area.height);
         let header = Rect::new(area.x, area.y, area.width, header_height);
         let footer_height = 1.min(area.height.saturating_sub(header.height));
@@ -1620,6 +1630,12 @@ impl WorkflowStatusSurface {
             );
         }
         if area.height > 2 {
+            frame.write_line(
+                Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+                &workflow_breadcrumb_line(self, theme),
+            );
+        }
+        if area.height > 3 {
             let (message, style) = self.inline_error.as_ref().map_or_else(
                 || {
                     self.catalog_error.as_ref().map_or_else(
@@ -1646,7 +1662,7 @@ impl WorkflowStatusSurface {
                 |error| (error.clone(), theme.error),
             );
             frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+                Rect::new(area.x, area.y.saturating_add(3), area.width, 1),
                 &Line::from_spans(vec![Span::styled(message, style)]),
             );
         }
@@ -4471,6 +4487,29 @@ impl PluginTuiSurface for WorkflowStatusSurface {
             _ => PluginTuiAction::None,
         }
     }
+}
+
+fn workflow_breadcrumb_line(surface: &WorkflowStatusSurface, theme: WorkflowSurfaceTheme) -> Line {
+    let run = surface.selected_run_view();
+    let run_label = run.map_or("select run", |run| run.run.display_title.as_str());
+    let node = surface.selected_node_id.as_deref().unwrap_or("select node");
+    let exact = surface.selected_attempt_id.as_ref().map_or_else(
+        || "latest activation/attempt".to_string(),
+        |(_, activation, attempt)| format!("{activation} / attempt {attempt}"),
+    );
+    let session = surface
+        .selected_child_session_id
+        .as_deref()
+        .map_or_else(String::new, |session| format!(" / session {session}"));
+    Line::from_spans(vec![
+        Span::styled("Runs", theme.muted),
+        Span::styled(" › ", theme.component.border),
+        Span::styled(run_label.to_string(), theme.focused),
+        Span::styled(" › Graph › ", theme.component.border),
+        Span::styled(node.to_string(), theme.focused),
+        Span::styled(" › ", theme.component.border),
+        Span::styled(format!("{exact}{session}"), theme.muted),
+    ])
 }
 
 fn launch_item_lines(
