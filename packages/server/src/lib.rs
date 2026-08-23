@@ -45677,6 +45677,76 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn session_bounded_reads_match_real_ipc_results() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions =
+            SessionManager::persistent(session_root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(Some("session reads".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let event_client_id = ClientId::new();
+        sessions
+            .append_user_message(session.id, event_client_id, "first".to_owned())
+            .await
+            .expect("first event");
+        sessions
+            .append_assistant_message(session.id, "second".to_owned())
+            .await
+            .expect("second event");
+        let state = Arc::new(test_server_state(sessions));
+        let client_id = ClientId::new();
+        let page_query = bcode_session_models::SessionHistoryQuery {
+            cursor: None,
+            limit: 2,
+            direction: bcode_session_models::SessionHistoryDirection::Backward,
+        };
+        let direct_page =
+            session_operations::history_page(state.as_ref(), client_id, session.id, page_query)
+                .await
+                .expect("direct history page");
+        let around_query = bcode_session_models::SessionHistoryAroundQuery {
+            sequence: direct_page.events[0].sequence,
+            before: 1,
+            after: 1,
+        };
+        let direct_around =
+            session_operations::history_around(state.as_ref(), client_id, session.id, around_query)
+                .await
+                .expect("direct history around");
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        assert_eq!(
+            client
+                .session_history_page(session.id, page_query)
+                .await
+                .expect("IPC history page"),
+            direct_page
+        );
+        assert_eq!(
+            client
+                .session_history_around(session.id, around_query)
+                .await
+                .expect("IPC history around"),
+            direct_around
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn interaction_operations_list_and_resolve_permissions_without_transport_writing() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
