@@ -109,7 +109,11 @@ Credential values are accepted only through hidden host prompts or successful te
 
 Plaintext values must not be copied into TOML, runtime JSON, diagnostics, flow state, command arguments, snapshots, or logs. Runtime metadata stores storage keys and profile locations only. Device sealing is host-owned policy and is enforced during mutation.
 
-At invocation time, the host resolves the selected profile and supplies only the credentials declared by the owning method. Normalized application/provider contexts receive canonical credential IDs; unrelated plugins and providers do not receive those values.
+At invocation time, the host resolves the selected profile and supplies only the credentials declared by the owning method. Normalized application/provider contexts receive canonical credential IDs; unrelated plugins and providers do not receive those values. Plugin code should use `NativeServiceContext::credentials()` and then `get(provider_id, credential_id)` or `require(provider_id, credential_id)`; it must not enumerate the raw secret map or construct host storage keys.
+
+Refresh persistence and security inspection use the versioned `bcode.provider-auth/v1` host service. Plugins submit semantic provider/profile IDs and credential replacements; caller ownership, vault location, storage keys, device-seal policy, and mutation are derived and validated by the host. A `None` replacement removes an optional credential atomically with the other updates.
+
+Native plugins are trusted in-process code and are not sandboxed. These contracts prevent accidental custody and cross-plugin access through supported APIs; they do not provide adversarial isolation from arbitrary native code.
 
 ## Lifecycle and failure behavior
 
@@ -142,13 +146,14 @@ the client/server boundary; frontends do not read auth state files directly.
 
 ## Plugin author checklist
 
-1. Depend on `bcode_provider_auth_models` and `bcode_plugin_sdk`; do not add vault dependencies for ordinary enrollment.
+1. Depend on `bcode_provider_auth_models` and `bcode_plugin_sdk`; ordinary plugins must not add vault dependencies.
 2. Register every provider and method during plugin activation.
 3. Use stable, bounded IDs and declare every credential the host may store or deliver.
-4. Keep endpoints, token exchange, refresh, and provider-native errors inside the plugin.
-5. Return only normalized effects and non-secret diagnostics.
-6. Validate cancellation and terminal-state behavior.
-7. Test malformed responses, missing credentials, ownership mismatch, redaction, and disabled-plugin behavior.
-8. Keep API keys, tokens, codes, and callback payloads out of config, state, logs, fixtures, and snapshots.
+4. Read invocation credentials through `NativeServiceContext::credentials()` using provider and credential IDs.
+5. Keep endpoints, token exchange, refresh, and provider-native errors inside the plugin, but persist refreshed credentials through the typed host operation.
+6. Return only normalized effects and non-secret diagnostics.
+7. Validate cancellation and terminal-state behavior.
+8. Test malformed responses, missing credentials, ownership mismatch, redaction, and disabled-plugin behavior.
+9. Keep API keys, tokens, codes, callback payloads, vault paths, and storage keys out of config, state, logs, fixtures, snapshots, and plugin-facing requests.
 
 The Exa registration in `plugins/web-search-plugin` is the minimal `SecretFields` example. OpenAI browser and device methods in `plugins/openai-compatible-provider-plugin` demonstrate normalized interactive flows.

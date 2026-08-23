@@ -105,6 +105,7 @@ pub const OP_UPDATE_CREDENTIALS: &str = "update_credentials";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthCredentialUpdateRequest {
     pub schema_version: u16,
+    pub provider_id: String,
     pub profile: String,
     /// Credential replacements. `None` removes an optional credential atomically with updates.
     pub credentials: BTreeMap<String, Option<String>>,
@@ -123,6 +124,7 @@ impl AuthCredentialUpdateRequest {
             self.schema_version,
             AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
         )?;
+        validate_id("provider_id", &self.provider_id)?;
         validate_id("profile", &self.profile)?;
         if self.credentials.is_empty() {
             return Err(AuthContractError::EmptyCollection {

@@ -1383,9 +1383,16 @@ impl OpenAiCompatibleProviderPlugin {
                         "refreshed credentials require an owned auth profile",
                     );
                 };
+                let provider_id = request
+                    .provider_context
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.attributes.get("provider"))
+                    .map_or("openai", String::as_str);
                 if let Err(error) = persist_refreshed_chatgpt_auth(
                     &context.bridge,
                     &request.turn_id,
+                    provider_id,
                     profile,
                     refreshed,
                 ) {
@@ -7679,11 +7686,13 @@ async fn refresh_chatgpt_auth_if_needed(
 fn persist_refreshed_chatgpt_auth(
     bridge: &ServiceBridge,
     invocation_id: &str,
+    provider_id: &str,
     profile: &str,
     refreshed: RefreshedChatGptAuth,
 ) -> Result<(), ProviderError> {
     let request = bcode_provider_auth_models::AuthCredentialUpdateRequest {
         schema_version: bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+        provider_id: provider_id.to_owned(),
         profile: profile.to_owned(),
         credentials: BTreeMap::from([
             ("access_token".to_owned(), Some(refreshed.access_token)),

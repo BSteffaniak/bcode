@@ -3753,18 +3753,19 @@ fn provider_auth_bridge_resolution(
         };
     };
     let runtime = bcode_config::load_runtime_auth_subscriptions();
-    let Some((provider_id, registered)) = plugins
-        .auth_provider_registry()
-        .providers()
-        .into_iter()
-        .find(|provider| provider.plugin_id == caller_plugin_id)
-        .map(|provider| (provider.contribution.provider_id.clone(), provider))
-    else {
+    let Some(registered) = plugins.auth_provider(&update.provider_id) else {
         return bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "auth_owner_unregistered".to_owned(),
-            message: "plugin does not own a registered authentication provider".to_owned(),
+            code: "auth_provider_unregistered".to_owned(),
+            message: "authentication provider is not registered".to_owned(),
         };
     };
+    if registered.plugin_id != caller_plugin_id {
+        return bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: "auth_owner_mismatch".to_owned(),
+            message: "authentication provider is owned by another plugin".to_owned(),
+        };
+    }
+    let provider_id = update.provider_id.clone();
     let resolved = match bcode_provider_auth::resolve_auth_provider_profile(
         &config,
         &provider_id,

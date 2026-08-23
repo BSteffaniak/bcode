@@ -44,6 +44,15 @@ pub fn update_credentials(
     request
         .validate()
         .map_err(|error| AuthCredentialUpdateError::InvalidRequest(error.to_string()))?;
+    if request.provider_id != context.provider_id {
+        return Err(AuthCredentialUpdateError::Ownership(
+            AuthProfileResolutionError::ProviderMismatch {
+                profile: request.profile,
+                expected: context.provider_id.to_owned(),
+                actual: request.provider_id,
+            },
+        ));
+    }
     if request.profile != context.resolved.profile_name {
         return Err(AuthCredentialUpdateError::Ownership(
             AuthProfileResolutionError::MissingProfile {
@@ -278,6 +287,7 @@ mod tests {
             context,
             AuthCredentialUpdateRequest {
                 schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                provider_id: "openai".to_owned(),
                 profile: "openai".to_owned(),
                 credentials: BTreeMap::from([
                     ("access_token".to_owned(), Some("access".to_owned())),
@@ -305,6 +315,7 @@ mod tests {
             },
             AuthCredentialUpdateRequest {
                 schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                provider_id: "openai".to_owned(),
                 profile: "openai".to_owned(),
                 credentials: BTreeMap::from([
                     ("access_token".to_owned(), Some("next-access".to_owned())),
@@ -346,6 +357,7 @@ mod tests {
                 },
                 AuthCredentialUpdateRequest {
                     schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                    provider_id: "openai".to_owned(),
                     profile: "openai".to_owned(),
                     credentials: BTreeMap::from([(
                         "access_token".to_owned(),
@@ -357,6 +369,32 @@ mod tests {
         );
         assert!(!invalid_vault.exists());
 
+        let mismatched_vault = temp.path().join("provider-mismatch-must-not-exist");
+        let mismatched_resolved = resolved(&mismatched_vault);
+        assert!(matches!(
+            update_credentials(
+                AuthCredentialUpdateContext {
+                    caller_plugin_id: "bcode.openai-compatible",
+                    provider_id: "openai",
+                    resolved: &mismatched_resolved,
+                    method: &method,
+                },
+                AuthCredentialUpdateRequest {
+                    schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                    provider_id: "xai".to_owned(),
+                    profile: "openai".to_owned(),
+                    credentials: BTreeMap::from([(
+                        "access_token".to_owned(),
+                        Some("secret".to_owned()),
+                    )]),
+                },
+            ),
+            Err(AuthCredentialUpdateError::Ownership(
+                AuthProfileResolutionError::ProviderMismatch { .. }
+            ))
+        ));
+        assert!(!mismatched_vault.exists());
+
         assert!(
             update_credentials(
                 AuthCredentialUpdateContext {
@@ -367,6 +405,7 @@ mod tests {
                 },
                 AuthCredentialUpdateRequest {
                     schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                    provider_id: "openai".to_owned(),
                     profile: "openai".to_owned(),
                     credentials: BTreeMap::from([("other".to_owned(), Some("secret".to_owned()))]),
                 },

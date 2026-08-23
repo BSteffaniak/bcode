@@ -62,6 +62,15 @@ if rg -n 'sshenv_vault|ProviderAuthStorageRef|vault_private_key_paths|SshenvStor
   violations=1
 fi
 
+if rg -n 'sshenv_vault\s*=' plugins --glob 'Cargo.toml' \
+  >/tmp/bcode-plugin-vault-dependencies.txt || \
+  rg -n 'sshenv_vault::|vault_private_key_paths|SshenvStore|ProviderAuthStorageRef' \
+    plugins --glob '*.rs' >>/tmp/bcode-plugin-vault-dependencies.txt; then
+  echo "Auth architecture violation: ordinary plugins must not depend on or invoke vault implementation APIs." >&2
+  cat /tmp/bcode-plugin-vault-dependencies.txt >&2
+  violations=1
+fi
+
 if ! rg -n 'fn register_auth_providers' plugins/web-search-plugin/src/lib.rs >/dev/null ||
    ! rg -n 'fn register_auth_providers' plugins/openai-compatible-provider-plugin/src/lib.rs >/dev/null; then
   echo "Auth architecture violation: bundled Exa/OpenAI/xAI providers must remain plugin-registered." >&2
