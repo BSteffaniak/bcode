@@ -8756,6 +8756,47 @@ mod tests {
     }
 
     #[test]
+    fn workflow_modes_render_explicit_empty_loading_disconnected_and_health_states() {
+        let mut surface = projected_surface();
+        surface.workspace_mode = WorkflowWorkspaceMode::Discover;
+        surface.launch_catalog = None;
+        surface.launch_catalog_loading = true;
+        assert!(render_workspace_text(&mut surface, 100, 24).contains("Discovering workflows"));
+        surface.launch_catalog_loading = false;
+        surface.live_status = "live updates unavailable: offline".to_string();
+        assert!(render_workspace_text(&mut surface, 100, 24).contains("Disconnected"));
+        surface.launch_catalog = Some(bcode_workflow::WorkflowLaunchCatalogPage {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            items: Vec::new(),
+            diagnostics: Vec::new(),
+            next_cursor: None,
+        });
+        assert!(render_workspace_text(&mut surface, 100, 24).contains("No workflows discovered"));
+
+        surface.workspace_mode = WorkflowWorkspaceMode::Runs;
+        surface.live_status = "live".to_string();
+        surface.catalog_loading = true;
+        surface.catalog_stale = true;
+        assert!(render_workspace_text(&mut surface, 100, 24).contains("showing stale"));
+        surface.catalog_loading = false;
+        surface.runs.get_mut("run-1").expect("run").health =
+            bcode_workflow_view_models::WorkflowProjectionHealth::UnsupportedVersion {
+                version: 99,
+            };
+        assert!(render_workspace_text(&mut surface, 100, 24).contains("unsupported"));
+        surface.runs.get_mut("run-1").expect("run").health =
+            bcode_workflow_view_models::WorkflowProjectionHealth::Degraded {
+                reason: "index stale".to_string(),
+            };
+        assert!(render_workspace_text(&mut surface, 100, 24).contains("degraded"));
+        surface.runs.get_mut("run-1").expect("run").health =
+            bcode_workflow_view_models::WorkflowProjectionHealth::RepairRequired {
+                reason: "repair exact run".to_string(),
+            };
+        assert!(render_workspace_text(&mut surface, 100, 24).contains("requires repair"));
+    }
+
+    #[test]
     fn missing_selected_detail_is_not_reported_as_loading() {
         let mut surface = projected_surface();
         surface.runs.clear();
