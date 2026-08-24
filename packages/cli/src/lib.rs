@@ -413,6 +413,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::ArtifactId => println!("{}", bcode_ipc::ArtifactId::current()),
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
+        Commands::State { command } => handle_state_command(command)?,
         #[cfg(feature = "web-renderer")]
         Commands::Web {
             bind,
@@ -2389,6 +2390,7 @@ async fn handle_session_io_command(
         | Commands::ArtifactId
         | Commands::Server { .. }
         | Commands::Session { .. }
+        | Commands::State { .. }
         | Commands::Plugin { .. }
         | Commands::Theme { .. }
         | Commands::Model { .. }
@@ -2703,6 +2705,11 @@ enum Commands {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// Inspect configured durable state locations.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
     },
     #[cfg(feature = "web-renderer")]
     Web {
@@ -3411,6 +3418,19 @@ enum ServerCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum StateCommand {
+    /// List configured state locations, their roles, and their availability.
+    ///
+    /// Read-only: this resolves configuration and probes availability without creating,
+    /// migrating, or repairing anything.
+    Locations {
+        /// Print the inventory as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SessionCommand {
     Create {
         name: Option<String>,
@@ -3863,6 +3883,28 @@ enum SessionCommand {
     /// Rebuild model-context and transcript indexes from canonical history.
     Reindex {
         session_id: SessionId,
+    },
+    /// Move canonical session storage to another configured state location.
+    ///
+    /// Relocation is an explicit maintenance operation: it refuses live owners, verifies every
+    /// copied byte before publishing, and only unlinks the source after a verified publish, so an
+    /// interruption always leaves the source authoritative.
+    Relocate {
+        /// Destination state root, or a `[state] profile` name via --to-profile.
+        #[arg(long = "to", value_name = "ROOT", conflicts_with = "to_profile")]
+        to: Option<PathBuf>,
+        /// Destination state profile name from `[state] profile`.
+        #[arg(long = "to-profile", value_name = "PROFILE")]
+        to_profile: Option<String>,
+        /// Sessions to relocate. Omit to consider every session in the source location.
+        #[arg(long = "session", value_name = "SESSION_ID")]
+        session: Vec<SessionId>,
+        /// Report the plan without copying, publishing, or deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the plan or report as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Ask the verified daemon owning a session to release ownership when quiescent.
     ReleaseOwner {
@@ -4785,6 +4827,15 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         SessionCommand::Reindex { session_id } => {
             reindex_session_model_context(session_id).await?;
         }
+        SessionCommand::Relocate {
+            to,
+            to_profile,
+            session,
+            dry_run,
+            json,
+        } => {
+            relocate_sessions_command(to, to_profile, session, dry_run, json)?;
+        }
         SessionCommand::ReleaseOwner { session_id } => {
             release_session_owner(session_id).await?;
         }
@@ -4800,6 +4851,279 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             stop_session_owner(session_id, true).await?;
         }
         SessionCommand::Import { command } => handle_session_import_command(command).await?,
+    }
+    Ok(())
+}
+
+/// Resolve the current state location set, or fail closed with an actionable message.
+///
+/// Resolution never substitutes a different location, so an unavailable location is reported
+/// rather than silently replaced.
+fn resolve_current_state_locations() -> Result<bcode_config::StateLocationSet, CliError> {
+    let config = bcode_config::load_config()?;
+    bcode_config::resolve_state_location_set(
+        &config.state,
+        &bcode_config::StateLocationSelection::default(),
+    )
+    .map_err(|error| CliError::InvalidArguments(error.to_string()))
+}
+
+fn handle_state_command(command: StateCommand) -> Result<(), CliError> {
+    match command {
+        StateCommand::Locations { json } => list_state_locations(json),
+    }
+}
+
+/// Print the configured state location inventory.
+///
+/// This is read-only: it resolves configuration and reports availability without creating,
+/// migrating, or repairing anything.
+fn list_state_locations(json: bool) -> Result<(), CliError> {
+    let resolved = resolve_current_state_locations()?;
+    let primary_id = resolved.primary().id().as_str().to_owned();
+    let rows = resolved
+        .readable()
+        .iter()
+        .map(|location| {
+            let sessions_root = location.sessions_root();
+            serde_json::json!({
+                "location_id": location.id().as_str(),
+                "profile": location.profile(),
+                "primary": location.id().as_str() == primary_id,
+                "provenance": format!("{:?}", location.provenance()),
+                "root": location.root(),
+                "sessions_root": sessions_root,
+                "available": sessions_root.is_dir(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "locations": rows }))?
+        );
+        return Ok(());
+    }
+
+    println!("Configured state locations ({}):", rows.len());
+    for row in &rows {
+        let role = if row["primary"] == serde_json::json!(true) {
+            "primary"
+        } else {
+            "readable"
+        };
+        let label = row["profile"].as_str().map_or_else(
+            || row["location_id"].as_str().unwrap_or("?").to_owned(),
+            |profile| format!("{profile} ({})", row["location_id"].as_str().unwrap_or("?")),
+        );
+        let availability = if row["available"] == serde_json::json!(true) {
+            "available"
+        } else {
+            "unavailable"
+        };
+        println!(
+            "  {label} [{role}, {availability}] selected by {}",
+            row["provenance"].as_str().unwrap_or("?")
+        );
+        println!("    state root:    {}", row["root"].as_str().unwrap_or("?"));
+        println!(
+            "    sessions root: {}",
+            row["sessions_root"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the relocation destination sessions root from `--to` or `--to-profile`.
+fn relocation_destination(
+    to: Option<PathBuf>,
+    to_profile: Option<String>,
+) -> Result<PathBuf, CliError> {
+    match (to, to_profile) {
+        (Some(root), _) => {
+            if !root.is_absolute() {
+                return Err(CliError::InvalidArguments(format!(
+                    "relocation destination must be an absolute path, got {}",
+                    root.display()
+                )));
+            }
+            Ok(root.join("sessions"))
+        }
+        (None, Some(profile)) => {
+            let config = bcode_config::load_config()?;
+            let resolved = bcode_config::resolve_state_location_set(
+                &config.state,
+                &bcode_config::StateLocationSelection {
+                    root: None,
+                    profile: Some(profile.clone()),
+                },
+            )
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+            Ok(resolved.primary().sessions_root().to_path_buf())
+        }
+        (None, None) => Err(CliError::InvalidArguments(
+            "relocation requires --to <ROOT> or --to-profile <PROFILE>".to_owned(),
+        )),
+    }
+}
+
+/// Plan or apply an explicit cross-location session relocation.
+///
+/// Ownership is fenced by the session domain's exclusive maintenance guard, which refuses every
+/// live owner, so a session can never be moved out from under a running daemon.
+fn relocate_sessions_command(
+    to: Option<PathBuf>,
+    to_profile: Option<String>,
+    sessions: Vec<SessionId>,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let destination_root = relocation_destination(to, to_profile)?;
+    let source_root = bcode_config::default_session_store_dir();
+
+    let plan = bcode_session_migration::plan_session_relocation(
+        &source_root,
+        &destination_root,
+        &sessions,
+        |session_id, root| {
+            // A live owner is authoritative: probe without taking the guard so planning stays
+            // non-mutating.
+            bcode_session::lease::active_session_owners(root, session_id).map(|owners| {
+                if owners.is_empty() {
+                    bcode_session_migration::SessionRelocationOwnership::Available
+                } else {
+                    bcode_session_migration::SessionRelocationOwnership::BlockedByOwner
+                }
+            })
+        },
+    )
+    .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+
+    if dry_run {
+        print_relocation_plan(&plan, &source_root, &destination_root, json)?;
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&destination_root).map_err(|error| {
+        CliError::InvalidArguments(format!(
+            "relocation destination {} is unavailable: {error}",
+            destination_root.display()
+        ))
+    })?;
+
+    let report = bcode_session_migration::relocate_sessions(
+        &source_root,
+        &destination_root,
+        &plan,
+        |session_id, apply| {
+            // Exclusive maintenance refuses every live owner and is held for the whole move.
+            let Ok(guard) =
+                bcode_session::lease::acquire_session_maintenance_guard(&source_root, session_id)
+            else {
+                return Ok::<_, bcode_session::lease::SessionLeaseError>(
+                    bcode_session_migration::SessionRelocationOwnership::BlockedByOwner,
+                );
+            };
+            apply();
+            drop(guard);
+            Ok(bcode_session_migration::SessionRelocationOwnership::Available)
+        },
+    )
+    .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+
+    print_relocation_report(&report, json)
+}
+
+fn print_relocation_plan(
+    plan: &bcode_session_migration::SessionRelocationPlan,
+    source_root: &Path,
+    destination_root: &Path,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source_sessions_root": source_root,
+                "destination_sessions_root": destination_root,
+                "relocatable": plan.relocatable,
+                "blocked": plan.blocked,
+                "total_bytes": plan.total_bytes(),
+                "pinned_artifact_sessions": plan.pinned_artifact_sessions(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!("Relocation plan (dry run; nothing was copied or deleted):");
+    println!("  source:      {}", source_root.display());
+    println!("  destination: {}", destination_root.display());
+    println!(
+        "  relocatable: {} session(s), {} byte(s)",
+        plan.relocatable.len(),
+        plan.total_bytes()
+    );
+    for entry in &plan.relocatable {
+        let pinned = if entry.has_pinned_artifacts {
+            " (has location-pinned artifacts; source copies are retained)"
+        } else {
+            ""
+        };
+        println!(
+            "    {} — {} byte(s){pinned}",
+            entry.session_id, entry.canonical_bytes
+        );
+    }
+    if !plan.blocked.is_empty() {
+        println!("  blocked: {} session(s)", plan.blocked.len());
+        for entry in &plan.blocked {
+            println!("    {} — {}", entry.session_id, describe_block(entry));
+        }
+    }
+    Ok(())
+}
+
+fn describe_block(entry: &bcode_session_migration::SessionRelocationEntry) -> &'static str {
+    match entry.blocked {
+        Some(bcode_session_migration::SessionRelocationBlock::BlockedByOwner) => {
+            "a live owner holds this session; stop it first"
+        }
+        Some(bcode_session_migration::SessionRelocationBlock::DestinationConflict) => {
+            "the destination already claims this session ID; resolve the conflict explicitly"
+        }
+        Some(bcode_session_migration::SessionRelocationBlock::Unreadable) => {
+            "canonical storage is missing or unreadable"
+        }
+        None => "relocatable",
+    }
+}
+
+fn print_relocation_report(
+    report: &bcode_session_migration::SessionRelocationReport,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Relocated {} session(s).", report.relocated.len());
+    for session_id in &report.relocated {
+        println!("  {session_id}");
+    }
+    if !report.retained_pinned_artifacts.is_empty() {
+        println!(
+            "Retained source artifact copies for {} session(s) so recorded absolute URIs stay resolvable:",
+            report.retained_pinned_artifacts.len()
+        );
+        for session_id in &report.retained_pinned_artifacts {
+            println!("  {session_id}");
+        }
+    }
+    if !report.blocked.is_empty() {
+        println!("Skipped {} session(s):", report.blocked.len());
+        for entry in &report.blocked {
+            println!("  {} — {}", entry.session_id, describe_block(entry));
+        }
     }
     Ok(())
 }
@@ -19061,6 +19385,73 @@ mod client_timeout_cli_tests {
             cli.state_root.as_deref(),
             Some(std::path::Path::new("/volumes/big/bcode-state"))
         );
+    }
+
+    #[test]
+    fn session_relocate_parses_destination_selection_and_options() {
+        let session_id = bcode_session_models::SessionId::new();
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "relocate",
+            "--to",
+            "/volumes/big/bcode-state",
+            "--session",
+            &session_id.to_string(),
+            "--dry-run",
+            "--json",
+        ])
+        .expect("relocate should parse");
+
+        let Some(super::Commands::Session {
+            command:
+                super::SessionCommand::Relocate {
+                    to,
+                    to_profile,
+                    session,
+                    dry_run,
+                    json,
+                },
+        }) = cli.command
+        else {
+            panic!("expected a session relocate command");
+        };
+        assert_eq!(
+            to.as_deref(),
+            Some(std::path::Path::new("/volumes/big/bcode-state"))
+        );
+        assert_eq!(to_profile, None);
+        assert_eq!(session, vec![session_id]);
+        assert!(dry_run);
+        assert!(json);
+    }
+
+    #[test]
+    fn session_relocate_destination_selectors_are_mutually_exclusive() {
+        Cli::try_parse_from([
+            "bcode",
+            "session",
+            "relocate",
+            "--to",
+            "/volumes/big/bcode-state",
+            "--to-profile",
+            "big",
+        ])
+        .expect_err("--to and --to-profile must be mutually exclusive");
+    }
+
+    #[test]
+    fn state_locations_inventory_parses() {
+        let cli = Cli::try_parse_from(["bcode", "state", "locations", "--json"])
+            .expect("state locations should parse");
+
+        let Some(super::Commands::State {
+            command: super::StateCommand::Locations { json },
+        }) = cli.command
+        else {
+            panic!("expected a state locations command");
+        };
+        assert!(json);
     }
 
     #[test]

@@ -16,6 +16,7 @@ server = Path("packages/server/src/lib.rs").read_text(encoding="utf-8")
 catalog = Path("packages/server/src/session_catalog.rs").read_text(encoding="utf-8")
 session_store = Path("packages/session/src/store.rs").read_text(encoding="utf-8")
 lifecycle = Path("packages/daemon-lifecycle/src/lib.rs").read_text(encoding="utf-8")
+relocation = Path("packages/session-migration/src/relocation.rs").read_text(encoding="utf-8")
 invariants = Path("INVARIANTS.md").read_text(encoding="utf-8")
 
 # Production sources that must not re-resolve the durable state root themselves.
@@ -37,6 +38,39 @@ for path in list(Path("packages").rglob("*.rs")) + list(Path("plugins").rglob("*
     for variable in ('"BCODE_STATE_DIR"', '"XDG_STATE_HOME"', '"BCODE_SESSION_STORE_DIR"'):
         if re.search(r"var(_os)?\(\s*" + re.escape(variable), source):
             state_env_readers.append(f"{path}: reads {variable}")
+
+# Every attach handler must refuse an ambiguous session before it performs any
+# activation or attach side effect. Checking only that the refusal helper exists
+# somewhere is too weak: a new attach path can silently skip it, which is exactly
+# how the projection-window path regressed. Assert per-handler ordering instead.
+def attach_handlers_refuse_ambiguity_before_side_effects(source: str) -> bool:
+    handlers = re.findall(
+        r"^async fn (handle_attach_\w+)\(.*?^\}",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if len(handlers) < 3:
+        return False
+    for name in handlers:
+        body = re.search(
+            r"^async fn " + name + r"\(.*?^\}",
+            source,
+            re.MULTILINE | re.DOTALL,
+        ).group(0)
+        refusal = body.find("ambiguous_session_location_response")
+        if refusal == -1:
+            return False
+        # The refusal must precede runtime-work recovery, namespace activation, and
+        # the attach call itself, so no side effect can precede authorization.
+        for side_effect in (
+            "recover_abandoned_session_runtime_work_best_effort",
+            "try_activate_session_namespace",
+        ):
+            position = body.find(side_effect)
+            if position != -1 and position < refusal:
+                return False
+    return True
+
 
 required = {
     "state location invariants must remain cataloged":
@@ -112,6 +146,36 @@ required = {
     "opening an ambiguous session must fail closed":
         "session_location_ambiguous" in server
         and "ambiguous_session_location_response" in server,
+    "every attach path must refuse an ambiguous session before any side effect":
+        attach_handlers_refuse_ambiguity_before_side_effects(server),
+    # Phase 6: relocation must be explicit, ownership-fenced, verified, and source-authoritative.
+    "relocation must be owned by the session-migration domain":
+        "pub fn plan_session_relocation" in relocation
+        and "pub fn relocate_sessions" in relocation,
+    "relocation must be ownership-fenced rather than trusting its own plan":
+        "acquire_session_maintenance_guard" in cli
+        and "SessionRelocationOwnership::BlockedByOwner" in relocation,
+    "relocation must verify copied bytes before publishing":
+        "fn verify_copy" in relocation
+        and "fn copy_and_hash" in relocation
+        and "Sha256" in relocation,
+    "relocation must publish atomically and unlink the source only afterward":
+        "fs::rename(&staging, &destination_dir)" in relocation
+        and 'abort_at_relocation_crash_boundary("before_source_unlink")' in relocation,
+    "relocation must be resumable through a journal and discardable staging":
+        "pub fn read_relocation_journal" in relocation
+        and "pub fn discard_relocation_staging" in relocation
+        and "SESSION_RELOCATION_JOURNAL_SCHEMA_VERSION" in relocation,
+    "relocation must never merge a destination conflict":
+        "SessionRelocationBlock::DestinationConflict" in relocation
+        and "if destination_dir.exists()" in relocation,
+    "relocation must retain pinned artifacts at the source":
+        "retained_pinned_artifacts" in relocation
+        and "fn copy_session_artifacts" in relocation,
+    "relocation must not carry derived or coordination state across locations":
+        "derived_state_and_coordination_state_are_not_carried_across" in relocation,
+    "the state location inventory must be exposed as a read-only command":
+        "StateCommand" in cli and "fn list_state_locations" in cli,
     "state root resolution must not be duplicated outside bcode_config":
         not state_env_readers,
 }

@@ -942,7 +942,10 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeLocation, mark_ambiguous_locations};
+    use super::{
+        CatalogSourcePlan, NativeLocation, SessionCatalog, SourceDiagnostics, SourceLoadResult,
+        mark_ambiguous_locations,
+    };
     use bcode_session_models::{
         SessionId, SessionLocationSummary, SessionSummary, SessionTitleSource,
     };
@@ -1058,5 +1061,57 @@ mod tests {
         mark_ambiguous_locations(&mut sessions);
 
         assert!(sessions.iter().all(|session| session.location.is_none()));
+    }
+
+    /// Populate one loaded catalog source directly, without discovery or storage access.
+    ///
+    /// Keys and metadata come from the production `CatalogSourcePlan`, so the seeded state
+    /// is identical in shape to what real per-location discovery produces.
+    async fn seed_source(catalog: &SessionCatalog, location: &NativeLocation, id: SessionId) {
+        let plan = CatalogSourcePlan::Native {
+            location: location.clone(),
+        };
+        catalog
+            .apply_source_result(
+                plan.key(),
+                plan.metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![summary(id, Some(location.summary()))],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+    }
+
+    /// The refusal the attach handlers consult must report every claiming location once
+    /// more than one readable location claims the same session ID, and must report
+    /// nothing when the session is unambiguous.
+    #[tokio::test]
+    async fn ambiguous_location_ids_reports_conflicting_claims_from_loaded_sources() {
+        let catalog = SessionCatalog::default();
+        let primary = location("aaaa", None, true);
+        let foreign = location("bbbb", Some("big"), false);
+
+        let unique = SessionId::new();
+        seed_source(&catalog, &primary, unique).await;
+        assert!(
+            catalog.ambiguous_location_ids(unique).await.is_empty(),
+            "a session claimed by exactly one location must not be reported ambiguous"
+        );
+
+        let shared = SessionId::new();
+        seed_source(&catalog, &primary, shared).await;
+        seed_source(&catalog, &foreign, shared).await;
+
+        let claims = catalog.ambiguous_location_ids(shared).await;
+        assert_eq!(
+            claims,
+            vec!["aaaa".to_owned(), "bbbb".to_owned()],
+            "every claiming location must be surfaced so the conflict is actionable"
+        );
+        assert!(
+            catalog.ambiguous_location_ids(unique).await.is_empty(),
+            "ambiguity must not leak across session IDs"
+        );
     }
 }

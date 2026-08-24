@@ -10929,6 +10929,12 @@ async fn handle_attach_session_projection_window(
     state
         .metrics
         .increment_counter("server.attach_projection_window.total");
+    // Ambiguity is checked before any activation or attach side effect, matching the other
+    // attach paths: when more than one readable state location claims this session ID, no
+    // location may be opened as authoritative until explicit maintenance resolves it.
+    if let Some(response) = ambiguous_session_location_response(state, session_id).await {
+        return send_response(writer, request_id, response).await;
+    }
     recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
     let namespace_started_at = Instant::now();
     let client_namespace = state.client_session_namespace(client_id).await;

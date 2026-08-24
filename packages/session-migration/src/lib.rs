@@ -16,6 +16,7 @@ mod execution;
 mod inventory;
 mod operation;
 mod planning;
+mod relocation;
 mod service;
 mod storage;
 mod target;
@@ -31,6 +32,13 @@ pub use backup::{
 };
 pub use operation::{
     SessionMigrationOperation, SessionMigrationOperations, SessionMigrationProgressReporter,
+};
+pub use relocation::{
+    SESSION_RELOCATION_JOURNAL_SCHEMA_VERSION, SessionRelocationBlock, SessionRelocationEntry,
+    SessionRelocationError, SessionRelocationJournal, SessionRelocationOwnership,
+    SessionRelocationPlan, SessionRelocationReport, SessionRelocationStage,
+    discard_relocation_staging, plan_session_relocation, read_relocation_journal,
+    relocate_sessions, session_artifact_dir,
 };
 pub use service::SessionMigrationService;
 pub use storage::{
