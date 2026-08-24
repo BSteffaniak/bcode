@@ -241,6 +241,22 @@ fn import_event_provenance(
     )
 }
 
+fn import_error_response(error: &str) -> ErrorResponse {
+    let (code, message) = match error {
+        "session import is disabled" => ("session_import_disabled", "session import is disabled"),
+        "no session import providers are loaded" => (
+            "session_import_unavailable",
+            "session import provider is unavailable",
+        ),
+        "external session not found" => (
+            "external_session_not_found",
+            "external session was not found",
+        ),
+        _ => ("import_failed", "session import failed"),
+    };
+    ErrorResponse::new(code, message)
+}
+
 /// Send IPC response for an explicit external import request.
 ///
 /// # Errors
@@ -287,7 +303,7 @@ pub async fn handle_import_external_session(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("import_failed", error)),
+                Response::Err(import_error_response(&error)),
             )
             .await
         }
@@ -398,6 +414,37 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_errors_are_stable_and_secret_safe() {
+        for (detail, code, message) in [
+            (
+                "session import is disabled",
+                "session_import_disabled",
+                "session import is disabled",
+            ),
+            (
+                "no session import providers are loaded",
+                "session_import_unavailable",
+                "session import provider is unavailable",
+            ),
+            (
+                "external session not found",
+                "external_session_not_found",
+                "external session was not found",
+            ),
+            (
+                "secret-plugin-or-session-detail",
+                "import_failed",
+                "session import failed",
+            ),
+        ] {
+            let error = import_error_response(detail);
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+            assert!(!error.message.contains("secret-plugin-or-session-detail"));
+        }
+    }
 
     #[test]
     fn imported_tool_result_preserves_typed_text_fallback_without_presentation() {

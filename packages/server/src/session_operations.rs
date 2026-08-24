@@ -158,12 +158,37 @@ pub async fn default_model_status(
     super::model_status_for_selection(state, selection, None, &config).await
 }
 
+/// Public failure while listing models for a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListModelsError {
+    /// The selected provider could not return a trustworthy model list.
+    ProviderUnavailable,
+}
+
+impl ListModelsError {
+    /// Stable public operation error code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProviderUnavailable => "model_list_failed",
+        }
+    }
+
+    /// Secret-safe public operation error message.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::ProviderUnavailable => "model list is unavailable",
+        }
+    }
+}
+
 /// Return the user-visible model list for a client's selected provider.
 pub async fn list_models(
     state: &ServerState,
     client_id: bcode_session_models::ClientId,
     provider_plugin_id: Option<String>,
-) -> Result<(Option<String>, bcode_model::ModelList), String> {
+) -> Result<(Option<String>, bcode_model::ModelList), ListModelsError> {
     let runtime_context = state
         .client_runtime_contexts
         .try_lock()
@@ -186,7 +211,8 @@ pub async fn list_models(
         },
         bcode_model_catalog::ModelListView::UserVisible,
     )
-    .await?;
+    .await
+    .map_err(|_| ListModelsError::ProviderUnavailable)?;
     let provider_for_ignores = selected_provider_plugin_id
         .as_deref()
         .unwrap_or("bcode.openai-compatible");

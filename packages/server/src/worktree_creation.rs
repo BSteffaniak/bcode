@@ -10,13 +10,15 @@ use super::{
 const MAX_WAIT: Duration = Duration::from_secs(30);
 const MAX_RETAINED_OPERATIONS: usize = 128;
 
-fn operation_not_found(operation_id: &str) -> Response {
-    Response::Err(ErrorResponse::new(
+pub fn operation_not_found_response() -> ErrorResponse {
+    ErrorResponse::new(
         "worktree_create_operation_not_found",
-        format!(
-            "worktree creation operation {operation_id} is unavailable; daemon operation state is transient and creation will not be retried automatically"
-        ),
-    ))
+        "worktree creation operation is unavailable; daemon operation state is transient and creation will not be retried automatically",
+    )
+}
+
+fn operation_not_found(_operation_id: &str) -> Response {
+    Response::Err(operation_not_found_response())
 }
 
 async fn publish(
@@ -160,26 +162,23 @@ async fn run(state: Arc<ServerState>, operation_id: String, request: WorktreeCre
             &state,
             &operation_id,
             "session_busy",
-            &format!("session has an active model turn: {session_id}"),
+            "session has an active model turn",
             None,
         )
         .await;
         return;
     }
     let config_paths = bcode_config::default_config_paths_from(&cwd);
-    let config = match bcode_config::load_config_from_paths(&config_paths) {
-        Ok(config) => config,
-        Err(error) => {
-            fail(
-                &state,
-                &operation_id,
-                "worktree_config_failed",
-                &error.to_string(),
-                None,
-            )
-            .await;
-            return;
-        }
+    let Ok(config) = bcode_config::load_config_from_paths(&config_paths) else {
+        fail(
+            &state,
+            &operation_id,
+            "worktree_config_failed",
+            "worktree configuration is unavailable",
+            None,
+        )
+        .await;
+        return;
     };
     let blocking_request = request.clone();
     let blocking_cwd = cwd.clone();
@@ -189,23 +188,23 @@ async fn run(state: Arc<ServerState>, operation_id: String, request: WorktreeCre
     .await;
     let mut response = match created {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
+        Ok(Err(_)) => {
             fail(
                 &state,
                 &operation_id,
                 "worktree_create_command_failed",
-                &error.to_string(),
+                "worktree creation command failed",
                 None,
             )
             .await;
             return;
         }
-        Err(error) => {
+        Err(_) => {
             fail(
                 &state,
                 &operation_id,
                 "worktree_create_task_failed",
-                &error.to_string(),
+                "worktree creation task failed",
                 None,
             )
             .await;
@@ -221,7 +220,7 @@ async fn run(state: Arc<ServerState>, operation_id: String, request: WorktreeCre
     let finalized = async {
         if let Some(session_id) = request.attach_session_id {
             if state.session_has_active_turn(session_id).await {
-                return Err(format!("session has an active model turn: {session_id}"));
+                return Err("session has an active model turn".to_owned());
             }
             let changed = state
                 .sessions
@@ -256,12 +255,12 @@ async fn run(state: Arc<ServerState>, operation_id: String, request: WorktreeCre
         Ok::<(), String>(())
     }
     .await;
-    if let Err(error) = finalized {
+    if finalized.is_err() {
         fail(
             &state,
             &operation_id,
             "worktree_session_finalize_failed",
-            &error,
+            "worktree was created but session finalization failed",
             Some(created_path),
         )
         .await;

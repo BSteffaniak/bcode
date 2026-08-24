@@ -3761,57 +3761,77 @@ async fn recover_abandoned_session_runtime_work(
 }
 
 fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
-    match error {
+    let (code, message) = match error {
         WorkflowStoreError::RunNotFound { .. } => {
-            ErrorResponse::new("workflow_run_not_found", error.to_string())
+            ("workflow_run_not_found", "workflow run was not found")
         }
-        WorkflowStoreError::InvalidRunTransition { .. } => {
-            ErrorResponse::new("workflow_invalid_transition", error.to_string())
-        }
-        WorkflowStoreError::CancellationPreventsControl => {
-            ErrorResponse::new("workflow_cancellation_prevents_control", error.to_string())
-        }
-        WorkflowStoreError::TargetInputValidation(_) => {
-            ErrorResponse::new("workflow_target_input_invalid", error.to_string())
-        }
-        WorkflowStoreError::AuthoringConflict { .. } => {
-            ErrorResponse::new("workflow_authoring_conflict", error.to_string())
-        }
-        WorkflowStoreError::UnsupportedStore { .. } => {
-            ErrorResponse::new("workflow_store_reset_required", error.to_string())
-        }
+        WorkflowStoreError::InvalidRunTransition { .. } => (
+            "workflow_invalid_transition",
+            "workflow run cannot perform the requested transition",
+        ),
+        WorkflowStoreError::CancellationPreventsControl => (
+            "workflow_cancellation_prevents_control",
+            "workflow cancellation prevents the requested state change",
+        ),
+        WorkflowStoreError::TargetInputValidation(_) => (
+            "workflow_target_input_invalid",
+            "workflow target input does not satisfy its contract",
+        ),
+        WorkflowStoreError::AuthoringConflict { .. } => (
+            "workflow_authoring_conflict",
+            "workflow authoring state changed; refresh and retry",
+        ),
+        WorkflowStoreError::UnsupportedStore { .. } => (
+            "workflow_store_reset_required",
+            "workflow store requires explicit maintenance",
+        ),
         WorkflowStoreError::Database(_)
         | WorkflowStoreError::Io(_)
         | WorkflowStoreError::Serialization(_)
         | WorkflowStoreError::InvalidData(_) => {
-            ErrorResponse::new("workflow_unavailable", error.to_string())
+            ("workflow_unavailable", "workflow state is unavailable")
         }
-    }
+    };
+    ErrorResponse::new(code, message)
 }
 
 fn request_error_response(error: &ServerError) -> ErrorResponse {
-    match error {
-        ServerError::WorkflowStore(error) => workflow_store_error_response(error),
-        ServerError::Workflow(error) => {
-            ErrorResponse::new("workflow_contract_invalid", error.to_string())
+    let (code, message) = match error {
+        ServerError::WorkflowStore(error) => return workflow_store_error_response(error),
+        ServerError::Workflow(_) => (
+            "workflow_contract_invalid",
+            "workflow request does not satisfy its contract",
+        ),
+        ServerError::WorkflowDiscovery(_) => {
+            ("workflow_discovery_failed", "workflow discovery failed")
         }
-        ServerError::WorkflowDefinitionUnsupported(_) => {
-            ErrorResponse::new("workflow_definition_unsupported", error.to_string())
-        }
-        ServerError::WorkflowCapabilityUnavailable(_) => {
-            ErrorResponse::new("workflow_capability_unavailable", error.to_string())
-        }
-        ServerError::WorkflowComputationTimedOut(_) => {
-            ErrorResponse::new("workflow_computation_timed_out", error.to_string())
-        }
-        ServerError::WorkflowComputationCancelled(_) => {
-            ErrorResponse::new("workflow_computation_cancelled", error.to_string())
-        }
-        ServerError::WorkflowComputationControlInvalid(_) => {
-            ErrorResponse::new("workflow_computation_control_invalid", error.to_string())
-        }
-        _ => ErrorResponse::new("request_failed", error.to_string()),
-    }
+        ServerError::WorkflowDefinitionUnsupported(_) => (
+            "workflow_definition_unsupported",
+            "workflow definition is unsupported by this host",
+        ),
+        ServerError::WorkflowCapabilityUnavailable(_) => (
+            "workflow_capability_unavailable",
+            "a required workflow capability is unavailable",
+        ),
+        ServerError::WorkflowApplicationOperationUnauthorized(_) => (
+            "workflow_operation_unauthorized",
+            "workflow operation is not authorized",
+        ),
+        ServerError::WorkflowComputationTimedOut(_) => (
+            "workflow_computation_timed_out",
+            "workflow computation timed out",
+        ),
+        ServerError::WorkflowComputationCancelled(_) => (
+            "workflow_computation_cancelled",
+            "workflow computation was cancelled",
+        ),
+        ServerError::WorkflowComputationControlInvalid(_) => (
+            "workflow_computation_control_invalid",
+            "workflow computation control request is invalid",
+        ),
+        _ => ("request_failed", "request failed"),
+    };
+    ErrorResponse::new(code, message)
 }
 
 async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Result<(), ServerError> {
@@ -13031,6 +13051,17 @@ async fn resolved_provider_models(
     .await
 }
 
+const fn context_occupancy_error_message() -> &'static str {
+    "request context occupancy is unavailable"
+}
+
+fn compaction_provider_error_response() -> ErrorResponse {
+    ErrorResponse::new(
+        "provider_error",
+        "model provider failed during context compaction",
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 async fn model_status_for_selection(
     state: &ServerState,
@@ -13091,10 +13122,14 @@ async fn model_status_for_selection(
         .clone()
         .or_else(|| model.as_ref().and_then(|model| model.reasoning.clone()));
     let (context_occupancy, request_context_error) = if let Some(session_id) = session_id {
-        match state.sessions.current_context_occupancy(session_id).await {
-            Ok(occupancy) => (occupancy, None),
-            Err(error) => (None, Some(error.to_string())),
-        }
+        state
+            .sessions
+            .current_context_occupancy(session_id)
+            .await
+            .map_or_else(
+                |_| (None, Some(context_occupancy_error_message().to_owned())),
+                |occupancy| (occupancy, None),
+            )
     } else {
         (None, None)
     };
@@ -13160,7 +13195,7 @@ async fn handle_session_model_list(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("model_list_failed", error.clone())),
+                Response::Err(ErrorResponse::new(error.code(), error.message())),
             )
             .await
         }
@@ -14349,11 +14384,11 @@ async fn handle_compact_session(
         Err(session_operations::CompactError::Compaction(
             CompactionError::InsufficientProgress { message, .. },
         )) => send_compaction_noop_response(writer, request_id, message).await,
-        Err(session_operations::CompactError::Compaction(CompactionError::Provider(error))) => {
+        Err(session_operations::CompactError::Compaction(CompactionError::Provider(_))) => {
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("plugin_error", error)),
+                Response::Err(compaction_provider_error_response()),
             )
             .await
         }
@@ -31622,6 +31657,7 @@ mod tests {
         assert_eq!(error.code, "session_bulk_migration_operation_not_found");
         assert!(error.message.contains("transient"));
         assert!(error.message.contains("explicit re-invocation"));
+        assert!(!error.message.contains(operation_id));
         assert!(!error.message.contains("resume"));
     }
 
@@ -45499,6 +45535,67 @@ library = "test"
             assert_eq!(error.message(), message);
             assert!(!error.message().contains("secret-exchange-payload"));
         }
+    }
+
+    #[test]
+    fn worktree_creation_errors_are_stable_and_secret_safe() {
+        let error = worktree_creation::operation_not_found_response();
+        assert_eq!(error.code, "worktree_create_operation_not_found");
+        assert_eq!(
+            error.message,
+            "worktree creation operation is unavailable; daemon operation state is transient and creation will not be retried automatically"
+        );
+        assert!(!error.message.contains("secret-operation-id"));
+    }
+
+    #[test]
+    fn model_status_and_compaction_errors_are_stable_and_secret_safe() {
+        assert_eq!(
+            context_occupancy_error_message(),
+            "request context occupancy is unavailable"
+        );
+        assert!(!context_occupancy_error_message().contains("secret-session-detail"));
+
+        let provider = compaction_provider_error_response();
+        assert_eq!(provider.code, "provider_error");
+        assert_eq!(
+            provider.message,
+            "model provider failed during context compaction"
+        );
+        assert!(!provider.message.contains("secret-provider-detail"));
+    }
+
+    #[test]
+    fn model_list_errors_are_stable_and_secret_safe() {
+        let error = session_operations::ListModelsError::ProviderUnavailable;
+        assert_eq!(error.code(), "model_list_failed");
+        assert_eq!(error.message(), "model list is unavailable");
+        assert!(!error.message().contains("secret-provider-detail"));
+    }
+
+    #[test]
+    fn workflow_errors_are_stable_and_secret_safe() {
+        let missing = workflow_store_error_response(&WorkflowStoreError::RunNotFound {
+            run_id: "secret-workflow-run".to_owned(),
+        });
+        assert_eq!(missing.code, "workflow_run_not_found");
+        assert_eq!(missing.message, "workflow run was not found");
+        assert!(!missing.message.contains("secret-workflow-run"));
+
+        let unavailable = workflow_store_error_response(&WorkflowStoreError::InvalidData(
+            "secret-workflow-state".to_owned(),
+        ));
+        assert_eq!(unavailable.code, "workflow_unavailable");
+        assert_eq!(unavailable.message, "workflow state is unavailable");
+        assert!(!unavailable.message.contains("secret-workflow-state"));
+
+        let unauthorized =
+            request_error_response(&ServerError::WorkflowApplicationOperationUnauthorized(
+                "secret-authorization-detail".to_owned(),
+            ));
+        assert_eq!(unauthorized.code, "workflow_operation_unauthorized");
+        assert_eq!(unauthorized.message, "workflow operation is not authorized");
+        assert!(!unauthorized.message.contains("secret-authorization-detail"));
     }
 
     #[test]

@@ -7,12 +7,10 @@ use super::*;
 const MAX_BULK_MIGRATION_WAIT: Duration = Duration::from_secs(30);
 pub const BULK_MIGRATION_PAGE_SIZE: usize = 64;
 
-pub fn operation_not_found(operation_id: &str) -> Response {
+pub fn operation_not_found(_operation_id: &str) -> Response {
     Response::Err(ErrorResponse::new(
         "session_bulk_migration_operation_not_found",
-        format!(
-            "bulk migration operation {operation_id} is unavailable; aggregate operation state is transient and restart recovery requires explicit re-invocation"
-        ),
+        "bulk migration operation is unavailable; aggregate operation state is transient and restart recovery requires explicit re-invocation",
     ))
 }
 
@@ -259,7 +257,7 @@ async fn migrate_one(
                 )
                 .await
             }
-            Err(error) => bcode_ipc::SessionCompatibilityEntry {
+            Err(_) => bcode_ipc::SessionCompatibilityEntry {
                 session_id,
                 updated_at_ms: 0,
                 category: bcode_ipc::SessionCompatibilityCategory::Missing,
@@ -267,12 +265,12 @@ async fn migrate_one(
                 retryable: false,
                 source_writer_epoch: None,
                 first_historical_event_schema: None,
-                message: Some(error.to_string()),
+                message: Some("session is unavailable".to_owned()),
             },
         };
     };
-    if let Err(error) = state.session_migrations.plan(source_writer_epoch) {
-        return failed_entry(session_id, error.to_string());
+    if state.session_migrations.plan(source_writer_epoch).is_err() {
+        return failed_entry(session_id, "session migration is unavailable".to_owned());
     }
     let initial = migrating_session_open_snapshot(session_id, source_writer_epoch);
     let sessions = state.sessions.clone();
@@ -326,7 +324,7 @@ async fn migrate_one(
                 message: None,
             }
         }
-        Some(outcome) => failed_entry(session_id, format!("{outcome:?}")),
+        Some(_) => failed_entry(session_id, "session migration failed".to_owned()),
         None => failed_entry(
             session_id,
             "migration operation ended without an outcome".to_owned(),
