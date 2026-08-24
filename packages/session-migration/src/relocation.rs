@@ -18,6 +18,12 @@
 //! which is reported as a conflict rather than silently merged
 //! (`Canonical history is never silently merged`).
 //!
+//! Relocation is **crash-safe and idempotent, but not resumable**: an interrupted copy restarts
+//! from zero rather than continuing, because treating partially copied canonical bytes as
+//! authoritative would be unsafe. Abandoned staging is reclaimed by an explicit prune operation,
+//! which distinguishes a live relocation from dead debris using an advisory lock rather than a
+//! timing heuristic.
+//!
 //! This module owns discovery, classification, copy, verification, publish, and journalling.
 //! Ownership coordination is injected by the caller, because this crate must not depend on the
 //! session runtime's lease types — the same inversion `recover_accidental_epoch_session_root`
@@ -43,8 +49,16 @@ const RELOCATION_BUFFER_BYTES: usize = 128 * 1024;
 /// so canonical session discovery ignores it.
 const RELOCATION_STAGING_PREFIX: &str = "relocating-";
 
-/// File name of the resumable relocation journal.
+/// File name of the relocation journal inside a staging directory.
 const RELOCATION_JOURNAL_FILE: &str = "relocation-journal.json";
+
+/// File name of the advisory liveness lock inside a staging directory.
+///
+/// Held for the lifetime of an in-flight relocation. The operating system releases an advisory
+/// file lock when the holding process dies, so a prune operation that *acquires* this lock knows
+/// the previous owner is gone, while contention means a relocation is genuinely still running.
+/// That is a real liveness signal rather than a timing heuristic.
+const RELOCATION_LOCK_FILE: &str = "relocation.lock";
 
 /// Session-owned artifact directory name, a sibling of canonical session directories.
 const SESSION_ARTIFACTS_DIR: &str = "session-artifacts";
@@ -135,11 +149,15 @@ pub struct SessionRelocationReport {
     pub retained_pinned_artifacts: Vec<SessionId>,
 }
 
-/// Durable, resumable record of one in-flight relocation.
+/// Durable record of one in-flight relocation, used for diagnosis rather than resume.
 ///
-/// The journal is written into the staging directory before any destination bytes exist, so a
-/// resumed run can tell a staging directory it owns from unrelated debris. It is derived state:
-/// discarding it only costs a re-copy, never canonical history.
+/// The journal is written into the staging directory before any destination bytes exist, so an
+/// operator inspecting abandoned staging can see which session it belonged to and how far it got.
+///
+/// It deliberately does **not** drive resume: an interrupted copy is discarded and re-copied rather
+/// than continued, because trusting a partially copied canonical database would risk treating
+/// unverified bytes as authoritative. Staging is derived state, so discarding it only costs a
+/// re-copy, never canonical history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRelocationJournal {
     /// Journal schema version.
@@ -157,7 +175,10 @@ pub struct SessionRelocationJournal {
 /// Current journal schema version.
 pub const SESSION_RELOCATION_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
-/// Ordered relocation stages recorded in the journal.
+/// Stages recorded in the journal before publication.
+///
+/// There is no `Published` stage: publication is a single atomic `rename`, after which the staging
+/// directory and its journal no longer exist, so no journal can ever describe a published move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRelocationStage {
@@ -165,8 +186,6 @@ pub enum SessionRelocationStage {
     Copying,
     /// Copy finished and verified; publish not yet performed.
     Verified,
-    /// Published into canonical destination; source not yet unlinked.
-    Published,
 }
 
 /// Relocation failures.
@@ -402,6 +421,16 @@ fn relocate_one_session<E>(
     }
     fs::create_dir_all(&staging).map_err(|source| SessionRelocationError::io(&staging, source))?;
 
+    // Hold an advisory lock for the whole move so a concurrent prune can tell this live
+    // relocation from abandoned debris. The OS releases it if this process dies, which is what
+    // makes prune's liveness check a fact rather than a timing guess.
+    let lock_path = staging.join(RELOCATION_LOCK_FILE);
+    let lock_file = File::create(&lock_path)
+        .map_err(|source| SessionRelocationError::io(&lock_path, source))?;
+    lock_file
+        .lock()
+        .map_err(|source| SessionRelocationError::io(&lock_path, source))?;
+
     write_journal(
         &staging,
         &SessionRelocationJournal {
@@ -421,11 +450,14 @@ fn relocate_one_session<E>(
     update_journal_stage(&staging, SessionRelocationStage::Verified)?;
     abort_at_relocation_crash_boundary("before_publish");
 
-    // Publish atomically. The journal lives inside the staging directory, so remove it first:
-    // canonical storage must not gain a relocation artifact.
+    // Publish atomically. The journal and lock both live inside the staging directory, so remove
+    // them first: canonical storage must not gain relocation artifacts.
     let journal_path = staging.join(RELOCATION_JOURNAL_FILE);
     fs::remove_file(&journal_path)
         .map_err(|source| SessionRelocationError::io(&journal_path, source))?;
+    // Release before unlinking so no handle outlives the file it locks.
+    drop(lock_file);
+    fs::remove_file(&lock_path).map_err(|source| SessionRelocationError::io(&lock_path, source))?;
     fs::rename(&staging, &destination_dir)
         .map_err(|source| SessionRelocationError::io(&destination_dir, source))?;
 
@@ -629,12 +661,7 @@ fn update_journal_stage<E>(
 ///
 /// An unknown future schema version is surfaced as an error rather than guessed
 /// (`Unknown future state is not guessed`).
-///
-/// # Errors
-///
-/// Returns an error when the journal exists but cannot be read or decoded, or when its schema
-/// version is newer than this build understands.
-pub fn read_relocation_journal(
+fn read_relocation_journal(
     staging: &Path,
 ) -> Result<Option<SessionRelocationJournal>, std::io::Error> {
     let path = staging.join(RELOCATION_JOURNAL_FILE);
@@ -656,43 +683,137 @@ pub fn read_relocation_journal(
     Ok(Some(journal))
 }
 
-/// Discard staging directories left behind by interrupted relocations.
+/// One abandoned-or-live staging directory found in a destination root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocationStagingEntry {
+    /// Session the staging directory belongs to.
+    pub session_id: SessionId,
+    /// Stage the interrupted relocation had reached, when its journal is readable.
+    pub stage: Option<String>,
+    /// Bytes currently staged.
+    pub staged_bytes: u64,
+    /// Whether a live relocation still holds this staging directory's advisory lock.
+    ///
+    /// A live entry is never pruned: doing so would delete a running relocation's working
+    /// directory out from under it.
+    pub live: bool,
+}
+
+/// Inventory and optional cleanup outcome for staging directories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocationStagingReport {
+    /// Abandoned staging directories that can be pruned.
+    pub prunable: Vec<RelocationStagingEntry>,
+    /// Staging directories skipped because a live relocation still owns them.
+    pub live: Vec<RelocationStagingEntry>,
+    /// Sessions whose staging directories were actually removed.
+    pub pruned: Vec<SessionId>,
+}
+
+impl RelocationStagingReport {
+    /// Return whether nothing needs attention.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.prunable.is_empty() && self.live.is_empty()
+    }
+
+    /// Return total bytes held by prunable staging directories.
+    #[must_use]
+    pub fn prunable_bytes(&self) -> u64 {
+        self.prunable
+            .iter()
+            .fold(0, |total, entry| total.saturating_add(entry.staged_bytes))
+    }
+}
+
+/// Inventory staging directories left behind by interrupted relocations, optionally pruning them.
 ///
 /// Staging directories are derived state: their presence is never proof that canonical history
-/// moved (`Derived state is disposable`). This never touches canonical session directories.
+/// moved (`Derived state is disposable`). Canonical session directories are never touched, because
+/// only names carrying the staging prefix are considered.
+///
+/// Liveness is decided by advisory lock, not elapsed time: a staging directory whose lock can be
+/// acquired had its owner die, while a contended lock means a relocation is still running and is
+/// reported as live rather than pruned. With `apply` false this mutates nothing, matching the
+/// inventory-then-apply shape of other explicit maintenance operations (`Repair is explicit`).
 ///
 /// # Errors
 ///
-/// Returns an error when the destination root cannot be enumerated.
-pub fn discard_relocation_staging(
+/// Returns an error when the destination root cannot be enumerated or a prune fails.
+pub fn prune_relocation_staging(
     destination_root: &Path,
-) -> Result<Vec<SessionId>, std::io::Error> {
+    apply: bool,
+) -> Result<RelocationStagingReport, std::io::Error> {
+    let mut report = RelocationStagingReport::default();
     if !destination_root.exists() {
-        return Ok(Vec::new());
+        return Ok(report);
     }
-    let mut discarded = Vec::new();
-    for entry in fs::read_dir(destination_root)?.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+    let mut entries = fs::read_dir(destination_root)?
+        .flatten()
+        .filter_map(|entry| {
+            entry.file_type().ok().filter(std::fs::FileType::is_dir)?;
+            let name = entry.file_name();
+            let suffix = name.to_str()?.strip_prefix(RELOCATION_STAGING_PREFIX)?;
+            let session_id = suffix.parse::<SessionId>().ok()?;
+            Some((session_id, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(session_id, _)| *session_id);
+
+    for (session_id, path) in entries {
+        let stage = read_relocation_journal(&path)
+            .ok()
+            .flatten()
+            .map(|journal| match journal.stage {
+                SessionRelocationStage::Copying => "copying".to_owned(),
+                SessionRelocationStage::Verified => "verified".to_owned(),
+            });
+        let staged_bytes = relocation_files(&path, &path).map_or(0, |files| {
+            files
+                .iter()
+                .fold(0_u64, |total, file| total.saturating_add(file.bytes))
+        });
+        let live = staging_is_live(&path)?;
+        let entry = RelocationStagingEntry {
+            session_id,
+            stage,
+            staged_bytes,
+            live,
         };
-        if !file_type.is_dir() {
+        if live {
+            report.live.push(entry);
             continue;
         }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(suffix) = name.strip_prefix(RELOCATION_STAGING_PREFIX) else {
-            continue;
-        };
-        let Ok(session_id) = suffix.parse::<SessionId>() else {
-            continue;
-        };
-        fs::remove_dir_all(entry.path())?;
-        discarded.push(session_id);
+        report.prunable.push(entry);
+        if apply {
+            fs::remove_dir_all(&path)?;
+            report.pruned.push(session_id);
+        }
     }
-    discarded.sort_unstable();
-    Ok(discarded)
+    Ok(report)
+}
+
+/// Report whether a live relocation still holds a staging directory's advisory lock.
+///
+/// Acquiring the lock proves the previous owner is gone, because the operating system releases
+/// advisory locks when a process dies. The probe lock is released immediately, so this never
+/// prevents a later real relocation from claiming the directory.
+fn staging_is_live(staging: &Path) -> Result<bool, std::io::Error> {
+    let lock_path = staging.join(RELOCATION_LOCK_FILE);
+    if !lock_path.is_file() {
+        // Staging without a lock file predates the lock or was interrupted before locking; it has
+        // no live owner to protect.
+        return Ok(false);
+    }
+    let file = File::open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => {
+            drop(file);
+            Ok(false)
+        }
+        Err(fs::TryLockError::WouldBlock) => Ok(true),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 fn canonical_session_ids<E>(root: &Path) -> Result<Vec<SessionId>, SessionRelocationError<E>> {
@@ -895,6 +1016,14 @@ mod tests {
                 .exists(),
             "canonical storage must not carry a relocation journal"
         );
+        assert!(
+            !destination
+                .path()
+                .join(session_id.to_string())
+                .join(RELOCATION_LOCK_FILE)
+                .exists(),
+            "canonical storage must not carry a relocation lock file"
+        );
     }
 
     #[test]
@@ -1024,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_staging_is_discarded_rather_than_trusted() {
+    fn abandoned_staging_is_inventoried_then_pruned_without_touching_canonical_sessions() {
         let destination = tempfile::tempdir().expect("destination");
         let session_id = SessionId::new();
         let staging = destination
@@ -1035,18 +1164,62 @@ mod tests {
         let canonical = SessionId::new();
         seed_session(destination.path(), canonical, b"untouched");
 
-        let discarded = discard_relocation_staging(destination.path()).expect("discard");
+        // Inventory first: reporting must not mutate anything.
+        let inventory = prune_relocation_staging(destination.path(), false).expect("inventory");
+        assert_eq!(inventory.prunable.len(), 1);
+        assert_eq!(inventory.prunable[0].session_id, session_id);
+        assert_eq!(inventory.prunable[0].staged_bytes, 7);
+        assert!(inventory.pruned.is_empty(), "inventory must not delete");
+        assert!(staging.exists(), "inventory must not mutate staging");
 
-        assert_eq!(discarded, vec![session_id]);
-        assert!(!staging.exists(), "partial staging must be discarded");
+        let report = prune_relocation_staging(destination.path(), true).expect("prune");
+
+        assert_eq!(report.pruned, vec![session_id]);
+        assert!(!staging.exists(), "abandoned staging must be pruned");
         assert!(
             destination.path().join(canonical.to_string()).exists(),
-            "canonical sessions must never be discarded as staging"
+            "canonical sessions must never be pruned as staging"
         );
     }
 
+    /// A staging directory whose advisory lock is still held belongs to a running relocation and
+    /// must never be pruned, even with `apply`.
     #[test]
-    fn a_staging_journal_records_resumable_progress() {
+    fn live_staging_is_reported_rather_than_pruned() {
+        let destination = tempfile::tempdir().expect("destination");
+        let session_id = SessionId::new();
+        let staging = destination
+            .path()
+            .join(format!("{RELOCATION_STAGING_PREFIX}{session_id}"));
+        fs::create_dir_all(&staging).expect("staging");
+        let lock_path = staging.join(RELOCATION_LOCK_FILE);
+        let held = File::create(&lock_path).expect("lock file");
+        held.lock().expect("hold the lock like a live relocation");
+
+        let report = prune_relocation_staging(destination.path(), true).expect("prune");
+
+        assert!(
+            report.prunable.is_empty(),
+            "a live relocation is not prunable"
+        );
+        assert_eq!(report.live.len(), 1);
+        assert_eq!(report.live[0].session_id, session_id);
+        assert!(report.live[0].live);
+        assert!(report.pruned.is_empty());
+        assert!(
+            staging.exists(),
+            "pruning must never delete a running relocation's staging directory"
+        );
+
+        // Once the owner releases the lock, the same directory becomes prunable.
+        drop(held);
+        let after = prune_relocation_staging(destination.path(), true).expect("prune");
+        assert_eq!(after.pruned, vec![session_id]);
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn a_staging_journal_records_interrupted_progress() {
         let source = tempfile::tempdir().expect("source");
         let destination = tempfile::tempdir().expect("destination");
         let session_id = SessionId::new();
@@ -1253,14 +1426,19 @@ mod tests {
                         !published.exists(),
                         "publish had not happened yet at {phase}"
                     );
-                    // Only staging may exist, and staging is discardable derived state.
+                    // Only staging may exist, and staging is prunable derived state. The aborted
+                    // child held the advisory lock, so this also proves the OS released it on
+                    // death: a dead owner's staging must be reclaimable, not stuck forever.
                     let staging =
                         destination.join(format!("{RELOCATION_STAGING_PREFIX}{session_id}"));
                     assert!(staging.exists(), "verified staging should be present");
-                    assert_eq!(
-                        discard_relocation_staging(&destination).expect("discard"),
-                        vec![session_id]
+                    let report = prune_relocation_staging(&destination, true).expect("prune");
+                    assert!(
+                        report.live.is_empty(),
+                        "a crashed relocation must not look live"
                     );
+                    assert_eq!(report.pruned, vec![session_id]);
+                    assert!(!staging.exists());
                 }
                 "before_source_unlink" => {
                     // Both exist: the move completed publication but not source removal. This is

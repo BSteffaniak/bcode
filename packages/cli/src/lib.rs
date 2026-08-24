@@ -3428,6 +3428,21 @@ enum StateCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Inventory staging directories left behind by interrupted relocations.
+    ///
+    /// Without `--apply` this is a non-mutating inventory. Staging still held by a running
+    /// relocation is reported as live and never pruned.
+    PruneStaging {
+        /// State root whose sessions root should be scanned. Defaults to the current location.
+        #[arg(long = "root", value_name = "ROOT")]
+        root: Option<PathBuf>,
+        /// Remove abandoned staging directories. Without this flag, nothing is deleted.
+        #[arg(long)]
+        apply: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -4871,7 +4886,79 @@ fn resolve_current_state_locations() -> Result<bcode_config::StateLocationSet, C
 fn handle_state_command(command: StateCommand) -> Result<(), CliError> {
     match command {
         StateCommand::Locations { json } => list_state_locations(json),
+        StateCommand::PruneStaging { root, apply, json } => {
+            prune_relocation_staging_command(root, apply, json)
+        }
     }
+}
+
+/// Inventory, and optionally remove, staging directories from interrupted relocations.
+///
+/// Staging is derived state, so removing it never risks canonical history. Staging still held by a
+/// running relocation is reported as live and left alone.
+fn prune_relocation_staging_command(
+    root: Option<PathBuf>,
+    apply: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let sessions_root = match root {
+        Some(root) => {
+            if !root.is_absolute() {
+                return Err(CliError::InvalidArguments(format!(
+                    "state root must be an absolute path, got {}",
+                    root.display()
+                )));
+            }
+            root.join("sessions")
+        }
+        None => bcode_config::default_session_store_dir(),
+    };
+    let report = bcode_session_migration::prune_relocation_staging(&sessions_root, apply)
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if report.is_empty() {
+        println!(
+            "No interrupted relocation staging found under {}.",
+            sessions_root.display()
+        );
+        return Ok(());
+    }
+    if !report.live.is_empty() {
+        println!(
+            "Live relocations in progress ({}); not pruned:",
+            report.live.len()
+        );
+        for entry in &report.live {
+            println!(
+                "  {} — staging held by a running relocation",
+                entry.session_id
+            );
+        }
+    }
+    if !report.prunable.is_empty() {
+        let verb = if apply { "Pruned" } else { "Prunable" };
+        println!(
+            "{verb} abandoned staging ({}, {} byte(s)):",
+            report.prunable.len(),
+            report.prunable_bytes()
+        );
+        for entry in &report.prunable {
+            let stage = entry.stage.as_deref().unwrap_or("unknown");
+            println!(
+                "  {} — interrupted while {stage}, {} byte(s)",
+                entry.session_id, entry.staged_bytes
+            );
+        }
+        if !apply {
+            println!("Re-run with --apply to remove them.");
+        }
+    }
+    Ok(())
 }
 
 /// Print the configured state location inventory.
@@ -19438,6 +19525,44 @@ mod client_timeout_cli_tests {
             "big",
         ])
         .expect_err("--to and --to-profile must be mutually exclusive");
+    }
+
+    #[test]
+    fn state_prune_staging_parses_inventory_and_apply_modes() {
+        let inventory = Cli::try_parse_from(["bcode", "state", "prune-staging"])
+            .expect("prune-staging should parse");
+        let Some(super::Commands::State {
+            command: super::StateCommand::PruneStaging { root, apply, json },
+        }) = inventory.command
+        else {
+            panic!("expected a state prune-staging command");
+        };
+        assert_eq!(root, None);
+        assert!(!apply, "inventory must be the default, not deletion");
+        assert!(!json);
+
+        let applied = Cli::try_parse_from([
+            "bcode",
+            "state",
+            "prune-staging",
+            "--root",
+            "/volumes/big/bcode-state",
+            "--apply",
+            "--json",
+        ])
+        .expect("prune-staging --apply should parse");
+        let Some(super::Commands::State {
+            command: super::StateCommand::PruneStaging { root, apply, json },
+        }) = applied.command
+        else {
+            panic!("expected a state prune-staging command");
+        };
+        assert_eq!(
+            root.as_deref(),
+            Some(std::path::Path::new("/volumes/big/bcode-state"))
+        );
+        assert!(apply);
+        assert!(json);
     }
 
     #[test]

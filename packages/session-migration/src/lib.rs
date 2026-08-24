@@ -34,11 +34,10 @@ pub use operation::{
     SessionMigrationOperation, SessionMigrationOperations, SessionMigrationProgressReporter,
 };
 pub use relocation::{
-    SESSION_RELOCATION_JOURNAL_SCHEMA_VERSION, SessionRelocationBlock, SessionRelocationEntry,
-    SessionRelocationError, SessionRelocationJournal, SessionRelocationOwnership,
-    SessionRelocationPlan, SessionRelocationReport, SessionRelocationStage,
-    discard_relocation_staging, plan_session_relocation, read_relocation_journal,
-    relocate_sessions, session_artifact_dir,
+    RelocationStagingEntry, RelocationStagingReport, SessionRelocationBlock,
+    SessionRelocationEntry, SessionRelocationError, SessionRelocationOwnership,
+    SessionRelocationPlan, SessionRelocationReport, plan_session_relocation,
+    prune_relocation_staging, relocate_sessions, session_artifact_dir,
 };
 pub use service::SessionMigrationService;
 pub use storage::{

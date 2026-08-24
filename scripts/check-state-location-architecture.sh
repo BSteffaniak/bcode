@@ -162,10 +162,14 @@ required = {
     "relocation must publish atomically and unlink the source only afterward":
         "fs::rename(&staging, &destination_dir)" in relocation
         and 'abort_at_relocation_crash_boundary("before_source_unlink")' in relocation,
-    "relocation must be resumable through a journal and discardable staging":
-        "pub fn read_relocation_journal" in relocation
-        and "pub fn discard_relocation_staging" in relocation
-        and "SESSION_RELOCATION_JOURNAL_SCHEMA_VERSION" in relocation,
+    "relocation must be crash-safe with prunable staging and a liveness-aware prune":
+        "pub fn prune_relocation_staging" in relocation
+        and "fn staging_is_live" in relocation
+        and "RELOCATION_LOCK_FILE" in relocation
+        and "try_lock()" in relocation
+        and "fn prune_relocation_staging_command" in cli,
+    "abandoned staging must never be pruned while a relocation still holds it":
+        "live_staging_is_reported_rather_than_pruned" in relocation,
     "relocation must never merge a destination conflict":
         "SessionRelocationBlock::DestinationConflict" in relocation
         and "if destination_dir.exists()" in relocation,
