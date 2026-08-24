@@ -21919,15 +21919,15 @@ fn format_git_revision_context(
     deadline: Instant,
 ) -> Option<String> {
     let root = repository_root?;
-    let head = run_bounded_command(root, "git", &["rev-parse", "--short=12", "HEAD"], deadline)?;
+    let head =
+        run_bounded_repository_command(root, &["rev-parse", "--short=12", "HEAD"], deadline)?;
     let mut lines = vec![
         "Git revision context:".to_string(),
         format!("* HEAD: {head}"),
     ];
     let upstream_ref = format!("@{{{}}}", "upstream");
-    if let Some(upstream) = run_bounded_command(
+    if let Some(upstream) = run_bounded_repository_command(
         root,
-        "git",
         &[
             "rev-parse",
             "--abbrev-ref",
@@ -21938,9 +21938,8 @@ fn format_git_revision_context(
     ) {
         lines.push(format!("* Upstream: {upstream}"));
         let revision_range = ["HEAD...", upstream_ref.as_str()].concat();
-        if let Some(counts) = run_bounded_command(
+        if let Some(counts) = run_bounded_repository_command(
             root,
-            "git",
             &["rev-list", "--left-right", "--count", &revision_range],
             deadline,
         ) {
@@ -21959,15 +21958,13 @@ fn format_worktree_context(
     deadline: Instant,
 ) -> Option<String> {
     let root = repository_root?;
-    let git_dir = PathBuf::from(run_bounded_command(
+    let git_dir = PathBuf::from(run_bounded_repository_command(
         root,
-        "git",
         &["rev-parse", "--absolute-git-dir"],
         deadline,
     )?);
-    let common_dir = PathBuf::from(run_bounded_command(
+    let common_dir = PathBuf::from(run_bounded_repository_command(
         root,
-        "git",
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         deadline,
     )?);
@@ -22014,9 +22011,7 @@ fn read_process_output(mut stream: impl std::io::Read, max_bytes: usize) -> Vec<
 }
 
 fn run_command_with_deadline(
-    cwd: &Path,
-    program: &str,
-    args: &[&str],
+    command: &mut Command,
     deadline: Instant,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -22024,9 +22019,7 @@ fn run_command_with_deadline(
     if timeout.is_zero() {
         return None;
     }
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -22048,13 +22041,37 @@ fn run_command_with_deadline(
     status.success().then_some((stdout, stderr))
 }
 
+fn read_only_git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        // Repository probes are read-only and may be killed at their deadline. Suppress optional
+        // index refreshes so abrupt termination cannot orphan `index.lock`.
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
+fn run_bounded_repository_command(cwd: &Path, args: &[&str], deadline: Instant) -> Option<String> {
+    let mut command = read_only_git_command(cwd, args);
+    let (stdout, stderr) = run_command_with_deadline(&mut command, deadline)?;
+    let output = if stdout.is_empty() { stderr } else { stdout };
+    let output = String::from_utf8_lossy(&output)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!output.is_empty()).then(|| truncate_text(&output, DYNAMIC_COMMAND_MAX_CHARS))
+}
+
 fn run_bounded_command(
     cwd: &Path,
     program: &str,
     args: &[&str],
     deadline: Instant,
 ) -> Option<String> {
-    let (stdout, stderr) = run_command_with_deadline(cwd, program, args, deadline)?;
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    let (stdout, stderr) = run_command_with_deadline(&mut command, deadline)?;
     let output = if stdout.is_empty() { stderr } else { stdout };
     let output = String::from_utf8_lossy(&output)
         .split_whitespace()
@@ -22105,7 +22122,8 @@ fn run_repository_command(
     deadline: Instant,
     max_output_bytes: usize,
 ) -> Option<String> {
-    let (stdout, _) = run_command_with_deadline(cwd, "git", args, deadline)?;
+    let mut command = read_only_git_command(cwd, args);
+    let (stdout, _) = run_command_with_deadline(&mut command, deadline)?;
     String::from_utf8(stdout)
         .ok()
         .map(|output| output.chars().take(max_output_bytes).collect::<String>())
@@ -44661,6 +44679,56 @@ library = "test"
         ] {
             assert!(standard_trace_phase(phase));
         }
+    }
+
+    #[test]
+    fn repository_status_probe_does_not_refresh_or_lock_index() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .output()
+                .expect("git command should run");
+            assert!(
+                output.status.success(),
+                "git command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test User"]);
+        fs::write(repository.path().join("tracked.txt"), "initial\n").expect("tracked file");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+
+        let index = repository.path().join(".git/index");
+        let original_modified = fs::metadata(&index)
+            .expect("index metadata")
+            .modified()
+            .expect("index modification time");
+        std::thread::sleep(Duration::from_secs(1));
+        fs::write(repository.path().join("tracked.txt"), "changed\n").expect("tracked file");
+
+        let status = run_repository_command(
+            repository.path(),
+            &["status", "--short"],
+            Instant::now() + Duration::from_secs(5),
+            4_096,
+        )
+        .expect("repository status");
+
+        assert!(status.contains("tracked.txt"));
+        assert_eq!(
+            fs::metadata(index)
+                .expect("index metadata")
+                .modified()
+                .expect("index modification time"),
+            original_modified,
+            "read-only status probe must not refresh the index"
+        );
+        assert!(!repository.path().join(".git/index.lock").exists());
     }
 
     #[test]
