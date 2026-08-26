@@ -464,6 +464,15 @@ pub struct CatalogComposerDraft {
     pub updated_at_ms: u64,
 }
 
+/// Result of inspecting authoritative composer drafts in a retired catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogComposerDraftInventory {
+    /// The catalog predates durable composer drafts and therefore contains none.
+    TableAbsent,
+    /// The catalog contains the authoritative draft rows listed here.
+    Rows(Vec<CatalogComposerDraft>),
+}
+
 /// Backend-agnostic handle for Bcode's global session catalog database.
 #[derive(Debug, Clone)]
 pub struct GlobalSessionDb {
@@ -639,6 +648,46 @@ impl GlobalSessionDb {
             Self::open_observed_connection(path, MetricsRegistry::disabled(), None).await?;
         catalog.verify_schema().await?;
         Ok(catalog)
+    }
+
+    /// Open an existing retired catalog at an arbitrary path for explicit maintenance that already
+    /// owns the applicable catalog lock. This path never runs schema migrations and accepts
+    /// catalogs that predate durable composer drafts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot be opened or lacks its baseline catalog schema.
+    pub async fn open_retired_turso_without_catalog_lock(path: &Path) -> SessionDbResult<Self> {
+        if !path.exists() {
+            return Err(SessionDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("catalog database does not exist: {}", path.display()),
+            )));
+        }
+        let catalog =
+            Self::open_observed_connection(path, MetricsRegistry::disabled(), None).await?;
+        if !catalog.db.table_exists("sessions").await? {
+            return Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: "global catalog is missing required table sessions".to_owned(),
+            });
+        }
+        Ok(catalog)
+    }
+
+    /// Inspect authoritative composer drafts without mutating a retired catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema inspection or draft-row reading fails.
+    pub async fn retired_composer_draft_inventory(
+        &self,
+    ) -> SessionDbResult<CatalogComposerDraftInventory> {
+        if !self.db.table_exists("composer_drafts").await? {
+            return Ok(CatalogComposerDraftInventory::TableAbsent);
+        }
+        self.list_draft_session_composer_drafts()
+            .await
+            .map(CatalogComposerDraftInventory::Rows)
     }
 
     /// Open the global session catalog database at `path` without acquiring the catalog lock.

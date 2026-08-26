@@ -92,7 +92,7 @@ async fn inventory_one(
         return report;
     }
     let retired =
-        match bcode_session::db::GlobalSessionDb::open_existing_turso_without_catalog_lock(&db_path)
+        match bcode_session::db::GlobalSessionDb::open_retired_turso_without_catalog_lock(&db_path)
             .await
         {
             Ok(catalog) => catalog,
@@ -102,8 +102,9 @@ async fn inventory_one(
                 return report;
             }
         };
-    let drafts = match retired.list_draft_session_composer_drafts().await {
-        Ok(drafts) => drafts,
+    let drafts = match retired.retired_composer_draft_inventory().await {
+        Ok(bcode_session::db::CatalogComposerDraftInventory::TableAbsent) => Vec::new(),
+        Ok(bcode_session::db::CatalogComposerDraftInventory::Rows(drafts)) => drafts,
         Err(error) => {
             let _ = retired.close().await;
             report.action = RetiredCatalogAction::Failed;
@@ -288,6 +289,39 @@ mod tests {
         assert_eq!(reports[0].action, RetiredCatalogAction::WouldRemove);
         assert!(reports[0].error.is_none());
         assert!(namespace_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_catalog_that_predates_composer_drafts() {
+        let state = tempfile::tempdir().expect("state");
+        let session_root = state.path().join("sessions");
+        let namespace_dir = session_root.join("catalogs").join("legacy-build");
+        std::fs::create_dir_all(&namespace_dir).expect("namespace");
+        let retired = bcode_session::db::GlobalSessionDb::open_turso_without_catalog_lock(
+            &namespace_dir.join("catalog.db"),
+        )
+        .await
+        .expect("retired");
+        retired
+            .database()
+            .drop_table("composer_drafts")
+            .execute(retired.database())
+            .await
+            .expect("draft table drops");
+        retired.close().await.expect("retired closes");
+        let active = bcode_session::db::GlobalSessionDb::initialize_turso_in_root(&session_root)
+            .await
+            .expect("active");
+        active.close().await.expect("active closes");
+
+        let reports = retired_catalog_reports(state.path(), &session_root, true)
+            .await
+            .expect("cleanup");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].draft_rows, 0);
+        assert_eq!(reports[0].action, RetiredCatalogAction::Removed);
+        assert!(!namespace_dir.exists());
     }
 
     #[tokio::test]
