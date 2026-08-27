@@ -311,6 +311,7 @@ enum AsyncRecordingCommand {
         columns: u16,
         rows: u16,
     },
+    Shutdown,
     Finish {
         offset_micros: u64,
         exit_code: Option<i32>,
@@ -557,8 +558,10 @@ impl AsyncShellRecordingWriter {
 
 impl Drop for AsyncShellRecordingWriter {
     fn drop(&mut self) {
-        // Dropping the sender disconnects the worker. It then drops the synchronous writer and
-        // leaves only the explicit partial file.
+        if let Some(worker) = self.worker.take() {
+            let _ = self.sender.send(AsyncRecordingCommand::Shutdown);
+            let _ = worker.join();
+        }
     }
 }
 
@@ -682,6 +685,7 @@ fn run_async_recording_writer(
                     failure = Some(error);
                 }
             }
+            AsyncRecordingCommand::Shutdown => break,
             AsyncRecordingCommand::Finish {
                 offset_micros,
                 exit_code,
@@ -1350,6 +1354,46 @@ mod tests {
             publication.timeout(started + RECORDING_PUBLICATION_INTERVAL),
             RECORDING_PUBLICATION_INTERVAL
         );
+    }
+
+    #[test]
+    fn dropping_async_writer_waits_for_observer_to_finish() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("drop-joins.bcsr");
+        let (observer_started_tx, observer_started_rx) = mpsc::channel();
+        let (observer_release_tx, observer_release_rx) = mpsc::channel();
+        let observer_release_rx = Arc::new(Mutex::new(observer_release_rx));
+        let observer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer_call_count = Arc::clone(&observer_calls);
+        let observer: ShellRecordingCommitObserver = Arc::new(move |_| {
+            if observer_call_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                let _ = observer_started_tx.send(());
+                let _ = observer_release_rx.lock().expect("observer release").recv();
+            }
+        });
+        let mut writer =
+            AsyncShellRecordingWriter::create_with_observer(&path, 80, 24, Some(observer))
+                .expect("writer");
+        assert!(writer.try_write_output(1, b"pending output"));
+        observer_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("publication started");
+
+        let (drop_finished_tx, drop_finished_rx) = mpsc::channel();
+        let drop_thread = thread::spawn(move || {
+            drop(writer);
+            let _ = drop_finished_tx.send(());
+        });
+        assert!(
+            drop_finished_rx
+                .recv_timeout(Duration::from_millis(25))
+                .is_err()
+        );
+        observer_release_tx.send(()).expect("release observer");
+        drop_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drop joined worker");
+        drop_thread.join().expect("drop thread");
     }
 
     #[test]
