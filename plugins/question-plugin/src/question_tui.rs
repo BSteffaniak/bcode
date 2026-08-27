@@ -50,6 +50,7 @@ struct QuestionMeasurement {
     height: u16,
     focused_rows: std::ops::Range<u16>,
     question_rows: Vec<std::ops::Range<u16>>,
+    custom_heights: Vec<Option<u16>>,
     actions_row: u16,
 }
 
@@ -106,15 +107,23 @@ impl QuestionTerminalRenderer {
                 || measurement.width != width
         });
         if rebuild {
-            let (start, end) = Self::focused_content_range(snapshot, width);
-            let (height, question_rows, actions_row) = Self::content_geometry(snapshot, width);
+            let (height, question_rows, custom_heights, actions_row) =
+                self.content_geometry(snapshot, width);
+            let focused_rows = Self::focused_content_range(
+                snapshot,
+                &question_rows,
+                &custom_heights,
+                actions_row,
+                width,
+            );
             self.measurement = Some(QuestionMeasurement {
                 layout_revision: snapshot.layout_revision,
                 focus: snapshot.focus,
                 width,
                 height,
-                focused_rows: start..end.max(start.saturating_add(1)),
+                focused_rows,
                 question_rows,
+                custom_heights,
                 actions_row,
             });
         }
@@ -300,7 +309,18 @@ impl QuestionTerminalRenderer {
             .as_deref()
             .unwrap_or_default();
         let start_y = *content_y;
-        let input_height = {
+        let input_height = self
+            .measurement
+            .as_ref()
+            .and_then(|measurement| measurement.custom_heights.get(question_index))
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| {
+                self.custom_inputs
+                    .get(&question_index)
+                    .map_or(3, |state| custom_input_height(state, self.last_area.width))
+            });
+        {
             let state = self
                 .custom_inputs
                 .entry(question_index)
@@ -311,8 +331,7 @@ impl QuestionTerminalRenderer {
                     .buffer_mut()
                     .move_cursor(bmux_text_edit::TextMotion::End);
             }
-            custom_input_height(state, self.last_area.width)
-        };
+        }
         *content_y = content_y.saturating_add(input_height);
         let control_id = custom_control_id(question_index);
         if let Some(area) = self.control_area(start_y, input_height) {
@@ -535,15 +554,17 @@ impl QuestionTerminalRenderer {
     }
 
     fn content_geometry(
+        &mut self,
         snapshot: &QuestionSnapshot,
         width: u16,
-    ) -> (u16, Vec<std::ops::Range<u16>>, u16) {
+    ) -> (u16, Vec<std::ops::Range<u16>>, Vec<Option<u16>>, u16) {
         let width = usize::from(width.max(1));
         let mut height = 1_u16;
         if snapshot.validation_error.is_some() {
             height = height.saturating_add(1);
         }
         let mut question_rows = Vec::with_capacity(snapshot.request.questions.len());
+        let mut custom_heights = Vec::with_capacity(snapshot.request.questions.len());
         for (question_index, question) in snapshot.request.questions.iter().enumerate() {
             let start = height;
             let required = if question.required { " *" } else { "" };
@@ -568,89 +589,136 @@ impl QuestionTerminalRenderer {
                     ));
                 }
             }
-            if question.options.is_empty() || question.custom {
+            let custom_height = if question.options.is_empty() || question.custom {
                 let value = snapshot.answers[question_index]
                     .custom
                     .as_deref()
                     .unwrap_or_default();
-                let state = TextInputState::new(TextEditBuffer::from_text(value));
-                height = height.saturating_add(custom_input_height(
-                    &state,
+                let state = self
+                    .custom_inputs
+                    .entry(question_index)
+                    .or_insert_with(|| TextInputState::new(TextEditBuffer::from_text(value)));
+                if state.buffer().text() != value {
+                    *state = TextInputState::new(TextEditBuffer::from_text(value));
+                    state
+                        .buffer_mut()
+                        .move_cursor(bmux_text_edit::TextMotion::End);
+                }
+                Some(custom_input_height(
+                    state,
                     u16::try_from(width).unwrap_or(u16::MAX),
-                ));
+                ))
+            } else {
+                None
+            };
+            if let Some(custom_height) = custom_height {
+                height = height.saturating_add(custom_height);
             }
             if snapshot.invalid_question_index == Some(question_index) {
                 height = height.saturating_add(1);
             }
             height = height.saturating_add(1);
             question_rows.push(start..height);
+            custom_heights.push(custom_height);
         }
         let actions_row = height;
-        (height.saturating_add(2), question_rows, actions_row)
+        (
+            height.saturating_add(2),
+            question_rows,
+            custom_heights,
+            actions_row,
+        )
     }
 
-    fn focused_content_range(snapshot: &QuestionSnapshot, width: u16) -> (u16, u16) {
+    fn focused_content_range(
+        snapshot: &QuestionSnapshot,
+        question_rows: &[std::ops::Range<u16>],
+        custom_heights: &[Option<u16>],
+        actions_row: u16,
+        width: u16,
+    ) -> std::ops::Range<u16> {
         let width = usize::from(width.max(1));
-        let mut y = 1_u16;
-        if snapshot.validation_error.is_some() {
-            y = y.saturating_add(1);
-        }
-        for (question_index, question) in snapshot.request.questions.iter().enumerate() {
-            let required = if question.required { " *" } else { "" };
-            let prompt = question.header.as_ref().map_or_else(
-                || format!("{}{required}", question.text),
-                |header| format!("{header}{required}: {}", question.text),
-            );
-            y = y.saturating_add(wrapped_height(&prompt, width, width));
-            for (option_index, option) in question.options.iter().enumerate() {
-                let start = y;
-                let prefix_width =
-                    7_usize.saturating_add(option_shortcut_label(option_index).len());
-                let available = width.saturating_sub(prefix_width).max(1);
-                y = y.saturating_add(wrapped_height(&option.label, available, available));
-                if let Some(description) = option.description.as_deref() {
-                    let description_width = width
-                        .saturating_sub(bmux_tui::text_width::display_width(DESCRIPTION_INDENT))
-                        .max(1);
-                    y = y.saturating_add(wrapped_height(
-                        description,
-                        description_width,
-                        description_width,
-                    ));
+        let QuestionFocusTarget::Option {
+            question_index,
+            option_index,
+        } = snapshot.focus
+        else {
+            if let QuestionFocusTarget::Custom { question_index } = snapshot.focus
+                && let Some(question) = snapshot.request.questions.get(question_index)
+                && let Some(rows) = question_rows.get(question_index)
+            {
+                let mut start = rows.start;
+                let required = if question.required { " *" } else { "" };
+                let prompt = question.header.as_ref().map_or_else(
+                    || format!("{}{required}", question.text),
+                    |header| format!("{header}{required}: {}", question.text),
+                );
+                start = start.saturating_add(wrapped_height(&prompt, width, width));
+                for (option_index, option) in question.options.iter().enumerate() {
+                    let prefix_width =
+                        7_usize.saturating_add(option_shortcut_label(option_index).len());
+                    let available = width.saturating_sub(prefix_width).max(1);
+                    start =
+                        start.saturating_add(wrapped_height(&option.label, available, available));
+                    if let Some(description) = option.description.as_deref() {
+                        let description_width = width
+                            .saturating_sub(bmux_tui::text_width::display_width(DESCRIPTION_INDENT))
+                            .max(1);
+                        start = start.saturating_add(wrapped_height(
+                            description,
+                            description_width,
+                            description_width,
+                        ));
+                    }
                 }
-                if snapshot.focus
-                    == (QuestionFocusTarget::Option {
-                        question_index,
-                        option_index,
-                    })
-                {
-                    return (start, y);
-                }
+                let height = custom_heights
+                    .get(question_index)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(1);
+                return start..start.saturating_add(height);
             }
-            if question.options.is_empty() || question.custom {
-                let start = y;
-                let value = snapshot.answers[question_index]
-                    .custom
-                    .as_deref()
-                    .unwrap_or_default();
-                let state = TextInputState::new(TextEditBuffer::from_text(value));
-                y = y.saturating_add(custom_input_height(
-                    &state,
-                    u16::try_from(width).unwrap_or(u16::MAX),
+            return match snapshot.focus {
+                QuestionFocusTarget::Submit | QuestionFocusTarget::Cancel => {
+                    actions_row..actions_row.saturating_add(1)
+                }
+                QuestionFocusTarget::Option { .. } | QuestionFocusTarget::Custom { .. } => 0..1,
+            };
+        };
+        let Some(question) = snapshot.request.questions.get(question_index) else {
+            return 0..1;
+        };
+        let Some(rows) = question_rows.get(question_index) else {
+            return 0..1;
+        };
+        let required = if question.required { " *" } else { "" };
+        let prompt = question.header.as_ref().map_or_else(
+            || format!("{}{required}", question.text),
+            |header| format!("{header}{required}: {}", question.text),
+        );
+        let mut y = rows
+            .start
+            .saturating_add(wrapped_height(&prompt, width, width));
+        for (index, option) in question.options.iter().enumerate() {
+            let start = y;
+            let prefix_width = 7_usize.saturating_add(option_shortcut_label(index).len());
+            let available = width.saturating_sub(prefix_width).max(1);
+            y = y.saturating_add(wrapped_height(&option.label, available, available));
+            if let Some(description) = option.description.as_deref() {
+                let description_width = width
+                    .saturating_sub(bmux_tui::text_width::display_width(DESCRIPTION_INDENT))
+                    .max(1);
+                y = y.saturating_add(wrapped_height(
+                    description,
+                    description_width,
+                    description_width,
                 ));
-                if snapshot.focus == (QuestionFocusTarget::Custom { question_index }) {
-                    return (start, y);
-                }
             }
-            if snapshot.invalid_question_index == Some(question_index) {
-                y = y.saturating_add(1);
+            if index == option_index {
+                return start..y.max(start.saturating_add(1));
             }
-            y = y.saturating_add(1);
         }
-        match snapshot.focus {
-            QuestionFocusTarget::Submit | QuestionFocusTarget::Cancel => (y, y.saturating_add(1)),
-            QuestionFocusTarget::Option { .. } | QuestionFocusTarget::Custom { .. } => (0, 1),
-        }
+        0..1
     }
 }
 
