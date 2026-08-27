@@ -20,6 +20,13 @@ if rg -n '#!\[allow\(unsafe_op_in_unsafe_fn\)\]' packages/plugin-sdk/src package
   violations=1
 fi
 
+if rg -n 'std::ptr::from_(mut|ref)\([^)]*(callback_state|cancellation)' packages/plugin/src \
+  --glob '*.rs' >/tmp/bcode-plugin-stack-callback-state.txt; then
+  echo "Plugin ABI safety violation: invocation callback state must cross the ABI as an opaque registered handle, not a stack pointer." >&2
+  cat /tmp/bcode-plugin-stack-callback-state.txt >&2
+  violations=1
+fi
+
 for crate in packages/plugin-sdk/src/lib.rs packages/plugin/src/lib.rs; do
   if ! rg -n '^#!\[deny\(unsafe_op_in_unsafe_fn\)\]$' "$crate" >/dev/null; then
     echo "Plugin ABI safety violation: $crate must deny unsafe operations outside explicit unsafe blocks." >&2

@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod bmux_host_adapter;
+mod invocation_callbacks;
 
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
@@ -135,6 +136,7 @@ fn validate_auth_plugin_id(plugin_id: &str) -> Result<(), AuthProviderRegistryEr
 pub use bmux_host_adapter::{
     BcodeHostCapabilityMap, BcodePluginRuntimeMode, BmuxHostPluginAdapter,
 };
+use invocation_callbacks::{CallbackGuard, CallbackRegistration};
 use libloading::Library;
 use semver::Version;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -194,13 +196,23 @@ extern "C" fn service_event_callback(
     if payload_ptr.is_null() || user_data.is_null() {
         return;
     }
+    let Some(guard) = CallbackGuard::acquire(user_data) else {
+        return;
+    };
     let payload = unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }.to_vec();
-    let state = unsafe { &mut *user_data.cast::<ServiceCallbackState<'_>>() };
-    if let Some(chunk) = payload.strip_prefix(SERVICE_RESPONSE_CHUNK_PREFIX) {
-        state.response_chunks.push(chunk.to_vec());
-    } else {
-        (state.on_event)(payload);
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: invoke_service_with_bridge registers ServiceCallbackState for this handle and
+        // keeps it alive until registration closure drains this callback.
+        unsafe {
+            guard.with_state::<ServiceCallbackState<'_>, _>(|state| {
+                if let Some(chunk) = payload.strip_prefix(SERVICE_RESPONSE_CHUNK_PREFIX) {
+                    state.response_chunks.push(chunk.to_vec());
+                } else {
+                    (state.on_event)(payload);
+                }
+            });
+        }
+    }));
 }
 
 extern "C" fn service_bridge_callback(
@@ -218,7 +230,36 @@ extern "C" fn service_bridge_callback(
     {
         return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
     }
-    let state = unsafe { &mut *user_data.cast::<ServiceCallbackState<'_>>() };
+    let Some(guard) = CallbackGuard::acquire(user_data) else {
+        return SERVICE_BRIDGE_STATUS_CANCELLED;
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: invoke_service_with_bridge registers ServiceCallbackState for this handle and
+        // keeps it alive until registration closure drains this callback.
+        unsafe {
+            guard.with_state::<ServiceCallbackState<'_>, _>(|state| {
+                service_bridge_callback_with_state(
+                    request_ptr,
+                    request_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                    state,
+                )
+            })
+        }
+    }))
+    .unwrap_or(SERVICE_BRIDGE_STATUS_FAILED)
+}
+
+fn service_bridge_callback_with_state(
+    request_ptr: *const u8,
+    request_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+    state: &mut ServiceCallbackState<'_>,
+) -> i32 {
     if state.cancellation.is_cancelled() {
         return SERVICE_BRIDGE_STATUS_CANCELLED;
     }
@@ -259,8 +300,17 @@ extern "C" fn service_cancellation_wait_callback(
     if user_data.is_null() {
         return false;
     }
-    let cancellation = unsafe { &*user_data.cast::<bcode_plugin_sdk::ServiceCancellation>() };
-    cancellation.wait_cancelled(Duration::from_millis(timeout_ms))
+    let Some(guard) = CallbackGuard::acquire(user_data) else {
+        return false;
+    };
+    // SAFETY: invoke_service_with_bridge registers ServiceCancellation for this handle and keeps
+    // it alive until registration closure drains this callback.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        guard.with_state::<bcode_plugin_sdk::ServiceCancellation, _>(|cancellation| {
+            cancellation.wait_cancelled(Duration::from_millis(timeout_ms))
+        })
+    }))
+    .unwrap_or(true)
 }
 
 /// Stable plugin-owned workflow template contribution version.
@@ -1309,37 +1359,38 @@ impl LoadedPlugin {
             if payload.is_null() || user_data.is_null() {
                 return;
             }
+            let Some(guard) = CallbackGuard::acquire(user_data) else {
+                return;
+            };
             let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
             let Ok(contribution) =
                 serde_json::from_slice::<bcode_command::CommandContribution>(bytes)
             else {
                 return;
             };
-            let registry = unsafe { &mut *(user_data.cast::<bcode_command::CommandRegistry>()) };
-            registry.register(contribution);
+            // SAFETY: register_commands registers this exact state type and keeps it alive until
+            // callback registration closure drains admitted callbacks.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                guard.with_state::<bcode_command::CommandRegistry, _>(|registry| {
+                    registry.register(contribution);
+                });
+            }));
         }
 
+        let callback_registration = CallbackRegistration::new(registry);
+        let user_data = callback_registration.user_data();
         let code = match &self.backend {
             LoadedPluginBackend::Dynamic {
                 register_commands: Some(register_commands),
                 ..
-            } => unsafe {
-                register_commands(
-                    Some(register_command_callback),
-                    std::ptr::from_mut(registry).cast::<std::ffi::c_void>(),
-                )
-            },
+            } => unsafe { register_commands(Some(register_command_callback), user_data) },
             LoadedPluginBackend::Dynamic {
                 register_commands: None,
                 ..
             } => 0,
             LoadedPluginBackend::Static { vtable } => {
                 vtable.register_commands.map_or(0, |register_commands| {
-                    register_commands(
-                        vtable.instance,
-                        Some(register_command_callback),
-                        std::ptr::from_mut(registry).cast::<std::ffi::c_void>(),
-                    )
+                    register_commands(vtable.instance, Some(register_command_callback), user_data)
                 })
             }
         };
@@ -1378,22 +1429,31 @@ impl LoadedPlugin {
             if payload.is_null() || user_data.is_null() {
                 return;
             }
-            let context = unsafe { &mut *user_data.cast::<RegistrationContext<'_>>() };
-            if context.error.is_some() {
-                return;
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
-            let Ok(contribution) = serde_json::from_slice::<AuthProviderContribution>(bytes) else {
-                context.error = Some(AuthProviderRegistryError::InvalidContribution(
-                    AuthContractError::InvalidFlowShape(
-                        "authentication registration payload did not decode",
-                    ),
-                ));
+            let Some(guard) = CallbackGuard::acquire(user_data) else {
                 return;
             };
-            if let Err(error) = context.registry.register(context.plugin_id, contribution) {
-                context.error = Some(error);
-            }
+            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+            let contribution = serde_json::from_slice::<AuthProviderContribution>(bytes);
+            // SAFETY: register_auth_providers registers this exact state type and keeps it alive
+            // until callback registration closure drains admitted callbacks.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                guard.with_state::<RegistrationContext<'_>, _>(|context| {
+                    if context.error.is_some() {
+                        return;
+                    }
+                    let Ok(contribution) = contribution else {
+                        context.error = Some(AuthProviderRegistryError::InvalidContribution(
+                            AuthContractError::InvalidFlowShape(
+                                "authentication registration payload did not decode",
+                            ),
+                        ));
+                        return;
+                    };
+                    if let Err(error) = context.registry.register(context.plugin_id, contribution) {
+                        context.error = Some(error);
+                    }
+                });
+            }));
         }
 
         let mut context = RegistrationContext {
@@ -1401,7 +1461,8 @@ impl LoadedPlugin {
             registry,
             error: None,
         };
-        let user_data = std::ptr::from_mut(&mut context).cast::<std::ffi::c_void>();
+        let callback_registration = CallbackRegistration::new(&mut context);
+        let user_data = callback_registration.user_data();
         let code = match &self.backend {
             LoadedPluginBackend::Dynamic {
                 register_auth_providers,
@@ -1554,8 +1615,11 @@ impl LoadedPlugin {
             response_chunks: Vec::new(),
             cancellation: cancellation.clone(),
         };
-        let event_user_data = (&raw mut callback_state).cast::<std::ffi::c_void>();
-        let cancellation_user_data = std::ptr::from_ref(cancellation).cast_mut().cast();
+        let callback_registration = CallbackRegistration::new(&mut callback_state);
+        let event_user_data = callback_registration.user_data();
+        let mut cancellation_callback_state = cancellation.clone();
+        let cancellation_registration = CallbackRegistration::new(&mut cancellation_callback_state);
+        let cancellation_user_data = cancellation_registration.user_data();
         let status = self.invoke_service_raw(
             input.as_ptr(),
             input.len(),
