@@ -3715,6 +3715,32 @@ async fn recover_abandoned_session_runtime_work(
     session_id: SessionId,
 ) -> Result<(), ServerError> {
     let active_runtime_ids = state.runtime_work.active_ids_for_session(session_id).await;
+    let active_tool_runs = state.sessions.active_tool_runs(session_id).await?;
+    for tool in active_tool_runs {
+        let message = format!(
+            "The daemon restarted while tool `{}` was running. Its outcome could not be verified, so Bcode did not execute it again.",
+            tool.tool_name.as_deref().unwrap_or("unknown")
+        );
+        let event = state
+            .sessions
+            .append_tool_invocation_result(
+                session_id,
+                bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: tool.tool_call_id,
+                    model_output: message.clone(),
+                    is_error: true,
+                    content: vec![bcode_session_models::ToolResultContent::Text {
+                        text: message.clone(),
+                    }],
+                    presentation: None,
+                    result: Some(bcode_session_models::ToolInvocationResult::Text {
+                        text: message,
+                    }),
+                },
+            )
+            .await?;
+        publish_session_event(state, &event).await;
+    }
     let active = state.sessions.active_runtime_work(session_id).await?;
     let work_ids = active
         .iter()
@@ -47279,6 +47305,49 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .detach_session(session.id, client_id)
             .await
             .expect("detach");
+    }
+
+    #[tokio::test]
+    async fn abandoned_tool_recovery_records_unknown_outcome_without_rerunning() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent session manager");
+        let session = sessions
+            .create_session(Some("tool recovery".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        sessions
+            .append_tool_call_requested(
+                session.id,
+                bcode_session::AppendToolCallRequestedInput {
+                    tool_call_id: "tool-call-1".to_owned(),
+                    producer_plugin_id: None,
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            )
+            .await
+            .expect("tool call request");
+        let state = test_server_state(sessions.clone());
+
+        recover_abandoned_session_runtime_work(&state, session.id)
+            .await
+            .expect("first recovery");
+        recover_abandoned_session_runtime_work(&state, session.id)
+            .await
+            .expect("idempotent recovery");
+
+        let history = sessions.session_history(session.id).await.expect("history");
+        let records = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record } => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].is_error);
+        assert!(records[0].model_output.contains("did not execute it again"));
     }
 
     #[tokio::test]

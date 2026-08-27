@@ -4832,6 +4832,10 @@ impl BcodeClient {
             request_timeout: self.request_timeout,
             reconnect_client: Some(std::sync::Arc::new(self.clone())),
             reconnect_name: std::sync::Arc::from(client_name),
+            restore_state: ConnectionRestoreState {
+                runtime_context: self.runtime_context.clone(),
+                ..ConnectionRestoreState::default()
+            },
         };
         match connection
             .send_request(Request::Hello {
@@ -4856,6 +4860,40 @@ impl BcodeClient {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SessionRestoreAttachment {
+    Full {
+        session_id: SessionId,
+    },
+    Recent {
+        session_id: SessionId,
+        limit: usize,
+    },
+    Projection {
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    },
+}
+
+impl SessionRestoreAttachment {
+    const fn session_id(&self) -> SessionId {
+        match self {
+            Self::Full { session_id }
+            | Self::Recent { session_id, .. }
+            | Self::Projection { session_id, .. } => *session_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConnectionRestoreState {
+    runtime_context: Option<ClientRuntimeContext>,
+    attached_session: Option<SessionRestoreAttachment>,
+    catalog_updates: bool,
+    workflow_runs: bool,
+    runtime_work_sessions: std::collections::BTreeSet<SessionId>,
+}
+
 /// Long-lived client connection.
 #[derive(Debug)]
 pub struct ClientConnection {
@@ -4866,6 +4904,7 @@ pub struct ClientConnection {
     request_timeout: Duration,
     reconnect_client: Option<std::sync::Arc<BcodeClient>>,
     reconnect_name: std::sync::Arc<str>,
+    restore_state: ConnectionRestoreState,
 }
 
 impl ClientConnection {
@@ -4885,10 +4924,15 @@ impl ClientConnection {
         runtime_context: Option<ClientRuntimeContext>,
     ) -> Result<(), ClientError> {
         match self
-            .send_request(Request::UpdateClientRuntimeContext { runtime_context })
+            .send_request(Request::UpdateClientRuntimeContext {
+                runtime_context: runtime_context.clone(),
+            })
             .await?
         {
-            ResponsePayload::ClientRuntimeContextUpdated => Ok(()),
+            ResponsePayload::ClientRuntimeContextUpdated => {
+                self.restore_state.runtime_context = runtime_context;
+                Ok(())
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -4910,7 +4954,10 @@ impl ClientConnection {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn subscribe_catalog_updates(&mut self) -> Result<(), ClientError> {
         match self.send_request(Request::SubscribeCatalogUpdates).await? {
-            ResponsePayload::CatalogUpdatesSubscribed => Ok(()),
+            ResponsePayload::CatalogUpdatesSubscribed => {
+                self.restore_state.catalog_updates = true;
+                Ok(())
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -4950,7 +4997,10 @@ impl ClientConnection {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn subscribe_workflow_runs(&mut self) -> Result<u64, ClientError> {
         match self.send_request(Request::SubscribeWorkflowRuns).await? {
-            ResponsePayload::WorkflowRunsSubscribed { after_sequence } => Ok(after_sequence),
+            ResponsePayload::WorkflowRunsSubscribed { after_sequence } => {
+                self.restore_state.workflow_runs = true;
+                Ok(after_sequence)
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -4968,7 +5018,10 @@ impl ClientConnection {
             .send_request(Request::SubscribeRuntimeWork { session_id })
             .await?
         {
-            ResponsePayload::RuntimeWorkSubscribed => Ok(()),
+            ResponsePayload::RuntimeWorkSubscribed => {
+                self.restore_state.runtime_work_sessions.insert(session_id);
+                Ok(())
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -5041,7 +5094,7 @@ impl ClientConnection {
         &mut self,
         session_id: SessionId,
     ) -> Result<AttachedSessionHistory, ClientError> {
-        match self
+        let attached = match self
             .send_request(Request::AttachSession { session_id })
             .await?
         {
@@ -5054,7 +5107,7 @@ impl ClientConnection {
                 projection_window,
                 session,
                 ..
-            } => Ok(AttachedSessionHistory {
+            } => AttachedSessionHistory {
                 session,
                 history,
                 input_history,
@@ -5062,9 +5115,11 @@ impl ClientConnection {
                 draft,
                 runtime_selection,
                 projection_window,
-            }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+            },
+            _ => return Err(ClientError::UnexpectedResponse),
+        };
+        self.restore_state.attached_session = Some(SessionRestoreAttachment::Full { session_id });
+        Ok(attached)
     }
 
     /// Classify session storage and start or join legacy migration when required.
@@ -5198,15 +5253,108 @@ impl ClientConnection {
     }
 
     async fn reconnect_for_session_open(&mut self) -> Result<(), ClientError> {
+        self.reconnect_and_restore().await
+    }
+
+    async fn reconnect_and_restore(&mut self) -> Result<(), ClientError> {
         let client = self
             .reconnect_client
             .clone()
             .ok_or(ClientError::UnexpectedResponse)?;
-        let mut replacement = client.connect(&self.reconnect_name).await?;
+        let restore_state = self.restore_state.clone();
+        let mut delay = Duration::from_millis(25);
+        let mut replacement = loop {
+            match client.connect(&self.reconnect_name).await {
+                Ok(connection) => break connection,
+                Err(error) if error.is_daemon_unavailable() => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(2));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        replacement.restore_connection_state(&restore_state).await?;
         let mut pending_events = std::mem::take(&mut self.pending_events);
         pending_events.append(&mut replacement.pending_events);
+        if let Some(attachment) = &restore_state.attached_session {
+            pending_events.push_back(Event::SessionViewResyncRequired {
+                session_id: attachment.session_id(),
+            });
+        }
         replacement.pending_events = pending_events;
         *self = replacement;
+        Ok(())
+    }
+
+    async fn restore_connection_state(
+        &mut self,
+        restore: &ConnectionRestoreState,
+    ) -> Result<(), ClientError> {
+        if self.restore_state.runtime_context != restore.runtime_context {
+            match self
+                .send_request(Request::UpdateClientRuntimeContext {
+                    runtime_context: restore.runtime_context.clone(),
+                })
+                .await?
+            {
+                ResponsePayload::ClientRuntimeContextUpdated => {}
+                _ => return Err(ClientError::UnexpectedResponse),
+            }
+        }
+        if let Some(attachment) = &restore.attached_session {
+            let request = match attachment {
+                SessionRestoreAttachment::Full { session_id } => Request::AttachSession {
+                    session_id: *session_id,
+                },
+                SessionRestoreAttachment::Recent { session_id, limit } => {
+                    Request::AttachSessionRecent {
+                        session_id: *session_id,
+                        limit: *limit,
+                    }
+                }
+                SessionRestoreAttachment::Projection {
+                    session_id,
+                    request,
+                } => Request::AttachSessionProjectionWindow {
+                    session_id: *session_id,
+                    request: request.clone(),
+                },
+            };
+            if !matches!(
+                self.send_request(request).await?,
+                ResponsePayload::Attached { .. }
+            ) {
+                return Err(ClientError::UnexpectedResponse);
+            }
+        }
+        if restore.catalog_updates
+            && !matches!(
+                self.send_request(Request::SubscribeCatalogUpdates).await?,
+                ResponsePayload::CatalogUpdatesSubscribed
+            )
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        if restore.workflow_runs
+            && !matches!(
+                self.send_request(Request::SubscribeWorkflowRuns).await?,
+                ResponsePayload::WorkflowRunsSubscribed { .. }
+            )
+        {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        for session_id in &restore.runtime_work_sessions {
+            if !matches!(
+                self.send_request(Request::SubscribeRuntimeWork {
+                    session_id: *session_id,
+                })
+                .await?,
+                ResponsePayload::RuntimeWorkSubscribed
+            ) {
+                return Err(ClientError::UnexpectedResponse);
+            }
+        }
+        self.restore_state = restore.clone();
         Ok(())
     }
 
@@ -5235,7 +5383,7 @@ impl ClientConnection {
         session_id: SessionId,
         limit: usize,
     ) -> Result<AttachedSessionHistory, ClientError> {
-        match self
+        let attached = match self
             .send_request(Request::AttachSessionRecent { session_id, limit })
             .await?
         {
@@ -5248,7 +5396,7 @@ impl ClientConnection {
                 projection_window,
                 session,
                 ..
-            } => Ok(AttachedSessionHistory {
+            } => AttachedSessionHistory {
                 session,
                 history,
                 input_history,
@@ -5256,9 +5404,12 @@ impl ClientConnection {
                 draft,
                 runtime_selection,
                 projection_window,
-            }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+            },
+            _ => return Err(ClientError::UnexpectedResponse),
+        };
+        self.restore_state.attached_session =
+            Some(SessionRestoreAttachment::Recent { session_id, limit });
+        Ok(attached)
     }
 
     /// Prepare a session to a terminal state, then attach with a bounded projection window.
@@ -5295,7 +5446,8 @@ impl ClientConnection {
         session_id: SessionId,
         request: ProjectionWindowRequest,
     ) -> Result<AttachedSessionHistory, ClientError> {
-        match self
+        let restore_request = request.clone();
+        let attached = match self
             .send_request(Request::AttachSessionProjectionWindow {
                 session_id,
                 request,
@@ -5311,7 +5463,7 @@ impl ClientConnection {
                 projection_window,
                 session,
                 ..
-            } => Ok(AttachedSessionHistory {
+            } => AttachedSessionHistory {
                 session,
                 history,
                 input_history,
@@ -5319,9 +5471,14 @@ impl ClientConnection {
                 draft,
                 runtime_selection,
                 projection_window,
-            }),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+            },
+            _ => return Err(ClientError::UnexpectedResponse),
+        };
+        self.restore_state.attached_session = Some(SessionRestoreAttachment::Projection {
+            session_id,
+            request: restore_request,
+        });
+        Ok(attached)
     }
 
     /// Send a user message to a session.
@@ -5369,17 +5526,27 @@ impl ClientConnection {
     ///
     /// # Errors
     ///
-    /// Returns an error when the connection closes or the event cannot be decoded.
+    /// Returns an error when replacement/reconnection fails or an event cannot be decoded.
     pub async fn recv_event(&mut self) -> Result<Event, ClientError> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Ok(event);
-        }
         loop {
-            let envelope = recv_envelope(&mut self.stream).await?;
-            if envelope.kind != EnvelopeKind::Event {
-                continue;
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(event);
             }
-            return decode_event(&envelope.payload).map_err(ClientError::from);
+            match recv_envelope(&mut self.stream).await {
+                Ok(envelope) => {
+                    if envelope.kind != EnvelopeKind::Event {
+                        continue;
+                    }
+                    return decode_event(&envelope.payload).map_err(ClientError::from);
+                }
+                Err(error) => {
+                    let error = ClientError::from(error);
+                    if !error.is_daemon_unavailable() || self.reconnect_client.is_none() {
+                        return Err(error);
+                    }
+                    self.reconnect_and_restore().await?;
+                }
+            }
         }
     }
 
@@ -5811,6 +5978,7 @@ mod client_timeout_tests {
             request_timeout: Duration::from_secs(1),
             reconnect_client: None,
             reconnect_name: std::sync::Arc::from(""),
+            restore_state: super::ConnectionRestoreState::default(),
         };
 
         assert!(matches!(
@@ -5853,6 +6021,7 @@ mod client_timeout_tests {
             request_timeout: Duration::from_millis(10),
             reconnect_client: None,
             reconnect_name: std::sync::Arc::from(""),
+            restore_state: super::ConnectionRestoreState::default(),
         };
         let session_id = SessionId::new();
 
