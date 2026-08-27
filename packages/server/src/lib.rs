@@ -592,6 +592,7 @@ enum FollowupCommand {
         queued_steering: Option<Arc<AtomicUsize>>,
         cancel_state: Option<Arc<TurnCancelState>>,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
+        recovering: bool,
         ownership: bcode_session::SessionOwnershipGuard,
     },
     SkillInvocation {
@@ -3697,7 +3698,7 @@ fn interrupt_stale_ralph_runs_best_effort(state: &ServerState) {
 }
 
 async fn recover_abandoned_session_runtime_work_best_effort(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
 ) {
     if let Err(error) = recover_abandoned_session_runtime_work(state, session_id).await {
@@ -3710,8 +3711,73 @@ async fn recover_abandoned_session_runtime_work_best_effort(
     }
 }
 
+async fn enqueue_recovered_model_turn(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    work: &bcode_session::db::RuntimeWorkProjection,
+) -> Result<bool, ServerError> {
+    let Some(turn_id) = work.label.strip_prefix("model turn ") else {
+        return Ok(false);
+    };
+    let sequence_prefix = format!("{session_id}-");
+    let Some(sequence) = turn_id
+        .strip_prefix(&sequence_prefix)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return Ok(false);
+    };
+    let mut events = state
+        .sessions
+        .session_events_range(session_id, sequence, sequence, 1)
+        .await?;
+    let Some(user_event) = events.pop() else {
+        return Ok(false);
+    };
+    let client_id = match &user_event.kind {
+        SessionEventKind::UserMessage { client_id, .. } => *client_id,
+        _ => return Ok(false),
+    };
+    let cancel_state = Arc::new(TurnCancelState::default());
+    register_recovered_model_runtime_work(
+        state,
+        session_id,
+        work.work_id.clone(),
+        turn_id.to_owned(),
+        Arc::clone(&cancel_state),
+    )
+    .await;
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
+    let handle = session_runtime_handle(state, session_id).await;
+    handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+    if handle
+        .followup_commands
+        .send(FollowupCommand::ExecuteTurn {
+            client_id,
+            runtime_context: None,
+            user_event: Box::new(user_event),
+            queued_steering: None,
+            cancel_state: Some(cancel_state),
+            completion: None,
+            recovering: true,
+            ownership,
+        })
+        .await
+        .is_err()
+    {
+        state.runtime_work.finish(session_id, &work.work_id).await;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 async fn recover_abandoned_session_runtime_work(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
     let active_runtime_ids = state.runtime_work.active_ids_for_session(session_id).await;
@@ -3748,6 +3814,12 @@ async fn recover_abandoned_session_runtime_work(
         .collect::<std::collections::BTreeSet<_>>();
     for work in active {
         if active_runtime_ids.contains(&work.work_id) {
+            continue;
+        }
+        if work.kind == RuntimeWorkKind::ModelTurn
+            && work.parent_work_id.is_none()
+            && enqueue_recovered_model_turn(state, session_id, &work).await?
+        {
             continue;
         }
         let message = if work
@@ -11328,6 +11400,7 @@ async fn enqueue_user_message_command(
             queued_steering: None,
             cancel_state: None,
             completion: None,
+            recovering: false,
             ownership,
         })
         .await
@@ -11385,6 +11458,7 @@ async fn enqueue_steering_message_command(
                     queued_steering: None,
                     cancel_state: None,
                     completion: None,
+                    recovering: false,
                     ownership,
                 })
                 .await
@@ -11440,6 +11514,7 @@ async fn enqueue_steering_message_command(
                     queued_steering: Some(Arc::clone(&handle.queued_steering)),
                     cancel_state: None,
                     completion: None,
+                    recovering: false,
                     ownership,
                 })
                 .await
@@ -11700,6 +11775,7 @@ async fn run_session_runtime(
                 user_event,
                 cancel_state,
                 completion,
+                recovering,
                 ownership,
                 ..
             } => {
@@ -11717,6 +11793,7 @@ async fn run_session_runtime(
                     *user_event,
                     completion,
                     cancel_state,
+                    recovering,
                 ))
                 .await;
                 drop(ownership);
@@ -12165,6 +12242,7 @@ async fn process_existing_user_event_command(
     user_event: bcode_session_models::SessionEvent,
     completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
+    recovering: bool,
 ) {
     set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
     suggest_skills_for_prompt(state, permit.session_id(), &user_event).await;
@@ -12184,6 +12262,7 @@ async fn process_existing_user_event_command(
         &mut command_context,
         &phase,
         supplied_cancel_state,
+        recovering,
     ))
     .await;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
@@ -12320,6 +12399,7 @@ async fn process_skill_invocation_command(
                 &mut command_context,
                 &phase,
                 None,
+                false,
             ))
             .await;
         }
@@ -12587,6 +12667,7 @@ async fn submit_session_model_turn_with_admission(
             queued_steering: None,
             cancel_state,
             completion: Some(sender),
+            recovering: false,
             ownership,
         },
     )
@@ -12724,6 +12805,7 @@ async fn handle_submit_turn(
                 queued_steering: None,
                 cancel_state: None,
                 completion: None,
+                recovering: false,
                 ownership,
             },
         )
@@ -15106,6 +15188,7 @@ async fn run_model_turn(
     command_context: &mut RuntimeCommandContext<'_>,
     phase: &Arc<Mutex<SessionRuntimePhase>>,
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
+    recovering: bool,
 ) -> ModelTurnCompletion {
     let session_id = permit.enter_turn();
     state
@@ -15120,14 +15203,25 @@ async fn run_model_turn(
     let model_work_id = WorkId::new(format!("model_{turn_id}"));
     let cancel_state =
         supplied_cancel_state.unwrap_or_else(|| Arc::new(TurnCancelState::default()));
-    append_model_runtime_work_started_event(
-        state,
-        session_id,
-        model_work_id.clone(),
-        turn_id.clone(),
-        Arc::clone(&cancel_state),
-    )
-    .await;
+    if recovering {
+        register_recovered_model_runtime_work(
+            state,
+            session_id,
+            model_work_id.clone(),
+            turn_id.clone(),
+            Arc::clone(&cancel_state),
+        )
+        .await;
+    } else {
+        append_model_runtime_work_started_event(
+            state,
+            session_id,
+            model_work_id.clone(),
+            turn_id.clone(),
+            Arc::clone(&cancel_state),
+        )
+        .await;
+    }
     begin_current_turn(
         command_context,
         client_id,
@@ -15135,7 +15229,9 @@ async fn run_model_turn(
         Arc::clone(&cancel_state),
     )
     .await;
-    append_model_turn_started_event(state, session_id, turn_id.clone()).await;
+    if !recovering {
+        append_model_turn_started_event(state, session_id, turn_id.clone()).await;
+    }
     if turn_config
         .invariants
         .selector
@@ -29732,6 +29828,39 @@ async fn finish_registered_runtime_work(
     state.release_session_resources_if_idle(session_id).await;
 }
 
+async fn register_recovered_model_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+    work_id: WorkId,
+    turn_id: String,
+    cancel_state: Arc<TurnCancelState>,
+) {
+    let ownership = match state
+        .sessions
+        .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await
+    {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "failed to acquire recovered runtime-work ownership");
+            return;
+        }
+    };
+    let mut spec = RuntimeWorkSpec::new(
+        work_id,
+        RuntimeWorkKind::ModelTurn,
+        format!("model turn {turn_id}"),
+        CancellationHandle::SessionTurn(cancel_state),
+    );
+    spec.ownership = Some(ownership);
+    let (.., newly_registered) = state.runtime_work.start(session_id, spec).await;
+    if newly_registered {
+        state
+            .metrics
+            .increment_counter("server.runtime_work.model_turn_recovered_total");
+    }
+}
+
 async fn append_model_runtime_work_started_event(
     state: &ServerState,
     session_id: SessionId,
@@ -37741,6 +37870,7 @@ library = "test"
             &mut command_context,
             &Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
             None,
+            false,
         )
         .await
     }
@@ -37773,6 +37903,7 @@ library = "test"
             &mut command_context,
             &Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
             cancel_state,
+            false,
         )
         .await
     }
@@ -37823,6 +37954,7 @@ library = "test"
             &mut command_context,
             &phase,
             None,
+            false,
         );
         let append_steering = async {
             if tokio::time::timeout(Duration::from_secs(5), async {
@@ -41930,6 +42062,7 @@ library = "test"
                 queued_steering: None,
                 cancel_state: None,
                 completion: Some(turn_tx),
+                recovering: false,
                 ownership,
             },
         )
@@ -47328,7 +47461,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("tool call request");
-        let state = test_server_state(sessions.clone());
+        let state = Arc::new(test_server_state(sessions.clone()));
 
         recover_abandoned_session_runtime_work(&state, session.id)
             .await
@@ -47348,6 +47481,89 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(records.len(), 1);
         assert!(records[0].is_error);
         assert!(records[0].model_output.contains("did not execute it again"));
+    }
+
+    #[tokio::test]
+    async fn abandoned_model_turn_is_redispatched_from_its_canonical_trigger() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent session manager");
+        let session = sessions
+            .create_session(Some("recovery".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let user_events = sessions
+            .append_user_message(session.id, ClientId::new(), "continue this turn".to_owned())
+            .await
+            .expect("user message");
+        let user_event = user_events.last().expect("accepted user event");
+        let turn_id = format!("{}-{}", session.id, user_event.sequence);
+        let work_id = WorkId::new(format!("model_{turn_id}"));
+        sessions
+            .append_runtime_work_started(
+                session.id,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: work_id.clone(),
+                    kind: RuntimeWorkKind::ModelTurn,
+                    label: format!("model turn {turn_id}"),
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(1),
+                    cancellable: true,
+                },
+            )
+            .await
+            .expect("runtime work start");
+        sessions
+            .append_model_turn_started(session.id, turn_id.clone())
+            .await
+            .expect("turn start");
+        let state = Arc::new(test_server_state_with_fake_provider(sessions.clone()));
+
+        recover_abandoned_session_runtime_work(&state, session.id)
+            .await
+            .expect("recover turn");
+        for _ in 0..100 {
+            if sessions
+                .active_runtime_work(session.id)
+                .await
+                .expect("active work")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let history = sessions.session_history(session.id).await.expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::ModelTurnStarted { turn_id: id } if id == &turn_id
+                ))
+                .count(),
+            1
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: id,
+                outcome: ModelTurnOutcome::Completed,
+                ..
+            } if id == &turn_id
+        )));
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: id,
+                outcome: ModelTurnOutcome::Error,
+                ..
+            } if id == &turn_id
+        )));
     }
 
     #[tokio::test]
@@ -47402,7 +47618,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 },
             )
             .await;
-        let state = test_server_state(sessions.clone());
+        let state = Arc::new(test_server_state(sessions.clone()));
 
         recover_abandoned_session_runtime_work(&state, session.id)
             .await
@@ -54955,6 +55171,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             queued_steering: None,
             cancel_state: None,
             completion: None,
+            recovering: false,
             ownership,
         };
         queued_followups.fetch_add(1, Ordering::AcqRel);
@@ -62020,6 +62237,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &mut command_context,
             &phase,
             None,
+            false,
         )
         .await;
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
@@ -62138,6 +62356,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &mut command_context,
             &phase,
             None,
+            false,
         )
         .await;
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
@@ -62259,6 +62478,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &mut command_context,
             &phase,
             None,
+            false,
         )
         .await;
 
@@ -62428,6 +62648,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &mut command_context,
             &phase,
             None,
+            false,
         )
         .await;
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
@@ -62585,6 +62806,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &mut command_context,
             &phase,
             None,
+            false,
         )
         .await;
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
