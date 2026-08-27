@@ -41,6 +41,9 @@ pub struct QuestionTerminalRenderer {
     measurement: Option<QuestionMeasurement>,
     #[cfg(test)]
     rendered_questions: usize,
+    #[cfg(test)]
+    visited_question_spans: usize,
+    wrapped_rows_visited: std::cell::Cell<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +223,8 @@ impl QuestionTerminalRenderer {
         style: Style,
     ) {
         for (index, chunk) in wrapped.chunks.iter().enumerate() {
+            self.wrapped_rows_visited
+                .set(self.wrapped_rows_visited.get().saturating_add(1));
             let prefix = if index == 0 {
                 first_prefix
             } else {
@@ -463,11 +468,13 @@ impl QuestionTerminalRenderer {
             self.pending_custom_mouse_focus = None;
         }
         self.last_area = area;
+        self.wrapped_rows_visited.set(0);
         self.controls.clear();
         self.custom_areas.clear();
         #[cfg(test)]
         {
             self.rendered_questions = 0;
+            self.visited_question_spans = 0;
         }
         let mut content_y = 0;
         self.render_title(frame, &mut content_y);
@@ -478,26 +485,42 @@ impl QuestionTerminalRenderer {
                 &Line::from_spans(vec![Span::styled(error, self.theme.error)]),
             );
         }
-        let measurement = self.measurement(snapshot, area.width).clone();
-        debug_assert_eq!(measurement.title_rows, 0..1);
-        debug_assert_eq!(
-            measurement.global_validation_rows.is_some(),
-            snapshot.validation_error.is_some()
-        );
-        let questions = measurement.questions.clone();
         let visible_start = self.logical_origin;
         let visible_end = visible_start.saturating_add(area.height);
-        for (question_index, geometry) in questions.into_iter().enumerate() {
-            if geometry.rows.end <= visible_start || geometry.rows.start >= visible_end {
-                content_y = geometry.rows.end;
-            } else {
-                self.render_question(frame, &mut content_y, snapshot, question_index, &geometry);
-            }
+        let (first_question, questions, action_rows, hint_rows) = {
+            let measurement = self.measurement(snapshot, area.width);
+            debug_assert_eq!(measurement.title_rows, 0..1);
+            debug_assert_eq!(
+                measurement.global_validation_rows.is_some(),
+                snapshot.validation_error.is_some()
+            );
+            let first = measurement
+                .questions
+                .partition_point(|geometry| geometry.rows.end <= visible_start);
+            let count = measurement.questions[first..]
+                .partition_point(|geometry| geometry.rows.start < visible_end);
+            (
+                first,
+                measurement.questions[first..first.saturating_add(count)].to_vec(),
+                measurement.action_rows.clone(),
+                measurement.hint_rows.clone(),
+            )
+        };
+        #[cfg(test)]
+        {
+            self.visited_question_spans = questions.len();
         }
-        content_y = measurement.action_rows.start;
-        if measurement.action_rows.end > visible_start
-            && measurement.hint_rows.end > visible_start
-            && measurement.action_rows.start < visible_end
+        let mut content_y = questions
+            .first()
+            .map_or(visible_start, |geometry| geometry.rows.start);
+        for (relative_index, geometry) in questions.into_iter().enumerate() {
+            let question_index = first_question.saturating_add(relative_index);
+            self.render_question(frame, &mut content_y, snapshot, question_index, &geometry);
+        }
+        content_y = action_rows.start;
+        if action_rows.end > visible_start
+            && hint_rows.end > visible_start
+            && action_rows.start < visible_end
         {
             self.render_actions(frame, &mut content_y, snapshot);
         }
@@ -786,6 +809,13 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
     ) {
         self.theme = QuestionSurfaceTheme::resolve(theme);
         self.render_snapshot(snapshot, area, frame);
+    }
+
+    fn work_shape(&self) -> bcode_plugin_sdk::tui::PluginTuiWorkShape {
+        bcode_plugin_sdk::tui::PluginTuiWorkShape {
+            wrapped_rows_visited: self.wrapped_rows_visited.get(),
+            ..bcode_plugin_sdk::tui::PluginTuiWorkShape::default()
+        }
     }
 
     fn input(
@@ -1477,6 +1507,67 @@ mod tests {
     }
 
     #[test]
+    fn layout_cache_invalidation_tracks_extent_dependencies_without_retaining_history() {
+        let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question(
+                "A deliberately long question that must wrap",
+                &[("A deliberately long option", Some("A long description too"))],
+                true,
+                true,
+            )],
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        let initial = controller.snapshot();
+        let initial_height = renderer.preferred_height(&initial, 18);
+        let initial_prompt = Arc::clone(
+            &renderer.measurement.as_ref().unwrap().questions[0]
+                .prompt
+                .chunks,
+        );
+
+        controller.handle_input(InteractionInput::Navigate {
+            direction: InteractionNavigation::Next,
+        });
+        let focused = controller.snapshot();
+        assert_eq!(renderer.preferred_height(&focused, 18), initial_height);
+        assert!(Arc::ptr_eq(
+            &initial_prompt,
+            &renderer.measurement.as_ref().unwrap().questions[0]
+                .prompt
+                .chunks
+        ));
+
+        let narrow_height = renderer.preferred_height(&focused, 9);
+        let narrow_prompt = Arc::clone(
+            &renderer.measurement.as_ref().unwrap().questions[0]
+                .prompt
+                .chunks,
+        );
+        assert!(narrow_height > initial_height);
+        assert!(!Arc::ptr_eq(&initial_prompt, &narrow_prompt));
+        assert_eq!(renderer.measurement.as_ref().unwrap().width, 9);
+
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("line one\nline two\nline three".to_owned()),
+        });
+        let edited = controller.snapshot();
+        let edited_height = renderer.preferred_height(&edited, 9);
+        assert!(edited.layout_revision > focused.layout_revision);
+        assert!(edited_height >= narrow_height);
+        assert!(!Arc::ptr_eq(
+            &narrow_prompt,
+            &renderer.measurement.as_ref().unwrap().questions[0]
+                .prompt
+                .chunks
+        ));
+        assert_eq!(
+            renderer.measurement.as_ref().unwrap().layout_revision,
+            edited.layout_revision
+        );
+    }
+
+    #[test]
     fn focus_navigation_reuses_wrapped_layout_geometry() {
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question(
@@ -1522,6 +1613,77 @@ mod tests {
     }
 
     #[test]
+    fn maximum_valid_layout_is_bounded_and_slices_only_visible_questions() {
+        let option_label = "o".repeat(crate::MAX_OPTION_TEXT_BYTES);
+        let options = (0..crate::MAX_OPTIONS_PER_QUESTION)
+            .map(|index| QuestionOption {
+                label: option_label.clone(),
+                value: Some(index.to_string()),
+                description: Some(option_label.clone()),
+            })
+            .collect::<Vec<_>>();
+        let questions = (0..crate::MAX_QUESTIONS)
+            .map(|index| Question {
+                header: Some(format!("Question {index}")),
+                text: "q".repeat(crate::MAX_QUESTION_TEXT_BYTES),
+                options: options.clone(),
+                control: QuestionControl::Checkbox,
+                selection_mode: QuestionSelectionMode::Multiple,
+                custom: true,
+                custom_mode: QuestionCustomMode::Additional,
+                required: true,
+            })
+            .collect();
+        let controller =
+            QuestionInteractionController::new(NormalizedQuestionRequest { questions });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        let logical_height = renderer.preferred_height(&snapshot, 80);
+        assert_eq!(
+            renderer.measurement.as_ref().unwrap().questions.len(),
+            crate::MAX_QUESTIONS
+        );
+        assert!(logical_height > 512);
+
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        renderer.render_slice(&snapshot, logical_height, 4_000, area, &mut frame);
+        assert!(renderer.rendered_questions <= 1);
+        assert_eq!(renderer.visited_question_spans, renderer.rendered_questions);
+    }
+
+    #[test]
+    fn duplicate_values_keep_distinct_rendered_hit_regions() {
+        let duplicate = QuestionOption {
+            label: "Same".to_owned(),
+            value: Some("duplicate".to_owned()),
+            description: None,
+        };
+        let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![Question {
+                header: None,
+                text: "Choose duplicates".to_owned(),
+                options: vec![duplicate.clone(), duplicate],
+                control: QuestionControl::Checkbox,
+                selection_mode: QuestionSelectionMode::Multiple,
+                custom: false,
+                custom_mode: QuestionCustomMode::Additional,
+                required: false,
+            }],
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        let _buffer = render_snapshot(
+            &mut renderer,
+            &controller.snapshot(),
+            Rect::new(0, 0, 32, 10),
+        );
+        assert_eq!(renderer.controls[0].control_id, option_control_id(0, 0));
+        assert_eq!(renderer.controls[1].control_id, option_control_id(0, 1));
+        assert_ne!(renderer.controls[0].area, renderer.controls[1].area);
+    }
+
+    #[test]
     fn sliced_render_visits_only_intersecting_questions() {
         let questions = (0..20)
             .map(|index| {
@@ -1550,6 +1712,7 @@ mod tests {
         );
 
         assert!(renderer.rendered_questions <= 2);
+        assert_eq!(renderer.visited_question_spans, renderer.rendered_questions);
         assert!(renderer.rendered_questions < snapshot.request.questions.len());
     }
 

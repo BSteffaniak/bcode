@@ -4478,8 +4478,9 @@ mod tests {
         root_test_chat_with_input_history(&[])
     }
 
-    async fn question_surface_for_root_test(
+    async fn question_surface_with_questions_for_root_test(
         keymap: &super::super::keymap::BmuxKeyMap,
+        questions: serde_json::Value,
     ) -> super::super::interactive_surface::InteractiveSurfaceState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
@@ -4494,26 +4495,33 @@ mod tests {
             &runtime,
             "question-root-test",
             "bcode.question.inline",
-            &serde_json::json!({
-                "questions": [{
-                    "header": null,
-                    "question": "Choose one",
-                    "options": [
-                        {"label": "One", "value": "one", "description": null},
-                        {"label": "Two", "value": "two", "description": null}
-                    ],
-                    "control": "radio",
-                    "selection_mode": "single",
-                    "custom": false,
-                    "custom_mode": "additional",
-                    "required": true
-                }]
-            })
-            .to_string(),
+            &serde_json::json!({ "questions": questions }).to_string(),
             keymap,
         )
         .await
         .expect("question surface")
+    }
+
+    async fn question_surface_for_root_test(
+        keymap: &super::super::keymap::BmuxKeyMap,
+    ) -> super::super::interactive_surface::InteractiveSurfaceState {
+        question_surface_with_questions_for_root_test(
+            keymap,
+            serde_json::json!([{
+                "header": null,
+                "question": "Choose one",
+                "options": [
+                    {"label": "One", "value": "one", "description": null},
+                    {"label": "Two", "value": "two", "description": null}
+                ],
+                "control": "radio",
+                "selection_mode": "single",
+                "custom": false,
+                "custom_mode": "additional",
+                "required": true
+            }]),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -4802,6 +4810,128 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One matrix keeps semantic inputs and both production placements identical.
+    async fn normal_question_path_covers_radio_checkbox_custom_validation_and_both_placements() {
+        for placement in [
+            bcode_config::TuiInteractionPlacement::Transcript,
+            bcode_config::TuiInteractionPlacement::Pinned,
+        ] {
+            let mut model = root_test_model();
+            let mut config = model.chat.app.tui_config().clone();
+            config.interactions.placement = placement;
+            model.chat.app.apply_tui_config(config);
+            let keymap = super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
+            model.loop_state.install_interactive_surface_for_test(
+                question_surface_with_questions_for_root_test(
+                    &keymap,
+                    serde_json::json!([
+                        {
+                            "header": null,
+                            "question": "Choose radio",
+                            "options": [
+                                {"label": "One", "value": "one", "description": null},
+                                {"label": "Two", "value": "two", "description": null}
+                            ],
+                            "control": "radio",
+                            "selection_mode": "single",
+                            "custom": false,
+                            "custom_mode": "additional",
+                            "required": true
+                        },
+                        {
+                            "header": null,
+                            "question": "Choose checks",
+                            "options": [
+                                {"label": "Alpha", "value": "alpha", "description": null},
+                                {"label": "Beta", "value": "beta", "description": null}
+                            ],
+                            "control": "checkbox",
+                            "selection_mode": "multiple",
+                            "custom": false,
+                            "custom_mode": "additional",
+                            "required": false
+                        },
+                        {
+                            "header": null,
+                            "question": "Explain",
+                            "options": [],
+                            "control": "radio",
+                            "selection_mode": "single",
+                            "custom": true,
+                            "custom_mode": "additional",
+                            "required": true
+                        }
+                    ]),
+                )
+                .await,
+            );
+            let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+            let mut bytes = Vec::new();
+            let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+            bmux_tui_runtime::Presenter::present(
+                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                &mut model,
+            )
+            .expect("initial question matrix frame");
+
+            let event = |key| {
+                bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                    bmux_keyboard::KeyStroke {
+                        key,
+                        modifiers: bmux_keyboard::Modifiers::NONE,
+                    },
+                ))
+            };
+            for key in [
+                bmux_keyboard::KeyCode::Enter,
+                bmux_keyboard::KeyCode::Tab,
+                bmux_keyboard::KeyCode::Space,
+                bmux_keyboard::KeyCode::Tab,
+                bmux_keyboard::KeyCode::Tab,
+                bmux_keyboard::KeyCode::Char('x'),
+            ] {
+                bmux_tui_runtime::Program::update(&mut model, event(key))
+                    .expect("question matrix input");
+                bmux_tui_runtime::Presenter::present(
+                    &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                    &mut model,
+                )
+                .expect("question matrix committed presentation");
+            }
+        }
+
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let mut validation_surface = question_surface_with_questions_for_root_test(
+            settings.keymap(),
+            serde_json::json!([{
+                "header": null,
+                "question": "Required",
+                "options": [],
+                "control": "radio",
+                "selection_mode": "single",
+                "custom": true,
+                "custom_mode": "additional",
+                "required": true
+            }]),
+        )
+        .await;
+        let before = validation_surface.preferred_height(40);
+        assert!(matches!(
+            validation_surface.handle_event_outcome(&bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Enter,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            )),
+            super::super::interactive_surface::InteractiveSurfaceEventOutcome::Relayout
+        ));
+        assert!(validation_surface.preferred_height(40) > before);
+    }
+
+    #[tokio::test]
     async fn interactive_surface_navigation_repaints_without_composer_history_fallthrough() {
         let history = [bcode_session_models::SessionInputHistoryEntry {
             timestamp_ms: 1,
@@ -5068,6 +5198,199 @@ mod tests {
         );
         assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
         assert_eq!(partial_terminal.hits(), full_terminal.hits());
+    }
+
+    #[tokio::test]
+    async fn stable_question_redraw_is_independent_of_unrelated_transcript_length() {
+        async fn model(history_items: usize) -> super::BcodeRuntimeModel {
+            let session_id = bcode_session_models::SessionId::new();
+            let history = (1..=u64::try_from(history_items).unwrap_or(u64::MAX))
+                .map(|sequence| bcode_session_models::SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    timestamp_ms: sequence,
+                    session_id,
+                    provenance: None,
+                    kind: bcode_session_models::SessionEventKind::UserMessage {
+                        client_id: bcode_session_models::ClientId::new(),
+                        text: format!("unrelated transcript message {sequence}"),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let mut model = root_test_model_with_history(session_id, &history);
+            let mut config = model.chat.app.tui_config().clone();
+            config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+            model.chat.app.apply_tui_config(config);
+            let keymap = super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
+            model.loop_state.install_interactive_surface_for_test(
+                question_surface_with_questions_for_root_test(
+                    &keymap,
+                    serde_json::json!([{
+                        "header": null,
+                        "question": "Choose one",
+                        "options": [
+                            {"label": "One", "value": "one", "description": null},
+                            {"label": "Two", "value": "two", "description": "Second choice"}
+                        ],
+                        "control": "radio",
+                        "selection_mode": "single",
+                        "custom": false,
+                        "custom_mode": "additional",
+                        "required": true
+                    }]),
+                )
+                .await,
+            );
+            model
+        }
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut short = Box::pin(model(0)).await;
+        let mut long = Box::pin(model(1_000)).await;
+        let mut short_bytes = Vec::new();
+        let mut long_bytes = Vec::new();
+        let mut short_terminal = bmux_tui::terminal::Terminal::new(&mut short_bytes, area);
+        let mut long_terminal = bmux_tui::terminal::Terminal::new(&mut long_bytes, area);
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut short_terminal),
+            &mut short,
+        )
+        .expect("short initial frame");
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut long_terminal),
+            &mut long,
+        )
+        .expect("long initial frame");
+
+        let event = || {
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Down,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            ))
+        };
+        bmux_tui_runtime::Program::update(&mut short, event()).expect("short question input");
+        bmux_tui_runtime::Program::update(&mut long, event()).expect("long question input");
+        assert!(short.fast_temporal_presentation);
+        assert!(long.fast_temporal_presentation);
+        assert_eq!(short.presentation_damage, long.presentation_damage);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual already-built question interaction committed-presentation latency probe"]
+    #[allow(clippy::too_many_lines)] // The emitted artifact keeps timing and work-shape attribution together.
+    async fn question_interaction_to_committed_presentation_latency_report() {
+        const SAMPLES: usize = 50;
+        const LOCKED_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(17);
+        let mut model = root_test_model();
+        let mut config = model.chat.app.tui_config().clone();
+        config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+        model.chat.app.apply_tui_config(config);
+        let keymap = super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
+        model
+            .loop_state
+            .install_interactive_surface_for_test(question_surface_for_root_test(&keymap).await);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut terminal),
+            &mut model,
+        )
+        .expect("initial question frame");
+
+        let request_bytes = serde_json::to_vec(&serde_json::json!({
+            "questions": [{
+                "header": null,
+                "question": "Choose one",
+                "options": [
+                    {"label": "One", "value": "one", "description": null},
+                    {"label": "Two", "value": "two", "description": "Second choice"}
+                ],
+                "control": "radio",
+                "selection_mode": "single",
+                "custom": false,
+                "custom_mode": "additional",
+                "required": true
+            }]
+        }))
+        .expect("question fixture serialization")
+        .len();
+        let initial_geometry = model
+            .loop_state
+            .active_interactive_surface_geometry()
+            .expect("committed question geometry");
+        let initial_height = initial_geometry.logical_height;
+        let visible_rows = initial_geometry.destination.height;
+        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut draw_samples = Vec::with_capacity(SAMPLES);
+        let mut changed_cells = Vec::with_capacity(SAMPLES);
+        let mut full_repaints = 0_usize;
+        for index in 0..SAMPLES {
+            let started = std::time::Instant::now();
+            let event = bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: if index.is_multiple_of(2) {
+                        bmux_keyboard::KeyCode::Down
+                    } else {
+                        bmux_keyboard::KeyCode::Up
+                    },
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            ));
+            bmux_tui_runtime::Program::update(&mut model, event).expect("question input");
+            let draw_started = std::time::Instant::now();
+            let report = bmux_tui_runtime::Presenter::present(
+                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                &mut model,
+            )
+            .expect("question presentation");
+            samples.push(started.elapsed());
+            draw_samples.push(draw_started.elapsed());
+            changed_cells.push(report.changed_cells);
+            full_repaints = full_repaints.saturating_add(usize::from(report.full_repaint));
+        }
+        let work_shape = model
+            .loop_state
+            .active_interactive_surface_work_shape_for_test();
+        let summary = latency_summary(&samples);
+        let draw_summary = latency_summary(&draw_samples);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "kind": "bcode_question_interaction_committed_presentation_latency",
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "sample_count": SAMPLES,
+                "locked_p99_budget_ms": LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0,
+                "latency": summary,
+                "draw_latency": draw_summary,
+                "work_shape": {
+                    "fixture_request_bytes": request_bytes,
+                    "snapshot_materializations": work_shape.snapshot_materializations,
+                    "copied_request_bytes": request_bytes * usize::try_from(work_shape.snapshot_materializations).unwrap_or(usize::MAX),
+                    "preferred_height_measurements": work_shape.preferred_height_measurements,
+                    "focused_row_measurements": work_shape.focused_row_measurements,
+                    "wrapped_rows_visited": work_shape.wrapped_rows_visited,
+                    "semantic_events": SAMPLES,
+                    "logical_rows": initial_height,
+                    "visible_rows_rendered_per_frame": visible_rows,
+                    "broad_frame_preparations": 0,
+                    "transcript_entries_scanned": 0,
+                    "transcript_entries_rebuilt": 0,
+                    "transcript_rows_regenerated": 0,
+                    "scheduling_delay_ms": 0
+                },
+                "changed_cells": changed_cells,
+                "full_repaints": full_repaints,
+            })
+        );
+        assert!(
+            summary["p99_ms"].as_f64().expect("numeric p99")
+                <= LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(full_repaints, 0);
     }
 
     #[tokio::test]

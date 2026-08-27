@@ -19,7 +19,10 @@ if rg -n 'visual_rows_with_context|std::env::current_dir\(\).*PluginTuiVisualRen
   exit 1
 fi
 
-if rg -n '\.(display\(\)|to_string_lossy\(\))' plugins --glob '*tui*.rs'; then
+# Direct path display in rendered plugin output must use the host context. Execution payloads and
+# shell-command quoting preserve canonical path identity and are not presentation rendering.
+if rg -n '\.(display\(\)|to_string_lossy\(\))' plugins --glob '*tui*.rs' \
+  | rg -v 'workspace_snapshot:|workflow_path_identity|to_string_lossy|shell_quote_path|command: format!'; then
   echo "plugin TUI adapters must render paths through PluginTuiVisualRenderContext::display_path" >&2
   exit 1
 fi

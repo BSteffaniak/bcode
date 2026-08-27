@@ -2929,8 +2929,8 @@ impl WorkflowStatusSurface {
                         parent_session_id,
                         workspace_snapshot: self
                             .launch_workspace
-                            .as_ref()
-                            .map(|path| path.display().to_string()),
+                            .as_deref()
+                            .map(workflow_path_identity),
                         parent_session_generation: None,
                         configuration: Some(configuration),
                         input,
@@ -2958,8 +2958,8 @@ impl WorkflowStatusSurface {
                         parent_session_id,
                         workspace_snapshot: self
                             .launch_workspace
-                            .as_ref()
-                            .map(|path| path.display().to_string()),
+                            .as_deref()
+                            .map(workflow_path_identity),
                         configuration,
                         limits: detail.document.run_limits.clone(),
                     },
@@ -4792,8 +4792,12 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 }
 
+fn workflow_path_identity(path: &std::path::Path) -> String {
+    path.as_os_str().to_string_lossy().into_owned()
+}
+
 fn shell_quote_path(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    format!("'{}'", workflow_path_identity(path).replace('\'', "'\\''"))
 }
 
 fn workflow_breadcrumb_line(surface: &WorkflowStatusSurface, theme: WorkflowSurfaceTheme) -> Line {

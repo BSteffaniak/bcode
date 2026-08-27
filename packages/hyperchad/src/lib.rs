@@ -2608,6 +2608,13 @@ mod tests {
         );
         let snapshot = controller.snapshot_json();
 
+        assert_eq!(snapshot["revision"], 1);
+        assert_eq!(snapshot["layout_revision"], 0);
+        assert_eq!(snapshot["focus"]["type"], "option");
+        assert_eq!(snapshot["focus"]["question_index"], 0);
+        assert_eq!(snapshot["focus"]["option_index"], 0);
+        assert_eq!(snapshot["focused_control_id"], "question-0.option-0");
+        assert_eq!(snapshot["selected_option_indices"][0][0], 0);
         assert_eq!(snapshot["answers"][0]["selected"][0], "yes");
         assert_eq!(
             controller.handle_input(bcode_tool::InteractionInput::Submit),

@@ -1464,6 +1464,19 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
     ) -> Vec<Line>;
 }
 
+/// Deterministic work-shape counters for one native TUI interaction surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginTuiWorkShape {
+    /// Renderer-neutral snapshots materialized by the typed surface.
+    pub snapshot_materializations: u64,
+    /// Preferred-height measurements performed by the typed surface.
+    pub preferred_height_measurements: u64,
+    /// Focused-row measurements performed by the typed surface.
+    pub focused_row_measurements: u64,
+    /// Wrapped logical rows visited by the renderer's latest presentation.
+    pub wrapped_rows_visited: u64,
+}
+
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
 pub trait PluginTuiSurface: Send {
     /// Stable surface identifier.
@@ -1524,6 +1537,12 @@ pub trait PluginTuiSurface: Send {
 
     /// Notify a retained surface that native-session navigation finished or failed.
     fn session_navigation_finished(&mut self, _session_id: SessionId, _result: Result<(), String>) {
+    }
+
+    /// Return deterministic work-shape counters when the surface provides them.
+    #[must_use]
+    fn work_shape(&self) -> PluginTuiWorkShape {
+        PluginTuiWorkShape::default()
     }
 
     /// Poll internal async completions without blocking.
@@ -1613,6 +1632,12 @@ where
         self.render(snapshot, area, frame);
     }
 
+    /// Return renderer-owned deterministic work-shape counters.
+    #[must_use]
+    fn work_shape(&self) -> PluginTuiWorkShape {
+        PluginTuiWorkShape::default()
+    }
+
     /// Translate terminal input and report whether it was consumed.
     fn input(
         &mut self,
@@ -1632,6 +1657,7 @@ where
     renderer: R,
     preferred_height: Option<(u16, u16)>,
     focused_rows: Option<(u16, Option<std::ops::Range<u16>>)>,
+    work_shape: PluginTuiWorkShape,
 }
 
 impl<C, R> TypedTerminalInteractionSurface<C, R>
@@ -1647,6 +1673,10 @@ where
             renderer,
             preferred_height: None,
             focused_rows: None,
+            work_shape: PluginTuiWorkShape {
+                snapshot_materializations: 1,
+                ..PluginTuiWorkShape::default()
+            },
         }
     }
 
@@ -1659,6 +1689,8 @@ where
         let output = self.controller.handle_input(input);
         if !matches!(output, InteractionOutput::None) {
             self.snapshot = self.controller.snapshot();
+            self.work_shape.snapshot_materializations =
+                self.work_shape.snapshot_materializations.saturating_add(1);
             self.invalidate_measurement();
         }
         plugin_tui_action_from_interaction_output(output)
@@ -1685,6 +1717,10 @@ where
             return height;
         }
         let height = self.renderer.preferred_height(&self.snapshot, width);
+        self.work_shape.preferred_height_measurements = self
+            .work_shape
+            .preferred_height_measurements
+            .saturating_add(1);
         self.preferred_height = Some((width, height));
         height
     }
@@ -1716,6 +1752,8 @@ where
             return rows.clone();
         }
         let rows = self.renderer.focused_row_range(&self.snapshot, width);
+        self.work_shape.focused_row_measurements =
+            self.work_shape.focused_row_measurements.saturating_add(1);
         self.focused_rows = Some((width, rows.clone()));
         rows
     }
@@ -1728,6 +1766,12 @@ where
     ) {
         self.renderer
             .render_with_theme(&self.snapshot, area, frame, theme);
+    }
+
+    fn work_shape(&self) -> PluginTuiWorkShape {
+        let mut work_shape = self.work_shape;
+        work_shape.wrapped_rows_visited = self.renderer.work_shape().wrapped_rows_visited;
+        work_shape
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -1744,6 +1788,7 @@ where
 
 #[cfg(test)]
 mod typed_interaction_surface_tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1751,6 +1796,7 @@ mod typed_interaction_surface_tests {
     static SNAPSHOTS: AtomicUsize = AtomicUsize::new(0);
     static HEIGHTS: AtomicUsize = AtomicUsize::new(0);
     static FOCUSED_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_COUNTERS: Mutex<()> = Mutex::new(());
 
     struct CountingController {
         value: usize,
@@ -1837,8 +1883,66 @@ mod typed_interaction_surface_tests {
         fn request_redraw(&self) {}
     }
 
+    #[derive(Default)]
+    struct FallbackRenderer;
+
+    impl TerminalInteractionRenderer<CountingController> for FallbackRenderer {
+        const SURFACE_KIND: &'static str = "test.fallback.surface";
+
+        fn id(&self) -> &'static str {
+            "fallback"
+        }
+
+        fn title(&self) -> &'static str {
+            "Fallback"
+        }
+
+        fn preferred_height(&mut self, _snapshot: &usize, _width: u16) -> u16 {
+            1
+        }
+
+        fn render(&mut self, snapshot: &usize, area: Rect, frame: &mut Frame<'_>) {
+            frame.write_line(area, &Line::from(format!("fallback:{snapshot}")));
+        }
+
+        fn input(
+            &mut self,
+            _event: &Event,
+            _snapshot: &usize,
+            _host: &dyn PluginTuiHost,
+        ) -> TerminalInteractionInput {
+            TerminalInteractionInput::Ignored
+        }
+    }
+
+    #[test]
+    fn typed_surface_preserves_renderer_fallbacks() {
+        let _guard = TEST_COUNTERS.lock().expect("test counter lock");
+        let mut surface =
+            TypedTerminalInteractionSurface::new(CountingController::new(()), FallbackRenderer);
+        assert_eq!(surface.focused_row_range(24), None);
+        assert_eq!(surface.preferred_height(24), 1);
+
+        let area = Rect::new(0, 0, 24, 1);
+        let mut sliced = bmux_tui::buffer::Buffer::empty(area);
+        surface.render_slice(8, 7, area, &mut Frame::new(&mut sliced));
+        assert_eq!(
+            sliced.row_symbols(0).as_deref(),
+            Some("fallback:0              ")
+        );
+
+        let mut themed = bmux_tui::buffer::Buffer::empty(area);
+        surface.render_with_theme(area, &mut Frame::new(&mut themed), None);
+        assert_eq!(themed, sliced);
+        assert_eq!(
+            surface.handle_event(&Event::Tick, &TestHost),
+            PluginTuiAction::None
+        );
+    }
+
     #[test]
     fn typed_surface_reuses_one_snapshot_until_semantic_state_changes() {
+        let _guard = TEST_COUNTERS.lock().expect("test counter lock");
         SNAPSHOTS.store(0, Ordering::Relaxed);
         HEIGHTS.store(0, Ordering::Relaxed);
         FOCUSED_ROWS.store(0, Ordering::Relaxed);

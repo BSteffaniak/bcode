@@ -66,6 +66,54 @@ worktree. Each process was sampled with `ps -o rss=` every 2 ms for seven indepe
 This fixed-workload process comparison shows no memory regression after migration. It complements,
 rather than replaces, the structural boundedness assertions and interactive queue telemetry.
 
+## Interactive plugin-surface performance contracts
+
+Stable-extent plugin interaction updates use committed surface geometry and terminal damage rather
+than rebuilding unrelated transcript, Markdown, or image presentation. A surface that changes its
+preferred height takes the relayout path; missing or stale committed geometry falls back to normal
+full frame preparation. These are generic host contracts rather than question-specific routing.
+
+Question surfaces retain one bounded layout for the current semantic layout revision and terminal
+width. Focus-only updates reuse that layout. Width or extent changes replace it. Sliced rendering
+binary-searches ordered question spans and visits only spans intersecting the requested viewport;
+the renderer does not retain historical layouts or materialize a full-surface scratch buffer.
+
+The deterministic work-shape checks are:
+
+```sh
+cargo test -p bcode_question_plugin --features static-bundled question_tui
+cargo test -p bcode_plugin_sdk --features tui typed_interaction_surface_tests
+cargo test -p bcode_tui interactive_surface
+cargo test -p bcode_tui stable_interaction_redraw
+cargo test -p bcode_tui question_interaction_to_committed_presentation_latency_report -- --ignored --nocapture
+```
+
+These checks cover maximum-valid question bounds, visible-slice traversal, snapshot and measurement
+reuse, generic renderer fallback, clipping, cursor and mouse projection, redraw/relayout behavior,
+and equality between localized and full presentation. The ignored question probe measures semantic
+Up/Down events through committed terminal presentation against one 17 ms frame cadence and reports
+changed cells and full repaints. Its timings are local debug-build regression evidence, not a
+universal release guarantee.
+
+For machine-attributed product latency, use the existing capture command:
+
+```sh
+scripts/capture-question-interaction-performance.sh target/question-interaction-performance.json
+scripts/compare-question-interaction-performance.py \
+  target/question-interaction-performance-before.json \
+  target/question-interaction-performance-after.json \
+  --output target/question-interaction-performance-comparison.json
+scripts/capture-tui-product-latency.sh target/tui-product-latency.json
+```
+
+The artifacts record revision, toolchain, machine, dirty state, distributions, and gate outcomes.
+The comparator rejects incompatible artifact schemas, sample counts, or locked budgets. A meaningful
+before/after claim requires separately captured revisions or clearly identified implementations;
+repeated samples from one dirty checkout are useful only for validating the comparison machinery and
+observing local run-to-run variance.
+Do not present one machine's timing as a universal guarantee, and do not substitute runtime queue
+admission latency for a question event reaching committed terminal presentation.
+
 ## Product verification closure
 
 Managed-runtime terminal and timer latency are covered by a Bcode-bound acceptance test against the

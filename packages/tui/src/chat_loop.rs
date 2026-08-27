@@ -1973,6 +1973,16 @@ impl ChatLoopState {
             .map(InteractiveSurfaceState::surface_id_for_test)
     }
 
+    #[cfg(test)]
+    pub fn active_interactive_surface_work_shape_for_test(
+        &self,
+    ) -> bcode_plugin_sdk::tui::PluginTuiWorkShape {
+        self.interactive_surface.as_ref().map_or_else(
+            bcode_plugin_sdk::tui::PluginTuiWorkShape::default,
+            InteractiveSurfaceState::work_shape_for_test,
+        )
+    }
+
     pub fn active_interactive_surface_id(&self) -> Option<&str> {
         self.interactive_surface
             .as_ref()

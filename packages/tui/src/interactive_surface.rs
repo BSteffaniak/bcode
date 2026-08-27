@@ -475,6 +475,11 @@ impl InteractiveSurfaceState {
     }
 
     /// Handle an input event, report consumption, and retain close resolution until confirmation.
+    #[cfg(test)]
+    pub(crate) fn work_shape_for_test(&self) -> bcode_plugin_sdk::tui::PluginTuiWorkShape {
+        self.surface.work_shape()
+    }
+
     pub fn handle_event_outcome(&mut self, event: &Event) -> InteractiveSurfaceEventOutcome {
         if let Some(resolution) = &self.pending_resolution {
             return InteractiveSurfaceEventOutcome::Resolved(resolution.clone());

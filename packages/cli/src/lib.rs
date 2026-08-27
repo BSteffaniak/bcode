@@ -4849,7 +4849,7 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             dry_run,
             json,
         } => {
-            relocate_sessions_command(to, to_profile, session, dry_run, json)?;
+            relocate_sessions_command(to, to_profile, &session, dry_run, json)?;
         }
         SessionCommand::ReleaseOwner { session_id } => {
             release_session_owner(session_id).await?;
@@ -5043,7 +5043,7 @@ fn relocation_destination(
                 &config.state,
                 &bcode_config::StateLocationSelection {
                     root: None,
-                    profile: Some(profile.clone()),
+                    profile: Some(profile),
                 },
             )
             .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
@@ -5062,7 +5062,7 @@ fn relocation_destination(
 fn relocate_sessions_command(
     to: Option<PathBuf>,
     to_profile: Option<String>,
-    sessions: Vec<SessionId>,
+    sessions: &[SessionId],
     dry_run: bool,
     json: bool,
 ) -> Result<(), CliError> {
@@ -5072,7 +5072,7 @@ fn relocate_sessions_command(
     let plan = bcode_session_migration::plan_session_relocation(
         &source_root,
         &destination_root,
-        &sessions,
+        sessions,
         |session_id, root| {
             // A live owner is authoritative: probe without taking the guard so planning stays
             // non-mutating.
@@ -5170,7 +5170,7 @@ fn print_relocation_plan(
     Ok(())
 }
 
-fn describe_block(entry: &bcode_session_migration::SessionRelocationEntry) -> &'static str {
+const fn describe_block(entry: &bcode_session_migration::SessionRelocationEntry) -> &'static str {
     match entry.blocked {
         Some(bcode_session_migration::SessionRelocationBlock::BlockedByOwner) => {
             "a live owner holds this session; stop it first"
