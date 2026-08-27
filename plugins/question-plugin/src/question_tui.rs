@@ -37,6 +37,16 @@ pub struct QuestionTerminalRenderer {
     custom_areas: BTreeMap<usize, Rect>,
     pending_custom_mouse_focus: Option<usize>,
     theme: QuestionSurfaceTheme,
+    measurement: Option<QuestionMeasurement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuestionMeasurement {
+    layout_revision: u64,
+    focus: QuestionFocusTarget,
+    width: u16,
+    height: u16,
+    focused_rows: std::ops::Range<u16>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +94,26 @@ struct ControlRegion {
 }
 
 impl QuestionTerminalRenderer {
+    fn measurement(&mut self, snapshot: &QuestionSnapshot, width: u16) -> &QuestionMeasurement {
+        let width = width.max(1);
+        let rebuild = self.measurement.as_ref().is_none_or(|measurement| {
+            measurement.layout_revision != snapshot.layout_revision
+                || measurement.focus != snapshot.focus
+                || measurement.width != width
+        });
+        if rebuild {
+            let (start, end) = Self::focused_content_range(snapshot, width);
+            self.measurement = Some(QuestionMeasurement {
+                layout_revision: snapshot.layout_revision,
+                focus: snapshot.focus,
+                width,
+                height: Self::content_height(snapshot, width),
+                focused_rows: start..end.max(start.saturating_add(1)),
+            });
+        }
+        self.measurement.as_ref().expect("measurement initialized")
+    }
+
     fn render_line(&self, frame: &mut Frame<'_>, content_y: &mut u16, line: &Line) {
         if let Some(screen_y) = self.screen_y(*content_y) {
             frame.write_line(
@@ -603,7 +633,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
     }
 
     fn preferred_height(&mut self, snapshot: &QuestionSnapshot, width: u16) -> u16 {
-        Self::content_height(snapshot, width)
+        self.measurement(snapshot, width).height
     }
 
     fn render(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
@@ -629,8 +659,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         snapshot: &QuestionSnapshot,
         width: u16,
     ) -> Option<std::ops::Range<u16>> {
-        let (start, end) = Self::focused_content_range(snapshot, width.max(1));
-        Some(start..end.max(start.saturating_add(1)))
+        Some(self.measurement(snapshot, width).focused_rows.clone())
     }
 
     fn render_with_theme(

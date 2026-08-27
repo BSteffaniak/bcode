@@ -1628,6 +1628,7 @@ where
     R: TerminalInteractionRenderer<C>,
 {
     controller: C,
+    snapshot: C::Snapshot,
     renderer: R,
 }
 
@@ -1636,11 +1637,21 @@ where
     C: PluginInteraction,
     R: TerminalInteractionRenderer<C>,
 {
-    const fn new(controller: C, renderer: R) -> Self {
+    fn new(controller: C, renderer: R) -> Self {
+        let snapshot = controller.snapshot();
         Self {
             controller,
+            snapshot,
             renderer,
         }
+    }
+
+    fn apply_input(&mut self, input: InteractionInput) -> PluginTuiAction {
+        let output = self.controller.handle_input(input);
+        if !matches!(output, InteractionOutput::None) {
+            self.snapshot = self.controller.snapshot();
+        }
+        plugin_tui_action_from_interaction_output(output)
     }
 }
 
@@ -1658,13 +1669,11 @@ where
     }
 
     fn preferred_height(&mut self, width: u16) -> u16 {
-        self.renderer
-            .preferred_height(&self.controller.snapshot(), width)
+        self.renderer.preferred_height(&self.snapshot, width)
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
-        self.renderer
-            .render(&self.controller.snapshot(), area, frame);
+        self.renderer.render(&self.snapshot, area, frame);
     }
 
     fn render_slice(
@@ -1675,7 +1684,7 @@ where
         frame: &mut Frame<'_>,
     ) {
         self.renderer.render_slice(
-            &self.controller.snapshot(),
+            &self.snapshot,
             logical_height,
             logical_row_offset,
             destination,
@@ -1684,8 +1693,7 @@ where
     }
 
     fn focused_row_range(&mut self, width: u16) -> Option<std::ops::Range<u16>> {
-        self.renderer
-            .focused_row_range(&self.controller.snapshot(), width)
+        self.renderer.focused_row_range(&self.snapshot, width)
     }
 
     fn render_with_theme(
@@ -1695,20 +1703,116 @@ where
         theme: Option<&PluginTuiTheme>,
     ) {
         self.renderer
-            .render_with_theme(&self.controller.snapshot(), area, frame, theme);
+            .render_with_theme(&self.snapshot, area, frame, theme);
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        match self
-            .renderer
-            .input(event, &self.controller.snapshot(), host)
-        {
+        match self.renderer.input(event, &self.snapshot, host) {
             TerminalInteractionInput::Ignored => PluginTuiAction::None,
             TerminalInteractionInput::Consumed => PluginTuiAction::Redraw,
-            TerminalInteractionInput::Semantic(input) => {
-                plugin_tui_action_from_interaction_output(self.controller.handle_input(input))
-            }
+            TerminalInteractionInput::Semantic(input) => self.apply_input(input),
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_interaction_surface_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static SNAPSHOTS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingController {
+        value: usize,
+    }
+
+    impl PluginInteraction for CountingController {
+        const KIND: &'static str = "test.counting";
+
+        type Request = ();
+        type Snapshot = usize;
+
+        fn new((): Self::Request) -> Self {
+            Self { value: 0 }
+        }
+
+        fn snapshot(&self) -> Self::Snapshot {
+            SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
+            self.value
+        }
+
+        fn handle_input(&mut self, _input: InteractionInput) -> InteractionOutput {
+            self.value = self.value.saturating_add(1);
+            InteractionOutput::Redraw
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingRenderer;
+
+    impl TerminalInteractionRenderer<CountingController> for CountingRenderer {
+        const SURFACE_KIND: &'static str = "test.counting.surface";
+
+        fn id(&self) -> &'static str {
+            "counting"
+        }
+
+        fn title(&self) -> &'static str {
+            "Counting"
+        }
+
+        fn preferred_height(&mut self, snapshot: &usize, _width: u16) -> u16 {
+            u16::try_from(snapshot.saturating_add(1)).unwrap_or(u16::MAX)
+        }
+
+        fn render(&mut self, snapshot: &usize, area: Rect, frame: &mut Frame<'_>) {
+            frame.write_line(area, &Line::from(snapshot.to_string()));
+        }
+
+        fn input(
+            &mut self,
+            _event: &Event,
+            _snapshot: &usize,
+            _host: &dyn PluginTuiHost,
+        ) -> TerminalInteractionInput {
+            TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                direction: bcode_tool::InteractionNavigation::Next,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestHost;
+
+    impl PluginTuiHost for TestHost {
+        fn spawn(&self, _task: PluginTask) {}
+
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+
+        fn request_redraw(&self) {}
+    }
+
+    #[test]
+    fn typed_surface_reuses_one_snapshot_until_semantic_state_changes() {
+        SNAPSHOTS.store(0, Ordering::Relaxed);
+        let mut surface =
+            TypedTerminalInteractionSurface::new(CountingController::new(()), CountingRenderer);
+        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 1);
+        assert_eq!(surface.preferred_height(80), 1);
+        assert_eq!(surface.focused_row_range(80), None);
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render(area, &mut Frame::new(&mut buffer));
+        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            surface.handle_event(&Event::Tick, &TestHost),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 2);
+        assert_eq!(surface.preferred_height(80), 2);
+        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 2);
     }
 }
 

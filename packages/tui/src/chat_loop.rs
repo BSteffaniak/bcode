@@ -4704,6 +4704,21 @@ fn draw_temporal_frame<W: Write>(
     let draw_started = Instant::now();
     let draw_stats = terminal.draw_damage(damage, |frame| {
         render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
+        if let Some(surface) = &mut loop_state.interactive_surface
+            && let Some(geometry) = loop_state.interactive_surface_geometry
+            && !geometry.destination.is_empty()
+            && intersects(geometry.destination)
+        {
+            if geometry.placement == InteractiveSurfacePlacement::Pinned {
+                frame.fill(geometry.destination, " ", bmux_tui::prelude::Style::new());
+            }
+            surface.render_slice(
+                geometry.logical_height,
+                geometry.visible_logical_offset,
+                geometry.destination,
+                frame,
+            );
+        }
     })?;
     record_frame_telemetry(
         loop_state,

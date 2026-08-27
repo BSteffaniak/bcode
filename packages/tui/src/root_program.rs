@@ -2339,7 +2339,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                         },
                                     )
                                 });
-                            self.fast_temporal_presentation = false;
+                            self.fast_temporal_presentation = true;
                             return Ok(bmux_tui_runtime::Update::redraw());
                         }
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Relayout => {
@@ -4951,7 +4951,115 @@ mod tests {
             model.invalidation,
             super::super::invalidation::UiInvalidation::Paint
         );
-        assert!(!model.fast_temporal_presentation);
+        assert!(model.fast_temporal_presentation);
+    }
+
+    #[tokio::test]
+    async fn stable_interaction_redraw_matches_full_presentation() {
+        struct CountingSurface(usize);
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for CountingSurface {
+            fn id(&self) -> &'static str {
+                "counting-test"
+            }
+
+            fn title(&self) -> &'static str {
+                "Counting test"
+            }
+
+            fn render(
+                &mut self,
+                area: bmux_tui::geometry::Rect,
+                frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+                frame.write_line(area, &bmux_tui::prelude::Line::from(self.0.to_string()));
+            }
+
+            fn handle_event(
+                &mut self,
+                event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                if matches!(event, bmux_tui::event::Event::Key(_)) {
+                    self.0 = self.0.saturating_add(1);
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                } else {
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
+            }
+        }
+
+        fn model() -> super::BcodeRuntimeModel {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let mut loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            loop_state.install_interactive_surface_for_test(
+                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                    "counting-interaction",
+                    Box::new(CountingSurface(0)),
+                    settings.keymap(),
+                ),
+            );
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        }
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut partial = model();
+        let mut full = model();
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut partial_terminal),
+            &mut partial,
+        )
+        .expect("initial partial presentation");
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut full_terminal),
+            &mut full,
+        )
+        .expect("initial full presentation");
+
+        let event = || {
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Down,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            ))
+        };
+        bmux_tui_runtime::Program::update(&mut partial, event()).expect("partial input");
+        bmux_tui_runtime::Program::update(&mut full, event()).expect("full input");
+        assert!(partial.fast_temporal_presentation);
+        full.presentation_damage = bmux_tui::damage::Damage::Full;
+        full.fast_temporal_presentation = false;
+
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut partial_terminal),
+            &mut partial,
+        )
+        .expect("partial redraw");
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut full_terminal),
+            &mut full,
+        )
+        .expect("full redraw");
+
+        assert_eq!(
+            partial_terminal.retained_buffer(),
+            full_terminal.retained_buffer()
+        );
+        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+        assert_eq!(partial_terminal.hits(), full_terminal.hits());
     }
 
     #[tokio::test]

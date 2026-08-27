@@ -27,7 +27,7 @@ pub trait PluginInteraction: Send + 'static {
     /// Request payload used to initialize this interaction.
     type Request: DeserializeOwned;
     /// Renderer-neutral snapshot exposed to clients.
-    type Snapshot: Serialize;
+    type Snapshot: Serialize + Send;
 
     /// Create an interaction from a decoded request.
     fn new(request: Self::Request) -> Self;

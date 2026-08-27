@@ -56,6 +56,10 @@ impl QuestionFocusTarget {
 /// Renderer-neutral question snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionSnapshot {
+    /// Monotonic controller presentation revision.
+    pub revision: u64,
+    /// Monotonic revision for content that can change logical layout.
+    pub layout_revision: u64,
     /// Original normalized request.
     pub request: NormalizedQuestionRequest,
     /// Current answers in submitted-value form.
@@ -77,6 +81,8 @@ pub struct QuestionSnapshot {
 /// Renderer-neutral question controller.
 pub struct QuestionInteractionController {
     request: NormalizedQuestionRequest,
+    revision: u64,
+    layout_revision: u64,
     answers: Vec<QuestionAnswerPayload>,
     selected_option_indices: Vec<BTreeSet<usize>>,
     focus: QuestionFocusTarget,
@@ -102,6 +108,8 @@ impl QuestionInteractionController {
         let focus = first_focus_target(&request);
         Self {
             request,
+            revision: 0,
+            layout_revision: 0,
             answers,
             selected_option_indices,
             focus,
@@ -298,6 +306,8 @@ impl QuestionInteractionController {
 
     fn snapshot(&self) -> QuestionSnapshot {
         QuestionSnapshot {
+            revision: self.revision,
+            layout_revision: self.layout_revision,
             request: self.request.clone(),
             answers: self.answers.clone(),
             selected_option_indices: self
@@ -313,7 +323,11 @@ impl QuestionInteractionController {
     }
 
     fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
-        match input {
+        let layout_may_change = matches!(
+            input,
+            InteractionInput::Change { .. } | InteractionInput::Submit
+        );
+        let output = match input {
             InteractionInput::Activate { control_id } => self.activate_control(&control_id),
             InteractionInput::Change { control_id, value } => {
                 self.change_control(&control_id, &value)
@@ -326,7 +340,14 @@ impl QuestionInteractionController {
             }
             InteractionInput::Submit => self.submit(),
             InteractionInput::Cancel => dismissed(),
+        };
+        if !matches!(output, InteractionOutput::None) {
+            self.revision = self.revision.wrapping_add(1);
+            if layout_may_change {
+                self.layout_revision = self.layout_revision.wrapping_add(1);
+            }
         }
+        output
     }
 }
 
