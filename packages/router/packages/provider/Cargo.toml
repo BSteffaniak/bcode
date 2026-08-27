@@ -1,0 +1,43 @@
+[package]
+authors     = { workspace = true }
+categories  = ["api-bindings"]
+description = "Provider registry primitives for brouter"
+edition     = { workspace = true }
+keywords    = ["llm", "provider", "router"]
+license     = { workspace = true }
+name        = "brouter_provider"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+base64                       = { workspace = true }
+brouter_api_models           = { workspace = true }
+brouter_catalog_models       = { workspace = true }
+brouter_config_models        = { workspace = true }
+brouter_introspection_models = { workspace = true }
+brouter_provider_models      = { workspace = true }
+bytes                        = { workspace = true }
+futures-util                 = { workspace = true }
+reqwest                      = { workspace = true, features = ["form", "json", "rustls", "stream"] }
+serde                        = { workspace = true, features = ["derive"] }
+serde_json                   = { workspace = true, features = ["std"] }
+sshenv_vault                 = { workspace = true }
+thiserror                    = { workspace = true }
+tokio                        = { workspace = true, features = ["time"] }
+tracing                      = { workspace = true }
+zeroize                      = { workspace = true }
+
+[dev-dependencies]
+axum  = { workspace = true, features = ["http1", "json", "tokio"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
+[features]
+default = []
+fail-on-warnings = [
+    "brouter_api_models/fail-on-warnings",
+    "brouter_catalog_models/fail-on-warnings",
+    "brouter_config_models/fail-on-warnings",
+    "brouter_introspection_models/fail-on-warnings",
+    "brouter_provider_models/fail-on-warnings",
+]

@@ -1,0 +1,295 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+# Optional local server auth. Requests must send Authorization: Bearer $BROUTER_API_KEY.
+# api_key_env = "BROUTER_API_KEY"
+max_request_body_bytes = 67108864 # Set to 0 or null to disable the brouter body limit.
+# cors_allowed_origins = ["http://localhost:3000"]
+
+[router]
+default_objective = "balanced"
+# Optional named profile for brouter/auto. Requests can also use model = "profile:<name>",
+# x-brouter-profile, or metadata.brouter_profile.
+# default_profile = "conserve_openai"
+debug_headers = true
+# When router.llm_judge is omitted, brouter picks a safe low-cost judge from
+# configured chat models and uses it when deterministic scores are close.
+default_judge = true
+provider_failure_threshold = 3
+provider_cooldown_ms = 30000
+# Optional budget guards based on router cost estimates.
+# max_estimated_cost = 0.05
+# max_session_estimated_cost = 1.00
+
+[router.aliases]
+fast = "fast_local"
+strong = "strong_cloud"
+
+[router.groups]
+cloud = ["cheap_cloud", "strong_cloud"]
+
+[router.metadata]
+# Live provider metadata/account usage is refreshed by default for providers
+# with known introspection support, cached here, and reused if live refresh fails.
+refresh_on_startup = true
+max_age_ms = 86400000
+refresh_interval_ms = 300000
+refresh_before_expensive_route = true
+allow_stale_on_provider_error = true
+allow_fallback_catalog = true
+# cache_path defaults to ~/.local/state/brouter/introspection.json
+
+[router.dynamic_policy]
+# Generic account/resource policy for introspected quota pools.
+low_remaining_ratio = 0.25
+critical_remaining_ratio = 0.05
+low_remaining_penalty = 30.0
+exclude_when_exhausted = true
+# disable_attributes_when_low = { latency_class = "priority" }
+
+[router.context]
+# Protect conversations from silently falling back to a smaller context window.
+safety_margin_ratio = 0.15
+preserve_session_context_floor = true
+allow_context_downgrade = false
+
+# Example quota-conservation profile: keep the same models available, but avoid
+# the priority lane and prefer cheaper/free candidates while quota is low.
+# [[router.profiles.conserve_openai.deny]]
+# attributes = { latency_class = "priority" }
+# reason = "priority lane disabled while quota is low"
+# hard = true
+#
+# [[router.profiles.conserve_openai.deny]]
+# providers = ["openai"]
+# reason = "prefer free/local models before OpenAI"
+# hard = false
+# penalty = 25.0
+
+[router.scoring]
+quality_weight = 1.0
+balanced_cost_weight = 20.0
+cheapest_cost_weight = 100.0
+local_bonus = 10.0
+strongest_quality_weight = 0.5
+first_message_reasoning_bonus = 8.0
+code_bonus = 15.0
+reasoning_bonus = 20.0
+policy_penalty = 30.0
+
+# LLM judge re-evaluates routing decisions when configured.
+# The judge model is selected from the shortlist just like any other candidate,
+# and if it fails (e.g., provider usage limit), brouter falls back to other
+# available models across all enabled providers.
+# [[router.llm_judge]]
+# The model used to generate routing rationales. Must be in the models list.
+# model = "fast_model"
+# provider = "openai"
+# system_prompt = "You are a routing advisor..."
+# trigger = { score_gap_threshold = 5.0, rule_triggered = true }
+# shortlist = { size = 5, min_score = 0.0 }
+# output = { structured = true, max_tokens = 256, temperature = 0.0 }
+# budget = { max_estimated_cost = 0.0 }
+
+[[router.rules]]
+name = "private-local"
+when_contains = ["secret", "private key", "credentials"]
+objective = "local_only"
+require_capabilities = ["local"]
+
+[[router.rules]]
+name = "debug-code-reasoning"
+intent = "debugging"
+prefer_capabilities = ["reasoning"]
+
+[[router.rules]]
+name = "explicit-priority"
+when_contains = ["priority", "urgent", "asap", "low latency", "quick response"]
+prefer_attributes = { latency_class = "priority" }
+
+[telemetry]
+# Persistent telemetry is enabled by default at ~/.local/state/brouter/brouter.db.
+# Set disabled = true to keep telemetry in memory only.
+disabled = false
+database_path = "brouter.db"
+
+[telemetry.events]
+# Session routing event logs power `brouter sessions timeline` and integrations.
+# Prompt text is omitted by default; enable include_prompt or prompt previews only
+# when the telemetry DB is stored somewhere trusted.
+disabled = false
+include_prompt = false
+prompt_preview_chars = 0
+candidate_limit = 8
+include_excluded_candidates = true
+include_judge_prompt = false
+
+# Logs default to ~/.local/state/brouter/brouter.log. Override with
+# BROUTER_LOG_FILE=/path/to/log, BROUTER_LOG_FILE=off, RUST_LOG=debug, and/or
+# BROUTER_LOG_FORMAT=json.
+
+[providers.ollama]
+kind = "open-ai-compatible"
+base_url = "http://localhost:11434/v1"
+timeout_ms = 60000
+
+[providers.openai]
+# Presets fill kind/base_url/api_key_env/introspection defaults when omitted.
+# preset = "openai"
+kind = "open-ai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+timeout_ms = 60000
+# [providers.openai.introspection]
+# enabled = true
+# catalog = true
+# account = false
+# Optional configured/user-managed budget pool. Live usage can be merged with
+# these totals/refill timestamps when provider account APIs expose partial data.
+# [[providers.openai.resource_pools]]
+# id = "monthly-api-budget"
+# scope = "provider"
+# kind = "monetary_credit"
+# unit = "usd"
+# total = 100.0
+# refill_at_ms = 1764547200000
+# Optional provider-level per-request estimated cost budget.
+# max_estimated_cost = 0.05
+
+# ChatGPT/Codex Max subscription auth through a brouter-owned sshenv vault.
+# Create credentials with browser OAuth: brouter auth openai-codex login --profile openai-max
+# [providers.openai_max]
+# kind = "openai-codex"
+# auth_backend = "sshenv"
+# auth_profile = "openai-max"
+# auth_vault_path = "~/.local/state/brouter/auth/vault"
+# timeout_ms = 60000
+# # openai-codex account/usage introspection is auto-enabled by default.
+# # Set disabled = true to opt out, or provide usage_endpoints to override
+# # private ChatGPT/Codex usage endpoint probing when OpenAI changes it.
+# # [providers.openai_max.introspection]
+# # disabled = false
+# # usage_endpoints = ["https://chatgpt.com/backend-api/codex/usage"]
+# # OpenAI Codex also gets these declarative provider controls by default:
+# # [providers.openai_max.controls.virtual_variants]
+# # service_tiers = ["standard", "priority"]
+# # reasoning_efforts = ["low", "medium", "high"]
+#
+# Declarative controls translate brouter's generic route attributes into
+# provider-specific request fields only when the selected model has that
+# attribute value.
+# [providers.openai_max.controls.attribute_mappings.latency_class.priority.request_fields]
+# service_tier = "priority"
+#
+# [providers.openai_max.controls.attribute_mappings.latency_class.standard]
+# omit_request_fields = ["service_tier"]
+#
+# Provider-level controls.omit_request_fields removes fields from ALL requests to this provider.
+# This is useful for providers that error on certain fields (e.g., reasoning_effort).
+# Legacy top-level omit_request_fields/attribute_mappings/virtual_variants still work.
+# [providers.deepseek.controls]
+# omit_request_fields = ["reasoning_effort", "thinking"]
+
+[models.fast_local]
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+context_window = 32768
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+quality = 60
+capabilities = ["chat", "code", "local"]
+
+[models.cheap_cloud]
+provider = "openai"
+model = "gpt-4o-mini"
+context_window = 128000
+input_cost_per_million = 0.15
+output_cost_per_million = 0.60
+quality = 70
+capabilities = ["chat", "json", "tools"]
+attributes = { latency_class = "standard", billing_class = "api" }
+display_badges = ["standard"]
+
+[models.strong_cloud]
+provider = "openai"
+model = "gpt-4.1"
+context_window = 128000
+input_cost_per_million = 2.00
+output_cost_per_million = 8.00
+quality = 90
+capabilities = ["chat", "code", "json", "tools", "reasoning"]
+attributes = { latency_class = "priority", billing_class = "api" }
+display_badges = ["priority"]
+# Optional model-level per-request estimated cost budget.
+# max_estimated_cost = 0.10
+# Optional explicit user metadata override. Use mode = "force" only when you
+# intentionally know better than provider APIs and brouter's fallback catalog.
+# [models.strong_cloud.metadata_overrides]
+# mode = "force"
+# reason = "Provider API has not reflected latest docs yet"
+# source_url = "https://platform.openai.com/docs/models"
+# verified_at_ms = 1762560000000
+# context_window = 1047576
+# max_output_tokens = 32768
+
+# OpenRouter — aggregates many model providers. Create credentials with:
+#   brouter auth openrouter login --profile openrouter [--api-key sk-orv-...]
+# [providers.openrouter]
+# kind = "open-ai-compatible"
+# base_url = "https://openrouter.ai/api/v1"
+# auth_backend = "sshenv"
+# auth_profile = "openrouter"
+# auth_vault_path = "~/.local/state/brouter/auth/openrouter_vault"
+# timeout_ms = 60000
+#
+# [models.openrouter_fast]
+# provider = "openrouter"
+# model = "anthropic/claude-3.5-haiku"
+# context_window = 200000
+# input_cost_per_million = 0.0
+# output_cost_per_million = 0.0
+# quality = 85
+# capabilities = ["chat", "code", "json", "tools", "reasoning"]
+# attributes = { latency_class = "standard", billing_class = "subscription" }
+# display_badges = ["standard"]
+#
+# [models.openrouter_strong]
+# provider = "openrouter"
+# model = "anthropic/claude-3.7-sonnet"
+# context_window = 200000
+# input_cost_per_million = 0.0
+# output_cost_per_million = 0.0
+# quality = 92
+# capabilities = ["chat", "code", "json", "tools", "reasoning"]
+# attributes = { latency_class = "priority", billing_class = "subscription" }
+# display_badges = ["priority"]
+
+# OpenCode Zen — OpenCode's own LLM service. Create credentials with:
+#   brouter auth opencode-zen login --profile opencode-zen [--api-key ...]
+# [providers.opencode_zen]
+# kind = "open-ai-compatible"
+# base_url = "https://opencode.ai/zen/v1"
+# auth_backend = "sshenv"
+# auth_profile = "opencode-zen"
+# auth_vault_path = "~/.local/state/brouter/auth/opencode_zen_vault"
+# timeout_ms = 60000
+#
+# [models.opencode_zen_fast]
+# provider = "opencode_zen"
+# model = "big-pickle"
+# context_window = 128000
+# input_cost_per_million = 0.0
+# output_cost_per_million = 0.0
+# quality = 88
+# capabilities = ["chat", "code", "json", "tools", "reasoning"]
+# attributes = { latency_class = "standard", billing_class = "subscription" }
+# display_badges = ["standard"]
+
+[models.embedding_cloud]
+provider = "openai"
+model = "text-embedding-3-small"
+context_window = 8192
+input_cost_per_million = 0.02
+output_cost_per_million = 0.0
+quality = 70
+capabilities = ["embeddings"]

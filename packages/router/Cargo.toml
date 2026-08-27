@@ -1,0 +1,85 @@
+[workspace]
+members = [
+    "packages/api-models",
+    "packages/brouter",
+    "packages/catalog",
+    "packages/catalog-models",
+    "packages/cli",
+    "packages/config",
+    "packages/config-models",
+    "packages/introspection",
+    "packages/introspection-models",
+    "packages/proxy",
+    "packages/provider",
+    "packages/provider-models",
+    "packages/router",
+    "packages/router-models",
+    "packages/server",
+    "packages/telemetry",
+    "packages/telemetry-models",
+    "packages/telemetry-util",
+]
+resolver = "2"
+
+[profile.release]
+codegen-units = 1
+lto           = false
+opt-level     = 3
+strip         = "symbols"
+
+[workspace.package]
+authors    = ["Braden Steffaniak"]
+edition    = "2024"
+license    = "MPL-2.0"
+repository = "https://github.com/BSteffaniak/brouter"
+version    = "0.1.0"
+
+[workspace.dependencies]
+# Internal brouter packages
+brouter                      = { version = "0.1.0", default-features = false, path = "packages/brouter" }
+brouter_api_models           = { version = "0.1.0", default-features = false, path = "packages/api-models" }
+brouter_catalog              = { version = "0.1.0", default-features = false, path = "packages/catalog" }
+brouter_catalog_models       = { version = "0.1.0", default-features = false, path = "packages/catalog-models" }
+brouter_cli                  = { version = "0.1.0", default-features = false, path = "packages/cli" }
+brouter_config               = { version = "0.1.0", default-features = false, path = "packages/config" }
+brouter_config_models        = { version = "0.1.0", default-features = false, path = "packages/config-models" }
+brouter_introspection        = { version = "0.1.0", default-features = false, path = "packages/introspection" }
+brouter_introspection_models = { version = "0.1.0", default-features = false, path = "packages/introspection-models" }
+brouter_provider             = { version = "0.1.0", default-features = false, path = "packages/provider" }
+brouter_provider_models      = { version = "0.1.0", default-features = false, path = "packages/provider-models" }
+brouter_router               = { version = "0.1.0", default-features = false, path = "packages/router" }
+brouter_router_models        = { version = "0.1.0", default-features = false, path = "packages/router-models" }
+brouter_server               = { version = "0.1.0", default-features = false, path = "packages/server" }
+brouter_telemetry            = { version = "0.1.0", default-features = false, path = "packages/telemetry" }
+brouter_telemetry_models     = { version = "0.1.0", default-features = false, path = "packages/telemetry-models" }
+
+# External dependencies
+anyhow = { version = "1.0.102", default-features = false }
+axum = { version = "0.8.9", default-features = false }
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+bytes = { version = "1.11.1", default-features = false }
+clap = { version = "4.6.1", default-features = false }
+futures-util = { version = "0.3.32", default-features = false }
+http = { version = "1.4.0", default-features = false }
+rand = { version = "0.10.1", default-features = false, features = [
+    "sys_rng",
+    "std",
+] }
+reqwest = { version = "0.13.3", default-features = false }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.149", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
+sshenv_vault = { git = "https://github.com/BSteffaniak/sshenv.git", rev = "87973bb7681c68cb9c787931b0ab402468adb517", default-features = false }
+switchy_database = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "switchy_database", default-features = false }
+switchy_database_connection = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "switchy_database_connection", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
+tokio = { version = "1.52.3", default-features = false }
+tokio-stream = { version = "0.1.18", default-features = false }
+toml = { version = "1.1.2", default-features = false }
+tower = { version = "0.5.3", default-features = false }
+tower-http = { version = "0.6.10", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
+tracing-appender = { version = "0.2.3", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false }
+uuid = { version = "1.23.1", default-features = false }
+zeroize = { version = "1.8.2", default-features = false, features = ["std"] }

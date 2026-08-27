@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["observability", "telemetry"]
+description = "Structured observability utilities for brouter"
+edition     = { workspace = true }
+keywords    = ["observability", "logging", "telemetry", "tracing"]
+license     = { workspace = true }
+name        = "brouter_telemetry_util"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default          = []
+fail-on-warnings = []

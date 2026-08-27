@@ -1,0 +1,31 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Telemetry storage primitives for brouter"
+edition     = { workspace = true }
+keywords    = ["llm", "telemetry", "usage"]
+license     = { workspace = true }
+name        = "brouter_telemetry"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+brouter_provider_models = { workspace = true }
+brouter_telemetry_models = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+switchy_database = { workspace = true, features = ["sqlite-rusqlite"] }
+switchy_database_connection = { workspace = true, features = [
+    "sqlite-rusqlite",
+] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[features]
+default = []
+fail-on-warnings = [
+    "brouter_provider_models/fail-on-warnings",
+    "brouter_telemetry_models/fail-on-warnings",
+]
