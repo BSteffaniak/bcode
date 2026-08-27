@@ -1362,6 +1362,15 @@ pub struct SessionModelStatus {
     pub compaction_backend: Option<String>,
     #[serde(default)]
     pub proactive_compaction_threshold_percent: Option<u8>,
+    /// Configured absolute proactive threshold when model-specific token policy is active.
+    #[serde(default)]
+    pub proactive_compaction_threshold_tokens: Option<u64>,
+    /// Effective proactive threshold after safe-capacity capping.
+    #[serde(default)]
+    pub proactive_compaction_effective_threshold_tokens: Option<u64>,
+    /// Threshold source (`percent` or `tokens`).
+    #[serde(default)]
+    pub proactive_compaction_threshold_source: Option<String>,
     #[serde(default)]
     pub cache: Option<bcode_model::ModelCacheInfo>,
     #[serde(default)]

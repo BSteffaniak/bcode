@@ -159,6 +159,7 @@ pub async fn compact_session_context_with_limit(
     progress_requirement: Option<CompactionProgressRequirement>,
 ) -> Result<CompactionCompletion, CompactionError> {
     let config = state.session_config(session_id).await;
+    let compaction = effective_compaction_config(&config, selection);
     compact_session_context_with_policy(
         state,
         session_id,
@@ -168,7 +169,7 @@ pub async fn compact_session_context_with_limit(
         cancel_state,
         progress_requirement,
         CompactionPlanningPolicy::Proactive {
-            keep_recent_tokens: usize::try_from(config.model.compaction.keep_recent_tokens)
+            keep_recent_tokens: usize::try_from(compaction.keep_recent_tokens)
                 .unwrap_or(usize::MAX),
         },
     )
@@ -415,13 +416,27 @@ pub struct AutomaticCompactionPolicy {
     pub capability_reason: String,
 }
 
+fn effective_compaction_config(
+    config: &bcode_config::BcodeConfig,
+    selection: &SessionModelSelection,
+) -> bcode_config::EffectiveCompactionConfig {
+    config.model.compaction.effective_for(
+        selection.provider_plugin_id.as_deref(),
+        selection.model_id.as_deref(),
+    )
+}
+
 pub async fn automatic_compaction_policy(
     state: &ServerState,
     selection: &SessionModelSelection,
     compaction: &bcode_config::CompactionConfig,
 ) -> AutomaticCompactionPolicy {
+    let effective = compaction.effective_for(
+        selection.provider_plugin_id.as_deref(),
+        selection.model_id.as_deref(),
+    );
     let Some(provider_plugin_id) = selection.provider_plugin_id.as_deref() else {
-        let decision = resolve_compaction_decision(compaction.mode, None);
+        let decision = resolve_compaction_decision(effective.mode, None);
         return AutomaticCompactionPolicy {
             decision,
             capabilities: None,
@@ -465,7 +480,7 @@ pub async fn automatic_compaction_policy(
             format!("context-management capability discovery failed: {error}"),
         ),
     };
-    let decision = resolve_compaction_decision(compaction.mode, capabilities.as_ref());
+    let decision = resolve_compaction_decision(effective.mode, capabilities.as_ref());
     AutomaticCompactionPolicy {
         decision,
         capabilities,
@@ -485,10 +500,8 @@ pub async fn compact_context_with_selected_backend(
         return Err(CompactionError::Cancelled);
     }
     let config = state.session_config(session_id).await;
-    if matches!(
-        config.model.compaction.backend,
-        bcode_config::CompactionBackend::Local
-    ) {
+    let compaction = effective_compaction_config(&config, selection);
+    if matches!(compaction.backend, bcode_config::CompactionBackend::Local) {
         return Ok(None);
     }
     let provider_plugin_id = selection
@@ -508,7 +521,7 @@ pub async fn compact_context_with_selected_backend(
         .is_some_and(|capabilities| capabilities.native_compaction)
         && context_format.is_some();
     if !native_supported {
-        return match config.model.compaction.backend {
+        return match compaction.backend {
             bcode_config::CompactionBackend::ProviderNative => Err(CompactionError::Provider(
                 "active provider surface does not support native context compaction".to_string(),
             )),
@@ -580,7 +593,7 @@ pub async fn compact_context_with_selected_backend(
         )),
         Err(error)
             if matches!(
-                config.model.compaction.backend,
+                compaction.backend,
                 bcode_config::CompactionBackend::Auto
             ) =>
         {
@@ -694,7 +707,7 @@ pub struct CompactionCapacity {
 
 pub fn compaction_capacity_tokens(
     context_window: u32,
-    threshold_percent: u8,
+    threshold: bcode_config::ProactiveCompactionThreshold,
     requested_max_output_tokens: Option<u32>,
     provider_max_output_tokens: Option<u32>,
 ) -> CompactionCapacity {
@@ -712,10 +725,13 @@ pub fn compaction_capacity_tokens(
     let available_input_tokens = u64::from(context_window)
         .saturating_sub(output_reserve_tokens)
         .saturating_sub(safety_margin_tokens);
-    let threshold_tokens = (u64::from(context_window)
-        .saturating_mul(u64::from(threshold_percent.clamp(1, 100)))
-        / 100)
-        .min(available_input_tokens);
+    let threshold_tokens = match threshold {
+        bcode_config::ProactiveCompactionThreshold::Percent(percent) => {
+            u64::from(context_window).saturating_mul(u64::from(percent.clamp(1, 100))) / 100
+        }
+        bcode_config::ProactiveCompactionThreshold::Tokens(tokens) => tokens,
+    }
+    .min(available_input_tokens);
     CompactionCapacity {
         threshold_tokens,
         output_reserve_tokens,
@@ -744,9 +760,10 @@ pub async fn request_exceeds_compaction_capacity(
     let model_status =
         model_status_for_selection(state, selection.clone(), Some(session_id), &config).await;
     let context_window = model_status.context_window?;
+    let compaction = effective_compaction_config(&config, selection);
     let capacity = compaction_capacity_tokens(
         context_window,
-        config.model.compaction.proactive_threshold_percent,
+        compaction.proactive_threshold,
         request.parameters.max_output_tokens,
         model_status.max_output_tokens,
     );
@@ -815,10 +832,11 @@ pub async fn maybe_auto_compact_session_context(
         .await;
         return Ok(None);
     };
-    let threshold_percent = config.model.compaction.proactive_threshold_percent;
+    let compaction = effective_compaction_config(&config, selection);
+    let threshold = compaction.proactive_threshold;
     let capacity = compaction_capacity_tokens(
         context_window_tokens,
-        threshold_percent,
+        threshold,
         evaluation.requested_max_output_tokens,
         model_status.max_output_tokens,
     );
@@ -837,7 +855,7 @@ pub async fn maybe_auto_compact_session_context(
             projected_context_chars,
             false,
             Some(format!(
-                "projected context ~{projected_context_tokens} tokens < threshold {threshold_tokens} tokens ({threshold_percent}% of {context_window_tokens}; output reserve {} from {:?}; safety margin {}; available input {})",
+                "projected context ~{projected_context_tokens} tokens < threshold {threshold_tokens} tokens ({threshold:?} for context window {context_window_tokens}; output reserve {} from {:?}; safety margin {}; available input {})",
                 capacity.output_reserve_tokens,
                 capacity.output_reserve_source,
                 capacity.safety_margin_tokens,
@@ -856,7 +874,7 @@ pub async fn maybe_auto_compact_session_context(
         projected_context_chars,
         false,
         Some(format!(
-            "projected context ~{projected_context_tokens} tokens >= threshold {threshold_tokens} tokens ({threshold_percent}% of {context_window_tokens}; output reserve {} from {:?}; safety margin {}; available input {})",
+            "projected context ~{projected_context_tokens} tokens >= threshold {threshold_tokens} tokens ({threshold:?} for context window {context_window_tokens}; output reserve {} from {:?}; safety margin {}; available input {})",
             capacity.output_reserve_tokens,
             capacity.output_reserve_source,
             capacity.safety_margin_tokens,

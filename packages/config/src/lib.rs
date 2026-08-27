@@ -3606,6 +3606,10 @@ pub struct CompactionConfig {
     /// Approximate recent context tokens retained verbatim after local compaction.
     #[serde(default = "default_compaction_keep_recent_tokens")]
     pub keep_recent_tokens: u32,
+    /// Model-specific compaction policy overrides keyed by effective model id.
+    #[config_doc(nested, map_key = "<model-id>")]
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelCompactionOverrideConfig>,
     /// Legacy projected-character threshold. Retained only for configuration compatibility.
     #[serde(default)]
     pub context_chars: usize,
@@ -3618,7 +3622,88 @@ impl Default for CompactionConfig {
             backend: CompactionBackend::Auto,
             proactive_threshold_percent: default_proactive_compaction_threshold_percent(),
             keep_recent_tokens: default_compaction_keep_recent_tokens(),
+            models: BTreeMap::new(),
             context_chars: 0,
+        }
+    }
+}
+
+/// Model-specific automatic context compaction overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "model_compaction_override")]
+pub struct ModelCompactionOverrideConfig {
+    /// Provider plugin id required for this override to match.
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    /// Model-specific automatic compaction trigger policy.
+    #[serde(default)]
+    pub mode: Option<CompactionMode>,
+    /// Model-specific compaction implementation preference.
+    #[serde(default)]
+    pub backend: Option<CompactionBackend>,
+    /// Absolute candidate input-token count that triggers proactive compaction.
+    #[serde(default)]
+    pub proactive_threshold_tokens: Option<u64>,
+    /// Model-specific percentage threshold used when no absolute threshold is configured.
+    #[serde(default)]
+    pub proactive_threshold_percent: Option<u8>,
+    /// Model-specific recent context tokens retained after local compaction.
+    #[serde(default)]
+    pub keep_recent_tokens: Option<u32>,
+}
+
+/// Effective proactive compaction threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProactiveCompactionThreshold {
+    /// Percentage of the selected model's context window.
+    Percent(u8),
+    /// Absolute candidate input-token count.
+    Tokens(u64),
+}
+
+/// Effective compaction policy after model-specific overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveCompactionConfig {
+    pub mode: CompactionMode,
+    pub backend: CompactionBackend,
+    pub proactive_threshold: ProactiveCompactionThreshold,
+    pub keep_recent_tokens: u32,
+}
+
+impl CompactionConfig {
+    /// Resolve compaction policy for an effective provider and model selection.
+    #[must_use]
+    pub fn effective_for(
+        &self,
+        provider_plugin_id: Option<&str>,
+        model_id: Option<&str>,
+    ) -> EffectiveCompactionConfig {
+        let matched = model_id
+            .and_then(|model_id| self.models.get(model_id))
+            .filter(|policy| {
+                policy.provider_plugin_id.as_deref().is_none()
+                    || policy.provider_plugin_id.as_deref() == provider_plugin_id
+            });
+        EffectiveCompactionConfig {
+            mode: matched.and_then(|policy| policy.mode).unwrap_or(self.mode),
+            backend: matched
+                .and_then(|policy| policy.backend)
+                .unwrap_or(self.backend),
+            proactive_threshold: matched
+                .and_then(|policy| policy.proactive_threshold_tokens)
+                .map_or_else(
+                    || {
+                        ProactiveCompactionThreshold::Percent(
+                            matched
+                                .and_then(|policy| policy.proactive_threshold_percent)
+                                .unwrap_or(self.proactive_threshold_percent),
+                        )
+                    },
+                    ProactiveCompactionThreshold::Tokens,
+                ),
+            keep_recent_tokens: matched
+                .and_then(|policy| policy.keep_recent_tokens)
+                .unwrap_or(self.keep_recent_tokens),
         }
     }
 }
@@ -4063,6 +4148,40 @@ fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Composition {
             message: "client.request_timeout_secs must be greater than zero".to_owned(),
         });
+    }
+    if config.model.compaction.proactive_threshold_percent == 0
+        || config.model.compaction.proactive_threshold_percent > 100
+    {
+        return Err(ConfigError::Composition {
+            message: "model.compaction.proactive_threshold_percent must be between 1 and 100"
+                .to_owned(),
+        });
+    }
+    for (model_id, policy) in &config.model.compaction.models {
+        if policy
+            .proactive_threshold_percent
+            .is_some_and(|value| value == 0 || value > 100)
+        {
+            return Err(ConfigError::Composition {
+                message: format!(
+                    "model.compaction.models.{model_id}.proactive_threshold_percent must be between 1 and 100"
+                ),
+            });
+        }
+        if policy.proactive_threshold_tokens == Some(0) {
+            return Err(ConfigError::Composition {
+                message: format!(
+                    "model.compaction.models.{model_id}.proactive_threshold_tokens must be greater than zero"
+                ),
+            });
+        }
+        if policy.keep_recent_tokens == Some(0) {
+            return Err(ConfigError::Composition {
+                message: format!(
+                    "model.compaction.models.{model_id}.keep_recent_tokens must be greater than zero"
+                ),
+            });
+        }
     }
     let mut visual_adapters = BTreeSet::new();
     for adapter in config
@@ -6280,6 +6399,43 @@ fn write_model_compaction_toml(output: &mut String, compaction: &CompactionConfi
             .expect("writing to string should not fail");
     }
     output.push('\n');
+    for (model_id, policy) in &compaction.models {
+        writeln!(output, "[model.compaction.models.{}]", toml_key(model_id))
+            .expect("writing to string should not fail");
+        if let Some(provider_plugin_id) = &policy.provider_plugin_id {
+            writeln!(
+                output,
+                "provider_plugin_id = {}",
+                toml_string(provider_plugin_id)
+            )
+            .expect("writing to string should not fail");
+        }
+        if let Some(mode) = policy.mode {
+            writeln!(output, "mode = {}", toml_string(compaction_mode_name(mode)))
+                .expect("writing to string should not fail");
+        }
+        if let Some(backend) = policy.backend {
+            writeln!(
+                output,
+                "backend = {}",
+                toml_string(compaction_backend_name(backend))
+            )
+            .expect("writing to string should not fail");
+        }
+        if let Some(tokens) = policy.proactive_threshold_tokens {
+            writeln!(output, "proactive_threshold_tokens = {tokens}")
+                .expect("writing to string should not fail");
+        }
+        if let Some(percent) = policy.proactive_threshold_percent {
+            writeln!(output, "proactive_threshold_percent = {percent}")
+                .expect("writing to string should not fail");
+        }
+        if let Some(tokens) = policy.keep_recent_tokens {
+            writeln!(output, "keep_recent_tokens = {tokens}")
+                .expect("writing to string should not fail");
+        }
+        output.push('\n');
+    }
 }
 
 fn write_model_tool_output_toml(output: &mut String, tool_output: &ToolOutputConfig) {
@@ -8010,11 +8166,12 @@ mod tests {
         AuthConfig, AuthPoolConfig, BCODE_CONFIG_ENV, BcodeConfig, CompactionBackend,
         CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot, ConfigError,
         ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
-        InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, PromptProfileLayerConfig,
-        PromptProfileTextMode, RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions,
-        ToolDescriptionOverrideConfig, TuiAccentTransitionCurve, TuiAgentAccentPolicy,
-        TuiInteractionOffscreenFocus, TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig,
-        TuiThemeVariant, TuiVisualAdapterConfig, clear_tui_streaming_presentation_override,
+        InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc,
+        ProactiveCompactionThreshold, PromptProfileLayerConfig, PromptProfileTextMode,
+        RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions, ToolDescriptionOverrideConfig,
+        TuiAccentTransitionCurve, TuiAgentAccentPolicy, TuiInteractionOffscreenFocus,
+        TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig, TuiThemeVariant,
+        TuiVisualAdapterConfig, clear_tui_streaming_presentation_override,
         clear_tui_theme_selection, default_config_paths_from, default_permissions_state_path,
         load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, load_tui_streaming_presentation_override_from,
@@ -10536,6 +10693,59 @@ max_tool_rounds = 3
         assert_eq!(config.model.compaction.proactive_threshold_percent, 90);
         assert_eq!(config.model.compaction.keep_recent_tokens, 20_000);
         assert_eq!(config.model.compaction.context_chars, 0);
+    }
+
+    #[test]
+    fn resolves_model_specific_compaction_policy() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model.compaction]
+mode = "proactive"
+proactive_threshold_percent = 90
+
+[model.compaction.models."gpt-5.6-sol"]
+provider_plugin_id = "bcode.amazon-bedrock"
+mode = "proactive_and_overflow"
+proactive_threshold_tokens = 272000
+keep_recent_tokens = 16000
+"#,
+        )
+        .expect("config should parse");
+
+        let matched = config
+            .model
+            .compaction
+            .effective_for(Some("bcode.amazon-bedrock"), Some("gpt-5.6-sol"));
+        assert_eq!(matched.mode, CompactionMode::ProactiveAndOverflow);
+        assert_eq!(
+            matched.proactive_threshold,
+            ProactiveCompactionThreshold::Tokens(272_000)
+        );
+        assert_eq!(matched.keep_recent_tokens, 16_000);
+
+        let provider_mismatch = config
+            .model
+            .compaction
+            .effective_for(Some("other-provider"), Some("gpt-5.6-sol"));
+        assert_eq!(provider_mismatch.mode, CompactionMode::Proactive);
+        assert_eq!(
+            provider_mismatch.proactive_threshold,
+            ProactiveCompactionThreshold::Percent(90)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_model_compaction_threshold() {
+        let value: toml::Value = toml::from_str(
+            r"
+[model.compaction.models.test]
+proactive_threshold_tokens = 0
+",
+        )
+        .expect("TOML should parse");
+        let error = super::validate_config_value(value, "test config")
+            .expect_err("zero threshold should be rejected");
+        assert!(error.to_string().contains("must be greater than zero"));
     }
 
     #[test]

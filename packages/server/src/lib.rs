@@ -13137,6 +13137,28 @@ async fn model_status_for_selection(
         .await
         .and_then(|capabilities| capabilities.context_format)
         .filter(|format| format.version > 0 && !format.compatibility_key.trim().is_empty());
+    let effective_compaction = config
+        .model
+        .compaction
+        .effective_for(selection.provider_plugin_id.as_deref(), model_id.as_deref());
+    let (threshold_percent, threshold_tokens, threshold_source) =
+        match effective_compaction.proactive_threshold {
+            bcode_config::ProactiveCompactionThreshold::Percent(percent) => {
+                (Some(percent), None, "percent")
+            }
+            bcode_config::ProactiveCompactionThreshold::Tokens(tokens) => {
+                (None, Some(tokens), "tokens")
+            }
+        };
+    let effective_threshold_tokens = context_window.map(|window| {
+        compaction_capacity_tokens(
+            window,
+            effective_compaction.proactive_threshold,
+            None,
+            max_output_tokens,
+        )
+        .threshold_tokens
+    });
     bcode_ipc::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
         requested_model_id: selection.requested_model_id.clone(),
@@ -13159,13 +13181,12 @@ async fn model_status_for_selection(
             conversation_reuse_mode_name(config.model.effective_conversation_reuse_mode())
                 .to_string(),
         ),
-        compaction_mode: Some(compaction_mode_name(config.model.compaction.mode).to_string()),
-        compaction_backend: Some(
-            compaction_backend_name(config.model.compaction.backend).to_string(),
-        ),
-        proactive_compaction_threshold_percent: Some(
-            config.model.compaction.proactive_threshold_percent,
-        ),
+        compaction_mode: Some(compaction_mode_name(effective_compaction.mode).to_string()),
+        compaction_backend: Some(compaction_backend_name(effective_compaction.backend).to_string()),
+        proactive_compaction_threshold_percent: threshold_percent,
+        proactive_compaction_threshold_tokens: threshold_tokens,
+        proactive_compaction_effective_threshold_tokens: effective_threshold_tokens,
+        proactive_compaction_threshold_source: Some(threshold_source.to_string()),
         cache: cache_info,
         metadata_source,
         pricing: model.as_ref().and_then(|model| model.pricing.clone()),
@@ -19926,7 +19947,7 @@ const fn plugin_scope_kind(scope: &PluginInvocationScope) -> &'static str {
 fn provider_managed_context_request(
     decision: CompactionDecision,
     context_window: Option<u32>,
-    proactive_threshold_percent: u8,
+    proactive_threshold: bcode_config::ProactiveCompactionThreshold,
     requested_max_output_tokens: Option<u32>,
     provider_max_output_tokens: Option<u32>,
 ) -> bcode_model::ContextManagementRequest {
@@ -19937,7 +19958,7 @@ fn provider_managed_context_request(
         compact_threshold: context_window.map(|window| {
             compaction_capacity_tokens(
                 window,
-                proactive_threshold_percent,
+                proactive_threshold,
                 requested_max_output_tokens,
                 provider_max_output_tokens,
             )
@@ -20467,7 +20488,14 @@ async fn build_model_turn_request(
         provider_managed_context_request(
             compaction_policy.decision,
             status.context_window,
-            config.model.compaction.proactive_threshold_percent,
+            config
+                .model
+                .compaction
+                .effective_for(
+                    selection.provider_plugin_id.as_deref(),
+                    selection.model_id.as_deref(),
+                )
+                .proactive_threshold,
             parameters.max_output_tokens,
             status.max_output_tokens,
         )
@@ -38016,7 +38044,12 @@ library = "test"
 
     #[test]
     fn proactive_policy_uses_complete_candidate_estimate_at_capacity_threshold() {
-        let capacity = compaction_capacity_tokens(10_000, 90, Some(1_000), Some(4_000));
+        let capacity = compaction_capacity_tokens(
+            10_000,
+            bcode_config::ProactiveCompactionThreshold::Percent(90),
+            Some(1_000),
+            Some(4_000),
+        );
         assert!(!candidate_requires_proactive_compaction(
             capacity.threshold_tokens.saturating_sub(1),
             capacity
@@ -38032,9 +38065,32 @@ library = "test"
     }
 
     #[test]
+    fn absolute_compaction_threshold_is_capped_by_safe_capacity() {
+        let capacity = compaction_capacity_tokens(
+            300_000,
+            bcode_config::ProactiveCompactionThreshold::Tokens(272_000),
+            Some(40_000),
+            Some(50_000),
+        );
+
+        assert_eq!(capacity.available_input_tokens, 254_000);
+        assert_eq!(capacity.threshold_tokens, 254_000);
+    }
+
+    #[test]
     fn output_reserve_can_make_an_otherwise_fitting_request_oversized() {
-        let without_reserve = compaction_capacity_tokens(10_000, 100, Some(0), Some(8_000));
-        let with_reserve = compaction_capacity_tokens(10_000, 100, Some(4_000), Some(8_000));
+        let without_reserve = compaction_capacity_tokens(
+            10_000,
+            bcode_config::ProactiveCompactionThreshold::Percent(100),
+            Some(0),
+            Some(8_000),
+        );
+        let with_reserve = compaction_capacity_tokens(
+            10_000,
+            bcode_config::ProactiveCompactionThreshold::Percent(100),
+            Some(4_000),
+            Some(8_000),
+        );
 
         assert!(7_000 <= without_reserve.available_input_tokens);
         assert!(7_000 > with_reserve.available_input_tokens);
@@ -38227,12 +38283,24 @@ library = "test"
         };
 
         assert_eq!(
-            provider_managed_context_request(managed, Some(128_000), 90, None, Some(100_000))
-                .compact_threshold,
+            provider_managed_context_request(
+                managed,
+                Some(128_000),
+                bcode_config::ProactiveCompactionThreshold::Percent(90),
+                None,
+                Some(100_000)
+            )
+            .compact_threshold,
             Some(109_440)
         );
         assert_eq!(
-            provider_managed_context_request(overflow_only, Some(128_000), 90, None, Some(100_000),),
+            provider_managed_context_request(
+                overflow_only,
+                Some(128_000),
+                bcode_config::ProactiveCompactionThreshold::Percent(90),
+                None,
+                Some(100_000),
+            ),
             bcode_model::ContextManagementRequest::default()
         );
     }
@@ -38252,7 +38320,12 @@ library = "test"
             100_000
         );
         assert_eq!(
-            compaction_capacity_tokens(128_000, 90, None, Some(100_000)),
+            compaction_capacity_tokens(
+                128_000,
+                bcode_config::ProactiveCompactionThreshold::Percent(90),
+                None,
+                Some(100_000)
+            ),
             CompactionCapacity {
                 threshold_tokens: 109_440,
                 output_reserve_tokens: 16_000,
@@ -38262,7 +38335,14 @@ library = "test"
             }
         );
         assert!(
-            31_000 < compaction_capacity_tokens(128_000, 90, None, Some(100_000)).threshold_tokens
+            31_000
+                < compaction_capacity_tokens(
+                    128_000,
+                    bcode_config::ProactiveCompactionThreshold::Percent(90),
+                    None,
+                    Some(100_000)
+                )
+                .threshold_tokens
         );
     }
 
