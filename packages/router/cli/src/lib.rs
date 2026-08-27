@@ -38,7 +38,7 @@ use brouter_router_models::{
 use brouter_telemetry::TelemetryStore;
 use brouter_telemetry_models::{RoutingEvent, RoutingEventKind, SessionSummary};
 use clap::{Parser, Subcommand};
-use rand::TryRng as _;
+use rand::TryRngCore as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, info, warn as tracing_warn};
@@ -654,7 +654,7 @@ fn print_provider_attempt_event(event: &RoutingEvent) {
 }
 
 fn print_example_config() {
-    print!("{}", include_str!("../../../brouter.example.toml"));
+    print!("{}", include_str!("../../brouter.example.toml"));
 }
 
 async fn auth(command: AuthCommand) -> Result<()> {
@@ -1201,14 +1201,14 @@ fn oauth_callback_url_from_text(input: &str) -> Option<&str> {
 
 fn random_urlsafe(bytes: usize) -> Result<String> {
     let mut data = vec![0_u8; bytes];
-    rand::rngs::SysRng.try_fill_bytes(&mut data)?;
+    rand::rngs::OsRng.try_fill_bytes(&mut data)?;
     Ok(URL_SAFE_NO_PAD.encode(data))
 }
 
 fn random_pkce_verifier(length: usize) -> Result<String> {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     let mut data = vec![0_u8; length];
-    rand::rngs::SysRng.try_fill_bytes(&mut data)?;
+    rand::rngs::OsRng.try_fill_bytes(&mut data)?;
     Ok(data
         .into_iter()
         .map(|byte| char::from(CHARS[usize::from(byte) % CHARS.len()]))

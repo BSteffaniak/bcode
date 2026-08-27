@@ -15,7 +15,7 @@ anyhow = { workspace = true, features = ["std"] }
 axum = { workspace = true, features = ["tokio", "http1", "http2"] }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 http = { workspace = true }
-reqwest = { workspace = true, features = ["rustls", "stream"] }
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 tokio = { workspace = true, features = ["full", "process", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = [

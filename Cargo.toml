@@ -103,6 +103,23 @@ members = [
     "packages/workflow-view/models",
     "packages/worktree",
     "packages/worktree/models",
+    "packages/router/api/models",
+    "packages/router/catalog",
+    "packages/router/catalog/models",
+    "packages/router/cli",
+    "packages/router/config",
+    "packages/router/config/models",
+    "packages/router/introspection",
+    "packages/router/introspection/models",
+    "packages/router",
+    "packages/router/models",
+    "packages/router/provider",
+    "packages/router/provider/models",
+    "packages/router/proxy",
+    "packages/router/server",
+    "packages/router/telemetry",
+    "packages/router/telemetry/models",
+    "packages/router/telemetry-util",
     "plugins/worktree-plugin",
     "packages/session/models",
 ]
@@ -117,6 +134,24 @@ repository = "https://github.com/BSteffaniak/bcode"
 version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
+# Internal brouter packages
+brouter_api_models           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/api/models" }
+brouter_catalog              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/catalog" }
+brouter_catalog_models       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/catalog/models" }
+brouter_cli                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/cli" }
+brouter_config               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/config" }
+brouter_config_models        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/config/models" }
+brouter_introspection        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/introspection" }
+brouter_introspection_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/introspection/models" }
+brouter_provider             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/provider" }
+brouter_provider_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/provider/models" }
+brouter_router               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router" }
+brouter_router_models        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/models" }
+brouter_server               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/server" }
+brouter_telemetry            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/telemetry" }
+brouter_telemetry_models     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/telemetry/models" }
+brouter_telemetry_util       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/router/telemetry-util" }
+
 # Internal bcode packages
 bcode_agent_permissions                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-permissions" }
 bcode_agent_policy                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/agent-policy" }
@@ -245,6 +280,8 @@ arboard = { version = "3.6.1", default-features = false, features = [
     "image-data",
 ] }
 async-trait = { version = "0.1.89", default-features = false }
+anyhow = { version = "1.0.102", default-features = false }
+axum = { version = "0.8.9", default-features = false }
 aws-config = { version = "1.8.16", default-features = false, features = [
     "credentials-process",
     "rt-tokio",
@@ -265,12 +302,14 @@ aws-smithy-runtime-api = { version = "1.14.0", default-features = false, feature
 ] }
 aws-smithy-types = { version = "1.4.7", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+bytes = { version = "1.11.1", default-features = false }
 brush-parser = { version = "0.4.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = [
     "clock",
     "std",
 ] }
 clap = { version = "4.5.40", default-features = false }
+futures-util = { version = "0.3.32", default-features = false }
 cmake = { version = "0.1.54", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 devicons = { version = "0.6.12", default-features = false }
@@ -278,6 +317,7 @@ futures = { version = "0.3.32", default-features = false, features = ["std"] }
 git2 = { version = "0.20.3", default-features = false }
 globset = { version = "0.4.18", default-features = false }
 httpdate = { version = "1.0.3", default-features = false }
+http = { version = "1.4.0", default-features = false }
 hyperchad = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_color = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_docs_config = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
@@ -383,6 +423,7 @@ tempfile = { version = "3.27.0", default-features = false }
 test-log = { version = "0.2.20", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
+tokio-stream = { version = "0.1.18", default-features = false }
 toml = { version = "1.1.2", default-features = false, features = [
     "parse",
     "serde",
@@ -393,6 +434,9 @@ toml_edit = { version = "0.23.7", default-features = false, features = [
     "serde",
 ] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tower = { version = "0.5.3", default-features = false }
+tower-http = { version = "0.6.10", default-features = false }
+tracing-appender = { version = "0.2.3", default-features = false }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "ansi",

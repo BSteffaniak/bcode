@@ -303,4 +303,4 @@ capabilities = ["chat", "code", "json", "tools", "reasoning"]
 
 ## Built-in fallback catalog
 
-When provider APIs do not expose context/pricing/capabilities and the user has not provided metadata, brouter can use an isolated curated fallback catalog in `packages/catalog/data`. This catalog is a last-resort source; route explanations include field provenance so users can see when fallback data was used.
+When provider APIs do not expose context/pricing/capabilities and the user has not provided metadata, brouter can use an isolated curated fallback catalog in `packages/router/catalog/data`. This catalog is a last-resort source; route explanations include field provenance so users can see when fallback data was used.

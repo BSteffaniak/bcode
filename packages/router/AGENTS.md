@@ -4,7 +4,7 @@ Guidance for AI coding agents working on this repository.
 
 ## Project Structure
 
-Rust workspace with crates under `packages/`. Domain data shared across crates
+Rust crates for the routing domain live under this directory. Domain data shared across crates
 belongs in sibling `*-models` crates. Model crates contain only serde-friendly
 wire/config types, type aliases, conversions, and small parsing helpers. Runtime
 logic belongs in the matching implementation crate.

@@ -1218,6 +1218,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core",
+ "bytes 1.12.1",
+ "form_urlencoded",
+ "futures-util",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "hyper 1.11.0",
+ "hyper-util",
+ "itoa",
+ "matchit",
+ "memchr",
+ "mime 0.3.17",
+ "percent-encoding 2.3.2",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes 1.12.1",
+ "futures-core",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "mime 0.3.17",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3458,6 +3508,233 @@ checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
+]
+
+[[package]]
+name = "brouter_api_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "brouter_catalog"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_catalog_models",
+ "brouter_config_models",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
+name = "brouter_catalog_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "brouter_cli"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "brouter_api_models",
+ "brouter_catalog_models",
+ "brouter_config",
+ "brouter_config_models",
+ "brouter_provider",
+ "brouter_provider_models",
+ "brouter_router",
+ "brouter_router_models",
+ "brouter_server",
+ "brouter_telemetry",
+ "brouter_telemetry_models",
+ "clap",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sshenv_vault",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "brouter_config"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_catalog",
+ "brouter_catalog_models",
+ "brouter_config_models",
+ "brouter_introspection_models",
+ "brouter_provider_models",
+ "brouter_router_models",
+ "serde_json",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
+name = "brouter_config_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "brouter_introspection"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_catalog_models",
+ "brouter_introspection_models",
+ "brouter_provider_models",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "brouter_introspection_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_catalog_models",
+ "brouter_provider_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "brouter_provider"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "brouter_api_models",
+ "brouter_catalog_models",
+ "brouter_config_models",
+ "brouter_introspection_models",
+ "brouter_provider_models",
+ "bytes 1.12.1",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sshenv_vault",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "brouter_provider_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_catalog_models",
+ "serde",
+]
+
+[[package]]
+name = "brouter_proxy"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "http 1.5.0",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "brouter_router"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_api_models",
+ "brouter_catalog_models",
+ "brouter_introspection_models",
+ "brouter_provider_models",
+ "brouter_router_models",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "brouter_router_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_catalog_models",
+ "brouter_introspection_models",
+ "brouter_provider_models",
+ "serde",
+]
+
+[[package]]
+name = "brouter_server"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "axum",
+ "brouter_api_models",
+ "brouter_catalog_models",
+ "brouter_config",
+ "brouter_config_models",
+ "brouter_introspection",
+ "brouter_introspection_models",
+ "brouter_provider",
+ "brouter_provider_models",
+ "brouter_router",
+ "brouter_router_models",
+ "brouter_telemetry",
+ "brouter_telemetry_models",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "brouter_telemetry"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_provider_models",
+ "brouter_telemetry_models",
+ "serde_json",
+ "switchy_database",
+ "switchy_database_connection",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "brouter_telemetry_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "brouter_provider_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "brouter_telemetry_util"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -5731,6 +6008,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -7196,6 +7474,12 @@ name = "matches"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2532096657941c2fea9c289d370a250971c689d4f143798ff67113ec042024a5"
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maud"

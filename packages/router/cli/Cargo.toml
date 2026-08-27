@@ -34,7 +34,7 @@ brouter_telemetry = { workspace = true }
 brouter_telemetry_models = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
