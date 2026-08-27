@@ -1630,6 +1630,8 @@ where
     controller: C,
     snapshot: C::Snapshot,
     renderer: R,
+    preferred_height: Option<(u16, u16)>,
+    focused_rows: Option<(u16, Option<std::ops::Range<u16>>)>,
 }
 
 impl<C, R> TypedTerminalInteractionSurface<C, R>
@@ -1643,13 +1645,21 @@ where
             controller,
             snapshot,
             renderer,
+            preferred_height: None,
+            focused_rows: None,
         }
+    }
+
+    const fn invalidate_measurement(&mut self) {
+        self.preferred_height = None;
+        self.focused_rows = None;
     }
 
     fn apply_input(&mut self, input: InteractionInput) -> PluginTuiAction {
         let output = self.controller.handle_input(input);
         if !matches!(output, InteractionOutput::None) {
             self.snapshot = self.controller.snapshot();
+            self.invalidate_measurement();
         }
         plugin_tui_action_from_interaction_output(output)
     }
@@ -1669,7 +1679,14 @@ where
     }
 
     fn preferred_height(&mut self, width: u16) -> u16 {
-        self.renderer.preferred_height(&self.snapshot, width)
+        if let Some((cached_width, height)) = self.preferred_height
+            && cached_width == width
+        {
+            return height;
+        }
+        let height = self.renderer.preferred_height(&self.snapshot, width);
+        self.preferred_height = Some((width, height));
+        height
     }
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
@@ -1693,7 +1710,14 @@ where
     }
 
     fn focused_row_range(&mut self, width: u16) -> Option<std::ops::Range<u16>> {
-        self.renderer.focused_row_range(&self.snapshot, width)
+        if let Some((cached_width, rows)) = &self.focused_rows
+            && *cached_width == width
+        {
+            return rows.clone();
+        }
+        let rows = self.renderer.focused_row_range(&self.snapshot, width);
+        self.focused_rows = Some((width, rows.clone()));
+        rows
     }
 
     fn render_with_theme(
@@ -1709,7 +1733,10 @@ where
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         match self.renderer.input(event, &self.snapshot, host) {
             TerminalInteractionInput::Ignored => PluginTuiAction::None,
-            TerminalInteractionInput::Consumed => PluginTuiAction::Redraw,
+            TerminalInteractionInput::Consumed => {
+                self.invalidate_measurement();
+                PluginTuiAction::Redraw
+            }
             TerminalInteractionInput::Semantic(input) => self.apply_input(input),
         }
     }
@@ -1722,6 +1749,8 @@ mod typed_interaction_surface_tests {
     use super::*;
 
     static SNAPSHOTS: AtomicUsize = AtomicUsize::new(0);
+    static HEIGHTS: AtomicUsize = AtomicUsize::new(0);
+    static FOCUSED_ROWS: AtomicUsize = AtomicUsize::new(0);
 
     struct CountingController {
         value: usize,
@@ -1763,7 +1792,18 @@ mod typed_interaction_surface_tests {
         }
 
         fn preferred_height(&mut self, snapshot: &usize, _width: u16) -> u16 {
+            HEIGHTS.fetch_add(1, Ordering::Relaxed);
             u16::try_from(snapshot.saturating_add(1)).unwrap_or(u16::MAX)
+        }
+
+        fn focused_row_range(
+            &mut self,
+            snapshot: &usize,
+            _width: u16,
+        ) -> Option<std::ops::Range<u16>> {
+            FOCUSED_ROWS.fetch_add(1, Ordering::Relaxed);
+            let row = u16::try_from(*snapshot).unwrap_or(u16::MAX);
+            Some(row..row.saturating_add(1))
         }
 
         fn render(&mut self, snapshot: &usize, area: Rect, frame: &mut Frame<'_>) {
@@ -1772,13 +1812,17 @@ mod typed_interaction_surface_tests {
 
         fn input(
             &mut self,
-            _event: &Event,
+            event: &Event,
             _snapshot: &usize,
             _host: &dyn PluginTuiHost,
         ) -> TerminalInteractionInput {
-            TerminalInteractionInput::Semantic(InteractionInput::Navigate {
-                direction: bcode_tool::InteractionNavigation::Next,
-            })
+            if matches!(event, Event::Tick) {
+                TerminalInteractionInput::Consumed
+            } else {
+                TerminalInteractionInput::Semantic(InteractionInput::Navigate {
+                    direction: bcode_tool::InteractionNavigation::Next,
+                })
+            }
         }
     }
 
@@ -1796,15 +1840,38 @@ mod typed_interaction_surface_tests {
     #[test]
     fn typed_surface_reuses_one_snapshot_until_semantic_state_changes() {
         SNAPSHOTS.store(0, Ordering::Relaxed);
+        HEIGHTS.store(0, Ordering::Relaxed);
+        FOCUSED_ROWS.store(0, Ordering::Relaxed);
         let mut surface =
             TypedTerminalInteractionSurface::new(CountingController::new(()), CountingRenderer);
         assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 1);
         assert_eq!(surface.preferred_height(80), 1);
-        assert_eq!(surface.focused_row_range(80), None);
+        assert_eq!(surface.preferred_height(80), 1);
+        assert_eq!(HEIGHTS.load(Ordering::Relaxed), 1);
+        assert_eq!(surface.focused_row_range(80), Some(0..1));
+        assert_eq!(surface.focused_row_range(80), Some(0..1));
+        assert_eq!(FOCUSED_ROWS.load(Ordering::Relaxed), 1);
         let area = Rect::new(0, 0, 10, 1);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
         surface.render(area, &mut Frame::new(&mut buffer));
         assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            surface.handle_event(
+                &Event::Key(KeyStroke {
+                    key: bmux_keyboard::KeyCode::Down,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                }),
+                &TestHost,
+            ),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 2);
+        assert_eq!(surface.preferred_height(80), 2);
+        assert_eq!(HEIGHTS.load(Ordering::Relaxed), 2);
+        assert_eq!(surface.focused_row_range(80), Some(1..2));
+        assert_eq!(FOCUSED_ROWS.load(Ordering::Relaxed), 2);
+        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 2);
 
         assert_eq!(
             surface.handle_event(&Event::Tick, &TestHost),
@@ -1812,7 +1879,9 @@ mod typed_interaction_surface_tests {
         );
         assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 2);
         assert_eq!(surface.preferred_height(80), 2);
-        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 2);
+        assert_eq!(HEIGHTS.load(Ordering::Relaxed), 3);
+        assert_eq!(surface.focused_row_range(80), Some(1..2));
+        assert_eq!(FOCUSED_ROWS.load(Ordering::Relaxed), 3);
     }
 }
 

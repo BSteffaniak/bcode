@@ -2326,10 +2326,12 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                             self.invalidation = self
                                 .invalidation
                                 .merge(super::invalidation::UiInvalidation::Paint);
-                            self.presentation_damage = self
+                            let geometry = self
                                 .loop_state
                                 .active_interactive_surface_geometry()
-                                .map_or(bmux_tui::damage::Damage::Full, |geometry| {
+                                .filter(|geometry| !geometry.destination.is_empty());
+                            self.presentation_damage =
+                                geometry.map_or(bmux_tui::damage::Damage::Full, |geometry| {
                                     bmux_tui::damage::Damage::regions(
                                         [geometry.destination],
                                         self.committed_area,
@@ -2339,7 +2341,10 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                         },
                                     )
                                 });
-                            self.fast_temporal_presentation = true;
+                            self.fast_temporal_presentation = geometry.is_some()
+                                && self.committed_layout.is_some()
+                                && !self.presentation_damage.is_full()
+                                && !self.presentation_damage.is_none();
                             return Ok(bmux_tui_runtime::Update::redraw());
                         }
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Relayout => {
@@ -4990,7 +4995,10 @@ mod tests {
         }
 
         fn model() -> super::BcodeRuntimeModel {
-            let chat = root_test_chat();
+            let mut chat = root_test_chat();
+            let mut config = chat.app.tui_config().clone();
+            config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+            chat.app.apply_tui_config(config);
             let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
                 std::path::PathBuf::from("."),
                 &[],
@@ -5060,6 +5068,69 @@ mod tests {
         );
         assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
         assert_eq!(partial_terminal.hits(), full_terminal.hits());
+    }
+
+    #[tokio::test]
+    async fn stable_interaction_redraw_falls_back_without_committed_geometry() {
+        struct RedrawSurface;
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for RedrawSurface {
+            fn id(&self) -> &'static str {
+                "redraw-test"
+            }
+
+            fn title(&self) -> &'static str {
+                "Redraw test"
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::frame::Frame<'_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                _event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+        }
+
+        let chat = root_test_chat();
+        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+            std::path::PathBuf::from("."),
+            &[],
+        );
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+        let mut loop_state =
+            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+        loop_state.install_interactive_surface_for_test(
+            super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                "redraw-interaction",
+                Box::new(RedrawSurface),
+                settings.keymap(),
+            ),
+        );
+        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Down,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            )),
+        )
+        .expect("redraw without committed geometry");
+
+        assert!(model.presentation_damage.is_full());
+        assert!(!model.fast_temporal_presentation);
     }
 
     #[tokio::test]

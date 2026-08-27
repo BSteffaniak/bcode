@@ -118,27 +118,25 @@ impl QuestionInteractionController {
         }
     }
 
-    fn focus_targets(&self) -> Vec<QuestionFocusTarget> {
-        focus_targets(&self.request)
-    }
-
     fn navigate(&mut self, direction: InteractionNavigation) {
-        let targets = self.focus_targets();
-        let index = targets
-            .iter()
-            .position(|target| *target == self.focus)
-            .unwrap_or(0);
-        self.focus = match direction {
-            InteractionNavigation::Next => targets[(index + 1) % targets.len()],
-            InteractionNavigation::Previous => targets[(index + targets.len() - 1) % targets.len()],
+        let count = focus_target_count(&self.request);
+        if count == 0 {
+            self.focus = QuestionFocusTarget::Submit;
+            return;
+        }
+        let index = focus_target_index(&self.request, self.focus).unwrap_or(0);
+        let next = match direction {
+            InteractionNavigation::Next => (index + 1) % count,
+            InteractionNavigation::Previous => (index + count - 1) % count,
         };
+        self.focus = focus_target_at(&self.request, next).unwrap_or(QuestionFocusTarget::Submit);
     }
 
     fn focus_control(&mut self, control_id: &InteractionControlId) -> InteractionOutput {
         let Some(target) = parse_focus_target(control_id.as_str()) else {
             return InteractionOutput::None;
         };
-        if !self.focus_targets().contains(&target) {
+        if focus_target_index(&self.request, target).is_none() {
             return InteractionOutput::None;
         }
         self.focus = target;
@@ -153,7 +151,7 @@ impl QuestionInteractionController {
                 let Some(target) = parse_focus_target(value) else {
                     return InteractionOutput::None;
                 };
-                if !self.focus_targets().contains(&target) {
+                if focus_target_index(&self.request, target).is_none() {
                     return InteractionOutput::None;
                 }
                 self.focus = target;
@@ -359,29 +357,78 @@ fn answer_is_meaningful(answer: &QuestionAnswerPayload) -> bool {
             .is_some_and(|custom| !custom.trim().is_empty())
 }
 
-fn focus_targets(request: &NormalizedQuestionRequest) -> Vec<QuestionFocusTarget> {
-    let mut targets = Vec::new();
+fn focus_target_count(request: &NormalizedQuestionRequest) -> usize {
+    request
+        .questions
+        .iter()
+        .map(|question| {
+            question
+                .options
+                .len()
+                .saturating_add(usize::from(question.custom || question.options.is_empty()))
+        })
+        .sum::<usize>()
+        .saturating_add(2)
+}
+
+fn focus_target_at(
+    request: &NormalizedQuestionRequest,
+    mut index: usize,
+) -> Option<QuestionFocusTarget> {
     for (question_index, question) in request.questions.iter().enumerate() {
-        targets.extend((0..question.options.len()).map(|option_index| {
-            QuestionFocusTarget::Option {
+        if index < question.options.len() {
+            return Some(QuestionFocusTarget::Option {
                 question_index,
-                option_index,
-            }
-        }));
+                option_index: index,
+            });
+        }
+        index = index.saturating_sub(question.options.len());
         if question.custom || question.options.is_empty() {
-            targets.push(QuestionFocusTarget::Custom { question_index });
+            if index == 0 {
+                return Some(QuestionFocusTarget::Custom { question_index });
+            }
+            index = index.saturating_sub(1);
         }
     }
-    targets.push(QuestionFocusTarget::Submit);
-    targets.push(QuestionFocusTarget::Cancel);
-    targets
+    match index {
+        0 => Some(QuestionFocusTarget::Submit),
+        1 => Some(QuestionFocusTarget::Cancel),
+        _ => None,
+    }
+}
+
+fn focus_target_index(
+    request: &NormalizedQuestionRequest,
+    target: QuestionFocusTarget,
+) -> Option<usize> {
+    let mut index = 0_usize;
+    for (question_index, question) in request.questions.iter().enumerate() {
+        if let QuestionFocusTarget::Option {
+            question_index: target_question,
+            option_index,
+        } = target
+            && target_question == question_index
+            && option_index < question.options.len()
+        {
+            return Some(index.saturating_add(option_index));
+        }
+        index = index.saturating_add(question.options.len());
+        if question.custom || question.options.is_empty() {
+            if target == (QuestionFocusTarget::Custom { question_index }) {
+                return Some(index);
+            }
+            index = index.saturating_add(1);
+        }
+    }
+    match target {
+        QuestionFocusTarget::Submit => Some(index),
+        QuestionFocusTarget::Cancel => Some(index.saturating_add(1)),
+        QuestionFocusTarget::Option { .. } | QuestionFocusTarget::Custom { .. } => None,
+    }
 }
 
 fn first_focus_target(request: &NormalizedQuestionRequest) -> QuestionFocusTarget {
-    focus_targets(request)
-        .into_iter()
-        .next()
-        .unwrap_or(QuestionFocusTarget::Submit)
+    focus_target_at(request, 0).unwrap_or(QuestionFocusTarget::Submit)
 }
 
 fn first_question_focus_target(
@@ -568,6 +615,35 @@ mod tests {
                 option_index: 0,
             }
         );
+    }
+
+    #[test]
+    fn focus_indexing_round_trips_without_materializing_target_lists() {
+        let request = NormalizedQuestionRequest {
+            questions: vec![
+                question(
+                    &[("One", "one"), ("Two", "two")],
+                    QuestionSelectionMode::Single,
+                    true,
+                    QuestionCustomMode::Additional,
+                    false,
+                ),
+                question(
+                    &[],
+                    QuestionSelectionMode::Single,
+                    true,
+                    QuestionCustomMode::Additional,
+                    false,
+                ),
+            ],
+        };
+        let count = focus_target_count(&request);
+        assert_eq!(count, 6);
+        for index in 0..count {
+            let target = focus_target_at(&request, index).expect("target");
+            assert_eq!(focus_target_index(&request, target), Some(index));
+        }
+        assert_eq!(focus_target_at(&request, count), None);
     }
 
     #[test]
