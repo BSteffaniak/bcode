@@ -666,6 +666,55 @@ mod tests {
         (text, cursor)
     }
 
+    #[derive(Default)]
+    struct GrowingSurface {
+        height: u16,
+    }
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for GrowingSurface {
+        fn id(&self) -> &'static str {
+            "growing"
+        }
+
+        fn title(&self) -> &'static str {
+            "Growing"
+        }
+
+        fn preferred_height(&mut self, _width: u16) -> u16 {
+            self.height.max(1)
+        }
+
+        fn render(&mut self, _area: Rect, _frame: &mut Frame<'_>) {}
+
+        fn handle_event(
+            &mut self,
+            _event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> PluginTuiAction {
+            self.height = self.height.saturating_add(1);
+            PluginTuiAction::Redraw
+        }
+    }
+
+    #[tokio::test]
+    async fn height_changes_report_relayout_after_committed_measurement() {
+        let mut surface = InteractiveSurfaceState::from_surface_for_test(
+            "growing",
+            Box::new(GrowingSurface { height: 1 }),
+            &BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        );
+        assert_eq!(surface.preferred_height(80), 1);
+        assert_eq!(
+            surface.handle_event_outcome(&Event::Tick),
+            InteractiveSurfaceEventOutcome::Relayout
+        );
+        assert_eq!(surface.preferred_height(80), 2);
+        assert_eq!(
+            surface.handle_event_outcome(&Event::Tick),
+            InteractiveSurfaceEventOutcome::Relayout
+        );
+    }
+
     #[test]
     fn logical_height_and_visible_render_work_have_independent_host_limits() {
         assert_eq!(bounded_surface_height(0, u16::MAX), 0);

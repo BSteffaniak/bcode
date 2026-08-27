@@ -38,6 +38,8 @@ pub struct QuestionTerminalRenderer {
     pending_custom_mouse_focus: Option<usize>,
     theme: QuestionSurfaceTheme,
     measurement: Option<QuestionMeasurement>,
+    #[cfg(test)]
+    rendered_questions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,8 @@ struct QuestionMeasurement {
     width: u16,
     height: u16,
     focused_rows: std::ops::Range<u16>,
+    question_rows: Vec<std::ops::Range<u16>>,
+    actions_row: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,12 +107,15 @@ impl QuestionTerminalRenderer {
         });
         if rebuild {
             let (start, end) = Self::focused_content_range(snapshot, width);
+            let (height, question_rows, actions_row) = Self::content_geometry(snapshot, width);
             self.measurement = Some(QuestionMeasurement {
                 layout_revision: snapshot.layout_revision,
                 focus: snapshot.focus,
                 width,
-                height: Self::content_height(snapshot, width),
+                height,
                 focused_rows: start..end.max(start.saturating_add(1)),
+                question_rows,
+                actions_row,
             });
         }
         self.measurement.as_ref().expect("measurement initialized")
@@ -199,6 +206,10 @@ impl QuestionTerminalRenderer {
         snapshot: &QuestionSnapshot,
         question_index: usize,
     ) {
+        #[cfg(test)]
+        {
+            self.rendered_questions = self.rendered_questions.saturating_add(1);
+        }
         let question = &snapshot.request.questions[question_index];
         let required = if question.required { " *" } else { "" };
         let prompt = question.header.as_ref().map_or_else(
@@ -383,6 +394,10 @@ impl QuestionTerminalRenderer {
         self.last_area = area;
         self.controls.clear();
         self.custom_areas.clear();
+        #[cfg(test)]
+        {
+            self.rendered_questions = 0;
+        }
         let mut content_y = 0;
         self.render_title(frame, &mut content_y);
         if let Some(error) = &snapshot.validation_error {
@@ -392,10 +407,21 @@ impl QuestionTerminalRenderer {
                 &Line::from_spans(vec![Span::styled(error, self.theme.error)]),
             );
         }
-        for question_index in 0..snapshot.request.questions.len() {
-            self.render_question(frame, &mut content_y, snapshot, question_index);
+        let question_rows = self.measurement(snapshot, area.width).question_rows.clone();
+        let visible_start = self.logical_origin;
+        let visible_end = visible_start.saturating_add(area.height);
+        for (question_index, rows) in question_rows.into_iter().enumerate() {
+            if rows.end <= visible_start || rows.start >= visible_end {
+                content_y = rows.end;
+            } else {
+                self.render_question(frame, &mut content_y, snapshot, question_index);
+            }
         }
-        self.render_actions(frame, &mut content_y, snapshot);
+        let actions_row = self.measurement(snapshot, area.width).actions_row;
+        content_y = actions_row;
+        if actions_row < visible_end && actions_row.saturating_add(2) > visible_start {
+            self.render_actions(frame, &mut content_y, snapshot);
+        }
     }
 
     fn custom_vertical_input(
@@ -508,13 +534,18 @@ impl QuestionTerminalRenderer {
             })
     }
 
-    fn content_height(snapshot: &QuestionSnapshot, width: u16) -> u16 {
+    fn content_geometry(
+        snapshot: &QuestionSnapshot,
+        width: u16,
+    ) -> (u16, Vec<std::ops::Range<u16>>, u16) {
         let width = usize::from(width.max(1));
         let mut height = 1_u16;
         if snapshot.validation_error.is_some() {
             height = height.saturating_add(1);
         }
+        let mut question_rows = Vec::with_capacity(snapshot.request.questions.len());
         for (question_index, question) in snapshot.request.questions.iter().enumerate() {
+            let start = height;
             let required = if question.required { " *" } else { "" };
             let prompt = question.header.as_ref().map_or_else(
                 || format!("{}{required}", question.text),
@@ -552,8 +583,10 @@ impl QuestionTerminalRenderer {
                 height = height.saturating_add(1);
             }
             height = height.saturating_add(1);
+            question_rows.push(start..height);
         }
-        height.saturating_add(2)
+        let actions_row = height;
+        (height.saturating_add(2), question_rows, actions_row)
     }
 
     fn focused_content_range(snapshot: &QuestionSnapshot, width: u16) -> (u16, u16) {
@@ -1346,6 +1379,38 @@ mod tests {
                 && control.area.y >= buffer.area().y
                 && control.area.bottom() <= buffer.area().bottom()
         }));
+    }
+
+    #[test]
+    fn sliced_render_visits_only_intersecting_questions() {
+        let questions = (0..20)
+            .map(|index| {
+                question(
+                    &format!("Question {index}"),
+                    &[("Answer", None)],
+                    false,
+                    false,
+                )
+            })
+            .collect();
+        let controller =
+            QuestionInteractionController::new(NormalizedQuestionRequest { questions });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        let width = 40;
+        let logical_height = renderer.preferred_height(&snapshot, width);
+        let area = Rect::new(0, 0, width, 4);
+        let mut buffer = Buffer::empty(area);
+        renderer.render_slice(
+            &snapshot,
+            logical_height,
+            logical_height.saturating_sub(area.height),
+            area,
+            &mut Frame::new(&mut buffer),
+        );
+
+        assert!(renderer.rendered_questions <= 2);
+        assert!(renderer.rendered_questions < snapshot.request.questions.len());
     }
 
     #[test]
