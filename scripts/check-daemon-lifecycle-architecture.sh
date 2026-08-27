@@ -20,6 +20,8 @@ invariants = Path("INVARIANTS.md").read_text(encoding="utf-8")
 required = {
     "daemon artifact isolation invariant must remain cataloged":
         "**Daemon artifact versions are isolated.**" in invariants,
+    "daemon disposability invariant must remain cataloged":
+        "**Daemon processes are disposable.**" in invariants,
     "IPC endpoint routing must not hash the running executable":
         "current_executable_fingerprint()" not in ipc,
     "IPC must expose typed exact artifact identity":

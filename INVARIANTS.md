@@ -85,6 +85,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 ## Reliability and compatibility
 
 * **Derived state is disposable.** Derived data is identifiable and its presence is not proof of canonical validity.
+* **Daemon processes are disposable.** Loss or replacement of a daemon must not by itself terminate a client session or authoritative nonterminal work. Clients reconnect through normal application boundaries to a matching daemon for the same artifact identity and state location; recovery restores bounded state and resumes or reconciles work only when safe and ownership-authorized, without repeating ambiguous side effects.
 * **Domain-local durable failures remain isolated.** Missing, incompatible, corrupt, or maintenance-required state owned by one optional domain must not prevent the daemon or unrelated capabilities from starting; the affected domain fails closed and reports degraded or maintenance-required status without mutating its durable state.
 * **Normal interactive paths are bounded.** Attach, refresh, rendering, catalog discovery, context construction, and routine history access have bounded work and memory behavior.
 * **Terminal outcomes are stable.** Once a turn, interaction, or persisted stream reaches its authoritative terminal state, stale live updates cannot reopen or overwrite it.

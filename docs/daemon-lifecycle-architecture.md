@@ -7,7 +7,7 @@ Bcode daemon availability is split across explicit owners:
 * Artifact production embeds one exact `ArtifactId` in each produced `bcode` executable.
 * IPC owns the portable artifact identity contract, protocol version, `Hello`, status payloads, and endpoint derivation.
 * Daemon lifecycle owns executable integrity evidence, image materialization, startup locking, spawning, readiness, records, stale endpoint handling, and conservative cleanup.
-* The client owns connection and auto-start policy.
+* The client owns connection, auto-start, and transparent replacement-daemon reconnection policy.
 * The server owns application initialization and full readiness.
 * Frontends observe client outcomes; normal TUI operation does not host a daemon.
 
@@ -62,7 +62,11 @@ The canonical auto-start path is:
 3. If transport is unavailable and auto-start is enabled, invoke one lifecycle ensure operation using the startup deadline.
 4. After lifecycle reports readiness, attempt one final verified connection.
 
-Application requests are issued only after a connection exists. The client does not replay a request merely because connection or startup failed. `RequireRunning` and explicit endpoint clients do not implicitly start a daemon.
+Application requests are issued only after a connection exists. Initial connection or startup failure does not cause the client to replay an application request. `RequireRunning` and explicit endpoint clients do not implicitly start a daemon.
+
+After a verified connection has been established, ordinary daemon loss is recoverable rather than a terminal frontend outcome. An auto-start client keeps its frontend state, coordinates a matching replacement for the same exact artifact and runtime scope, reconnects with bounded backoff, restores its runtime context, session attachment, and subscriptions, then refreshes from bounded authoritative snapshots. Recovery retries reads and mutations with defined duplicate-delivery semantics; it never blindly replays an operation whose side effects may already have occurred. `RequireRunning` clients report loss without starting a replacement, while explicit callers may reconnect to their configured endpoint without changing its authority.
+
+Daemon replacement does not itself terminalize authoritative nonterminal work. The matching replacement daemon uses bounded current-format projections to classify unfinished work, resumes safe work, and converts unverifiable side-effecting operations into explicit interrupted results before continuing. Recovery remains ownership-fenced, preserves stable terminal outcomes, and never substitutes another artifact or state location.
 
 ## Image materialization
 

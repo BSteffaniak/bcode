@@ -147,6 +147,7 @@ Minimum expected validation once Rust crates exist:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `scripts/check-session-architecture.sh` for session persistence changes
 - `scripts/check-state-location-architecture.sh` for state location resolution, daemon location scoping, aggregated multi-location discovery, duplicate-ID ambiguity, or session relocation changes
+- `scripts/check-daemon-lifecycle-architecture.sh` for daemon startup, artifact identity, process replacement, client reconnection, or recovery from daemon loss
 - `scripts/check-loop-runtime-architecture.sh` for generic runtime, turn scheduling, cancellation, plugin/tool domain isolation, or `/loop` changes
 - `scripts/check-model-catalog-architecture.sh` for model catalog/provider resolution changes
 - `scripts/check-router-architecture.sh` for router domain package layout, portable router models, or routing engine dependency changes
