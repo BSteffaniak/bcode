@@ -141,17 +141,9 @@ fn log_file_path() -> Option<PathBuf> {
 }
 
 fn default_state_file(file_name: &str) -> PathBuf {
-    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state_home).join("brouter").join(file_name);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("brouter")
-            .join(file_name);
-    }
-    PathBuf::from(".brouter-state").join(file_name)
+    bcode_config::default_state_dir()
+        .join("router")
+        .join(file_name)
 }
 
 fn expand_user_path(path: &str) -> PathBuf {

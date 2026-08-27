@@ -3541,6 +3541,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bcode_config",
  "brouter_api_models",
  "brouter_catalog_models",
  "brouter_config",
@@ -3570,6 +3571,7 @@ dependencies = [
 name = "brouter_config"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_config",
  "brouter_catalog",
  "brouter_catalog_models",
  "brouter_config_models",

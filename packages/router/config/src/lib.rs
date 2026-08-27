@@ -430,23 +430,8 @@ fn apply_default_telemetry(config: &mut BrouterConfig) {
 }
 
 fn default_state_file(file_name: &str) -> String {
-    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state_home)
-            .join("brouter")
-            .join(file_name)
-            .display()
-            .to_string();
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("brouter")
-            .join(file_name)
-            .display()
-            .to_string();
-    }
-    PathBuf::from(".brouter-state")
+    bcode_config::default_state_dir()
+        .join("router")
         .join(file_name)
         .display()
         .to_string()
