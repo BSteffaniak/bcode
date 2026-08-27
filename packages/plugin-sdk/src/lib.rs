@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 //! Plugin author SDK for Bcode native plugins.
 
@@ -14,6 +15,8 @@ pub use bcode_agent_profile::{ToolPolicyIdentity, ToolPolicyOperation, ToolPolic
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_void};
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -277,6 +280,7 @@ impl ServiceCancellation {
 pub struct CommandRegistrar {
     callback: Option<CommandRegistrationCallback>,
     user_data: usize,
+    not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl CommandRegistrar {
@@ -286,6 +290,7 @@ impl CommandRegistrar {
         Self {
             callback,
             user_data: user_data as usize,
+            not_send_or_sync: PhantomData,
         }
     }
 
@@ -316,14 +321,12 @@ impl CommandRegistrar {
     }
 }
 
-unsafe impl Send for CommandRegistrar {}
-unsafe impl Sync for CommandRegistrar {}
-
 /// Cloneable authentication-provider registrar scoped to plugin activation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AuthRegistrar {
     callback: Option<AuthRegistrationCallback>,
     user_data: usize,
+    not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl AuthRegistrar {
@@ -333,6 +336,7 @@ impl AuthRegistrar {
         Self {
             callback,
             user_data: user_data as usize,
+            not_send_or_sync: PhantomData,
         }
     }
 
@@ -362,9 +366,6 @@ impl AuthRegistrar {
         Ok(())
     }
 }
-
-unsafe impl Send for AuthRegistrar {}
-unsafe impl Sync for AuthRegistrar {}
 
 /// Cloneable event emitter scoped to one service invocation.
 #[derive(Debug, Clone, Copy, Default)]

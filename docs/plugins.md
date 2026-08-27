@@ -2,7 +2,7 @@
 
 Bcode uses plugins for domain behavior rather than treating extensibility as a thin callback layer. Model providers, tools, authentication methods, commands, skills, workflows, session importers, visual adapters, and complete TUI surfaces can all be plugin-owned.
 
-The initial plugin runtime loads native Rust dynamic libraries. Plugins are trusted native code, not sandboxed extensions.
+The initial plugin runtime loads native Rust dynamic libraries. Plugins are trusted native code, not sandboxed extensions. Invocation callback lifetime, unsafe-boundary, and performance migration requirements are defined in [Native plugin invocation safety and performance architecture](native-plugin-invocation-safety.md).
 
 ## Bundled and discovered plugins
 
