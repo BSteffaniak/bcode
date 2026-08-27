@@ -1119,7 +1119,7 @@ fn process_mantle_openai_line(
         }
         "response.completed" => {
             if let Some(usage) = mantle_openai_usage(&event) {
-                sink.push(ProviderTurnEvent::Usage { usage });
+                push_mantle_openai_usage(sink, usage);
             }
             if state.saw_tool_call {
                 finish_mantle_openai_tool_calls(sink, &state.tool_calls, name_map)?;
@@ -1129,7 +1129,7 @@ fn process_mantle_openai_line(
         }
         "response.incomplete" => {
             if let Some(usage) = mantle_openai_usage(&event) {
-                sink.push(ProviderTurnEvent::Usage { usage });
+                push_mantle_openai_usage(sink, usage);
             }
             let reason = responses::responses_incomplete_reason(&event);
             if reason == "max_output_tokens" {
@@ -1216,6 +1216,23 @@ fn mantle_openai_usage(event: &serde_json::Value) -> Option<TokenUsage> {
         cache_write_input_tokens: None,
         reasoning_tokens: reasoning,
     })
+}
+
+/// Emit billing usage and provider-exact request occupancy for Mantle Responses.
+///
+/// The Responses `input_tokens` field already includes cached input tokens, so it is the complete
+/// request input count and must not be added to `cached_input_tokens`.
+fn push_mantle_openai_usage(
+    sink: &impl bcode_openai_responses::ResponsesEventSink,
+    usage: TokenUsage,
+) {
+    let exact_input_tokens = usage.input_tokens;
+    sink.push(ProviderTurnEvent::Usage { usage });
+    if let Some(tokens) = exact_input_tokens {
+        sink.push(ProviderTurnEvent::ExactRequestInputTokens {
+            tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+        });
+    }
 }
 
 /// Build the error reported by a `response.failed` or `error` stream event.
@@ -6669,6 +6686,37 @@ mod tests {
                 if usage.input_tokens == Some(11)
                     && usage.output_tokens == Some(5)
                     && usage.reasoning_tokens == Some(3)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 11
+        )));
+    }
+
+    #[test]
+    fn mantle_openai_cached_usage_does_not_double_count_exact_input() {
+        let turn = TurnState::default();
+        let sink = MantleTurnEventSink(&turn);
+        let mut state = MantleOpenAiStreamState::default();
+        let outcome = process_mantle_openai_line(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":492,"output_tokens":5,"input_tokens_details":{"cached_tokens":400}}}}"#,
+            &sink,
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .expect("completion decodes")
+        .expect("completion is terminal");
+        assert_eq!(outcome, StreamOutcome::Finished);
+
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage }
+                if usage.input_tokens == Some(492) && usage.cached_input_tokens == Some(400)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 492
         )));
     }
 
