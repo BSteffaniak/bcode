@@ -1931,6 +1931,14 @@ impl BmuxApp {
                 visibility: bcode_model::ModelVisibility::Visible,
             });
         self.token_usage.apply_model_info(model.as_ref());
+        self.token_usage.proactive_compaction_target = status
+            .proactive_compaction_effective_threshold_tokens
+            .filter(|_| {
+                matches!(
+                    status.compaction_mode.as_deref(),
+                    Some("proactive" | "proactive_and_overflow")
+                )
+            });
         self.apply_context_occupancy(status.context_occupancy.map(|occupancy| *occupancy));
     }
 
@@ -4543,6 +4551,7 @@ struct TokenUsageMeter {
     latest_total_message_count: Option<usize>,
     latest_prompt_cache_points: Option<usize>,
     context_window: Option<u32>,
+    proactive_compaction_target: Option<u64>,
     pricing: Option<bcode_model::ModelPricingInfo>,
 }
 
@@ -4580,6 +4589,7 @@ impl TokenUsageMeter {
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
         self.context_window = None;
+        self.proactive_compaction_target = None;
         self.pricing = None;
     }
 
@@ -4644,10 +4654,12 @@ impl TokenUsageMeter {
         &self,
         occupancy: Option<&bcode_session_models::RequestContextOccupancy>,
     ) -> String {
-        match (occupancy, self.context_window) {
+        let display_limit = self
+            .proactive_compaction_target
+            .or_else(|| self.context_window.map(u64::from));
+        match (occupancy, display_limit) {
             (Some(occupancy), Some(window)) if window > 0 => {
-                let input = u32::try_from(occupancy.observation.context_tokens.tokens())
-                    .unwrap_or(u32::MAX);
+                let input = occupancy.observation.context_tokens.tokens();
                 let percentage = context_window_percentage(input, window);
                 format!(
                     "{}{}/{} {}",
@@ -4656,8 +4668,8 @@ impl TokenUsageMeter {
                     } else {
                         ""
                     },
-                    format_context_count(u64::from(input)),
-                    compact_context_window(u64::from(window)),
+                    format_context_count(input),
+                    compact_context_window(window),
                     if percentage > 100 {
                         "100%+".to_string()
                     } else {
@@ -4666,7 +4678,7 @@ impl TokenUsageMeter {
                 )
             }
             (None, Some(window)) if window > 0 => {
-                format!("—/{} —%", compact_context_window(u64::from(window)))
+                format!("—/{} —%", compact_context_window(window))
             }
             _ => "—/— —%".to_owned(),
         }
@@ -4760,9 +4772,9 @@ fn format_provider_bytes(bytes: usize) -> String {
     }
 }
 
-fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
-    let numerator = u64::from(input_tokens).saturating_mul(100);
-    let denominator = u64::from(context_window).max(1);
+fn context_window_percentage(input_tokens: u64, context_window: u64) -> u32 {
+    let numerator = input_tokens.saturating_mul(100);
+    let denominator = context_window.max(1);
     u32::try_from(numerator / denominator).unwrap_or(u32::MAX)
 }
 
@@ -7068,6 +7080,22 @@ mod tests {
                 .as_deref(),
             Some("detailed")
         );
+    }
+
+    #[test]
+    fn context_summary_uses_effective_proactive_compaction_target() {
+        let meter = TokenUsageMeter {
+            context_window: Some(1_050_000),
+            proactive_compaction_target: Some(272_000),
+            ..TokenUsageMeter::default()
+        };
+        let occupancy = bcode_session_models::RequestContextOccupancy {
+            context_epoch: 3,
+            observation_sequence: 7,
+            observation: snapshot(true, 136_000),
+        };
+
+        assert_eq!(meter.context_summary(Some(&occupancy)), "~136,000/272k 50%");
     }
 
     #[test]
