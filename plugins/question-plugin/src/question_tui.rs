@@ -1,6 +1,7 @@
 //! Native TUI renderer for the interactive question tool.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use bcode_plugin_sdk::tui::{
     PluginTuiTheme, TerminalInteractionInput, TerminalInteractionRenderer,
@@ -49,9 +50,43 @@ struct QuestionMeasurement {
     width: u16,
     height: u16,
     focused_rows: std::ops::Range<u16>,
-    question_rows: Vec<std::ops::Range<u16>>,
-    custom_heights: Vec<Option<u16>>,
-    actions_row: u16,
+    title_rows: std::ops::Range<u16>,
+    global_validation_rows: Option<std::ops::Range<u16>>,
+    questions: Vec<QuestionGeometry>,
+    action_rows: std::ops::Range<u16>,
+    hint_rows: std::ops::Range<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuestionLayout {
+    height: u16,
+    title_rows: std::ops::Range<u16>,
+    global_validation_rows: Option<std::ops::Range<u16>>,
+    questions: Vec<QuestionGeometry>,
+    action_rows: std::ops::Range<u16>,
+    hint_rows: std::ops::Range<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuestionGeometry {
+    rows: std::ops::Range<u16>,
+    prompt: WrappedText,
+    options: Vec<OptionGeometry>,
+    custom_rows: Option<std::ops::Range<u16>>,
+    validation_rows: Option<std::ops::Range<u16>>,
+    spacer_rows: std::ops::Range<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OptionGeometry {
+    rows: std::ops::Range<u16>,
+    label: WrappedText,
+    description: Option<WrappedText>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrappedText {
+    chunks: Arc<[String]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,31 +136,44 @@ struct ControlRegion {
 impl QuestionTerminalRenderer {
     fn measurement(&mut self, snapshot: &QuestionSnapshot, width: u16) -> &QuestionMeasurement {
         let width = width.max(1);
-        let rebuild = self.measurement.as_ref().is_none_or(|measurement| {
-            measurement.layout_revision != snapshot.layout_revision
-                || measurement.focus != snapshot.focus
-                || measurement.width != width
+        let layout_changed = self.measurement.as_ref().is_none_or(|measurement| {
+            measurement.layout_revision != snapshot.layout_revision || measurement.width != width
         });
-        if rebuild {
-            let (height, question_rows, custom_heights, actions_row) =
-                self.content_geometry(snapshot, width);
+        if layout_changed {
+            let geometry = self.content_geometry(snapshot, width);
             let focused_rows = Self::focused_content_range(
                 snapshot,
-                &question_rows,
-                &custom_heights,
-                actions_row,
-                width,
+                &geometry.questions,
+                geometry.action_rows.start,
             );
             self.measurement = Some(QuestionMeasurement {
                 layout_revision: snapshot.layout_revision,
                 focus: snapshot.focus,
                 width,
-                height,
+                height: geometry.height,
                 focused_rows,
-                question_rows,
-                custom_heights,
-                actions_row,
+                title_rows: geometry.title_rows,
+                global_validation_rows: geometry.global_validation_rows,
+                questions: geometry.questions,
+                action_rows: geometry.action_rows,
+                hint_rows: geometry.hint_rows,
             });
+        } else if self
+            .measurement
+            .as_ref()
+            .is_some_and(|measurement| measurement.focus != snapshot.focus)
+        {
+            let focused_rows = {
+                let measurement = self.measurement.as_ref().expect("measured above");
+                Self::focused_content_range(
+                    snapshot,
+                    &measurement.questions,
+                    measurement.action_rows.start,
+                )
+            };
+            let measurement = self.measurement.as_mut().expect("measured above");
+            measurement.focus = snapshot.focus;
+            measurement.focused_rows = focused_rows;
         }
         self.measurement.as_ref().expect("measurement initialized")
     }
@@ -166,21 +214,12 @@ impl QuestionTerminalRenderer {
         &self,
         frame: &mut Frame<'_>,
         content_y: &mut u16,
-        text: &str,
+        wrapped: &WrappedText,
         first_prefix: &str,
         continuation_prefix: &str,
         style: Style,
     ) {
-        let first_width = usize::from(self.last_area.width)
-            .saturating_sub(bmux_tui::text_width::display_width(first_prefix))
-            .max(1);
-        let next_width = usize::from(self.last_area.width)
-            .saturating_sub(bmux_tui::text_width::display_width(continuation_prefix))
-            .max(1);
-        for (index, chunk) in wrap_text_with_continuation(text, first_width, next_width)
-            .into_iter()
-            .enumerate()
-        {
+        for (index, chunk) in wrapped.chunks.iter().enumerate() {
             let prefix = if index == 0 {
                 first_prefix
             } else {
@@ -191,7 +230,7 @@ impl QuestionTerminalRenderer {
                 content_y,
                 &Line::from_spans(vec![
                     Span::raw(prefix.to_owned()),
-                    Span::styled(chunk, style),
+                    Span::styled(chunk.clone(), style),
                 ]),
             );
         }
@@ -214,19 +253,27 @@ impl QuestionTerminalRenderer {
         content_y: &mut u16,
         snapshot: &QuestionSnapshot,
         question_index: usize,
+        geometry: &QuestionGeometry,
     ) {
         #[cfg(test)]
         {
             self.rendered_questions = self.rendered_questions.saturating_add(1);
         }
         let question = &snapshot.request.questions[question_index];
-        let required = if question.required { " *" } else { "" };
-        let prompt = question.header.as_ref().map_or_else(
-            || format!("{}{required}", question.text),
-            |header| format!("{header}{required}: {}", question.text),
+        debug_assert_eq!(
+            geometry.validation_rows.is_some(),
+            snapshot.invalid_question_index == Some(question_index)
         );
-        self.render_wrapped(frame, content_y, &prompt, "", "", self.theme.text);
-        for (option_index, option) in question.options.iter().enumerate() {
+        debug_assert_eq!(
+            geometry
+                .spacer_rows
+                .end
+                .saturating_sub(geometry.spacer_rows.start),
+            1
+        );
+        self.render_wrapped(frame, content_y, &geometry.prompt, "", "", self.theme.text);
+        for option_index in 0..question.options.len() {
+            let option_geometry = &geometry.options[option_index];
             let start_y = *content_y;
             let option_id = option_control_id(question_index, option_index);
             let selected = snapshot.selected_option_indices[question_index].contains(&option_index);
@@ -252,12 +299,12 @@ impl QuestionTerminalRenderer {
             self.render_wrapped(
                 frame,
                 content_y,
-                &option.label,
+                &option_geometry.label,
                 &prefix,
                 &continuation,
                 option_style(&self.theme, focused, selected),
             );
-            if let Some(description) = option.description.as_deref() {
+            if let Some(description) = option_geometry.description.as_ref() {
                 self.render_wrapped(
                     frame,
                     content_y,
@@ -276,13 +323,16 @@ impl QuestionTerminalRenderer {
         }
         self.render_custom_answer(frame, content_y, snapshot, question_index);
         if snapshot.invalid_question_index == Some(question_index) {
-            self.render_wrapped(
+            self.render_line(
                 frame,
                 content_y,
-                "An answer is required.",
-                "  ",
-                "  ",
-                self.theme.error.add_modifier(Modifier::BOLD),
+                &Line::from_spans(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "An answer is required.",
+                        self.theme.error.add_modifier(Modifier::BOLD),
+                    ),
+                ]),
             );
         }
         self.render_line(frame, content_y, &Line::from(""));
@@ -312,14 +362,16 @@ impl QuestionTerminalRenderer {
         let input_height = self
             .measurement
             .as_ref()
-            .and_then(|measurement| measurement.custom_heights.get(question_index))
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| {
-                self.custom_inputs
-                    .get(&question_index)
-                    .map_or(3, |state| custom_input_height(state, self.last_area.width))
-            });
+            .and_then(|measurement| measurement.questions.get(question_index))
+            .and_then(|geometry| geometry.custom_rows.as_ref())
+            .map_or_else(
+                || {
+                    self.custom_inputs
+                        .get(&question_index)
+                        .map_or(3, |state| custom_input_height(state, self.last_area.width))
+                },
+                range_height,
+            );
         {
             let state = self
                 .custom_inputs
@@ -426,19 +478,27 @@ impl QuestionTerminalRenderer {
                 &Line::from_spans(vec![Span::styled(error, self.theme.error)]),
             );
         }
-        let question_rows = self.measurement(snapshot, area.width).question_rows.clone();
+        let measurement = self.measurement(snapshot, area.width).clone();
+        debug_assert_eq!(measurement.title_rows, 0..1);
+        debug_assert_eq!(
+            measurement.global_validation_rows.is_some(),
+            snapshot.validation_error.is_some()
+        );
+        let questions = measurement.questions.clone();
         let visible_start = self.logical_origin;
         let visible_end = visible_start.saturating_add(area.height);
-        for (question_index, rows) in question_rows.into_iter().enumerate() {
-            if rows.end <= visible_start || rows.start >= visible_end {
-                content_y = rows.end;
+        for (question_index, geometry) in questions.into_iter().enumerate() {
+            if geometry.rows.end <= visible_start || geometry.rows.start >= visible_end {
+                content_y = geometry.rows.end;
             } else {
-                self.render_question(frame, &mut content_y, snapshot, question_index);
+                self.render_question(frame, &mut content_y, snapshot, question_index, &geometry);
             }
         }
-        let actions_row = self.measurement(snapshot, area.width).actions_row;
-        content_y = actions_row;
-        if actions_row < visible_end && actions_row.saturating_add(2) > visible_start {
+        content_y = measurement.action_rows.start;
+        if measurement.action_rows.end > visible_start
+            && measurement.hint_rows.end > visible_start
+            && measurement.action_rows.start < visible_end
+        {
             self.render_actions(frame, &mut content_y, snapshot);
         }
     }
@@ -553,43 +613,51 @@ impl QuestionTerminalRenderer {
             })
     }
 
-    fn content_geometry(
-        &mut self,
-        snapshot: &QuestionSnapshot,
-        width: u16,
-    ) -> (u16, Vec<std::ops::Range<u16>>, Vec<Option<u16>>, u16) {
+    fn content_geometry(&mut self, snapshot: &QuestionSnapshot, width: u16) -> QuestionLayout {
         let width = usize::from(width.max(1));
-        let mut height = 1_u16;
-        if snapshot.validation_error.is_some() {
-            height = height.saturating_add(1);
-        }
-        let mut question_rows = Vec::with_capacity(snapshot.request.questions.len());
-        let mut custom_heights = Vec::with_capacity(snapshot.request.questions.len());
-        for (question_index, question) in snapshot.request.questions.iter().enumerate() {
+        let title_rows = 0_u16..1;
+        let mut height = title_rows.end;
+        let global_validation_rows = if snapshot.validation_error.is_some() {
             let start = height;
+            height = height.saturating_add(1);
+            Some(start..height)
+        } else {
+            None
+        };
+        let mut questions = Vec::with_capacity(snapshot.request.questions.len());
+        for (question_index, question) in snapshot.request.questions.iter().enumerate() {
+            let question_start = height;
             let required = if question.required { " *" } else { "" };
             let prompt = question.header.as_ref().map_or_else(
                 || format!("{}{required}", question.text),
                 |header| format!("{header}{required}: {}", question.text),
             );
-            height = height.saturating_add(wrapped_height(&prompt, width, width));
+            let prompt = WrappedText::new(&prompt, width, width);
+            height = height.saturating_add(prompt.height());
+            let mut options = Vec::with_capacity(question.options.len());
             for (option_index, option) in question.options.iter().enumerate() {
+                let option_start = height;
                 let prefix_width =
                     7_usize.saturating_add(option_shortcut_label(option_index).len());
                 let available = width.saturating_sub(prefix_width).max(1);
-                height = height.saturating_add(wrapped_height(&option.label, available, available));
-                if let Some(description) = option.description.as_deref() {
+                let label = WrappedText::new(&option.label, available, available);
+                height = height.saturating_add(label.height());
+                let description = option.description.as_deref().map(|description| {
                     let description_width = width
                         .saturating_sub(bmux_tui::text_width::display_width(DESCRIPTION_INDENT))
                         .max(1);
-                    height = height.saturating_add(wrapped_height(
-                        description,
-                        description_width,
-                        description_width,
-                    ));
+                    WrappedText::new(description, description_width, description_width)
+                });
+                if let Some(description) = &description {
+                    height = height.saturating_add(description.height());
                 }
+                options.push(OptionGeometry {
+                    rows: option_start..height,
+                    label,
+                    description,
+                });
             }
-            let custom_height = if question.options.is_empty() || question.custom {
+            let custom_rows = if question.options.is_empty() || question.custom {
                 let value = snapshot.answers[question_index]
                     .custom
                     .as_deref()
@@ -604,121 +672,67 @@ impl QuestionTerminalRenderer {
                         .buffer_mut()
                         .move_cursor(bmux_text_edit::TextMotion::End);
                 }
-                Some(custom_input_height(
+                let start = height;
+                height = height.saturating_add(custom_input_height(
                     state,
                     u16::try_from(width).unwrap_or(u16::MAX),
-                ))
+                ));
+                Some(start..height)
             } else {
                 None
             };
-            if let Some(custom_height) = custom_height {
-                height = height.saturating_add(custom_height);
-            }
-            if snapshot.invalid_question_index == Some(question_index) {
+            let validation_rows = if snapshot.invalid_question_index == Some(question_index) {
+                let start = height;
                 height = height.saturating_add(1);
-            }
-            height = height.saturating_add(1);
-            question_rows.push(start..height);
-            custom_heights.push(custom_height);
+                Some(start..height)
+            } else {
+                None
+            };
+            let spacer_rows = height..height.saturating_add(1);
+            height = spacer_rows.end;
+            questions.push(QuestionGeometry {
+                rows: question_start..height,
+                prompt,
+                options,
+                custom_rows,
+                validation_rows,
+                spacer_rows,
+            });
         }
-        let actions_row = height;
-        (
-            height.saturating_add(2),
-            question_rows,
-            custom_heights,
-            actions_row,
-        )
+        let action_rows = height..height.saturating_add(1);
+        let hint_rows = action_rows.end..action_rows.end.saturating_add(1);
+        QuestionLayout {
+            height: hint_rows.end,
+            title_rows,
+            global_validation_rows,
+            questions,
+            action_rows,
+            hint_rows,
+        }
     }
 
     fn focused_content_range(
         snapshot: &QuestionSnapshot,
-        question_rows: &[std::ops::Range<u16>],
-        custom_heights: &[Option<u16>],
+        questions: &[QuestionGeometry],
         actions_row: u16,
-        width: u16,
     ) -> std::ops::Range<u16> {
-        let width = usize::from(width.max(1));
-        let QuestionFocusTarget::Option {
-            question_index,
-            option_index,
-        } = snapshot.focus
-        else {
-            if let QuestionFocusTarget::Custom { question_index } = snapshot.focus
-                && let Some(question) = snapshot.request.questions.get(question_index)
-                && let Some(rows) = question_rows.get(question_index)
-            {
-                let mut start = rows.start;
-                let required = if question.required { " *" } else { "" };
-                let prompt = question.header.as_ref().map_or_else(
-                    || format!("{}{required}", question.text),
-                    |header| format!("{header}{required}: {}", question.text),
-                );
-                start = start.saturating_add(wrapped_height(&prompt, width, width));
-                for (option_index, option) in question.options.iter().enumerate() {
-                    let prefix_width =
-                        7_usize.saturating_add(option_shortcut_label(option_index).len());
-                    let available = width.saturating_sub(prefix_width).max(1);
-                    start =
-                        start.saturating_add(wrapped_height(&option.label, available, available));
-                    if let Some(description) = option.description.as_deref() {
-                        let description_width = width
-                            .saturating_sub(bmux_tui::text_width::display_width(DESCRIPTION_INDENT))
-                            .max(1);
-                        start = start.saturating_add(wrapped_height(
-                            description,
-                            description_width,
-                            description_width,
-                        ));
-                    }
-                }
-                let height = custom_heights
-                    .get(question_index)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(1);
-                return start..start.saturating_add(height);
-            }
-            return match snapshot.focus {
-                QuestionFocusTarget::Submit | QuestionFocusTarget::Cancel => {
-                    actions_row..actions_row.saturating_add(1)
-                }
-                QuestionFocusTarget::Option { .. } | QuestionFocusTarget::Custom { .. } => 0..1,
-            };
-        };
-        let Some(question) = snapshot.request.questions.get(question_index) else {
-            return 0..1;
-        };
-        let Some(rows) = question_rows.get(question_index) else {
-            return 0..1;
-        };
-        let required = if question.required { " *" } else { "" };
-        let prompt = question.header.as_ref().map_or_else(
-            || format!("{}{required}", question.text),
-            |header| format!("{header}{required}: {}", question.text),
-        );
-        let mut y = rows
-            .start
-            .saturating_add(wrapped_height(&prompt, width, width));
-        for (index, option) in question.options.iter().enumerate() {
-            let start = y;
-            let prefix_width = 7_usize.saturating_add(option_shortcut_label(index).len());
-            let available = width.saturating_sub(prefix_width).max(1);
-            y = y.saturating_add(wrapped_height(&option.label, available, available));
-            if let Some(description) = option.description.as_deref() {
-                let description_width = width
-                    .saturating_sub(bmux_tui::text_width::display_width(DESCRIPTION_INDENT))
-                    .max(1);
-                y = y.saturating_add(wrapped_height(
-                    description,
-                    description_width,
-                    description_width,
-                ));
-            }
-            if index == option_index {
-                return start..y.max(start.saturating_add(1));
+        match snapshot.focus {
+            QuestionFocusTarget::Option {
+                question_index,
+                option_index,
+            } => questions
+                .get(question_index)
+                .and_then(|question| question.options.get(option_index))
+                .map(|option| option.rows.clone())
+                .unwrap_or(0..1),
+            QuestionFocusTarget::Custom { question_index } => questions
+                .get(question_index)
+                .and_then(|question| question.custom_rows.clone())
+                .unwrap_or(0..1),
+            QuestionFocusTarget::Submit | QuestionFocusTarget::Cancel => {
+                actions_row..actions_row.saturating_add(1)
             }
         }
-        0..1
     }
 }
 
@@ -969,12 +983,25 @@ fn custom_input_height(state: &TextInputState, width: u16) -> u16 {
         .saturating_add(2)
 }
 
-fn wrapped_height(text: &str, first_width: usize, continuation_width: usize) -> u16 {
-    u16::try_from(
-        wrap_text_with_continuation(text, first_width.max(1), continuation_width.max(1)).len(),
-    )
-    .unwrap_or(u16::MAX)
-    .max(1)
+impl WrappedText {
+    fn new(text: &str, first_width: usize, continuation_width: usize) -> Self {
+        Self {
+            chunks: wrap_text_with_continuation(
+                text,
+                first_width.max(1),
+                continuation_width.max(1),
+            )
+            .into(),
+        }
+    }
+
+    fn height(&self) -> u16 {
+        u16::try_from(self.chunks.len()).unwrap_or(u16::MAX)
+    }
+}
+
+const fn range_height(range: &std::ops::Range<u16>) -> u16 {
+    range.end.saturating_sub(range.start)
 }
 
 const fn option_style(theme: &QuestionSurfaceTheme, focused: bool, selected: bool) -> Style {
@@ -1447,6 +1474,51 @@ mod tests {
                 && control.area.y >= buffer.area().y
                 && control.area.bottom() <= buffer.area().bottom()
         }));
+    }
+
+    #[test]
+    fn focus_navigation_reuses_wrapped_layout_geometry() {
+        let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question(
+                "A deliberately long question that must wrap",
+                &[("A deliberately long option", Some("A long description too"))],
+                true,
+                true,
+            )],
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        let initial = controller.snapshot();
+        let initial_height = renderer.preferred_height(&initial, 18);
+        let prompt = Arc::clone(
+            &renderer.measurement.as_ref().unwrap().questions[0]
+                .prompt
+                .chunks,
+        );
+        let label = Arc::clone(
+            &renderer.measurement.as_ref().unwrap().questions[0].options[0]
+                .label
+                .chunks,
+        );
+        let description = Arc::clone(
+            &renderer.measurement.as_ref().unwrap().questions[0].options[0]
+                .description
+                .as_ref()
+                .unwrap()
+                .chunks,
+        );
+
+        controller.handle_input(InteractionInput::Navigate {
+            direction: InteractionNavigation::Next,
+        });
+        let focused = controller.snapshot();
+        assert_eq!(renderer.preferred_height(&focused, 18), initial_height);
+        let geometry = &renderer.measurement.as_ref().unwrap().questions[0];
+        assert!(Arc::ptr_eq(&prompt, &geometry.prompt.chunks));
+        assert!(Arc::ptr_eq(&label, &geometry.options[0].label.chunks));
+        assert!(Arc::ptr_eq(
+            &description,
+            &geometry.options[0].description.as_ref().unwrap().chunks
+        ));
     }
 
     #[test]
