@@ -328,6 +328,32 @@ fn decode_for_migration(
         });
     }
     let source_kind = envelope.source_kind_name()?;
+    if source_kind == "model_usage" {
+        return match current {
+            Ok(mut event) => {
+                let SessionEventKind::ModelUsage { usage, .. } = &mut event.kind else {
+                    unreachable!("model_usage kind decoded to a different current event");
+                };
+                if usage.cost.is_none() {
+                    usage.cost = Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                        reason: bcode_session_models::SessionCostUnavailableReason::RequestIdentityUnavailable,
+                    });
+                }
+                Ok(HistoricalDecode::Converted {
+                    event,
+                    metadata: HistoricalEventMetadata {
+                        source_schema: envelope.schema_version(),
+                        source_kind: source_kind.to_owned(),
+                    },
+                })
+            }
+            Err(reason) => Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: envelope.schema_version(),
+                event_kind: source_kind.to_owned(),
+                reason,
+            }),
+        };
+    }
     if source_kind == "execution_session_created"
         && envelope.schema_version() <= crate::LATEST_HISTORICAL_EVENT_SCHEMA
     {
@@ -387,6 +413,34 @@ mod tests {
         schema_version: u16,
         sequence: u64,
         kind: BTreeMap<String, serde_json::Value>,
+    }
+
+    #[test]
+    fn historical_usage_without_trustworthy_attribution_is_explicitly_unavailable() {
+        let payload = format!(
+            r#"{{"schema_version":45,"sequence":1,"timestamp_ms":2,"session_id":"{SESSION_ID}","provenance":null,"kind":{{"model_usage":{{"turn_id":"turn","usage":{{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}}}}}}"#
+        );
+        let decoded = decode_for_migration(&payload, |payload| {
+            serde_json::from_str(payload).map_err(|error| error.to_string())
+        })
+        .expect("historical usage should convert");
+
+        let HistoricalDecode::Converted { event, metadata } = decoded else {
+            panic!("historical usage should be migration-owned conversion");
+        };
+        assert_eq!(metadata.source_schema, 45);
+        let SessionEventKind::ModelUsage { usage, .. } = event.kind else {
+            panic!("converted event should remain model usage");
+        };
+        assert!(usage.request.is_none());
+        assert!(usage.request_id.is_none());
+        assert_eq!(
+            usage.cost,
+            Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                reason:
+                    bcode_session_models::SessionCostUnavailableReason::RequestIdentityUnavailable,
+            })
+        );
     }
 
     #[test]

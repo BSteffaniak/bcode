@@ -272,6 +272,13 @@ bounded blocker while later sessions continue. Verified backups and migration re
 per-session evidence; current canonical classification makes explicit re-invocation idempotent.
 Search providers are not consulted or invoked by canonical migration.
 
+Historical usage migration preserves the facts actually recorded by the historical writer. When a
+usage event has no trustworthy fixed estimate or exact request-attempt attribution, migration marks
+its cost explicitly unavailable. It does not resolve the session's current model or consult current
+catalog pricing: doing so would assign a later mutable price to an earlier request and silently
+change history. Token usage remains available, while unavailable historical cost honestly records
+that the original billing context cannot be reconstructed.
+
 Aggregate operation IDs, revisions, cursors, progress, and outcome samples are bounded daemon-local
 notification state. They define no retention, acknowledgment, replay, or conflict protocol and are
 therefore neither reconnect-safe nor durably resumable. After daemon restart an old aggregate ID is

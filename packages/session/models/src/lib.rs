@@ -4629,6 +4629,22 @@ mod tests {
     }
 
     #[test]
+    fn cost_contract_rejects_unknown_future_variants_and_reasons() {
+        let future_estimate = serde_json::json!({
+            "status": "future_estimate",
+            "currency": "USD",
+            "total_micros": 1
+        });
+        assert!(serde_json::from_value::<SessionCostEstimate>(future_estimate).is_err());
+
+        let future_reason = serde_json::json!({
+            "status": "unavailable",
+            "reason": "future_reason"
+        });
+        assert!(serde_json::from_value::<SessionCostEstimate>(future_reason).is_err());
+    }
+
+    #[test]
     fn execution_session_provenance_rejects_unknown_future_versions() {
         let parent_session_id = SessionId::new();
         let encoded = serde_json::json!({

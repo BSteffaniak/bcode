@@ -1295,4 +1295,33 @@ if ! rg -q 'subscribe_session_view' packages/plugin-sdk/src/tui.rs \
   violations=1
 fi
 
+if rg -n 'bcode_model(?:_catalog)?\s*=' packages/session/models/Cargo.toml \
+  || rg -n 'bcode_model::|bcode_model_catalog::' packages/session/models/src --glob '*.rs' \
+    >/tmp/bcode-session-model-pricing-dependency.txt; then
+  echo "Session model dependency violation: portable session models must not depend on model or catalog implementations." >&2
+  cat /tmp/bcode-session-model-pricing-dependency.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if rg -n 'estimate_cost|bcode_model_catalog' packages/tui/src --glob '*.rs' \
+    >/tmp/bcode-tui-historical-repricing.txt; then
+  echo "Session cost architecture violation: TUI code must consume shared fixed estimates and must not select or calculate historical pricing." >&2
+  cat /tmp/bcode-tui-historical-repricing.txt >&2
+  violations=1
+fi
+
+if ! rg -q 'pub cost: Option<SessionCostEstimate>' packages/session/models/src/lib.rs \
+  || ! rg -q 'pub struct SessionCostSummary' packages/session-view/models/src/lib.rs \
+  || ! rg -q 'SessionCostSummary::rebuild' packages/session-view/src/lib.rs; then
+  echo "Session cost architecture violation: canonical usage must own fixed estimates and session-view must own aggregate semantics." >&2
+  violations=1
+fi
+
+if rg -n 'estimate_cost|ModelPricingInfo|bcode_model_catalog' packages/session-view/src packages/session-view/models/src --glob '*.rs' \
+    >/tmp/bcode-session-view-repricing.txt; then
+  echo "Session cost architecture violation: session-view may aggregate fixed outcomes but must not reprice history." >&2
+  cat /tmp/bcode-session-view-repricing.txt >&2
+  violations=1
+fi
+
 exit "$violations"
