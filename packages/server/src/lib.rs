@@ -30256,6 +30256,10 @@ fn session_token_usage(
     }
 }
 
+const COST_AVAILABILITY_ESTIMATED: &str = "estimated";
+const COST_AVAILABILITY_UNAVAILABLE: &str = "unavailable";
+const COST_AVAILABILITY_NOT_OBSERVED: &str = "not_observed";
+
 fn trace_session_cost_estimate(cost: Option<&bcode_session_models::SessionCostEstimate>) {
     match cost {
         Some(bcode_session_models::SessionCostEstimate::Estimated {
@@ -30265,7 +30269,7 @@ fn trace_session_cost_estimate(cost: Option<&bcode_session_models::SessionCostEs
             ..
         }) => tracing::debug!(
             target: "bcode_server::cost_accounting",
-            availability = "estimated",
+            availability = COST_AVAILABILITY_ESTIMATED,
             currency,
             total_micros,
             source,
@@ -30274,14 +30278,14 @@ fn trace_session_cost_estimate(cost: Option<&bcode_session_models::SessionCostEs
         Some(bcode_session_models::SessionCostEstimate::Unavailable { reason }) => {
             tracing::debug!(
                 target: "bcode_server::cost_accounting",
-                availability = "unavailable",
+                availability = COST_AVAILABILITY_UNAVAILABLE,
                 reason = ?reason,
                 "provider request cost estimate unavailable"
             );
         }
         None => tracing::debug!(
             target: "bcode_server::cost_accounting",
-            availability = "not_observed",
+            availability = COST_AVAILABILITY_NOT_OBSERVED,
             "provider request has no cost observation"
         ),
     }
@@ -45189,6 +45193,13 @@ library = "test"
 
         assert_eq!(truncated.chars().count(), 200);
         assert!(truncated.contains("Repository invariants truncated"));
+    }
+
+    #[test]
+    fn cost_telemetry_labels_are_bounded() {
+        assert_eq!(COST_AVAILABILITY_ESTIMATED, "estimated");
+        assert_eq!(COST_AVAILABILITY_UNAVAILABLE, "unavailable");
+        assert_eq!(COST_AVAILABILITY_NOT_OBSERVED, "not_observed");
     }
 
     #[test]

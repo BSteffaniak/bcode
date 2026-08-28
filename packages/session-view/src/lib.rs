@@ -5586,6 +5586,8 @@ mod tests {
         assert_eq!(view.snapshot().runtime.cost.totals_micros["USD"], 15);
         assert_eq!(view.snapshot().runtime.cost.totals_micros["EUR"], 20);
         assert_eq!(view.snapshot().runtime.cost.estimated_usage_count, 2);
+        assert_eq!(view.snapshot().runtime.cost.observed_usage_count, 2);
+        assert!(view.snapshot().runtime.cost.has_complete_coverage());
         let revisions = view
             .usage_by_request
             .values()
@@ -5598,6 +5600,32 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(revisions, BTreeSet::from(["catalog-v1", "catalog-v2"]));
         assert_eq!(view.snapshot().runtime.cumulative_metered_tokens, 0);
+    }
+
+    #[test]
+    fn cost_projection_exposes_partial_coverage() {
+        let mut summary = bcode_session_view_models::SessionCostSummary::default();
+        summary.observe(&SessionTokenUsage {
+            cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                currency: "USD".to_string(),
+                total_micros: 1,
+                components: Vec::new(),
+                source: "fixture".to_string(),
+                revision: None,
+            }),
+            ..SessionTokenUsage::default()
+        });
+        summary.observe(&SessionTokenUsage {
+            cost: Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                reason: bcode_session_models::SessionCostUnavailableReason::ProviderUsageIncomplete,
+            }),
+            ..SessionTokenUsage::default()
+        });
+
+        assert_eq!(summary.observed_usage_count, 2);
+        assert_eq!(summary.estimated_usage_count, 1);
+        assert_eq!(summary.unavailable_usage_count, 1);
+        assert!(!summary.has_complete_coverage());
     }
 
     #[test]

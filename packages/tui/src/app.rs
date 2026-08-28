@@ -4636,7 +4636,11 @@ impl TokenUsageMeter {
             }
         }
         if cost.unavailable_usage_count > 0 {
-            parts.push("cost partial".to_string());
+            parts.push(if cost.estimated_usage_count > 0 {
+                "cost partial".to_string()
+            } else {
+                "cost unavailable".to_string()
+            });
         }
         parts.join(" · ")
     }
@@ -7158,6 +7162,40 @@ mod tests {
 
         assert!(!live.observation.context_tokens.is_estimated());
         assert_eq!(meter.context_summary(Some(live)), "2,500/10k 25%");
+    }
+
+    #[test]
+    fn footer_renders_cost_currency_coverage_and_zero_semantics() {
+        let meter = TokenUsageMeter::default();
+        let complete = bcode_session_view_models::SessionCostSummary {
+            totals_micros: BTreeMap::from([("USD".to_string(), 0), ("EUR".to_string(), 2_000_000)]),
+            estimated_usage_count: 2,
+            unavailable_usage_count: 0,
+            observed_usage_count: 2,
+        };
+        let partial = bcode_session_view_models::SessionCostSummary {
+            unavailable_usage_count: 1,
+            ..complete.clone()
+        };
+        let unavailable = bcode_session_view_models::SessionCostSummary {
+            unavailable_usage_count: 1,
+            observed_usage_count: 1,
+            ..bcode_session_view_models::SessionCostSummary::default()
+        };
+
+        let complete_text = meter.footer_summary(None, 0, &complete);
+        assert!(complete_text.contains("~$0.00"));
+        assert!(complete_text.contains("~EUR 2.000000"));
+        assert!(
+            meter
+                .footer_summary(None, 0, &partial)
+                .contains("cost partial")
+        );
+        assert!(
+            meter
+                .footer_summary(None, 0, &unavailable)
+                .contains("cost unavailable")
+        );
     }
 
     #[test]

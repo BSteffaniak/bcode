@@ -1552,6 +1552,9 @@ pub struct SessionCostSummary {
     /// Number of usage observations whose estimate is explicitly unavailable.
     #[serde(default)]
     pub unavailable_usage_count: u64,
+    /// Number of observed usage records represented by this summary.
+    #[serde(default)]
+    pub observed_usage_count: u64,
 }
 
 impl SessionCostSummary {
@@ -1566,6 +1569,7 @@ impl SessionCostSummary {
 
     /// Record one canonical usage observation without consulting current model state.
     pub fn observe(&mut self, usage: &SessionTokenUsage) {
+        self.observed_usage_count = self.observed_usage_count.saturating_add(1);
         match usage.cost.as_ref() {
             Some(bcode_session_models::SessionCostEstimate::Estimated {
                 currency,
@@ -1582,9 +1586,16 @@ impl SessionCostSummary {
             None => {}
         }
     }
+
+    /// Whether every observed usage record has a complete fixed estimate.
+    #[must_use]
+    pub const fn has_complete_coverage(&self) -> bool {
+        self.observed_usage_count > 0
+            && self.estimated_usage_count == self.observed_usage_count
+            && self.unavailable_usage_count == 0
+    }
 }
 
-/// Renderer-neutral model, agent, context, and turn state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeViewState {
     /// Selected provider plugin, when known.
