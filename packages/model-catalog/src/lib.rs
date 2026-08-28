@@ -1229,7 +1229,8 @@ fn pricing_from_catalog(
             .cache_write_input_micros
             .map(ModelTokenPrice::from_micros),
         output: pricing.output_micros.map(ModelTokenPrice::from_micros),
-        rules: flat_catalog_pricing_rules(pricing),
+        context_threshold_tokens: pricing.context_threshold_tokens,
+        rules: catalog_pricing_rules(pricing),
         revision: None,
         source: if remote {
             ModelPricingSource::RemoteCatalog
@@ -1237,6 +1238,63 @@ fn pricing_from_catalog(
             ModelPricingSource::BundledCatalog
         },
     })
+}
+
+fn catalog_pricing_rules(pricing: &CatalogPricing) -> Vec<bcode_model::ModelPricingRule> {
+    use bcode_model::{
+        ModelInvocationClass, ModelPricingBucket, ModelPricingRule, ModelTokenModality,
+    };
+    if !pricing.rules.is_empty() {
+        return pricing
+            .rules
+            .iter()
+            .map(|rule| ModelPricingRule {
+                bucket: match rule.bucket {
+                    bcode_model_catalog_models::CatalogPricingBucket::Input => {
+                        ModelPricingBucket::Input
+                    }
+                    bcode_model_catalog_models::CatalogPricingBucket::CacheReadInput => {
+                        ModelPricingBucket::CacheReadInput
+                    }
+                    bcode_model_catalog_models::CatalogPricingBucket::CacheWriteInput => {
+                        ModelPricingBucket::CacheWriteInput
+                    }
+                    bcode_model_catalog_models::CatalogPricingBucket::Output => {
+                        ModelPricingBucket::Output
+                    }
+                },
+                modality: rule.modality.map(|modality| match modality {
+                    bcode_model_catalog_models::CatalogTokenModality::Text => {
+                        ModelTokenModality::Text
+                    }
+                    bcode_model_catalog_models::CatalogTokenModality::Image => {
+                        ModelTokenModality::Image
+                    }
+                    bcode_model_catalog_models::CatalogTokenModality::Audio => {
+                        ModelTokenModality::Audio
+                    }
+                    bcode_model_catalog_models::CatalogTokenModality::Video => {
+                        ModelTokenModality::Video
+                    }
+                }),
+                service_tier: rule.service_tier.clone(),
+                invocation_class: rule.invocation_class.map(|class| match class {
+                    bcode_model_catalog_models::CatalogInvocationClass::OnDemand => {
+                        ModelInvocationClass::OnDemand
+                    }
+                    bcode_model_catalog_models::CatalogInvocationClass::Batch => {
+                        ModelInvocationClass::Batch
+                    }
+                }),
+                cache_ttl_seconds: rule.cache_ttl_seconds,
+                min_request_input_tokens: rule.min_request_input_tokens,
+                max_request_input_tokens: rule.max_request_input_tokens,
+                billing_scope: rule.billing_scope.clone(),
+                price: ModelTokenPrice::from_micros(rule.price_micros),
+            })
+            .collect();
+    }
+    flat_catalog_pricing_rules(pricing)
 }
 
 fn flat_catalog_pricing_rules(pricing: &CatalogPricing) -> Vec<bcode_model::ModelPricingRule> {
@@ -1566,6 +1624,9 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
                     if live_model.reasoning.is_some() {
                         deployment.reasoning.clone_from(&live_model.reasoning);
                     }
+                    if live_model.pricing.is_some() {
+                        deployment.pricing.clone_from(&live_model.pricing);
+                    }
                     deployment.capabilities =
                         merge_capabilities(&deployment.capabilities, &live_model.capabilities);
                 } else {
@@ -1575,7 +1636,7 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
                         max_output_tokens: live_model.max_output_tokens,
                         capabilities: live_model.capabilities.clone(),
                         reasoning: live_model.reasoning.clone(),
-                        pricing: None,
+                        pricing: live_model.pricing.clone(),
                     });
                 }
             } else {
@@ -1587,6 +1648,9 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
                 }
                 if entry.reasoning.is_none() {
                     entry.reasoning.clone_from(&live_model.reasoning);
+                }
+                if live_model.pricing.is_some() {
+                    entry.pricing.clone_from(&live_model.pricing);
                 }
             }
             entry.capabilities = merge_capabilities(&entry.capabilities, &live_model.capabilities);
@@ -1628,7 +1692,7 @@ fn live_model_entry(
         replaced_by: None,
         notes: None,
         documentation_url: None,
-        pricing: None,
+        pricing: live_model.pricing.clone(),
         capabilities: live_model.capabilities.clone(),
         reasoning: live_model.reasoning.clone(),
         api_surface: None,
@@ -1642,7 +1706,7 @@ fn live_model_entry(
                 max_output_tokens: live_model.max_output_tokens,
                 capabilities: live_model.capabilities.clone(),
                 reasoning: live_model.reasoning.clone(),
-                pricing: None,
+                pricing: live_model.pricing.clone(),
             })
             .into_iter()
             .collect(),
@@ -2263,6 +2327,32 @@ mod tests {
     }
 
     #[test]
+    fn openai_gpt_5_6_uses_catalog_owned_long_context_rules() {
+        let catalog = ModelCatalog::load_bundled().expect("bundled catalog");
+        let model = catalog
+            .provider_models_as_model_info("openai")
+            .into_iter()
+            .find(|model| model.model_id == "gpt-5.6-terra")
+            .expect("GPT-5.6 Terra");
+        let pricing = model.pricing.expect("catalog pricing");
+        let usage = bcode_model::TokenUsage {
+            input_tokens: Some(300_000),
+            output_tokens: Some(10_000),
+            pricing_context: Box::new(bcode_model::ModelPricingContext {
+                request_input_tokens: Some(300_000),
+                invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                ..bcode_model::ModelPricingContext::default()
+            }),
+            ..bcode_model::TokenUsage::default()
+        };
+        let estimate = pricing
+            .estimate_cost(&usage)
+            .expect("long-context estimate");
+        assert_eq!(estimate.total_micros, 1_380_000);
+        assert_eq!(pricing.rules.len(), 8);
+    }
+
+    #[test]
     fn openai_fallback_prefers_gpt_5_6_sol_then_terra_then_5_5() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let provider = catalog.provider("openai").expect("openai provider exists");
@@ -2327,14 +2417,14 @@ mod tests {
                 .pricing
                 .as_ref()
                 .and_then(|pricing| pricing.input_micros),
-            Some(5_000_000)
+            Some(4_000_000)
         );
         assert_eq!(
             entry
                 .pricing
                 .as_ref()
                 .and_then(|pricing| pricing.output_micros),
-            Some(30_000_000)
+            Some(20_000_000)
         );
         assert!(
             entry

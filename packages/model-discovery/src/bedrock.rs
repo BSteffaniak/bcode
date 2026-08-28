@@ -29,6 +29,9 @@ async fn discover_region(region: &str, snapshot: &mut LiveCatalogSnapshot) -> Re
         .load()
         .await;
     let client = Client::new(&config);
+    let pricing = crate::bedrock_pricing::fetch_region(region)
+        .await
+        .unwrap_or_default();
     let output = client
         .list_foundation_models()
         .send()
@@ -38,7 +41,7 @@ async fn discover_region(region: &str, snapshot: &mut LiveCatalogSnapshot) -> Re
         })?;
 
     for summary in output.model_summaries() {
-        merge_summary(snapshot, region, summary);
+        merge_summary(snapshot, region, summary, &pricing);
     }
     Ok(())
 }
@@ -47,12 +50,28 @@ fn merge_summary(
     snapshot: &mut LiveCatalogSnapshot,
     region: &str,
     summary: &FoundationModelSummary,
+    pricing: &BTreeMap<String, bcode_model_catalog_models::CatalogPricing>,
 ) {
     let entry = snapshot
         .models
         .entry(summary.model_id.clone())
         .or_insert_with(|| live_model_from_summary(summary));
     entry.regions.insert(region.to_string());
+    if entry.pricing.is_none() {
+        entry.pricing = pricing
+            .get(&normalize_pricing_name(
+                summary.model_name.as_deref().unwrap_or(&summary.model_id),
+            ))
+            .cloned();
+    }
+}
+
+fn normalize_pricing_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn live_model_from_summary(summary: &FoundationModelSummary) -> LiveModel {
@@ -70,6 +89,7 @@ fn live_model_from_summary(summary: &FoundationModelSummary) -> LiveModel {
         context_window: None,
         max_output_tokens: None,
         reasoning: None,
+        pricing: None,
         raw: Some(raw_summary(summary)),
     }
 }

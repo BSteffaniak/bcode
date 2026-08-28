@@ -25,6 +25,22 @@ if grep -R --include='*.rs' -nE 'gpt-5\.5|gpt-5\.6-sol' plugins/*-provider-plugi
   exit 1
 fi
 
+if grep -R --include='*.rs' -nE 'pricing::fetch_region|agreement_pricing|pricing_from_agreement_rates' \
+  plugins/*-provider-plugin/src; then
+  echo "provider plugins must not fetch or normalize model pricing catalogs" >&2
+  exit 1
+fi
+if grep -R --include='*.rs' -nE 'gpt-5\.6.*(price|cost)|price.*gpt-5\.6' \
+  plugins/*-provider-plugin/src; then
+  echo "provider plugins must not own model-specific pricing thresholds or rates" >&2
+  exit 1
+fi
+
+if ! grep -F 'rules: catalog_pricing_rules(pricing)' packages/model-catalog/src/lib.rs >/dev/null; then
+  echo "conditional pricing rules must resolve through the model catalog" >&2
+  exit 1
+fi
+
 if grep -R --include='*.rs' -nE 'fn (effective_model_id|resolve_model_api_surface)' packages/server/src; then
   echo "server model identity and API surface must resolve together through model_request_target" >&2
   exit 1

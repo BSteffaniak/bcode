@@ -465,8 +465,67 @@ max_output_tokens = 128000
 [models."gpt-5.6-sol".pricing]
 currency = "USD"
 unit = "per_million_tokens"
-input_micros = 5000000
-output_micros = 30000000
+context_threshold_tokens = 272000
+input_micros = 4000000
+cached_input_micros = 400000
+cache_write_input_micros = 5000000
+output_micros = 20000000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 4000000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 8000000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 400000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 800000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 5000000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 10000000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 20000000
+
+[[models."gpt-5.6-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 30000000
 
 [models."gpt-5.6-sol".capabilities]
 text_input = true
@@ -507,8 +566,67 @@ max_output_tokens = 128000
 [models."gpt-5.6-terra".pricing]
 currency = "USD"
 unit = "per_million_tokens"
-input_micros = 2500000
-output_micros = 15000000
+context_threshold_tokens = 272000
+input_micros = 2000000
+cached_input_micros = 200000
+cache_write_input_micros = 2500000
+output_micros = 12000000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 2000000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 4000000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 200000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 400000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 2500000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 5000000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 12000000
+
+[[models."gpt-5.6-terra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 18000000
 
 [models."gpt-5.6-terra".capabilities]
 text_input = true
@@ -549,8 +667,67 @@ max_output_tokens = 128000
 [models."gpt-5.6-luna".pricing]
 currency = "USD"
 unit = "per_million_tokens"
-input_micros = 1000000
-output_micros = 6000000
+context_threshold_tokens = 272000
+input_micros = 200000
+cached_input_micros = 20000
+cache_write_input_micros = 250000
+output_micros = 1200000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 200000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 400000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 20000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 40000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 250000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 500000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 1200000
+
+[[models."gpt-5.6-luna".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 1800000
 
 [models."gpt-5.6-luna".capabilities]
 text_input = true

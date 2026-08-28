@@ -1900,6 +1900,8 @@ struct ModelResponseItem {
 #[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
     prompt_tokens: Option<u32>,
     #[serde(default)]
     completion_tokens: Option<u32>,
@@ -4460,6 +4462,7 @@ async fn read_responses_stream_events(
         dialect,
         context_format,
         name_map: &name_map,
+        pricing_context: openai_usage_context(request),
         suppress_provider_reuse_state,
         uses_previous_response: request
             .conversation_reuse
@@ -4499,6 +4502,7 @@ struct ResponsesStreamProcessor<'a> {
     dialect: OpenAiCompatibleDialect,
     context_format: ProviderContextFormat,
     name_map: &'a BTreeMap<String, String>,
+    pricing_context: OpenAiUsageContext,
     suppress_provider_reuse_state: bool,
     uses_previous_response: bool,
     saw_assistant_text: std::cell::Cell<bool>,
@@ -4688,7 +4692,11 @@ fn process_responses_stream_line(
                     .then(|| usage.prompt_tokens.or(usage.input_tokens))
                     .flatten();
                 processor.sink.push(ProviderTurnEvent::Usage {
-                    usage: token_usage_from_openai_usage(usage, processor.dialect),
+                    usage: token_usage_from_openai_usage_with_context(
+                        usage,
+                        processor.dialect,
+                        processor.pricing_context.clone(),
+                    ),
                 });
                 if let Some(tokens) = exact_input {
                     processor
@@ -4735,7 +4743,11 @@ fn process_responses_stream_line(
                         .then(|| usage.prompt_tokens.or(usage.input_tokens))
                         .flatten();
                     processor.sink.push(ProviderTurnEvent::Usage {
-                        usage: token_usage_from_openai_usage(usage, processor.dialect),
+                        usage: token_usage_from_openai_usage_with_context(
+                            usage,
+                            processor.dialect,
+                            processor.pricing_context.clone(),
+                        ),
                     });
                     if let Some(tokens) = exact_input {
                         processor
@@ -4980,10 +4992,56 @@ fn process_stream_line(
     Ok(StreamOutcome::Cancelled)
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAiUsageContext {
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    prompt_cache_retention: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn openai_usage_context(request: &ModelTurnRequest) -> OpenAiUsageContext {
+    let options = request
+        .provider_context
+        .extension::<OpenAiResponsesRequestOptions>()
+        .ok()
+        .flatten();
+    OpenAiUsageContext {
+        service_tier: options
+            .as_ref()
+            .and_then(|options| options.service_tier)
+            .map(|tier| match tier {
+                OpenAiServiceTier::Auto | OpenAiServiceTier::Default => "standard",
+                OpenAiServiceTier::Flex => "flex",
+                OpenAiServiceTier::Priority => "priority",
+            })
+            .map(str::to_string),
+        prompt_cache_retention: options
+            .and_then(|options| options.prompt_cache_retention)
+            .map(|retention| match retention {
+                OpenAiPromptCacheRetention::InMemory => "in_memory",
+                OpenAiPromptCacheRetention::TwentyFourHours => "24h",
+            })
+            .map(str::to_string),
+        model: Some(request.model_id.clone()),
+    }
+}
+
 fn token_usage_from_openai_usage(
     usage: OpenAiUsage,
-    _dialect: OpenAiCompatibleDialect,
+    dialect: OpenAiCompatibleDialect,
 ) -> TokenUsage {
+    token_usage_from_openai_usage_with_context(usage, dialect, OpenAiUsageContext::default())
+}
+
+fn token_usage_from_openai_usage_with_context(
+    usage: OpenAiUsage,
+    _dialect: OpenAiCompatibleDialect,
+    context: OpenAiUsageContext,
+) -> TokenUsage {
+    let service_tier = usage.service_tier.or(context.service_tier);
     let cached_input_tokens = usage
         .prompt_tokens_details
         .and_then(|details| details.cached_tokens)
@@ -5009,7 +5067,36 @@ fn token_usage_from_openai_usage(
         cached_input_tokens,
         cache_write_input_tokens: None,
         details: Box::default(),
-        pricing_context: Box::default(),
+        pricing_context: Box::new(bcode_model::ModelPricingContext {
+            service_tier: service_tier.map(|tier| {
+                if tier == "default" {
+                    "standard".to_string()
+                } else {
+                    tier
+                }
+            }),
+            invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+            billing_scope: context.model.as_deref().map(|model| {
+                if model.starts_with("global.") {
+                    "global".to_string()
+                } else if model
+                    .split_once('.')
+                    .is_some_and(|(prefix, _)| matches!(prefix, "us" | "eu" | "apac" | "in"))
+                {
+                    "geo".to_string()
+                } else {
+                    "in_region".to_string()
+                }
+            }),
+            request_input_tokens: input_tokens.map(u64::from),
+            cache_ttl_seconds: context
+                .prompt_cache_retention
+                .as_deref()
+                .and_then(|retention| match retention {
+                    "24h" => Some(24 * 60 * 60),
+                    _ => None,
+                }),
+        }),
         reasoning_tokens,
     }
 }
@@ -6449,6 +6536,7 @@ fn pricing_from_provider_api(
         )
         .map(ModelTokenPrice::from_micros),
         output,
+        context_threshold_tokens: None,
         rules: Vec::new(),
         revision: None,
         source: ModelPricingSource::ProviderApi,
@@ -11349,6 +11437,7 @@ mod tests {
                 compatibility_key: "test".to_string(),
             },
             name_map,
+            pricing_context: OpenAiUsageContext::default(),
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
             saw_assistant_text: std::cell::Cell::new(false),
@@ -11614,6 +11703,7 @@ mod tests {
                 compatibility_key: "test".to_string(),
             },
             name_map: &name_map,
+            pricing_context: OpenAiUsageContext::default(),
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
             saw_assistant_text: std::cell::Cell::new(false),
@@ -11691,6 +11781,7 @@ mod tests {
                 compatibility_key: "test".to_string(),
             },
             name_map: &name_map,
+            pricing_context: OpenAiUsageContext::default(),
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
             saw_assistant_text: std::cell::Cell::new(false),

@@ -12,7 +12,7 @@ pub use live::{LiveCatalogSnapshot, LiveModel, LiveModelMetadata};
 mod live;
 
 /// Catalog schema version emitted by this crate.
-pub const SCHEMA_VERSION: &str = "2.0.0";
+pub const SCHEMA_VERSION: &str = "3.0.0";
 
 /// Complete model catalog document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +368,70 @@ pub struct CatalogPricing {
     /// Output token price in currency micros.
     #[serde(default)]
     pub output_micros: Option<u64>,
+    /// Request-input threshold separating short and long context rules.
+    #[serde(default)]
+    pub context_threshold_tokens: Option<u64>,
+    /// Conditional pricing rules. Empty means the flat fields above are authoritative.
+    #[serde(default)]
+    pub rules: Vec<CatalogPricingRule>,
+}
+
+/// One conditional token-pricing rule owned by the model catalog.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CatalogPricingRule {
+    /// Billed token category.
+    pub bucket: CatalogPricingBucket,
+    /// Optional modality restriction.
+    #[serde(default)]
+    pub modality: Option<CatalogTokenModality>,
+    /// Optional effective service tier.
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    /// Optional invocation class.
+    #[serde(default)]
+    pub invocation_class: Option<CatalogInvocationClass>,
+    /// Optional cache retention in seconds.
+    #[serde(default)]
+    pub cache_ttl_seconds: Option<u64>,
+    /// Inclusive minimum complete request input size.
+    #[serde(default)]
+    pub min_request_input_tokens: Option<u64>,
+    /// Inclusive maximum complete request input size.
+    #[serde(default)]
+    pub max_request_input_tokens: Option<u64>,
+    /// Optional deployment/billing scope.
+    #[serde(default)]
+    pub billing_scope: Option<String>,
+    /// Price in currency micros per configured pricing unit.
+    pub price_micros: u64,
+}
+
+/// Catalog token-pricing category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogPricingBucket {
+    Input,
+    CacheReadInput,
+    CacheWriteInput,
+    Output,
+}
+
+/// Catalog token modality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogTokenModality {
+    Text,
+    Image,
+    Audio,
+    Video,
+}
+
+/// Catalog invocation class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogInvocationClass {
+    OnDemand,
+    Batch,
 }
 
 /// Pricing unit.

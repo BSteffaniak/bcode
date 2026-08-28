@@ -1170,6 +1170,9 @@ pub struct ModelPricingInfo {
     /// Provider/catalog publication or effective revision used for these prices.
     #[serde(default)]
     pub revision: Option<String>,
+    /// Request-input threshold separating short and long context pricing classes.
+    #[serde(default)]
+    pub context_threshold_tokens: Option<u64>,
     /// Price source.
     pub source: ModelPricingSource,
 }
@@ -4015,6 +4018,7 @@ mod tests {
             cached_input: Some(ModelTokenPrice::from_micros(100_000)),
             cache_write_input: Some(ModelTokenPrice::from_micros(1_250_000)),
             output: Some(ModelTokenPrice::from_micros(4_000_000)),
+            context_threshold_tokens: None,
             rules: Vec::new(),
             revision: None,
             source: ModelPricingSource::BundledCatalog,
@@ -4041,6 +4045,7 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: Some(ModelTokenPrice::from_micros(0)),
+            context_threshold_tokens: None,
             rules: Vec::new(),
             revision: None,
             source: ModelPricingSource::UserOverride,
@@ -4064,6 +4069,7 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: Some(ModelTokenPrice::from_micros(1)),
+            context_threshold_tokens: None,
             rules: Vec::new(),
             revision: None,
             source: ModelPricingSource::UserOverride,
@@ -4087,6 +4093,7 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: None,
+            context_threshold_tokens: None,
             rules: Vec::new(),
             revision: None,
             source: ModelPricingSource::UserOverride,
@@ -4109,6 +4116,7 @@ mod tests {
             cached_input: Some(ModelTokenPrice::from_micros(1)),
             cache_write_input: None,
             output: Some(ModelTokenPrice::from_micros(1)),
+            context_threshold_tokens: None,
             rules: Vec::new(),
             revision: None,
             source: ModelPricingSource::UserOverride,
@@ -4132,6 +4140,7 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: None,
+            context_threshold_tokens: None,
             rules: Vec::new(),
             revision: None,
             source: ModelPricingSource::Unknown,

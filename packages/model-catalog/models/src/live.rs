@@ -1,6 +1,6 @@
 //! Generated live model catalog snapshot types.
 
-use crate::{CatalogCapabilities, CatalogReasoning};
+use crate::{CatalogCapabilities, CatalogPricing, CatalogReasoning};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,6 +74,9 @@ pub struct LiveModel {
     /// Reasoning-specific metadata, when returned by the provider API.
     #[serde(default)]
     pub reasoning: Option<CatalogReasoning>,
+    /// Pricing returned by provider catalog/discovery sources.
+    #[serde(default)]
+    pub pricing: Option<CatalogPricing>,
     /// Compact raw provider metadata for debugging/auditing.
     #[serde(default)]
     pub raw: Option<serde_json::Value>,

@@ -168,6 +168,7 @@ fn live_model_from_language_model(model: LanguageModel) -> LiveModel {
         context_window,
         max_output_tokens,
         reasoning: None,
+        pricing: None,
         raw,
     }
 }

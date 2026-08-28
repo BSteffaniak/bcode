@@ -228,6 +228,7 @@ function mergeSnapshot(catalog, snapshot) {
     if (!entry.display_name && liveModel.display_name) entry.display_name = liveModel.display_name;
     if (!entry.context_window && liveModel.context_window) entry.context_window = liveModel.context_window;
     if (!entry.max_output_tokens && liveModel.max_output_tokens) entry.max_output_tokens = liveModel.max_output_tokens;
+    entry.pricing = liveModel.pricing || entry.pricing || null;
     entry.capabilities = mergeCapabilities(entry.capabilities || {}, liveModel.capabilities || {});
     entry.live = {
       status: liveModel.status || null,
@@ -328,6 +329,7 @@ function liveBedrockModel(summary) {
     },
     context_window: null,
     max_output_tokens: null,
+    pricing: null,
     raw: compactBedrockSummary(summary),
   };
 }

@@ -4,8 +4,6 @@
 
 //! Amazon Bedrock Runtime and Mantle model provider plugin for Bcode.
 
-mod pricing;
-
 #[cfg(feature = "static-bundled")]
 mod cli;
 
@@ -4585,10 +4583,6 @@ struct CachedDiscovery {
 struct CandidateModel {
     model_id: String,
     display_name: String,
-    /// Foundation model id used to resolve agreement pricing for inference profiles.
-    pricing_model_id: String,
-    /// Whether Bedrock exposes a public agreement rate card for this model.
-    agreement_pricing: bool,
     /// Higher values are preferred. This is based on Bedrock resource shape, not model family.
     priority: i32,
     /// Service-provided recency timestamp when available.
@@ -5148,63 +5142,23 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
     let default_model_id = candidates
         .first()
         .map(|candidate| candidate.model_id.clone());
-    let mut pricing_catalog = None;
-    match pricing::fetch_region(
-        bedrock_sdk_config(settings)
-            .await
-            .region()
-            .map_or(DEFAULT_REGION, aws_config::Region::as_ref),
-    )
-    .await
-    {
-        Ok(catalog) => pricing_catalog = Some(catalog),
-        Err(error) => tracing::debug!(
-            target: "bcode_bedrock::pricing",
-            error = %error,
-            "AWS public Bedrock pricing refresh failed"
-        ),
-    }
-    let mut pricing_by_model = BTreeMap::new();
-    for candidate in &candidates {
-        let pricing_model_name = candidates
-            .iter()
-            .find(|model| model.model_id == candidate.pricing_model_id)
-            .map_or(candidate.display_name.as_str(), |model| {
-                model.display_name.as_str()
-            });
-        if let Some(pricing) = pricing_catalog
-            .as_ref()
-            .and_then(|catalog| catalog.pricing_for_model_name(pricing_model_name))
-        {
-            pricing_by_model.insert(candidate.model_id.clone(), pricing);
-            continue;
-        }
-        if candidate.agreement_pricing
-            && let Some(pricing) = agreement_pricing(&client, &candidate.pricing_model_id).await
-        {
-            pricing_by_model.insert(candidate.model_id.clone(), pricing);
-        }
-    }
     let models: Vec<ModelInfo> = candidates
         .into_iter()
-        .map(|candidate| {
-            let pricing = pricing_by_model.remove(&candidate.model_id);
-            ModelInfo {
-                is_default: default_model_id.as_deref() == Some(candidate.model_id.as_str()),
-                model_id: candidate.model_id,
-                display_name: candidate.display_name,
-                context_window: None,
-                max_output_tokens: None,
-                max_image_input_base64_bytes: None,
-                capabilities: bedrock_model_capabilities(),
-                feature_support: bcode_model::ModelFeatureSupport::default(),
-                reasoning: None,
-                cache: bedrock_model_cache_info(),
-                metadata_source: None,
-                pricing,
-                api_surface: None,
-                visibility: bcode_model::ModelVisibility::Visible,
-            }
+        .map(|candidate| ModelInfo {
+            is_default: default_model_id.as_deref() == Some(candidate.model_id.as_str()),
+            model_id: candidate.model_id,
+            display_name: candidate.display_name,
+            context_window: None,
+            max_output_tokens: None,
+            max_image_input_base64_bytes: None,
+            capabilities: bedrock_model_capabilities(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bedrock_model_cache_info(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: bcode_model::ModelVisibility::Visible,
         })
         .collect();
     Ok(ModelDiscovery {
@@ -5216,75 +5170,6 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
 async fn bedrock_control_client(settings: &Settings) -> bedrock::Client {
     let config = bedrock_sdk_config(settings).await;
     bedrock::Client::new(&config)
-}
-
-fn model_id_from_arn(arn: &str) -> Option<String> {
-    arn.rsplit_once("/foundation-model/")
-        .map(|(_, model_id)| model_id.to_string())
-}
-
-async fn agreement_pricing(
-    client: &bedrock::Client,
-    model_id: &str,
-) -> Option<bcode_model::ModelPricingInfo> {
-    let response = client
-        .list_foundation_model_agreement_offers()
-        .model_id(model_id)
-        .offer_type(bedrock::types::OfferType::Public)
-        .send()
-        .await
-        .ok()?;
-    let rates = response
-        .offers()
-        .iter()
-        .filter_map(|offer| offer.term_details())
-        .filter_map(|details| details.usage_based_pricing_term())
-        .flat_map(bedrock::types::PricingTerm::rate_card);
-    pricing_from_agreement_rates(rates)
-}
-
-fn pricing_from_agreement_rates<'a>(
-    rates: impl Iterator<Item = &'a bedrock::types::DimensionalPriceRate>,
-) -> Option<bcode_model::ModelPricingInfo> {
-    let mut input = None;
-    let mut cached_input = None;
-    let mut cache_write_input = None;
-    let mut output = None;
-    for rate in rates {
-        let dimension = format!(
-            "{} {}",
-            rate.dimension().unwrap_or_default(),
-            rate.description().unwrap_or_default()
-        )
-        .to_ascii_lowercase();
-        let micros = pricing::price_per_million_micros(rate.price()?, rate.unit()?)?;
-        let bucket = if dimension.contains("cache") && dimension.contains("read") {
-            &mut cached_input
-        } else if dimension.contains("cache") && dimension.contains("write") {
-            &mut cache_write_input
-        } else if dimension.contains("input") {
-            &mut input
-        } else if dimension.contains("output") {
-            &mut output
-        } else {
-            continue;
-        };
-        if bucket.is_some_and(|existing| existing != micros) {
-            return None;
-        }
-        *bucket = Some(micros);
-    }
-    Some(bcode_model::ModelPricingInfo {
-        currency: "USD".to_string(),
-        unit: bcode_model::ModelPricingUnit::PerMillionTokens,
-        input: Some(bcode_model::ModelTokenPrice::from_micros(input?)),
-        cached_input: cached_input.map(bcode_model::ModelTokenPrice::from_micros),
-        cache_write_input: cache_write_input.map(bcode_model::ModelTokenPrice::from_micros),
-        output: Some(bcode_model::ModelTokenPrice::from_micros(output?)),
-        rules: Vec::new(),
-        revision: None,
-        source: bcode_model::ModelPricingSource::ProviderApi,
-    })
 }
 
 async fn discover_inference_profiles(
@@ -5309,17 +5194,9 @@ async fn discover_inference_profiles(
                 .updated_at()
                 .or_else(|| profile.created_at())
                 .map_or(0, aws_smithy_types::DateTime::secs);
-            let pricing_model_id = profile
-                .models()
-                .iter()
-                .find_map(|model| model.model_arn())
-                .and_then(model_id_from_arn)
-                .unwrap_or_else(|| model_id.clone());
             candidates.push(CandidateModel {
                 model_id,
                 display_name,
-                agreement_pricing: pricing_model_id.starts_with("anthropic."),
-                pricing_model_id,
                 priority: 2,
                 date_key,
             });
@@ -5364,10 +5241,6 @@ async fn discover_foundation_models(
             .and_then(|lifecycle| lifecycle.start_of_life_time())
             .map_or(0, aws_smithy_types::DateTime::secs);
         candidates.push(CandidateModel {
-            pricing_model_id: model_id.clone(),
-            agreement_pricing: model
-                .provider_name()
-                .is_some_and(|provider| provider.eq_ignore_ascii_case("anthropic")),
             model_id,
             display_name,
             priority: 1,
