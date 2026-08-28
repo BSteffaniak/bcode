@@ -711,6 +711,11 @@ impl TurnCancelState {
 struct ModelRequestAttempt {
     identity: bcode_session_models::ModelRequestIdentity,
     provider_turn_id: String,
+    pricing: Option<bcode_model::ModelPricingInfo>,
+    catalog_provider_id: Option<String>,
+    catalog_entry_id: Option<String>,
+    catalog_family: Option<String>,
+    catalog_api_surface: Option<bcode_model::ModelApiSurface>,
     reuse_key: Option<String>,
     request_message_count: usize,
     /// Exact canonical event boundary captured while this request was projected.
@@ -15497,6 +15502,9 @@ async fn run_model_turn_inner(
         let PreparedModelRequest {
             mut request,
             mut context_projection,
+            pricing,
+            catalog_provider_id,
+            catalog_identity,
             structured_output_execution,
         } = prepared;
         let structured_output_phase = if structured_output_finalization {
@@ -15718,6 +15726,9 @@ async fn run_model_turn_inner(
                 provider_plugin_id: provider_plugin_id.as_deref(),
                 request: &request,
                 context_projection: &context_projection,
+                pricing: pricing.as_ref(),
+                catalog_provider_id: catalog_provider_id.as_deref(),
+                catalog_identity: catalog_identity.as_ref(),
                 streaming: &turn_config.model.streaming,
             },
             Arc::clone(&cancel_state),
@@ -17030,6 +17041,9 @@ struct ModelTurnRoundContext<'a> {
     provider_plugin_id: Option<&'a str>,
     request: &'a ModelTurnRequest,
     context_projection: &'a bcode_session_models::RequestContextObservation,
+    pricing: Option<&'a bcode_model::ModelPricingInfo>,
+    catalog_provider_id: Option<&'a str>,
+    catalog_identity: Option<&'a bcode_model_catalog::ModelCatalogIdentity>,
     streaming: &'a bcode_config::StreamingConfig,
 }
 
@@ -17048,6 +17062,9 @@ async fn run_model_turn_round(
         provider_plugin_id,
         request,
         context_projection,
+        pricing,
+        catalog_provider_id,
+        catalog_identity,
         streaming,
     } = round;
     let round_start = Instant::now();
@@ -17177,6 +17194,11 @@ async fn run_model_turn_round(
     let active_model_turn = ModelRequestAttempt {
         identity: context_projection.request.clone(),
         provider_turn_id: provider_turn_id.clone(),
+        pricing: pricing.cloned(),
+        catalog_provider_id: catalog_provider_id.map(ToOwned::to_owned),
+        catalog_entry_id: catalog_identity.map(|identity| identity.catalog_entry_id.clone()),
+        catalog_family: catalog_identity.and_then(|identity| identity.family.clone()),
+        catalog_api_surface: catalog_identity.and_then(|identity| identity.api_surface),
         reuse_key: request.conversation_reuse.key.clone(),
         request_message_count: request.messages.len(),
         context_through_sequence: context_projection.context_through_sequence,
@@ -18801,7 +18823,20 @@ async fn handle_provider_usage_event(
     }
     append_provider_event_trace(state, session_id, turn_id, "usage", None).await;
     update_provider_usage_state(state, session_id, &usage).await;
-    append_model_usage_event(state, session_id, turn_id.to_owned(), usage).await;
+    let attempt = state
+        .session_current_turn(session_id)
+        .await
+        .and_then(|turn| {
+            turn.model_attempt_for_provider_turn(provider_turn_id)
+                .cloned()
+        });
+    append_model_usage_event(
+        state,
+        session_id,
+        turn_id.to_owned(),
+        session_token_usage(&usage, attempt.as_ref()),
+    )
+    .await;
 }
 
 async fn handle_provider_request_projection_event(
@@ -20148,6 +20183,9 @@ fn apply_structured_output_phase(
 struct PreparedModelRequest {
     request: ModelTurnRequest,
     context_projection: bcode_session_models::RequestContextObservation,
+    pricing: Option<bcode_model::ModelPricingInfo>,
+    catalog_provider_id: Option<String>,
+    catalog_identity: Option<bcode_model_catalog::ModelCatalogIdentity>,
     structured_output_execution: Option<bcode_model::CapabilityExecution>,
 }
 
@@ -20482,6 +20520,9 @@ async fn build_model_turn_request(
             "failed to resolve model request target: {error}"
         ))
     })?;
+    let pricing = target.pricing.clone();
+    let catalog_provider_id = target.catalog_provider_id.clone();
+    let catalog_identity = target.catalog_identity.clone();
     let model_id = target.model_id;
     let reasoning_capabilities = resolve_model_reasoning_info(
         state,
@@ -20709,6 +20750,9 @@ async fn build_model_turn_request(
     Ok(PreparedModelRequest {
         request,
         context_projection,
+        pricing,
+        catalog_provider_id,
+        catalog_identity,
         structured_output_execution: resolved_features.structured_output_execution(),
     })
 }
@@ -30127,11 +30171,11 @@ async fn append_model_usage_event(
     state: &ServerState,
     session_id: SessionId,
     turn_id: String,
-    usage: TokenUsage,
+    usage: SessionTokenUsage,
 ) {
     match state
         .sessions
-        .append_model_usage(session_id, turn_id, session_token_usage(&usage))
+        .append_model_usage(session_id, turn_id, usage)
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
@@ -30139,27 +30183,131 @@ async fn append_model_usage_event(
     }
 }
 
-fn session_token_usage(usage: &TokenUsage) -> SessionTokenUsage {
+fn session_token_usage(
+    usage: &TokenUsage,
+    attempt: Option<&ModelRequestAttempt>,
+) -> SessionTokenUsage {
+    let cost = attempt.map_or_else(
+        || {
+            Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                reason: bcode_session_models::SessionCostUnavailableReason::RequestIdentityUnavailable,
+            })
+        },
+        |attempt| {
+            attempt.pricing.as_ref().map_or_else(
+                || {
+                    Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                        reason: bcode_session_models::SessionCostUnavailableReason::RequestPricingUnavailable,
+                    })
+                },
+                |pricing| {
+                    pricing.estimate_cost(usage).map_or_else(
+                        || {
+                            Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                                reason: bcode_session_models::SessionCostUnavailableReason::PricingRuleUnavailableOrAmbiguous,
+                            })
+                        },
+                        |estimate| Some(session_cost_estimate(estimate)),
+                    )
+                },
+            )
+        },
+    );
+    trace_session_cost_estimate(cost.as_ref());
     SessionTokenUsage {
+        request_id: attempt.map(|attempt| attempt.identity.request_id.clone()),
+        observation_id: attempt.map(|attempt| format!("{}:usage", attempt.identity.request_id)),
+        observation_ordinal: 0,
+        terminal: attempt.is_some(),
+        request: attempt.map(|attempt| Box::new(attempt.identity.clone())),
+        catalog_provider_id: attempt.and_then(|attempt| attempt.catalog_provider_id.clone()),
+        catalog_entry_id: attempt.and_then(|attempt| attempt.catalog_entry_id.clone()),
+        catalog_family: attempt.and_then(|attempt| attempt.catalog_family.clone()),
+        catalog_api_surface: attempt
+            .and_then(|attempt| attempt.catalog_api_surface)
+            .map(|surface| format!("{surface:?}").to_ascii_lowercase()),
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
-        pricing_context: serde_json::to_value(&usage.pricing_context)
-            .ok()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default(),
+        pricing_context: bcode_session_models::SessionPricingContext {
+            service_tier: usage.pricing_context.service_tier.clone(),
+            invocation_class: usage
+                .pricing_context
+                .invocation_class
+                .map(|class| format!("{class:?}").to_ascii_lowercase()),
+            billing_scope: usage.pricing_context.billing_scope.clone(),
+            request_input_tokens: usage.pricing_context.request_input_tokens,
+            cache_ttl_seconds: usage.pricing_context.cache_ttl_seconds,
+        },
         pricing_usage_details: usage
             .details
             .iter()
-            .filter_map(|detail| serde_json::to_value(detail).ok())
+            .map(|detail| bcode_session_models::SessionPricingUsageDetail {
+                bucket: format!("{:?}", detail.bucket).to_ascii_lowercase(),
+                modality: format!("{:?}", detail.modality).to_ascii_lowercase(),
+                tokens: detail.tokens,
+                cache_ttl_seconds: detail.cache_ttl_seconds,
+            })
             .collect(),
-        estimated_cost_micros: None,
-        estimated_cost_currency: None,
-        estimated_cost_source: None,
-        estimated_cost_revision: None,
+        cost,
         reasoning_tokens: usage.reasoning_tokens,
+    }
+}
+
+fn trace_session_cost_estimate(cost: Option<&bcode_session_models::SessionCostEstimate>) {
+    match cost {
+        Some(bcode_session_models::SessionCostEstimate::Estimated {
+            currency,
+            total_micros,
+            source,
+            ..
+        }) => tracing::debug!(
+            target: "bcode_server::cost_accounting",
+            availability = "estimated",
+            currency,
+            total_micros,
+            source,
+            "provider request cost estimate prepared"
+        ),
+        Some(bcode_session_models::SessionCostEstimate::Unavailable { reason }) => {
+            tracing::debug!(
+                target: "bcode_server::cost_accounting",
+                availability = "unavailable",
+                reason = ?reason,
+                "provider request cost estimate unavailable"
+            );
+        }
+        None => tracing::debug!(
+            target: "bcode_server::cost_accounting",
+            availability = "not_observed",
+            "provider request has no cost observation"
+        ),
+    }
+}
+
+fn session_cost_estimate(
+    estimate: bcode_model::ModelCostEstimate,
+) -> bcode_session_models::SessionCostEstimate {
+    bcode_session_models::SessionCostEstimate::Estimated {
+        currency: estimate.currency,
+        total_micros: estimate.total_micros,
+        components: estimate
+            .components
+            .into_iter()
+            .map(|component| bcode_session_models::SessionCostComponent {
+                bucket: format!("{:?}", component.bucket).to_ascii_lowercase(),
+                modality: component
+                    .modality
+                    .map(|modality| format!("{modality:?}").to_ascii_lowercase()),
+                tokens: component.tokens,
+                price_micros: component.price.micros,
+                cost_micros: component.cost_micros,
+            })
+            .collect(),
+        source: format!("{:?}", estimate.source).to_ascii_lowercase(),
+        revision: estimate.revision,
     }
 }
 
@@ -38739,6 +38887,11 @@ library = "test"
                 context_epoch: 0,
             },
             provider_turn_id: "provider-turn".to_owned(),
+            pricing: None,
+            catalog_provider_id: None,
+            catalog_entry_id: None,
+            catalog_family: None,
+            catalog_api_surface: None,
             reuse_key: Some("reuse-key".to_owned()),
             request_message_count: 4,
             context_through_sequence: 7,
@@ -45040,14 +45193,18 @@ library = "test"
 
     #[test]
     fn session_token_usage_preserves_normalized_fields() {
-        let usage = session_token_usage(&TokenUsage {
-            input_tokens: Some(10),
-            output_tokens: Some(5),
-            total_tokens: Some(15),
-            cached_input_tokens: Some(3),
-            cache_write_input_tokens: Some(4),
-            reasoning_tokens: Some(2),
-        });
+        let usage = session_token_usage(
+            &TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                total_tokens: Some(15),
+                cached_input_tokens: Some(3),
+                cache_write_input_tokens: Some(4),
+                reasoning_tokens: Some(2),
+                ..TokenUsage::default()
+            },
+            None,
+        );
 
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(5));
@@ -45055,6 +45212,19 @@ library = "test"
         assert_eq!(usage.cached_input_tokens, Some(3));
         assert_eq!(usage.cache_write_input_tokens, Some(4));
         assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(usage.pricing_context.request_input_tokens, None);
+        assert!(usage.pricing_usage_details.is_empty());
+        assert_eq!(
+            usage.cost,
+            Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                reason:
+                    bcode_session_models::SessionCostUnavailableReason::RequestIdentityUnavailable,
+            })
+        );
+        assert!(!usage.terminal);
+        usage
+            .validate()
+            .expect("degraded usage remains persistable");
     }
 
     #[test]
@@ -48093,6 +48263,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     context_epoch: 0,
                 },
                 provider_turn_id: "provider-active-turn".to_owned(),
+                pricing: None,
+                catalog_provider_id: None,
+                catalog_entry_id: None,
+                catalog_family: None,
+                catalog_api_surface: None,
                 reuse_key: None,
                 request_message_count: 1,
                 context_through_sequence: 1,
@@ -53592,6 +53767,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             requested_model_id: Some("us.anthropic.claude-opus-5-v1:0".to_string()),
             model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
+            pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
                 provider_id: "bedrock".to_string(),
@@ -53664,6 +53840,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             requested_model_id: None,
             model_id: "anthropic.claude-opus-5".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
+            pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
                 provider_id: "bedrock".to_string(),
@@ -64619,6 +64796,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             requested_model_id: None,
             model_id: "model".to_owned(),
             provider_context: bcode_model::ProviderRequestContext::default(),
+            pricing: None,
             catalog_provider_id: None,
             catalog_identity: None,
         };

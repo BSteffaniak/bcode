@@ -550,6 +550,12 @@ impl ProviderEventValidator {
         &mut self,
         usage: &bcode_model::TokenUsage,
     ) -> Result<(), ProviderConformanceError> {
+        if self.usage_events > 0 {
+            return violation(
+                BASE_TURN,
+                "provider emitted more than one cumulative usage snapshot for one request",
+            );
+        }
         if let (Some(total), Some(input), Some(output)) =
             (usage.total_tokens, usage.input_tokens, usage.output_tokens)
             && total < input.saturating_add(output)
@@ -559,13 +565,58 @@ impl ProviderEventValidator {
                 "total token usage is smaller than input plus output usage",
             );
         }
-        if let (Some(input), Some(cached)) = (usage.input_tokens, usage.cached_input_tokens)
-            && cached > input
+        if (usage.cached_input_tokens.is_some() || usage.cache_write_input_tokens.is_some())
+            && usage.pricing_context.request_input_tokens.is_none()
         {
             return violation(
                 BASE_TURN,
-                "cached input token usage exceeds total input token usage",
+                "cache usage requires complete request input semantics",
             );
+        }
+        if let Some(request_input) = usage.pricing_context.request_input_tokens {
+            let input = u64::from(usage.input_tokens.unwrap_or_default());
+            let cached = u64::from(usage.cached_input_tokens.unwrap_or_default());
+            let cache_write = u64::from(usage.cache_write_input_tokens.unwrap_or_default());
+            if request_input < input || request_input < cached || request_input < cache_write {
+                return violation(
+                    BASE_TURN,
+                    "complete request input is smaller than a reported input usage bucket",
+                );
+            }
+        }
+        if usage.details.iter().any(|detail| detail.tokens == 0) {
+            return violation(BASE_TURN, "detailed usage contains an empty token bucket");
+        }
+        let mut detail_totals = BTreeMap::new();
+        let mut detail_identities = BTreeSet::new();
+        for detail in &usage.details {
+            if !detail_identities.insert((detail.bucket, detail.modality, detail.cache_ttl_seconds))
+            {
+                return violation(BASE_TURN, "detailed usage repeats a priced bucket");
+            }
+            let total = detail_totals.entry(detail.bucket).or_insert(0_u32);
+            *total = total.saturating_add(detail.tokens);
+        }
+        for (bucket, reported) in [
+            (bcode_model::ModelPricingBucket::Input, usage.input_tokens),
+            (
+                bcode_model::ModelPricingBucket::CacheReadInput,
+                usage.cached_input_tokens,
+            ),
+            (
+                bcode_model::ModelPricingBucket::CacheWriteInput,
+                usage.cache_write_input_tokens,
+            ),
+            (bcode_model::ModelPricingBucket::Output, usage.output_tokens),
+        ] {
+            if let Some(detail_total) = detail_totals.get(&bucket)
+                && reported.is_none_or(|reported| *detail_total > reported)
+            {
+                return violation(
+                    BASE_TURN,
+                    "detailed usage exceeds or lacks its aggregate token bucket",
+                );
+            }
         }
         self.usage_events += 1;
         Ok(())
@@ -1685,6 +1736,140 @@ mod tests {
         let summary = validator.finish().expect("valid terminal state");
         assert_eq!(summary.stop_reason, StopReason::EndTurn);
         assert_eq!(summary.usage_events, 1);
+    }
+
+    #[test]
+    fn validator_rejects_contradictory_complete_request_input() {
+        let mut validator = ProviderEventValidator::default();
+        let error = validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: Some(20),
+                        cached_input_tokens: Some(10),
+                        pricing_context: Box::new(bcode_model::ModelPricingContext {
+                            request_input_tokens: Some(19),
+                            ..bcode_model::ModelPricingContext::default()
+                        }),
+                        ..TokenUsage::default()
+                    },
+                },
+            ])
+            .expect_err("contradictory request input must fail conformance");
+        assert!(error.to_string().contains("complete request input"));
+    }
+
+    #[test]
+    fn validator_accepts_native_separate_cache_buckets() {
+        let mut validator = ProviderEventValidator::default();
+        validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: Some(5),
+                        cached_input_tokens: Some(10),
+                        cache_write_input_tokens: Some(7),
+                        pricing_context: Box::new(bcode_model::ModelPricingContext {
+                            request_input_tokens: Some(22),
+                            ..bcode_model::ModelPricingContext::default()
+                        }),
+                        ..TokenUsage::default()
+                    },
+                },
+            ])
+            .expect("separate native cache buckets are valid with complete request input");
+    }
+
+    #[test]
+    fn validator_rejects_cache_usage_without_complete_request_input() {
+        let mut validator = ProviderEventValidator::default();
+        let error = validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: Some(5),
+                        cached_input_tokens: Some(10),
+                        ..TokenUsage::default()
+                    },
+                },
+            ])
+            .expect_err("cache semantics require complete request input");
+        assert!(error.to_string().contains("complete request input"));
+    }
+
+    #[test]
+    fn validator_rejects_incoherent_detailed_modality_usage() {
+        let mut validator = ProviderEventValidator::default();
+        let error = validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: Some(5),
+                        details: vec![bcode_model::ModelTokenUsageDetail {
+                            bucket: bcode_model::ModelPricingBucket::Input,
+                            modality: bcode_model::ModelTokenModality::Audio,
+                            tokens: 6,
+                            cache_ttl_seconds: None,
+                        }]
+                        .into_boxed_slice(),
+                        ..TokenUsage::default()
+                    },
+                },
+            ])
+            .expect_err("modality detail cannot exceed aggregate usage");
+        assert!(error.to_string().contains("detailed usage"));
+    }
+
+    #[test]
+    fn validator_accepts_coherent_detailed_modality_usage() {
+        let mut validator = ProviderEventValidator::default();
+        validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: Some(8),
+                        details: vec![
+                            bcode_model::ModelTokenUsageDetail {
+                                bucket: bcode_model::ModelPricingBucket::Input,
+                                modality: bcode_model::ModelTokenModality::Text,
+                                tokens: 5,
+                                cache_ttl_seconds: None,
+                            },
+                            bcode_model::ModelTokenUsageDetail {
+                                bucket: bcode_model::ModelPricingBucket::Input,
+                                modality: bcode_model::ModelTokenModality::Audio,
+                                tokens: 3,
+                                cache_ttl_seconds: None,
+                            },
+                        ]
+                        .into_boxed_slice(),
+                        ..TokenUsage::default()
+                    },
+                },
+            ])
+            .expect("coherent modality detail is valid");
+    }
+
+    #[test]
+    fn validator_rejects_multiple_usage_snapshots_for_one_request() {
+        let mut validator = ProviderEventValidator::default();
+        let error = validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage::default(),
+                },
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage::default(),
+                },
+            ])
+            .expect_err("multiple cumulative snapshots must be normalized by the provider");
+        assert!(error.to_string().contains("more than one cumulative usage"));
     }
 
     #[test]

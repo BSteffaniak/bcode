@@ -433,6 +433,8 @@ pub struct SessionView {
         BTreeMap<TranscriptViewItemId, bcode_session_models::TextStreamUpdate>,
     streaming_presentation_policy: StreamingPresentationPolicy,
     pending_text_presentations: BTreeMap<TranscriptViewItemId, PendingTextPresentation>,
+    usage_by_request: BTreeMap<String, bcode_session_models::SessionTokenUsage>,
+    unattributed_metered_tokens: u64,
 }
 
 impl Default for SessionView {
@@ -458,6 +460,8 @@ impl SessionView {
             last_text_stream_updates: BTreeMap::new(),
             streaming_presentation_policy: StreamingPresentationPolicy::immediate(),
             pending_text_presentations: BTreeMap::new(),
+            usage_by_request: BTreeMap::new(),
+            unattributed_metered_tokens: 0,
         }
     }
 
@@ -980,6 +984,8 @@ impl SessionView {
         replacement.snapshot.composer = previous.composer;
         replacement.snapshot.thinking = previous.thinking;
         replacement.snapshot.runtime = previous.runtime;
+        replacement.usage_by_request = self.usage_by_request.clone();
+        replacement.unattributed_metered_tokens = self.unattributed_metered_tokens;
         replacement.snapshot.session_summary = previous.session_summary;
         replacement.snapshot.transcript.source_start_sequence =
             previous.transcript.source_start_sequence;
@@ -1580,14 +1586,48 @@ impl SessionView {
                 }
             }
             SessionEventKind::ModelUsage { turn_id: _, usage } => {
-                if let Some(tokens) = usage.metered_total_tokens() {
-                    self.snapshot.runtime.cumulative_metered_tokens = self
-                        .snapshot
-                        .runtime
-                        .cumulative_metered_tokens
-                        .saturating_add(u64::from(tokens));
+                let mut accepted = true;
+                if let Some(request_id) = &usage.request_id {
+                    accepted = self.usage_by_request.get(request_id).is_none_or(|current| {
+                        !current.terminal
+                            && (usage.observation_ordinal > current.observation_ordinal
+                                || (usage.observation_ordinal == current.observation_ordinal
+                                    && usage == current))
+                    });
+                    if accepted {
+                        self.usage_by_request
+                            .insert(request_id.clone(), usage.clone());
+                    }
+                    self.snapshot.runtime.cumulative_metered_tokens =
+                        self.unattributed_metered_tokens.saturating_add(
+                            self.usage_by_request
+                                .values()
+                                .filter_map(
+                                    bcode_session_models::SessionTokenUsage::metered_total_tokens,
+                                )
+                                .map(u64::from)
+                                .fold(0_u64, u64::saturating_add),
+                        );
+                    self.snapshot.runtime.cost =
+                        bcode_session_view_models::SessionCostSummary::rebuild(
+                            self.usage_by_request.values(),
+                        );
+                } else {
+                    if let Some(tokens) = usage.metered_total_tokens() {
+                        self.unattributed_metered_tokens = self
+                            .unattributed_metered_tokens
+                            .saturating_add(u64::from(tokens));
+                        self.snapshot.runtime.cumulative_metered_tokens = self
+                            .snapshot
+                            .runtime
+                            .cumulative_metered_tokens
+                            .saturating_add(u64::from(tokens));
+                    }
+                    self.snapshot.runtime.cost.observe(usage);
                 }
-                self.snapshot.runtime.latest_usage = Some(usage.clone());
+                if accepted {
+                    self.snapshot.runtime.latest_usage = Some(usage.clone());
+                }
                 self.bump_revision();
             }
             SessionEventKind::ContextCompacted { summary, .. } => {
@@ -5498,6 +5538,135 @@ mod tests {
             },
         ));
         assert_eq!(transcript_item_text(view.snapshot(), &id), Some("complete"));
+    }
+
+    #[test]
+    fn request_keyed_cost_projection_replaces_usage_and_separates_currencies() {
+        let session_id = SessionId::new();
+        let usage =
+            |request_id: &str, currency: &str, revision: &str, total_micros| SessionTokenUsage {
+                observation_id: Some(format!("{request_id}:{total_micros}")),
+                observation_ordinal: u32::try_from(total_micros).expect("fixture ordinal"),
+                request_id: Some(request_id.to_string()),
+                cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                    currency: currency.to_string(),
+                    total_micros,
+                    components: Vec::new(),
+                    source: "fixture".to_string(),
+                    revision: Some(revision.to_string()),
+                }),
+                ..SessionTokenUsage::default()
+            };
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_string(),
+                usage: usage("request-1", "USD", "catalog-v1", 10),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_string(),
+                usage: usage("request-1", "USD", "catalog-v1", 15),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-2".to_string(),
+                usage: usage("request-2", "EUR", "catalog-v2", 20),
+            },
+        ));
+
+        assert_eq!(view.snapshot().runtime.cost.totals_micros["USD"], 15);
+        assert_eq!(view.snapshot().runtime.cost.totals_micros["EUR"], 20);
+        assert_eq!(view.snapshot().runtime.cost.estimated_usage_count, 2);
+        let revisions = view
+            .usage_by_request
+            .values()
+            .filter_map(|usage| match usage.cost.as_ref() {
+                Some(bcode_session_models::SessionCostEstimate::Estimated { revision, .. }) => {
+                    revision.as_deref()
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(revisions, BTreeSet::from(["catalog-v1", "catalog-v2"]));
+        assert_eq!(view.snapshot().runtime.cumulative_metered_tokens, 0);
+    }
+
+    #[test]
+    fn conflicting_duplicate_usage_observation_is_rejected() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for (sequence, tokens) in [(1, 10), (2, 30)] {
+            view.apply_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn-1".to_string(),
+                    usage: SessionTokenUsage {
+                        request_id: Some("request-1".to_string()),
+                        observation_id: Some("request-1:0".to_string()),
+                        observation_ordinal: 0,
+                        total_tokens: Some(tokens),
+                        ..SessionTokenUsage::default()
+                    },
+                },
+            ));
+        }
+
+        assert_eq!(view.snapshot().runtime.cumulative_metered_tokens, 10);
+        assert_eq!(
+            view.snapshot()
+                .runtime
+                .latest_usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn terminal_request_usage_is_absorbing_and_cumulative_tokens_are_replaced() {
+        let session_id = SessionId::new();
+        let usage = |ordinal, terminal, total_tokens| SessionTokenUsage {
+            request_id: Some("request-1".to_string()),
+            observation_id: Some(format!("request-1:{ordinal}")),
+            observation_ordinal: ordinal,
+            terminal,
+            total_tokens: Some(total_tokens),
+            ..SessionTokenUsage::default()
+        };
+        let mut view = SessionView::new();
+        for (sequence, item) in [usage(0, false, 10), usage(1, true, 15), usage(2, false, 30)]
+            .into_iter()
+            .enumerate()
+        {
+            view.apply_event(&event(
+                session_id,
+                u64::try_from(sequence + 1).expect("sequence"),
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn-1".to_string(),
+                    usage: item,
+                },
+            ));
+        }
+
+        assert_eq!(view.snapshot().runtime.cumulative_metered_tokens, 15);
+        assert_eq!(
+            view.snapshot()
+                .runtime
+                .latest_usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(15)
+        );
     }
 
     fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {

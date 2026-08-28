@@ -1589,6 +1589,7 @@ impl BmuxApp {
                 .snapshot()
                 .runtime
                 .cumulative_metered_tokens,
+            &self.session_view.snapshot().runtime.cost,
         )
     }
 
@@ -4543,7 +4544,6 @@ fn tool_request_status(arguments_json: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TokenUsageMeter {
-    session_cost_micros: Option<u64>,
     latest_cached_input_tokens: Option<u32>,
     latest_cache_write_input_tokens: Option<u32>,
     provider_reuse_active: bool,
@@ -4552,37 +4552,10 @@ struct TokenUsageMeter {
     latest_prompt_cache_points: Option<usize>,
     context_window: Option<u32>,
     proactive_compaction_target: Option<u64>,
-    pricing: Option<bcode_model::ModelPricingInfo>,
 }
 
 impl TokenUsageMeter {
     fn absorb(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
-        if let Some(cost) = usage.estimated_cost_micros {
-            self.session_cost_micros = Some(
-                self.session_cost_micros
-                    .unwrap_or_default()
-                    .saturating_add(cost),
-            );
-        } else if let Some(pricing) = &self.pricing {
-            let usage = bcode_model::TokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                total_tokens: usage.total_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                cache_write_input_tokens: usage.cache_write_input_tokens,
-                details: Box::default(),
-                pricing_context: serde_json::from_value(serde_json::json!(usage.pricing_context))
-                    .unwrap_or_default(),
-                reasoning_tokens: usage.reasoning_tokens,
-            };
-            if let Some(cost) = pricing.estimate_cost(&usage) {
-                self.session_cost_micros = Some(
-                    self.session_cost_micros
-                        .unwrap_or_default()
-                        .saturating_add(cost.total_micros),
-                );
-            }
-        }
         self.latest_cached_input_tokens = usage.cached_input_tokens;
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
@@ -4590,7 +4563,6 @@ impl TokenUsageMeter {
     fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
         if let Some(model) = model {
             self.context_window = model.context_window;
-            self.pricing.clone_from(&model.pricing);
         }
     }
 
@@ -4599,7 +4571,6 @@ impl TokenUsageMeter {
         self.latest_cache_write_input_tokens = None;
         self.context_window = None;
         self.proactive_compaction_target = None;
-        self.pricing = None;
     }
 
     const fn apply_model_request(
@@ -4619,6 +4590,7 @@ impl TokenUsageMeter {
         &self,
         occupancy: Option<&bcode_session_models::RequestContextOccupancy>,
         cumulative_metered_tokens: u64,
+        cost: &bcode_session_view_models::SessionCostSummary,
     ) -> String {
         let mut parts = vec![self.context_summary(occupancy)];
         if self.provider_reuse_active {
@@ -4653,8 +4625,18 @@ impl TokenUsageMeter {
             "spent {} tok",
             compact_u64(cumulative_metered_tokens)
         ));
-        if let Some(cost_micros) = self.session_cost_micros {
-            parts.push(format!("~{}", format_usd_micros(cost_micros)));
+        for (currency, cost_micros) in &cost.totals_micros {
+            if currency == "USD" {
+                parts.push(format!("~{}", format_usd_micros(*cost_micros)));
+            } else {
+                parts.push(format!(
+                    "~{currency} {:.6}",
+                    *cost_micros as f64 / 1_000_000.0
+                ));
+            }
+        }
+        if cost.unavailable_usage_count > 0 {
+            parts.push("cost partial".to_string());
         }
         parts.join(" · ")
     }

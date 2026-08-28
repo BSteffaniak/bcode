@@ -1925,24 +1925,32 @@ struct OpenAiUsage {
 struct OpenAiPromptTokenDetails {
     #[serde(default)]
     cached_tokens: Option<u32>,
+    #[serde(default)]
+    audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiCompletionTokenDetails {
     #[serde(default)]
     reasoning_tokens: Option<u32>,
+    #[serde(default)]
+    audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiInputTokenDetails {
     #[serde(default)]
     cached_tokens: Option<u32>,
+    #[serde(default)]
+    audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiOutputTokenDetails {
     #[serde(default)]
     reasoning_tokens: Option<u32>,
+    #[serde(default)]
+    audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5044,50 +5052,71 @@ fn token_usage_from_openai_usage_with_context(
     let service_tier = usage.service_tier.or(context.service_tier);
     let cached_input_tokens = usage
         .prompt_tokens_details
+        .as_ref()
         .and_then(|details| details.cached_tokens)
         .or_else(|| {
             usage
                 .input_tokens_details
+                .as_ref()
                 .and_then(|details| details.cached_tokens)
         });
     let reasoning_tokens = usage
         .completion_tokens_details
+        .as_ref()
         .and_then(|details| details.reasoning_tokens)
         .or_else(|| {
             usage
                 .output_tokens_details
+                .as_ref()
                 .and_then(|details| details.reasoning_tokens)
         });
+    let input_audio_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.audio_tokens)
+        .or_else(|| {
+            usage
+                .input_tokens_details
+                .as_ref()
+                .and_then(|details| details.audio_tokens)
+        });
+    let output_audio_tokens = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.audio_tokens)
+        .or_else(|| {
+            usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.audio_tokens)
+        });
     let input_tokens = usage.prompt_tokens.or(usage.input_tokens);
+    // OpenAI Chat Completions `prompt_tokens` and Responses `input_tokens` are totals that already
+    // include cached tokens. Cached details are a billed subset, not additional model-visible
+    // input, across both native OpenAI and compatible surfaces using this contract.
     let total_tokens = usage.total_tokens;
+    let output_tokens = usage.completion_tokens.or(usage.output_tokens);
+    let details = openai_modality_usage_details(
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        input_audio_tokens,
+        output_audio_tokens,
+    );
     TokenUsage {
         input_tokens,
-        output_tokens: usage.completion_tokens.or(usage.output_tokens),
+        output_tokens,
         total_tokens,
         cached_input_tokens,
         cache_write_input_tokens: None,
-        details: Box::default(),
+        details,
         pricing_context: Box::new(bcode_model::ModelPricingContext {
-            service_tier: service_tier.map(|tier| {
-                if tier == "default" {
-                    "standard".to_string()
-                } else {
-                    tier
-                }
-            }),
+            service_tier: service_tier.map(|tier| bcode_model::normalize_model_service_tier(&tier)),
             invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
-            billing_scope: context.model.as_deref().map(|model| {
-                if model.starts_with("global.") {
-                    "global".to_string()
-                } else if model
-                    .split_once('.')
-                    .is_some_and(|(prefix, _)| matches!(prefix, "us" | "eu" | "apac" | "in"))
-                {
-                    "geo".to_string()
-                } else {
-                    "in_region".to_string()
-                }
-            }),
+            billing_scope: context
+                .model
+                .as_deref()
+                .map(bcode_model::model_billing_scope_from_effective_id),
             request_input_tokens: input_tokens.map(u64::from),
             cache_ttl_seconds: context
                 .prompt_cache_retention
@@ -5099,6 +5128,68 @@ fn token_usage_from_openai_usage_with_context(
         }),
         reasoning_tokens,
     }
+}
+
+fn openai_modality_usage_details(
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cached_input_tokens: Option<u32>,
+    input_audio_tokens: Option<u32>,
+    output_audio_tokens: Option<u32>,
+) -> Box<[bcode_model::ModelTokenUsageDetail]> {
+    if input_audio_tokens.is_none() && output_audio_tokens.is_none() {
+        return Box::default();
+    }
+    let cached = cached_input_tokens.unwrap_or_default();
+    let input_audio = input_audio_tokens
+        .unwrap_or_default()
+        .min(input_tokens.unwrap_or_default());
+    let output_audio = output_audio_tokens
+        .unwrap_or_default()
+        .min(output_tokens.unwrap_or_default());
+    let mut details = Vec::new();
+    for (bucket, modality, tokens) in [
+        (
+            bcode_model::ModelPricingBucket::Input,
+            bcode_model::ModelTokenModality::Text,
+            input_tokens
+                .unwrap_or_default()
+                .saturating_sub(cached)
+                .saturating_sub(input_audio),
+        ),
+        (
+            bcode_model::ModelPricingBucket::Input,
+            bcode_model::ModelTokenModality::Audio,
+            input_audio,
+        ),
+        (
+            bcode_model::ModelPricingBucket::CacheReadInput,
+            bcode_model::ModelTokenModality::Text,
+            cached,
+        ),
+        (
+            bcode_model::ModelPricingBucket::Output,
+            bcode_model::ModelTokenModality::Text,
+            output_tokens
+                .unwrap_or_default()
+                .saturating_sub(output_audio),
+        ),
+        (
+            bcode_model::ModelPricingBucket::Output,
+            bcode_model::ModelTokenModality::Audio,
+            output_audio,
+        ),
+    ] {
+        if tokens > 0 {
+            details.push(bcode_model::ModelTokenUsageDetail {
+                bucket,
+                modality,
+                tokens,
+                cache_ttl_seconds: None,
+            });
+        }
+    }
+    details.into_boxed_slice()
 }
 
 fn openai_usage_from_responses_event(event: &serde_json::Value) -> Option<OpenAiUsage> {
@@ -6538,9 +6629,24 @@ fn pricing_from_provider_api(
         output,
         context_threshold_tokens: None,
         rules: Vec::new(),
-        revision: None,
+        revision: provider_api_pricing_revision(metadata),
         source: ModelPricingSource::ProviderApi,
     })
+}
+
+fn provider_api_pricing_revision(metadata: &BTreeMap<String, serde_json::Value>) -> Option<String> {
+    [
+        "pricing_revision",
+        "pricingRevision",
+        "pricing_version",
+        "pricingVersion",
+        "pricing_effective_at",
+        "pricingEffectiveAt",
+    ]
+    .into_iter()
+    .find_map(|key| metadata.get(key).and_then(serde_json::Value::as_str))
+    .filter(|revision| !revision.trim().is_empty())
+    .map(ToOwned::to_owned)
 }
 
 fn provider_api_context_window(metadata: &BTreeMap<String, serde_json::Value>) -> Option<u32> {
@@ -8706,6 +8812,30 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_api_pricing_preserves_provider_owned_revision() {
+        let metadata = BTreeMap::from([
+            (
+                "input_price_micros".to_string(),
+                serde_json::json!(3_000_000),
+            ),
+            (
+                "output_price_micros".to_string(),
+                serde_json::json!(15_000_000),
+            ),
+            (
+                "pricing_effective_at".to_string(),
+                serde_json::json!("2026-08-28"),
+            ),
+        ]);
+
+        let pricing = pricing_from_provider_api(&metadata).expect("pricing");
+
+        assert_eq!(pricing.source, ModelPricingSource::ProviderApi);
+        assert_eq!(pricing.revision.as_deref(), Some("2026-08-28"));
+    }
+
     use bcode_model_provider_runtime::{
         BlockingModelProviderInvoker, ProviderConformanceOptions, ProviderConformanceOutcome,
         run_provider_conformance_suite,
@@ -10627,8 +10757,8 @@ mod tests {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "total_tokens": 15,
-                "prompt_tokens_details": { "cached_tokens": 3 },
-                "completion_tokens_details": { "reasoning_tokens": 2 }
+                "prompt_tokens_details": { "cached_tokens": 3, "audio_tokens": 2 },
+                "completion_tokens_details": { "reasoning_tokens": 2, "audio_tokens": 1 }
             }"#,
         )
         .expect("usage should decode");
@@ -10639,6 +10769,17 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(15));
         assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.pricing_context.request_input_tokens, Some(10));
+        assert!(usage.details.iter().any(|detail| {
+            detail.modality == bcode_model::ModelTokenModality::Audio
+                && detail.bucket == bcode_model::ModelPricingBucket::Input
+                && detail.tokens == 2
+        }));
+        assert!(usage.details.iter().any(|detail| {
+            detail.modality == bcode_model::ModelTokenModality::Audio
+                && detail.bucket == bcode_model::ModelPricingBucket::Output
+                && detail.tokens == 1
+        }));
         assert_eq!(usage.reasoning_tokens, Some(2));
     }
 
@@ -10664,6 +10805,7 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(7));
         assert_eq!(usage.total_tokens, Some(27));
         assert_eq!(usage.cached_input_tokens, Some(4));
+        assert_eq!(usage.pricing_context.request_input_tokens, Some(20));
         assert_eq!(usage.reasoning_tokens, Some(6));
     }
 

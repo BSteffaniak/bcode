@@ -1231,7 +1231,7 @@ fn pricing_from_catalog(
         output: pricing.output_micros.map(ModelTokenPrice::from_micros),
         context_threshold_tokens: pricing.context_threshold_tokens,
         rules: catalog_pricing_rules(pricing),
-        revision: None,
+        revision: pricing.revision.clone(),
         source: if remote {
             ModelPricingSource::RemoteCatalog
         } else {
@@ -1399,6 +1399,7 @@ pub fn load_embedded_catalog() -> Result<CatalogDocument> {
         insert_provider_catalog(&mut catalog, provider, name)?;
     }
 
+    stamp_missing_pricing_revisions(&mut catalog);
     validate_catalog(&catalog)?;
     Ok(catalog)
 }
@@ -1425,8 +1426,29 @@ pub fn load_catalog(source_dir: &Path) -> Result<CatalogDocument> {
         insert_provider_catalog(&mut catalog, provider, &source)?;
     }
 
+    stamp_missing_pricing_revisions(&mut catalog);
     validate_catalog(&catalog)?;
     Ok(catalog)
+}
+
+fn stamp_missing_pricing_revisions(catalog: &mut CatalogDocument) {
+    let revision = catalog.catalog_revision.clone();
+    for provider in catalog.providers.values_mut() {
+        for entry in provider.models.values_mut() {
+            if let Some(pricing) = &mut entry.pricing
+                && pricing.revision.is_none()
+            {
+                pricing.revision = Some(revision.clone());
+            }
+            for deployment in &mut entry.deployments {
+                if let Some(pricing) = &mut deployment.pricing
+                    && pricing.revision.is_none()
+                {
+                    pricing.revision = Some(revision.clone());
+                }
+            }
+        }
+    }
 }
 
 fn parse_provider_catalog(contents: &str, source: &str) -> Result<ProviderCatalog> {
@@ -2469,11 +2491,81 @@ status = "stable"
     #[test]
     fn catalog_alias_prefixes_match_model_variants() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let canonical = catalog
+            .enrich_model("openai", test_model_info("gpt-4o"))
+            .pricing
+            .expect("canonical pricing");
+        let aliased = catalog
+            .enrich_model("openai", test_model_info("gpt-4o-2024-08-06"))
+            .pricing
+            .expect("alias pricing");
         let entry = catalog
             .model("openai", "gpt-4o-2024-08-06")
             .expect("alias should resolve");
 
         assert_eq!(entry.model_id, "gpt-4o");
+        assert_eq!(aliased, canonical);
+    }
+
+    #[test]
+    fn bedrock_region_prefixed_ids_resolve_to_the_same_catalog_price() {
+        let mut document = ModelCatalog::load_bundled()
+            .expect("catalog should load")
+            .document()
+            .clone();
+        let provider = document.providers.get_mut("bedrock").expect("bedrock");
+        let entry = provider
+            .models
+            .get_mut("anthropic.claude-sonnet-4")
+            .expect("sonnet family");
+        entry.pricing = Some(CatalogPricing {
+            currency: "USD".to_string(),
+            unit: bcode_model_catalog_models::CatalogPricingUnit::PerMillionTokens,
+            input_micros: Some(3_000_000),
+            cached_input_micros: None,
+            cache_write_input_micros: None,
+            output_micros: Some(15_000_000),
+            context_threshold_tokens: None,
+            revision: Some("test-revision".to_string()),
+            rules: Vec::new(),
+        });
+        let catalog = ModelCatalog::new(document);
+
+        let canonical = catalog
+            .enrich_model(
+                "bedrock",
+                test_model_info("anthropic.claude-sonnet-4-20250514-v1:0"),
+            )
+            .pricing
+            .expect("canonical pricing");
+        let regional = catalog
+            .enrich_model(
+                "bedrock",
+                test_model_info("us.anthropic.claude-sonnet-4-20250514-v1:0"),
+            )
+            .pricing
+            .expect("regional pricing");
+
+        assert_eq!(regional, canonical);
+    }
+
+    fn test_model_info(model_id: &str) -> bcode_model::ModelInfo {
+        bcode_model::ModelInfo {
+            model_id: model_id.to_string(),
+            display_name: model_id.to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            max_image_input_base64_bytes: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        }
     }
 
     #[test]
@@ -2939,6 +3031,21 @@ status = "stable"
     }
 
     #[test]
+    fn embedded_pricing_uses_bundled_catalog_revision() {
+        let document = load_embedded_catalog().expect("embedded catalog should load");
+        let revision = document.catalog_revision.clone();
+        let catalog = ModelCatalog::new(document);
+        let pricing = catalog
+            .provider_models_as_model_info("openai")
+            .into_iter()
+            .find_map(|model| model.pricing)
+            .expect("bundled OpenAI pricing exists");
+
+        assert_eq!(pricing.source, ModelPricingSource::BundledCatalog);
+        assert_eq!(pricing.revision, Some(revision));
+    }
+
+    #[test]
     fn overlay_marks_remote_models_and_remote_values_take_precedence() {
         let mut local = load_embedded_catalog().expect("embedded catalog should load");
         let mut remote = CatalogDocument::empty("remote", "2026-01-01T00:00:00Z");
@@ -2951,7 +3058,9 @@ status = "stable"
         let entry = provider.models.get_mut("gpt-5.6-sol").expect("sol exists");
         entry.display_name = "Remote Sol".to_string();
         entry.context_window = Some(999_999);
-        entry.pricing.as_mut().expect("pricing exists").input_micros = Some(42);
+        let pricing = entry.pricing.as_mut().expect("pricing exists");
+        pricing.input_micros = Some(42);
+        pricing.revision = None;
         remote.providers.insert("openai".to_string(), provider);
 
         overlay_remote_catalog(&mut local, &remote);
@@ -2983,8 +3092,12 @@ status = "stable"
             Some(ModelMetadataSource::RemoteCatalog)
         );
         assert_eq!(
-            model.pricing.map(|pricing| pricing.source),
+            model.pricing.as_ref().map(|pricing| pricing.source),
             Some(ModelPricingSource::RemoteCatalog)
+        );
+        assert_eq!(
+            model.pricing.and_then(|pricing| pricing.revision),
+            Some("remote".to_string())
         );
     }
 
@@ -3104,6 +3217,44 @@ status = "stable"
     }
 
     #[test]
+    fn target_specific_pricing_precedes_model_pricing_and_keeps_revision() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let revision = document.catalog_revision.clone();
+        let entry = document
+            .providers
+            .get_mut("openai")
+            .and_then(|provider| provider.models.get_mut("gpt-5.6-sol"))
+            .expect("Sol entry");
+        let deployment = entry
+            .deployments
+            .iter_mut()
+            .find(|deployment| deployment.target.api_surface == "chatgpt_codex")
+            .expect("ChatGPT deployment");
+        let mut deployment_pricing = entry.pricing.clone().expect("model pricing");
+        deployment_pricing.input_micros = Some(123);
+        deployment_pricing.revision = Some("deployment-v1".to_string());
+        deployment.pricing = Some(deployment_pricing);
+        let catalog = ModelCatalog::new(document);
+        let target = ModelSupportTarget::new(
+            "openai",
+            "chatgpt_subscription",
+            "chatgpt_codex",
+            Some("bcode"),
+        );
+
+        let resolved = catalog
+            .provider_models_for_support_target("openai", &target, false)
+            .into_iter()
+            .find(|model| model.model_id == "gpt-5.6-sol")
+            .expect("resolved Sol");
+        let pricing = resolved.pricing.expect("resolved pricing");
+
+        assert_eq!(pricing.input.map(|price| price.micros), Some(123));
+        assert_eq!(pricing.revision.as_deref(), Some("deployment-v1"));
+        assert_ne!(pricing.revision.as_deref(), Some(revision.as_str()));
+    }
+
+    #[test]
     fn target_enrichment_preserves_provider_limits_and_uses_deployment_fallback() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let target = ModelSupportTarget::new(
@@ -3201,6 +3352,7 @@ status = "stable"
             cache_write_input_micros: None,
             output_micros: Some(15_000_000),
             context_threshold_tokens: None,
+            revision: None,
             rules: Vec::new(),
         };
         document

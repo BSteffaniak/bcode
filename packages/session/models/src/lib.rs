@@ -2719,9 +2719,117 @@ pub enum ModelTurnOutcome {
     ProviderUnavailable,
 }
 
+/// Durable outcome of estimating one provider request's reported usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SessionCostEstimate {
+    /// Complete estimate with the exact normalized rates used for each component.
+    Estimated {
+        /// ISO 4217 currency code.
+        currency: String,
+        /// Total estimated cost in micros of `currency`.
+        total_micros: u64,
+        /// Independently priced components whose sum produces `total_micros`.
+        #[serde(default)]
+        components: Vec<SessionCostComponent>,
+        /// Normalized source label.
+        source: String,
+        /// Source revision, when available.
+        #[serde(default)]
+        revision: Option<String>,
+    },
+    /// Usage was preserved but could not be estimated completely and unambiguously.
+    Unavailable {
+        /// Typed, renderer-neutral reason.
+        reason: SessionCostUnavailableReason,
+    },
+}
+
+/// One durable component of an estimated provider-request cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCostComponent {
+    /// Normalized pricing bucket label.
+    pub bucket: String,
+    /// Optional normalized modality label.
+    #[serde(default)]
+    pub modality: Option<String>,
+    /// Provider-reported tokens charged by this component.
+    pub tokens: u32,
+    /// Applied price in currency micros per million tokens.
+    pub price_micros: u64,
+    /// Estimated component cost in currency micros.
+    pub cost_micros: u64,
+}
+
+/// Why a provider request's usage could not be estimated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCostUnavailableReason {
+    RequestIdentityUnavailable,
+    RequestPricingUnavailable,
+    ProviderUsageIncomplete,
+    RequiredPricingContextUnavailable,
+    DetailedUsageUnavailable,
+    PricingRuleUnavailableOrAmbiguous,
+    UnsupportedPricingUnit,
+    ConflictingUsage,
+}
+
+/// Session-owned normalized pricing context for one provider request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPricingContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u64>,
+}
+
+/// Session-owned normalized independently priced usage bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPricingUsageDetail {
+    pub bucket: String,
+    pub modality: String,
+    pub tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u64>,
+}
+
 /// Provider-neutral token usage persisted with a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTokenUsage {
+    /// Unique provider request-attempt identifier, when recorded by the current runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Stable identity of this cumulative usage observation within the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_id: Option<String>,
+    /// Monotonic cumulative observation ordinal within the request.
+    #[serde(default)]
+    pub observation_ordinal: u32,
+    /// Whether this observation is authoritative and cannot be superseded.
+    #[serde(default)]
+    pub terminal: bool,
+    /// Exact provider and model attribution for this usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Box<ModelRequestIdentity>>,
+    /// Stable catalog provider captured for this request attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_provider_id: Option<String>,
+    /// Stable catalog entry captured for this request attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_entry_id: Option<String>,
+    /// Catalog family captured for pricing provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_family: Option<String>,
+    /// Normalized deployment/API surface captured for pricing provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_api_surface: Option<String>,
     /// Tokens supplied to the model for this turn or provider round.
     #[serde(default)]
     pub input_tokens: Option<u32>,
@@ -2739,28 +2847,64 @@ pub struct SessionTokenUsage {
     pub cache_write_input_tokens: Option<u32>,
     /// Pricing context confirmed for this provider round.
     #[serde(default)]
-    pub pricing_context: BTreeMap<String, String>,
-    /// Detailed independently priced usage buckets serialized from the normalized model contract.
+    pub pricing_context: SessionPricingContext,
+    /// Detailed independently priced normalized usage buckets.
     #[serde(default)]
-    pub pricing_usage_details: Vec<serde_json::Value>,
-    /// Estimated cost fixed at the time this round was recorded.
-    #[serde(default)]
-    pub estimated_cost_micros: Option<u64>,
-    /// Currency for the fixed estimated cost.
-    #[serde(default)]
-    pub estimated_cost_currency: Option<String>,
-    /// Pricing-source label for the fixed estimate.
-    #[serde(default)]
-    pub estimated_cost_source: Option<String>,
-    /// Pricing revision used for the fixed estimate.
-    #[serde(default)]
-    pub estimated_cost_revision: Option<String>,
+    pub pricing_usage_details: Vec<SessionPricingUsageDetail>,
+    /// Durable request-time cost outcome, including normalized applied rates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<SessionCostEstimate>,
     /// Reasoning tokens reported separately by a provider, when available.
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
 }
 
 impl SessionTokenUsage {
+    /// Validate durable request attribution and cost arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request observation identity is incomplete, a non-terminal
+    /// observation omits its stable identity, or estimated component costs do not exactly sum to
+    /// the persisted total using checked arithmetic.
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.request_id, &self.observation_id) {
+            (Some(request_id), Some(observation_id))
+                if request_id.trim().is_empty() || observation_id.trim().is_empty() =>
+            {
+                return Err("request and observation identities must not be empty".to_string());
+            }
+            (Some(_), None) => {
+                return Err("request-attributed usage requires an observation identity".to_string());
+            }
+            (None, Some(_)) => {
+                return Err("observation identity requires a request identity".to_string());
+            }
+            (None, None) if self.terminal || self.observation_ordinal != 0 => {
+                return Err(
+                    "unattributed usage cannot declare observation lifecycle state".to_string(),
+                );
+            }
+            _ => {}
+        }
+        if let Some(SessionCostEstimate::Estimated {
+            total_micros,
+            components,
+            ..
+        }) = &self.cost
+        {
+            let sum = components.iter().try_fold(0_u64, |sum, component| {
+                sum.checked_add(component.cost_micros)
+            });
+            if sum != Some(*total_micros) {
+                return Err(
+                    "estimated cost components must exactly sum to total_micros".to_string()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Return the most reliable total token count for spend/session metering.
     #[must_use]
     pub fn metered_total_tokens(&self) -> Option<u32> {
@@ -4282,6 +4426,72 @@ mod tests {
         );
         assert_eq!(projections[0].started_at_ms, Some(100));
         assert_eq!(projections[0].finished_at_ms, None);
+    }
+
+    #[test]
+    fn session_usage_validation_rejects_incomplete_identity_and_invalid_cost_arithmetic() {
+        let incomplete = SessionTokenUsage {
+            request_id: Some("request-1".to_string()),
+            ..SessionTokenUsage::default()
+        };
+        assert!(incomplete.validate().is_err());
+
+        let overflow = SessionTokenUsage {
+            request_id: Some("request-1".to_string()),
+            observation_id: Some("request-1:usage".to_string()),
+            terminal: true,
+            cost: Some(SessionCostEstimate::Estimated {
+                currency: "USD".to_string(),
+                total_micros: u64::MAX,
+                components: vec![
+                    SessionCostComponent {
+                        bucket: "input".to_string(),
+                        modality: None,
+                        tokens: 1,
+                        price_micros: 1,
+                        cost_micros: u64::MAX,
+                    },
+                    SessionCostComponent {
+                        bucket: "output".to_string(),
+                        modality: None,
+                        tokens: 1,
+                        price_micros: 1,
+                        cost_micros: 1,
+                    },
+                ],
+                source: "fixture".to_string(),
+                revision: None,
+            }),
+            ..SessionTokenUsage::default()
+        };
+        assert!(overflow.validate().is_err());
+    }
+
+    #[test]
+    fn session_usage_serializes_only_typed_cost_outcome() {
+        let usage = SessionTokenUsage {
+            request_id: Some("request-1".to_string()),
+            observation_id: Some("request-1:usage".to_string()),
+            cost: Some(SessionCostEstimate::Estimated {
+                currency: "USD".to_string(),
+                total_micros: 15,
+                components: vec![SessionCostComponent {
+                    bucket: "input".to_string(),
+                    modality: None,
+                    tokens: 5,
+                    price_micros: 3_000_000,
+                    cost_micros: 15,
+                }],
+                source: "bundled_catalog".to_string(),
+                revision: Some("revision-1".to_string()),
+            }),
+            ..SessionTokenUsage::default()
+        };
+
+        let value = serde_json::to_value(&usage).expect("usage serializes");
+        assert!(value.get("estimated_cost_micros").is_none());
+        assert_eq!(value["cost"]["status"], "estimated");
+        assert_eq!(value["cost"]["components"][0]["price_micros"], 3_000_000);
     }
 
     #[test]

@@ -1295,6 +1295,38 @@ pub enum ModelPricingSource {
     Unknown,
 }
 
+/// Normalize a provider service-tier label to the model-catalog vocabulary.
+///
+/// Provider defaults (`default` and `auto`) are represented as `standard`. Other labels are
+/// trimmed and ASCII-lowercased so catalog rule matching is stable across provider wire formats.
+#[must_use]
+pub fn normalize_model_service_tier(service_tier: &str) -> String {
+    let normalized = service_tier.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "auto" | "default" => "standard".to_string(),
+        _ => normalized,
+    }
+}
+
+/// Resolve normalized billing scope from an authoritative effective provider model identifier.
+///
+/// Bedrock-style `global.` identifiers are global, supported geographic inference-profile prefixes
+/// are geo-scoped, and all other effective identifiers are in-region.
+#[must_use]
+pub fn model_billing_scope_from_effective_id(model_id: &str) -> String {
+    if model_id.starts_with("global.") {
+        "global"
+    } else if model_id
+        .split_once('.')
+        .is_some_and(|(prefix, _)| matches!(prefix, "us" | "eu" | "apac" | "in"))
+    {
+        "geo"
+    } else {
+        "in_region"
+    }
+    .to_string()
+}
+
 /// Estimated model-call cost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCostEstimate {
@@ -2963,6 +2995,11 @@ impl ExactRequestInputTokens {
 }
 
 /// Provider-neutral token usage metadata.
+///
+/// A [`ProviderTurnEvent::Usage`] carries one final cumulative usage snapshot for a single
+/// provider request. Provider integrations that receive intermediate or repeated usage reports
+/// must merge them before emission; hosts must not infer delta-versus-cumulative behavior from a
+/// provider identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Tokens supplied to the model for this turn or provider round.
@@ -3388,13 +3425,15 @@ pub enum ProviderErrorCategory {
 mod tests {
     use super::{
         ModelApiSurface, ModelCatalogPolicy, ModelCatalogSupportHint, ModelFeatureSupport,
-        ModelInfo, ModelList, ModelListAuthority, ModelParameterKey, ModelPricingInfo,
-        ModelPricingSource, ModelPricingUnit, ModelTokenPrice, ModelTurnRequest, ModelVisibility,
-        ModelVisibilitySource, NegotiatedFeatureSupport, ParallelToolCallCapabilities,
-        ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderOperationRequirement,
-        ProviderRequestContext, ProviderRequestExtension, ProviderTurnEvent, RequestedModelFeature,
-        StructuredOutputMode, TokenUsage, ToolCallRequestPolicy, ToolChoice, ToolChoiceMode,
-        ToolSchemaMode,
+        ModelInfo, ModelInvocationClass, ModelList, ModelListAuthority, ModelParameterKey,
+        ModelPricingBucket, ModelPricingContext, ModelPricingInfo, ModelPricingRule,
+        ModelPricingSource, ModelPricingUnit, ModelTokenModality, ModelTokenPrice,
+        ModelTurnRequest, ModelVisibility, ModelVisibilitySource, NegotiatedFeatureSupport,
+        ParallelToolCallCapabilities, ProviderError, ProviderErrorCategory, ProviderErrorSource,
+        ProviderOperationRequirement, ProviderRequestContext, ProviderRequestExtension,
+        ProviderTurnEvent, RequestedModelFeature, StructuredOutputMode, TokenUsage,
+        ToolCallRequestPolicy, ToolChoice, ToolChoiceMode, ToolSchemaMode,
+        model_billing_scope_from_effective_id, normalize_model_service_tier,
     };
 
     #[test]
@@ -3968,6 +4007,30 @@ mod tests {
     }
 
     #[test]
+    fn model_billing_scope_uses_effective_model_identity() {
+        assert_eq!(
+            model_billing_scope_from_effective_id("global.anthropic.claude-sonnet-4"),
+            "global"
+        );
+        assert_eq!(
+            model_billing_scope_from_effective_id("us.anthropic.claude-sonnet-4-20250514-v1:0"),
+            "geo"
+        );
+        assert_eq!(
+            model_billing_scope_from_effective_id("anthropic.claude-sonnet-4"),
+            "in_region"
+        );
+    }
+
+    #[test]
+    fn model_service_tiers_normalize_to_catalog_vocabulary() {
+        assert_eq!(normalize_model_service_tier("default"), "standard");
+        assert_eq!(normalize_model_service_tier(" AUTO "), "standard");
+        assert_eq!(normalize_model_service_tier("Priority"), "priority");
+        assert_eq!(normalize_model_service_tier("flex"), "flex");
+    }
+
+    #[test]
     fn provider_metadata_debug_redacts_private_values() {
         let sentinel = "encrypted-sentinel-do-not-log";
         let event = ProviderTurnEvent::ProviderMetadata {
@@ -4082,6 +4145,89 @@ mod tests {
 
         let estimate = pricing.estimate_cost(&usage).expect("known rounded cost");
         assert_eq!(estimate.total_micros, 0);
+    }
+
+    #[test]
+    fn conditional_pricing_uses_complete_request_input_at_threshold_boundaries() {
+        let short_rate = ModelTokenPrice::from_micros(1_000_000);
+        let long_rate = ModelTokenPrice::from_micros(2_000_000);
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: None,
+            cached_input: None,
+            cache_write_input: None,
+            output: None,
+            rules: vec![
+                ModelPricingRule {
+                    bucket: ModelPricingBucket::Input,
+                    modality: Some(ModelTokenModality::Text),
+                    service_tier: Some("standard".to_string()),
+                    invocation_class: Some(ModelInvocationClass::OnDemand),
+                    cache_ttl_seconds: None,
+                    min_request_input_tokens: None,
+                    max_request_input_tokens: Some(272_000),
+                    billing_scope: None,
+                    price: short_rate,
+                },
+                ModelPricingRule {
+                    bucket: ModelPricingBucket::Input,
+                    modality: Some(ModelTokenModality::Text),
+                    service_tier: Some("standard".to_string()),
+                    invocation_class: Some(ModelInvocationClass::OnDemand),
+                    cache_ttl_seconds: None,
+                    min_request_input_tokens: Some(272_001),
+                    max_request_input_tokens: None,
+                    billing_scope: None,
+                    price: long_rate,
+                },
+            ],
+            revision: Some("fixture-v1".to_string()),
+            context_threshold_tokens: Some(272_000),
+            source: ModelPricingSource::BundledCatalog,
+        };
+        let usage_at = |request_input_tokens| TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(0),
+            pricing_context: Box::new(ModelPricingContext {
+                service_tier: Some("standard".to_string()),
+                invocation_class: Some(ModelInvocationClass::OnDemand),
+                request_input_tokens: Some(request_input_tokens),
+                ..ModelPricingContext::default()
+            }),
+            ..TokenUsage::default()
+        };
+
+        assert_eq!(
+            pricing
+                .estimate_cost(&usage_at(272_000))
+                .expect("short-context estimate")
+                .components[0]
+                .price,
+            short_rate
+        );
+        assert_eq!(
+            pricing
+                .estimate_cost(&usage_at(272_001))
+                .expect("long-context estimate")
+                .components[0]
+                .price,
+            long_rate
+        );
+        assert!(
+            pricing
+                .estimate_cost(&TokenUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(0),
+                    pricing_context: Box::new(ModelPricingContext {
+                        service_tier: Some("standard".to_string()),
+                        invocation_class: Some(ModelInvocationClass::OnDemand),
+                        ..ModelPricingContext::default()
+                    }),
+                    ..TokenUsage::default()
+                })
+                .is_none()
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Remote catalog overlay support for models.bmux.dev.
 
-use crate::{Error, Result, merge_live_snapshots};
+use crate::{Error, Result, merge_live_snapshots, stamp_missing_pricing_revisions};
 use bcode_model_catalog_models::{
     CatalogDocument, LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogEntry, ProviderCatalog,
 };
@@ -280,6 +280,8 @@ impl RemoteCatalogClient {
 
 /// Overlay remote catalog data onto a bundled catalog document.
 pub fn overlay_remote_catalog(local: &mut CatalogDocument, remote: &CatalogDocument) {
+    let mut remote = remote.clone();
+    stamp_missing_pricing_revisions(&mut remote);
     for (provider_id, remote_provider) in &remote.providers {
         match local.providers.get_mut(provider_id) {
             Some(local_provider) => overlay_provider(local_provider, remote_provider),

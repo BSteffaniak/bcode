@@ -228,6 +228,7 @@ mod tests {
             cache_write_input_micros: None,
             output_micros: Some(15_000_000),
             context_threshold_tokens: None,
+            revision: None,
             rules: Vec::new(),
         };
         let pricing = BTreeMap::from([("claude35sonnet".to_string(), expected.clone())]);

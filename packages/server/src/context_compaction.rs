@@ -1627,7 +1627,13 @@ pub async fn handle_compaction_events(
             },
             ProviderTurnEvent::TextDelta { text } => summary.push_str(&text),
             ProviderTurnEvent::Usage { usage } => {
-                append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
+                append_model_usage_event(
+                    state,
+                    session_id,
+                    turn_id.to_string(),
+                    session_token_usage(&usage, None),
+                )
+                .await;
             }
             ProviderTurnEvent::Warning { message } => {
                 append_system_event(state, session_id, format!("model warning: {message}")).await;

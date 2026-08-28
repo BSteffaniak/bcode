@@ -2871,6 +2871,40 @@ mod tests {
     use switchy::database::query::FilterableQuery;
 
     #[tokio::test]
+    async fn model_usage_append_returns_the_same_event_stored_and_broadcast() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("usage".to_string()), test_working_directory())
+            .await
+            .expect("session");
+        let mut subscription = manager
+            .subscribe_session_events(session.id)
+            .await
+            .expect("subscription")
+            .events;
+        let usage = bcode_session_models::SessionTokenUsage {
+            request_id: Some("request-1".to_string()),
+            observation_id: Some("request-1:usage".to_string()),
+            terminal: true,
+            cost: Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                reason:
+                    bcode_session_models::SessionCostUnavailableReason::RequestPricingUnavailable,
+            }),
+            ..bcode_session_models::SessionTokenUsage::default()
+        };
+
+        let appended = manager
+            .append_model_usage(session.id, "turn-1".to_string(), usage)
+            .await
+            .expect("usage append");
+        let broadcast = subscription.recv().await.expect("broadcast event");
+        let history = manager.session_history(session.id).await.expect("history");
+
+        assert_eq!(broadcast, appended);
+        assert_eq!(history.last(), Some(&appended));
+    }
+
+    #[tokio::test]
     async fn catalog_draft_listing_and_timestamp_conflicts_preserve_newer_state() {
         let root = unique_temp_dir();
         let catalog = db::GlobalSessionDb::initialize_turso_in_root(&root)

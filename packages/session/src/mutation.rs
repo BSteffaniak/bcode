@@ -463,6 +463,7 @@ impl SessionManager {
         turn_id: String,
         usage: SessionTokenUsage,
     ) -> Result<SessionEvent, SessionError> {
+        usage.validate().map_err(SessionError::EventSerialization)?;
         self.append_event(session_id, SessionEventKind::ModelUsage { turn_id, usage })
             .await
     }

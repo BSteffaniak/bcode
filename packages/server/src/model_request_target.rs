@@ -20,6 +20,7 @@ pub struct ResolvedModelRequestTarget {
     pub requested_model_id: Option<String>,
     pub model_id: String,
     pub provider_context: bcode_model::ProviderRequestContext,
+    pub pricing: Option<bcode_model::ModelPricingInfo>,
     pub catalog_provider_id: Option<String>,
     pub catalog_identity: Option<bcode_model_catalog::ModelCatalogIdentity>,
 }
@@ -61,6 +62,7 @@ pub async fn resolve_model_request_target(
         .or_else(|| models.models.first())
         .ok_or(ModelRequestTargetError::NoUsableModel)?;
     let model_id = model.model_id.clone();
+    let pricing = model.pricing.clone();
     let api_surface = resolve_request_api_surface(
         &state.model_catalog,
         &models.catalog.policy,
@@ -86,6 +88,7 @@ pub async fn resolve_model_request_target(
         requested_model_id: input.selected_model_id.map(ToOwned::to_owned),
         model_id,
         provider_context,
+        pricing,
         catalog_provider_id,
         catalog_identity,
     })

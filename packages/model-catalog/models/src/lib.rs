@@ -371,6 +371,9 @@ pub struct CatalogPricing {
     /// Request-input threshold separating short and long context rules.
     #[serde(default)]
     pub context_threshold_tokens: Option<u64>,
+    /// Stable source revision for this normalized price set.
+    #[serde(default)]
+    pub revision: Option<String>,
     /// Conditional pricing rules. Empty means the flat fields above are authoritative.
     #[serde(default)]
     pub rules: Vec<CatalogPricingRule>,

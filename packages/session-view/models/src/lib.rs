@@ -1540,6 +1540,50 @@ impl RuntimeWorkView {
     }
 }
 
+/// Renderer-neutral aggregate of fixed canonical session cost estimates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCostSummary {
+    /// Estimated totals grouped by ISO 4217 currency code.
+    #[serde(default)]
+    pub totals_micros: BTreeMap<String, u64>,
+    /// Number of usage observations carrying complete fixed estimates.
+    #[serde(default)]
+    pub estimated_usage_count: u64,
+    /// Number of usage observations whose estimate is explicitly unavailable.
+    #[serde(default)]
+    pub unavailable_usage_count: u64,
+}
+
+impl SessionCostSummary {
+    /// Rebuild fixed-cost totals from the latest canonical observation for each request.
+    pub fn rebuild<'a>(usage: impl Iterator<Item = &'a SessionTokenUsage>) -> Self {
+        let mut summary = Self::default();
+        for usage in usage {
+            summary.observe(usage);
+        }
+        summary
+    }
+
+    /// Record one canonical usage observation without consulting current model state.
+    pub fn observe(&mut self, usage: &SessionTokenUsage) {
+        match usage.cost.as_ref() {
+            Some(bcode_session_models::SessionCostEstimate::Estimated {
+                currency,
+                total_micros,
+                ..
+            }) => {
+                let total = self.totals_micros.entry(currency.clone()).or_default();
+                *total = total.saturating_add(*total_micros);
+                self.estimated_usage_count = self.estimated_usage_count.saturating_add(1);
+            }
+            Some(bcode_session_models::SessionCostEstimate::Unavailable { .. }) => {
+                self.unavailable_usage_count = self.unavailable_usage_count.saturating_add(1);
+            }
+            None => {}
+        }
+    }
+}
+
 /// Renderer-neutral model, agent, context, and turn state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeViewState {
@@ -1560,6 +1604,9 @@ pub struct SessionRuntimeViewState {
     /// Cumulative metered tokens observed across model usage events in the current projection.
     #[serde(default)]
     pub cumulative_metered_tokens: u64,
+    /// Fixed canonical estimated-cost totals and coverage.
+    #[serde(default)]
+    pub cost: SessionCostSummary,
     /// Most recently observed model usage.
     pub latest_usage: Option<SessionTokenUsage>,
     /// Active model turn identifier, when a turn is running or cancelling.

@@ -28,6 +28,7 @@ pub async fn fetch_region(
 }
 
 fn parse(document: PriceListDocument) -> BTreeMap<String, CatalogPricing> {
+    let publication_date = document.publication_date.clone();
     let Some(terms) = document.terms.on_demand else {
         return BTreeMap::new();
     };
@@ -96,6 +97,7 @@ fn parse(document: PriceListDocument) -> BTreeMap<String, CatalogPricing> {
                     cache_write_input_micros: flat(CatalogPricingBucket::CacheWriteInput),
                     output_micros: flat(CatalogPricingBucket::Output),
                     context_threshold_tokens: threshold,
+                    revision: publication_date.clone(),
                     rules,
                 },
             )
@@ -215,6 +217,8 @@ fn price_per_million_micros(price: &str, unit: &str) -> Option<u64> {
 #[serde(rename_all = "camelCase")]
 struct PriceListDocument {
     #[serde(default)]
+    publication_date: Option<String>,
+    #[serde(default)]
     products: BTreeMap<String, Product>,
     #[serde(default)]
     terms: Terms,
@@ -259,6 +263,7 @@ mod tests {
     #[test]
     fn parses_standard_cache_and_long_context_rates() {
         let document: PriceListDocument = serde_json::from_value(serde_json::json!({
+            "publicationDate": "2026-08-28T00:00:00Z",
             "products": {
                 "input": {"attributes": {"model": "Claude Test", "feature": "On-demand Inference", "inferenceType": "Input tokens"}},
                 "output": {"attributes": {"model": "Claude Test", "feature": "On-demand Inference", "inferenceType": "Output tokens"}},
@@ -277,6 +282,7 @@ mod tests {
         let pricing = parse(document)
             .remove("claudetest")
             .expect("normalized model pricing");
+        assert_eq!(pricing.revision.as_deref(), Some("2026-08-28T00:00:00Z"));
         assert_eq!(pricing.output_micros, Some(15_000_000));
         assert!(pricing.rules.iter().any(|rule| {
             rule.bucket == CatalogPricingBucket::CacheReadInput && rule.price_micros == 300_000

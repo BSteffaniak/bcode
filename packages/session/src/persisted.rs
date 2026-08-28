@@ -1275,6 +1275,74 @@ mod tests {
     use bcode_session_models::ToolInvocationResult;
 
     #[test]
+    fn model_usage_round_trips_applied_rates_without_catalog_lookup() {
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 9,
+            timestamp_ms: 13,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: SessionTokenUsage {
+                    request_id: Some("request-1".to_owned()),
+                    observation_id: Some("request-1:usage".to_owned()),
+                    terminal: true,
+                    cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                        currency: "USD".to_owned(),
+                        total_micros: 15,
+                        components: vec![bcode_session_models::SessionCostComponent {
+                            bucket: "input".to_owned(),
+                            modality: Some("text".to_owned()),
+                            tokens: 5,
+                            price_micros: 3_000_000,
+                            cost_micros: 15,
+                        }],
+                        source: "remote_catalog".to_owned(),
+                        revision: Some("catalog-v1".to_owned()),
+                    }),
+                    ..SessionTokenUsage::default()
+                },
+            },
+        };
+
+        let encoded = encode_session_event(&event).expect("encode model usage");
+        let decoded = decode_session_event(&encoded).expect("decode model usage");
+
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn model_usage_round_trips_exact_identity_and_unavailable_outcome() {
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 8,
+            timestamp_ms: 12,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: SessionTokenUsage {
+                    request_id: Some("request-1".to_owned()),
+                    observation_id: Some("request-1:usage".to_owned()),
+                    terminal: true,
+                    catalog_provider_id: Some("bedrock".to_owned()),
+                    catalog_entry_id: Some("anthropic.claude".to_owned()),
+                    cost: Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                        reason: bcode_session_models::SessionCostUnavailableReason::RequiredPricingContextUnavailable,
+                    }),
+                    ..SessionTokenUsage::default()
+                },
+            },
+        };
+
+        let encoded = encode_session_event(&event).expect("encode model usage");
+        let decoded = decode_session_event(&encoded).expect("decode model usage");
+
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
     fn completed_assistant_segment_round_trips_through_persistence() {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,

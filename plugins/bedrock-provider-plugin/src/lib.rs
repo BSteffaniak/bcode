@@ -956,6 +956,10 @@ async fn stream_mantle_openai_turn(
             turn,
             &name_map,
             request.metadata.get("service_tier").map(String::as_str),
+            request
+                .metadata
+                .get("prompt_cache_retention")
+                .map(String::as_str),
         )
         .await;
     }
@@ -977,6 +981,7 @@ async fn read_mantle_openai_stream(
     turn: &TurnState,
     name_map: &BTreeMap<String, String>,
     requested_service_tier: Option<&str>,
+    requested_cache_retention: Option<&str>,
 ) -> Result<StreamOutcome, ProviderError> {
     let sink = MantleTurnEventSink(turn);
     let mut buffer = String::new();
@@ -1007,6 +1012,7 @@ async fn read_mantle_openai_stream(
                             &mut state,
                             name_map,
                             requested_service_tier,
+                            requested_cache_retention,
                         )?
                     {
                         return Ok(outcome);
@@ -1048,6 +1054,7 @@ fn process_mantle_openai_line(
     state: &mut MantleOpenAiStreamState,
     name_map: &BTreeMap<String, String>,
     requested_service_tier: Option<&str>,
+    requested_cache_retention: Option<&str>,
 ) -> Result<Option<StreamOutcome>, ProviderError> {
     use bcode_openai_responses as responses;
 
@@ -1142,7 +1149,9 @@ fn process_mantle_openai_line(
             responses::process_responses_function_arguments_done(&event, &mut state.tool_calls);
         }
         "response.completed" => {
-            if let Some(usage) = mantle_openai_usage(&event, requested_service_tier) {
+            if let Some(usage) =
+                mantle_openai_usage(&event, requested_service_tier, requested_cache_retention)
+            {
                 push_mantle_openai_usage(sink, usage);
             }
             if state.saw_tool_call {
@@ -1152,7 +1161,9 @@ fn process_mantle_openai_line(
             return Ok(Some(StreamOutcome::Finished));
         }
         "response.incomplete" => {
-            if let Some(usage) = mantle_openai_usage(&event, requested_service_tier) {
+            if let Some(usage) =
+                mantle_openai_usage(&event, requested_service_tier, requested_cache_retention)
+            {
                 push_mantle_openai_usage(sink, usage);
             }
             let reason = responses::responses_incomplete_reason(&event);
@@ -1213,6 +1224,7 @@ fn finish_mantle_openai_tool_calls(
 fn mantle_openai_usage(
     event: &serde_json::Value,
     requested_service_tier: Option<&str>,
+    requested_cache_retention: Option<&str>,
 ) -> Option<TokenUsage> {
     let usage = event
         .get("response")
@@ -1258,32 +1270,21 @@ fn mantle_openai_usage(
                 .get("service_tier")
                 .and_then(serde_json::Value::as_str)
                 .or(requested_service_tier)
-                .map(str::to_string),
+                .map(bcode_model::normalize_model_service_tier),
             invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
             billing_scope: event
                 .get("response")
                 .unwrap_or(event)
                 .get("model")
                 .and_then(serde_json::Value::as_str)
-                .map(|model| {
-                    if model.starts_with("global.") {
-                        "global"
-                    } else if model
-                        .split_once('.')
-                        .is_some_and(|(prefix, _)| matches!(prefix, "us" | "eu" | "apac" | "in"))
-                    {
-                        "geo"
-                    } else {
-                        "in_region"
-                    }
-                })
-                .map(str::to_string),
+                .map(bcode_model::model_billing_scope_from_effective_id),
             request_input_tokens: read("input_tokens").map(u64::from),
             cache_ttl_seconds: event
                 .get("response")
                 .unwrap_or(event)
                 .get("prompt_cache_retention")
                 .and_then(serde_json::Value::as_str)
+                .or(requested_cache_retention)
                 .and_then(|retention| match retention {
                     "30m" => Some(30 * 60),
                     "1h" => Some(60 * 60),
@@ -1602,6 +1603,7 @@ async fn read_mantle_anthropic_stream(
                             accumulator.saw_output(),
                         ));
                     }
+                    accumulator.emit_usage(turn);
                     return Ok(accumulator.finish());
                 }
             }
@@ -1957,6 +1959,7 @@ async fn read_anthropic_messages_stream(
                             accumulator.saw_output(),
                         ));
                     }
+                    accumulator.emit_usage(turn);
                     return Ok(accumulator.finish());
                 };
                 if let ResponseStream::Chunk(chunk) = event
@@ -2016,7 +2019,16 @@ struct AnthropicMessagesAccumulator {
     /// Anthropic reports `max_tokens` here when the output budget is exhausted. Without it a
     /// truncated turn is indistinguishable from a completed one.
     stop_reason: Option<StopReason>,
+    /// Latest cumulative usage for this provider request.
+    usage: Option<TokenUsage>,
+    usage_state: UsageEmissionState,
     name_map: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageEmissionState {
+    final_usage: bool,
+    exact_input: bool,
 }
 
 impl AnthropicMessagesAccumulator {
@@ -2033,6 +2045,11 @@ impl AnthropicMessagesAccumulator {
             synthetic_call_indexes: BTreeSet::new(),
             synthetic,
             stop_reason: None,
+            usage: None,
+            usage_state: UsageEmissionState {
+                final_usage: false,
+                exact_input: false,
+            },
             name_map,
         }
     }
@@ -2043,22 +2060,26 @@ impl AnthropicMessagesAccumulator {
         turn: &TurnState,
     ) -> Result<Option<StreamOutcome>, ProviderError> {
         match event.get("type").and_then(serde_json::Value::as_str) {
-            Some("message_start") => Self::emit_usage(
-                event
-                    .get("message")
-                    .and_then(|message| message.get("usage")),
-                turn,
-                true,
-            ),
+            Some("message_start") => {
+                self.record_usage(
+                    event
+                        .get("message")
+                        .and_then(|message| message.get("usage")),
+                );
+                self.emit_exact_input(turn);
+            }
             Some("error") => return Err(anthropic_messages_event_error(event)),
             Some("content_block_start") => self.start_content_block(event, turn)?,
             Some("content_block_delta") => self.content_block_delta(event, turn),
             Some("content_block_stop") => self.finish_content_block(event, turn)?,
             Some("message_delta") => {
                 self.record_message_delta_stop_reason(event);
-                Self::emit_usage(event.get("usage"), turn, false);
+                self.record_usage(event.get("usage"));
             }
-            Some("message_stop") => return Ok(Some(self.finish())),
+            Some("message_stop") => {
+                self.emit_usage(turn);
+                return Ok(Some(self.finish()));
+            }
             _ => {}
         }
         Ok(None)
@@ -2285,37 +2306,74 @@ impl AnthropicMessagesAccumulator {
         }
     }
 
-    fn emit_usage(usage: Option<&serde_json::Value>, turn: &TurnState, exact_input: bool) {
+    fn record_usage(&mut self, usage: Option<&serde_json::Value>) {
         let Some(usage) = usage else {
             return;
         };
-        let input_tokens = usage.get("input_tokens").and_then(json_u32);
-        let output_tokens = usage.get("output_tokens").and_then(json_u32);
-        let cached_input_tokens = usage.get("cache_read_input_tokens").and_then(json_u32);
-        let cache_write_input_tokens = usage.get("cache_creation_input_tokens").and_then(json_u32);
-        turn.push(ProviderTurnEvent::Usage {
-            usage: TokenUsage {
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-                cache_write_input_tokens,
-                pricing_context: Box::new(bcode_model::ModelPricingContext {
-                    invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
-                    request_input_tokens: input_tokens.map(u64::from),
-                    ..bcode_model::ModelPricingContext::default()
+        let read = |key| usage.get(key).and_then(json_u32);
+        let merge = |previous: Option<u32>, current: Option<u32>| match (previous, current) {
+            (Some(previous), Some(current)) => Some(previous.max(current)),
+            (previous, current) => current.or(previous),
+        };
+        let previous = self.usage.take().unwrap_or_default();
+        let input_tokens = merge(previous.input_tokens, read("input_tokens"));
+        let output_tokens = merge(previous.output_tokens, read("output_tokens"));
+        let cached_input_tokens = merge(
+            previous.cached_input_tokens,
+            read("cache_read_input_tokens"),
+        );
+        let cache_write_input_tokens = merge(
+            previous.cache_write_input_tokens,
+            read("cache_creation_input_tokens"),
+        );
+        self.usage = Some(TokenUsage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
+            pricing_context: Box::new(bcode_model::ModelPricingContext {
+                service_tier: Some("standard".to_string()),
+                invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                request_input_tokens: input_tokens.map(|input_tokens| {
+                    complete_request_input_tokens(
+                        input_tokens,
+                        cached_input_tokens,
+                        cache_write_input_tokens,
+                    )
                 }),
-                ..TokenUsage::default()
-            },
+                ..bcode_model::ModelPricingContext::default()
+            }),
+            ..TokenUsage::default()
         });
-        if exact_input && let Some(input_tokens) = input_tokens {
-            turn.push(ProviderTurnEvent::ExactRequestInputTokens {
-                tokens: bcode_model::ExactRequestInputTokens::new(complete_request_input_tokens(
-                    input_tokens,
-                    cached_input_tokens,
-                    cache_write_input_tokens,
-                )),
-            });
+    }
+
+    fn emit_exact_input(&mut self, turn: &TurnState) {
+        if self.usage_state.exact_input {
+            return;
         }
+        let Some(input_tokens) = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.pricing_context.request_input_tokens)
+        else {
+            return;
+        };
+        turn.push(ProviderTurnEvent::ExactRequestInputTokens {
+            tokens: bcode_model::ExactRequestInputTokens::new(input_tokens),
+        });
+        self.usage_state.exact_input = true;
+    }
+
+    fn emit_usage(&mut self, turn: &TurnState) {
+        if self.usage_state.final_usage {
+            return;
+        }
+        let Some(usage) = self.usage.take() else {
+            return;
+        };
+        self.emit_exact_input(turn);
+        turn.push(ProviderTurnEvent::Usage { usage });
+        self.usage_state.final_usage = true;
     }
 
     /// Choose the stream outcome for a finished Anthropic Messages turn.
@@ -2483,8 +2541,15 @@ impl StreamAccumulator {
                             cached_input_tokens: cache_read_input_tokens,
                             cache_write_input_tokens,
                             pricing_context: Box::new(bcode_model::ModelPricingContext {
+                                service_tier: Some("standard".to_string()),
                                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
-                                request_input_tokens: input_tokens.map(u64::from),
+                                request_input_tokens: input_tokens.map(|input_tokens| {
+                                    complete_request_input_tokens(
+                                        input_tokens,
+                                        cache_read_input_tokens,
+                                        cache_write_input_tokens,
+                                    )
+                                }),
                                 ..bcode_model::ModelPricingContext::default()
                             }),
                             ..TokenUsage::default()
@@ -6776,6 +6841,7 @@ mod tests {
                 &mut state,
                 &name_map,
                 None,
+                None,
             )
             .expect("delta decodes")
             .is_none()
@@ -6785,6 +6851,7 @@ mod tests {
             &sink,
             &mut state,
             &name_map,
+            None,
             None,
         )
         .expect("completion decodes")
@@ -6820,6 +6887,7 @@ mod tests {
             &mut state,
             &BTreeMap::new(),
             None,
+            None,
         )
         .expect("completion decodes")
         .expect("completion is terminal");
@@ -6850,7 +6918,7 @@ mod tests {
             r#"data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"a.rs\"}"}"#,
         ] {
             assert!(
-                process_mantle_openai_line(line, &sink, &mut state, &name_map, None)
+                process_mantle_openai_line(line, &sink, &mut state, &name_map, None, None)
                     .expect("line decodes")
                     .is_none()
             );
@@ -6861,6 +6929,7 @@ mod tests {
             &sink,
             &mut state,
             &name_map,
+            None,
             None,
         )
         .expect("completion decodes")
@@ -6893,6 +6962,7 @@ mod tests {
             &mut truncated,
             &name_map,
             None,
+            None,
         )
         .expect("incomplete decodes")
         .expect("incomplete is terminal");
@@ -6906,6 +6976,7 @@ mod tests {
             &mut filtered,
             &name_map,
             None,
+            None,
         )
         .expect_err("unexpected incomplete reasons must fail");
         assert_eq!(error.code, "bedrock_mantle_openai_response_incomplete");
@@ -6917,6 +6988,7 @@ mod tests {
             &sink,
             &mut failed,
             &name_map,
+            None,
             None,
         )
         .expect_err("failures must propagate");
@@ -7380,6 +7452,9 @@ mod tests {
                 &turn,
             )
             .expect("usage should process");
+        accumulator
+            .process(&serde_json::json!({"type":"message_stop"}), &turn)
+            .expect("message stop should process");
 
         let events = turn.drain();
         assert!(events.iter().any(
@@ -7405,6 +7480,9 @@ mod tests {
                 &turn,
             )
             .expect("usage should process");
+        accumulator
+            .process(&serde_json::json!({"type":"message_stop"}), &turn)
+            .expect("message stop should process");
 
         let events = turn.drain();
         // Anthropic reports `input_tokens` as non-cached input, so the complete request context is
@@ -7413,13 +7491,16 @@ mod tests {
             event,
             ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 492
         )));
-        // Billing-shaped usage keeps the provider's own field split.
+        // Billing-shaped usage keeps the provider's own field split while threshold pricing uses
+        // the complete model-visible request size.
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderTurnEvent::Usage { usage }
                 if usage.input_tokens == Some(12)
                     && usage.cached_input_tokens == Some(400)
                     && usage.cache_write_input_tokens == Some(80)
+                    && usage.pricing_context.request_input_tokens == Some(492)
+                    && usage.pricing_context.service_tier.as_deref() == Some("standard")
         )));
     }
 
@@ -7509,6 +7590,29 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 47
+        )));
+    }
+
+    #[test]
+    fn converse_metadata_uses_complete_input_for_pricing_thresholds() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+
+        accumulator
+            .process_event(
+                converse_message_stop_event(BedrockStopReason::EndTurn),
+                &turn,
+            )
+            .expect("message stop should process");
+        accumulator
+            .process_event(converse_metadata_event(12, Some(400), Some(80)), &turn)
+            .expect("metadata should process");
+
+        assert!(turn.drain().iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage }
+                if usage.pricing_context.request_input_tokens == Some(492)
+                    && usage.pricing_context.service_tier.as_deref() == Some("standard")
         )));
     }
 
