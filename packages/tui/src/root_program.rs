@@ -2296,12 +2296,19 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                 | bmux_tui::event::MouseEventKind::ScrollDown
                         )
                     {
-                        let _changed = super::mouse_flow::handle_non_permission_mouse(
+                        let changed = super::mouse_flow::handle_non_permission_mouse(
                             None,
                             &mut self.chat,
                             mouse,
                             self.settings.mouse_scroll_rows(),
                         );
+                        if changed {
+                            self.invalidation = self
+                                .invalidation
+                                .merge(super::invalidation::UiInvalidation::Structural);
+                            self.presentation_damage = bmux_tui::damage::Damage::Full;
+                            self.fast_temporal_presentation = false;
+                        }
                         return Ok(bmux_tui_runtime::Update::redraw());
                     }
                 }
@@ -5391,6 +5398,149 @@ mod tests {
                 <= LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0
         );
         assert_eq!(full_repaints, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual inline-question transcript-scroll committed-presentation probe"]
+    #[allow(clippy::too_many_lines)] // The probe keeps fixture setup and per-frame attribution together.
+    async fn inline_question_transcript_scroll_performance_report() {
+        const SAMPLES: usize = 30;
+        const LOCKED_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(17);
+        let session_id = bcode_session_models::SessionId::new();
+        let history = (1..=1_000)
+            .map(|sequence| bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: sequence,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: format!("scroll fixture transcript message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut model = root_test_model_with_history(session_id, &history);
+        let mut config = model.chat.app.tui_config().clone();
+        config.interactions.placement = bcode_config::TuiInteractionPlacement::Transcript;
+        model.chat.app.apply_tui_config(config);
+        let questions = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "header": format!("Question {index}"),
+                    "question": format!(
+                        "Choose an answer for a deliberately long question number {index} while scrolling"
+                    ),
+                    "options": [
+                        {"label": "One long answer", "value": "one", "description": "A deliberately long option description that wraps in the inline viewport"},
+                        {"label": "Two long answer", "value": "two", "description": "Another deliberately long option description that wraps in the inline viewport"}
+                    ],
+                    "control": "radio",
+                    "selection_mode": "single",
+                    "custom": false,
+                    "custom_mode": "additional",
+                    "required": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let question_snapshot = serde_json::json!({ "questions": questions });
+        model.chat.app.set_pending_interactions(vec![
+            bcode_session_view_models::InteractionViewSummary {
+                interaction_id: "question-root-test".to_owned(),
+                producer_id: Some("bcode.question".to_owned()),
+                exchange_schema: Some("bcode.question.request".to_owned()),
+                exchange_schema_version: Some(1),
+                kind: "bcode.question".to_owned(),
+                tool_call_id: Some("call-question-scroll".to_owned()),
+                title: Some("Question".to_owned()),
+                required: true,
+                snapshot: Some(question_snapshot.clone()),
+                state: bcode_session_view_models::InteractionViewState::Pending,
+                status_detail: None,
+                resolved: false,
+                resolution: None,
+            },
+        ]);
+        let keymap = super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
+        model.loop_state.install_interactive_surface_for_test(
+            question_surface_with_questions_for_root_test(
+                &keymap,
+                question_snapshot["questions"].clone(),
+            )
+            .await,
+        );
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        bmux_tui_runtime::Presenter::present(
+            &mut super::BcodeRuntimePresenter::new(&mut terminal),
+            &mut model,
+        )
+        .expect("initial inline question scroll frame");
+
+        let initial_geometry = model.loop_state.active_interactive_surface_geometry();
+        let surface_work_shape = model
+            .loop_state
+            .active_interactive_surface_work_shape_for_test();
+        let mut total_samples = Vec::with_capacity(SAMPLES);
+        let mut draw_samples = Vec::with_capacity(SAMPLES);
+        let mut changed_cells = Vec::with_capacity(SAMPLES);
+        let mut scroll_offsets = Vec::with_capacity(SAMPLES);
+        let mut fast_path_frames = 0_usize;
+        let mut full_repaints = 0_usize;
+        for index in 0..SAMPLES {
+            let started = std::time::Instant::now();
+            let mouse = bmux_tui::event::MouseEvent::new(
+                if index.is_multiple_of(2) {
+                    bmux_tui::event::MouseEventKind::ScrollUp
+                } else {
+                    bmux_tui::event::MouseEventKind::ScrollDown
+                },
+                bmux_tui::geometry::Point::new(2, 2),
+            );
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Mouse(mouse)),
+            )
+            .expect("inline question scroll input");
+            fast_path_frames =
+                fast_path_frames.saturating_add(usize::from(model.fast_temporal_presentation));
+            scroll_offsets.push(model.chat.app.scroll_offset());
+            let draw_started = std::time::Instant::now();
+            let report = bmux_tui_runtime::Presenter::present(
+                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                &mut model,
+            )
+            .expect("inline question scroll presentation");
+            total_samples.push(started.elapsed());
+            draw_samples.push(draw_started.elapsed());
+            changed_cells.push(report.changed_cells);
+            full_repaints = full_repaints.saturating_add(usize::from(report.full_repaint));
+        }
+        let total = latency_summary(&total_samples);
+        let draw = latency_summary(&draw_samples);
+        let within_budget = total["p99_ms"].as_f64().expect("numeric p99")
+            <= LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "kind": "bcode_inline_question_transcript_scroll_performance",
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "sample_count": SAMPLES,
+                "resident_transcript_events": history.len(),
+                "initial_surface_geometry": format!("{initial_geometry:?}"),
+                "surface_work_shape": surface_work_shape,
+                "locked_p99_budget_ms": LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0,
+                "total_latency": total,
+                "draw_latency": draw,
+                "changed_cells": changed_cells,
+                "scroll_offsets": scroll_offsets,
+                "full_repaints": full_repaints,
+                "fast_path_frames": fast_path_frames,
+                "within_budget": within_budget
+            })
+        );
     }
 
     #[tokio::test]
