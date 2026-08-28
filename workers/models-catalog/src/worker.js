@@ -290,6 +290,7 @@ function liveSummary(snapshots, env) {
 async function discoverBedrock(env) {
   const regions = csv(env.BEDROCK_DISCOVERY_REGIONS);
   if (regions.length === 0) throw new Error('BEDROCK_DISCOVERY_REGIONS is required');
+  const pricing = await loadBedrockPricingSeed(env);
   const snapshot = {
     schema_version: '1.0.0',
     provider_id: 'bedrock',
@@ -303,12 +304,38 @@ async function discoverBedrock(env) {
       const modelId = summary.modelId;
       if (!modelId) continue;
       const model = snapshot.models[modelId] || liveBedrockModel(summary);
+      applyBedrockPricing(model, pricing);
       model.regions ||= [];
       if (!model.regions.includes(region)) model.regions.push(region);
       snapshot.models[modelId] = model;
     }
   }
+  if (!Object.values(snapshot.models).some((model) => model.pricing)) {
+    throw new Error('Bedrock discovery produced no priced models');
+  }
   return snapshot;
+}
+
+async function loadBedrockPricingSeed(env) {
+  if (!env.ASSETS) throw new Error('Bedrock pricing seed requires the ASSETS binding');
+  const response = await env.ASSETS.fetch(new Request('https://assets.invalid/v1/live/bedrock.json'));
+  if (!response.ok) throw new Error(`Bedrock pricing seed is unavailable: ${response.status}`);
+  const snapshot = await response.json();
+  if (snapshot.schema_version !== '1.0.0' || snapshot.provider_id !== 'bedrock') {
+    throw new Error('Bedrock pricing seed has an unsupported schema or provider');
+  }
+  const pricing = new Map(
+    Object.values(snapshot.models || {})
+      .filter((model) => model.model_id && model.pricing)
+      .map((model) => [model.model_id, model.pricing]),
+  );
+  if (pricing.size === 0) throw new Error('Bedrock pricing seed contains no priced models');
+  return pricing;
+}
+
+function applyBedrockPricing(model, pricing) {
+  const normalizedPricing = pricing.get(model.model_id);
+  if (normalizedPricing) model.pricing = normalizedPricing;
 }
 
 function liveBedrockModel(summary) {
@@ -454,6 +481,8 @@ function numberEnv(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
+
+export { applyBedrockPricing, loadBedrockPricingSeed, mergeSnapshot };
 
 function booleanEnv(value, fallback) {
   if (value === undefined || value === null || value === '') return fallback;

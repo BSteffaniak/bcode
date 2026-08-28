@@ -21,6 +21,9 @@ enum Command {
         /// Comma-separated AWS regions to query.
         #[arg(long, value_delimiter = ',')]
         regions: Vec<String>,
+        /// Fail rather than write a snapshot when pricing cannot be loaded or matched.
+        #[arg(long)]
+        require_pricing: bool,
         /// Output JSON path.
         #[arg(long)]
         output: PathBuf,
@@ -40,7 +43,11 @@ enum Command {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Bedrock { regions, output } => {
+        Command::Bedrock {
+            regions,
+            require_pricing,
+            output,
+        } => {
             let regions = if regions.is_empty() {
                 regions_from_env()
             } else {
@@ -49,7 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if regions.is_empty() {
                 return Err("pass --regions or set BCODE_MODEL_DISCOVERY_BEDROCK_REGIONS".into());
             }
-            let snapshot = bcode_model_discovery::bedrock::discover(&regions).await?;
+            let snapshot = bcode_model_discovery::bedrock::discover_with_options(
+                &regions,
+                bcode_model_discovery::bedrock::DiscoveryOptions { require_pricing },
+            )
+            .await?;
             bcode_model_discovery::write_snapshot(&output, &snapshot)?;
             println!(
                 "wrote {} Bedrock live models to {}",

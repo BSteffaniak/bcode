@@ -3191,6 +3191,45 @@ status = "stable"
     }
 
     #[test]
+    fn null_live_pricing_does_not_erase_catalog_pricing() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let expected = bcode_model_catalog_models::CatalogPricing {
+            currency: "USD".to_string(),
+            unit: bcode_model_catalog_models::CatalogPricingUnit::PerMillionTokens,
+            input_micros: Some(3_000_000),
+            cached_input_micros: None,
+            cache_write_input_micros: None,
+            output_micros: Some(15_000_000),
+            context_threshold_tokens: None,
+            rules: Vec::new(),
+        };
+        document
+            .providers
+            .get_mut("bedrock")
+            .expect("bedrock provider")
+            .models
+            .get_mut("anthropic.claude")
+            .expect("Claude entry")
+            .pricing = Some(expected.clone());
+        let mut snapshot = LiveCatalogSnapshot::empty("bedrock", "2026-01-01T00:00:00Z");
+        snapshot.models.insert(
+            "anthropic.claude".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "model_id": "anthropic.claude",
+                "pricing": null
+            }))
+            .expect("live model"),
+        );
+
+        merge_live_snapshots(&mut document, &[snapshot]);
+
+        assert_eq!(
+            document.providers["bedrock"].models["anthropic.claude"].pricing,
+            Some(expected)
+        );
+    }
+
+    #[test]
     fn merge_can_include_catalog_only_models() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let merged = catalog.merge_provider_models("openai", Vec::new(), true);

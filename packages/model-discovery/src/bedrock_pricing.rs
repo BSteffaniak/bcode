@@ -251,3 +251,57 @@ struct PriceDimension {
     #[serde(default)]
     price_per_unit: BTreeMap<String, String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_standard_cache_and_long_context_rates() {
+        let document: PriceListDocument = serde_json::from_value(serde_json::json!({
+            "products": {
+                "input": {"attributes": {"model": "Claude Test", "feature": "On-demand Inference", "inferenceType": "Input tokens"}},
+                "output": {"attributes": {"model": "Claude Test", "feature": "On-demand Inference", "inferenceType": "Output tokens"}},
+                "cache": {"attributes": {"model": "Claude Test", "feature": "On-demand Inference", "tokenType": "Cache Read Input Tokens"}},
+                "long": {"attributes": {"model": "Claude Test", "feature": "On-demand Inference", "tokenType": "Input tokens long context"}}
+            },
+            "terms": {"OnDemand": {
+                "input": {"term": {"priceDimensions": {"dimension": {"unit": "1K tokens", "pricePerUnit": {"USD": "0.003"}}}}},
+                "output": {"term": {"priceDimensions": {"dimension": {"unit": "1K tokens", "pricePerUnit": {"USD": "0.015"}}}}},
+                "cache": {"term": {"priceDimensions": {"dimension": {"unit": "1M tokens", "pricePerUnit": {"USD": "0.30"}}}}},
+                "long": {"term": {"priceDimensions": {"dimension": {"unit": "1K tokens", "pricePerUnit": {"USD": "0.006"}}}}}
+            }}
+        }))
+        .expect("price-list fixture");
+
+        let pricing = parse(document)
+            .remove("claudetest")
+            .expect("normalized model pricing");
+        assert_eq!(pricing.output_micros, Some(15_000_000));
+        assert!(pricing.rules.iter().any(|rule| {
+            rule.bucket == CatalogPricingBucket::CacheReadInput && rule.price_micros == 300_000
+        }));
+        assert_eq!(
+            pricing.context_threshold_tokens,
+            Some(PRICE_LIST_CONTEXT_THRESHOLD_TOKENS)
+        );
+        assert!(pricing.rules.iter().any(|rule| {
+            rule.bucket == CatalogPricingBucket::Input
+                && rule.min_request_input_tokens == Some(PRICE_LIST_CONTEXT_THRESHOLD_TOKENS + 1)
+        }));
+    }
+
+    #[test]
+    fn normalizes_model_names_and_token_units() {
+        assert_eq!(normalize_name("Claude 3.5-Sonnet"), "claude35sonnet");
+        assert_eq!(
+            price_per_million_micros("0.003", "1K tokens"),
+            Some(3_000_000)
+        );
+        assert_eq!(
+            price_per_million_micros("3.00", "1M tokens"),
+            Some(3_000_000)
+        );
+        assert_eq!(price_per_million_micros("1", "image"), None);
+    }
+}

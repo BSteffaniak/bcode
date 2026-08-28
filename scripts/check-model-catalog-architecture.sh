@@ -36,6 +36,18 @@ if grep -R --include='*.rs' -nE 'gpt-5\.6.*(price|cost)|price.*gpt-5\.6' \
   exit 1
 fi
 
+if grep -nE 'pricing\.amazonaws\.com|priceDimensions|pricePerUnit|function .*pricing.*rule' \
+  workers/models-catalog/src/worker.js; then
+  echo "the models-catalog Worker may consume normalized pricing but must not fetch or normalize AWS pricing catalogs" >&2
+  exit 1
+fi
+
+if ! grep -F "new Request('https://assets.invalid/v1/live/bedrock.json')" \
+  workers/models-catalog/src/worker.js >/dev/null; then
+  echo "the Bedrock Worker refresh must consume the normalized static pricing seed" >&2
+  exit 1
+fi
+
 if ! grep -F 'rules: catalog_pricing_rules(pricing)' packages/model-catalog/src/lib.rs >/dev/null; then
   echo "conditional pricing rules must resolve through the model catalog" >&2
   exit 1

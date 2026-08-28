@@ -1,6 +1,8 @@
 name: Deploy Models Site
 
 on:
+  schedule:
+    - cron: "17 5 * * *"
   push:
     branches: [master]
     paths:
@@ -42,14 +44,29 @@ jobs:
       - name: Validate model catalog
         run: cargo run --release -p bcode_model_catalog -- validate
 
+      - name: Discover Bedrock models and normalized pricing
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          export BCODE_MODEL_DISCOVERY_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cargo run --release -p bcode_model_discovery -- bedrock \
+            --regions us-east-1,us-west-2 \
+            --require-pricing \
+            --output target/model-live/bedrock.json
+          python3 -c 'import json; data=json.load(open("target/model-live/bedrock.json")); models=list(data["models"].values()); priced=[model for model in models if model.get("pricing")]; assert models, "Bedrock discovery returned no models"; assert priced, "Bedrock discovery returned no priced models"; print(f"validated {len(priced)}/{len(models)} priced Bedrock models")'
+
       - name: Build static models site
-        run: cargo run --release -p bcode_models_site -- gen --output dist
+        run: cargo run --release -p bcode_models_site -- gen --output dist --live target/model-live
 
       - name: Build catalog artifacts
-        run: cargo run --release -p bcode_model_catalog -- build --output dist/v1
+        run: cargo run --release -p bcode_model_catalog -- build --output dist/v1 --live target/model-live
 
-      - name: Check Worker syntax
-        run: node --check workers/models-catalog/src/worker.js
+      - name: Check Worker syntax and tests
+        run: |
+          node --check workers/models-catalog/src/worker.js
+          node --test workers/models-catalog/worker.test.js
 
       - name: Install Wrangler
         run: npm install --global wrangler
