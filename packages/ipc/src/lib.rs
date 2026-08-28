@@ -5615,6 +5615,8 @@ mod tests {
                         cached_input: Some(bcode_model::ModelTokenPrice::from_micros(125_000)),
                         cache_write_input: None,
                         output: Some(bcode_model::ModelTokenPrice::from_micros(10_000_000)),
+                        rules: Vec::new(),
+                        revision: None,
                         source: bcode_model::ModelPricingSource::PatternMatch,
                     }),
                     api_surface: None,
@@ -6198,6 +6200,7 @@ mod tests {
                     cached_input_tokens: None,
                     cache_write_input_tokens: None,
                     reasoning_tokens: None,
+                    ..bcode_session_models::SessionTokenUsage::default()
                 },
             },
             SessionEventKind::ContextCompacted {

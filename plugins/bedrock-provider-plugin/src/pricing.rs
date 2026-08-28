@@ -1,11 +1,17 @@
 //! Amazon Bedrock pricing resolution from AWS-published pricing data.
 
-use bcode_model::{ModelPricingInfo, ModelPricingSource, ModelPricingUnit, ModelTokenPrice};
+use bcode_model::{
+    ModelInvocationClass, ModelPricingBucket, ModelPricingInfo, ModelPricingRule,
+    ModelPricingSource, ModelPricingUnit, ModelTokenModality, ModelTokenPrice,
+};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const PRICE_LIST_BASE_URL: &str =
     "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrock/current";
+const SHORT_CONTEXT_MAX_TOKENS: u64 = 272_000;
+const LONG_CONTEXT_MIN_TOKENS: u64 = SHORT_CONTEXT_MAX_TOKENS + 1;
+const THIRTY_MINUTES_SECONDS: u64 = 30 * 60;
 
 /// Fetch the current public Bedrock price list for one AWS region.
 pub async fn fetch_region(
@@ -22,7 +28,7 @@ pub async fn fetch_region(
     Ok(BedrockPricingCatalog::from_document(document))
 }
 
-/// Region-specific, on-demand token prices indexed by AWS's public model display name.
+/// Region-specific token prices indexed by AWS's public model display name.
 #[derive(Debug, Clone, Default)]
 pub struct BedrockPricingCatalog {
     by_model_name: BTreeMap<String, ModelPricingInfo>,
@@ -30,26 +36,37 @@ pub struct BedrockPricingCatalog {
 
 impl BedrockPricingCatalog {
     fn from_document(document: PriceListDocument) -> Self {
-        let mut buckets = BTreeMap::<String, PriceBuckets>::new();
+        let revision = document.version.clone();
         let Some(terms) = document.terms.on_demand else {
             return Self::default();
         };
+        let mut model_names = BTreeMap::<String, BTreeSet<String>>::new();
+        for product in document.products.values() {
+            if let Some(model) = product.attributes.model.as_deref() {
+                model_names
+                    .entry(normalize_name(model))
+                    .or_default()
+                    .insert(model.to_string());
+            }
+        }
+        let ambiguous_names = model_names
+            .into_iter()
+            .filter_map(|(name, originals)| (originals.len() > 1).then_some(name))
+            .collect::<BTreeSet<_>>();
+        let mut rules = BTreeMap::<String, BTreeSet<ModelPricingRule>>::new();
         for (sku, product) in document.products {
             let attributes = product.attributes;
-            if attributes.feature.as_deref() != Some("On-demand Inference")
-                || attributes
-                    .service_tier
-                    .as_deref()
-                    .is_some_and(|tier| !tier.is_empty())
-            {
+            let Some(model) = attributes
+                .model
+                .as_deref()
+                .filter(|model| !model.is_empty())
+            else {
+                continue;
+            };
+            let normalized_model = normalize_name(model);
+            if ambiguous_names.contains(&normalized_model) {
                 continue;
             }
-            let Some(model) = attributes.model.filter(|model| !model.is_empty()) else {
-                continue;
-            };
-            let Some(inference_type) = attributes.inference_type else {
-                continue;
-            };
             let Some(product_terms) = terms.get(&sku) else {
                 continue;
             };
@@ -58,75 +75,165 @@ impl BedrockPricingCatalog {
                     let Some(usd) = dimension.price_per_unit.get("USD") else {
                         continue;
                     };
-                    let Some(micros) = price_per_million_micros(usd, &dimension.unit) else {
+                    let Some(price) = price_per_million_micros(usd, &dimension.unit)
+                        .map(ModelTokenPrice::from_micros)
+                    else {
                         continue;
                     };
-                    buckets
-                        .entry(normalize_name(&model))
-                        .or_default()
-                        .set(&inference_type, micros);
+                    if let Some(rule) = pricing_rule(&attributes, price) {
+                        rules
+                            .entry(normalized_model.clone())
+                            .or_default()
+                            .insert(rule);
+                    }
                 }
             }
         }
         Self {
-            by_model_name: buckets
+            by_model_name: rules
                 .into_iter()
-                .filter_map(|(name, prices)| prices.complete().map(|pricing| (name, pricing)))
+                .map(|(model, rules)| {
+                    let rules = rules.into_iter().collect::<Vec<_>>();
+                    let (input, cached_input, cache_write_input, output) = flat_prices(&rules);
+                    (
+                        model,
+                        ModelPricingInfo {
+                            currency: "USD".to_string(),
+                            unit: ModelPricingUnit::PerMillionTokens,
+                            input,
+                            cached_input,
+                            cache_write_input,
+                            output,
+                            rules,
+                            revision: revision.clone(),
+                            source: ModelPricingSource::ProviderApi,
+                        },
+                    )
+                })
                 .collect(),
         }
     }
 
-    /// Resolve complete standard on-demand token pricing by AWS model display name.
+    /// Resolve all known token-pricing rules by AWS model display name.
     #[must_use]
     pub fn pricing_for_model_name(&self, model_name: &str) -> Option<ModelPricingInfo> {
         self.by_model_name.get(&normalize_name(model_name)).cloned()
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct PriceBuckets {
-    input: std::collections::BTreeSet<u64>,
-    cached_input: std::collections::BTreeSet<u64>,
-    cache_write_input: std::collections::BTreeSet<u64>,
-    output: std::collections::BTreeSet<u64>,
+fn pricing_rule(
+    attributes: &ProductAttributes,
+    price: ModelTokenPrice,
+) -> Option<ModelPricingRule> {
+    let dimension = attributes
+        .token_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or(attributes.inference_type.as_deref())?
+        .to_ascii_lowercase();
+    let bucket = if dimension.contains("cache") && dimension.contains("read") {
+        ModelPricingBucket::CacheReadInput
+    } else if dimension.contains("cache") && dimension.contains("write") {
+        ModelPricingBucket::CacheWriteInput
+    } else if dimension.contains("input") && !dimension.contains("output") {
+        ModelPricingBucket::Input
+    } else if dimension.contains("output") {
+        ModelPricingBucket::Output
+    } else {
+        return None;
+    };
+    let modality = if dimension.contains("image") {
+        Some(ModelTokenModality::Image)
+    } else if dimension.contains("audio") || dimension.contains("speech") {
+        Some(ModelTokenModality::Audio)
+    } else if dimension.contains("video") {
+        Some(ModelTokenModality::Video)
+    } else {
+        Some(ModelTokenModality::Text)
+    };
+    let long_context = dimension.contains("long-ctx") || dimension.contains("long context");
+    let feature = attributes.feature.as_deref().unwrap_or_default();
+    let invocation_class = if feature == "Batch Inference"
+        || attributes.service_tier.as_deref() == Some("batch")
+        || dimension.contains("batch")
+    {
+        ModelInvocationClass::Batch
+    } else if feature.is_empty()
+        || feature == "On-demand Inference"
+        || attributes.token_type.is_some()
+    {
+        ModelInvocationClass::OnDemand
+    } else {
+        return None;
+    };
+    Some(ModelPricingRule {
+        bucket,
+        modality,
+        service_tier: attributes.service_tier.clone().or_else(|| {
+            (attributes.token_type.is_some() || feature == "On-demand Inference")
+                .then_some("standard".to_string())
+        }),
+        invocation_class: Some(invocation_class),
+        cache_ttl_seconds: (bucket == ModelPricingBucket::CacheWriteInput
+            && dimension.contains("30m"))
+        .then_some(THIRTY_MINUTES_SECONDS),
+        min_request_input_tokens: long_context.then_some(LONG_CONTEXT_MIN_TOKENS),
+        max_request_input_tokens: (!long_context && attributes.token_type.is_some())
+            .then_some(SHORT_CONTEXT_MAX_TOKENS),
+        billing_scope: Some(billing_scope(attributes)),
+        price,
+    })
 }
 
-impl PriceBuckets {
-    fn set(&mut self, inference_type: &str, micros: u64) {
-        let dimension = inference_type.to_ascii_lowercase();
-        let bucket = match dimension.as_str() {
-            "input tokens" | "text input tokens" => &mut self.input,
-            "output tokens" | "text output tokens" => &mut self.output,
-            "prompt cache read input tokens" => &mut self.cached_input,
-            "prompt cache write input tokens" => &mut self.cache_write_input,
-            _ => return,
-        };
-        bucket.insert(micros);
+fn billing_scope(attributes: &ProductAttributes) -> String {
+    let usage = attributes.usage_type.as_deref().unwrap_or_default();
+    if attributes
+        .service_tier
+        .as_deref()
+        .is_some_and(|tier| tier.starts_with("global-"))
+        || usage.contains("cross-region-global")
+    {
+        "global".to_string()
+    } else if usage.contains("cross-region") {
+        "geo".to_string()
+    } else {
+        "in_region".to_string()
     }
-
-    fn complete(self) -> Option<ModelPricingInfo> {
-        Some(ModelPricingInfo {
-            currency: "USD".to_string(),
-            unit: ModelPricingUnit::PerMillionTokens,
-            input: Some(ModelTokenPrice::from_micros(single_price(&self.input)?)),
-            cached_input: optional_single_price(&self.cached_input)
-                .map(ModelTokenPrice::from_micros),
-            cache_write_input: optional_single_price(&self.cache_write_input)
-                .map(ModelTokenPrice::from_micros),
-            output: Some(ModelTokenPrice::from_micros(single_price(&self.output)?)),
-            source: ModelPricingSource::ProviderApi,
-        })
-    }
 }
 
-fn single_price(prices: &std::collections::BTreeSet<u64>) -> Option<u64> {
-    (prices.len() == 1)
-        .then(|| prices.iter().next().copied())
-        .flatten()
-}
-
-fn optional_single_price(prices: &std::collections::BTreeSet<u64>) -> Option<u64> {
-    single_price(prices)
+fn flat_prices(
+    rules: &[ModelPricingRule],
+) -> (
+    Option<ModelTokenPrice>,
+    Option<ModelTokenPrice>,
+    Option<ModelTokenPrice>,
+    Option<ModelTokenPrice>,
+) {
+    let price = |bucket| {
+        let prices = rules
+            .iter()
+            .filter(|rule| {
+                rule.bucket == bucket
+                    && rule.modality == Some(ModelTokenModality::Text)
+                    && rule.service_tier.is_none()
+                    && rule.invocation_class == Some(ModelInvocationClass::OnDemand)
+                    && rule.cache_ttl_seconds.is_none()
+                    && rule.min_request_input_tokens.is_none()
+                    && rule.max_request_input_tokens.is_none()
+                    && rule.billing_scope.is_none()
+            })
+            .map(|rule| rule.price)
+            .collect::<BTreeSet<_>>();
+        (prices.len() == 1)
+            .then(|| prices.first().copied())
+            .flatten()
+    };
+    (
+        price(ModelPricingBucket::Input),
+        price(ModelPricingBucket::CacheReadInput),
+        price(ModelPricingBucket::CacheWriteInput),
+        price(ModelPricingBucket::Output),
+    )
 }
 
 fn normalize_name(value: &str) -> String {
@@ -158,7 +265,10 @@ pub fn price_per_million_micros(price: &str, unit: &str) -> Option<u64> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PriceListDocument {
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     products: BTreeMap<String, Product>,
     #[serde(default)]
@@ -177,6 +287,8 @@ struct ProductAttributes {
     feature: Option<String>,
     inference_type: Option<String>,
     service_tier: Option<String>,
+    token_type: Option<String>,
+    usage_type: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -203,11 +315,12 @@ struct PriceDimension {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_model::{ModelPricingContext, TokenUsage};
 
     #[test]
     fn converts_public_price_units_to_micros_per_million_tokens() {
         assert_eq!(
-            price_per_million_micros("0.0008000000", "1K tokens"),
+            price_per_million_micros("0.0008", "1K tokens"),
             Some(800_000)
         );
         assert_eq!(
@@ -217,27 +330,41 @@ mod tests {
     }
 
     #[test]
-    fn parses_complete_standard_on_demand_pricing() {
+    fn selects_long_context_rates_for_the_entire_request() {
         let document = serde_json::from_value::<PriceListDocument>(serde_json::json!({
+            "version": "fixture-v1",
             "products": {
-                "input": {"attributes": {"model": "Nova Pro", "feature": "On-demand Inference", "inferenceType": "Input tokens"}},
-                "output": {"attributes": {"model": "Nova Pro", "feature": "On-demand Inference", "inferenceType": "Output tokens"}},
-                "priority": {"attributes": {"model": "Nova Pro", "feature": "On-demand Inference", "inferenceType": "Input tokens priority", "serviceTier": "priority"}}
+                "short-in": {"attributes": {"model": "openai.gpt-5.6-terra", "tokenType": "input_tokens_mantle", "serviceTier": "standard"}},
+                "long-in": {"attributes": {"model": "openai.gpt-5.6-terra", "tokenType": "input-tokens-long-ctx", "serviceTier": "standard"}},
+                "short-out": {"attributes": {"model": "openai.gpt-5.6-terra", "tokenType": "output_tokens_mantle", "serviceTier": "standard"}},
+                "long-out": {"attributes": {"model": "openai.gpt-5.6-terra", "tokenType": "output-tokens-long-ctx", "serviceTier": "standard"}}
             },
             "terms": {"OnDemand": {
-                "input": {"term": {"priceDimensions": {"rate": {"unit": "1K tokens", "pricePerUnit": {"USD": "0.0008"}}}}},
-                "output": {"term": {"priceDimensions": {"rate": {"unit": "1K tokens", "pricePerUnit": {"USD": "0.0032"}}}}},
-                "priority": {"term": {"priceDimensions": {"rate": {"unit": "1K tokens", "pricePerUnit": {"USD": "9"}}}}}
+                "short-in": {"term": {"priceDimensions": {"rate": {"unit": "1M tokens", "pricePerUnit": {"USD": "2.20"}}}}},
+                "long-in": {"term": {"priceDimensions": {"rate": {"unit": "1M tokens", "pricePerUnit": {"USD": "4.40"}}}}},
+                "short-out": {"term": {"priceDimensions": {"rate": {"unit": "1M tokens", "pricePerUnit": {"USD": "13.20"}}}}},
+                "long-out": {"term": {"priceDimensions": {"rate": {"unit": "1M tokens", "pricePerUnit": {"USD": "19.80"}}}}}
             }}
         })).expect("price list");
         let pricing = BedrockPricingCatalog::from_document(document)
-            .pricing_for_model_name("nova-pro")
-            .expect("complete pricing");
-        assert_eq!(pricing.input, Some(ModelTokenPrice::from_micros(800_000)));
-        assert_eq!(
-            pricing.output,
-            Some(ModelTokenPrice::from_micros(3_200_000))
-        );
-        assert_eq!(pricing.source, ModelPricingSource::ProviderApi);
+            .pricing_for_model_name("openai.gpt-5.6-terra")
+            .expect("pricing");
+        let usage = TokenUsage {
+            input_tokens: Some(300_000),
+            output_tokens: Some(10_000),
+            pricing_context: Box::new(ModelPricingContext {
+                service_tier: Some("standard".to_string()),
+                invocation_class: Some(ModelInvocationClass::OnDemand),
+                billing_scope: Some("in_region".to_string()),
+                request_input_tokens: Some(300_000),
+                ..ModelPricingContext::default()
+            }),
+            ..TokenUsage::default()
+        };
+        let estimate = pricing
+            .estimate_cost_with_context(&usage, &usage.pricing_context)
+            .expect("long-context estimate");
+        assert_eq!(estimate.total_micros, 1_518_000);
+        assert_eq!(estimate.revision.as_deref(), Some("fixture-v1"));
     }
 }

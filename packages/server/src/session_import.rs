@@ -93,6 +93,7 @@ fn imported_session_event_kind(
                 cached_input_tokens,
                 cache_write_input_tokens,
                 reasoning_tokens,
+                ..bcode_session_models::SessionTokenUsage::default()
             },
         },
         ImportableSessionEventKind::ModelChanged { provider, model } => {

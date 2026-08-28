@@ -92,6 +92,8 @@ async fn multi_round_response_exposes_aggregate_usage_and_cost() {
         cached_input: Some(ModelTokenPrice::from_micros(100_000)),
         cache_write_input: None,
         output: Some(ModelTokenPrice::from_micros(2_000_000)),
+        rules: Vec::new(),
+        revision: None,
         source: ModelPricingSource::UserOverride,
     };
     let cost = response.estimated_cost(&pricing).expect("estimated cost");

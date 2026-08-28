@@ -798,6 +798,8 @@ mod tests {
                 cached_input: Some(price(125_000)),
                 cache_write_input: None,
                 output: output.map(price),
+                rules: Vec::new(),
+                revision: None,
                 source: bcode_model::ModelPricingSource::PatternMatch,
             }),
             api_surface: None,
@@ -814,6 +816,8 @@ mod tests {
             cached_input: Some(price(125_000)),
             cache_write_input: None,
             output: Some(price(10_000_000)),
+            rules: Vec::new(),
+            revision: None,
             source: bcode_model::ModelPricingSource::PatternMatch,
         };
 
@@ -832,6 +836,8 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: Some(price(8_500_000)),
+            rules: Vec::new(),
+            revision: None,
             source: bcode_model::ModelPricingSource::ProviderApi,
         };
 

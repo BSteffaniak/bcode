@@ -5008,6 +5008,8 @@ fn token_usage_from_openai_usage(
         total_tokens,
         cached_input_tokens,
         cache_write_input_tokens: None,
+        details: Box::default(),
+        pricing_context: Box::default(),
         reasoning_tokens,
     }
 }
@@ -6447,6 +6449,8 @@ fn pricing_from_provider_api(
         )
         .map(ModelTokenPrice::from_micros),
         output,
+        rules: Vec::new(),
+        revision: None,
         source: ModelPricingSource::ProviderApi,
     })
 }

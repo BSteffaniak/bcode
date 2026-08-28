@@ -1229,12 +1229,45 @@ fn pricing_from_catalog(
             .cache_write_input_micros
             .map(ModelTokenPrice::from_micros),
         output: pricing.output_micros.map(ModelTokenPrice::from_micros),
+        rules: flat_catalog_pricing_rules(pricing),
+        revision: None,
         source: if remote {
             ModelPricingSource::RemoteCatalog
         } else {
             ModelPricingSource::BundledCatalog
         },
     })
+}
+
+fn flat_catalog_pricing_rules(pricing: &CatalogPricing) -> Vec<bcode_model::ModelPricingRule> {
+    use bcode_model::{ModelPricingBucket, ModelPricingRule, ModelTokenModality};
+    [
+        (ModelPricingBucket::Input, pricing.input_micros),
+        (
+            ModelPricingBucket::CacheReadInput,
+            pricing.cached_input_micros,
+        ),
+        (
+            ModelPricingBucket::CacheWriteInput,
+            pricing.cache_write_input_micros,
+        ),
+        (ModelPricingBucket::Output, pricing.output_micros),
+    ]
+    .into_iter()
+    .filter_map(|(bucket, micros)| {
+        micros.map(|micros| ModelPricingRule {
+            bucket,
+            modality: Some(ModelTokenModality::Text),
+            service_tier: None,
+            invocation_class: None,
+            cache_ttl_seconds: None,
+            min_request_input_tokens: None,
+            max_request_input_tokens: None,
+            billing_scope: None,
+            price: ModelTokenPrice::from_micros(micros),
+        })
+    })
+    .collect()
 }
 
 fn reasoning_from_catalog(entry: &ModelCatalogEntry) -> Option<ModelReasoningInfo> {

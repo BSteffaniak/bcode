@@ -12021,7 +12021,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     total_tokens: Some(15),
-                    ..bcode_session_models::SessionTokenUsage::default()
+                    ..SessionTokenUsage::default()
                 },
             },
         ));

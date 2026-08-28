@@ -4557,13 +4557,22 @@ struct TokenUsageMeter {
 
 impl TokenUsageMeter {
     fn absorb(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
-        if let Some(pricing) = &self.pricing {
+        if let Some(cost) = usage.estimated_cost_micros {
+            self.session_cost_micros = Some(
+                self.session_cost_micros
+                    .unwrap_or_default()
+                    .saturating_add(cost),
+            );
+        } else if let Some(pricing) = &self.pricing {
             let usage = bcode_model::TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 total_tokens: usage.total_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 cache_write_input_tokens: usage.cache_write_input_tokens,
+                details: Box::default(),
+                pricing_context: serde_json::from_value(serde_json::json!(usage.pricing_context))
+                    .unwrap_or_default(),
                 reasoning_tokens: usage.reasoning_tokens,
             };
             if let Some(cost) = pricing.estimate_cost(&usage) {

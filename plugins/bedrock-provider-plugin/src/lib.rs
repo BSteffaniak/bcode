@@ -829,13 +829,23 @@ fn build_mantle_openai_request(
         max_output_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
     };
-    serde_json::to_value(typed).map_err(|error| {
+    let mut value = serde_json::to_value(typed).map_err(|error| {
         provider_error(
             "bedrock_mantle_openai_request_encode_failed",
             ProviderErrorCategory::InvalidRequest,
             format!("failed to encode Bedrock Mantle OpenAI request: {error}"),
         )
-    })
+    })?;
+    if let Some(service_tier) = request.metadata.get("service_tier") {
+        value["service_tier"] = serde_json::Value::String(service_tier.clone());
+    }
+    if let Some(prompt_cache_key) = request.metadata.get("prompt_cache_key") {
+        value["prompt_cache_key"] = serde_json::Value::String(prompt_cache_key.clone());
+    }
+    if let Some(retention) = request.metadata.get("prompt_cache_retention") {
+        value["prompt_cache_retention"] = serde_json::Value::String(retention.clone());
+    }
+    Ok(value)
 }
 
 /// Reasoning controls for a Mantle `OpenAI` request, when the turn requested any.
@@ -943,7 +953,13 @@ async fn stream_mantle_openai_turn(
             last_error = Some(error);
             continue;
         }
-        return read_mantle_openai_stream(response, turn, &name_map).await;
+        return read_mantle_openai_stream(
+            response,
+            turn,
+            &name_map,
+            request.metadata.get("service_tier").map(String::as_str),
+        )
+        .await;
     }
     Err(last_error.unwrap_or_else(|| {
         provider_error(
@@ -962,6 +978,7 @@ async fn read_mantle_openai_stream(
     mut response: reqwest::Response,
     turn: &TurnState,
     name_map: &BTreeMap<String, String>,
+    requested_service_tier: Option<&str>,
 ) -> Result<StreamOutcome, ProviderError> {
     let sink = MantleTurnEventSink(turn);
     let mut buffer = String::new();
@@ -986,7 +1003,13 @@ async fn read_mantle_openai_stream(
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 for line in bcode_openai_responses::drain_complete_stream_lines(&mut buffer) {
                     if let Some(outcome) =
-                        process_mantle_openai_line(&line, &sink, &mut state, name_map)?
+                        process_mantle_openai_line(
+                            &line,
+                            &sink,
+                            &mut state,
+                            name_map,
+                            requested_service_tier,
+                        )?
                     {
                         return Ok(outcome);
                     }
@@ -1026,6 +1049,7 @@ fn process_mantle_openai_line(
     sink: &impl bcode_openai_responses::ResponsesEventSink,
     state: &mut MantleOpenAiStreamState,
     name_map: &BTreeMap<String, String>,
+    requested_service_tier: Option<&str>,
 ) -> Result<Option<StreamOutcome>, ProviderError> {
     use bcode_openai_responses as responses;
 
@@ -1120,7 +1144,7 @@ fn process_mantle_openai_line(
             responses::process_responses_function_arguments_done(&event, &mut state.tool_calls);
         }
         "response.completed" => {
-            if let Some(usage) = mantle_openai_usage(&event) {
+            if let Some(usage) = mantle_openai_usage(&event, requested_service_tier) {
                 push_mantle_openai_usage(sink, usage);
             }
             if state.saw_tool_call {
@@ -1130,7 +1154,7 @@ fn process_mantle_openai_line(
             return Ok(Some(StreamOutcome::Finished));
         }
         "response.incomplete" => {
-            if let Some(usage) = mantle_openai_usage(&event) {
+            if let Some(usage) = mantle_openai_usage(&event, requested_service_tier) {
                 push_mantle_openai_usage(sink, usage);
             }
             let reason = responses::responses_incomplete_reason(&event);
@@ -1188,7 +1212,10 @@ fn finish_mantle_openai_tool_calls(
 }
 
 /// Normalized token usage reported by a Responses completion event.
-fn mantle_openai_usage(event: &serde_json::Value) -> Option<TokenUsage> {
+fn mantle_openai_usage(
+    event: &serde_json::Value,
+    requested_service_tier: Option<&str>,
+) -> Option<TokenUsage> {
     let usage = event
         .get("response")
         .unwrap_or(event)
@@ -1205,6 +1232,15 @@ fn mantle_openai_usage(event: &serde_json::Value) -> Option<TokenUsage> {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
+    let cache_write = usage
+        .get("input_tokens_details")
+        .and_then(|details| {
+            details
+                .get("cache_write_tokens")
+                .or_else(|| details.get("cache_creation_tokens"))
+        })
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
     let reasoning = usage
         .get("output_tokens_details")
         .and_then(|details| details.get("reasoning_tokens"))
@@ -1215,7 +1251,47 @@ fn mantle_openai_usage(event: &serde_json::Value) -> Option<TokenUsage> {
         output_tokens: read("output_tokens"),
         total_tokens: read("total_tokens"),
         cached_input_tokens: cached,
-        cache_write_input_tokens: None,
+        cache_write_input_tokens: cache_write,
+        details: Box::default(),
+        pricing_context: Box::new(bcode_model::ModelPricingContext {
+            service_tier: event
+                .get("response")
+                .unwrap_or(event)
+                .get("service_tier")
+                .and_then(serde_json::Value::as_str)
+                .or(requested_service_tier)
+                .map(str::to_string),
+            invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+            billing_scope: event
+                .get("response")
+                .unwrap_or(event)
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(|model| {
+                    if model.starts_with("global.") {
+                        "global"
+                    } else if model
+                        .split_once('.')
+                        .is_some_and(|(prefix, _)| matches!(prefix, "us" | "eu" | "apac" | "in"))
+                    {
+                        "geo"
+                    } else {
+                        "in_region"
+                    }
+                })
+                .map(str::to_string),
+            request_input_tokens: read("input_tokens").map(u64::from),
+            cache_ttl_seconds: event
+                .get("response")
+                .unwrap_or(event)
+                .get("prompt_cache_retention")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|retention| match retention {
+                    "30m" => Some(30 * 60),
+                    "1h" => Some(60 * 60),
+                    _ => None,
+                }),
+        }),
         reasoning_tokens: reasoning,
     })
 }
@@ -2225,6 +2301,11 @@ impl AnthropicMessagesAccumulator {
                 output_tokens,
                 cached_input_tokens,
                 cache_write_input_tokens,
+                pricing_context: Box::new(bcode_model::ModelPricingContext {
+                    invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                    request_input_tokens: input_tokens.map(u64::from),
+                    ..bcode_model::ModelPricingContext::default()
+                }),
                 ..TokenUsage::default()
             },
         });
@@ -2403,6 +2484,11 @@ impl StreamAccumulator {
                             output_tokens: nonnegative_u32(usage.output_tokens()),
                             cached_input_tokens: cache_read_input_tokens,
                             cache_write_input_tokens,
+                            pricing_context: Box::new(bcode_model::ModelPricingContext {
+                                invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                                request_input_tokens: input_tokens.map(u64::from),
+                                ..bcode_model::ModelPricingContext::default()
+                            }),
                             ..TokenUsage::default()
                         },
                     });
@@ -5195,6 +5281,8 @@ fn pricing_from_agreement_rates<'a>(
         cached_input: cached_input.map(bcode_model::ModelTokenPrice::from_micros),
         cache_write_input: cache_write_input.map(bcode_model::ModelTokenPrice::from_micros),
         output: Some(bcode_model::ModelTokenPrice::from_micros(output?)),
+        rules: Vec::new(),
+        revision: None,
         source: bcode_model::ModelPricingSource::ProviderApi,
     })
 }
@@ -6814,6 +6902,7 @@ mod tests {
                 &sink,
                 &mut state,
                 &name_map,
+                None,
             )
             .expect("delta decodes")
             .is_none()
@@ -6823,6 +6912,7 @@ mod tests {
             &sink,
             &mut state,
             &name_map,
+            None,
         )
         .expect("completion decodes")
         .expect("completion is terminal");
@@ -6856,6 +6946,7 @@ mod tests {
             &sink,
             &mut state,
             &BTreeMap::new(),
+            None,
         )
         .expect("completion decodes")
         .expect("completion is terminal");
@@ -6886,7 +6977,7 @@ mod tests {
             r#"data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"a.rs\"}"}"#,
         ] {
             assert!(
-                process_mantle_openai_line(line, &sink, &mut state, &name_map)
+                process_mantle_openai_line(line, &sink, &mut state, &name_map, None)
                     .expect("line decodes")
                     .is_none()
             );
@@ -6897,6 +6988,7 @@ mod tests {
             &sink,
             &mut state,
             &name_map,
+            None,
         )
         .expect("completion decodes")
         .expect("completion is terminal");
@@ -6927,6 +7019,7 @@ mod tests {
             &sink,
             &mut truncated,
             &name_map,
+            None,
         )
         .expect("incomplete decodes")
         .expect("incomplete is terminal");
@@ -6939,6 +7032,7 @@ mod tests {
             &sink,
             &mut filtered,
             &name_map,
+            None,
         )
         .expect_err("unexpected incomplete reasons must fail");
         assert_eq!(error.code, "bedrock_mantle_openai_response_incomplete");
@@ -6950,6 +7044,7 @@ mod tests {
             &sink,
             &mut failed,
             &name_map,
+            None,
         )
         .expect_err("failures must propagate");
         assert_eq!(error.code, "server_error");

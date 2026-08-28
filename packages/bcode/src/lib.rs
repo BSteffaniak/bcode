@@ -9239,13 +9239,44 @@ impl GenerateTextResponse {
         self.runtime.usage.as_ref()
     }
 
-    /// Estimate total turn cost from aggregate provider-reported usage and explicit pricing.
+    /// Estimate total turn cost by pricing every provider round independently.
     ///
     /// The returned value retains currency and pricing-source provenance. `None` means complete
     /// reported usage and pricing coverage were unavailable; it never means zero cost.
     #[must_use]
     pub fn estimated_cost(&self, pricing: &ModelPricingInfo) -> Option<ModelCostEstimate> {
-        pricing.estimate_cost(self.usage()?)
+        let round_estimates = self
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                GenerationStep::Model {
+                    usage: Some(usage), ..
+                } => Some(pricing.estimate_cost(usage)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if round_estimates.is_empty() {
+            return pricing.estimate_cost(self.usage()?);
+        }
+        let currency = round_estimates.first()?.currency.clone();
+        if round_estimates
+            .iter()
+            .any(|estimate| estimate.currency != currency || estimate.source != pricing.source)
+        {
+            return None;
+        }
+        Some(ModelCostEstimate {
+            currency,
+            total_micros: round_estimates.iter().fold(0_u64, |total, estimate| {
+                total.saturating_add(estimate.total_micros)
+            }),
+            components: round_estimates
+                .into_iter()
+                .flat_map(|estimate| estimate.components)
+                .collect(),
+            source: pricing.source,
+            revision: pricing.revision.clone(),
+        })
     }
 }
 

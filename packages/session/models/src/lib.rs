@@ -2737,6 +2737,24 @@ pub struct SessionTokenUsage {
     /// Input tokens written to a provider prompt cache, when available.
     #[serde(default)]
     pub cache_write_input_tokens: Option<u32>,
+    /// Pricing context confirmed for this provider round.
+    #[serde(default)]
+    pub pricing_context: BTreeMap<String, String>,
+    /// Detailed independently priced usage buckets serialized from the normalized model contract.
+    #[serde(default)]
+    pub pricing_usage_details: Vec<serde_json::Value>,
+    /// Estimated cost fixed at the time this round was recorded.
+    #[serde(default)]
+    pub estimated_cost_micros: Option<u64>,
+    /// Currency for the fixed estimated cost.
+    #[serde(default)]
+    pub estimated_cost_currency: Option<String>,
+    /// Pricing-source label for the fixed estimate.
+    #[serde(default)]
+    pub estimated_cost_source: Option<String>,
+    /// Pricing revision used for the fixed estimate.
+    #[serde(default)]
+    pub estimated_cost_revision: Option<String>,
     /// Reasoning tokens reported separately by a provider, when available.
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,

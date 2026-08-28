@@ -5606,6 +5606,7 @@ mod tests {
                     cached_input_tokens: Some(3),
                     cache_write_input_tokens: Some(4),
                     reasoning_tokens: Some(2),
+                    ..bcode_session_models::SessionTokenUsage::default()
                 },
             )
             .await
@@ -8651,6 +8652,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_write_input_tokens: None,
                         reasoning_tokens: None,
+                        ..bcode_session_models::SessionTokenUsage::default()
                     },
                 },
             ),

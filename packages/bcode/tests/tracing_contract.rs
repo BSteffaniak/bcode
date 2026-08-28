@@ -169,6 +169,8 @@ async fn stable_tracing_contract_covers_request_provider_tool_session_retry_cach
             cached_input: None,
             cache_write_input: None,
             output: Some(ModelTokenPrice::from_micros(1_000_000)),
+            rules: Vec::new(),
+            revision: None,
             source: ModelPricingSource::UserOverride,
         })
         .retry_policy(RetryPolicy::new(1, Duration::ZERO))
@@ -194,6 +196,8 @@ async fn stable_tracing_contract_covers_request_provider_tool_session_retry_cach
                     cached_input: None,
                     cache_write_input: None,
                     output: Some(ModelTokenPrice::from_micros(1_000_000)),
+                    rules: Vec::new(),
+                    revision: None,
                     source: ModelPricingSource::UserOverride,
                 })
                 .retry_policy(RetryPolicy::new(1, Duration::ZERO))

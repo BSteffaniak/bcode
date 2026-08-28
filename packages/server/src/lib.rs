@@ -30139,13 +30139,26 @@ async fn append_model_usage_event(
     }
 }
 
-const fn session_token_usage(usage: &TokenUsage) -> SessionTokenUsage {
+fn session_token_usage(usage: &TokenUsage) -> SessionTokenUsage {
     SessionTokenUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
+        pricing_context: serde_json::to_value(&usage.pricing_context)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        pricing_usage_details: usage
+            .details
+            .iter()
+            .filter_map(|detail| serde_json::to_value(detail).ok())
+            .collect(),
+        estimated_cost_micros: None,
+        estimated_cost_currency: None,
+        estimated_cost_source: None,
+        estimated_cost_revision: None,
         reasoning_tokens: usage.reasoning_tokens,
     }
 }

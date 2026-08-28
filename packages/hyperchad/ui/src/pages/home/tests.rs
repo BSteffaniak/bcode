@@ -553,6 +553,7 @@ fn usage_and_context_render_compact_summaries_with_secondary_details() {
         cached_input_tokens: Some(40),
         cache_write_input_tokens: Some(10),
         reasoning_tokens: Some(5),
+        ..bcode_session_models::SessionTokenUsage::default()
     };
     let runtime = bcode_session_view_models::SessionRuntimeViewState {
         context_occupancy: Some(exact_context_occupancy(8_000)),

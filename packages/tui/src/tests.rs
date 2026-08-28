@@ -1841,6 +1841,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
                     cached_input_tokens: Some(256),
                     cache_write_input_tokens: Some(128),
                     reasoning_tokens: Some(64),
+                    ..SessionTokenUsage::default()
                 },
             },
         ),
@@ -1932,6 +1933,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
                 cached_input_tokens: None,
                 cache_write_input_tokens: None,
                 reasoning_tokens: None,
+                ..SessionTokenUsage::default()
             },
         },
     )];
@@ -1988,6 +1990,7 @@ fn status_line_includes_unknown_context_before_spent_tokens() {
                 cached_input_tokens: Some(75_700),
                 cache_write_input_tokens: None,
                 reasoning_tokens: None,
+                ..SessionTokenUsage::default()
             },
         },
     )];

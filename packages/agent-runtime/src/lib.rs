@@ -3098,6 +3098,11 @@ fn aggregate_finished_usage(events: &[AgentRuntimeEvent]) -> Option<TokenUsage> 
         cache_write_input_tokens: aggregate_complete_bucket(&usages, |usage| {
             usage.cache_write_input_tokens
         }),
+        details: usages
+            .iter()
+            .flat_map(|usage| usage.details.iter().cloned())
+            .collect(),
+        pricing_context: Box::default(),
         reasoning_tokens: aggregate_complete_bucket(&usages, |usage| usage.reasoning_tokens),
     })
 }

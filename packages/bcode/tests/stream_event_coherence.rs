@@ -111,6 +111,7 @@ fn usage() -> TokenUsage {
         cached_input_tokens: Some(3),
         cache_write_input_tokens: Some(2),
         reasoning_tokens: Some(1),
+        ..TokenUsage::default()
     }
 }
 

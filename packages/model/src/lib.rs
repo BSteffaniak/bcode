@@ -1164,8 +1164,97 @@ pub struct ModelPricingInfo {
     /// Price for generated output tokens.
     #[serde(default)]
     pub output: Option<ModelTokenPrice>,
+    /// Conditional token-pricing rules. Empty means the legacy flat buckets above are authoritative.
+    #[serde(default)]
+    pub rules: Vec<ModelPricingRule>,
+    /// Provider/catalog publication or effective revision used for these prices.
+    #[serde(default)]
+    pub revision: Option<String>,
     /// Price source.
     pub source: ModelPricingSource,
+}
+
+/// One normalized conditional token-pricing rule.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ModelPricingRule {
+    /// Billed token category.
+    pub bucket: ModelPricingBucket,
+    /// Optional modality restriction. `None` applies only when no modality split is required.
+    #[serde(default)]
+    pub modality: Option<ModelTokenModality>,
+    /// Optional effective service tier.
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    /// Optional invocation class.
+    #[serde(default)]
+    pub invocation_class: Option<ModelInvocationClass>,
+    /// Optional cache retention required by this rule.
+    #[serde(default)]
+    pub cache_ttl_seconds: Option<u64>,
+    /// Inclusive minimum complete request-input size selecting this rule.
+    #[serde(default)]
+    pub min_request_input_tokens: Option<u64>,
+    /// Inclusive maximum complete request-input size selecting this rule.
+    #[serde(default)]
+    pub max_request_input_tokens: Option<u64>,
+    /// Optional billing scope, such as in-region, geo, or global routing.
+    #[serde(default)]
+    pub billing_scope: Option<String>,
+    /// Token price for this condition.
+    pub price: ModelTokenPrice,
+}
+
+/// Normalized billed token category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPricingBucket {
+    Input,
+    CacheReadInput,
+    CacheWriteInput,
+    Output,
+}
+
+/// Provider-neutral token modality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTokenModality {
+    Text,
+    Image,
+    Audio,
+    Video,
+}
+
+/// Invocation class affecting usage-based pricing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInvocationClass {
+    OnDemand,
+    Batch,
+}
+
+/// Pricing context confirmed or derived for one provider round.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPricingContext {
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    #[serde(default)]
+    pub invocation_class: Option<ModelInvocationClass>,
+    #[serde(default)]
+    pub billing_scope: Option<String>,
+    #[serde(default)]
+    pub request_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_ttl_seconds: Option<u64>,
+}
+
+/// Detailed provider-reported token usage for one independently priced category.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTokenUsageDetail {
+    pub bucket: ModelPricingBucket,
+    pub modality: ModelTokenModality,
+    pub tokens: u32,
+    #[serde(default)]
+    pub cache_ttl_seconds: Option<u64>,
 }
 
 /// Model pricing unit.
@@ -1177,7 +1266,7 @@ pub enum ModelPricingUnit {
 }
 
 /// Price for a token bucket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ModelTokenPrice {
     /// Price in micros of the pricing currency.
     pub micros: u64,
@@ -1210,18 +1299,39 @@ pub struct ModelCostEstimate {
     pub currency: String,
     /// Total estimated cost in micros of the pricing currency.
     pub total_micros: u64,
+    /// Per-bucket estimated cost components.
+    #[serde(default)]
+    pub components: Vec<ModelCostComponent>,
     /// Price metadata source used for the estimate.
     pub source: ModelPricingSource,
+    /// Provider/catalog revision used for the estimate.
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
+/// One component of an estimated model-call cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCostComponent {
+    pub bucket: ModelPricingBucket,
+    #[serde(default)]
+    pub modality: Option<ModelTokenModality>,
+    pub tokens: u32,
+    pub price: ModelTokenPrice,
+    pub cost_micros: u64,
 }
 
 impl ModelPricingInfo {
     /// Estimate cost for provider-reported token usage.
     /// Returns `Some` only when the provider reported complete input/output usage and every
-    /// non-zero separately priced cache bucket has corresponding pricing. Legitimate zero-cost or
-    /// sub-micro estimates remain `Some(0)`. Returns `None` rather than silently producing a
-    /// partial total when usage or pricing coverage is incomplete.
+    /// non-zero separately priced cache bucket has corresponding pricing. Conditional pricing
+    /// rules are selected using the provider-confirmed pricing context carried by the usage.
+    /// Legitimate zero-cost or sub-micro estimates remain `Some(0)`. Returns `None` rather than
+    /// silently producing a partial total when usage or pricing coverage is incomplete.
     #[must_use]
     pub fn estimate_cost(&self, usage: &TokenUsage) -> Option<ModelCostEstimate> {
+        if !self.rules.is_empty() {
+            return self.estimate_cost_with_context(usage, &usage.pricing_context);
+        }
         let input = usage.input_tokens?;
         let output = usage.output_tokens?;
         let cached = usage.cached_input_tokens.unwrap_or_default();
@@ -1248,9 +1358,123 @@ impl ModelPricingInfo {
         Some(ModelCostEstimate {
             currency: self.currency.clone(),
             total_micros,
+            components: Vec::new(),
             source: self.source,
+            revision: self.revision.clone(),
         })
     }
+
+    /// Estimate one provider round using conditional normalized pricing rules.
+    #[must_use]
+    pub fn estimate_cost_with_context(
+        &self,
+        usage: &TokenUsage,
+        context: &ModelPricingContext,
+    ) -> Option<ModelCostEstimate> {
+        if self.rules.is_empty() {
+            return self.estimate_cost(usage);
+        }
+        let usages = normalized_pricing_usages(usage)?;
+        if usage.details.is_empty()
+            && self.rules.iter().any(|rule| {
+                rule.modality
+                    .is_some_and(|modality| modality != ModelTokenModality::Text)
+            })
+        {
+            return None;
+        }
+        let mut components = Vec::with_capacity(usages.len());
+        for usage in usages {
+            let matching = self
+                .rules
+                .iter()
+                .filter(|rule| pricing_rule_matches(rule, &usage, context))
+                .collect::<Vec<_>>();
+            let [rule] = matching.as_slice() else {
+                return None;
+            };
+            let cost_micros = price_bucket_micros(usage.tokens, Some(rule.price));
+            components.push(ModelCostComponent {
+                bucket: usage.bucket,
+                modality: Some(usage.modality),
+                tokens: usage.tokens,
+                price: rule.price,
+                cost_micros,
+            });
+        }
+        Some(ModelCostEstimate {
+            currency: self.currency.clone(),
+            total_micros: components.iter().fold(0_u64, |total, component| {
+                total.saturating_add(component.cost_micros)
+            }),
+            components,
+            source: self.source,
+            revision: self.revision.clone(),
+        })
+    }
+}
+
+fn normalized_pricing_usages(usage: &TokenUsage) -> Option<Vec<ModelTokenUsageDetail>> {
+    if !usage.details.is_empty() {
+        return Some(usage.details.to_vec());
+    }
+    let input = usage.input_tokens?;
+    let output = usage.output_tokens?;
+    let cached = usage.cached_input_tokens.unwrap_or_default();
+    let cache_write = usage.cache_write_input_tokens.unwrap_or_default();
+    let mut details = Vec::new();
+    let uncached = input.saturating_sub(cached);
+    for (bucket, tokens) in [
+        (ModelPricingBucket::Input, uncached),
+        (ModelPricingBucket::CacheReadInput, cached),
+        (ModelPricingBucket::CacheWriteInput, cache_write),
+        (ModelPricingBucket::Output, output),
+    ] {
+        if tokens > 0 {
+            details.push(ModelTokenUsageDetail {
+                bucket,
+                modality: ModelTokenModality::Text,
+                tokens,
+                cache_ttl_seconds: None,
+            });
+        }
+    }
+    Some(details)
+}
+
+fn pricing_rule_matches(
+    rule: &ModelPricingRule,
+    usage: &ModelTokenUsageDetail,
+    context: &ModelPricingContext,
+) -> bool {
+    rule.bucket == usage.bucket
+        && rule
+            .modality
+            .is_none_or(|modality| modality == usage.modality)
+        && rule
+            .service_tier
+            .as_deref()
+            .is_none_or(|tier| context.service_tier.as_deref() == Some(tier))
+        && rule
+            .invocation_class
+            .is_none_or(|class| context.invocation_class == Some(class))
+        && rule
+            .billing_scope
+            .as_deref()
+            .is_none_or(|scope| context.billing_scope.as_deref() == Some(scope))
+        && rule
+            .cache_ttl_seconds
+            .is_none_or(|ttl| usage.cache_ttl_seconds.or(context.cache_ttl_seconds) == Some(ttl))
+        && rule.min_request_input_tokens.is_none_or(|minimum| {
+            context
+                .request_input_tokens
+                .is_some_and(|tokens| tokens >= minimum)
+        })
+        && rule.max_request_input_tokens.is_none_or(|maximum| {
+            context
+                .request_input_tokens
+                .is_some_and(|tokens| tokens <= maximum)
+        })
 }
 
 fn price_bucket_micros(tokens: u32, price: Option<ModelTokenPrice>) -> u64 {
@@ -2753,6 +2977,12 @@ pub struct TokenUsage {
     /// Input tokens written to a provider prompt cache, when available.
     #[serde(default)]
     pub cache_write_input_tokens: Option<u32>,
+    /// Detailed independently priced token buckets, when reported.
+    #[serde(default)]
+    pub details: Box<[ModelTokenUsageDetail]>,
+    /// Pricing context confirmed by the provider for this round.
+    #[serde(default)]
+    pub pricing_context: Box<ModelPricingContext>,
     /// Reasoning tokens reported separately by a provider, when available.
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
@@ -3785,6 +4015,8 @@ mod tests {
             cached_input: Some(ModelTokenPrice::from_micros(100_000)),
             cache_write_input: Some(ModelTokenPrice::from_micros(1_250_000)),
             output: Some(ModelTokenPrice::from_micros(4_000_000)),
+            rules: Vec::new(),
+            revision: None,
             source: ModelPricingSource::BundledCatalog,
         };
         let usage = TokenUsage {
@@ -3809,6 +4041,8 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: Some(ModelTokenPrice::from_micros(0)),
+            rules: Vec::new(),
+            revision: None,
             source: ModelPricingSource::UserOverride,
         };
         let usage = TokenUsage {
@@ -3830,6 +4064,8 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: Some(ModelTokenPrice::from_micros(1)),
+            rules: Vec::new(),
+            revision: None,
             source: ModelPricingSource::UserOverride,
         };
         let usage = TokenUsage {
@@ -3851,6 +4087,8 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: None,
+            rules: Vec::new(),
+            revision: None,
             source: ModelPricingSource::UserOverride,
         };
         let usage = TokenUsage {
@@ -3871,6 +4109,8 @@ mod tests {
             cached_input: Some(ModelTokenPrice::from_micros(1)),
             cache_write_input: None,
             output: Some(ModelTokenPrice::from_micros(1)),
+            rules: Vec::new(),
+            revision: None,
             source: ModelPricingSource::UserOverride,
         };
         let usage = TokenUsage {
@@ -3892,6 +4132,8 @@ mod tests {
             cached_input: None,
             cache_write_input: None,
             output: None,
+            rules: Vec::new(),
+            revision: None,
             source: ModelPricingSource::Unknown,
         };
 
