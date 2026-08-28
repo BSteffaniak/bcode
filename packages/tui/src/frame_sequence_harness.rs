@@ -61,8 +61,8 @@ pub fn assert_no_forbidden_frames(
 
 pub enum TranscriptFrameInput {
     EphemeralPlain(String),
-    Durable(SessionEvent),
-    Live(SessionLiveEvent),
+    Durable(Box<SessionEvent>),
+    Live(Box<SessionLiveEvent>),
     PrependHistory {
         events: Vec<SessionEvent>,
         has_more: bool,
@@ -73,6 +73,14 @@ pub enum TranscriptFrameInput {
     AdvanceStreaming(std::time::Duration),
     AssertNoPendingStreaming,
     Observe,
+}
+
+fn live_input(event: SessionLiveEvent) -> TranscriptFrameInput {
+    TranscriptFrameInput::Live(Box::new(event))
+}
+
+fn durable_input(event: SessionEvent) -> TranscriptFrameInput {
+    TranscriptFrameInput::Durable(Box::new(event))
 }
 
 pub struct TranscriptFrameStep {
@@ -225,7 +233,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "later durable",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     2,
                     SessionEventKind::AssistantMessage {
@@ -300,7 +308,7 @@ mod tests {
         let frames = TranscriptFrameSequence::new(app, 80, 24).run([
             TranscriptFrameStep {
                 label: "stream-start",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                         output_position: None,
@@ -321,7 +329,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "turn-cancelled",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     1,
                     SessionEventKind::ModelTurnFinished {
@@ -364,7 +372,7 @@ mod tests {
         let frames = TranscriptFrameSequence::new(app, 80, 24).run([
             TranscriptFrameStep {
                 label: "stream-start",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                         output_position: None,
@@ -423,7 +431,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "user",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     1,
                     SessionEventKind::UserMessage {
@@ -435,7 +443,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "assistant-first",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                         output_position: None,
@@ -456,7 +464,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "assistant-second",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                         output_position: None,
@@ -534,7 +542,7 @@ mod tests {
                     1 => "assistant-middle",
                     _ => "assistant-trailing",
                 },
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                         output_position: None,
@@ -580,7 +588,7 @@ mod tests {
         let first_len = first.len();
         let second_offset = first_len.saturating_add(second.len());
         let update = |revision, expected_offset, text: String| {
-            TranscriptFrameInput::Live(SessionLiveEvent {
+            live_input(SessionLiveEvent {
                 session_id,
                 kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                     output_position: None,
@@ -599,7 +607,7 @@ mod tests {
                 },
             })
         };
-        let terminal = TranscriptFrameInput::Live(SessionLiveEvent {
+        let terminal = live_input(SessionLiveEvent {
             session_id,
             kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                 output_position: None,
@@ -682,7 +690,7 @@ mod tests {
             } else {
                 "reasoning-second-part"
             },
-            input: TranscriptFrameInput::Live(SessionLiveEvent {
+            input: live_input(SessionLiveEvent {
                 session_id,
                 kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
                     output_position: None,
@@ -742,7 +750,7 @@ mod tests {
         let delta = |label: &'static str, revision: u64, expected_offset: usize, text: &str| {
             TranscriptFrameStep {
                 label,
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
                         output_position: None,
@@ -772,7 +780,7 @@ mod tests {
             // `content_block_stop` finishes the activity; readable text must remain.
             TranscriptFrameStep {
                 label: "reasoning-finished",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningActivity {
                         output_position: None,
@@ -824,7 +832,7 @@ mod tests {
         let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
             label: "durable-reasoning-replay",
-            input: TranscriptFrameInput::Durable(SessionEvent {
+            input: durable_input(SessionEvent {
                 schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 1,
                 timestamp_ms: 1,
@@ -866,7 +874,7 @@ mod tests {
         let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
             label: "opaque-only-reasoning",
-            input: TranscriptFrameInput::Durable(SessionEvent {
+            input: durable_input(SessionEvent {
                 schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
                 sequence: 1,
                 timestamp_ms: 1,
@@ -932,7 +940,7 @@ mod tests {
             app.set_reasoning_display_mode(mode);
             let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
                 label: "reasoning-visible",
-                input: TranscriptFrameInput::Durable(reasoning.clone()),
+                input: durable_input(reasoning.clone()),
             }]);
             assert!(
                 frames[0].text.contains("Raw chain of thought"),
@@ -947,7 +955,7 @@ mod tests {
         let frames =
             TranscriptFrameSequence::new(summary_app, 100, 40).run([TranscriptFrameStep {
                 label: "reasoning-filtered-by-summary-mode",
-                input: TranscriptFrameInput::Durable(reasoning.clone()),
+                input: durable_input(reasoning.clone()),
             }]);
         assert!(
             !frames[0].text.contains("Raw chain of thought"),
@@ -965,7 +973,7 @@ mod tests {
         hidden_app.set_reasoning_visible(false);
         let frames = TranscriptFrameSequence::new(hidden_app, 100, 40).run([TranscriptFrameStep {
             label: "reasoning-hidden",
-            input: TranscriptFrameInput::Durable(reasoning),
+            input: durable_input(reasoning),
         }]);
         assert!(
             !frames[0].text.contains("Raw chain of thought"),
@@ -1054,19 +1062,19 @@ mod tests {
         let frames = TranscriptFrameSequence::new(app, 100, 40).run([
             TranscriptFrameStep {
                 label: "draft-first",
-                input: TranscriptFrameInput::Live(draft(1, "hello")),
+                input: live_input(draft(1, "hello")),
             },
             TranscriptFrameStep {
                 label: "draft-second",
-                input: TranscriptFrameInput::Live(draft(2, "hello world")),
+                input: live_input(draft(2, "hello world")),
             },
             TranscriptFrameStep {
                 label: "accepted-request",
-                input: TranscriptFrameInput::Durable(request),
+                input: durable_input(request),
             },
             TranscriptFrameStep {
                 label: "result",
-                input: TranscriptFrameInput::Durable(result),
+                input: durable_input(result),
             },
         ]);
         assert_no_forbidden_frames(&frames, |frame| {
@@ -1146,7 +1154,7 @@ mod tests {
         let preview = r#"{"command":"cargo check --workspace","cwd":"/tmp/project"}"#;
         let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
             label: "coalesced-shell-draft",
-            input: TranscriptFrameInput::Live(SessionLiveEvent {
+            input: live_input(SessionLiveEvent {
                 session_id,
                 kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
@@ -1198,7 +1206,7 @@ mod tests {
         app.set_plugin_host(Arc::new(shell_plugin_host()));
         let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
             label: "atomic-shell-request",
-            input: TranscriptFrameInput::Durable(durable(
+            input: durable_input(durable(
                 session_id,
                 1,
                 SessionEventKind::ToolCallRequested {
@@ -1241,7 +1249,7 @@ mod tests {
             } else {
                 "draft-cwd"
             },
-            input: TranscriptFrameInput::Live(SessionLiveEvent {
+            input: live_input(SessionLiveEvent {
                 session_id,
                 kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
@@ -1289,7 +1297,7 @@ mod tests {
             } else {
                 "live-output"
             },
-            input: TranscriptFrameInput::Live(SessionLiveEvent {
+            input: live_input(SessionLiveEvent {
                 session_id,
                 kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
                     update: bcode_tool::ToolPresentationUpdate {
@@ -1367,13 +1375,13 @@ mod tests {
             ),
             TranscriptFrameStep {
                 label: "assembled-request",
-                input: TranscriptFrameInput::Durable(request),
+                input: durable_input(request),
             },
             live_update(2, None),
             live_update(3, Some(0)),
             TranscriptFrameStep {
                 label: "terminal-result",
-                input: TranscriptFrameInput::Durable(result),
+                input: durable_input(result),
             },
         ]);
 
@@ -1423,7 +1431,7 @@ mod tests {
             } else {
                 "recording-later"
             },
-            input: TranscriptFrameInput::Live(SessionLiveEvent {
+            input: live_input(SessionLiveEvent {
                 session_id,
                 kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
                     update: bcode_tool::ToolPresentationUpdate {
@@ -1456,7 +1464,7 @@ mod tests {
         let frames = TranscriptFrameSequence::new(app, 100, 40).run([
             TranscriptFrameStep {
                 label: "accepted",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     1,
                     SessionEventKind::ToolCallRequested {
@@ -1471,7 +1479,7 @@ mod tests {
             presentation(1, 64),
             TranscriptFrameStep {
                 label: "running",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     2,
                     SessionEventKind::ToolInvocationLifecycle {
@@ -1535,7 +1543,7 @@ mod tests {
         let mut steps = (0..24_u64)
             .map(|index| TranscriptFrameStep {
                 label: "history-row",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     index.saturating_add(1),
                     SessionEventKind::UserMessage {
@@ -1552,7 +1560,7 @@ mod tests {
         });
         steps.push(TranscriptFrameStep {
             label: "tool-update",
-            input: TranscriptFrameInput::Live(SessionLiveEvent {
+            input: live_input(SessionLiveEvent {
                 session_id,
                 kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
@@ -1596,7 +1604,7 @@ mod tests {
         let mut steps = (0..24_u64)
             .map(|index| TranscriptFrameStep {
                 label: "newer-history-row",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     index.saturating_add(101),
                     SessionEventKind::UserMessage {
@@ -1655,7 +1663,7 @@ mod tests {
         let frames = TranscriptFrameSequence::new(app, 100, 40).run([
             TranscriptFrameStep {
                 label: "assistant-position-2",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                         output_position: Some(bcode_session_models::TurnOutputPosition::new(2)),
@@ -1676,7 +1684,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "tool-position-1",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
                         event: bcode_session_models::ToolRequestDraftEvent {
@@ -1703,7 +1711,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "reasoning-position-0",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
                         output_position: Some(bcode_session_models::TurnOutputPosition::new(0)),
@@ -1780,7 +1788,7 @@ mod tests {
         .run([
             TranscriptFrameStep {
                 label: "assistant-position-2",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
                         output_position: Some(bcode_session_models::TurnOutputPosition::new(2)),
@@ -1801,7 +1809,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "system-barrier",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     1,
                     SessionEventKind::SystemMessage {
@@ -1811,7 +1819,7 @@ mod tests {
             },
             TranscriptFrameStep {
                 label: "reasoning-position-0",
-                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                input: live_input(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
                         output_position: Some(bcode_session_models::TurnOutputPosition::new(0)),
@@ -1867,7 +1875,7 @@ mod tests {
             let work_id = WorkId::new(format!("raw-work-{index}-{tool_name}"));
             steps.push(TranscriptFrameStep {
                 label: "tool-request",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     sequence,
                     SessionEventKind::ToolCallRequested {
@@ -1939,7 +1947,7 @@ mod tests {
             });
             steps.push(TranscriptFrameStep {
                 label: "tool-result",
-                input: TranscriptFrameInput::Durable(durable(
+                input: durable_input(durable(
                     session_id,
                     sequence,
                     SessionEventKind::ToolInvocationResultRecorded {

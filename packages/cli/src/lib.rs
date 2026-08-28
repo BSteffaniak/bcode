@@ -412,7 +412,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         }
         Commands::ArtifactId => println!("{}", bcode_ipc::ArtifactId::current()),
         Commands::Server { command } => handle_server_command(command).await?,
-        Commands::Session { command } => handle_session_command(command).await?,
+        Commands::Session { command } => handle_session_command(Box::new(command)).await?,
         Commands::State { command } => handle_state_command(command)?,
         #[cfg(feature = "web-renderer")]
         Commands::Web {
@@ -4687,20 +4687,20 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_session_command(command: SessionCommand) -> Result<(), CliError> {
-    match command {
-        SessionCommand::Create { name, json } => create_session(name, json).await?,
-        SessionCommand::List { json } => list_sessions(json).await?,
+async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
+    match *command {
+        SessionCommand::Create { name, json } => Box::pin(create_session(name, json)).await?,
+        SessionCommand::List { json } => Box::pin(list_sessions(json)).await?,
         SessionCommand::Rename {
             session_id,
             name,
             json,
-        } => rename_session(session_id, name, json).await?,
+        } => Box::pin(rename_session(session_id, name, json)).await?,
         SessionCommand::Delete {
             session_id,
             yes,
             json,
-        } => delete_session(session_id, yes, json).await?,
+        } => Box::pin(delete_session(session_id, yes, json)).await?,
         SessionCommand::SetWorkingDirectory {
             session_id,
             path,
@@ -4767,14 +4767,14 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             before,
             limit,
             json,
-        } => session_history(session_id, after, before, limit, json).await?,
+        } => Box::pin(session_history(session_id, after, before, limit, json)).await?,
         SessionCommand::Around {
             session_id,
             sequence,
             before,
             after,
             json,
-        } => session_around(session_id, sequence, before, after, json).await?,
+        } => Box::pin(session_around(session_id, sequence, before, after, json)).await?,
         SessionCommand::Inspect {
             session_id,
             category,
@@ -4782,13 +4782,18 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             before,
             limit,
             json,
-        } => session_inspect(session_id, category, after, before, limit, json).await?,
+        } => {
+            Box::pin(session_inspect(
+                session_id, category, after, before, limit, json,
+            ))
+            .await?;
+        }
         command @ (SessionCommand::MigrateInventory { .. }
         | SessionCommand::MigrateStart { .. }
         | SessionCommand::MigrateStatus { .. }
         | SessionCommand::MigrateWait { .. }
         | SessionCommand::MigrateCancel { .. }) => {
-            handle_session_migration_subcommand(command).await?;
+            Box::pin(handle_session_migration_subcommand(command)).await?;
         }
         command @ (SessionCommand::Search { .. }
         | SessionCommand::SearchStatus { .. }
@@ -4800,14 +4805,14 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
         | SessionCommand::SearchBackfillCancel { .. }
         | SessionCommand::SearchBackfill { .. }
         | SessionCommand::SearchExplain { .. }) => {
-            handle_session_search_subcommand(command).await?;
+            Box::pin(handle_session_search_subcommand(command)).await?;
         }
         SessionCommand::Export { session_id, format } => {
-            session_export(session_id, format).await?;
+            Box::pin(session_export(session_id, format)).await?;
         }
-        SessionCommand::Timeline { session_id } => session_timeline(session_id).await?,
+        SessionCommand::Timeline { session_id } => Box::pin(session_timeline(session_id)).await?,
         SessionCommand::Diagnose { session_id, json } => {
-            session_diagnose(session_id, json).await?;
+            Box::pin(session_diagnose(session_id, json)).await?;
         }
         SessionCommand::Doctor {
             session_id,
@@ -4823,7 +4828,7 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             .await?;
         }
         SessionCommand::RetiredCatalogs { apply, json } => {
-            retired_catalogs(apply, json).await?;
+            Box::pin(retired_catalogs(apply, json)).await?;
         }
         SessionCommand::Repair {
             session_id,
@@ -4840,7 +4845,7 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             .await?;
         }
         SessionCommand::Reindex { session_id } => {
-            reindex_session_model_context(session_id).await?;
+            Box::pin(reindex_session_model_context(session_id)).await?;
         }
         SessionCommand::Relocate {
             to,
@@ -4852,10 +4857,10 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             relocate_sessions_command(to, to_profile, &session, dry_run, json)?;
         }
         SessionCommand::ReleaseOwner { session_id } => {
-            release_session_owner(session_id).await?;
+            Box::pin(release_session_owner(session_id)).await?;
         }
         SessionCommand::StopOwner { session_id } => {
-            stop_session_owner(session_id, false).await?;
+            Box::pin(stop_session_owner(session_id, false)).await?;
         }
         SessionCommand::KillOwner { session_id, yes } => {
             if !yes {
@@ -4863,9 +4868,11 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
                     "force-killing a session owner requires --yes".to_owned(),
                 ));
             }
-            stop_session_owner(session_id, true).await?;
+            Box::pin(stop_session_owner(session_id, true)).await?;
         }
-        SessionCommand::Import { command } => handle_session_import_command(command).await?,
+        SessionCommand::Import { command } => {
+            Box::pin(handle_session_import_command(command)).await?;
+        }
     }
     Ok(())
 }
