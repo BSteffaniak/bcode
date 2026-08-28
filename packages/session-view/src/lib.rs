@@ -5629,6 +5629,40 @@ mod tests {
     }
 
     #[test]
+    fn cost_snapshot_serialization_preserves_portable_semantics() {
+        let session_id = SessionId::new();
+        let snapshot = build_session_view_snapshot(&[event(
+            session_id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_string(),
+                usage: SessionTokenUsage {
+                    request_id: Some("request-1".to_string()),
+                    observation_id: Some("request-1:usage".to_string()),
+                    terminal: true,
+                    cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                        currency: "USD".to_string(),
+                        total_micros: 42,
+                        components: Vec::new(),
+                        source: "fixture".to_string(),
+                        revision: Some("v1".to_string()),
+                    }),
+                    ..SessionTokenUsage::default()
+                },
+            },
+        )]);
+
+        let encoded = serde_json::to_vec(&snapshot).expect("snapshot should encode");
+        let decoded: bcode_session_view_models::SessionViewSnapshot =
+            serde_json::from_slice(&encoded).expect("snapshot should decode");
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.runtime.cost.totals_micros["USD"], 42);
+        assert_eq!(decoded.runtime.cost.observed_usage_count, 1);
+        assert!(decoded.runtime.cost.has_complete_coverage());
+    }
+
+    #[test]
     fn conflicting_duplicate_usage_observation_is_rejected() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
@@ -5663,18 +5697,29 @@ mod tests {
     #[test]
     fn terminal_request_usage_is_absorbing_and_cumulative_tokens_are_replaced() {
         let session_id = SessionId::new();
-        let usage = |ordinal, terminal, total_tokens| SessionTokenUsage {
+        let usage = |ordinal, terminal, total_tokens, total_micros| SessionTokenUsage {
             request_id: Some("request-1".to_string()),
             observation_id: Some(format!("request-1:{ordinal}")),
             observation_ordinal: ordinal,
             terminal,
             total_tokens: Some(total_tokens),
+            cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                currency: "USD".to_string(),
+                total_micros,
+                components: Vec::new(),
+                source: "fixture".to_string(),
+                revision: Some("v1".to_string()),
+            }),
             ..SessionTokenUsage::default()
         };
         let mut view = SessionView::new();
-        for (sequence, item) in [usage(0, false, 10), usage(1, true, 15), usage(2, false, 30)]
-            .into_iter()
-            .enumerate()
+        for (sequence, item) in [
+            usage(0, false, 10, 10),
+            usage(1, true, 15, 15),
+            usage(2, false, 30, 30),
+        ]
+        .into_iter()
+        .enumerate()
         {
             view.apply_event(&event(
                 session_id,
@@ -5687,6 +5732,8 @@ mod tests {
         }
 
         assert_eq!(view.snapshot().runtime.cumulative_metered_tokens, 15);
+        assert_eq!(view.snapshot().runtime.cost.totals_micros["USD"], 15);
+        assert_eq!(view.snapshot().runtime.cost.observed_usage_count, 1);
         assert_eq!(
             view.snapshot()
                 .runtime

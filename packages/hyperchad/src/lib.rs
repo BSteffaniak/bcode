@@ -2030,7 +2030,7 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
         ..
     } = &context;
     let Some((mut watcher, mut attached, mut view)) =
-        attach_watch_with_retry(&context, "attach").await?
+        Box::pin(attach_watch_with_retry(&context, "attach")).await?
     else {
         return Ok(());
     };
@@ -2074,7 +2074,7 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
                 }
                 tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
                 let Some((new_watcher, new_attached, new_view)) =
-                    attach_watch_with_retry(&context, "reconnect").await?
+                    Box::pin(attach_watch_with_retry(&context, "reconnect")).await?
                 else {
                     return Ok(());
                 };
@@ -2108,7 +2108,7 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
             {
                 return Ok(());
             }
-            let Some(state) = attach_watch_with_retry(&context, "resync").await? else {
+            let Some(state) = Box::pin(attach_watch_with_retry(&context, "resync")).await? else {
                 return Ok(());
             };
             (watcher, attached, view) = state;
