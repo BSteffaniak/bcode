@@ -823,8 +823,13 @@ async fn stream_plugin_session_view(
     sender: mpsc::Sender<PluginSessionViewUpdate>,
     redraw: InvalidationSignal,
 ) {
-    if let Err(error) =
-        stream_plugin_session_view_inner(client, request, sender.clone(), redraw.clone()).await
+    if let Err(error) = Box::pin(stream_plugin_session_view_inner(
+        client,
+        request,
+        sender.clone(),
+        redraw.clone(),
+    ))
+    .await
     {
         let _ = sender
             .send(PluginSessionViewUpdate::Disconnected {

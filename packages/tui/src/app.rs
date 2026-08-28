@@ -4555,18 +4555,18 @@ struct TokenUsageMeter {
 }
 
 impl TokenUsageMeter {
-    fn absorb(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
+    const fn absorb(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
         self.latest_cached_input_tokens = usage.cached_input_tokens;
         self.latest_cache_write_input_tokens = usage.cache_write_input_tokens;
     }
 
-    fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
+    const fn apply_model_info(&mut self, model: Option<&bcode_model::ModelInfo>) {
         if let Some(model) = model {
             self.context_window = model.context_window;
         }
     }
 
-    fn clear_model_info(&mut self) {
+    const fn clear_model_info(&mut self) {
         self.latest_cached_input_tokens = None;
         self.latest_cache_write_input_tokens = None;
         self.context_window = None;
@@ -4630,8 +4630,8 @@ impl TokenUsageMeter {
                 parts.push(format!("~{}", format_usd_micros(*cost_micros)));
             } else {
                 parts.push(format!(
-                    "~{currency} {:.6}",
-                    *cost_micros as f64 / 1_000_000.0
+                    "~{currency} {}",
+                    format_decimal_micros(*cost_micros)
                 ));
             }
         }
@@ -4739,6 +4739,10 @@ fn compact_decimal(value: u64, unit: u64, suffix: char) -> String {
     } else {
         format!("{whole}.{fraction:02}{suffix}")
     }
+}
+
+fn format_decimal_micros(micros: u64) -> String {
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
 }
 
 fn format_usd_micros(micros: u64) -> String {

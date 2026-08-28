@@ -1534,7 +1534,7 @@ impl TuiEffect {
             },
             Self::LoadDraftStatus {
                 launch_working_directory,
-            } => load_draft_status(&client, launch_working_directory).await,
+            } => Box::pin(load_draft_status(&client, launch_working_directory)).await,
             Self::LoadSessionStatus { session_id } => {
                 Box::pin(Self::run_session_status_effect(&client, session_id)).await
             }
@@ -2404,12 +2404,13 @@ async fn load_draft_status(
     client: &BcodeClient,
     launch_working_directory: std::path::PathBuf,
 ) -> TuiEffectResult {
-    let (model, model_error) = optional_client_result(client.default_model_status()).await;
+    let (model, model_error) =
+        Box::pin(optional_client_result(client.default_model_status())).await;
     let draft_scope = ComposerDraftScope::DraftSession {
         launch_working_directory,
     };
     let (composer_draft, draft_error) =
-        optional_client_result(client.composer_draft(draft_scope)).await;
+        Box::pin(optional_client_result(client.composer_draft(draft_scope))).await;
     TuiEffectResult::DraftStatusLoaded {
         daemon_connected: model.is_some() || composer_draft.is_some(),
         model,
@@ -2568,8 +2569,10 @@ pub async fn load_pending_interactions(
 }
 
 async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> TuiEffectResult {
-    let (model, model_error) =
-        optional_client_result(client.session_model_status(session_id)).await;
+    let (model, model_error) = Box::pin(optional_client_result(
+        client.session_model_status(session_id),
+    ))
+    .await;
     let (
         (active_skills, skills_error),
         (runtime_work, runtime_work_error),
