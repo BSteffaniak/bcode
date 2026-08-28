@@ -1384,16 +1384,39 @@ impl ModelPricingInfo {
         {
             return None;
         }
-        let mut total_micros = 0_u64;
-        total_micros = total_micros.saturating_add(price_bucket_micros(uncached_input, self.input));
-        total_micros = total_micros.saturating_add(price_bucket_micros(cached, self.cached_input));
-        total_micros =
-            total_micros.saturating_add(price_bucket_micros(cache_write, self.cache_write_input));
-        total_micros = total_micros.saturating_add(price_bucket_micros(output, self.output));
+        let components = [
+            (ModelPricingBucket::Input, uncached_input, self.input),
+            (
+                ModelPricingBucket::CacheReadInput,
+                cached,
+                self.cached_input,
+            ),
+            (
+                ModelPricingBucket::CacheWriteInput,
+                cache_write,
+                self.cache_write_input,
+            ),
+            (ModelPricingBucket::Output, output, self.output),
+        ]
+        .into_iter()
+        .filter(|(_, tokens, _)| *tokens > 0)
+        .filter_map(|(bucket, tokens, price)| {
+            price.map(|price| ModelCostComponent {
+                bucket,
+                modality: Some(ModelTokenModality::Text),
+                tokens,
+                price,
+                cost_micros: price_bucket_micros(tokens, Some(price)),
+            })
+        })
+        .collect::<Vec<_>>();
+        let total_micros = components.iter().fold(0_u64, |total, component| {
+            total.saturating_add(component.cost_micros)
+        });
         Some(ModelCostEstimate {
             currency: self.currency.clone(),
             total_micros,
-            components: Vec::new(),
+            components,
             source: self.source,
             revision: self.revision.clone(),
         })
@@ -4097,6 +4120,14 @@ mod tests {
         let cost = pricing.estimate_cost(&usage).expect("cost should estimate");
 
         assert_eq!(cost.total_micros, 2_675_000);
+        assert_eq!(cost.components.len(), 4);
+        assert_eq!(
+            cost.components
+                .iter()
+                .map(|component| component.cost_micros)
+                .sum::<u64>(),
+            cost.total_micros
+        );
     }
 
     #[test]

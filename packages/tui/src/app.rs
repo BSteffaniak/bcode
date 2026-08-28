@@ -7021,6 +7021,56 @@ mod tests {
     }
 
     #[test]
+    fn model_change_preserves_accumulated_shared_cost() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        app.absorb_session_event(&event(
+            1,
+            bcode_session_models::SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: bcode_session_models::SessionTokenUsage {
+                    request_id: Some("request-1".to_owned()),
+                    observation_id: Some("request-1:usage".to_owned()),
+                    terminal: true,
+                    cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                        currency: "USD".to_owned(),
+                        total_micros: 25_000,
+                        components: Vec::new(),
+                        source: "fixture".to_owned(),
+                        revision: Some("v1".to_owned()),
+                    }),
+                    ..bcode_session_models::SessionTokenUsage::default()
+                },
+            },
+        ));
+        let before = app.session_view_snapshot().runtime.cost.clone();
+
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::ModelChanged {
+                provider: "provider-2".to_owned(),
+                model: "model-2".to_owned(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+            },
+        ));
+
+        assert_eq!(app.session_view_snapshot().runtime.cost, before);
+        assert!(
+            TokenUsageMeter::default()
+                .footer_summary(None, 0, &app.session_view_snapshot().runtime.cost)
+                .ends_with("spent 0 tok · ~$0.02")
+        );
+    }
+
+    #[test]
     fn model_reasoning_and_agent_events_consume_shared_runtime_projection() {
         let session_id = bcode_session_models::SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

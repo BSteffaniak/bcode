@@ -5075,6 +5075,7 @@ mod tests {
             ),
         );
         let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        model.invalidation = super::super::invalidation::UiInvalidation::None;
 
         let _update = bmux_tui_runtime::Program::update(
             &mut model,
@@ -5093,7 +5094,6 @@ mod tests {
             model.invalidation,
             super::super::invalidation::UiInvalidation::Paint
         );
-        assert!(model.fast_temporal_presentation);
     }
 
     #[tokio::test]

@@ -22,4 +22,13 @@ if rg -n 'local_model_request_estimate_tokens' packages/server/src/context_compa
   fail "compaction must consume PreparedModelRequest projections"
 fi
 
+complete_input_sources="$(rg -l 'fn complete_request_input_tokens' plugins/*-provider-plugin/src --glob '*.rs' || true)"
+if [[ "$complete_input_sources" != "plugins/bedrock-provider-plugin/src/lib.rs" ]]; then
+  fail "complete provider-visible request input must have one audited semantic source"
+fi
+if rg -n 'input_tokens\s*\+\s*(cached_input_tokens|cache_(read|write)_input_tokens)' \
+  packages/server/src packages/session/src packages/session-view/src packages/tui/src --glob '*.rs'; then
+  fail "hosts and renderers must not independently reconstruct complete provider-visible input"
+fi
+
 echo "context accounting architecture guard passed"

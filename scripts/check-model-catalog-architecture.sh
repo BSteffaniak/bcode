@@ -123,4 +123,12 @@ if ! grep -F 'model_identity(' packages/server/src/model_request_target.rs >/dev
   exit 1
 fi
 
+if rg -n 'context_threshold_tokens|ModelPricingRule|price_bucket_micros' \
+  packages/server/src packages/tui/src/app.rs packages/session/src packages/session-view/src --glob '*.rs'; then
+  fail "pricing thresholds, rule selection, and rate application must remain model/catalog-owned"
+fi
+if ! rg -n 'pricing_from_catalog' packages/model-catalog/src/lib.rs >/dev/null; then
+  fail "catalog pricing normalization must remain in the model-catalog domain"
+fi
+
 echo "model catalog architecture guard passed"

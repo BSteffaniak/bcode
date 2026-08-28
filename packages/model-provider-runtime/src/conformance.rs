@@ -1739,6 +1739,28 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_repeated_usage_delivery_for_one_request() {
+        let usage = ProviderTurnEvent::Usage {
+            usage: TokenUsage {
+                input_tokens: Some(2),
+                output_tokens: Some(1),
+                total_tokens: Some(3),
+                ..TokenUsage::default()
+            },
+        };
+        let mut validator = ProviderEventValidator::default();
+        let error = validator
+            .observe(&[ProviderTurnEvent::TurnStarted, usage.clone(), usage])
+            .expect_err("repeated cumulative snapshots must fail conformance");
+
+        assert!(
+            error
+                .to_string()
+                .contains("more than one cumulative usage snapshot")
+        );
+    }
+
+    #[test]
     fn validator_rejects_contradictory_complete_request_input() {
         let mut validator = ProviderEventValidator::default();
         let error = validator
