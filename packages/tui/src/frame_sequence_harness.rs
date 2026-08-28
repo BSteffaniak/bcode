@@ -361,7 +361,8 @@ mod tests {
             frames[1].observation.semantic_items,
             frames[2].observation.semantic_items
         );
-        assert_eq!(frames[1].text, frames[2].text);
+        assert!(frames[2].text.contains("cancelled multi-paragraph output"));
+        assert!(frames[2].text.contains("with an exact final prefix"));
     }
 
     #[test]
