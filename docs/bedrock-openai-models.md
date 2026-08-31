@@ -46,8 +46,34 @@ environment variable.
 
 The endpoint defaults to `https://bedrock-mantle.<region>.api.aws/openai/v1` and the adapter appends
 `/responses`. Note that AWS documents this as `openai/v1/responses`, which is deliberately different
-from the `v1/responses` path other models use on the responses endpoint. Override the base URL with
-`BCODE_BEDROCK_MANTLE_BASE_URL` when needed; it must use HTTPS unless it points at a loopback host.
+from the `v1/responses` path other models use on the responses endpoint.
+
+### Custom endpoints and gateways
+
+For custom Bedrock endpoints, gateways, or proxies:
+
+```sh
+# Standard AWS SDK variable (recommended)
+export AWS_ENDPOINT_URL_BEDROCK=https://ai.nexus9.app/gw
+
+# Or use bcode-specific variables
+export BCODE_BEDROCK_ENDPOINT_URL=https://ai.nexus9.app/gw           # For Runtime API
+export BCODE_BEDROCK_MANTLE_BASE_URL=https://ai.nexus9.app/gw       # For Mantle APIs
+```
+
+When using `AWS_ENDPOINT_URL_BEDROCK` alone, it applies to both Bedrock Runtime (Converse) and
+Mantle (OpenAI/Anthropic) APIs.
+
+**Path construction:**
+- Bedrock Runtime (via AWS SDK): Appends `/model/{model-id}/converse-stream`
+- Mantle OpenAI: Appends `/openai/v1/responses`
+- Mantle Anthropic: Appends `/anthropic/v1/messages`
+
+For example, with `AWS_ENDPOINT_URL_BEDROCK=https://ai.nexus9.app/gw`:
+- Claude Opus 5 → `https://ai.nexus9.app/gw/model/anthropic.claude-opus-5/converse-stream`
+- GPT 5.6 Sol → `https://ai.nexus9.app/gw/openai/v1/responses`
+
+Your gateway should accept these paths and route to the appropriate Bedrock API backend.
 
 ### Optional transport override
 

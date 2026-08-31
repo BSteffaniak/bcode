@@ -1367,11 +1367,19 @@ impl MantleFlavor {
         }
     }
 
-    /// Request path appended to the resolved base URL.
+    /// Request path appended to the resolved base URL (for default AWS endpoints).
     const fn request_path(self) -> &'static str {
         match self {
             Self::Anthropic => "/v1/messages",
             Self::OpenAi => "/responses",
+        }
+    }
+
+    /// Full request path including service prefix (for custom endpoints/gateways).
+    const fn full_request_path(self) -> &'static str {
+        match self {
+            Self::Anthropic => "/anthropic/v1/messages",
+            Self::OpenAi => "/openai/v1/responses",
         }
     }
 }
@@ -1408,11 +1416,24 @@ fn mantle_endpoint(settings: &Settings, flavor: MantleFlavor) -> Result<String, 
             "Bedrock Mantle base URL must use HTTPS",
         ));
     }
-    let path = format!(
-        "{}{}",
-        url.path().trim_end_matches('/'),
-        flavor.request_path()
-    );
+    // For custom endpoints, append the full AWS-style path including service prefix.
+    // For default AWS endpoints, the prefix is already in the base URL.
+    let is_default_aws_endpoint = settings.mantle_base_url.is_none();
+    let path = if is_default_aws_endpoint {
+        // Default AWS: base already has /openai/v1 or /anthropic, just add final segment
+        format!(
+            "{}{}",
+            url.path().trim_end_matches('/'),
+            flavor.request_path()
+        )
+    } else {
+        // Custom endpoint: append full service path for gateway routing
+        format!(
+            "{}{}",
+            url.path().trim_end_matches('/'),
+            flavor.full_request_path()
+        )
+    };
     url.set_path(&path);
     Ok(url.to_string())
 }
@@ -3759,6 +3780,7 @@ impl BedrockTransport {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct Settings {
     transport: Result<BedrockTransport, ProviderError>,
     mantle_base_url: Option<String>,
@@ -3907,8 +3929,20 @@ impl Settings {
         let transport_value =
             first_context_env(&["BCODE_BEDROCK_TRANSPORT"]).or_else(|| value(&["transport"]));
         let transport = BedrockTransport::parse(transport_value.as_deref());
+
+        // Resolve endpoint_url with AWS standard variable taking precedence
+        let endpoint_url = first_context_env(&[
+            "AWS_ENDPOINT_URL_BEDROCK",   // AWS SDK standard
+            "BCODE_BEDROCK_ENDPOINT_URL", // Bcode-specific
+            "BEDROCK_ENDPOINT_URL",       // Legacy
+        ])
+        .or_else(|| value(&["endpoint_url"]));
+
+        // Resolve mantle_base_url, falling back to endpoint_url for unified gateway support
         let mantle_base_url = first_context_env(&["BCODE_BEDROCK_MANTLE_BASE_URL"])
-            .or_else(|| value(&["mantle_base_url"]));
+            .or_else(|| value(&["mantle_base_url"]))
+            .or_else(|| endpoint_url.clone());
+
         let mantle_auth_header = first_context_env(&["BCODE_BEDROCK_MANTLE_AUTH_HEADER"])
             .or_else(|| value(&["mantle_auth_header"]))
             .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
@@ -3927,11 +3961,7 @@ impl Settings {
             region_source,
             aws_profile: first_context_env(&["BCODE_BEDROCK_AWS_PROFILE", "AWS_PROFILE"])
                 .or_else(|| value(&["profile", "aws_profile"])),
-            endpoint_url: first_context_env(&[
-                "BCODE_BEDROCK_ENDPOINT_URL",
-                "BEDROCK_ENDPOINT_URL",
-            ])
-            .or_else(|| value(&["endpoint_url"])),
+            endpoint_url,
             auth_credentials: request_auth_credentials,
             env: request_env,
             config_source: if request_context.is_some() {
@@ -6705,17 +6735,32 @@ mod tests {
 
     #[test]
     fn mantle_endpoint_defaults_from_region_and_accepts_local_tests() {
+        // Default AWS endpoint construction appends paths
         let settings = test_settings();
         assert_eq!(
             mantle_anthropic_messages_endpoint(&settings).expect("default endpoint"),
             "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"
         );
 
-        let mut local = settings;
-        local.mantle_base_url = Some("http://127.0.0.1:8080/anthropic/".to_string());
+        // Custom endpoints get full AWS-style paths for gateway routing
+        let mut custom = test_settings();
+        custom.mantle_base_url = Some("http://127.0.0.1:8080".to_string());
         assert_eq!(
-            mantle_anthropic_messages_endpoint(&local).expect("local endpoint"),
+            mantle_anthropic_messages_endpoint(&custom).expect("custom endpoint"),
             "http://127.0.0.1:8080/anthropic/v1/messages"
+        );
+
+        // Gateway with base path preserves it and appends full Mantle path
+        custom.mantle_base_url = Some("https://gateway.example.com/gw".to_string());
+        assert_eq!(
+            mantle_anthropic_messages_endpoint(&custom).expect("gateway endpoint"),
+            "https://gateway.example.com/gw/anthropic/v1/messages"
+        );
+
+        // OpenAI surface also appends full paths
+        assert_eq!(
+            mantle_endpoint(&custom, MantleFlavor::OpenAi).expect("custom openai endpoint"),
+            "https://gateway.example.com/gw/openai/v1/responses"
         );
     }
 
@@ -7013,8 +7058,9 @@ mod tests {
             "https://bedrock-mantle.eu-west-1.api.aws/openai/v1/responses"
         );
 
+        // Custom endpoints get full AWS-style paths for gateway routing
         let mut local = settings;
-        local.mantle_base_url = Some("http://localhost:8080/openai/v1/".to_string());
+        local.mantle_base_url = Some("http://localhost:8080".to_string());
         assert_eq!(
             mantle_endpoint(&local, MantleFlavor::OpenAi).expect("local endpoint"),
             "http://localhost:8080/openai/v1/responses"
