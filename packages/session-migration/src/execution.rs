@@ -428,7 +428,12 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(metadata.source_schema, 45);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 46);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 45);
+        assert_eq!(
+            metadata.source_schema,
+            crate::LATEST_HISTORICAL_EVENT_SCHEMA
+        );
         let SessionEventKind::ModelUsage { usage, .. } = event.kind else {
             panic!("converted event should remain model usage");
         };

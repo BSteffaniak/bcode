@@ -5433,6 +5433,45 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_turn_preserves_usage_estimate_for_its_request() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: SessionTokenUsage {
+                    request_id: Some("request-1".to_owned()),
+                    observation_id: Some("request-1:usage".to_owned()),
+                    terminal: true,
+                    cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                        currency: "USD".to_owned(),
+                        total_micros: 17,
+                        components: Vec::new(),
+                        source: "fixture".to_owned(),
+                        revision: Some("v1".to_owned()),
+                    }),
+                    ..SessionTokenUsage::default()
+                },
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".to_owned(),
+                outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                message: None,
+            },
+        ));
+
+        assert_eq!(view.snapshot().runtime.cost.totals_micros["USD"], 17);
+        assert_eq!(view.snapshot().runtime.cost.estimated_usage_count, 1);
+        assert!(view.snapshot().runtime.cost.has_complete_coverage());
+    }
+
+    #[test]
     fn smoothed_assistant_stream_exposes_first_grapheme_then_exact_target() {
         let session_id = SessionId::new();
         let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
@@ -5585,6 +5624,7 @@ mod tests {
 
         assert_eq!(view.snapshot().runtime.cost.totals_micros["USD"], 15);
         assert_eq!(view.snapshot().runtime.cost.totals_micros["EUR"], 20);
+        assert_eq!(view.snapshot().runtime.cost.totals_micros.len(), 2);
         assert_eq!(view.snapshot().runtime.cost.estimated_usage_count, 2);
         assert_eq!(view.snapshot().runtime.cost.observed_usage_count, 2);
         assert!(view.snapshot().runtime.cost.has_complete_coverage());
@@ -5626,6 +5666,30 @@ mod tests {
         assert_eq!(summary.estimated_usage_count, 1);
         assert_eq!(summary.unavailable_usage_count, 1);
         assert!(!summary.has_complete_coverage());
+    }
+
+    #[test]
+    fn estimated_zero_remains_complete_and_distinct_from_unavailable() {
+        let mut summary = bcode_session_view_models::SessionCostSummary::default();
+        summary.observe(&SessionTokenUsage {
+            request_id: Some("request-zero".to_string()),
+            observation_id: Some("request-zero:usage".to_string()),
+            terminal: true,
+            cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                currency: "USD".to_string(),
+                total_micros: 0,
+                components: Vec::new(),
+                source: "fixture".to_string(),
+                revision: Some("v1".to_string()),
+            }),
+            ..SessionTokenUsage::default()
+        });
+
+        assert_eq!(summary.observed_usage_count, 1);
+        assert_eq!(summary.estimated_usage_count, 1);
+        assert_eq!(summary.unavailable_usage_count, 0);
+        assert_eq!(summary.totals_micros.get("USD"), Some(&0));
+        assert!(summary.has_complete_coverage());
     }
 
     #[test]

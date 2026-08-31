@@ -4262,6 +4262,45 @@ mod tests {
     }
 
     #[test]
+    fn conditional_pricing_rejects_overlapping_matching_rules() {
+        let duplicate = ModelPricingRule {
+            bucket: ModelPricingBucket::Input,
+            modality: Some(ModelTokenModality::Text),
+            service_tier: Some("standard".to_string()),
+            invocation_class: Some(ModelInvocationClass::OnDemand),
+            cache_ttl_seconds: None,
+            min_request_input_tokens: None,
+            max_request_input_tokens: None,
+            billing_scope: None,
+            price: ModelTokenPrice::from_micros(1_000_000),
+        };
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: None,
+            cached_input: None,
+            cache_write_input: None,
+            output: None,
+            context_threshold_tokens: None,
+            rules: vec![duplicate.clone(), duplicate],
+            revision: Some("fixture-v1".to_string()),
+            source: ModelPricingSource::BundledCatalog,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(0),
+            pricing_context: Box::new(ModelPricingContext {
+                service_tier: Some("standard".to_string()),
+                invocation_class: Some(ModelInvocationClass::OnDemand),
+                ..ModelPricingContext::default()
+            }),
+            ..TokenUsage::default()
+        };
+
+        assert!(pricing.estimate_cost(&usage).is_none());
+    }
+
+    #[test]
     fn pricing_estimate_rejects_partial_pricing_coverage() {
         let pricing = ModelPricingInfo {
             currency: "USD".to_string(),

@@ -49836,17 +49836,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
         });
         let pending = wait_for_pending_permissions(state.as_ref(), 1).await;
         approve_pending_permission_for_test(state.as_ref(), &pending[0]).await;
-        loop {
-            if state
-                .active_plugin_invocations
-                .lock()
-                .expect("active invocation registry")
-                .contains_key(&(session_id, "canonical-cancelled-shell".to_owned()))
-            {
-                break;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state
+                    .active_plugin_invocations
+                    .lock()
+                    .expect("active invocation registry")
+                    .contains_key(&(session_id, "canonical-cancelled-shell".to_owned()))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("canonical shell invocation should become active");
         cancel_state.close();
         assert!(
             !tokio::time::timeout(Duration::from_secs(5), task)
