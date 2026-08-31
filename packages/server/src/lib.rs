@@ -13277,6 +13277,7 @@ async fn model_status_for_selection(
         requested_model_id: selection.requested_model_id.clone(),
         effective_model_id: model_id.clone(),
         model_id,
+        display_name: model.as_ref().map(|model| model.display_name.clone()),
         context_window,
         context_occupancy: context_occupancy.map(Box::new),
         request_context_error,

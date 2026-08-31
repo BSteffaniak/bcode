@@ -1330,6 +1330,9 @@ pub struct SessionModelStatus {
     /// Legacy display model field retained for wire compatibility.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// User-friendly display name from model catalog.
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub context_window: Option<u32>,
     /// Authoritative active context occupancy.

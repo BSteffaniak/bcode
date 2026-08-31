@@ -1602,6 +1602,8 @@ pub struct SessionRuntimeViewState {
     pub provider_plugin_id: Option<String>,
     /// User-facing requested model selection, when known.
     pub requested_model_id: Option<String>,
+    /// User-friendly display name for the selected model, when known.
+    pub display_name: Option<String>,
     /// Concrete effective model, when known.
     pub effective_model_id: Option<String>,
     /// Selected agent, when known.

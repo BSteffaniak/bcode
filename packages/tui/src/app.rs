@@ -1561,7 +1561,14 @@ impl BmuxApp {
     /// Return the model label shown in the header.
     #[must_use]
     pub fn model_header_label(&self) -> String {
-        let model = self.selected_model_id().unwrap_or("default");
+        let model = self
+            .session_view
+            .snapshot()
+            .runtime
+            .display_name
+            .as_deref()
+            .or_else(|| self.selected_model_id())
+            .unwrap_or("default");
         self.reasoning_header_label().map_or_else(
             || model.to_owned(),
             |reasoning| format!("{model} [{reasoning}]"),
@@ -1881,6 +1888,7 @@ impl BmuxApp {
             provider_plugin_id,
             requested_model_id,
             effective_model_id,
+            status.display_name.clone(),
         );
         if let Some(effort) = status.reasoning_effort.as_deref() {
             self.reconcile_pending_reasoning_effort(effort);
@@ -1917,7 +1925,11 @@ impl BmuxApp {
             .context_window
             .map(|context_window| bcode_model::ModelInfo {
                 model_id: self.selected_model_id().unwrap_or_default().to_owned(),
-                display_name: self.selected_model_id().unwrap_or_default().to_owned(),
+                display_name: status
+                    .display_name
+                    .clone()
+                    .or_else(|| self.selected_model_id().map(ToOwned::to_owned))
+                    .unwrap_or_default(),
                 is_default: false,
                 context_window: Some(context_window),
                 max_output_tokens: status.max_output_tokens,
@@ -3648,8 +3660,12 @@ impl BmuxApp {
 
     /// Apply a locally selected model before a persisted session exists.
     pub fn apply_local_model_selection(&mut self, provider: Option<String>, model: &str) {
-        self.session_view
-            .set_model_selection(provider, model_to_display_selection(model), None);
+        self.session_view.set_model_selection(
+            provider,
+            model_to_display_selection(model),
+            None,
+            None,
+        );
         self.reasoning_support = ReasoningSupport::Unsupported;
         self.reasoning_effort_values.clear();
         self.pending_reasoning_effort = None;

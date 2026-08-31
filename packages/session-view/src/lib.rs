@@ -682,15 +682,18 @@ impl SessionView {
         provider_plugin_id: Option<String>,
         requested_model_id: Option<String>,
         effective_model_id: Option<String>,
+        display_name: Option<String>,
     ) {
         let runtime = &mut self.snapshot.runtime;
         if runtime.provider_plugin_id != provider_plugin_id
             || runtime.requested_model_id != requested_model_id
             || runtime.effective_model_id != effective_model_id
+            || runtime.display_name != display_name
         {
             runtime.provider_plugin_id = provider_plugin_id;
             runtime.requested_model_id = requested_model_id;
             runtime.effective_model_id = effective_model_id;
+            runtime.display_name = display_name;
             self.bump_revision();
         }
     }
@@ -1531,6 +1534,7 @@ impl SessionView {
                     provider_to_display_selection(provider),
                     model_to_display_selection(model),
                     model_to_display_selection(model),
+                    None,
                 );
             }
             SessionEventKind::AgentChanged { agent_id } => {
