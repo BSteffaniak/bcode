@@ -496,6 +496,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 4400000
 cached_input_micros = 440000
+cache_write_input_micros = 5500000
 output_micros = 22000000
 
 # US cross-region inference profile
@@ -532,6 +533,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 4400000
 cached_input_micros = 440000
+cache_write_input_micros = 5500000
 output_micros = 22000000
 
 # Global cross-region inference profile
@@ -568,6 +570,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 4000000
 cached_input_micros = 400000
+cache_write_input_micros = 5000000
 output_micros = 20000000
 
 [models."openai.gpt-5.6-terra"]
@@ -603,6 +606,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 2200000
 cached_input_micros = 220000
+cache_write_input_micros = 2750000
 output_micros = 13200000
 
 # US cross-region inference profile
@@ -639,6 +643,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 2200000
 cached_input_micros = 220000
+cache_write_input_micros = 2750000
 output_micros = 13200000
 
 # Global cross-region inference profile
@@ -675,6 +680,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 2000000
 cached_input_micros = 200000
+cache_write_input_micros = 2500000
 output_micros = 12000000
 
 # EU cross-region inference profile
@@ -711,6 +717,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 220000
 cached_input_micros = 22000
+cache_write_input_micros = 275000
 output_micros = 1320000
 
 # US cross-region inference profile
@@ -747,6 +754,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 220000
 cached_input_micros = 22000
+cache_write_input_micros = 275000
 output_micros = 1320000
 
 # APAC cross-region inference profile
@@ -784,6 +792,7 @@ currency = "USD"
 unit = "per_million_tokens"
 input_micros = 200000
 cached_input_micros = 20000
+cache_write_input_micros = 250000
 output_micros = 1200000
 
 [models."openai.gpt-5.5"]
