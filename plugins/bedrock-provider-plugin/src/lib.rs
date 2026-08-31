@@ -537,8 +537,17 @@ async fn stream_bedrock_turn_inner(
     // The Responses surface is selected per model, not per configuration: the catalog declares
     // `api_surface = "responses"` for models that exist only on Mantle, so they route correctly on
     // the default transport. `BCODE_BEDROCK_TRANSPORT=mantle_openai` remains an explicit override.
-    let responses_surface = uses_mantle_openai_surface(request, transport);
-    validate_bedrock_request(request, responses_surface)?;
+    // However, custom gateways may expose all models through Runtime/Converse, so when an explicit
+    // endpoint is configured, ignore the catalog's api_surface and use Runtime unless the transport
+    // is explicitly set to a Mantle flavor.
+    let responses_surface = uses_mantle_openai_surface(request, transport, &settings);
+
+    // Feature validation follows the model's catalog metadata, not the routing decision.
+    // Custom gateways may translate Converse requests to backends that support Responses features.
+    let model_supports_responses_features = transport == BedrockTransport::MantleOpenAi
+        || request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses);
+
+    validate_bedrock_request(request, model_supports_responses_features)?;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
     let name_map = bedrock_tool_name_map(&request.tools);
     if responses_surface {
@@ -581,14 +590,16 @@ async fn stream_bedrock_converse_turn(
     let mut last_error = None;
     for model_id in &selection.model_ids {
         let mut effective_request;
-        let request_for_model =
-            if prompt_cache_known_unsupported(discovery, selection.cache_key.as_ref(), model_id) {
-                effective_request = request.clone();
-                effective_request.prompt_cache = bcode_model::PromptCacheHints::default();
-                &effective_request
-            } else {
-                request
-            };
+        // OpenAI models don't support prompt caching on Bedrock Converse
+        let needs_cache_disabled = model_id.contains(".openai.")
+            || prompt_cache_known_unsupported(discovery, selection.cache_key.as_ref(), model_id);
+        let request_for_model = if needs_cache_disabled {
+            effective_request = request.clone();
+            effective_request.prompt_cache = bcode_model::PromptCacheHints::default();
+            &effective_request
+        } else {
+            request
+        };
         let bedrock_request = build_converse_request(
             request_for_model,
             model_id.clone(),
@@ -738,9 +749,28 @@ async fn stream_mantle_anthropic_turn(
 /// models with `api_surface = "responses"`, so they work on the default transport with no
 /// environment variables. Selecting `mantle_openai` explicitly forces the surface for every model,
 /// which keeps the transport useful as an override and for local testing.
-fn uses_mantle_openai_surface(request: &ModelTurnRequest, transport: BedrockTransport) -> bool {
-    transport == BedrockTransport::MantleOpenAi
-        || request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses)
+///
+/// Custom endpoints (gateways/proxies) may expose all models through the Runtime/Converse API
+/// rather than separate Mantle endpoints, so when an explicit endpoint is configured, the catalog's
+/// `api_surface` is ignored unless the transport is explicitly set to a Mantle flavor.
+fn uses_mantle_openai_surface(
+    request: &ModelTurnRequest,
+    transport: BedrockTransport,
+    settings: &Settings,
+) -> bool {
+    // Explicit Mantle transport always uses Mantle
+    if transport == BedrockTransport::MantleOpenAi {
+        return true;
+    }
+
+    // Custom endpoints default to Runtime/Converse for all models unless explicitly overridden
+    let has_custom_endpoint = settings.endpoint_url.is_some() || settings.mantle_base_url.is_some();
+    if has_custom_endpoint {
+        return false;
+    }
+
+    // Default AWS endpoints: follow the catalog's api_surface
+    request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses)
 }
 
 /// Support target describing the Bedrock Mantle `OpenAI` Responses deployment.
@@ -900,6 +930,7 @@ fn mantle_openai_tool_choice(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn stream_mantle_openai_turn(
     request: &ModelTurnRequest,
     settings: &Settings,
@@ -914,55 +945,165 @@ async fn stream_mantle_openai_turn(
             "Bedrock Mantle requires AWS_BEARER_TOKEN_BEDROCK or a mapped bearer_token credential",
         )
     })?;
-    let endpoint = mantle_endpoint(settings, MantleFlavor::OpenAi)?;
+
     let client = if settings.force_http1 {
         reqwest::Client::builder().http1_only().build()
     } else {
         reqwest::Client::builder().build()
     }
     .map_err(|error| mantle_network_error("client_build_failed", &error))?;
-    // The OpenAI surface authenticates with a bearer token rather than Anthropic's `x-api-key`.
-    let request_builder = client
-        .post(endpoint)
-        .bearer_auth(&token)
-        .header("accept", "text/event-stream")
-        .header("user-agent", "bcode/0.0.1");
+
+    // For custom endpoints, try multiple path patterns to discover what the gateway expects
+    let endpoints_to_try = if settings.mantle_base_url.is_some() {
+        vec![
+            ("default", mantle_endpoint(settings, MantleFlavor::OpenAi)?), // /gw/openai/v1/responses
+            (
+                "bedrock_prefix",
+                mantle_endpoint_with_override(settings, MantleFlavor::OpenAi, "/bedrock")?,
+            ), // /gw/bedrock/openai/v1/responses
+            (
+                "runtime_prefix",
+                mantle_endpoint_with_override(settings, MantleFlavor::OpenAi, "/bedrock-runtime")?,
+            ), // /gw/bedrock-runtime/openai/v1/responses
+        ]
+    } else {
+        vec![("default", mantle_endpoint(settings, MantleFlavor::OpenAi)?)]
+    };
+
     let mut last_error = None;
     for model_id in &selection.model_ids {
-        let response = request_builder
-            .try_clone()
-            .ok_or_else(|| {
-                provider_error(
-                    "bedrock_mantle_request_clone_failed",
-                    ProviderErrorCategory::ProviderInternal,
-                    "failed to prepare Bedrock Mantle request",
-                )
-            })?
-            .json(&build_mantle_openai_request(request, model_id)?)
-            .send()
-            .await
-            .map_err(|error| mantle_network_error("request_failed", &error))?;
-        if !response.status().is_success() {
-            let error = mantle_status_error(response).await;
-            let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
-            if selection.explicit || is_last {
-                return Err(error);
+        // Try different model ID variations
+        let model_id_variations = if settings.mantle_base_url.is_some() {
+            let base_id = model_id.strip_prefix("us.").unwrap_or(model_id);
+            vec![
+                ("original", model_id.clone()),
+                ("without_us", base_id.to_string()),
+                ("with_us", format!("us.{base_id}")),
+            ]
+        } else {
+            vec![("original", model_id.clone())]
+        };
+
+        // Try each endpoint pattern with each model ID variation
+        for (path_label, endpoint) in &endpoints_to_try {
+            for (id_label, test_model_id) in &model_id_variations {
+                // Log attempt to file
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/bcode-mantle-attempts.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "Attempt: path={path_label} model_id={id_label} url={endpoint}"
+                    );
+                }
+
+                eprintln!("\n🔍 Trying: path={path_label} model_id={id_label}");
+                eprintln!("   URL: {endpoint}");
+                eprintln!("   Model ID: {test_model_id}");
+
+                let request_builder = client
+                    .post(endpoint)
+                    .bearer_auth(&token)
+                    .header("accept", "text/event-stream")
+                    .header("user-agent", "bcode/0.0.1");
+
+                let response = request_builder
+                    .try_clone()
+                    .ok_or_else(|| {
+                        provider_error(
+                            "bedrock_mantle_request_clone_failed",
+                            ProviderErrorCategory::ProviderInternal,
+                            "failed to prepare Bedrock Mantle request",
+                        )
+                    })?
+                    .json(&build_mantle_openai_request(request, test_model_id)?)
+                    .send()
+                    .await
+                    .map_err(|error| mantle_network_error("request_failed", &error))?;
+
+                if response.status().is_success() {
+                    // Log success to file
+                    let _ = std::fs::write(
+                        "/tmp/bcode-mantle-success.txt",
+                        format!(
+                            "SUCCESS at {}\nPath: {} ({})\nModel ID: {} ({})\nURL: {}\n",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            path_label,
+                            endpoint,
+                            id_label,
+                            test_model_id,
+                            endpoint
+                        ),
+                    );
+
+                    // Log which combination worked
+                    tracing::warn!(
+                        target: "bcode_bedrock::mantle",
+                        endpoint = %endpoint,
+                        path_pattern = path_label,
+                        model_id = %test_model_id,
+                        model_id_pattern = id_label,
+                        original_model_id = %model_id,
+                        "✅ SUCCESS: Mantle OpenAI request succeeded with this pattern"
+                    );
+                    eprintln!(
+                        "\n🎉 SUCCESS: Gateway accepted path={path_label} model_id={id_label}"
+                    );
+                    eprintln!("   Endpoint: {endpoint}");
+                    eprintln!("   Model ID: {test_model_id}\n");
+
+                    return read_mantle_openai_stream(
+                        response,
+                        turn,
+                        &name_map,
+                        request.metadata.get("service_tier").map(String::as_str),
+                        request
+                            .metadata
+                            .get("prompt_cache_retention")
+                            .map(String::as_str),
+                    )
+                    .await;
+                }
+
+                let error = mantle_status_error(response).await;
+
+                // Log failure to file
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/bcode-mantle-attempts.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "  Result: FAILED - {}", error.message);
+                }
+
+                // Log each failed attempt
+                tracing::debug!(
+                    target: "bcode_bedrock::mantle",
+                    endpoint = %endpoint,
+                    path_pattern = path_label,
+                    model_id = %test_model_id,
+                    model_id_pattern = id_label,
+                    error = %error.message,
+                    "❌ Mantle OpenAI pattern failed"
+                );
+                eprintln!(
+                    "❌ FAILED: path={path_label} model_id={id_label} -> {}",
+                    error.message
+                );
+
+                last_error = Some(error);
             }
-            last_error = Some(error);
-            continue;
         }
-        return read_mantle_openai_stream(
-            response,
-            turn,
-            &name_map,
-            request.metadata.get("service_tier").map(String::as_str),
-            request
-                .metadata
-                .get("prompt_cache_retention")
-                .map(String::as_str),
-        )
-        .await;
     }
+
+    eprintln!("\n⚠️  All Mantle OpenAI patterns failed. Check gateway configuration.\n");
     Err(last_error.unwrap_or_else(|| {
         provider_error(
             "bedrock_mantle_openai_model_unavailable",
@@ -996,6 +1137,16 @@ async fn read_mantle_openai_stream(
                 let Some(chunk) = chunk
                     .map_err(|error| mantle_network_error("stream_failed", &error))?
                 else {
+                    // Log stream end for debugging
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/bcode-mantle-stream.log")
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[STREAM END] No completion event received. Buffer: {buffer}");
+                    }
+
                     // The stream ended without reporting a terminal event.
                     return Err(provider_error(
                         "bedrock_mantle_openai_stream_incomplete",
@@ -1004,6 +1155,17 @@ async fn read_mantle_openai_stream(
                     ));
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Log raw stream data for debugging
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/bcode-mantle-stream.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[CHUNK] {}", String::from_utf8_lossy(&chunk));
+                }
+
                 for line in bcode_openai_responses::drain_complete_stream_lines(&mut buffer) {
                     if let Some(outcome) =
                         process_mantle_openai_line(
@@ -1440,6 +1602,37 @@ fn mantle_endpoint(settings: &Settings, flavor: MantleFlavor) -> Result<String, 
 
 fn mantle_anthropic_messages_endpoint(settings: &Settings) -> Result<String, ProviderError> {
     mantle_endpoint(settings, MantleFlavor::Anthropic)
+}
+
+/// Build a Mantle endpoint with a custom path override for testing.
+fn mantle_endpoint_with_override(
+    settings: &Settings,
+    flavor: MantleFlavor,
+    path_prefix: &str,
+) -> Result<String, ProviderError> {
+    let base_url = settings.mantle_base_url.clone().ok_or_else(|| {
+        provider_error(
+            "bedrock_mantle_base_url_missing",
+            ProviderErrorCategory::Config,
+            "path override requires explicit mantle_base_url",
+        )
+    })?;
+
+    let mut url = reqwest::Url::parse(base_url.trim()).map_err(|error| {
+        provider_error(
+            "bedrock_mantle_base_url_invalid",
+            ProviderErrorCategory::Config,
+            format!("invalid Bedrock Mantle base URL: {error}"),
+        )
+    })?;
+
+    // Build path: base path (e.g., /gw) + prefix (e.g., /bedrock) + service path (e.g., /openai/v1/responses)
+    let base_path = url.path().trim_end_matches('/');
+    let service_path = flavor.full_request_path();
+    let full_path = format!("{base_path}{path_prefix}{service_path}");
+
+    url.set_path(&full_path);
+    Ok(url.to_string())
 }
 
 async fn mantle_status_error(response: reqwest::Response) -> ProviderError {
@@ -2816,6 +3009,151 @@ fn bedrock_tool_input_schema(tool: &ToolDefinition) -> Result<&serde_json::Value
     Ok(&tool.input_schema)
 }
 
+/// Make a tool schema strict by adding `additionalProperties: false` and wrapping optional
+/// properties.
+///
+/// `OpenAI` models on Bedrock require strict schemas with:
+/// - `additionalProperties: false` on every object
+/// - `required` listing ALL properties on every object
+/// - Optional properties wrapped with `{ anyOf: [property, { type: "null" }] }`
+///
+/// This transforms a schema to meet those requirements while preserving optional/required
+/// semantics.
+fn make_tool_schema_strict(schema: &serde_json::Value) -> serde_json::Value {
+    match schema {
+        serde_json::Value::Object(obj) => {
+            let mut new_obj = serde_json::Map::new();
+
+            // For object types, handle properties, required, and additionalProperties
+            if obj.get("type").and_then(|v| v.as_str()) == Some("object") {
+                let original_required = obj
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(String::from)
+                            .collect::<std::collections::HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+
+                // Process properties
+                if let Some(serde_json::Value::Object(properties)) = obj.get("properties") {
+                    let mut new_properties = serde_json::Map::new();
+                    for (key, value) in properties {
+                        let strict_value = make_tool_schema_strict(value);
+                        // If property was not originally required and doesn't allow null, wrap it
+                        if !original_required.contains(key.as_str())
+                            && !schema_allows_null(&strict_value)
+                        {
+                            new_properties.insert(
+                                key.clone(),
+                                serde_json::json!({
+                                    "anyOf": [strict_value, {"type": "null"}]
+                                }),
+                            );
+                        } else {
+                            new_properties.insert(key.clone(), strict_value);
+                        }
+                    }
+                    new_obj.insert(
+                        "properties".to_string(),
+                        serde_json::Value::Object(new_properties.clone()),
+                    );
+
+                    // Set required to ALL property keys
+                    let required_keys: Vec<_> = new_properties
+                        .keys()
+                        .map(|k| serde_json::Value::String(k.clone()))
+                        .collect();
+                    new_obj.insert(
+                        "required".to_string(),
+                        serde_json::Value::Array(required_keys),
+                    );
+                }
+
+                // Add additionalProperties: false
+                if !obj.contains_key("additionalProperties") {
+                    new_obj.insert(
+                        "additionalProperties".to_string(),
+                        serde_json::Value::Bool(false),
+                    );
+                }
+
+                // Copy other fields
+                for (key, value) in obj {
+                    if key != "properties" && key != "required" && key != "additionalProperties" {
+                        new_obj.insert(key.clone(), make_tool_schema_strict(value));
+                    }
+                }
+            } else {
+                // Not an object type, just recursively process
+                for (key, value) in obj {
+                    new_obj.insert(key.clone(), make_tool_schema_strict(value));
+                }
+            }
+            serde_json::Value::Object(new_obj)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(make_tool_schema_strict).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Check if a JSON schema allows null values.
+fn schema_allows_null(schema: &serde_json::Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+
+    // Check type field
+    if let Some(type_val) = obj.get("type") {
+        if type_val.as_str() == Some("null") {
+            return true;
+        }
+        if let Some(types) = type_val.as_array()
+            && types.iter().any(|v| v.as_str() == Some("null"))
+        {
+            return true;
+        }
+    }
+
+    // Check const field
+    if obj.get("const").is_some_and(serde_json::Value::is_null) {
+        return true;
+    }
+
+    // Check enum field
+    if let Some(enum_arr) = obj.get("enum").and_then(|v| v.as_array())
+        && enum_arr.iter().any(serde_json::Value::is_null)
+    {
+        return true;
+    }
+
+    // Check anyOf field
+    if let Some(any_of) = obj.get("anyOf").and_then(|v| v.as_array())
+        && any_of.iter().any(schema_allows_null)
+    {
+        return true;
+    }
+
+    false
+}
+
+fn bedrock_tool_input_schema_for_model(
+    tool: &ToolDefinition,
+    model_id: &str,
+) -> Result<serde_json::Value, ProviderError> {
+    let schema = bedrock_tool_input_schema(tool)?;
+    // OpenAI models require strict schemas with additionalProperties: false
+    if model_id.contains(".openai.") {
+        Ok(make_tool_schema_strict(schema))
+    } else {
+        Ok(schema.clone())
+    }
+}
+
 /// Resolve the `max_tokens` value the Anthropic Messages surface requires.
 ///
 /// The Messages API rejects a request without `max_tokens`, so this value cannot simply be
@@ -3288,7 +3626,7 @@ fn build_converse_request(
     Ok(BedrockConverseRequest {
         messages: model_messages_to_bedrock_messages(request)?,
         system: system_blocks(request),
-        tool_config: model_tools_to_bedrock_tool_config(request)?,
+        tool_config: model_tools_to_bedrock_tool_config(request, &model_id)?,
         inference_config: model_parameters_to_inference_config(request),
         output_config: bedrock_output_config(request)?,
         additional_model_request_fields: bedrock_thinking_fields(
@@ -3602,6 +3940,7 @@ fn joined_text_content(message: &ModelMessage) -> String {
 
 fn model_tools_to_bedrock_tool_config(
     request: &ModelTurnRequest,
+    model_id: &str,
 ) -> Result<Option<ToolConfiguration>, ProviderError> {
     if matches!(request.tool_call_policy.choice, ToolChoice::None) {
         return Ok(None);
@@ -3621,12 +3960,11 @@ fn model_tools_to_bedrock_tool_config(
         .tools
         .iter()
         .map(|tool| {
+            let schema = bedrock_tool_input_schema_for_model(tool, model_id)?;
             let mut specification = ToolSpecification::builder()
                 .name(bedrock_tool_name(&tool.name))
                 .description(tool.description.clone())
-                .input_schema(ToolInputSchema::Json(json_value_to_document(
-                    bedrock_tool_input_schema(tool)?,
-                )));
+                .input_schema(ToolInputSchema::Json(json_value_to_document(&schema)));
             if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict) {
                 specification = specification.strict(true);
             }
@@ -7222,7 +7560,7 @@ mod tests {
             input_schema: serde_json::json!({"anyOf": [{"type": "object"}]}),
         }];
 
-        let error = model_tools_to_bedrock_tool_config(&request)
+        let error = model_tools_to_bedrock_tool_config(&request, "anthropic.claude-opus-5")
             .expect_err("unsupported root combinator must fail locally");
         assert_eq!(error.code, "bedrock_tool_schema_unsupported");
         assert!(error.message.contains("custom.choice"));
@@ -8644,7 +8982,7 @@ mod tests {
             messages[0].content().last(),
             Some(BedrockContentBlock::CachePoint(_))
         ));
-        let tool_config = model_tools_to_bedrock_tool_config(&request)
+        let tool_config = model_tools_to_bedrock_tool_config(&request, "anthropic.claude-opus-5")
             .expect("tools convert")
             .expect("tool config should exist");
         assert!(matches!(
@@ -9147,7 +9485,7 @@ mod tests {
         request.tool_call_policy.choice = ToolChoice::None;
 
         assert!(
-            model_tools_to_bedrock_tool_config(&request)
+            model_tools_to_bedrock_tool_config(&request, "anthropic.claude-opus-5")
                 .expect("none choice should project")
                 .is_none()
         );
@@ -9162,7 +9500,7 @@ mod tests {
             input_schema: serde_json::json!({"type":"object"}),
         });
         request.tool_call_policy.choice = ToolChoice::Required;
-        let required = model_tools_to_bedrock_tool_config(&request)
+        let required = model_tools_to_bedrock_tool_config(&request, "anthropic.claude-opus-5")
             .expect("required choice should project")
             .expect("required choice needs tool config");
         assert!(
@@ -9174,7 +9512,7 @@ mod tests {
         request.tool_call_policy.choice = ToolChoice::Tool {
             name: "filesystem.read".to_string(),
         };
-        let specific = model_tools_to_bedrock_tool_config(&request)
+        let specific = model_tools_to_bedrock_tool_config(&request, "anthropic.claude-opus-5")
             .expect("specific choice should project")
             .expect("specific choice needs tool config");
         let selected = specific
@@ -9196,7 +9534,7 @@ mod tests {
             name: "missing".to_string(),
         };
 
-        let error = model_tools_to_bedrock_tool_config(&request)
+        let error = model_tools_to_bedrock_tool_config(&request, "anthropic.claude-opus-5")
             .expect_err("unknown required tool must fail");
         assert_eq!(error.code, "unknown_required_tool");
         assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
@@ -9281,6 +9619,7 @@ mod tests {
         // variables. Requiring `BCODE_BEDROCK_TRANSPORT=mantle_openai` would hide clearly supported
         // models behind configuration.
         let default_transport = BedrockTransport::Runtime;
+        let default_settings = test_settings();
 
         let mut responses_request = test_model_turn_request();
         responses_request.model_id = "openai.gpt-5.6-sol".to_string();
@@ -9290,7 +9629,7 @@ mod tests {
         responses_request.provider_context.api_surface =
             Some(bcode_model::ModelApiSurface::Responses);
         assert!(
-            uses_mantle_openai_surface(&responses_request, default_transport),
+            uses_mantle_openai_surface(&responses_request, default_transport, &default_settings),
             "a Responses-surface model must route to Mantle OpenAI on the default transport"
         );
 
@@ -9298,7 +9637,8 @@ mod tests {
         let converse_request = test_model_turn_request();
         assert!(!uses_mantle_openai_surface(
             &converse_request,
-            default_transport
+            default_transport,
+            &default_settings
         ));
 
         // Messages-surface models still route to the Anthropic adapter, not Responses.
@@ -9307,13 +9647,15 @@ mod tests {
             Some(bcode_model::ModelApiSurface::Messages);
         assert!(!uses_mantle_openai_surface(
             &messages_request,
-            default_transport
+            default_transport,
+            &default_settings
         ));
 
         // The explicit transport still forces the surface for any model.
         assert!(uses_mantle_openai_surface(
             &converse_request,
-            BedrockTransport::MantleOpenAi
+            BedrockTransport::MantleOpenAi,
+            &default_settings
         ));
 
         // Feature negotiation follows the surface, so reasoning summaries and structured output are
@@ -9322,7 +9664,8 @@ mod tests {
         rich.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Responses);
         rich.parameters.reasoning_summary = Some("detailed".to_string());
         rich.tool_call_policy.parallel = Some(true);
-        let responses_surface = uses_mantle_openai_surface(&rich, default_transport);
+        let responses_surface =
+            uses_mantle_openai_surface(&rich, default_transport, &default_settings);
         validate_bedrock_request(&rich, responses_surface)
             .expect("Responses models accept these features on the default transport");
 
