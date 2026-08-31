@@ -491,6 +491,64 @@ default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
 default_summary = "auto"
 
+# US cross-region inference profile
+[models."us.openai.gpt-5.6-sol"]
+model_id = "us.openai.gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (US)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."us.openai.gpt-5.6-sol".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."us.openai.gpt-5.6-sol".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# Global cross-region inference profile
+[models."global.openai.gpt-5.6-sol"]
+model_id = "global.openai.gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (Global)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."global.openai.gpt-5.6-sol".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."global.openai.gpt-5.6-sol".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
 [models."openai.gpt-5.6-terra"]
 model_id = "openai.gpt-5.6-terra"
 display_name = "GPT-5.6 Terra"
@@ -514,6 +572,93 @@ reasoning = true
 prompt_cache = true
 
 [models."openai.gpt-5.6-terra".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# US cross-region inference profile
+[models."us.openai.gpt-5.6-terra"]
+model_id = "us.openai.gpt-5.6-terra"
+display_name = "GPT-5.6 Terra (US)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."us.openai.gpt-5.6-terra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."us.openai.gpt-5.6-terra".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# Global cross-region inference profile
+[models."global.openai.gpt-5.6-terra"]
+model_id = "global.openai.gpt-5.6-terra"
+display_name = "GPT-5.6 Terra (Global)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."global.openai.gpt-5.6-terra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."global.openai.gpt-5.6-terra".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# EU cross-region inference profile
+[models."eu.openai.gpt-5.6-terra"]
+model_id = "eu.openai.gpt-5.6-terra"
+display_name = "GPT-5.6 Terra (EU)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."eu.openai.gpt-5.6-terra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."eu.openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
@@ -547,6 +692,93 @@ default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
 default_summary = "auto"
 
+# US cross-region inference profile
+[models."us.openai.gpt-5.6-luna"]
+model_id = "us.openai.gpt-5.6-luna"
+display_name = "GPT-5.6 Luna (US)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."us.openai.gpt-5.6-luna".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."us.openai.gpt-5.6-luna".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# APAC cross-region inference profile
+[models."apac.openai.gpt-5.6-luna"]
+model_id = "apac.openai.gpt-5.6-luna"
+display_name = "GPT-5.6 Luna (APAC)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."apac.openai.gpt-5.6-luna".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."apac.openai.gpt-5.6-luna".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# Global cross-region inference profile
+[models."global.openai.gpt-5.6-luna"]
+model_id = "global.openai.gpt-5.6-luna"
+display_name = "GPT-5.6 Luna (Global)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5.6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."global.openai.gpt-5.6-luna".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."global.openai.gpt-5.6-luna".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
 [models."openai.gpt-5.5"]
 model_id = "openai.gpt-5.5"
 display_name = "GPT-5.5"
@@ -575,6 +807,64 @@ default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
 default_summary = "auto"
 
+# US cross-region inference profile
+[models."us.openai.gpt-5.5"]
+model_id = "us.openai.gpt-5.5"
+display_name = "GPT-5.5 (US)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5"
+context_window = 272000
+max_output_tokens = 100000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."us.openai.gpt-5.5".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."us.openai.gpt-5.5".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# Global cross-region inference profile
+[models."global.openai.gpt-5.5"]
+model_id = "global.openai.gpt-5.5"
+display_name = "GPT-5.5 (Global)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5"
+context_window = 272000
+max_output_tokens = 100000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."global.openai.gpt-5.5".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."global.openai.gpt-5.5".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
 [models."openai.gpt-5.4"]
 model_id = "openai.gpt-5.4"
 display_name = "GPT-5.4"
@@ -598,6 +888,64 @@ reasoning = true
 prompt_cache = true
 
 [models."openai.gpt-5.4".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# US cross-region inference profile
+[models."us.openai.gpt-5.4"]
+model_id = "us.openai.gpt-5.4"
+display_name = "GPT-5.4 (US)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5"
+context_window = 272000
+max_output_tokens = 100000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."us.openai.gpt-5.4".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."us.openai.gpt-5.4".reasoning]
+effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+# Global cross-region inference profile
+[models."global.openai.gpt-5.4"]
+model_id = "global.openai.gpt-5.4"
+display_name = "GPT-5.4 (Global)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-5"
+context_window = 272000
+max_output_tokens = 100000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."global.openai.gpt-5.4".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."global.openai.gpt-5.4".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
 default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
