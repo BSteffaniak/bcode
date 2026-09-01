@@ -60,7 +60,9 @@ pub fn image_data_url(image: &bcode_model::ImageContent) -> String {
 /// Project one message into a role-tagged input item with its text and image content.
 ///
 /// `input_text` selects the caller-side (`input_text`) versus model-side (`output_text`) content
-/// discriminator. Returns an empty vector when the message carries no projectable content.
+/// discriminator. A provider-neutral cache point on the message is projected onto the final
+/// cacheable caller content block. Returns an empty vector when the message carries no projectable
+/// content.
 #[must_use]
 pub fn responses_message(
     role: &str,
@@ -88,6 +90,23 @@ pub fn responses_message(
     }
     if content.is_empty() {
         return Vec::new();
+    }
+    if input_text
+        && message
+            .content
+            .iter()
+            .any(|block| matches!(block, bcode_model::ContentBlock::CachePoint { .. }))
+        && let Some(ResponsesContent::InputText {
+            prompt_cache_breakpoint,
+            ..
+        }) = content
+            .iter_mut()
+            .rev()
+            .find(|content| matches!(content, ResponsesContent::InputText { .. }))
+    {
+        *prompt_cache_breakpoint = Some(crate::ResponsesPromptCacheBreakpoint {
+            mode: "explicit".to_string(),
+        });
     }
     vec![ResponsesInputItem::Message {
         role: role.to_string(),
@@ -370,6 +389,34 @@ mod tests {
 
     fn identity(name: &str) -> String {
         name.to_string()
+    }
+
+    #[test]
+    fn cache_point_projects_to_the_message_input_text() {
+        let message = bcode_model::ModelMessage {
+            role: bcode_model::MessageRole::User,
+            content: vec![
+                bcode_model::ContentBlock::Text {
+                    text: "stable prefix".to_string(),
+                },
+                bcode_model::ContentBlock::CachePoint {
+                    hint: bcode_model::PromptCachePoint::default(),
+                },
+            ],
+        };
+
+        let input = model_message_to_responses_input(&message, &identity);
+        assert!(matches!(
+            &input[0],
+            ResponsesInputItem::Message { content, .. }
+                if matches!(
+                    &content[0],
+                    ResponsesContent::InputText {
+                        prompt_cache_breakpoint: Some(_),
+                        ..
+                    }
+                )
+        ));
     }
 
     #[test]

@@ -19717,7 +19717,7 @@ async fn session_model_selection_with_runtime_context(
     session_id: SessionId,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> SessionModelSelection {
-    let selection = session_model_selection(state, session_id).await;
+    let mut selection = session_model_selection(state, session_id).await;
     let Some(context) = runtime_context else {
         return selection;
     };
@@ -19729,14 +19729,35 @@ async fn session_model_selection_with_runtime_context(
         .cloned()
         .unwrap_or_default();
     if matches!(origin, SessionModelSelectionOrigin::Default)
-        && !state.session_has_active_turn(session_id).await
         && (context.selected_provider_plugin_id.is_some()
             || context.selected_model_id.is_some()
             || context.requested_model_id.is_some())
     {
         return model_selection_from_runtime_context(state, context);
     }
+    overlay_transient_provider_context(&mut selection.provider_context, context.provider_context);
     selection
+}
+
+fn overlay_transient_provider_context(
+    selection: &mut bcode_model::ProviderRequestContext,
+    runtime: bcode_model::ProviderRequestContext,
+) {
+    if runtime.auth_profile.is_some() {
+        selection.auth_profile = runtime.auth_profile;
+    }
+    if runtime.auth_pool.is_some() {
+        selection.auth_pool = runtime.auth_pool;
+    }
+    if runtime.auth.is_some() {
+        selection.auth = runtime.auth;
+    }
+    if !runtime.auth_candidates.is_empty() {
+        selection.auth_candidates = runtime.auth_candidates;
+    }
+    selection.auth_pool_routing = runtime.auth_pool_routing;
+    selection.auth_pool_selection_reason = runtime.auth_pool_selection_reason;
+    selection.env.extend(runtime.env);
 }
 
 fn default_model_selection_with_runtime_context(
@@ -20480,13 +20501,6 @@ async fn build_model_turn_request(
             .sum::<usize>() as u64,
         metric_labels.clone(),
     );
-    let prompt_cache_timer = state.metrics.timer();
-    let prompt_cache = plan_prompt_cache(&mut messages, config.model.effective_prompt_cache_mode());
-    state.metrics.record_histogram_with_labels(
-        "model.request_build.prompt_cache_plan_duration_ms",
-        prompt_cache_timer.elapsed_ms(),
-        metric_labels.clone(),
-    );
     let mut system_prefix_len = 0;
     for message in static_context.system_messages.iter().cloned() {
         messages.insert(system_prefix_len, message);
@@ -20525,6 +20539,26 @@ async fn build_model_turn_request(
     let catalog_provider_id = target.catalog_provider_id.clone();
     let catalog_identity = target.catalog_identity.clone();
     let model_cache_info = target.cache;
+    let prompt_cache_ttl_supported = target
+        .feature_support
+        .prompt_cache
+        .get(&bcode_model::PromptCacheFeature::Ttl)
+        .is_some_and(bcode_model::CapabilitySupport::is_guaranteed);
+    let prompt_cache_timer = state.metrics.timer();
+    let prompt_cache = plan_prompt_cache(
+        &mut messages,
+        config.model.effective_prompt_cache_mode(),
+        session_id,
+        model_cache_info
+            .capabilities
+            .contains(&bcode_model::ModelCacheCapability::ExplicitCachePoints),
+        prompt_cache_ttl_supported,
+    );
+    state.metrics.record_histogram_with_labels(
+        "model.request_build.prompt_cache_plan_duration_ms",
+        prompt_cache_timer.elapsed_ms(),
+        metric_labels.clone(),
+    );
     let model_id = target.model_id;
     let reasoning_capabilities = resolve_model_reasoning_info(
         state,
@@ -21605,20 +21639,12 @@ fn model_request_trace_metadata(
         cache_point_projection(&cache_capabilities, provider_plugin_id, prompt_cache_points),
     );
     metadata.insert(
-        "provider_wire_prompt_cache_points".to_string(),
-        if provider_plugin_id == Some("bcode.bedrock")
-            && cache_capabilities
-                .split(',')
-                .any(|capability| capability == "explicit_cache_points")
-        {
-            prompt_cache_points.to_string()
-        } else {
-            "0".to_string()
-        },
+        "host_prompt_cache_plan_points".to_string(),
+        prompt_cache_points.to_string(),
     );
     metadata.insert(
-        "provider_wire_cache_mode".to_string(),
-        if provider_plugin_id == Some("bcode.bedrock") && prompt_cache_points > 0 {
+        "host_prompt_cache_plan_mode".to_string(),
+        if prompt_cache_points > 0 {
             "explicit"
         } else {
             "off"
@@ -21626,11 +21652,12 @@ fn model_request_trace_metadata(
         .to_string(),
     );
     metadata.insert(
-        "provider_wire_prompt_cache_key_fingerprint".to_string(),
+        "host_prompt_cache_key_fingerprint".to_string(),
         request
-            .metadata
-            .get("prompt_cache_key")
-            .cloned()
+            .prompt_cache
+            .key
+            .clone()
+            .or_else(|| request.metadata.get("prompt_cache_key").cloned())
             .unwrap_or_else(|| "stable_prefix".to_string()),
     );
     metadata.insert(
@@ -21878,46 +21905,70 @@ fn stable_hash(value: &str) -> String {
 fn plan_prompt_cache(
     messages: &mut [ModelMessage],
     mode: bcode_model::PromptCacheMode,
+    session_id: SessionId,
+    explicit_cache_points: bool,
+    ttl_supported: bool,
 ) -> bcode_model::PromptCacheHints {
+    // Cache points are provider-request projection artifacts. A tool round rebuild may receive
+    // messages projected for an earlier round, so remove them before applying the current policy.
+    for message in messages.iter_mut() {
+        message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::CachePoint { .. }));
+    }
+
     if !mode.is_enabled() {
         return bcode_model::PromptCacheHints::default();
     }
 
-    if mode.cache_conversation_prefix()
-        && let Some(index) = conversation_cache_point_index(messages)
-    {
-        messages[index].content.push(ContentBlock::CachePoint {
-            hint: bcode_model::PromptCachePoint {
-                label: Some("conversation_prefix".to_string()),
-                ttl_seconds: None,
-            },
-        });
+    let explicit_cache_points = explicit_cache_points && mode.is_enabled();
+    let ttl_seconds = (explicit_cache_points && ttl_supported).then_some(30 * 60);
+    if explicit_cache_points {
+        for index in conversation_cache_point_indices(messages) {
+            messages[index].content.push(ContentBlock::CachePoint {
+                hint: bcode_model::PromptCachePoint {
+                    label: Some("conversation_prefix".to_string()),
+                    ttl_seconds,
+                },
+            });
+        }
     }
 
     bcode_model::PromptCacheHints {
         mode,
+        key: Some(format!("bcode:{session_id}")),
+        ttl_seconds,
         cache_system_prompt: true,
         cache_tools: true,
     }
 }
 
-fn conversation_cache_point_index(messages: &[ModelMessage]) -> Option<usize> {
-    const MIN_MESSAGES_FOR_CONVERSATION_CACHE: usize = 6;
+fn conversation_cache_point_indices(messages: &[ModelMessage]) -> Vec<usize> {
+    const MAX_CONVERSATION_CACHE_POINTS: usize = 3;
+    const MIN_MESSAGES_FOR_CONVERSATION_CACHE: usize = 3;
     if messages.len() < MIN_MESSAGES_FOR_CONVERSATION_CACHE {
-        return None;
+        return Vec::new();
     }
     messages
         .iter()
         .enumerate()
         .rev()
-        .skip(2)
-        .find_map(|(index, message)| {
-            matches!(
-                message.role,
-                MessageRole::User | MessageRole::Assistant | MessageRole::Tool
-            )
+        .skip(1)
+        .filter_map(|(index, message)| {
+            (matches!(message.role, MessageRole::User)
+                && message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if !text.trim().is_empty()
+                    )
+                }))
             .then_some(index)
         })
+        .take(MAX_CONVERSATION_CACHE_POINTS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn model_id_for_provider_request(selected_model_id: Option<&str>) -> String {
@@ -38764,14 +38815,22 @@ library = "test"
             })
             .collect::<Vec<_>>();
 
-        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Aggressive);
+        let hints = plan_prompt_cache(
+            &mut messages,
+            bcode_model::PromptCacheMode::Aggressive,
+            SessionId::new(),
+            true,
+            true,
+        );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Aggressive);
-        assert_eq!(prompt_cache_point_count_in_messages(&messages), 1);
+        assert_eq!(prompt_cache_point_count_in_messages(&messages), 3);
+        assert_eq!(hints.ttl_seconds, Some(30 * 60));
+        assert!(hints.key.is_some());
     }
 
     #[test]
-    fn auto_prompt_cache_does_not_add_conversation_cache_point() {
+    fn auto_prompt_cache_uses_explicit_points_when_supported() {
         let mut messages = (0..6)
             .map(|index| ModelMessage {
                 role: MessageRole::User,
@@ -38781,10 +38840,18 @@ library = "test"
             })
             .collect::<Vec<_>>();
 
-        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Auto);
+        let hints = plan_prompt_cache(
+            &mut messages,
+            bcode_model::PromptCacheMode::Auto,
+            SessionId::new(),
+            true,
+            false,
+        );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
-        assert_eq!(prompt_cache_point_count_in_messages(&messages), 0);
+        assert_eq!(prompt_cache_point_count_in_messages(&messages), 3);
+        assert_eq!(hints.ttl_seconds, None);
+        assert!(hints.key.is_some());
     }
 
     #[test]
@@ -39083,7 +39150,7 @@ library = "test"
     }
 
     #[test]
-    fn resolved_cache_metadata_reports_explicit_bedrock_wire_projection() {
+    fn resolved_cache_metadata_reports_explicit_host_plan() {
         let mut request = test_model_turn_request(Vec::new());
         request.system_prompt = Some("stable instructions".to_string());
         request.prompt_cache.mode = bcode_model::PromptCacheMode::Auto;
@@ -39106,12 +39173,14 @@ library = "test"
             Some("prompt_cache_key,explicit_cache_points,cache_usage_reporting")
         );
         assert_eq!(
-            metadata.get("provider_wire_cache_mode").map(String::as_str),
+            metadata
+                .get("host_prompt_cache_plan_mode")
+                .map(String::as_str),
             Some("explicit")
         );
         assert_eq!(
             metadata
-                .get("provider_wire_prompt_cache_points")
+                .get("host_prompt_cache_plan_points")
                 .map(String::as_str),
             Some("1")
         );
@@ -44322,14 +44391,137 @@ library = "test"
     }
 
     #[test]
-    fn prompt_cache_auto_marks_stable_sections_only() {
+    fn prompt_cache_auto_marks_stable_sections_without_history() {
         let mut messages = Vec::new();
 
-        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Auto);
+        let hints = plan_prompt_cache(
+            &mut messages,
+            bcode_model::PromptCacheMode::Auto,
+            SessionId::new(),
+            true,
+            false,
+        );
 
         assert!(hints.cache_system_prompt);
         assert!(hints.cache_tools);
         assert_eq!(messages.len(), 0);
+    }
+
+    #[test]
+    fn prompt_cache_planning_removes_stale_points_before_applying_auto() {
+        let mut messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "stable message".to_string(),
+                },
+                ContentBlock::CachePoint {
+                    hint: bcode_model::PromptCachePoint::default(),
+                },
+            ],
+        }];
+
+        let hints = plan_prompt_cache(
+            &mut messages,
+            bcode_model::PromptCacheMode::Auto,
+            SessionId::new(),
+            true,
+            false,
+        );
+
+        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
+        assert_eq!(prompt_cache_point_count_in_messages(&messages), 0);
+    }
+
+    #[test]
+    fn prompt_cache_auto_rolls_breakpoints_without_marking_mutable_tail() {
+        let session_id = SessionId::new();
+        let mut first_round = (0..6)
+            .map(|index| ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("message {index}"),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let first_hints = plan_prompt_cache(
+            &mut first_round,
+            bcode_model::PromptCacheMode::Auto,
+            session_id,
+            true,
+            true,
+        );
+        let first_points = first_round
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        let mut second_round = first_round;
+        second_round.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "mutable tail".to_string(),
+            }],
+        });
+        let second_hints = plan_prompt_cache(
+            &mut second_round,
+            bcode_model::PromptCacheMode::Auto,
+            session_id,
+            true,
+            true,
+        );
+        let second_points = second_round
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_points, vec![2, 3, 4]);
+        assert_eq!(second_points, vec![3, 4, 5]);
+        assert_eq!(first_hints.key, second_hints.key);
+        assert_eq!(second_hints.ttl_seconds, Some(30 * 60));
+        assert!(!matches!(
+            second_round
+                .last()
+                .and_then(|message| message.content.last()),
+            Some(ContentBlock::CachePoint { .. })
+        ));
+    }
+
+    #[test]
+    fn prompt_cache_auto_does_not_add_points_without_explicit_support() {
+        let mut messages = (0..6)
+            .map(|index| ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("message {index}"),
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let hints = plan_prompt_cache(
+            &mut messages,
+            bcode_model::PromptCacheMode::Auto,
+            SessionId::new(),
+            false,
+            false,
+        );
+
+        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
+        assert_eq!(prompt_cache_point_count_in_messages(&messages), 0);
     }
 
     #[test]
@@ -44343,13 +44535,16 @@ library = "test"
             })
             .collect::<Vec<_>>();
 
-        let hints = plan_prompt_cache(&mut messages, bcode_model::PromptCacheMode::Aggressive);
+        let hints = plan_prompt_cache(
+            &mut messages,
+            bcode_model::PromptCacheMode::Aggressive,
+            SessionId::new(),
+            true,
+            false,
+        );
 
         assert!(hints.cache_system_prompt);
-        assert!(matches!(
-            messages[3].content.last(),
-            Some(ContentBlock::CachePoint { .. })
-        ));
+        assert_eq!(prompt_cache_point_count_in_messages(&messages), 3);
         assert!(!matches!(
             messages[5].content.last(),
             Some(ContentBlock::CachePoint { .. })
@@ -53661,7 +53856,99 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some("user.provider")
         );
         assert_eq!(selection.model_id.as_deref(), Some("user-model"));
-        assert_eq!(selection.provider_context, user_provider_context);
+        assert_eq!(
+            selection.provider_context.settings,
+            user_provider_context.settings
+        );
+    }
+
+    #[tokio::test]
+    async fn client_runtime_auth_overlays_sticky_model_selection() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("sticky model auth".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    settings: BTreeMap::from([("transport".to_owned(), "responses".to_owned())]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..SessionModelSelection::default()
+            },
+        );
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .insert(session_id, SessionModelSelectionOrigin::User);
+        let bearer = bcode_model::ProviderAuthCredential {
+            value: "secret-token".to_owned(),
+            source: Some("AWS_BEARER_TOKEN_BEDROCK".to_owned()),
+        };
+
+        let selection = session_model_selection_with_runtime_context(
+            &state,
+            session_id,
+            Some(ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                selected_model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    auth_profile: Some("bedrock".to_owned()),
+                    auth: Some(bcode_model::ProviderAuthContext {
+                        credentials: BTreeMap::from([("bearer_token".to_owned(), bearer)]),
+                        ..bcode_model::ProviderAuthContext::default()
+                    }),
+                    env: BTreeMap::from([(
+                        "AWS_BEARER_TOKEN_BEDROCK".to_owned(),
+                        "secret-token".to_owned(),
+                    )]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..ClientRuntimeContext::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(selection.model_id.as_deref(), Some("us.openai.gpt-5.6-sol"));
+        assert_eq!(
+            selection
+                .provider_context
+                .settings
+                .get("transport")
+                .map(String::as_str),
+            Some("responses")
+        );
+        assert_eq!(
+            selection.provider_context.auth_profile.as_deref(),
+            Some("bedrock")
+        );
+        assert_eq!(
+            selection
+                .provider_context
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.credentials.get("bearer_token"))
+                .map(|credential| credential.value.as_str()),
+            Some("secret-token")
+        );
+        assert_eq!(
+            selection
+                .provider_context
+                .env
+                .get("AWS_BEARER_TOKEN_BEDROCK")
+                .map(String::as_str),
+            Some("secret-token")
+        );
     }
 
     #[test]
@@ -53839,6 +54126,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -53913,6 +54201,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "anthropic.claude-opus-5".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -64870,6 +65159,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "model".to_owned(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
             pricing: None,
             catalog_provider_id: None,
             catalog_identity: None,

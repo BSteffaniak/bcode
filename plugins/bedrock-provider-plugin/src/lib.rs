@@ -61,6 +61,7 @@ const MODEL_DISCOVERY_TTL: Duration = Duration::from_mins(10);
 const COMPATIBILITY_CACHE_VERSION: u8 = 1;
 const COMPATIBILITY_CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const STREAMING_TOOL_UNSUPPORTED_REASON: &str = "streaming_tool_use_unsupported";
+#[cfg(test)]
 const PROMPT_CACHE_UNSUPPORTED_REASON: &str = "prompt_cache_unsupported";
 
 /// Amazon Bedrock model provider plugin.
@@ -534,13 +535,19 @@ async fn stream_bedrock_turn_inner(
 ) -> Result<StreamOutcome, ProviderError> {
     let settings = Settings::resolve(Some(request));
     let transport = settings.transport.clone()?;
-    // The Responses surface is selected per model, not per configuration: the catalog declares
-    // `api_surface = "responses"` for models that exist only on Mantle, so they route correctly on
-    // the default transport. `BCODE_BEDROCK_TRANSPORT=mantle_openai` remains an explicit override.
-    // However, custom gateways may expose all models through Runtime/Converse, so when an explicit
-    // endpoint is configured, ignore the catalog's api_surface and use Runtime unless the transport
-    // is explicitly set to a Mantle flavor.
+    // Explicit Mantle selection uses Responses. A custom Runtime gateway remains on Converse even
+    // when the catalog model's native AWS surface is Responses; the endpoint owns that translation.
     let responses_surface = uses_mantle_openai_surface(request, transport, &settings);
+    let mut effective_request;
+    let request = if !responses_surface
+        && request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses)
+    {
+        effective_request = request.clone();
+        disable_prompt_cache(&mut effective_request);
+        &effective_request
+    } else {
+        request
+    };
 
     // Feature validation follows the model's catalog metadata, not the routing decision.
     // Custom gateways may translate Converse requests to backends that support Responses features.
@@ -590,12 +597,11 @@ async fn stream_bedrock_converse_turn(
     let mut last_error = None;
     for model_id in &selection.model_ids {
         let mut effective_request;
-        // OpenAI models don't support prompt caching on Bedrock Converse
-        let needs_cache_disabled = model_id.contains(".openai.")
-            || prompt_cache_known_unsupported(discovery, selection.cache_key.as_ref(), model_id);
+        let needs_cache_disabled =
+            prompt_cache_known_unsupported(discovery, selection.cache_key.as_ref(), model_id);
         let request_for_model = if needs_cache_disabled {
             effective_request = request.clone();
-            effective_request.prompt_cache = bcode_model::PromptCacheHints::default();
+            disable_prompt_cache(&mut effective_request);
             &effective_request
         } else {
             request
@@ -633,7 +639,6 @@ async fn stream_bedrock_converse_turn(
                 match handle_bedrock_turn_error(
                     error,
                     request,
-                    request_for_model,
                     model_id,
                     selection,
                     settings.region.as_deref(),
@@ -743,33 +748,22 @@ async fn stream_mantle_anthropic_turn(
     }))
 }
 
-/// Whether this turn should be served over the Mantle `OpenAI` Responses surface.
+/// Whether this turn should be served over the `OpenAI` Responses surface.
 ///
-/// Routing follows the model rather than configuration: the catalog marks Mantle-only `OpenAI`
-/// models with `api_surface = "responses"`, so they work on the default transport with no
-/// environment variables. Selecting `mantle_openai` explicitly forces the surface for every model,
-/// which keeps the transport useful as an override and for local testing.
-///
-/// Custom endpoints (gateways/proxies) may expose all models through the Runtime/Converse API
-/// rather than separate Mantle endpoints, so when an explicit endpoint is configured, the catalog's
-/// `api_surface` is ignored unless the transport is explicitly set to a Mantle flavor.
+/// Explicit Mantle transport selection wins. A configured custom Runtime endpoint remains on
+/// Converse because that gateway owns translation for catalog models whose native AWS surface is
+/// Responses. Without a custom endpoint, the model catalog is authoritative.
 fn uses_mantle_openai_surface(
     request: &ModelTurnRequest,
     transport: BedrockTransport,
     settings: &Settings,
 ) -> bool {
-    // Explicit Mantle transport always uses Mantle
     if transport == BedrockTransport::MantleOpenAi {
         return true;
     }
-
-    // Custom endpoints default to Runtime/Converse for all models unless explicitly overridden
-    let has_custom_endpoint = settings.endpoint_url.is_some() || settings.mantle_base_url.is_some();
-    if has_custom_endpoint {
+    if settings.endpoint_url.is_some() || settings.mantle_base_url.is_some() {
         return false;
     }
-
-    // Default AWS endpoints: follow the catalog's api_surface
     request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses)
 }
 
@@ -813,7 +807,7 @@ fn build_mantle_openai_request(
         request.system_prompt.as_deref(),
         &request.messages,
     );
-    if mantle_openai_prompt_cache_enabled(request)
+    if mantle_openai_explicit_prompt_cache_enabled(request)
         && let Some(stable_instructions) = instructions.take()
     {
         input.insert(
@@ -870,15 +864,20 @@ fn build_mantle_openai_request(
         }),
         reasoning: mantle_openai_reasoning(request),
         include: Vec::new(),
-        prompt_cache_key: mantle_openai_prompt_cache_enabled(request).then(|| {
+        prompt_cache_key: mantle_openai_explicit_prompt_cache_enabled(request).then(|| {
             request
-                .metadata
-                .get("prompt_cache_key")
-                .cloned()
+                .prompt_cache
+                .key
+                .clone()
+                .or_else(|| request.metadata.get("prompt_cache_key").cloned())
                 .unwrap_or_else(|| mantle_openai_stable_prefix_key(request))
         }),
-        prompt_cache_options: mantle_openai_prompt_cache_enabled(request)
-            .then_some(bcode_openai_responses::ResponsesPromptCacheOptions { mode: "explicit" }),
+        prompt_cache_options: mantle_openai_explicit_prompt_cache_enabled(request).then_some(
+            bcode_openai_responses::ResponsesPromptCacheOptions {
+                mode: "explicit",
+                ttl: (request.prompt_cache.ttl_seconds == Some(30 * 60)).then_some("30m"),
+            },
+        ),
         temperature: request.parameters.temperature,
         max_output_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
@@ -890,23 +889,28 @@ fn build_mantle_openai_request(
             format!("failed to encode Bedrock Mantle OpenAI request: {error}"),
         )
     })?;
-    if mantle_openai_prompt_cache_enabled(request) {
+    if mantle_openai_explicit_prompt_cache_enabled(request) {
         project_mantle_openai_prompt_cache(&value)?;
     }
     if let Some(service_tier) = request.metadata.get("service_tier") {
         value["service_tier"] = serde_json::Value::String(service_tier.clone());
     }
-    if let Some(prompt_cache_key) = request.metadata.get("prompt_cache_key") {
-        value["prompt_cache_key"] = serde_json::Value::String(prompt_cache_key.clone());
-    }
-    if let Some(retention) = request.metadata.get("prompt_cache_retention") {
-        value["prompt_cache_retention"] = serde_json::Value::String(retention.clone());
-    }
     Ok(value)
 }
 
+fn requested_mantle_cache_retention(request: &ModelTurnRequest) -> Option<&str> {
+    match request.prompt_cache.ttl_seconds {
+        Some(1_800) => Some("30m"),
+        Some(3_600) => Some("1h"),
+        _ => request
+            .metadata
+            .get("prompt_cache_retention")
+            .map(String::as_str),
+    }
+}
+
 /// Return whether the resolved model capabilities authorize explicit prompt caching.
-fn mantle_openai_prompt_cache_enabled(request: &ModelTurnRequest) -> bool {
+fn mantle_openai_explicit_prompt_cache_enabled(request: &ModelTurnRequest) -> bool {
     request.prompt_cache.mode.is_enabled()
         && request
             .metadata
@@ -933,6 +937,7 @@ fn mantle_openai_stable_prefix_key(request: &ModelTurnRequest) -> String {
 
 /// Validate the typed explicit-cache projection before sending it to Mantle.
 fn project_mantle_openai_prompt_cache(value: &serde_json::Value) -> Result<(), ProviderError> {
+    const MAX_BREAKPOINTS: usize = 4;
     let breakpoint_count = value
         .get("input")
         .and_then(serde_json::Value::as_array)
@@ -942,11 +947,13 @@ fn project_mantle_openai_prompt_cache(value: &serde_json::Value) -> Result<(), P
         .flatten()
         .filter(|content| content.get("prompt_cache_breakpoint").is_some())
         .count();
-    if breakpoint_count != 1 {
+    if !(1..=MAX_BREAKPOINTS).contains(&breakpoint_count) {
         return Err(provider_error(
             "bedrock_mantle_openai_cache_projection_failed",
             ProviderErrorCategory::InvalidRequest,
-            format!("expected one explicit prompt cache breakpoint, found {breakpoint_count}"),
+            format!(
+                "expected one to {MAX_BREAKPOINTS} explicit prompt cache breakpoints, found {breakpoint_count}"
+            ),
         ));
     }
     Ok(())
@@ -1139,10 +1146,7 @@ async fn stream_mantle_openai_turn(
                         turn,
                         &name_map,
                         request.metadata.get("service_tier").map(String::as_str),
-                        request
-                            .metadata
-                            .get("prompt_cache_retention")
-                            .map(String::as_str),
+                        requested_mantle_cache_retention(request),
                     )
                     .await;
                 }
@@ -2109,13 +2113,12 @@ enum TurnAttempt {
 
 /// Classify and react to a Converse send error for one model.
 ///
-/// Handles prompt-cache rejection, streaming-tool incompatibility, and rerouting models rejected
-/// by Converse through the Anthropic Messages adapter.
+/// Handles streaming-tool incompatibility and reroutes models rejected by Converse through the
+/// Anthropic Messages adapter.
 #[allow(clippy::too_many_arguments)]
 async fn handle_bedrock_turn_error(
     error: ProviderError,
     request: &ModelTurnRequest,
-    request_for_model: &ModelTurnRequest,
     model_id: &str,
     selection: &ModelSelection,
     region: Option<&str>,
@@ -2124,23 +2127,6 @@ async fn handle_bedrock_turn_error(
     discovery: &Arc<Mutex<DiscoveryCache>>,
     name_map: BTreeMap<String, String>,
 ) -> TurnAttempt {
-    if prompt_cache_rejected(&error) && request_for_model.prompt_cache.mode.is_enabled() {
-        turn.push(ProviderTurnEvent::Warning {
-            message: format!(
-                "Bedrock model {model_id} rejected prompt cache points; retrying without explicit cache points"
-            ),
-        });
-        mark_prompt_cache_unsupported(
-            discovery,
-            selection.cache_key.as_ref(),
-            model_id,
-            &error.message,
-        );
-        return TurnAttempt::Completed(
-            retry_bedrock_without_prompt_cache(client, request, model_id, region, turn, name_map)
-                .await,
-        );
-    }
     let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
     if !selection.explicit && streaming_tool_use_unsupported(&error) && !is_last {
         mark_streaming_tool_unsupported(
@@ -2169,36 +2155,12 @@ async fn handle_bedrock_turn_error(
     TurnAttempt::Completed(Err(error))
 }
 
-async fn retry_bedrock_without_prompt_cache(
-    client: &Client,
-    request: &ModelTurnRequest,
-    model_id: &str,
-    region: Option<&str>,
-    turn: &TurnState,
-    name_map: BTreeMap<String, String>,
-) -> Result<StreamOutcome, ProviderError> {
-    let mut retry_request = request.clone();
-    retry_request.prompt_cache = bcode_model::PromptCacheHints::default();
-    let bedrock_request = build_converse_request(&retry_request, model_id.to_string(), region)?;
-    let mut retry_builder = client
-        .converse_stream()
-        .model_id(bedrock_request.model_id)
-        .set_messages(Some(bedrock_request.messages));
-    if !bedrock_request.system.is_empty() {
-        retry_builder = retry_builder.set_system(Some(bedrock_request.system));
-    }
-    if let Some(tool_config) = bedrock_request.tool_config {
-        retry_builder = retry_builder.tool_config(tool_config);
-    }
-    if let Some(inference_config) = bedrock_request.inference_config {
-        retry_builder = retry_builder.inference_config(inference_config);
-    }
-    if let Some(additional_fields) = bedrock_request.additional_model_request_fields {
-        retry_builder = retry_builder.additional_model_request_fields(additional_fields);
-    }
-    match retry_builder.send().await {
-        Ok(response) => read_bedrock_stream(response.stream, turn, name_map).await,
-        Err(retry_error) => Err(bedrock_sdk_error(&retry_error)),
+fn disable_prompt_cache(request: &mut ModelTurnRequest) {
+    request.prompt_cache = bcode_model::PromptCacheHints::default();
+    for message in &mut request.messages {
+        message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::CachePoint { .. }));
     }
 }
 
@@ -4573,6 +4535,7 @@ fn bedrock_strict_tool_schema_support(
 }
 
 fn bedrock_prompt_cache_support(
+    responses_surface: bool,
     supported: impl Fn() -> bcode_model::CapabilitySupport,
 ) -> std::collections::BTreeMap<bcode_model::PromptCacheFeature, bcode_model::CapabilitySupport> {
     use bcode_model::{CapabilitySource, CapabilitySupport, PromptCacheFeature};
@@ -4586,9 +4549,13 @@ fn bedrock_prompt_cache_support(
     .map(|feature| (feature, supported()))
     .chain(std::iter::once((
         PromptCacheFeature::Ttl,
-        CapabilitySupport::Unsupported {
-            source: CapabilitySource::BundledCatalog,
-            reason: "Bedrock cache points do not accept a portable TTL".to_string(),
+        if responses_surface {
+            supported()
+        } else {
+            CapabilitySupport::Unsupported {
+                source: CapabilitySource::BundledCatalog,
+                reason: "Bedrock Converse cache points do not accept a portable TTL".to_string(),
+            }
         },
     )))
     .collect()
@@ -4663,7 +4630,7 @@ fn bedrock_feature_support_for_surface(
         ]
         .into_iter()
         .collect(),
-        prompt_cache: bedrock_prompt_cache_support(supported),
+        prompt_cache: bedrock_prompt_cache_support(responses_surface, supported),
         media_input: [
             (MediaInputFeature::UserImage, supported()),
             (
@@ -5412,11 +5379,6 @@ fn model_unusable_via_converse(error: &ProviderError) -> bool {
             .contains("data retention mode")
 }
 
-fn prompt_cache_rejected(error: &ProviderError) -> bool {
-    error.category == ProviderErrorCategory::InvalidRequest
-        && error.message.to_ascii_lowercase().contains("cache")
-}
-
 fn prompt_cache_known_unsupported(
     cache: &Arc<Mutex<DiscoveryCache>>,
     key: Option<&DiscoveryCacheKey>,
@@ -5430,40 +5392,6 @@ fn prompt_cache_known_unsupported(
         .ok()
         .and_then(|cache| cache.entries.get(key).cloned())
         .is_some_and(|entry| entry.unsupported_prompt_cache_models.contains(model_id))
-}
-
-fn mark_prompt_cache_unsupported(
-    cache: &Arc<Mutex<DiscoveryCache>>,
-    key: Option<&DiscoveryCacheKey>,
-    model_id: &str,
-    message: &str,
-) {
-    let Some(key) = key else {
-        return;
-    };
-    let compatibility = cache.lock().ok().map(|mut cache| {
-        if let Some(cached) = cache.entries.get_mut(key) {
-            cached
-                .unsupported_prompt_cache_models
-                .insert(model_id.to_string());
-        }
-        cache.compatibility.mark_prompt_cache_unsupported(
-            key,
-            model_id,
-            message,
-            now_unix_seconds(),
-        );
-        cache.compatibility.clone()
-    });
-    if let Some(compatibility) = compatibility
-        && let Err(error) = save_compatibility_cache(&compatibility)
-    {
-        tracing::warn!(
-            target: "bcode_bedrock::compatibility",
-            error = %error.message,
-            "failed to save Bedrock compatibility cache"
-        );
-    }
 }
 
 impl PersistedCompatibilityCache {
@@ -5512,6 +5440,7 @@ impl PersistedCompatibilityCache {
         );
     }
 
+    #[cfg(test)]
     fn mark_prompt_cache_unsupported(
         &mut self,
         key: &DiscoveryCacheKey,
@@ -7263,7 +7192,8 @@ mod tests {
     }
 
     fn enable_explicit_prompt_cache(request: &mut ModelTurnRequest) {
-        request.prompt_cache.mode = bcode_model::PromptCacheMode::Auto;
+        request.prompt_cache.mode = bcode_model::PromptCacheMode::Aggressive;
+        request.prompt_cache.ttl_seconds = Some(30 * 60);
         request.metadata.insert(
             "model_cache_capabilities".to_string(),
             "prompt_cache_key,explicit_cache_points,cache_usage_reporting".to_string(),
@@ -7291,12 +7221,10 @@ mod tests {
         assert_eq!(overridden["prompt_cache_key"], "stable-override");
 
         request.metadata.remove("prompt_cache_key");
+        request.prompt_cache.key = Some("bcode:session-id".to_string());
         let stable_prefix = build_mantle_openai_request(&request, "openai.test-model")
             .expect("request should build");
-        assert_eq!(
-            stable_prefix["prompt_cache_key"],
-            "bcode:model:prompt-hash:tools-hash"
-        );
+        assert_eq!(stable_prefix["prompt_cache_key"], "bcode:session-id");
 
         request.session_id = "11111111-1111-1111-1111-111111111111"
             .parse()
@@ -7320,19 +7248,35 @@ mod tests {
         let mut request = test_model_turn_request();
         enable_explicit_prompt_cache(&mut request);
         request.system_prompt = Some("stable instructions".to_string());
-        request.messages = vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: "changing tail".to_string(),
-            }],
-        }];
+        request.messages = vec![
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "stable conversation prefix".to_string(),
+                    },
+                    ContentBlock::CachePoint {
+                        hint: bcode_model::PromptCachePoint {
+                            label: Some("conversation_prefix".to_string()),
+                            ttl_seconds: Some(30 * 60),
+                        },
+                    },
+                ],
+            },
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "changing tail".to_string(),
+                }],
+            },
+        ];
 
         let value = build_mantle_openai_request(&request, "test.explicit-cache-model")
             .expect("request should build");
 
         assert!(value.get("instructions").is_none());
         assert_eq!(value["prompt_cache_options"]["mode"], "explicit");
-        assert!(value["prompt_cache_options"].get("ttl").is_none());
+        assert_eq!(value["prompt_cache_options"]["ttl"], "30m");
         assert_eq!(value["input"][0]["role"], "developer");
         assert_eq!(
             value["input"][0]["content"][0]["text"],
@@ -7342,11 +7286,20 @@ mod tests {
             value["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"
         );
-        assert_eq!(value["input"][1]["content"][0]["text"], "changing tail");
+        assert_eq!(
+            value["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(value["input"][2]["content"][0]["text"], "changing tail");
+        assert!(
+            value["input"][2]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
     }
 
     #[test]
-    fn mantle_openai_does_not_infer_explicit_cache_from_model_name() {
+    fn mantle_openai_explicit_cache_requires_declared_capability() {
         let mut request = test_model_turn_request();
         request.prompt_cache.mode = bcode_model::PromptCacheMode::Auto;
         request.system_prompt = Some("stable instructions".to_string());
@@ -7357,6 +7310,29 @@ mod tests {
         assert_eq!(value["instructions"], "stable instructions");
         assert!(value.get("prompt_cache_options").is_none());
         assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn mantle_openai_auto_uses_explicit_cache_when_declared() {
+        let mut request = test_model_turn_request();
+        request.prompt_cache.mode = bcode_model::PromptCacheMode::Auto;
+        request.prompt_cache.key = Some("bcode:auto-session".to_string());
+        request.system_prompt = Some("stable instructions".to_string());
+        request.metadata.insert(
+            "model_cache_capabilities".to_string(),
+            "prompt_cache_key,explicit_cache_points,cache_usage_reporting".to_string(),
+        );
+
+        let value = build_mantle_openai_request(&request, "unrecognized-model-name")
+            .expect("request should build");
+
+        assert!(value.get("instructions").is_none());
+        assert_eq!(value["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(value["prompt_cache_key"], "bcode:auto-session");
+        assert_eq!(
+            value["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
     }
 
     /// Live acceptance test for Bedrock's cache contract.
@@ -9350,6 +9326,8 @@ mod tests {
             parameters: bcode_model::ModelParameters::default(),
             prompt_cache: bcode_model::PromptCacheHints {
                 mode: bcode_model::PromptCacheMode::Auto,
+                key: None,
+                ttl_seconds: None,
                 cache_system_prompt: true,
                 cache_tools: true,
             },
@@ -9995,6 +9973,60 @@ mod tests {
     }
 
     #[test]
+    fn custom_runtime_gateway_omits_responses_explicit_cache_controls() {
+        let mut request = test_model_turn_request();
+        enable_explicit_prompt_cache(&mut request);
+        request.prompt_cache.cache_system_prompt = true;
+        request.prompt_cache.cache_tools = true;
+        request.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Responses);
+        request.system_prompt = Some("stable instructions".to_string());
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::CachePoint {
+                    hint: bcode_model::PromptCachePoint::default(),
+                },
+            ],
+        }];
+        request.tools = vec![ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }];
+
+        let mut effective = request.clone();
+        disable_prompt_cache(&mut effective);
+        let projected = build_converse_request(
+            &effective,
+            "catalog-responses-model".to_string(),
+            Some("us-east-1"),
+        )
+        .expect("custom gateway Converse request should build");
+
+        assert!(
+            !projected
+                .system
+                .iter()
+                .any(|block| matches!(block, SystemContentBlock::CachePoint(_)))
+        );
+        assert!(!projected.messages.iter().any(|message| {
+            message
+                .content()
+                .iter()
+                .any(|block| matches!(block, BedrockContentBlock::CachePoint(_)))
+        }));
+        assert!(projected.tool_config.as_ref().is_some_and(|config| {
+            !config
+                .tools()
+                .iter()
+                .any(|tool| matches!(tool, Tool::CachePoint(_)))
+        }));
+    }
+
+    #[test]
     fn responses_models_route_and_list_without_any_configuration() {
         // The catalog declares `api_surface = "responses"` for Mantle-only OpenAI models, so both
         // routing and picker membership must work on the default transport with no environment
@@ -10012,7 +10044,14 @@ mod tests {
             Some(bcode_model::ModelApiSurface::Responses);
         assert!(
             uses_mantle_openai_surface(&responses_request, default_transport, &default_settings),
-            "a Responses-surface model must route to Mantle OpenAI on the default transport"
+            "a Responses-surface model must route to OpenAI Responses on the default AWS endpoint"
+        );
+        let mut gateway_settings = default_settings.clone();
+        gateway_settings.endpoint_url = Some("https://gateway.example.com/gw".to_string());
+        gateway_settings.mantle_base_url = Some("https://gateway.example.com/gw".to_string());
+        assert!(
+            !uses_mantle_openai_surface(&responses_request, default_transport, &gateway_settings),
+            "a custom Runtime gateway must keep catalog Responses models on Converse"
         );
 
         // Converse models are unaffected.
@@ -10083,6 +10122,7 @@ mod tests {
                 ("transport".to_string(), transport.to_string()),
                 ("model".to_string(), model.to_string()),
             ]),
+            env: BTreeMap::from([("BCODE_BEDROCK_TRANSPORT".to_string(), transport.to_string())]),
             ..ProviderRequestContext::default()
         };
 

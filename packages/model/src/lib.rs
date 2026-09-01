@@ -2626,6 +2626,12 @@ pub struct PromptCacheHints {
     /// Prompt cache mode selected by the host.
     #[serde(default)]
     pub mode: PromptCacheMode,
+    /// Stable provider cache partition key for this conversation.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Requested minimum cache lifetime in seconds.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
     /// Whether the stable system prompt prefix should end with a provider cache point.
     #[serde(default)]
     pub cache_system_prompt: bool,

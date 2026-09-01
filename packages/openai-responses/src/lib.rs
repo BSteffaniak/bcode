@@ -212,6 +212,9 @@ pub struct ResponsesRequest {
 pub struct ResponsesPromptCacheOptions {
     /// Cache selection mode. GPT-5.6 accepts `explicit` for developer-selected breakpoints.
     pub mode: &'static str,
+    /// Minimum lifetime applied to breakpoints written by this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<&'static str>,
 }
 
 /// Explicit prompt-cache breakpoint on a cacheable input content block.

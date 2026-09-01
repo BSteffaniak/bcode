@@ -1000,6 +1000,8 @@ where
     );
     request.prompt_cache = PromptCacheHints {
         mode: PromptCacheMode::Aggressive,
+        key: Some("conformance-cache".to_string()),
+        ttl_seconds: Some(60),
         cache_system_prompt: true,
         cache_tools: true,
     };

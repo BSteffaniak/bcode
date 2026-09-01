@@ -22,6 +22,8 @@ pub struct ResolvedModelRequestTarget {
     pub provider_context: bcode_model::ProviderRequestContext,
     /// Cache capabilities from the same catalog-resolved model snapshot as identity and pricing.
     pub cache: bcode_model::ModelCacheInfo,
+    /// Granular feature support from the same resolved model snapshot.
+    pub feature_support: bcode_model::ModelFeatureSupport,
     pub pricing: Option<bcode_model::ModelPricingInfo>,
     pub catalog_provider_id: Option<String>,
     pub catalog_identity: Option<bcode_model_catalog::ModelCatalogIdentity>,
@@ -65,6 +67,7 @@ pub async fn resolve_model_request_target(
         .ok_or(ModelRequestTargetError::NoUsableModel)?;
     let model_id = model.model_id.clone();
     let cache = model.cache.clone();
+    let feature_support = model.feature_support.clone();
     let pricing = model.pricing.clone();
     let api_surface = resolve_request_api_surface(
         &state.model_catalog,
@@ -92,6 +95,7 @@ pub async fn resolve_model_request_target(
         model_id,
         provider_context,
         cache,
+        feature_support,
         pricing,
         catalog_provider_id,
         catalog_identity,
