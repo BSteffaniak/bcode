@@ -2571,6 +2571,8 @@ pub enum StreamingServiceInvocationEvent {
 #[derive(Debug)]
 pub struct StreamingServiceInvocation {
     response: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
+    pending_response: Option<Result<ServiceResponse, PluginLoadError>>,
+    response_taken: bool,
     events: mpsc::UnboundedReceiver<Vec<u8>>,
     pub cancel: PluginInvocationCancelHandle,
     resource_permit: Option<Arc<PluginResourcePermit>>,
@@ -2579,35 +2581,69 @@ pub struct StreamingServiceInvocation {
 impl StreamingServiceInvocation {
     /// Wait for the next invocation event or final response.
     ///
+    /// Queued events are always delivered before the final response, even when both are ready.
+    ///
     /// # Errors
     ///
     /// Returns an error when the response channel closes before a plugin response is produced.
     pub async fn next_event(&mut self) -> Result<StreamingServiceInvocationEvent, PluginLoadError> {
-        tokio::select! {
-            biased;
-            event = self.events.recv() => {
-                match event {
-                    Some(payload) => Ok(StreamingServiceInvocationEvent::Event(payload)),
-                    None => (&mut self.response).await.map_or_else(
-                        |_| {
-                            Err(PluginLoadError::ServiceInvokeFailed {
-                                plugin_id: "streaming-service".to_owned(),
-                                code: -1,
-                            })
-                        },
-                        |response| Ok(StreamingServiceInvocationEvent::Response(response)),
-                    ),
+        loop {
+            match self.events.try_recv() {
+                Ok(payload) => {
+                    return Ok(StreamingServiceInvocationEvent::Event(payload));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return self.take_final_response().await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+            if let Some(response) = self.pending_response.take() {
+                return Ok(StreamingServiceInvocationEvent::Response(response));
+            }
+            tokio::select! {
+                biased;
+                event = self.events.recv() => {
+                    match event {
+                        Some(payload) => {
+                            return Ok(StreamingServiceInvocationEvent::Event(payload));
+                        }
+                        None => return self.take_final_response().await,
+                    }
+                }
+                response = &mut self.response, if !self.response_taken => {
+                    self.response_taken = true;
+                    self.pending_response = Some(match response {
+                        Ok(response) => response,
+                        Err(_error) => {
+                            return Err(Self::closed_response_error());
+                        }
+                    });
                 }
             }
-            response = &mut self.response => {
-                match response {
-                    Ok(response) => Ok(StreamingServiceInvocationEvent::Response(response)),
-                    Err(_error) => Err(PluginLoadError::ServiceInvokeFailed {
-                        plugin_id: "streaming-service".to_owned(),
-                        code: -1,
-                    }),
-                }
-            }
+        }
+    }
+
+    async fn take_final_response(
+        &mut self,
+    ) -> Result<StreamingServiceInvocationEvent, PluginLoadError> {
+        if let Some(response) = self.pending_response.take() {
+            return Ok(StreamingServiceInvocationEvent::Response(response));
+        }
+        if self.response_taken {
+            return Err(Self::closed_response_error());
+        }
+        self.response_taken = true;
+        match (&mut self.response).await {
+            Ok(response) => Ok(StreamingServiceInvocationEvent::Response(response)),
+            Err(_error) => Err(Self::closed_response_error()),
+        }
+    }
+
+    #[must_use]
+    fn closed_response_error() -> PluginLoadError {
+        PluginLoadError::ServiceInvokeFailed {
+            plugin_id: "streaming-service".to_owned(),
+            code: -1,
         }
     }
 
@@ -2756,6 +2792,8 @@ impl PluginExecutorHandle {
         }
         Ok(StreamingServiceInvocation {
             response: response_receiver,
+            pending_response: None,
+            response_taken: false,
             events: event_receiver,
             cancel,
             resource_permit: None,
@@ -6955,6 +6993,8 @@ library = "libexample_plugin.dylib"
             let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
             let mut invocation = StreamingServiceInvocation {
                 response,
+                pending_response: None,
+                response_taken: false,
                 events,
                 cancel: PluginInvocationCancelHandle {
                     id: PluginInvocationId(1),
@@ -6973,6 +7013,44 @@ library = "libexample_plugin.dylib"
                 StreamingServiceInvocationEvent::Response(Ok(response))
                     if response.payload_text().ok() == Some("complete")
             ));
+            drop(invocation);
+        });
+    }
+
+    #[test]
+    fn streaming_response_without_events_is_delivered() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        runtime.block_on(async {
+            let (response_tx, response) = oneshot::channel();
+            let (events_tx, events) = mpsc::unbounded_channel();
+            response_tx
+                .send(Ok(ServiceResponse::error("missing_auth", "login required")))
+                .expect("response");
+            drop(events_tx);
+            let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+            let mut invocation = StreamingServiceInvocation {
+                response,
+                pending_response: None,
+                response_taken: false,
+                events,
+                cancel: PluginInvocationCancelHandle {
+                    id: PluginInvocationId(1),
+                    cancellation,
+                },
+                resource_permit: None,
+            };
+
+            match invocation.next_event().await.expect("response item") {
+                StreamingServiceInvocationEvent::Response(Ok(response)) => {
+                    let error = response.error.expect("service error");
+                    assert_eq!(error.code, "missing_auth");
+                    assert_eq!(error.message, "login required");
+                }
+                other => panic!("expected response, got {other:?}"),
+            }
             drop(invocation);
         });
     }
@@ -7001,6 +7079,8 @@ library = "libexample_plugin.dylib"
         tokio.block_on(async {
             let StreamingServiceInvocation {
                 response,
+                pending_response: _,
+                response_taken: _,
                 mut events,
                 cancel: _,
                 resource_permit,

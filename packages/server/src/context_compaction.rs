@@ -885,7 +885,7 @@ pub async fn maybe_auto_compact_session_context(
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
-    let completion = compact_session_context_with_limit(
+    let completion = Box::pin(compact_session_context_with_limit(
         state,
         session_id,
         selection,
@@ -903,7 +903,7 @@ pub async fn maybe_auto_compact_session_context(
                 }])),
             previous_compacted_through_sequence: evaluation.previous_compacted_through_sequence,
         }),
-    )
+    ))
     .await?;
     append_context_compaction_trace(
         state,

@@ -93,8 +93,8 @@ use bcode_model::{
     MODEL_PROVIDER_INTERFACE_ID_V3, MessageRole, ModelList, ModelMessage, ModelParameters,
     ModelTurnRequest, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
     OP_POLL_TURN_EVENTS, OP_RUN_TURN, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage, ToolCallRequestPolicy,
-    ToolChoice,
+    ProviderTurnEvent, ReasoningEffort, RunTurnResponse, StartTurnResponse, TokenUsage,
+    ToolCallRequestPolicy, ToolChoice,
 };
 use bcode_plugin::{
     PluginInvocationBridge, PluginInvocationScope, StreamingServiceInvocationEvent,
@@ -12473,7 +12473,7 @@ async fn process_compact_session_command(
         queued_followups,
         Arc::clone(&current_turn),
     );
-    let result = compact_session_context_with_limit(
+    let result = Box::pin(compact_session_context_with_limit(
         state,
         session_id,
         &selection,
@@ -12481,7 +12481,7 @@ async fn process_compact_session_command(
         Some(&mut command_context),
         cancel_state.as_ref(),
         None,
-    )
+    ))
     .await;
     *current_turn.lock().await = None;
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
@@ -14586,6 +14586,117 @@ struct ModelPollOutcome {
     tool_output_positions: BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
     reasoning_text_streams: BTreeMap<(String, String), (u64, usize)>,
     saw_reasoning_evidence: bool,
+    stream: ProviderStreamObservation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ProviderStreamDelivery {
+    #[default]
+    Unknown,
+    Push,
+    Poll,
+}
+
+impl ProviderStreamDelivery {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Push => "push",
+            Self::Poll => "poll",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderStreamObservation {
+    delivery: ProviderStreamDelivery,
+    close_reason: Option<&'static str>,
+    events_received: u64,
+    events_decoded: u64,
+    events_decode_failed: u64,
+    events_drained_after_response: u64,
+    last_decoded_event: Option<String>,
+    last_decode_failure: Option<String>,
+    plugin_error_code: Option<String>,
+    plugin_error_message: Option<String>,
+    response_stop_reason: Option<String>,
+    missing_terminal: bool,
+}
+
+impl ProviderStreamObservation {
+    const fn record_close(&mut self, reason: &'static str) {
+        if self.close_reason.is_none() {
+            self.close_reason = Some(reason);
+        }
+    }
+
+    #[must_use]
+    fn detail(&self) -> String {
+        let mut parts = vec![
+            format!("delivery={}", self.delivery.as_str()),
+            format!("close={}", self.close_reason.unwrap_or("unknown")),
+            format!("events_received={}", self.events_received),
+            format!("events_decoded={}", self.events_decoded),
+            format!("decode_failed={}", self.events_decode_failed),
+        ];
+        if self.events_drained_after_response > 0 {
+            parts.push(format!(
+                "drained_after_response={}",
+                self.events_drained_after_response
+            ));
+        }
+        if let Some(event) = self.last_decoded_event.as_deref() {
+            parts.push(format!("last_event={event}"));
+        }
+        if let Some(failure) = self.last_decode_failure.as_deref() {
+            parts.push(format!("decode_failure={failure}"));
+        }
+        if let Some(code) = self.plugin_error_code.as_deref() {
+            parts.push(format!("plugin_error_code={code}"));
+        }
+        if let Some(message) = self.plugin_error_message.as_deref() {
+            parts.push(format!("plugin_error={message}"));
+        }
+        if let Some(reason) = self.response_stop_reason.as_deref() {
+            parts.push(format!("response_stop_reason={reason}"));
+        }
+        parts.join("; ")
+    }
+
+    #[must_use]
+    fn missing_terminal_message(&self) -> String {
+        format!(
+            "model provider polling ended without a terminal event ({})",
+            self.detail()
+        )
+    }
+
+    #[must_use]
+    const fn is_anomalous(&self) -> bool {
+        self.missing_terminal
+            || self.events_decode_failed > 0
+            || self.events_drained_after_response > 0
+            || self.plugin_error_code.is_some()
+            || self.response_stop_reason.is_some()
+    }
+
+    #[must_use]
+    const fn primary_anomaly_reason(&self) -> &'static str {
+        if self.plugin_error_code.is_some() {
+            "plugin_error"
+        } else if self.missing_terminal {
+            "missing_terminal"
+        } else if self.events_decode_failed > 0 {
+            "decode_failed"
+        } else if self.events_drained_after_response > 0 {
+            "drained_after_response"
+        } else if self.response_stop_reason.is_some() {
+            "response_stop_reason"
+        } else {
+            "other"
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -17285,6 +17396,14 @@ async fn run_model_turn_round(
 
     service_runtime_priority_commands(state, session_id, command_context).await;
     ensure_terminal_poll_outcome(state, session_id, &mut outcome).await;
+    emit_provider_stream_observation_if_anomalous(
+        state,
+        session_id,
+        request.turn_id.as_str(),
+        provider_plugin_id,
+        &outcome,
+    )
+    .await;
 
     let marker_commit = cancel_state.marker_commit.lock().await;
     let round_succeeded = !cancel_state.is_cancelled()
@@ -17449,12 +17568,240 @@ async fn ensure_terminal_poll_outcome(
         ));
         return;
     }
-    let message = "model provider polling ended without a terminal event".to_string();
+    outcome.stream.missing_terminal = true;
+    let message = outcome.stream.missing_terminal_message();
     append_system_event(state, session_id, message.clone()).await;
     outcome.completion = Some(ModelTurnCompletion::with_message(
         ModelTurnOutcome::Error,
         message,
     ));
+}
+
+const fn provider_turn_event_kind(event: &ProviderTurnEvent) -> &'static str {
+    match event {
+        ProviderTurnEvent::TurnStarted => "turn_started",
+        ProviderTurnEvent::Output { .. } => "output",
+        ProviderTurnEvent::TextDelta { .. } => "text_delta",
+        ProviderTurnEvent::ReasoningDelta { .. } => "reasoning_delta",
+        ProviderTurnEvent::ReasoningActivity { .. } => "reasoning_activity",
+        ProviderTurnEvent::ToolCallStarted { .. } => "tool_call_started",
+        ProviderTurnEvent::ToolCallDelta { .. } => "tool_call_delta",
+        ProviderTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
+        ProviderTurnEvent::Usage { .. } => "usage",
+        ProviderTurnEvent::ExactRequestInputTokens { .. } => "exact_request_input_tokens",
+        ProviderTurnEvent::RequestProjection { .. } => "request_projection",
+        ProviderTurnEvent::ContextCompacted { .. } => "context_compacted",
+        ProviderTurnEvent::ProviderMetadata { .. } => "provider_metadata",
+        ProviderTurnEvent::Warning { .. } => "warning",
+        ProviderTurnEvent::RetryScheduled { .. } => "retry_scheduled",
+        ProviderTurnEvent::Error { .. } => "error",
+        ProviderTurnEvent::TurnFinished { .. } => "turn_finished",
+        ProviderTurnEvent::Cancelled => "cancelled",
+    }
+}
+
+fn plugin_stream_payload_kind(payload: &[u8]) -> String {
+    if payload.is_empty() {
+        return "empty".to_string();
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return format!("non_json:bytes={}", payload.len());
+    };
+    match value {
+        serde_json::Value::Object(map) => {
+            let tag = ["type", "kind", "event", "event_type"]
+                .into_iter()
+                .find_map(|key| map.get(key).and_then(serde_json::Value::as_str))
+                .map_or_else(String::new, bounded_dynamic_value);
+            if tag.is_empty() {
+                format!("json_object:bytes={}", payload.len())
+            } else {
+                format!("json_object:{tag}:bytes={}", payload.len())
+            }
+        }
+        serde_json::Value::Array(items) => {
+            format!("json_array:len={}:bytes={}", items.len(), payload.len())
+        }
+        _ => format!("json:bytes={}", payload.len()),
+    }
+}
+
+fn plugin_service_error_message(code: &str, message: &str) -> String {
+    format!(
+        "model provider error {code}: {}",
+        bounded_structured_validation_message(message)
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_ref_mut)]
+async fn ingest_provider_stream_event_payload(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    provider_turn_id: &str,
+    turn_id: &str,
+    next_assistant_segment_order: &mut u32,
+    output_position_base: u64,
+    payload: Vec<u8>,
+    stream: &mut ModelStreamAccumulator,
+    outcome: &mut ModelPollOutcome,
+    stream_progress: &mut ModelStreamProgress,
+    command_context: &mut RuntimeCommandContext<'_>,
+) -> Option<bool> {
+    outcome.stream.events_received = outcome.stream.events_received.saturating_add(1);
+    let Ok(event) = serde_json::from_slice::<ProviderTurnEvent>(&payload) else {
+        outcome.stream.events_decode_failed = outcome.stream.events_decode_failed.saturating_add(1);
+        outcome.stream.last_decode_failure = Some(plugin_stream_payload_kind(&payload));
+        state.metrics.add_counter_with_labels(
+            "model.provider.stream_event_decode_failed_total",
+            1,
+            provider_poll_metric_labels(session_id, provider_plugin_id, turn_id),
+        );
+        return None;
+    };
+    outcome.stream.events_decoded = outcome.stream.events_decoded.saturating_add(1);
+    outcome.stream.last_decoded_event = Some(provider_turn_event_kind(&event).to_string());
+    let is_progress = model_event_is_progress(&event);
+    let event = rebase_provider_output_event(event, output_position_base);
+    handle_provider_turn_event(
+        state,
+        session_id,
+        provider_turn_id,
+        turn_id,
+        next_assistant_segment_order,
+        event,
+        stream,
+        outcome,
+        stream_progress,
+        command_context,
+    )
+    .await;
+    Some(is_progress)
+}
+
+fn apply_plugin_service_response(
+    outcome: &mut ModelPollOutcome,
+    response: bcode_plugin::ServiceResponse,
+) {
+    if let Some(error) = response.error {
+        outcome.stream.plugin_error_code = Some(bounded_dynamic_value(&error.code));
+        outcome.stream.plugin_error_message =
+            Some(bounded_structured_validation_message(&error.message));
+        if outcome.stop_reason.is_none() && outcome.completion.is_none() {
+            let message = plugin_service_error_message(&error.code, &error.message);
+            outcome.stop_reason = Some(bcode_model::StopReason::Error);
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                message,
+            ));
+        }
+        return;
+    }
+    if response.payload.is_empty() {
+        return;
+    }
+    if let Ok(run) = serde_json::from_slice::<RunTurnResponse>(&response.payload) {
+        if let Some(stop_reason) = run.stop_reason {
+            outcome.stream.response_stop_reason = Some(format!("{stop_reason:?}"));
+        }
+        return;
+    }
+    outcome.stream.response_stop_reason = Some(plugin_stream_payload_kind(&response.payload));
+}
+
+async fn emit_provider_stream_observation_if_anomalous(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    provider_plugin_id: Option<&str>,
+    outcome: &ModelPollOutcome,
+) {
+    if !outcome.stream.is_anomalous() {
+        return;
+    }
+    let detail = outcome.stream.detail();
+    let reason = outcome.stream.primary_anomaly_reason();
+    tracing::warn!(
+        target: "bcode_server::model_provider",
+        delivery = outcome.stream.delivery.as_str(),
+        close_reason = outcome.stream.close_reason.unwrap_or("unknown"),
+        anomaly_reason = reason,
+        %session_id,
+        turn_id,
+        "{detail}"
+    );
+    let mut labels = provider_poll_metric_labels(session_id, provider_plugin_id, turn_id);
+    labels.insert(
+        "delivery".to_owned(),
+        outcome.stream.delivery.as_str().to_owned(),
+    );
+    labels.insert("reason".to_owned(), reason.to_owned());
+    state
+        .metrics
+        .add_counter_with_labels("model.provider.stream_anomaly_total", 1, labels);
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "stream_observation",
+        Some(format!("reason={reason}; {detail}")),
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod provider_stream_observation_tests {
+    use super::{
+        ProviderStreamDelivery, ProviderStreamObservation, plugin_stream_payload_kind,
+        provider_turn_event_kind,
+    };
+    use bcode_model::ProviderTurnEvent;
+
+    #[test]
+    fn missing_terminal_message_includes_stream_close_detail() {
+        let observation = ProviderStreamObservation {
+            delivery: ProviderStreamDelivery::Push,
+            close_reason: Some("plugin_response"),
+            events_received: 0,
+            events_decoded: 0,
+            events_decode_failed: 0,
+            missing_terminal: true,
+            ..ProviderStreamObservation::default()
+        };
+        let message = observation.missing_terminal_message();
+        assert!(
+            message.starts_with("model provider polling ended without a terminal event"),
+            "{message}"
+        );
+        assert!(message.contains("delivery=push"), "{message}");
+        assert!(message.contains("close=plugin_response"), "{message}");
+        assert!(message.contains("events_received=0"), "{message}");
+        assert_eq!(observation.primary_anomaly_reason(), "missing_terminal");
+        assert!(observation.is_anomalous());
+    }
+
+    #[test]
+    fn plugin_stream_payload_kind_is_secret_safe() {
+        assert_eq!(plugin_stream_payload_kind(b""), "empty");
+        let kind = plugin_stream_payload_kind(br#"{"type":"error","secret":"do-not-leak"}"#);
+        assert!(kind.starts_with("json_object:error:bytes="), "{kind}");
+        assert!(!kind.contains("do-not-leak"), "{kind}");
+        assert!(plugin_stream_payload_kind(&[0xff, 0x00]).starts_with("non_json:bytes=2"));
+    }
+
+    #[test]
+    fn provider_turn_event_kind_names_terminal_events() {
+        assert_eq!(
+            provider_turn_event_kind(&ProviderTurnEvent::TurnFinished {
+                stop_reason: bcode_model::StopReason::EndTurn,
+            }),
+            "turn_finished"
+        );
+        assert_eq!(
+            provider_turn_event_kind(&ProviderTurnEvent::Cancelled),
+            "cancelled"
+        );
+    }
 }
 
 async fn append_model_provider_round_finished_trace(
@@ -17570,6 +17917,7 @@ async fn stream_model_turn_events(
         Arc::clone(&cancel_state),
     );
     let mut outcome = ModelPollOutcome::default();
+    outcome.stream.delivery = ProviderStreamDelivery::Push;
     let output_position_base = *next_output_position;
     let provider_context = session_model_selection(state, session_id)
         .await
@@ -17588,6 +17936,7 @@ async fn stream_model_turn_events(
         service_runtime_priority_commands(state, session_id, command_context).await;
         if cancel_state.is_cancelled() {
             invocation.cancel.cancel();
+            outcome.stream.record_close("host_cancelled");
             outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
             outcome.completion = Some(ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Cancelled,
@@ -17631,6 +17980,7 @@ async fn stream_model_turn_events(
                 ModelTurnOutcome::IdleTimeout,
                 message,
             ));
+            outcome.stream.record_close("idle_timeout");
             break;
         }
         let remaining_before_timeout = timeout_after.saturating_sub(idle_for);
@@ -17645,6 +17995,7 @@ async fn stream_model_turn_events(
             biased;
             () = cancel_state.cancelled() => {
                 invocation.cancel.cancel();
+                outcome.stream.record_close("host_cancelled");
                 outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
                 outcome.completion = Some(ModelTurnCompletion::with_message(
                     ModelTurnOutcome::Cancelled,
@@ -17684,10 +18035,23 @@ async fn stream_model_turn_events(
 
         match event {
             Ok(StreamingServiceInvocationEvent::Event(payload)) => {
-                let Ok(event) = serde_json::from_slice::<ProviderTurnEvent>(&payload) else {
-                    continue;
-                };
-                if model_event_is_progress(&event) {
+                if ingest_provider_stream_event_payload(
+                    state,
+                    session_id,
+                    provider_plugin_id,
+                    provider_turn_id,
+                    turn_id,
+                    next_assistant_segment_order,
+                    output_position_base,
+                    payload,
+                    &mut stream,
+                    &mut outcome,
+                    &mut stream_progress,
+                    command_context,
+                )
+                .await
+                    == Some(true)
+                {
                     if !first_output_recorded {
                         first_output_recorded = true;
                         state.metrics.record_histogram_with_labels(
@@ -17699,36 +18063,62 @@ async fn stream_model_turn_events(
                     last_progress_at = Instant::now();
                     no_progress_warned = false;
                 }
-                let event = rebase_provider_output_event(event, output_position_base);
-                handle_provider_turn_event(
-                    state,
-                    session_id,
-                    provider_turn_id,
-                    turn_id,
-                    next_assistant_segment_order,
-                    event,
-                    &mut stream,
-                    &mut outcome,
-                    &mut stream_progress,
-                    command_context,
-                )
-                .await;
                 if outcome.stop_reason.is_some() || outcome.completion.is_some() {
+                    outcome.stream.record_close("provider_event");
                     break;
                 }
             }
             Ok(StreamingServiceInvocationEvent::Response(response)) => {
-                if let Err(error) = response {
-                    let message = format!("model provider error: {error}");
-                    append_system_event(state, session_id, message.clone()).await;
-                    outcome.completion = Some(ModelTurnCompletion::with_message(
-                        ModelTurnOutcome::Error,
-                        message,
-                    ));
+                outcome.stream.record_close("plugin_response");
+                while let Some(payload) = invocation.try_recv_event() {
+                    outcome.stream.events_drained_after_response = outcome
+                        .stream
+                        .events_drained_after_response
+                        .saturating_add(1);
+                    let _ = ingest_provider_stream_event_payload(
+                        state,
+                        session_id,
+                        provider_plugin_id,
+                        provider_turn_id,
+                        turn_id,
+                        next_assistant_segment_order,
+                        output_position_base,
+                        payload,
+                        &mut stream,
+                        &mut outcome,
+                        &mut stream_progress,
+                        command_context,
+                    )
+                    .await;
+                    if outcome.stop_reason.is_some() || outcome.completion.is_some() {
+                        outcome.stream.record_close("provider_event");
+                        break;
+                    }
+                }
+                match response {
+                    Ok(service_response) => {
+                        let had_completion = outcome.completion.is_some();
+                        apply_plugin_service_response(&mut outcome, service_response);
+                        if !had_completion
+                            && let Some(message) =
+                                outcome.completion.as_ref().and_then(|c| c.message.clone())
+                        {
+                            append_system_event(state, session_id, message).await;
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("model provider error: {error}");
+                        append_system_event(state, session_id, message.clone()).await;
+                        outcome.completion = Some(ModelTurnCompletion::with_message(
+                            ModelTurnOutcome::Error,
+                            message,
+                        ));
+                    }
                 }
                 break;
             }
             Err(error) => {
+                outcome.stream.record_close("stream_error");
                 let message = format!("model provider error: {error}");
                 append_system_event(state, session_id, message.clone()).await;
                 outcome.completion = Some(ModelTurnCompletion::with_message(
@@ -17739,6 +18129,7 @@ async fn stream_model_turn_events(
             }
         }
     }
+    outcome.stream.record_close("loop_exited");
 
     finish_all_tool_request_drafts(
         state,
@@ -17803,6 +18194,7 @@ async fn poll_model_turn_events(
         Arc::clone(&cancel_state),
     );
     let mut outcome = ModelPollOutcome::default();
+    outcome.stream.delivery = ProviderStreamDelivery::Poll;
     let output_position_base = *next_output_position;
     let provider_context = session_model_selection(state, session_id)
         .await
@@ -17818,6 +18210,7 @@ async fn poll_model_turn_events(
     loop {
         service_runtime_priority_commands(state, session_id, command_context).await;
         if cancel_state.is_cancelled() {
+            outcome.stream.record_close("host_cancelled");
             outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
             outcome.completion = Some(ModelTurnCompletion::with_message(
                 ModelTurnOutcome::Cancelled,
@@ -17850,6 +18243,7 @@ async fn poll_model_turn_events(
         let response = match response {
             ProviderCallWait::Completed(Ok(response)) => response,
             ProviderCallWait::Completed(Err(error)) => {
+                outcome.stream.record_close("plugin_error");
                 let message = format!("model provider error: {error}");
                 append_system_event(state, session_id, message.clone()).await;
                 outcome.completion = Some(ModelTurnCompletion::with_message(
@@ -17859,6 +18253,7 @@ async fn poll_model_turn_events(
                 break;
             }
             ProviderCallWait::Cancelled => {
+                outcome.stream.record_close("host_cancelled");
                 outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
                 outcome.completion = Some(ModelTurnCompletion::with_message(
                     ModelTurnOutcome::Cancelled,
@@ -17907,6 +18302,9 @@ async fn poll_model_turn_events(
             response.events.len() as u64,
         );
         for event in response.events {
+            outcome.stream.events_received = outcome.stream.events_received.saturating_add(1);
+            outcome.stream.events_decoded = outcome.stream.events_decoded.saturating_add(1);
+            outcome.stream.last_decoded_event = Some(provider_turn_event_kind(&event).to_string());
             let event = rebase_provider_output_event(event, output_position_base);
             handle_provider_turn_event(
                 state,
@@ -17923,6 +18321,7 @@ async fn poll_model_turn_events(
             .await;
         }
         if outcome.stop_reason.is_some() || outcome.completion.is_some() {
+            outcome.stream.record_close("provider_event");
             break;
         }
         if saw_progress {
@@ -17949,6 +18348,7 @@ async fn poll_model_turn_events(
             idle_for = next_idle_for;
         }
     }
+    outcome.stream.record_close("loop_exited");
     state.metrics.record_histogram_with_labels(
         "model.provider.poll_idle_wait_duration_ms",
         u64::try_from(idle_wait_total.as_millis()).unwrap_or(u64::MAX),
