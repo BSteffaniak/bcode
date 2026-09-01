@@ -1953,6 +1953,61 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cache_capabilities_survive_target_enrichment() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let target = bcode_model_catalog_models::ModelSupportTarget::new(
+            "bedrock",
+            "bearer_token",
+            "responses",
+            Some("bcode"),
+        );
+        let discovered = bcode_model::ModelInfo {
+            model_id: "us.openai.gpt-5.6-sol".to_string(),
+            display_name: "live model".to_string(),
+            is_default: true,
+            context_window: None,
+            max_output_tokens: None,
+            max_image_input_base64_bytes: None,
+            capabilities: BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: ModelVisibility::Visible,
+        };
+
+        let resolved = catalog.merge_provider_models_for_target(
+            "bedrock",
+            vec![discovered],
+            false,
+            Some(&target),
+        );
+        let model = resolved.first().expect("selected model remains available");
+
+        assert_eq!(model.model_id, "us.openai.gpt-5.6-sol");
+        assert!(
+            model
+                .cache
+                .capabilities
+                .contains(&ModelCacheCapability::PromptCacheKey)
+        );
+        assert!(
+            model
+                .cache
+                .capabilities
+                .contains(&ModelCacheCapability::ExplicitCachePoints)
+        );
+        assert!(
+            model
+                .cache
+                .capabilities
+                .contains(&ModelCacheCapability::CacheUsageReporting)
+        );
+    }
+
+    #[test]
     fn catalog_enrichment_extends_provider_cache_capabilities() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let model = bcode_model::ModelInfo {

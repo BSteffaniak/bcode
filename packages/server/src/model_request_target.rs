@@ -20,6 +20,8 @@ pub struct ResolvedModelRequestTarget {
     pub requested_model_id: Option<String>,
     pub model_id: String,
     pub provider_context: bcode_model::ProviderRequestContext,
+    /// Cache capabilities from the same catalog-resolved model snapshot as identity and pricing.
+    pub cache: bcode_model::ModelCacheInfo,
     pub pricing: Option<bcode_model::ModelPricingInfo>,
     pub catalog_provider_id: Option<String>,
     pub catalog_identity: Option<bcode_model_catalog::ModelCatalogIdentity>,
@@ -36,11 +38,11 @@ pub enum ModelRequestTargetError {
     NoUsableModel,
 }
 
-/// Resolve one request's effective model, normalized API surface, and request-time auth context.
+/// Resolve one request's effective model and normalized request-critical metadata.
 ///
-/// Model identity and API surface come from the same resolved provider-model snapshot. When live
-/// discovery has not supplied a surface, the application catalog is consulted; an existing
-/// context surface is retained only when neither source knows the model's surface.
+/// Identity, API surface, cache capabilities, and pricing come from the same resolved provider-model
+/// snapshot. When live discovery has not supplied a surface, the application catalog is consulted;
+/// an existing context surface is retained only when neither source knows the model's surface.
 pub async fn resolve_model_request_target(
     state: &ServerState,
     input: ModelRequestTargetInput<'_>,
@@ -62,6 +64,7 @@ pub async fn resolve_model_request_target(
         .or_else(|| models.models.first())
         .ok_or(ModelRequestTargetError::NoUsableModel)?;
     let model_id = model.model_id.clone();
+    let cache = model.cache.clone();
     let pricing = model.pricing.clone();
     let api_surface = resolve_request_api_surface(
         &state.model_catalog,
@@ -88,6 +91,7 @@ pub async fn resolve_model_request_target(
         requested_model_id: input.selected_model_id.map(ToOwned::to_owned),
         model_id,
         provider_context,
+        cache,
         pricing,
         catalog_provider_id,
         catalog_identity,

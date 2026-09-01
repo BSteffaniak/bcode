@@ -20524,6 +20524,7 @@ async fn build_model_turn_request(
     let pricing = target.pricing.clone();
     let catalog_provider_id = target.catalog_provider_id.clone();
     let catalog_identity = target.catalog_identity.clone();
+    let model_cache_info = target.cache;
     let model_id = target.model_id;
     let reasoning_capabilities = resolve_model_reasoning_info(
         state,
@@ -20574,20 +20575,13 @@ async fn build_model_turn_request(
         projection_timer.elapsed_ms(),
         metric_labels.clone(),
     );
-    let model_cache_info = resolve_model_cache_info(
-        state,
-        provider_plugin_id,
-        Some(&model_id),
-        &provider_context,
-    )
-    .await;
     let conversation_reuse_timer = state.metrics.timer();
     let conversation_reuse = plan_conversation_reuse(
         state,
         config.model.effective_conversation_reuse_mode(),
         &projection,
         messages.len(),
-        model_cache_info.as_ref(),
+        Some(&model_cache_info),
     )
     .await;
     state.metrics.record_histogram_with_labels(
@@ -20598,9 +20592,7 @@ async fn build_model_turn_request(
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
     insert_reasoning_metadata(&mut metadata, &parameters);
-    if let Some(cache_info) = &model_cache_info {
-        insert_model_cache_metadata(&mut metadata, cache_info);
-    }
+    insert_model_cache_metadata(&mut metadata, &model_cache_info);
     if !static_context.prompt_profile_layers.is_empty() {
         metadata.insert(
             "prompt_profile_layers".to_string(),
@@ -21479,25 +21471,6 @@ const fn model_cache_capability_name(
         bcode_model::ModelCacheCapability::ProviderState => "provider_state",
         bcode_model::ModelCacheCapability::PreviousResponseId => "previous_response_id",
     }
-}
-
-async fn resolve_model_cache_info(
-    state: &ServerState,
-    provider_plugin_id: Option<&str>,
-    selected_model_id: Option<&str>,
-    provider_context: &bcode_model::ProviderRequestContext,
-) -> Option<bcode_model::ModelCacheInfo> {
-    let models = provider_models(
-        state,
-        provider_plugin_id.map(ToOwned::to_owned),
-        bcode_model::ModelListRequest {
-            provider_context: provider_context.clone(),
-            selected_model_id: selected_model_id.map(ToOwned::to_owned),
-        },
-    )
-    .await
-    .ok()?;
-    select_model_info(&models.models, selected_model_id).map(|model| model.cache)
 }
 
 async fn append_model_request_trace(
@@ -39110,6 +39083,41 @@ library = "test"
     }
 
     #[test]
+    fn resolved_cache_metadata_reports_explicit_bedrock_wire_projection() {
+        let mut request = test_model_turn_request(Vec::new());
+        request.system_prompt = Some("stable instructions".to_string());
+        request.prompt_cache.mode = bcode_model::PromptCacheMode::Auto;
+        request.prompt_cache.cache_system_prompt = true;
+        insert_model_cache_metadata(
+            &mut request.metadata,
+            &bcode_model::ModelCacheInfo {
+                capabilities: BTreeSet::from([
+                    bcode_model::ModelCacheCapability::PromptCacheKey,
+                    bcode_model::ModelCacheCapability::ExplicitCachePoints,
+                    bcode_model::ModelCacheCapability::CacheUsageReporting,
+                ]),
+            },
+        );
+
+        let metadata = model_request_trace_metadata(&request, Some("bcode.bedrock"));
+
+        assert_eq!(
+            metadata.get("model_cache_capabilities").map(String::as_str),
+            Some("prompt_cache_key,explicit_cache_points,cache_usage_reporting")
+        );
+        assert_eq!(
+            metadata.get("provider_wire_cache_mode").map(String::as_str),
+            Some("explicit")
+        );
+        assert_eq!(
+            metadata
+                .get("provider_wire_prompt_cache_points")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn structured_output_phases_preserve_work_and_isolate_finalization() {
         let structured_output = bcode_model::StructuredOutputRequest {
             name: "result".to_string(),
@@ -41901,6 +41909,7 @@ library = "test"
             Some("bcode.fake-provider")
         );
         assert_eq!(request.model_id, target.model_id);
+        assert_eq!(target.cache, bcode_model::ModelCacheInfo::default());
         assert_eq!(request.provider_context, target.provider_context);
         assert_eq!(
             request.provider_context.api_surface,
@@ -53829,6 +53838,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             requested_model_id: Some("us.anthropic.claude-opus-5-v1:0".to_string()),
             model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
+            cache: bcode_model::ModelCacheInfo::default(),
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -53902,6 +53912,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             requested_model_id: None,
             model_id: "anthropic.claude-opus-5".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
+            cache: bcode_model::ModelCacheInfo::default(),
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -64858,6 +64869,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             requested_model_id: None,
             model_id: "model".to_owned(),
             provider_context: bcode_model::ProviderRequestContext::default(),
+            cache: bcode_model::ModelCacheInfo::default(),
             pricing: None,
             catalog_provider_id: None,
             catalog_identity: None,
