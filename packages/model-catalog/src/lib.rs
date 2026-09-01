@@ -907,9 +907,10 @@ fn enrich_from_entry_for_target(
             },
         );
     }
-    if model.cache.capabilities.is_empty() {
-        model.cache = cache_info_from_catalog(&entry.capabilities);
-    }
+    model
+        .cache
+        .capabilities
+        .extend(cache_info_from_catalog(&entry.capabilities).capabilities);
     if model.pricing.is_none() {
         model.pricing = pricing_from_catalog(
             deployment
@@ -999,9 +1000,10 @@ fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelIn
             CapabilitySource::BundledCatalog
         },
     );
-    if model.cache.capabilities.is_empty() {
-        model.cache = cache_info_from_catalog(&entry.capabilities);
-    }
+    model
+        .cache
+        .capabilities
+        .extend(cache_info_from_catalog(&entry.capabilities).capabilities);
     if model.pricing.is_none()
         && let Some(pricing) = pricing_from_catalog(entry.pricing.as_ref(), remote)
     {
@@ -1198,9 +1200,15 @@ fn cache_info_from_catalog(capabilities: &CatalogCapabilities) -> ModelCacheInfo
     if capabilities.prompt_cache {
         cache.capabilities.extend([
             ModelCacheCapability::PromptCacheKey,
-            ModelCacheCapability::AutomaticPrefixCache,
             ModelCacheCapability::CacheUsageReporting,
         ]);
+        cache
+            .capabilities
+            .insert(if capabilities.explicit_prompt_cache {
+                ModelCacheCapability::ExplicitCachePoints
+            } else {
+                ModelCacheCapability::AutomaticPrefixCache
+            });
     }
     cache
 }
@@ -1758,6 +1766,7 @@ pub(crate) const fn merge_capabilities(
         structured_outputs: left.structured_outputs || right.structured_outputs,
         reasoning: left.reasoning || right.reasoning,
         prompt_cache: left.prompt_cache || right.prompt_cache,
+        explicit_prompt_cache: left.explicit_prompt_cache || right.explicit_prompt_cache,
         native_web_search: left.native_web_search || right.native_web_search,
     }
 }
@@ -1847,6 +1856,7 @@ pub fn default_source_dir() -> PathBuf {
 mod tests {
     use super::*;
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
+    use std::collections::BTreeSet;
 
     #[tokio::test]
     async fn resolver_identity_maps_region_prefixed_opus_five_to_stable_entry() {
@@ -1917,6 +1927,72 @@ mod tests {
                 entry.model_id
             );
         }
+    }
+
+    #[test]
+    fn bedrock_gpt_56_catalog_declares_explicit_cache_capabilities() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog
+            .provider("bedrock")
+            .expect("bedrock provider exists");
+        let entry = find_provider_model(provider, "openai.gpt-5.6-sol")
+            .expect("GPT-5.6 catalog entry should resolve");
+        assert!(entry.capabilities.prompt_cache);
+        assert!(entry.capabilities.explicit_prompt_cache);
+        let cache = cache_info_from_catalog(&entry.capabilities);
+        assert!(
+            cache
+                .capabilities
+                .contains(&ModelCacheCapability::ExplicitCachePoints)
+        );
+        assert!(
+            !cache
+                .capabilities
+                .contains(&ModelCacheCapability::AutomaticPrefixCache)
+        );
+    }
+
+    #[test]
+    fn catalog_enrichment_extends_provider_cache_capabilities() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let model = bcode_model::ModelInfo {
+            model_id: "us.openai.gpt-5.6-sol".to_string(),
+            display_name: "live model".to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            max_image_input_base64_bytes: None,
+            capabilities: BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: ModelCacheInfo {
+                capabilities: BTreeSet::from([ModelCacheCapability::CacheUsageReporting]),
+            },
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: ModelVisibility::Visible,
+        };
+
+        let enriched = catalog.enrich_model("bedrock", model);
+        assert!(
+            enriched
+                .cache
+                .capabilities
+                .contains(&ModelCacheCapability::ExplicitCachePoints)
+        );
+        assert!(
+            enriched
+                .cache
+                .capabilities
+                .contains(&ModelCacheCapability::PromptCacheKey)
+        );
+        assert!(
+            enriched
+                .cache
+                .capabilities
+                .contains(&ModelCacheCapability::CacheUsageReporting)
+        );
     }
 
     #[test]

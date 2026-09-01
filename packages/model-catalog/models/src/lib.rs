@@ -473,6 +473,9 @@ pub struct CatalogCapabilities {
     /// Supports prompt/cache discounts or cache controls.
     #[serde(default)]
     pub prompt_cache: bool,
+    /// Supports developer-selected explicit cache breakpoints.
+    #[serde(default)]
+    pub explicit_prompt_cache: bool,
     /// Supports native provider web search.
     #[serde(default)]
     pub native_web_search: bool,

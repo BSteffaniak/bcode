@@ -805,14 +805,32 @@ fn build_mantle_openai_request(
     request: &ModelTurnRequest,
     model_id: &str,
 ) -> Result<serde_json::Value, ProviderError> {
-    let input =
+    let mut input =
         bcode_openai_responses::model_messages_to_responses_input(&request.messages, 0, &|name| {
             bedrock_tool_name(name)
         });
-    let instructions = bcode_openai_responses::response_instruction_bundle(
+    let mut instructions = bcode_openai_responses::response_instruction_bundle(
         request.system_prompt.as_deref(),
         &request.messages,
     );
+    if mantle_openai_prompt_cache_enabled(request)
+        && let Some(stable_instructions) = instructions.take()
+    {
+        input.insert(
+            0,
+            bcode_openai_responses::ResponsesInputItem::Message {
+                role: "developer".to_string(),
+                content: vec![bcode_openai_responses::ResponsesContent::InputText {
+                    text: stable_instructions,
+                    prompt_cache_breakpoint: Some(
+                        bcode_openai_responses::ResponsesPromptCacheBreakpoint {
+                            mode: "explicit".to_string(),
+                        },
+                    ),
+                }],
+            },
+        );
+    }
     let tools = request
         .tools
         .iter()
@@ -852,7 +870,15 @@ fn build_mantle_openai_request(
         }),
         reasoning: mantle_openai_reasoning(request),
         include: Vec::new(),
-        prompt_cache_key: None,
+        prompt_cache_key: mantle_openai_prompt_cache_enabled(request).then(|| {
+            request
+                .metadata
+                .get("prompt_cache_key")
+                .cloned()
+                .unwrap_or_else(|| mantle_openai_stable_prefix_key(request))
+        }),
+        prompt_cache_options: mantle_openai_prompt_cache_enabled(request)
+            .then_some(bcode_openai_responses::ResponsesPromptCacheOptions { mode: "explicit" }),
         temperature: request.parameters.temperature,
         max_output_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
@@ -864,6 +890,9 @@ fn build_mantle_openai_request(
             format!("failed to encode Bedrock Mantle OpenAI request: {error}"),
         )
     })?;
+    if mantle_openai_prompt_cache_enabled(request) {
+        project_mantle_openai_prompt_cache(&value)?;
+    }
     if let Some(service_tier) = request.metadata.get("service_tier") {
         value["service_tier"] = serde_json::Value::String(service_tier.clone());
     }
@@ -874,6 +903,53 @@ fn build_mantle_openai_request(
         value["prompt_cache_retention"] = serde_json::Value::String(retention.clone());
     }
     Ok(value)
+}
+
+/// Return whether the resolved model capabilities authorize explicit prompt caching.
+fn mantle_openai_prompt_cache_enabled(request: &ModelTurnRequest) -> bool {
+    request.prompt_cache.mode.is_enabled()
+        && request
+            .metadata
+            .get("model_cache_capabilities")
+            .is_some_and(|capabilities| {
+                capabilities
+                    .split(',')
+                    .any(|capability| capability == "explicit_cache_points")
+            })
+}
+
+/// Partition cache entries by the byte-stable instruction and tool prefix rather than by session.
+fn mantle_openai_stable_prefix_key(request: &ModelTurnRequest) -> String {
+    let prompt_hash = request
+        .metadata
+        .get("stable_prompt_hash")
+        .map_or("unknown", String::as_str);
+    let tools_hash = request
+        .metadata
+        .get("tools_hash")
+        .map_or("unknown", String::as_str);
+    format!("bcode:{}:{prompt_hash}:{tools_hash}", request.model_id)
+}
+
+/// Validate the typed explicit-cache projection before sending it to Mantle.
+fn project_mantle_openai_prompt_cache(value: &serde_json::Value) -> Result<(), ProviderError> {
+    let breakpoint_count = value
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|content| content.get("prompt_cache_breakpoint").is_some())
+        .count();
+    if breakpoint_count != 1 {
+        return Err(provider_error(
+            "bedrock_mantle_openai_cache_projection_failed",
+            ProviderErrorCategory::InvalidRequest,
+            format!("expected one explicit prompt cache breakpoint, found {breakpoint_count}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Reasoning controls for a Mantle `OpenAI` request, when the turn requested any.
@@ -1418,13 +1494,28 @@ fn mantle_openai_usage(
         .and_then(|details| details.get("reasoning_tokens"))
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
+    let input = read("input_tokens");
+    let output = read("output_tokens");
+    let cache_ttl_seconds = event
+        .get("response")
+        .unwrap_or(event)
+        .get("prompt_cache_retention")
+        .and_then(serde_json::Value::as_str)
+        .or(requested_cache_retention)
+        .and_then(|retention| match retention {
+            "30m" => Some(30 * 60),
+            "1h" => Some(60 * 60),
+            _ => None,
+        });
+    let details =
+        mantle_openai_pricing_details(input, output, cached, cache_write, cache_ttl_seconds);
     Some(TokenUsage {
-        input_tokens: read("input_tokens"),
-        output_tokens: read("output_tokens"),
+        input_tokens: input,
+        output_tokens: output,
         total_tokens: read("total_tokens"),
         cached_input_tokens: cached,
         cache_write_input_tokens: cache_write,
-        details: Box::default(),
+        details,
         pricing_context: Box::new(bcode_model::ModelPricingContext {
             service_tier: event
                 .get("response")
@@ -1440,21 +1531,70 @@ fn mantle_openai_usage(
                 .get("model")
                 .and_then(serde_json::Value::as_str)
                 .map(bcode_model::model_billing_scope_from_effective_id),
-            request_input_tokens: read("input_tokens").map(u64::from),
-            cache_ttl_seconds: event
-                .get("response")
-                .unwrap_or(event)
-                .get("prompt_cache_retention")
-                .and_then(serde_json::Value::as_str)
-                .or(requested_cache_retention)
-                .and_then(|retention| match retention {
-                    "30m" => Some(30 * 60),
-                    "1h" => Some(60 * 60),
-                    _ => None,
-                }),
+            request_input_tokens: input
+                .filter(|input| {
+                    cached
+                        .unwrap_or_default()
+                        .saturating_add(cache_write.unwrap_or_default())
+                        <= *input
+                })
+                .map(u64::from),
+            cache_ttl_seconds,
         }),
         reasoning_tokens: reasoning,
     })
+}
+
+/// Split the Responses total input count into mutually exclusive billing buckets.
+///
+/// Mantle reports cache reads and writes as subsets of `input_tokens`. Keeping explicit details
+/// prevents the generic pricing fallback from charging cache writes once as ordinary input and a
+/// second time at the cache-write rate.
+fn mantle_openai_pricing_details(
+    input: Option<u32>,
+    output: Option<u32>,
+    cached: Option<u32>,
+    cache_write: Option<u32>,
+    cache_ttl_seconds: Option<u64>,
+) -> Box<[bcode_model::ModelTokenUsageDetail]> {
+    let Some(input) = input else {
+        return Box::default();
+    };
+    let cached = cached.unwrap_or_default();
+    let cache_write = cache_write.unwrap_or_default();
+    if cached.saturating_add(cache_write) > input {
+        return Box::default();
+    }
+    let uncached = input.saturating_sub(cached).saturating_sub(cache_write);
+    [
+        (bcode_model::ModelPricingBucket::Input, uncached, None),
+        (
+            bcode_model::ModelPricingBucket::CacheReadInput,
+            cached,
+            cache_ttl_seconds,
+        ),
+        (
+            bcode_model::ModelPricingBucket::CacheWriteInput,
+            cache_write,
+            cache_ttl_seconds,
+        ),
+        (
+            bcode_model::ModelPricingBucket::Output,
+            output.unwrap_or_default(),
+            None,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(bucket, tokens, cache_ttl_seconds)| {
+        (tokens > 0).then_some(bcode_model::ModelTokenUsageDetail {
+            bucket,
+            modality: bcode_model::ModelTokenModality::Text,
+            tokens,
+            cache_ttl_seconds,
+        })
+    })
+    .collect::<Vec<_>>()
+    .into_boxed_slice()
 }
 
 /// Emit billing usage and provider-exact request occupancy for Mantle Responses.
@@ -4838,7 +4978,7 @@ fn model_infos_from_ids(model_ids: &[String], default_model: Option<&str>) -> Ve
             capabilities: bedrock_model_capabilities(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
-            cache: bedrock_model_cache_info(),
+            cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
             api_surface: None,
@@ -4865,15 +5005,6 @@ fn apply_default_model_to_list(models: &mut Vec<ModelInfo>, default_model: Optio
     }
     for model in models.iter_mut() {
         model.is_default = model.model_id == default_model;
-    }
-}
-
-fn bedrock_model_cache_info() -> bcode_model::ModelCacheInfo {
-    bcode_model::ModelCacheInfo {
-        capabilities: std::collections::BTreeSet::from([
-            bcode_model::ModelCacheCapability::ExplicitCachePoints,
-            bcode_model::ModelCacheCapability::CacheUsageReporting,
-        ]),
     }
 }
 
@@ -5587,7 +5718,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             capabilities: bedrock_model_capabilities(),
             feature_support: bcode_model::ModelFeatureSupport::default(),
             reasoning: None,
-            cache: bedrock_model_cache_info(),
+            cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: None,
             pricing: None,
             api_surface: None,
@@ -7131,6 +7262,183 @@ mod tests {
         assert_eq!(input[0]["content"][0]["text"], "hello");
     }
 
+    fn enable_explicit_prompt_cache(request: &mut ModelTurnRequest) {
+        request.prompt_cache.mode = bcode_model::PromptCacheMode::Auto;
+        request.metadata.insert(
+            "model_cache_capabilities".to_string(),
+            "prompt_cache_key,explicit_cache_points,cache_usage_reporting".to_string(),
+        );
+        request
+            .metadata
+            .insert("stable_prompt_hash".to_string(), "prompt-hash".to_string());
+        request
+            .metadata
+            .insert("tools_hash".to_string(), "tools-hash".to_string());
+    }
+
+    #[test]
+    fn mantle_openai_request_uses_stable_prefix_cache_key() {
+        let mut request = test_model_turn_request();
+        enable_explicit_prompt_cache(&mut request);
+        request.system_prompt = Some("stable instructions".to_string());
+        request.metadata.insert(
+            "prompt_cache_key".to_string(),
+            "stable-override".to_string(),
+        );
+
+        let overridden = build_mantle_openai_request(&request, "openai.test-model")
+            .expect("request should build");
+        assert_eq!(overridden["prompt_cache_key"], "stable-override");
+
+        request.metadata.remove("prompt_cache_key");
+        let stable_prefix = build_mantle_openai_request(&request, "openai.test-model")
+            .expect("request should build");
+        assert_eq!(
+            stable_prefix["prompt_cache_key"],
+            "bcode:model:prompt-hash:tools-hash"
+        );
+
+        request.session_id = "11111111-1111-1111-1111-111111111111"
+            .parse()
+            .expect("static UUID should parse");
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "different changing suffix".to_string(),
+            }],
+        }];
+        let same_prefix = build_mantle_openai_request(&request, "openai.test-model")
+            .expect("request should build");
+        assert_eq!(
+            same_prefix["prompt_cache_key"],
+            stable_prefix["prompt_cache_key"]
+        );
+    }
+
+    #[test]
+    fn mantle_openai_explicit_cache_uses_documented_typed_shape() {
+        let mut request = test_model_turn_request();
+        enable_explicit_prompt_cache(&mut request);
+        request.system_prompt = Some("stable instructions".to_string());
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "changing tail".to_string(),
+            }],
+        }];
+
+        let value = build_mantle_openai_request(&request, "test.explicit-cache-model")
+            .expect("request should build");
+
+        assert!(value.get("instructions").is_none());
+        assert_eq!(value["prompt_cache_options"]["mode"], "explicit");
+        assert!(value["prompt_cache_options"].get("ttl").is_none());
+        assert_eq!(value["input"][0]["role"], "developer");
+        assert_eq!(
+            value["input"][0]["content"][0]["text"],
+            "stable instructions"
+        );
+        assert_eq!(
+            value["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(value["input"][1]["content"][0]["text"], "changing tail");
+    }
+
+    #[test]
+    fn mantle_openai_does_not_infer_explicit_cache_from_model_name() {
+        let mut request = test_model_turn_request();
+        request.prompt_cache.mode = bcode_model::PromptCacheMode::Auto;
+        request.system_prompt = Some("stable instructions".to_string());
+
+        let value = build_mantle_openai_request(&request, "test.gpt-5.6-unit")
+            .expect("request should build");
+
+        assert_eq!(value["instructions"], "stable instructions");
+        assert!(value.get("prompt_cache_options").is_none());
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    /// Live acceptance test for Bedrock's cache contract.
+    ///
+    /// Run with `AWS_BEARER_TOKEN_BEDROCK`, `AWS_ENDPOINT_URL_BEDROCK`, and optionally
+    /// `AWS_BEDROCK_OPENAI_MODEL`; the endpoint may be either a Mantle base URL or the full
+    /// `/openai/v1/responses` URL.
+    #[tokio::test]
+    #[ignore = "requires live Bedrock Mantle credentials and incurs model usage"]
+    async fn live_mantle_openai_reuses_explicit_stable_prefix() {
+        async fn send(endpoint: &str, token: &str, body: serde_json::Value) -> TokenUsage {
+            let response = reqwest::Client::new()
+                .post(endpoint)
+                .bearer_auth(token)
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await
+                .expect("live cache request should send");
+            let status = response.status();
+            let text = response.text().await.expect("response body should read");
+            assert!(
+                status.is_success(),
+                "live cache request failed: {status}: {text}"
+            );
+            text.lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                .find_map(|event| mantle_openai_usage(&event, None, None))
+                .expect("terminal response should report usage")
+        }
+
+        let token = std::env::var("AWS_BEARER_TOKEN_BEDROCK")
+            .expect("AWS_BEARER_TOKEN_BEDROCK is required");
+        let base = std::env::var("AWS_ENDPOINT_URL_BEDROCK")
+            .expect("AWS_ENDPOINT_URL_BEDROCK is required");
+        let endpoint = if base.trim_end_matches('/').ends_with("/openai/v1/responses") {
+            base
+        } else {
+            format!("{}/openai/v1/responses", base.trim_end_matches('/'))
+        };
+        let model = std::env::var("AWS_BEDROCK_OPENAI_MODEL")
+            .expect("AWS_BEDROCK_OPENAI_MODEL is required");
+        let mut request = test_model_turn_request();
+        enable_explicit_prompt_cache(&mut request);
+        request.model_id.clone_from(&model);
+        request.system_prompt = Some("stable cache acceptance instruction. ".repeat(1_500));
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "first changing suffix".to_string(),
+            }],
+        }];
+        let first = send(
+            &endpoint,
+            &token,
+            build_mantle_openai_request(&request, &model).expect("first request should build"),
+        )
+        .await;
+        assert!(
+            first.cache_write_input_tokens.unwrap_or_default() > 0,
+            "first request must write an eligible prefix: {first:?}"
+        );
+
+        request.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "second changing suffix".to_string(),
+            }],
+        }];
+        let second = send(
+            &endpoint,
+            &token,
+            build_mantle_openai_request(&request, &model).expect("second request should build"),
+        )
+        .await;
+        assert!(
+            second.cached_input_tokens.unwrap_or_default() > 0,
+            "same-prefix follow-up must read cached input: {second:?}"
+        );
+    }
+
     #[test]
     fn mantle_openai_request_projects_tools_with_bedrock_names() {
         let mut request = test_model_turn_request();
@@ -7286,6 +7594,80 @@ mod tests {
             event,
             ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 492
         )));
+    }
+
+    #[test]
+    fn mantle_openai_usage_splits_cache_billing_buckets() {
+        let assert_buckets =
+            |cached, cache_write, expected: &[(bcode_model::ModelPricingBucket, u32)]| {
+                let event = serde_json::json!({
+                    "response": {
+                        "usage": {
+                            "input_tokens": 1_000,
+                            "output_tokens": 25,
+                            "input_tokens_details": {
+                                "cached_tokens": cached,
+                                "cache_write_tokens": cache_write
+                            }
+                        }
+                    }
+                });
+                let usage = mantle_openai_usage(&event, None, Some("30m")).expect("usage decodes");
+                assert!(usage.has_valid_input_breakdown());
+                assert_eq!(usage.pricing_context.request_input_tokens, Some(1_000));
+                let actual = usage
+                    .details
+                    .iter()
+                    .map(|detail| (detail.bucket, detail.tokens))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            };
+
+        assert_buckets(
+            0,
+            900,
+            &[
+                (bcode_model::ModelPricingBucket::Input, 100),
+                (bcode_model::ModelPricingBucket::CacheWriteInput, 900),
+                (bcode_model::ModelPricingBucket::Output, 25),
+            ],
+        );
+        assert_buckets(
+            900,
+            0,
+            &[
+                (bcode_model::ModelPricingBucket::Input, 100),
+                (bcode_model::ModelPricingBucket::CacheReadInput, 900),
+                (bcode_model::ModelPricingBucket::Output, 25),
+            ],
+        );
+        assert_buckets(
+            600,
+            300,
+            &[
+                (bcode_model::ModelPricingBucket::Input, 100),
+                (bcode_model::ModelPricingBucket::CacheReadInput, 600),
+                (bcode_model::ModelPricingBucket::CacheWriteInput, 300),
+                (bcode_model::ModelPricingBucket::Output, 25),
+            ],
+        );
+
+        let malformed = serde_json::json!({
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 1,
+                    "input_tokens_details": {
+                        "cached_tokens": 60,
+                        "cache_write_tokens": 50
+                    }
+                }
+            }
+        });
+        let usage = mantle_openai_usage(&malformed, None, None).expect("usage decodes");
+        assert!(!usage.has_valid_input_breakdown());
+        assert!(usage.details.is_empty());
+        assert_eq!(usage.pricing_context.request_input_tokens, None);
     }
 
     #[test]

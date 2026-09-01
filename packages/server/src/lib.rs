@@ -21632,6 +21632,35 @@ fn model_request_trace_metadata(
         cache_point_projection(&cache_capabilities, provider_plugin_id, prompt_cache_points),
     );
     metadata.insert(
+        "provider_wire_prompt_cache_points".to_string(),
+        if provider_plugin_id == Some("bcode.bedrock")
+            && cache_capabilities
+                .split(',')
+                .any(|capability| capability == "explicit_cache_points")
+        {
+            prompt_cache_points.to_string()
+        } else {
+            "0".to_string()
+        },
+    );
+    metadata.insert(
+        "provider_wire_cache_mode".to_string(),
+        if provider_plugin_id == Some("bcode.bedrock") && prompt_cache_points > 0 {
+            "explicit"
+        } else {
+            "off"
+        }
+        .to_string(),
+    );
+    metadata.insert(
+        "provider_wire_prompt_cache_key_fingerprint".to_string(),
+        request
+            .metadata
+            .get("prompt_cache_key")
+            .cloned()
+            .unwrap_or_else(|| "stable_prefix".to_string()),
+    );
+    metadata.insert(
         "provider_reuse_capability".to_string(),
         provider_reuse_capability(&cache_capabilities, provider_plugin_id),
     );
@@ -21700,12 +21729,29 @@ fn sent_message_count(request: &ModelTurnRequest) -> usize {
 }
 
 fn prompt_cache_point_count(request: &ModelTurnRequest) -> usize {
-    request
+    let message_points = request
         .messages
         .iter()
         .flat_map(|message| &message.content)
         .filter(|block| matches!(block, ContentBlock::CachePoint { .. }))
-        .count()
+        .count();
+    let stable_prefix_point = usize::from(
+        request.prompt_cache.mode.is_enabled()
+            && request.prompt_cache.cache_system_prompt
+            && request
+                .metadata
+                .get("model_cache_capabilities")
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .split(',')
+                        .any(|capability| capability == "explicit_cache_points")
+                })
+            && request
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| !prompt.trim().is_empty()),
+    );
+    message_points.saturating_add(stable_prefix_point)
 }
 
 fn model_round_from_turn_id(turn_id: &str) -> Option<u32> {

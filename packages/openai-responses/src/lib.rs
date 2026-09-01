@@ -193,6 +193,9 @@ pub struct ResponsesRequest {
     /// Prompt-cache partition key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// Explicit prompt-cache mode, when supported by the deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<ResponsesPromptCacheOptions>,
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -202,6 +205,20 @@ pub struct ResponsesRequest {
     /// Nucleus sampling probability mass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+}
+
+/// Explicit prompt-cache request controls.
+#[derive(Debug, Serialize)]
+pub struct ResponsesPromptCacheOptions {
+    /// Cache selection mode. GPT-5.6 accepts `explicit` for developer-selected breakpoints.
+    pub mode: &'static str,
+}
+
+/// Explicit prompt-cache breakpoint on a cacheable input content block.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResponsesPromptCacheBreakpoint {
+    /// Breakpoint mode. The Responses API currently accepts only `explicit`.
+    pub mode: String,
 }
 
 /// Server-side context management directive.
@@ -318,6 +335,9 @@ pub enum ResponsesContent {
     InputText {
         /// Text value.
         text: String,
+        /// Explicit cache boundary after this content block.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<ResponsesPromptCacheBreakpoint>,
     },
     /// Model-produced text.
     OutputText {
@@ -457,6 +477,7 @@ mod tests {
             reasoning: None,
             include: Vec::new(),
             prompt_cache_key: None,
+            prompt_cache_options: None,
             temperature: None,
             max_output_tokens: None,
             top_p: None,
@@ -506,6 +527,7 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![ResponsesContent::InputText {
                     text: "hi".to_string(),
+                    prompt_cache_breakpoint: None,
                 }],
             },
             ResponsesInputItem::FunctionCall {
@@ -566,6 +588,7 @@ mod tests {
         let value = serde_json::to_value(vec![
             ResponsesContent::InputText {
                 text: "a".to_string(),
+                prompt_cache_breakpoint: None,
             },
             ResponsesContent::OutputText {
                 text: "b".to_string(),

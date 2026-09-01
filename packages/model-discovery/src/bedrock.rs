@@ -156,6 +156,7 @@ fn capabilities_from_summary(summary: &FoundationModelSummary) -> CatalogCapabil
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,
+        explicit_prompt_cache: false,
         native_web_search: false,
     }
 }

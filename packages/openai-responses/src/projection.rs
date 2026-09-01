@@ -71,7 +71,10 @@ pub fn responses_message(
     let text = joined_text_content(message);
     if !text.is_empty() {
         content.push(if input_text {
-            ResponsesContent::InputText { text }
+            ResponsesContent::InputText {
+                text,
+                prompt_cache_breakpoint: None,
+            }
         } else {
             ResponsesContent::OutputText { text }
         });
@@ -159,6 +162,7 @@ pub fn responses_tool_items(message: &bcode_model::ModelMessage) -> Vec<Response
                                     "Image content returned by tool call {}:",
                                     result.call_id
                                 ),
+                                prompt_cache_breakpoint: None,
                             },
                             ResponsesContent::InputImage {
                                 image_url: image_data_url(image),
@@ -171,13 +175,17 @@ pub fn responses_tool_items(message: &bcode_model::ModelMessage) -> Vec<Response
                         role: "user".to_string(),
                         content: vec![ResponsesContent::InputText {
                             text: image_ref_text(&result.call_id, image),
+                            prompt_cache_breakpoint: None,
                         }],
                     });
                 }
                 bcode_model::ToolResultContent::Text { text } => {
                     items.push(ResponsesInputItem::Message {
                         role: "user".to_string(),
-                        content: vec![ResponsesContent::InputText { text: text.clone() }],
+                        content: vec![ResponsesContent::InputText {
+                            text: text.clone(),
+                            prompt_cache_breakpoint: None,
+                        }],
                     });
                 }
             }
@@ -229,6 +237,7 @@ pub fn push_sanitized_responses_input_item(
                         text: format!(
                             "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {call_id}; tool: {name}; arguments: {arguments}"
                         ),
+                        prompt_cache_breakpoint: None,
                     }],
                 });
                 return;
@@ -251,6 +260,7 @@ pub fn push_sanitized_responses_input_item(
                         text: format!(
                             "Historical tool result omitted from structured tool protocol because its matching assistant tool call is unavailable. Call id: {call_id}; result: {output}"
                         ),
+                        prompt_cache_breakpoint: None,
                     }],
                 });
             }

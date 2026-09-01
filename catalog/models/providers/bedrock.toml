@@ -484,6 +484,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -521,6 +522,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."us.openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -558,6 +560,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."global.openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -594,6 +597,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -631,6 +635,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."us.openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -668,6 +673,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."global.openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -705,6 +711,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -742,6 +749,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."us.openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -780,6 +788,7 @@ parallel_tool_calls = true
 structured_outputs = true
 reasoning = true
 prompt_cache = true
+explicit_prompt_cache = true
 
 [models."global.openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]

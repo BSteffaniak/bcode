@@ -1369,6 +1369,42 @@ impl ModelPricingInfo {
         }
         let input = usage.input_tokens?;
         let output = usage.output_tokens?;
+        if !usage.has_valid_input_breakdown() {
+            return None;
+        }
+        if !usage.details.is_empty() {
+            if detailed_input_tokens(&usage.details) != u64::from(input) {
+                return None;
+            }
+            let components = usage
+                .details
+                .iter()
+                .map(|detail| {
+                    let price = match detail.bucket {
+                        ModelPricingBucket::Input => self.input,
+                        ModelPricingBucket::CacheReadInput => self.cached_input,
+                        ModelPricingBucket::CacheWriteInput => self.cache_write_input,
+                        ModelPricingBucket::Output => self.output,
+                    }?;
+                    Some(ModelCostComponent {
+                        bucket: detail.bucket,
+                        modality: Some(detail.modality),
+                        tokens: detail.tokens,
+                        price,
+                        cost_micros: price_bucket_micros(detail.tokens, Some(price)),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(ModelCostEstimate {
+                currency: self.currency.clone(),
+                total_micros: components.iter().fold(0_u64, |total, component| {
+                    total.saturating_add(component.cost_micros)
+                }),
+                components,
+                source: self.source,
+                revision: self.revision.clone(),
+            });
+        }
         let cached = usage.cached_input_tokens.unwrap_or_default();
         let cache_write = usage.cache_write_input_tokens.unwrap_or_default();
         if self.cached_input.is_some() && usage.cached_input_tokens.is_none()
@@ -1376,7 +1412,7 @@ impl ModelPricingInfo {
         {
             return None;
         }
-        let uncached_input = input.saturating_sub(cached);
+        let uncached_input = input.saturating_sub(cached).saturating_sub(cache_write);
         if uncached_input > 0 && self.input.is_none()
             || cached > 0 && self.cached_input.is_none()
             || cache_write > 0 && self.cache_write_input.is_none()
@@ -1472,16 +1508,40 @@ impl ModelPricingInfo {
     }
 }
 
+fn detailed_input_tokens(details: &[ModelTokenUsageDetail]) -> u64 {
+    details.iter().fold(0_u64, |total, detail| {
+        if matches!(
+            detail.bucket,
+            ModelPricingBucket::Input
+                | ModelPricingBucket::CacheReadInput
+                | ModelPricingBucket::CacheWriteInput
+        ) {
+            total.saturating_add(u64::from(detail.tokens))
+        } else {
+            total
+        }
+    })
+}
+
 fn normalized_pricing_usages(usage: &TokenUsage) -> Option<Vec<ModelTokenUsageDetail>> {
     if !usage.details.is_empty() {
-        return Some(usage.details.to_vec());
+        if usage
+            .input_tokens
+            .is_none_or(|input| detailed_input_tokens(&usage.details) == u64::from(input))
+        {
+            return Some(usage.details.to_vec());
+        }
+        return None;
+    }
+    if !usage.has_valid_input_breakdown() {
+        return None;
     }
     let input = usage.input_tokens?;
     let output = usage.output_tokens?;
     let cached = usage.cached_input_tokens.unwrap_or_default();
     let cache_write = usage.cache_write_input_tokens.unwrap_or_default();
     let mut details = Vec::new();
-    let uncached = input.saturating_sub(cached);
+    let uncached = input.saturating_sub(cached).saturating_sub(cache_write);
     for (bucket, tokens) in [
         (ModelPricingBucket::Input, uncached),
         (ModelPricingBucket::CacheReadInput, cached),
@@ -3068,13 +3128,31 @@ impl TokenUsage {
         })
     }
 
-    /// Return uncached input tokens when both input and cached counts are known.
+    /// Return ordinary input tokens after removing cache-read and cache-write subsets.
+    ///
+    /// Normalized providers report `input_tokens` as the complete model-visible request input;
+    /// cache read/write fields describe mutually exclusive subsets of that total.
     #[must_use]
-    pub const fn uncached_input_tokens(&self) -> Option<u32> {
-        match (self.input_tokens, self.cached_input_tokens) {
-            (Some(input), Some(cached)) => Some(input.saturating_sub(cached)),
-            _ => self.input_tokens,
-        }
+    pub fn uncached_input_tokens(&self) -> Option<u32> {
+        self.input_tokens.map(|input| {
+            input
+                .saturating_sub(self.cached_input_tokens.unwrap_or_default())
+                .saturating_sub(self.cache_write_input_tokens.unwrap_or_default())
+        })
+    }
+
+    /// Whether normalized cache subsets fit inside the complete provider input count.
+    #[must_use]
+    pub fn has_valid_input_breakdown(&self) -> bool {
+        self.input_tokens.map_or_else(
+            || self.cached_input_tokens.is_none() && self.cache_write_input_tokens.is_none(),
+            |input| {
+                self.cached_input_tokens
+                    .unwrap_or_default()
+                    .saturating_add(self.cache_write_input_tokens.unwrap_or_default())
+                    <= input
+            },
+        )
     }
 }
 
@@ -3451,12 +3529,12 @@ mod tests {
         ModelInfo, ModelInvocationClass, ModelList, ModelListAuthority, ModelParameterKey,
         ModelPricingBucket, ModelPricingContext, ModelPricingInfo, ModelPricingRule,
         ModelPricingSource, ModelPricingUnit, ModelTokenModality, ModelTokenPrice,
-        ModelTurnRequest, ModelVisibility, ModelVisibilitySource, NegotiatedFeatureSupport,
-        ParallelToolCallCapabilities, ProviderError, ProviderErrorCategory, ProviderErrorSource,
-        ProviderOperationRequirement, ProviderRequestContext, ProviderRequestExtension,
-        ProviderTurnEvent, RequestedModelFeature, StructuredOutputMode, TokenUsage,
-        ToolCallRequestPolicy, ToolChoice, ToolChoiceMode, ToolSchemaMode,
-        model_billing_scope_from_effective_id, normalize_model_service_tier,
+        ModelTokenUsageDetail, ModelTurnRequest, ModelVisibility, ModelVisibilitySource,
+        NegotiatedFeatureSupport, ParallelToolCallCapabilities, ProviderError,
+        ProviderErrorCategory, ProviderErrorSource, ProviderOperationRequirement,
+        ProviderRequestContext, ProviderRequestExtension, ProviderTurnEvent, RequestedModelFeature,
+        StructuredOutputMode, TokenUsage, ToolCallRequestPolicy, ToolChoice, ToolChoiceMode,
+        ToolSchemaMode, model_billing_scope_from_effective_id, normalize_model_service_tier,
     };
 
     #[test]
@@ -4119,7 +4197,7 @@ mod tests {
 
         let cost = pricing.estimate_cost(&usage).expect("cost should estimate");
 
-        assert_eq!(cost.total_micros, 2_675_000);
+        assert_eq!(cost.total_micros, 2_575_000);
         assert_eq!(cost.components.len(), 4);
         assert_eq!(
             cost.components
@@ -4128,6 +4206,82 @@ mod tests {
                 .sum::<u64>(),
             cost.total_micros
         );
+    }
+
+    #[test]
+    fn pricing_rejects_overlapping_cache_subsets() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: Some(ModelTokenPrice::from_micros(1_000_000)),
+            cached_input: Some(ModelTokenPrice::from_micros(100_000)),
+            cache_write_input: Some(ModelTokenPrice::from_micros(1_250_000)),
+            output: Some(ModelTokenPrice::from_micros(4_000_000)),
+            context_threshold_tokens: None,
+            rules: Vec::new(),
+            revision: None,
+            source: ModelPricingSource::BundledCatalog,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            cached_input_tokens: Some(60),
+            cache_write_input_tokens: Some(50),
+            output_tokens: Some(1),
+            ..TokenUsage::default()
+        };
+
+        assert!(pricing.estimate_cost(&usage).is_none());
+        assert!(!usage.has_valid_input_breakdown());
+    }
+
+    #[test]
+    fn pricing_estimate_honors_explicit_non_overlapping_usage_details() {
+        let pricing = ModelPricingInfo {
+            currency: "USD".to_string(),
+            unit: ModelPricingUnit::PerMillionTokens,
+            input: Some(ModelTokenPrice::from_micros(1_000_000)),
+            cached_input: Some(ModelTokenPrice::from_micros(100_000)),
+            cache_write_input: Some(ModelTokenPrice::from_micros(1_250_000)),
+            output: Some(ModelTokenPrice::from_micros(4_000_000)),
+            context_threshold_tokens: None,
+            rules: Vec::new(),
+            revision: None,
+            source: ModelPricingSource::BundledCatalog,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(1_000_000),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(900_000),
+            output_tokens: Some(25_000),
+            details: vec![
+                ModelTokenUsageDetail {
+                    bucket: ModelPricingBucket::Input,
+                    modality: ModelTokenModality::Text,
+                    tokens: 100_000,
+                    cache_ttl_seconds: None,
+                },
+                ModelTokenUsageDetail {
+                    bucket: ModelPricingBucket::CacheWriteInput,
+                    modality: ModelTokenModality::Text,
+                    tokens: 900_000,
+                    cache_ttl_seconds: Some(30 * 60),
+                },
+                ModelTokenUsageDetail {
+                    bucket: ModelPricingBucket::Output,
+                    modality: ModelTokenModality::Text,
+                    tokens: 25_000,
+                    cache_ttl_seconds: None,
+                },
+            ]
+            .into_boxed_slice(),
+            ..TokenUsage::default()
+        };
+
+        let cost = pricing.estimate_cost(&usage).expect("cost should estimate");
+
+        assert_eq!(cost.total_micros, 1_325_000);
+        assert_eq!(cost.components[0].tokens, 100_000);
+        assert_eq!(cost.components[1].tokens, 900_000);
     }
 
     #[test]

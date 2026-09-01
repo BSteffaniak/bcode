@@ -285,6 +285,7 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![ResponsesContent::InputText {
                     text: "hello".to_string(),
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             instructions: None,

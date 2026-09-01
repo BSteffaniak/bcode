@@ -5396,6 +5396,7 @@ fn build_responses_request(
         prompt_cache_key: capabilities
             .supports_prompt_cache_key
             .then(|| request.session_id.to_string()),
+        prompt_cache_options: None,
         temperature: request.parameters.temperature,
         max_output_tokens: capabilities
             .supports_max_output_tokens
@@ -9862,7 +9863,7 @@ mod tests {
             ResponsesInputItem::Message { content, .. }
                 if content.iter().any(|content| matches!(
                     content,
-                    ResponsesContent::InputText { text }
+                    ResponsesContent::InputText { text, prompt_cache_breakpoint: None }
                         if text.contains("/tmp/image.png") && text.contains("100x50")
                 ))
         )));
@@ -11063,7 +11064,7 @@ mod tests {
             ResponsesInputItem::Message { role, content }
                 if role == "user" && matches!(
                     &content[0],
-                    ResponsesContent::InputText { text }
+                    ResponsesContent::InputText { text, prompt_cache_breakpoint: None }
                         if text.contains("matching assistant tool call is unavailable")
                             && text.contains("orphaned output")
                 )

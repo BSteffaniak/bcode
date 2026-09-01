@@ -226,6 +226,7 @@ fn capabilities_from_modalities<'a>(
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,
+        explicit_prompt_cache: false,
         native_web_search: false,
     }
 }
