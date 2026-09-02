@@ -161,6 +161,13 @@ pub fn image_ref_text(call_id: &str, image: &bcode_model::ImageRefContent) -> St
 /// references become descriptive text, and text content becomes a user message.
 #[must_use]
 pub fn responses_tool_items(message: &bcode_model::ModelMessage) -> Vec<ResponsesInputItem> {
+    responses_tool_items_with_cache_boundaries(message, false)
+}
+
+fn responses_tool_items_with_cache_boundaries(
+    message: &bcode_model::ModelMessage,
+    stable_cache_boundaries: bool,
+) -> Vec<ResponsesInputItem> {
     let mut items = Vec::new();
     let cache_boundary = message
         .content
@@ -214,13 +221,15 @@ pub fn responses_tool_items(message: &bcode_model::ModelMessage) -> Vec<Response
             }
         }
     }
-    if cache_boundary && !items.is_empty() {
+    if stable_cache_boundaries && !items.is_empty() {
         items.push(ResponsesInputItem::Message {
             role: "user".to_string(),
             content: vec![ResponsesContent::InputText {
                 text: "Tool results received.".to_string(),
-                prompt_cache_breakpoint: Some(crate::ResponsesPromptCacheBreakpoint {
-                    mode: "explicit".to_string(),
+                prompt_cache_breakpoint: cache_boundary.then(|| {
+                    crate::ResponsesPromptCacheBreakpoint {
+                        mode: "explicit".to_string(),
+                    }
                 }),
             }],
         });
@@ -339,6 +348,14 @@ pub fn model_message_to_responses_input(
     message: &bcode_model::ModelMessage,
     provider_tool_name: &dyn Fn(&str) -> String,
 ) -> Vec<ResponsesInputItem> {
+    model_message_to_responses_input_with_cache_boundaries(message, provider_tool_name, false)
+}
+
+fn model_message_to_responses_input_with_cache_boundaries(
+    message: &bcode_model::ModelMessage,
+    provider_tool_name: &dyn Fn(&str) -> String,
+    stable_tool_cache_boundaries: bool,
+) -> Vec<ResponsesInputItem> {
     let extension_items = message
         .content
         .iter()
@@ -358,7 +375,9 @@ pub fn model_message_to_responses_input(
         bcode_model::MessageRole::Assistant => {
             responses_assistant_items(message, provider_tool_name)
         }
-        bcode_model::MessageRole::Tool => responses_tool_items(message),
+        bcode_model::MessageRole::Tool => {
+            responses_tool_items_with_cache_boundaries(message, stable_tool_cache_boundaries)
+        }
     }
 }
 
@@ -372,11 +391,32 @@ pub fn model_messages_to_responses_input(
     start: usize,
     provider_tool_name: &dyn Fn(&str) -> String,
 ) -> Vec<ResponsesInputItem> {
+    model_messages_to_responses_input_with_cache_boundaries(
+        messages,
+        start,
+        provider_tool_name,
+        false,
+    )
+}
+
+/// Project a message slice while retaining stable cacheable boundary content after every completed
+/// tool result. Only messages carrying a portable cache point receive breakpoint control metadata.
+#[must_use]
+pub fn model_messages_to_responses_input_with_cache_boundaries(
+    messages: &[bcode_model::ModelMessage],
+    start: usize,
+    provider_tool_name: &dyn Fn(&str) -> String,
+    stable_tool_cache_boundaries: bool,
+) -> Vec<ResponsesInputItem> {
     let mut input = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
     let mut pending_tool_call_ids = BTreeSet::new();
     for message in messages.iter().skip(start.min(messages.len())) {
-        for item in model_message_to_responses_input(message, provider_tool_name) {
+        for item in model_message_to_responses_input_with_cache_boundaries(
+            message,
+            provider_tool_name,
+            stable_tool_cache_boundaries,
+        ) {
             push_sanitized_responses_input_item(
                 &mut input,
                 &mut seen_tool_call_ids,
@@ -735,7 +775,12 @@ mod tests {
             ],
         };
 
-        let input = model_messages_to_responses_input(&[assistant, tool], 0, &identity);
+        let input = model_messages_to_responses_input_with_cache_boundaries(
+            &[assistant, tool],
+            0,
+            &identity,
+            true,
+        );
         assert_eq!(input.len(), 3);
         assert!(matches!(&input[0], ResponsesInputItem::FunctionCall { .. }));
         assert!(matches!(
@@ -753,6 +798,79 @@ mod tests {
                     })
                 )
         ));
+    }
+
+    #[test]
+    fn rolling_tool_boundaries_keep_rendered_history_append_stable() {
+        fn tool_round(index: usize, marked: bool) -> [bcode_model::ModelMessage; 2] {
+            let call_id = format!("call-{index}");
+            let assistant = bcode_model::ModelMessage {
+                role: bcode_model::MessageRole::Assistant,
+                content: vec![bcode_model::ContentBlock::ToolCall {
+                    call: bcode_model::ToolCall {
+                        id: call_id.clone(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"round": index}),
+                    },
+                }],
+            };
+            let mut content = vec![bcode_model::ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id,
+                    output: format!("output-{index}"),
+                    content: Vec::new(),
+                    is_error: false,
+                },
+            }];
+            if marked {
+                content.push(bcode_model::ContentBlock::CachePoint {
+                    hint: bcode_model::PromptCachePoint::default(),
+                });
+            }
+            let tool = bcode_model::ModelMessage {
+                role: bcode_model::MessageRole::Tool,
+                content,
+            };
+            [assistant, tool]
+        }
+
+        let mut first = Vec::new();
+        first.extend(tool_round(0, true));
+        first.extend(tool_round(1, true));
+        first.extend(tool_round(2, true));
+        let first_wire =
+            model_messages_to_responses_input_with_cache_boundaries(&first, 0, &identity, true);
+
+        let mut second = Vec::new();
+        second.extend(tool_round(0, false));
+        second.extend(tool_round(1, true));
+        second.extend(tool_round(2, true));
+        second.extend(tool_round(3, true));
+        let second_wire =
+            model_messages_to_responses_input_with_cache_boundaries(&second, 0, &identity, true);
+
+        let strip_controls = |items: Vec<ResponsesInputItem>| {
+            let mut value = serde_json::to_value(items).expect("wire serializes");
+            fn strip(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Array(values) => values.iter_mut().for_each(strip),
+                    serde_json::Value::Object(values) => {
+                        values.remove("prompt_cache_breakpoint");
+                        values.values_mut().for_each(strip);
+                    }
+                    _ => {}
+                }
+            }
+            strip(&mut value);
+            value.as_array().expect("wire input is an array").clone()
+        };
+        let first_stable = strip_controls(first_wire);
+        let second_stable = strip_controls(second_wire);
+        assert_eq!(
+            first_stable,
+            second_stable[..first_stable.len()],
+            "moving the three-point window must not remove prior rendered boundary content"
+        );
     }
 
     #[test]

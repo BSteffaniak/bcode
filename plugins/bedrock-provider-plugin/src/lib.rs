@@ -803,17 +803,18 @@ fn build_mantle_openai_request(
     request: &ModelTurnRequest,
     model_id: &str,
 ) -> Result<serde_json::Value, ProviderError> {
-    let mut input =
-        bcode_openai_responses::model_messages_to_responses_input(&request.messages, 0, &|name| {
-            bedrock_tool_name(name)
-        });
+    let explicit_prompt_cache = mantle_openai_explicit_prompt_cache_enabled(request);
+    let mut input = bcode_openai_responses::model_messages_to_responses_input_with_cache_boundaries(
+        &request.messages,
+        0,
+        &|name| bedrock_tool_name(name),
+        explicit_prompt_cache,
+    );
     let mut instructions = bcode_openai_responses::response_instruction_bundle(
         request.system_prompt.as_deref(),
         &request.messages,
     );
-    if mantle_openai_explicit_prompt_cache_enabled(request)
-        && let Some(stable_instructions) = instructions.take()
-    {
+    if explicit_prompt_cache && let Some(stable_instructions) = instructions.take() {
         input.insert(
             0,
             bcode_openai_responses::ResponsesInputItem::Message {

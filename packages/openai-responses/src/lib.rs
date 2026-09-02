@@ -40,8 +40,9 @@ mod projection;
 pub use projection::{
     INTERRUPTED_TOOL_OUTPUT, append_missing_responses_tool_outputs, image_data_url, image_ref_text,
     joined_text_content, model_message_to_responses_input, model_messages_to_responses_input,
-    push_sanitized_responses_input_item, response_instruction_bundle, responses_assistant_items,
-    responses_message, responses_tool_items,
+    model_messages_to_responses_input_with_cache_boundaries, push_sanitized_responses_input_item,
+    response_instruction_bundle, responses_assistant_items, responses_message,
+    responses_tool_items,
 };
 
 /// Terminal outcome of decoding one streamed provider response.
