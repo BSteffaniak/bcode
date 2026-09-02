@@ -7586,6 +7586,73 @@ mod tests {
             "cache reuse must reduce modeled follow-up input cost by more than 50%: effective={second_effective_input_cost}, uncached={second_uncached_input_cost}"
         );
 
+        let base_read = second_read;
+        request.messages.insert(
+            request.messages.len() - 1,
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: ToolCall {
+                        id: "live-cache-tool-call".to_string(),
+                        name: "filesystem.read".to_string(),
+                        arguments: serde_json::json!({"path":"stable.rs"}),
+                    },
+                }],
+            },
+        );
+        request.messages.insert(
+            request.messages.len() - 1,
+            ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        result: bcode_model::ToolResult {
+                            call_id: "live-cache-tool-call".to_string(),
+                            output: "stable completed tool output. ".repeat(500),
+                            is_error: false,
+                            content: Vec::new(),
+                        },
+                    },
+                    ContentBlock::CachePoint {
+                        hint: bcode_model::PromptCachePoint {
+                            label: Some("completed-tool-prefix".to_string()),
+                            ttl_seconds: Some(30 * 60),
+                        },
+                    },
+                ],
+            },
+        );
+        let expanded_body = build_mantle_openai_request(&request, &model)
+            .expect("expanded tool-prefix request should build");
+        assert!(expanded_body["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "message"
+                    && item["content"][0]["prompt_cache_breakpoint"]["mode"] == "explicit"
+                    && item["content"][0]["text"] == "Tool results received."
+            })
+        }));
+        let expanded = send(&endpoint, &token, expanded_body).await;
+        let expanded_write = expanded.cache_write_input_tokens.unwrap_or_default();
+        assert!(
+            expanded_write > 0,
+            "a newly completed tool prefix must extend the cache: {expanded:?}"
+        );
+
+        request.messages.last_mut().expect("mutable tail").content = vec![ContentBlock::Text {
+            text: "third changing suffix".to_string(),
+        }];
+        let expanded_follow_up = send(
+            &endpoint,
+            &token,
+            build_mantle_openai_request(&request, &model).expect("expanded follow-up should build"),
+        )
+        .await;
+        let expanded_read = expanded_follow_up.cached_input_tokens.unwrap_or_default();
+        assert!(
+            expanded_read >= base_read.saturating_add(expanded_write.saturating_mul(95) / 100),
+            "follow-up must read the expanded tool-loop prefix: base_read={base_read}, expanded_write={expanded_write}, expanded_read={expanded_read}, expanded={expanded:?}, follow_up={expanded_follow_up:?}"
+        );
+
         println!(
             "request,total_input,cache_read,cache_write,ordinary_input,hit_rate\ninitial,{},{},{},{},{:.2}%\nfollow_up,{},{},{},{},{:.2}%",
             first_total,

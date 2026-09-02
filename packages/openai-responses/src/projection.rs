@@ -162,6 +162,10 @@ pub fn image_ref_text(call_id: &str, image: &bcode_model::ImageRefContent) -> St
 #[must_use]
 pub fn responses_tool_items(message: &bcode_model::ModelMessage) -> Vec<ResponsesInputItem> {
     let mut items = Vec::new();
+    let cache_boundary = message
+        .content
+        .iter()
+        .any(|block| matches!(block, bcode_model::ContentBlock::CachePoint { .. }));
     for block in &message.content {
         let bcode_model::ContentBlock::ToolResult { result } = block else {
             continue;
@@ -209,6 +213,17 @@ pub fn responses_tool_items(message: &bcode_model::ModelMessage) -> Vec<Response
                 }
             }
         }
+    }
+    if cache_boundary && !items.is_empty() {
+        items.push(ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: vec![ResponsesContent::InputText {
+                text: "Tool results received.".to_string(),
+                prompt_cache_breakpoint: Some(crate::ResponsesPromptCacheBreakpoint {
+                    mode: "explicit".to_string(),
+                }),
+            }],
+        });
     }
     items
 }
@@ -535,7 +550,7 @@ mod tests {
         assert!(matches!(&input[0], ResponsesInputItem::FunctionCall { .. }));
         assert!(matches!(
             &input[1],
-            ResponsesInputItem::FunctionCallOutput { call_id, output }
+            ResponsesInputItem::FunctionCallOutput { call_id, output, .. }
                 if call_id == "call_1" && output == INTERRUPTED_TOOL_OUTPUT
         ));
         assert!(matches!(&input[2], ResponsesInputItem::Message { .. }));
@@ -686,8 +701,57 @@ mod tests {
         assert!(matches!(&input[0], ResponsesInputItem::FunctionCall { .. }));
         assert!(matches!(
             &input[1],
-            ResponsesInputItem::FunctionCallOutput { call_id, output }
+            ResponsesInputItem::FunctionCallOutput { call_id, output, .. }
                 if call_id == "call_1" && output == "contents"
+        ));
+    }
+
+    #[test]
+    fn tool_result_cache_point_projects_after_the_matched_output() {
+        let assistant = bcode_model::ModelMessage {
+            role: bcode_model::MessageRole::Assistant,
+            content: vec![bcode_model::ContentBlock::ToolCall {
+                call: bcode_model::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            }],
+        };
+        let tool = bcode_model::ModelMessage {
+            role: bcode_model::MessageRole::Tool,
+            content: vec![
+                bcode_model::ContentBlock::ToolResult {
+                    result: bcode_model::ToolResult {
+                        call_id: "call_1".to_string(),
+                        output: "contents".to_string(),
+                        content: Vec::new(),
+                        is_error: false,
+                    },
+                },
+                bcode_model::ContentBlock::CachePoint {
+                    hint: bcode_model::PromptCachePoint::default(),
+                },
+            ],
+        };
+
+        let input = model_messages_to_responses_input(&[assistant, tool], 0, &identity);
+        assert_eq!(input.len(), 3);
+        assert!(matches!(&input[0], ResponsesInputItem::FunctionCall { .. }));
+        assert!(matches!(
+            &input[1],
+            ResponsesInputItem::FunctionCallOutput { .. }
+        ));
+        assert!(matches!(
+            &input[2],
+            ResponsesInputItem::Message { content, .. }
+                if matches!(
+                    content.first(),
+                    Some(ResponsesContent::InputText {
+                        prompt_cache_breakpoint: Some(_),
+                        ..
+                    })
+                )
         ));
     }
 

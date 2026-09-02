@@ -21949,20 +21949,28 @@ fn conversation_cache_point_indices(messages: &[ModelMessage]) -> Vec<usize> {
     if messages.len() < MIN_MESSAGES_FOR_CONVERSATION_CACHE {
         return Vec::new();
     }
+    let mutable_tail = messages
+        .last()
+        .is_some_and(|message| message.role != MessageRole::Tool);
     messages
         .iter()
         .enumerate()
         .rev()
-        .skip(1)
+        .skip(usize::from(mutable_tail))
         .filter_map(|(index, message)| {
-            (matches!(message.role, MessageRole::User)
+            let cacheable_user = matches!(message.role, MessageRole::User)
                 && message.content.iter().any(|block| {
                     matches!(
                         block,
                         ContentBlock::Text { text } if !text.trim().is_empty()
                     )
-                }))
-            .then_some(index)
+                });
+            let completed_tool_result = matches!(message.role, MessageRole::Tool)
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+            (cacheable_user || completed_tool_result).then_some(index)
         })
         .take(MAX_CONVERSATION_CACHE_POINTS)
         .collect::<Vec<_>>()
@@ -44562,8 +44570,8 @@ library = "test"
                 .copied()
                 .expect("tool-loop history needs a cache point");
             assert!(
-                newest < messages.len() - 1,
-                "the mutable tail must remain after the newest cache point"
+                newest <= messages.len() - 1,
+                "the newest cache point must remain within completed history"
             );
             planned_prefix_ends.push(newest);
         }
