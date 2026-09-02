@@ -464,6 +464,12 @@ pub struct CatalogCapabilities {
     /// Supports multiple independent tool calls in one model response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    /// Supports requiring some tool call (`tool_choice = required` / `any`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_tool_choice: Option<bool>,
+    /// Supports requiring one named tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_tool_choice: Option<bool>,
     /// Supports structured output controls.
     #[serde(default)]
     pub structured_outputs: bool,
@@ -476,6 +482,9 @@ pub struct CatalogCapabilities {
     /// Supports developer-selected explicit cache breakpoints.
     #[serde(default)]
     pub explicit_prompt_cache: bool,
+    /// Supported prompt-cache TTL values in seconds.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub prompt_cache_ttl_seconds: BTreeSet<u64>,
     /// Supports native provider web search.
     #[serde(default)]
     pub native_web_search: bool,

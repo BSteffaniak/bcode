@@ -1654,6 +1654,9 @@ pub async fn handle_compaction_events(
                 bcode_model::StopReason::Cancelled => {
                     return CompactionPollStatus::Failed("model turn cancelled".to_string());
                 }
+                bcode_model::StopReason::Refusal => {
+                    return CompactionPollStatus::Failed("model declined compaction".to_string());
+                }
                 _ => return CompactionPollStatus::Finished,
             },
             ProviderTurnEvent::ToolCallStarted { .. }

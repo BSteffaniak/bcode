@@ -223,10 +223,13 @@ fn capabilities_from_modalities<'a>(
         // here belongs to that documented API surface.
         tool_use: true,
         parallel_tool_calls: Some(true),
+        required_tool_choice: None,
+        named_tool_choice: None,
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,
         explicit_prompt_cache: false,
+        prompt_cache_ttl_seconds: BTreeSet::new(),
         native_web_search: false,
     }
 }

@@ -410,6 +410,8 @@ pub enum StreamOutcome {
     /// Distinct from [`Self::ToolCall`] because a truncated turn may have started a tool call
     /// without completing it, so no complete tool call is available to execute.
     MaxTokens,
+    /// The provider declined the request without producing a normal answer.
+    Refusal,
     /// The turn was cancelled by the host.
     Cancelled,
 }

@@ -6717,7 +6717,10 @@ fn openai_model_cache_info(dialect: OpenAiCompatibleDialect) -> bcode_model::Mod
     if dialect.supports_previous_response_id() {
         capabilities.insert(bcode_model::ModelCacheCapability::PreviousResponseId);
     }
-    bcode_model::ModelCacheInfo { capabilities }
+    bcode_model::ModelCacheInfo {
+        capabilities,
+        ..bcode_model::ModelCacheInfo::default()
+    }
 }
 
 fn model_capabilities_for(_model: &ModelResponseItem) -> BTreeSet<ModelCapability> {

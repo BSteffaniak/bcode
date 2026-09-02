@@ -1622,6 +1622,9 @@ pub enum ModelMetadataSource {
 pub struct ModelCacheInfo {
     #[serde(default)]
     pub capabilities: BTreeSet<ModelCacheCapability>,
+    /// Provider/model-supported explicit prompt-cache TTLs in seconds.
+    #[serde(default)]
+    pub ttl_seconds: BTreeSet<u64>,
 }
 
 /// Provider cache/continuation capability.
@@ -3170,6 +3173,8 @@ pub enum StopReason {
     ToolCall,
     MaxTokens,
     StopSequence,
+    /// The provider declined the request as a normal, billed-or-unbilled model outcome.
+    Refusal,
     Cancelled,
     Error,
 }

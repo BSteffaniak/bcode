@@ -382,6 +382,9 @@ async fn stream_bedrock_turn(
         Ok(StreamOutcome::MaxTokens) => turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::MaxTokens,
         }),
+        Ok(StreamOutcome::Refusal) => turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::Refusal,
+        }),
         Ok(StreamOutcome::Cancelled) => {
             turn.push(ProviderTurnEvent::Cancelled);
             turn.push(ProviderTurnEvent::TurnFinished {
@@ -458,6 +461,7 @@ fn validate_bedrock_request(
         ));
     }
     validate_bedrock_cache_ttl(request)?;
+    validate_fable_5_1_request(request)?;
     validate_declared_bedrock_features(request, responses_surface)?;
     validate_tool_choice_registration(request)
 }
@@ -488,28 +492,85 @@ fn validate_declared_bedrock_features(
 }
 
 fn validate_bedrock_cache_ttl(request: &ModelTurnRequest) -> Result<(), ProviderError> {
-    let has_ttl = request.messages.iter().any(|message| {
-        message.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::CachePoint {
-                    hint: bcode_model::PromptCachePoint {
-                        ttl_seconds: Some(_),
-                        ..
-                    }
-                }
-            )
+    let ttl_values = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::CachePoint { hint } => hint.ttl_seconds,
+            _ => None,
         })
-    });
-    if has_ttl {
-        Err(provider_error(
-            "bedrock_cache_ttl_unsupported",
-            ProviderErrorCategory::UnsupportedFeature,
-            "Bedrock cache points do not accept a portable TTL",
-        ))
-    } else {
-        Ok(())
+        .chain(request.prompt_cache.ttl_seconds)
+        .collect::<BTreeSet<_>>();
+    if ttl_values.is_empty() {
+        return Ok(());
     }
+    if is_claude_fable_5_1(&request.model_id)
+        && ttl_values.iter().all(|ttl| matches!(ttl, 300 | 3_600))
+    {
+        return Ok(());
+    }
+    Err(provider_error(
+        "bedrock_cache_ttl_unsupported",
+        ProviderErrorCategory::UnsupportedFeature,
+        "the selected Bedrock model does not support the requested portable cache TTL",
+    ))
+}
+
+fn is_claude_fable_5_1(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "anthropic.claude-fable-5-1"
+            | "us.anthropic.claude-fable-5-1"
+            | "global.anthropic.claude-fable-5-1"
+    )
+}
+
+fn validate_fable_5_1_request(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    if !is_claude_fable_5_1(&request.model_id) {
+        return Ok(());
+    }
+    if matches!(
+        request.tool_call_policy.choice,
+        ToolChoice::Required | ToolChoice::Tool { .. }
+    ) {
+        return Err(provider_error(
+            "bedrock_fable_5_1_forced_tool_choice_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "Claude Fable 5.1 supports only auto or none tool choice",
+        ));
+    }
+    if request
+        .parameters
+        .temperature
+        .is_some_and(|value| (value - 1.0).abs() > f32::EPSILON)
+    {
+        return Err(provider_error(
+            "bedrock_fable_5_1_temperature_invalid",
+            ProviderErrorCategory::InvalidRequest,
+            "Claude Fable 5.1 temperature must be 1.0 or omitted",
+        ));
+    }
+    if request
+        .parameters
+        .top_p
+        .is_some_and(|value| (value - 0.99).abs() > f32::EPSILON)
+    {
+        return Err(provider_error(
+            "bedrock_fable_5_1_top_p_invalid",
+            ProviderErrorCategory::InvalidRequest,
+            "Claude Fable 5.1 top_p must be 0.99 or omitted",
+        ));
+    }
+    if request.parameters.temperature.is_some() && request.parameters.top_p.is_some() {
+        return Err(provider_error(
+            "bedrock_fable_5_1_sampling_parameters_conflict",
+            ProviderErrorCategory::InvalidRequest,
+            "Claude Fable 5.1 temperature and top_p cannot be specified together",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_tool_choice_registration(request: &ModelTurnRequest) -> Result<(), ProviderError> {
@@ -1908,6 +1969,7 @@ async fn stream_bedrock_messages_model(
         Ok(outcome) => Ok(outcome),
         Err(error)
             if request.structured_output.is_some()
+                && !is_claude_fable_5_1(&request.model_id)
                 && bedrock_messages_native_structured_output_rejected(&error) =>
         {
             let (fallback, synthetic) = bedrock_messages_structured_fallback_request(request)?;
@@ -2558,6 +2620,9 @@ impl AnthropicMessagesAccumulator {
         if matches!(self.stop_reason, Some(StopReason::MaxTokens)) {
             return StreamOutcome::MaxTokens;
         }
+        if matches!(self.stop_reason, Some(StopReason::Refusal)) {
+            return StreamOutcome::Refusal;
+        }
         if self.synthetic_output_emitted {
             StreamOutcome::Finished
         } else if self.saw_tool_call {
@@ -3167,7 +3232,9 @@ fn build_anthropic_messages_request_value(
             request
                 .messages
                 .iter()
-                .filter_map(|message| anthropic_message(message).transpose())
+                .filter_map(|message| {
+                    anthropic_message(message, request.prompt_cache.ttl_seconds).transpose()
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     );
@@ -3201,7 +3268,10 @@ fn build_anthropic_messages_request_value(
             .and_then(|tools| tools.last_mut())
             .and_then(serde_json::Value::as_object_mut)
     {
-        last_tool.insert("cache_control".to_string(), anthropic_cache_control());
+        last_tool.insert(
+            "cache_control".to_string(),
+            anthropic_cache_control(request.prompt_cache.ttl_seconds),
+        );
     }
     if let Some(temperature) = request.parameters.temperature {
         body.insert("temperature".to_string(), serde_json::json!(temperature));
@@ -3277,7 +3347,10 @@ fn anthropic_system_content(request: &ModelTurnRequest) -> Option<serde_json::Va
             block
                 .as_object_mut()
                 .expect("text block is an object")
-                .insert("cache_control".to_string(), anthropic_cache_control());
+                .insert(
+                    "cache_control".to_string(),
+                    anthropic_cache_control(request.prompt_cache.ttl_seconds),
+                );
         }
         blocks.push(block);
     }
@@ -3292,18 +3365,29 @@ fn anthropic_system_content(request: &ModelTurnRequest) -> Option<serde_json::Va
     (!blocks.is_empty()).then_some(serde_json::Value::Array(blocks))
 }
 
-fn anthropic_message(message: &ModelMessage) -> Result<Option<serde_json::Value>, ProviderError> {
+fn anthropic_message(
+    message: &ModelMessage,
+    default_cache_ttl_seconds: Option<u64>,
+) -> Result<Option<serde_json::Value>, ProviderError> {
     let role = match message.role {
         MessageRole::System => return Ok(None),
         MessageRole::User | MessageRole::Tool => "user",
         MessageRole::Assistant => "assistant",
     };
-    let content = anthropic_content_blocks(message)?;
+    let content = anthropic_content_blocks(message, default_cache_ttl_seconds)?;
     Ok((!content.is_empty()).then(|| serde_json::json!({"role": role, "content": content})))
 }
 
-fn anthropic_cache_control() -> serde_json::Value {
-    serde_json::json!({"type": "ephemeral"})
+fn anthropic_cache_control(ttl_seconds: Option<u64>) -> serde_json::Value {
+    let mut control = serde_json::json!({"type": "ephemeral"});
+    if let Some(ttl) = ttl_seconds.and_then(|ttl| match ttl {
+        300 => Some("5m"),
+        3_600 => Some("1h"),
+        _ => None,
+    }) {
+        control["ttl"] = serde_json::json!(ttl);
+    }
+    control
 }
 
 /// Placeholder text used when a failed tool result carries no model-visible content.
@@ -3314,6 +3398,7 @@ const EMPTY_ERROR_TOOL_RESULT_PLACEHOLDER: &str = "Tool call failed without prod
 
 fn anthropic_content_blocks(
     message: &ModelMessage,
+    default_cache_ttl_seconds: Option<u64>,
 ) -> Result<Vec<serde_json::Value>, ProviderError> {
     let mut blocks = Vec::new();
     for block in &message.content {
@@ -3363,12 +3448,15 @@ fn anthropic_content_blocks(
                     "content": content, "is_error": result.is_error,
                 }));
             }
-            ContentBlock::CachePoint { .. } => {
+            ContentBlock::CachePoint { hint } => {
                 if let Some(previous) = blocks
                     .last_mut()
                     .and_then(serde_json::Value::as_object_mut)
                 {
-                    previous.insert("cache_control".to_string(), anthropic_cache_control());
+                    previous.insert(
+                        "cache_control".to_string(),
+                        anthropic_cache_control(hint.ttl_seconds.or(default_cache_ttl_seconds)),
+                    );
                 }
             }
             ContentBlock::ProviderExtension { .. } | ContentBlock::Text { .. } => {}
@@ -4424,7 +4512,8 @@ fn bedrock_prompt_cache_support(
         } else {
             CapabilitySupport::Unsupported {
                 source: CapabilitySource::BundledCatalog,
-                reason: "Bedrock Converse cache points do not accept a portable TTL".to_string(),
+                reason: "most Bedrock models do not accept a portable TTL; model-level capabilities may narrow this"
+                    .to_string(),
             }
         },
     )))
@@ -5818,6 +5907,7 @@ fn map_anthropic_stop_reason(reason: &str) -> Option<StopReason> {
         "tool_use" => Some(StopReason::ToolCall),
         "max_tokens" => Some(StopReason::MaxTokens),
         "stop_sequence" => Some(StopReason::StopSequence),
+        "refusal" => Some(StopReason::Refusal),
         _ => None,
     }
 }
@@ -8799,6 +8889,27 @@ mod tests {
         assert!(accumulator.saw_terminal_stop_reason());
     }
 
+    #[test]
+    fn anthropic_messages_refusal_is_a_terminal_refusal() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        accumulator
+            .process(
+                &serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "refusal",
+                        "stop_details": {"category": "reasoning_extraction"}
+                    },
+                    "usage": {"output_tokens": 0}
+                }),
+                &turn,
+            )
+            .expect("refusal delta should process");
+        assert!(accumulator.saw_terminal_stop_reason());
+        assert_eq!(accumulator.finish(), StreamOutcome::Refusal);
+    }
+
     /// Converse must treat a stream that never delivered `messageStop` as cut off.
     #[test]
     fn converse_stream_without_message_stop_is_not_terminal() {
@@ -10105,6 +10216,70 @@ mod tests {
             Some(REASONING_EFFORT_LOW_BUDGET),
             "a zero explicit budget falls back to the effort mapping"
         );
+    }
+
+    #[test]
+    fn fable_5_1_rejects_forced_tools_and_invalid_sampling() {
+        let mut request = test_model_turn_request();
+        request.model_id = "global.anthropic.claude-fable-5-1".to_string();
+        request.tools = vec![ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }];
+        request.tool_call_policy.choice = ToolChoice::Required;
+        let error = validate_bedrock_request(&request, false).expect_err("forced tools must fail");
+        assert_eq!(
+            error.code,
+            "bedrock_fable_5_1_forced_tool_choice_unsupported"
+        );
+
+        request.tool_call_policy.choice = ToolChoice::Auto;
+        request.parameters.temperature = Some(0.5);
+        let error = validate_bedrock_request(&request, false).expect_err("temperature must fail");
+        assert_eq!(error.code, "bedrock_fable_5_1_temperature_invalid");
+
+        request.parameters.temperature = Some(1.0);
+        request.parameters.top_p = Some(0.99);
+        let error =
+            validate_bedrock_request(&request, false).expect_err("combined sampling must fail");
+        assert_eq!(error.code, "bedrock_fable_5_1_sampling_parameters_conflict");
+    }
+
+    #[test]
+    fn fable_5_1_serializes_adaptive_max_effort() {
+        let mut request = test_model_turn_request();
+        request.model_id = "global.anthropic.claude-fable-5-1".to_string();
+        request.parameters.max_output_tokens = Some(128_000);
+        request.parameters.reasoning_control = Some(bcode_model::ReasoningControl::Adaptive);
+        request.parameters.reasoning_effort_value = Some("max".to_string());
+        let body =
+            build_mantle_anthropic_request(&request, &request.model_id, Some(DEFAULT_REGION))
+                .expect("Fable request should serialize");
+        assert_eq!(body["model"], request.model_id);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["max_tokens"], 128_000);
+    }
+
+    #[test]
+    fn fable_5_1_serializes_supported_cache_ttls() {
+        let mut request = test_model_turn_request();
+        request.model_id = "global.anthropic.claude-fable-5-1".to_string();
+        request.prompt_cache.cache_system_prompt = true;
+        request.prompt_cache.ttl_seconds = Some(3_600);
+        request.system_prompt = Some("stable system".to_string());
+        validate_bedrock_request(&request, false).expect("one-hour TTL is supported");
+        let body =
+            build_mantle_anthropic_request(&request, &request.model_id, Some(DEFAULT_REGION))
+                .expect("Fable request should serialize");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+
+        request.prompt_cache.ttl_seconds = Some(600);
+        let error = validate_bedrock_request(&request, false).expect_err("unknown TTL must fail");
+        assert_eq!(error.code, "bedrock_cache_ttl_unsupported");
     }
 
     #[test]

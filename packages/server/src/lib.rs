@@ -15911,7 +15911,9 @@ async fn run_model_turn_inner(
                 {
                     if matches!(
                         reason,
-                        bcode_model::StopReason::Cancelled | bcode_model::StopReason::Error
+                        bcode_model::StopReason::Cancelled
+                            | bcode_model::StopReason::Error
+                            | bcode_model::StopReason::Refusal
                     ) {
                         return outcome
                             .assistant_output
@@ -20588,11 +20590,7 @@ async fn build_model_turn_request(
     let catalog_provider_id = target.catalog_provider_id.clone();
     let catalog_identity = target.catalog_identity.clone();
     let model_cache_info = target.cache;
-    let prompt_cache_ttl_supported = target
-        .feature_support
-        .prompt_cache
-        .get(&bcode_model::PromptCacheFeature::Ttl)
-        .is_some_and(bcode_model::CapabilitySupport::is_guaranteed);
+    let prompt_cache_ttl_seconds = model_cache_info.ttl_seconds.iter().next_back().copied();
     let prompt_cache_timer = state.metrics.timer();
     let prompt_cache = plan_prompt_cache(
         &mut messages,
@@ -20601,7 +20599,7 @@ async fn build_model_turn_request(
         model_cache_info
             .capabilities
             .contains(&bcode_model::ModelCacheCapability::ExplicitCachePoints),
-        prompt_cache_ttl_supported,
+        prompt_cache_ttl_seconds,
     );
     state.metrics.record_histogram_with_labels(
         "model.request_build.prompt_cache_plan_duration_ms",
@@ -21956,7 +21954,7 @@ fn plan_prompt_cache(
     mode: bcode_model::PromptCacheMode,
     session_id: SessionId,
     explicit_cache_points: bool,
-    ttl_supported: bool,
+    ttl_seconds: Option<u64>,
 ) -> bcode_model::PromptCacheHints {
     // Cache points are provider-request projection artifacts. A tool round rebuild may receive
     // messages projected for an earlier round, so remove them before applying the current policy.
@@ -21971,7 +21969,7 @@ fn plan_prompt_cache(
     }
 
     let explicit_cache_points = explicit_cache_points && mode.is_enabled();
-    let ttl_seconds = (explicit_cache_points && ttl_supported).then_some(30 * 60);
+    let ttl_seconds = explicit_cache_points.then_some(ttl_seconds).flatten();
     if explicit_cache_points {
         for index in conversation_cache_point_indices(messages) {
             messages[index].content.push(ContentBlock::CachePoint {
@@ -38843,9 +38841,11 @@ library = "test"
         let unsupported = bcode_model::ModelCacheInfo::default();
         let previous_response_supported = bcode_model::ModelCacheInfo {
             capabilities: BTreeSet::from([bcode_model::ModelCacheCapability::PreviousResponseId]),
+            ..bcode_model::ModelCacheInfo::default()
         };
         let provider_state_supported = bcode_model::ModelCacheInfo {
             capabilities: BTreeSet::from([bcode_model::ModelCacheCapability::ProviderState]),
+            ..bcode_model::ModelCacheInfo::default()
         };
 
         assert!(!supports_provider_conversation_reuse(None));
@@ -38878,7 +38878,7 @@ library = "test"
             bcode_model::PromptCacheMode::Aggressive,
             SessionId::new(),
             true,
-            true,
+            Some(30 * 60),
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Aggressive);
@@ -38903,7 +38903,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             true,
-            false,
+            None,
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
@@ -39221,6 +39221,7 @@ library = "test"
                     bcode_model::ModelCacheCapability::ExplicitCachePoints,
                     bcode_model::ModelCacheCapability::CacheUsageReporting,
                 ]),
+                ..bcode_model::ModelCacheInfo::default()
             },
         );
 
@@ -44457,7 +44458,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             true,
-            false,
+            None,
         );
 
         assert!(hints.cache_system_prompt);
@@ -44484,7 +44485,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             true,
-            false,
+            None,
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
@@ -44507,7 +44508,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             session_id,
             true,
-            true,
+            Some(30 * 60),
         );
         let first_points = first_round
             .iter()
@@ -44533,7 +44534,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             session_id,
             true,
-            true,
+            Some(30 * 60),
         );
         let second_points = second_round
             .iter()
@@ -44598,7 +44599,7 @@ library = "test"
                 bcode_model::PromptCacheMode::Auto,
                 session_id,
                 true,
-                true,
+                Some(30 * 60),
             );
             assert_eq!(
                 hints.key.as_deref(),
@@ -44653,7 +44654,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             false,
-            false,
+            None,
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
@@ -44676,7 +44677,7 @@ library = "test"
             bcode_model::PromptCacheMode::Aggressive,
             SessionId::new(),
             true,
-            false,
+            None,
         );
 
         assert!(hints.cache_system_prompt);
@@ -54380,7 +54381,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
-            feature_support: bcode_model::ModelFeatureSupport::default(),
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -54455,7 +54455,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "anthropic.claude-opus-5".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
-            feature_support: bcode_model::ModelFeatureSupport::default(),
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -65455,7 +65454,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "model".to_owned(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
-            feature_support: bcode_model::ModelFeatureSupport::default(),
             pricing: None,
             catalog_provider_id: None,
             catalog_identity: None,
@@ -67460,6 +67458,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ("us.anthropic.claude-opus-4-7-20250101-v1:0", "xhigh"),
             ("us.anthropic.claude-sonnet-5-20250101-v1:0", "high"),
             ("us.anthropic.claude-fable-5-20250101-v1:0", "xhigh"),
+            ("global.anthropic.claude-fable-5-1", "max"),
             ("us.anthropic.claude-haiku-5-20250101-v1:0", "high"),
             ("us.anthropic.claude-mythos-5-20250101-v1:0", "medium"),
         ] {

@@ -1097,6 +1097,21 @@ fn model_info_from_catalog_entry(entry: &ModelCatalogEntry) -> ModelInfo {
     model
 }
 
+fn catalog_boolean_support(
+    supported: bool,
+    source: CapabilitySource,
+    unsupported_reason: &str,
+) -> CapabilitySupport {
+    if supported {
+        CapabilitySupport::supported(source)
+    } else {
+        CapabilitySupport::Unsupported {
+            source,
+            reason: unsupported_reason.to_string(),
+        }
+    }
+}
+
 fn feature_support_from_catalog(
     capabilities: &CatalogCapabilities,
     source: CapabilitySource,
@@ -1135,18 +1150,60 @@ fn feature_support_from_catalog(
             ),
         ]);
     }
+    if capabilities.prompt_cache {
+        support.prompt_cache.extend([
+            (
+                bcode_model::PromptCacheFeature::ConversationPrefix,
+                CapabilitySupport::supported(source),
+            ),
+            (
+                bcode_model::PromptCacheFeature::ExplicitSystem,
+                CapabilitySupport::supported(source),
+            ),
+            (
+                bcode_model::PromptCacheFeature::ExplicitTools,
+                CapabilitySupport::supported(source),
+            ),
+            (
+                bcode_model::PromptCacheFeature::ExplicitMessage,
+                CapabilitySupport::supported(source),
+            ),
+        ]);
+        if !capabilities.prompt_cache_ttl_seconds.is_empty() {
+            support.prompt_cache.insert(
+                bcode_model::PromptCacheFeature::Ttl,
+                CapabilitySupport::supported(source),
+            );
+        }
+    }
+    if let Some(required) = capabilities.required_tool_choice {
+        support.tool_choice.insert(
+            ToolChoiceMode::Required,
+            catalog_boolean_support(
+                required,
+                source,
+                "model catalog explicitly marks required tool choice unsupported",
+            ),
+        );
+    }
+    if let Some(named) = capabilities.named_tool_choice {
+        support.tool_choice.insert(
+            ToolChoiceMode::Named,
+            catalog_boolean_support(
+                named,
+                source,
+                "model catalog explicitly marks named tool choice unsupported",
+            ),
+        );
+    }
     if let Some(parallel) = capabilities.parallel_tool_calls {
         support.tool_choice.insert(
             ToolChoiceMode::Parallel,
-            if parallel {
-                CapabilitySupport::supported(source)
-            } else {
-                CapabilitySupport::Unsupported {
-                    source,
-                    reason: "model catalog explicitly marks parallel tool calls unsupported"
-                        .to_string(),
-                }
-            },
+            catalog_boolean_support(
+                parallel,
+                source,
+                "model catalog explicitly marks parallel tool calls unsupported",
+            ),
         );
     }
     support
@@ -1164,6 +1221,10 @@ fn apply_catalog_feature_support(
         .extend(claims.structured_output);
     model.feature_support.tool_schema.extend(claims.tool_schema);
     model.feature_support.tool_choice.extend(claims.tool_choice);
+    model
+        .feature_support
+        .prompt_cache
+        .extend(claims.prompt_cache);
     model.feature_support.media_input.extend(claims.media_input);
 }
 
@@ -1196,7 +1257,10 @@ fn capabilities_from_catalog(
 }
 
 fn cache_info_from_catalog(capabilities: &CatalogCapabilities) -> ModelCacheInfo {
-    let mut cache = ModelCacheInfo::default();
+    let mut cache = ModelCacheInfo {
+        ttl_seconds: capabilities.prompt_cache_ttl_seconds.clone(),
+        ..ModelCacheInfo::default()
+    };
     if capabilities.prompt_cache {
         cache.capabilities.extend([
             ModelCacheCapability::PromptCacheKey,
@@ -1750,7 +1814,7 @@ fn live_model_entry(
     }
 }
 
-pub(crate) const fn merge_capabilities(
+pub(crate) fn merge_capabilities(
     left: &CatalogCapabilities,
     right: &CatalogCapabilities,
 ) -> CatalogCapabilities {
@@ -1759,14 +1823,18 @@ pub(crate) const fn merge_capabilities(
         image_input: left.image_input || right.image_input,
         text_output: left.text_output || right.text_output,
         tool_use: left.tool_use || right.tool_use,
-        parallel_tool_calls: match right.parallel_tool_calls {
-            Some(value) => Some(value),
-            None => left.parallel_tool_calls,
-        },
+        parallel_tool_calls: right.parallel_tool_calls.or(left.parallel_tool_calls),
+        required_tool_choice: right.required_tool_choice.or(left.required_tool_choice),
+        named_tool_choice: right.named_tool_choice.or(left.named_tool_choice),
         structured_outputs: left.structured_outputs || right.structured_outputs,
         reasoning: left.reasoning || right.reasoning,
         prompt_cache: left.prompt_cache || right.prompt_cache,
         explicit_prompt_cache: left.explicit_prompt_cache || right.explicit_prompt_cache,
+        prompt_cache_ttl_seconds: left
+            .prompt_cache_ttl_seconds
+            .union(&right.prompt_cache_ttl_seconds)
+            .copied()
+            .collect(),
         native_web_search: left.native_web_search || right.native_web_search,
     }
 }
@@ -2022,6 +2090,7 @@ mod tests {
             reasoning: None,
             cache: ModelCacheInfo {
                 capabilities: BTreeSet::from([ModelCacheCapability::CacheUsageReporting]),
+                ..ModelCacheInfo::default()
             },
             metadata_source: None,
             pricing: None,
@@ -2814,12 +2883,68 @@ status = "stable"
     }
 
     #[test]
+    fn bedrock_fable_5_1_uses_its_specific_capabilities() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let discovered_model = |model_id: &str| bcode_model::ModelInfo {
+            model_id: model_id.to_string(),
+            display_name: model_id.to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            max_image_input_base64_bytes: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+        for model_id in [
+            "anthropic.claude-fable-5-1",
+            "us.anthropic.claude-fable-5-1",
+            "global.anthropic.claude-fable-5-1",
+        ] {
+            let enriched = catalog.enrich_model("bedrock", discovered_model(model_id));
+            assert_eq!(enriched.context_window, Some(1_000_000));
+            assert_eq!(enriched.max_output_tokens, Some(128_000));
+            assert_eq!(
+                enriched.api_surface,
+                Some(bcode_model::ModelApiSurface::Messages)
+            );
+            let reasoning = enriched.reasoning.expect("reasoning metadata");
+            assert!(reasoning.effort_values.iter().any(|value| value == "max"));
+            assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+            assert!(matches!(
+                enriched
+                    .feature_support
+                    .tool_choice(bcode_model::ToolChoiceMode::Required),
+                bcode_model::CapabilitySupport::Unsupported { .. }
+            ));
+            assert!(matches!(
+                enriched
+                    .feature_support
+                    .tool_choice(bcode_model::ToolChoiceMode::Named),
+                bcode_model::CapabilitySupport::Unsupported { .. }
+            ));
+            assert!(
+                enriched
+                    .feature_support
+                    .prompt_cache(bcode_model::PromptCacheFeature::Ttl)
+                    .is_guaranteed()
+            );
+        }
+    }
+
+    #[test]
     fn bedrock_messages_api_only_models_route_to_messages_surface() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
 
         for model_id in [
             "global.anthropic.claude-opus-5",
             "global.anthropic.claude-fable-5",
+            "global.anthropic.claude-fable-5-1",
             "us.anthropic.claude-opus-4-7-20260416-v1:0",
             "us.anthropic.claude-sonnet-5-20260101-v1:0",
             "anthropic.claude-mythos-5",
@@ -3126,6 +3251,7 @@ status = "stable"
             ("us.anthropic.claude-opus-4-7-20250101-v1:0", true),
             ("us.anthropic.claude-sonnet-5-20250101-v1:0", true),
             ("us.anthropic.claude-fable-5-20250101-v1:0", true),
+            ("global.anthropic.claude-fable-5-1", true),
             ("us.anthropic.claude-haiku-5-20250101-v1:0", false),
             ("us.anthropic.claude-mythos-5-20250101-v1:0", false),
         ] {

@@ -7,7 +7,7 @@ use aws_sdk_bedrock::Client;
 use aws_sdk_bedrock::config::Region;
 use aws_sdk_bedrock::types::{FoundationModelSummary, ModelModality};
 use bcode_model_catalog_models::{CatalogCapabilities, LiveCatalogSnapshot, LiveModel};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bedrock discovery behavior.
 #[derive(Debug, Clone, Copy, Default)]
@@ -153,10 +153,13 @@ fn capabilities_from_summary(summary: &FoundationModelSummary) -> CatalogCapabil
         text_output: has_modality(output_modalities, "Text"),
         tool_use: false,
         parallel_tool_calls: None,
+        required_tool_choice: None,
+        named_tool_choice: None,
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,
         explicit_prompt_cache: false,
+        prompt_cache_ttl_seconds: BTreeSet::new(),
         native_web_search: false,
     }
 }

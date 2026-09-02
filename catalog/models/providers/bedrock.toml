@@ -222,6 +222,35 @@ effort_values = ["low", "medium", "high"]
 default_effort = "high"
 raw_reasoning_supported = true
 
+[models."anthropic.claude-fable-5-1"]
+model_id = "anthropic.claude-fable-5-1"
+display_name = "Claude Fable 5.1"
+aliases = ["*claude-fable-5-1*"]
+status = "stable"
+bcode_support = "supported"
+family = "claude"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "messages"
+thinking_mode = "adaptive"
+
+[models."anthropic.claude-fable-5-1".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+required_tool_choice = false
+named_tool_choice = false
+prompt_cache = true
+explicit_prompt_cache = true
+prompt_cache_ttl_seconds = [300, 3600]
+reasoning = true
+
+[models."anthropic.claude-fable-5-1".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "high"
+raw_reasoning_supported = true
+
 [models."anthropic.claude-fable-5"]
 model_id = "anthropic.claude-fable-5"
 display_name = "Claude Fable 5"
