@@ -19739,6 +19739,52 @@ async fn session_model_selection_with_runtime_context(
     selection
 }
 
+async fn workflow_runtime_context(
+    state: &ServerState,
+    parent_session_id: SessionId,
+) -> Option<ClientRuntimeContext> {
+    let selection = session_model_selection(state, parent_session_id).await;
+    attached_client_runtime_context(state, parent_session_id, &selection).await
+}
+
+async fn attached_client_runtime_context(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+) -> Option<ClientRuntimeContext> {
+    let attached_client_ids = {
+        let attached_clients = state.attached_client_sessions.lock().await;
+        attached_clients
+            .iter()
+            .filter_map(|(client_id, attached)| (*attached == session_id).then_some(*client_id))
+            .collect::<BTreeSet<_>>()
+    };
+    let candidates = {
+        let contexts = state.client_runtime_contexts.lock().await;
+        contexts
+            .iter()
+            .filter(|(client_id, _)| attached_client_ids.contains(client_id))
+            .map(|(_, context)| context)
+            .filter(|context| {
+                context
+                    .selected_provider_plugin_id
+                    .as_ref()
+                    .is_none_or(|provider| Some(provider) == selection.provider_plugin_id.as_ref())
+                    && context
+                        .selected_model_id
+                        .as_ref()
+                        .is_none_or(|model| Some(model) == selection.model_id.as_ref())
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut candidates = candidates.iter();
+    let first = candidates.next()?.clone();
+    candidates
+        .all(|candidate| candidate.provider_context == first.provider_context)
+        .then_some(first)
+}
+
 fn overlay_transient_provider_context(
     selection: &mut bcode_model::ProviderRequestContext,
     runtime: bcode_model::ProviderRequestContext,
@@ -29239,6 +29285,7 @@ async fn dispatch_workflow_prompt_turn(
             SessionId::from_str(value)
                 .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
         })?;
+    let workflow_runtime_context = workflow_runtime_context(state, parent_session_id).await;
     let provenance = ExecutionSessionProvenance {
         version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
         owner: "bcode.workflow".to_string(),
@@ -29398,7 +29445,7 @@ async fn dispatch_workflow_prompt_turn(
             state,
             target_session_id,
             prompt,
-            None,
+            workflow_runtime_context,
             metadata,
             Some(Arc::clone(&cancellation)),
         ),
@@ -54037,6 +54084,124 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    #[tokio::test]
+    async fn daemon_owned_workflow_turn_recovers_attached_client_auth() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("workflow auth".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    settings: BTreeMap::from([("transport".to_owned(), "responses".to_owned())]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..SessionModelSelection::default()
+            },
+        );
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .insert(session_id, SessionModelSelectionOrigin::User);
+        let client_id = ClientId::new();
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(ClientRuntimeContext {
+                    selected_provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                    selected_model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                    provider_context: bcode_model::ProviderRequestContext {
+                        auth_profile: Some("bedrock".to_owned()),
+                        auth: Some(bcode_model::ProviderAuthContext {
+                            credentials: BTreeMap::from([(
+                                "bearer_token".to_owned(),
+                                bcode_model::ProviderAuthCredential {
+                                    value: "secret-token".to_owned(),
+                                    source: Some("AWS_BEARER_TOKEN_BEDROCK".to_owned()),
+                                },
+                            )]),
+                            ..bcode_model::ProviderAuthContext::default()
+                        }),
+                        env: BTreeMap::from([(
+                            "AWS_BEARER_TOKEN_BEDROCK".to_owned(),
+                            "secret-token".to_owned(),
+                        )]),
+                        ..bcode_model::ProviderRequestContext::default()
+                    },
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        state.attach_client_session(client_id, session_id).await;
+
+        let credential = workflow_runtime_context(&state, session_id)
+            .await
+            .and_then(|context| context.provider_context.auth)
+            .and_then(|auth| auth.credentials.get("bearer_token").cloned());
+
+        assert_eq!(
+            credential.map(|credential| credential.value),
+            Some("secret-token".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_workflow_turn_fails_closed_for_ambiguous_attached_auth() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("ambiguous workflow auth".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                ..SessionModelSelection::default()
+            },
+        );
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .insert(session_id, SessionModelSelectionOrigin::User);
+        for token in ["first-token", "second-token"] {
+            let client_id = ClientId::new();
+            state
+                .set_client_runtime_context(
+                    client_id,
+                    Some(ClientRuntimeContext {
+                        selected_provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                        selected_model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                        provider_context: bcode_model::ProviderRequestContext {
+                            env: BTreeMap::from([(
+                                "AWS_BEARER_TOKEN_BEDROCK".to_owned(),
+                                token.to_owned(),
+                            )]),
+                            ..bcode_model::ProviderRequestContext::default()
+                        },
+                        ..ClientRuntimeContext::default()
+                    }),
+                )
+                .await;
+            state.attach_client_session(client_id, session_id).await;
+        }
+
+        assert!(workflow_runtime_context(&state, session_id).await.is_none());
+    }
+
     #[test]
     fn bundled_model_provider_route_prefers_v2_and_keeps_v1_compatibility() {
         let state = test_server_state_with_fake_provider(SessionManager::default());
@@ -57204,6 +57369,32 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "echo_input:".to_string(),
         );
         let state = Arc::new(state);
+        let client_id = ClientId::new();
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(ClientRuntimeContext {
+                    selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                    selected_model_id: Some("fake-echo".to_owned()),
+                    provider_context: bcode_model::ProviderRequestContext {
+                        auth_profile: Some("workflow-test-auth".to_owned()),
+                        auth: Some(bcode_model::ProviderAuthContext {
+                            credentials: BTreeMap::from([(
+                                "bearer_token".to_owned(),
+                                bcode_model::ProviderAuthCredential {
+                                    value: "workflow-secret".to_owned(),
+                                    source: Some("TEST_BEARER_TOKEN".to_owned()),
+                                },
+                            )]),
+                            ..bcode_model::ProviderAuthContext::default()
+                        }),
+                        ..bcode_model::ProviderRequestContext::default()
+                    },
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        state.attach_client_session(client_id, parent.id).await;
 
         let schema = bcode_workflow::ValueSchema {
             type_name: "bcode.loop.iteration/v1".to_string(),
@@ -57335,6 +57526,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .session_history(parent.id)
             .await
             .expect("history");
+        let observed_auth_profiles = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::RequestContextObserved { observation } => {
+                    observation.request.effective_auth_profile.as_deref()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            observed_auth_profiles.len() >= 2
+                && observed_auth_profiles
+                    .iter()
+                    .all(|profile| *profile == "workflow-test-auth"),
+            "every daemon-owned workflow request must retain the attached client's transient auth: {observed_auth_profiles:?}"
+        );
         assert_eq!(
             history
                 .iter()
