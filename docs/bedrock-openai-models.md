@@ -62,18 +62,26 @@ export BCODE_BEDROCK_MANTLE_BASE_URL=https://ai.nexus9.app/gw       # For Mantle
 ```
 
 When using `AWS_ENDPOINT_URL_BEDROCK` alone, it applies to both Bedrock Runtime (Converse) and
-Mantle (OpenAI/Anthropic) APIs.
+Mantle (OpenAI/Anthropic) APIs. Endpoint configuration changes only the destination; it never
+changes the catalog-resolved API surface. In particular, Responses-only GPT models remain on
+Responses when a custom gateway is configured. An explicit `runtime` override for such a model is
+rejected before network work rather than silently degrading it to Converse.
 
 **Path construction:**
 - Bedrock Runtime (via AWS SDK): Appends `/model/{model-id}/converse-stream`
-- Mantle OpenAI: Appends `/openai/v1/responses`
-- Mantle Anthropic: Appends `/anthropic/v1/messages`
+- Unified gateway OpenAI adapter: Appends `/v1/responses`; the gateway forwards it to AWS
+  `/openai/v1/responses`
+- Unified gateway Anthropic adapter: Appends `/v1/messages`
+- Direct AWS Mantle OpenAI: Uses `/openai/v1/responses`
+- Direct AWS Mantle Anthropic: Uses `/anthropic/v1/messages`
 
 For example, with `AWS_ENDPOINT_URL_BEDROCK=https://ai.nexus9.app/gw`:
-- Claude Opus 5 → `https://ai.nexus9.app/gw/model/anthropic.claude-opus-5/converse-stream`
-- GPT 5.6 Sol → `https://ai.nexus9.app/gw/openai/v1/responses`
+- Claude Opus 5 Runtime → `https://ai.nexus9.app/gw/model/anthropic.claude-opus-5/converse-stream`
+- GPT 5.6 Sol → `https://ai.nexus9.app/gw/v1/responses`
 
-Your gateway should accept these paths and route to the appropriate Bedrock API backend.
+A unified gateway is responsible for translating its client-facing adapter paths to the native AWS
+upstream paths. Bcode does not append the AWS `/openai` or `/anthropic` service prefix to a custom
+unified gateway base.
 
 ### Optional transport override
 
@@ -106,6 +114,17 @@ so a Responses model accepts them with no configuration.
 
 Provider-native conversation reuse is not used on this path: Bcode does not ask Mantle to persist
 responses, and `store` is always sent as `false`.
+
+The live acceptance check requires a write on its first request and a read on a same-prefix
+follow-up:
+
+```sh
+AWS_BEDROCK_OPENAI_MODEL=us.openai.gpt-5.6-sol \
+  scripts/test-bedrock-openai-cache.sh
+```
+
+A successful request or cache write alone is not a pass; the follow-up must report non-zero cached
+input tokens.
 
 ## Verify access
 

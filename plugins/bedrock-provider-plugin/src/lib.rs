@@ -209,9 +209,11 @@ impl BedrockProviderPlugin {
         if positioned_output {
             turn.enable_positioned_output();
         }
-        turn.push(ProviderTurnEvent::RequestProjection {
-            projection: bedrock_request_projection(&request),
-        });
+        if let Ok(route) = resolve_bedrock_route(&request, &Settings::resolve(Some(&request))) {
+            turn.push(ProviderTurnEvent::RequestProjection {
+                projection: bedrock_request_projection(&request, route),
+            });
+        }
         match &self.runtime {
             Ok(runtime) => {
                 self.turn_executor
@@ -239,9 +241,11 @@ impl BedrockProviderPlugin {
             .expect("bedrock turn store lock should not be poisoned")
             .insert_started("bedrock-turn");
         turn.enable_positioned_output();
-        turn.push(ProviderTurnEvent::RequestProjection {
-            projection: bedrock_request_projection(&request),
-        });
+        if let Ok(route) = resolve_bedrock_route(&request, &Settings::resolve(Some(&request))) {
+            turn.push(ProviderTurnEvent::RequestProjection {
+                projection: bedrock_request_projection(&request, route),
+            });
+        }
         match &self.runtime {
             Ok(runtime) => {
                 self.turn_executor.start(
@@ -534,33 +538,15 @@ async fn stream_bedrock_turn_inner(
     discovery: Arc<Mutex<DiscoveryCache>>,
 ) -> Result<StreamOutcome, ProviderError> {
     let settings = Settings::resolve(Some(request));
-    let transport = settings.transport.clone()?;
-    // Explicit Mantle selection uses Responses. A custom Runtime gateway remains on Converse even
-    // when the catalog model's native AWS surface is Responses; the endpoint owns that translation.
-    let responses_surface = uses_mantle_openai_surface(request, transport, &settings);
-    let mut effective_request;
-    let request = if !responses_surface
-        && request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses)
-    {
-        effective_request = request.clone();
-        disable_prompt_cache(&mut effective_request);
-        &effective_request
-    } else {
-        request
-    };
-
-    // Feature validation follows the model's catalog metadata, not the routing decision.
-    // Custom gateways may translate Converse requests to backends that support Responses features.
-    let model_supports_responses_features = transport == BedrockTransport::MantleOpenAi
-        || request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses);
-
-    validate_bedrock_request(request, model_supports_responses_features)?;
+    let route = resolve_bedrock_route(request, &settings)?;
+    let responses_surface = route == EffectiveBedrockRoute::OpenAiResponses;
+    validate_bedrock_request(request, responses_surface)?;
     let selection = resolve_turn_model_selection(request, &settings, turn, &discovery).await?;
     let name_map = bedrock_tool_name_map(&request.tools);
     if responses_surface {
         return stream_mantle_openai_turn(request, &settings, &selection, turn, name_map).await;
     }
-    if transport == BedrockTransport::MantleAnthropic {
+    if route == EffectiveBedrockRoute::AnthropicMessages {
         return stream_mantle_anthropic_turn(request, &settings, &selection, turn, name_map).await;
     }
     let client = bedrock_client(&settings).await;
@@ -748,23 +734,41 @@ async fn stream_mantle_anthropic_turn(
     }))
 }
 
-/// Whether this turn should be served over the `OpenAI` Responses surface.
-///
-/// Explicit Mantle transport selection wins. A configured custom Runtime endpoint remains on
-/// Converse because that gateway owns translation for catalog models whose native AWS surface is
-/// Responses. Without a custom endpoint, the model catalog is authoritative.
-fn uses_mantle_openai_surface(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveBedrockRoute {
+    Converse,
+    AnthropicMessages,
+    OpenAiResponses,
+}
+
+/// Resolve the wire surface independently from endpoint location.
+fn resolve_bedrock_route(
     request: &ModelTurnRequest,
-    transport: BedrockTransport,
     settings: &Settings,
-) -> bool {
-    if transport == BedrockTransport::MantleOpenAi {
-        return true;
+) -> Result<EffectiveBedrockRoute, ProviderError> {
+    let catalog_surface = request.provider_context.api_surface;
+    let transport = settings.transport.clone()?;
+    if settings.transport_explicit {
+        return match transport {
+            BedrockTransport::MantleOpenAi => Ok(EffectiveBedrockRoute::OpenAiResponses),
+            BedrockTransport::MantleAnthropic => Ok(EffectiveBedrockRoute::AnthropicMessages),
+            BedrockTransport::Runtime
+                if catalog_surface == Some(bcode_model::ModelApiSurface::Responses) =>
+            {
+                Err(provider_error(
+                    "bedrock_runtime_surface_unsupported",
+                    ProviderErrorCategory::UnsupportedFeature,
+                    "the selected model requires the OpenAI Responses surface and cannot be forced through Bedrock Runtime",
+                ))
+            }
+            BedrockTransport::Runtime => Ok(EffectiveBedrockRoute::Converse),
+        };
     }
-    if settings.endpoint_url.is_some() || settings.mantle_base_url.is_some() {
-        return false;
-    }
-    request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Responses)
+    Ok(match catalog_surface {
+        Some(bcode_model::ModelApiSurface::Responses) => EffectiveBedrockRoute::OpenAiResponses,
+        Some(bcode_model::ModelApiSurface::Messages) => EffectiveBedrockRoute::AnthropicMessages,
+        _ => EffectiveBedrockRoute::Converse,
+    })
 }
 
 /// Support target describing the Bedrock Mantle `OpenAI` Responses deployment.
@@ -1036,154 +1040,44 @@ async fn stream_mantle_openai_turn(
     }
     .map_err(|error| mantle_network_error("client_build_failed", &error))?;
 
-    // For custom endpoints, try multiple path patterns to discover what the gateway expects
-    let endpoints_to_try = if settings.mantle_base_url.is_some() {
-        vec![
-            ("default", mantle_endpoint(settings, MantleFlavor::OpenAi)?), // /gw/openai/v1/responses
-            (
-                "bedrock_prefix",
-                mantle_endpoint_with_override(settings, MantleFlavor::OpenAi, "/bedrock")?,
-            ), // /gw/bedrock/openai/v1/responses
-            (
-                "runtime_prefix",
-                mantle_endpoint_with_override(settings, MantleFlavor::OpenAi, "/bedrock-runtime")?,
-            ), // /gw/bedrock-runtime/openai/v1/responses
-        ]
-    } else {
-        vec![("default", mantle_endpoint(settings, MantleFlavor::OpenAi)?)]
-    };
-
+    let endpoint = mantle_endpoint(settings, MantleFlavor::OpenAi)?;
+    let request_builder = client
+        .post(&endpoint)
+        .bearer_auth(&token)
+        .header("accept", "text/event-stream")
+        .header("user-agent", "bcode/0.0.1");
     let mut last_error = None;
     for model_id in &selection.model_ids {
-        // Try different model ID variations
-        let model_id_variations = if settings.mantle_base_url.is_some() {
-            let base_id = model_id.strip_prefix("us.").unwrap_or(model_id);
-            vec![
-                ("original", model_id.clone()),
-                ("without_us", base_id.to_string()),
-                ("with_us", format!("us.{base_id}")),
-            ]
-        } else {
-            vec![("original", model_id.clone())]
-        };
-
-        // Try each endpoint pattern with each model ID variation
-        for (path_label, endpoint) in &endpoints_to_try {
-            for (id_label, test_model_id) in &model_id_variations {
-                // Log attempt to file
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/bcode-mantle-attempts.log")
-                {
-                    use std::io::Write;
-                    let _ = writeln!(
-                        f,
-                        "Attempt: path={path_label} model_id={id_label} url={endpoint}"
-                    );
-                }
-
-                eprintln!("\n🔍 Trying: path={path_label} model_id={id_label}");
-                eprintln!("   URL: {endpoint}");
-                eprintln!("   Model ID: {test_model_id}");
-
-                let request_builder = client
-                    .post(endpoint)
-                    .bearer_auth(&token)
-                    .header("accept", "text/event-stream")
-                    .header("user-agent", "bcode/0.0.1");
-
-                let response = request_builder
-                    .try_clone()
-                    .ok_or_else(|| {
-                        provider_error(
-                            "bedrock_mantle_request_clone_failed",
-                            ProviderErrorCategory::ProviderInternal,
-                            "failed to prepare Bedrock Mantle request",
-                        )
-                    })?
-                    .json(&build_mantle_openai_request(request, test_model_id)?)
-                    .send()
-                    .await
-                    .map_err(|error| mantle_network_error("request_failed", &error))?;
-
-                if response.status().is_success() {
-                    // Log success to file
-                    let _ = std::fs::write(
-                        "/tmp/bcode-mantle-success.txt",
-                        format!(
-                            "SUCCESS at {}\nPath: {} ({})\nModel ID: {} ({})\nURL: {}\n",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                            path_label,
-                            endpoint,
-                            id_label,
-                            test_model_id,
-                            endpoint
-                        ),
-                    );
-
-                    // Log which combination worked
-                    tracing::warn!(
-                        target: "bcode_bedrock::mantle",
-                        endpoint = %endpoint,
-                        path_pattern = path_label,
-                        model_id = %test_model_id,
-                        model_id_pattern = id_label,
-                        original_model_id = %model_id,
-                        "✅ SUCCESS: Mantle OpenAI request succeeded with this pattern"
-                    );
-                    eprintln!(
-                        "\n🎉 SUCCESS: Gateway accepted path={path_label} model_id={id_label}"
-                    );
-                    eprintln!("   Endpoint: {endpoint}");
-                    eprintln!("   Model ID: {test_model_id}\n");
-
-                    return read_mantle_openai_stream(
-                        response,
-                        turn,
-                        &name_map,
-                        request.metadata.get("service_tier").map(String::as_str),
-                        requested_mantle_cache_retention(request),
-                    )
-                    .await;
-                }
-
-                let error = mantle_status_error(response).await;
-
-                // Log failure to file
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/bcode-mantle-attempts.log")
-                {
-                    use std::io::Write;
-                    let _ = writeln!(f, "  Result: FAILED - {}", error.message);
-                }
-
-                // Log each failed attempt
-                tracing::debug!(
-                    target: "bcode_bedrock::mantle",
-                    endpoint = %endpoint,
-                    path_pattern = path_label,
-                    model_id = %test_model_id,
-                    model_id_pattern = id_label,
-                    error = %error.message,
-                    "❌ Mantle OpenAI pattern failed"
-                );
-                eprintln!(
-                    "❌ FAILED: path={path_label} model_id={id_label} -> {}",
-                    error.message
-                );
-
-                last_error = Some(error);
-            }
+        let response = request_builder
+            .try_clone()
+            .ok_or_else(|| {
+                provider_error(
+                    "bedrock_mantle_request_clone_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    "failed to prepare Bedrock Mantle request",
+                )
+            })?
+            .json(&build_mantle_openai_request(request, model_id)?)
+            .send()
+            .await
+            .map_err(|error| mantle_network_error("request_failed", &error))?;
+        if response.status().is_success() {
+            return read_mantle_openai_stream(
+                response,
+                turn,
+                &name_map,
+                request.metadata.get("service_tier").map(String::as_str),
+                requested_mantle_cache_retention(request),
+            )
+            .await;
         }
+        let error = mantle_status_error(response).await;
+        let is_last = selection.model_ids.last().map(String::as_str) == Some(model_id);
+        if selection.explicit || is_last {
+            return Err(error);
+        }
+        last_error = Some(error);
     }
-
-    eprintln!("\n⚠️  All Mantle OpenAI patterns failed. Check gateway configuration.\n");
     Err(last_error.unwrap_or_else(|| {
         provider_error(
             "bedrock_mantle_openai_model_unavailable",
@@ -1673,7 +1567,10 @@ impl MantleFlavor {
         }
     }
 
-    /// Request path appended to the resolved base URL (for default AWS endpoints).
+    /// Request path appended to both AWS-native and adapter-style gateway base URLs.
+    ///
+    /// AWS-native Mantle bases already include the service prefix. Unified gateways expose
+    /// provider-neutral client paths and translate them to AWS's native upstream path.
     const fn request_path(self) -> &'static str {
         match self {
             Self::Anthropic => "/v1/messages",
@@ -1681,11 +1578,11 @@ impl MantleFlavor {
         }
     }
 
-    /// Full request path including service prefix (for custom endpoints/gateways).
-    const fn full_request_path(self) -> &'static str {
+    /// Client-facing request path appended to a unified custom gateway base.
+    const fn gateway_request_path(self) -> &'static str {
         match self {
-            Self::Anthropic => "/anthropic/v1/messages",
-            Self::OpenAi => "/openai/v1/responses",
+            Self::Anthropic => "/v1/messages",
+            Self::OpenAi => "/v1/responses",
         }
     }
 }
@@ -1722,61 +1619,20 @@ fn mantle_endpoint(settings: &Settings, flavor: MantleFlavor) -> Result<String, 
             "Bedrock Mantle base URL must use HTTPS",
         ));
     }
-    // For custom endpoints, append the full AWS-style path including service prefix.
-    // For default AWS endpoints, the prefix is already in the base URL.
-    let is_default_aws_endpoint = settings.mantle_base_url.is_none();
-    let path = if is_default_aws_endpoint {
-        // Default AWS: base already has /openai/v1 or /anthropic, just add final segment
-        format!(
-            "{}{}",
-            url.path().trim_end_matches('/'),
-            flavor.request_path()
-        )
+    // AWS-native bases already contain `/openai/v1` or `/anthropic`; unified custom gateways
+    // expose the client-facing `/v1/*` adapter paths and translate them to the AWS upstream path.
+    let request_path = if settings.mantle_base_url.is_some() {
+        flavor.gateway_request_path()
     } else {
-        // Custom endpoint: append full service path for gateway routing
-        format!(
-            "{}{}",
-            url.path().trim_end_matches('/'),
-            flavor.full_request_path()
-        )
+        flavor.request_path()
     };
+    let path = format!("{}{request_path}", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url.to_string())
 }
 
 fn mantle_anthropic_messages_endpoint(settings: &Settings) -> Result<String, ProviderError> {
     mantle_endpoint(settings, MantleFlavor::Anthropic)
-}
-
-/// Build a Mantle endpoint with a custom path override for testing.
-fn mantle_endpoint_with_override(
-    settings: &Settings,
-    flavor: MantleFlavor,
-    path_prefix: &str,
-) -> Result<String, ProviderError> {
-    let base_url = settings.mantle_base_url.clone().ok_or_else(|| {
-        provider_error(
-            "bedrock_mantle_base_url_missing",
-            ProviderErrorCategory::Config,
-            "path override requires explicit mantle_base_url",
-        )
-    })?;
-
-    let mut url = reqwest::Url::parse(base_url.trim()).map_err(|error| {
-        provider_error(
-            "bedrock_mantle_base_url_invalid",
-            ProviderErrorCategory::Config,
-            format!("invalid Bedrock Mantle base URL: {error}"),
-        )
-    })?;
-
-    // Build path: base path (e.g., /gw) + prefix (e.g., /bedrock) + service path (e.g., /openai/v1/responses)
-    let base_path = url.path().trim_end_matches('/');
-    let service_path = flavor.full_request_path();
-    let full_path = format!("{base_path}{path_prefix}{service_path}");
-
-    url.set_path(&full_path);
-    Ok(url.to_string())
 }
 
 async fn mantle_status_error(response: reqwest::Response) -> ProviderError {
@@ -2845,27 +2701,40 @@ impl StreamAccumulator {
             },
             ConverseStreamOutput::Metadata(event) => {
                 if let Some(usage) = event.usage() {
-                    let input_tokens = nonnegative_u32(usage.input_tokens());
+                    let native_input_tokens = nonnegative_u32(usage.input_tokens());
                     let cache_read_input_tokens =
                         usage.cache_read_input_tokens().and_then(nonnegative_u32);
                     let cache_write_input_tokens =
                         usage.cache_write_input_tokens().and_then(nonnegative_u32);
+                    let input_tokens = native_input_tokens.map(|tokens| {
+                        u32::try_from(complete_request_input_tokens(
+                            tokens,
+                            cache_read_input_tokens,
+                            cache_write_input_tokens,
+                        ))
+                        .unwrap_or(u32::MAX)
+                    });
+                    let output_tokens = nonnegative_u32(usage.output_tokens());
+                    let details = converse_pricing_details(
+                        native_input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens,
+                        cache_write_input_tokens,
+                    );
                     turn.push(ProviderTurnEvent::Usage {
                         usage: TokenUsage {
                             input_tokens,
-                            output_tokens: nonnegative_u32(usage.output_tokens()),
+                            output_tokens,
+                            total_tokens: input_tokens
+                                .zip(output_tokens)
+                                .map(|(input, output)| input.saturating_add(output)),
                             cached_input_tokens: cache_read_input_tokens,
                             cache_write_input_tokens,
+                            details,
                             pricing_context: Box::new(bcode_model::ModelPricingContext {
                                 service_tier: Some("standard".to_string()),
                                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
-                                request_input_tokens: input_tokens.map(|input_tokens| {
-                                    complete_request_input_tokens(
-                                        input_tokens,
-                                        cache_read_input_tokens,
-                                        cache_write_input_tokens,
-                                    )
-                                }),
+                                request_input_tokens: input_tokens.map(u64::from),
                                 ..bcode_model::ModelPricingContext::default()
                             }),
                             ..TokenUsage::default()
@@ -2873,13 +2742,9 @@ impl StreamAccumulator {
                     });
                     if let Some(input_tokens) = input_tokens {
                         turn.push(ProviderTurnEvent::ExactRequestInputTokens {
-                            tokens: bcode_model::ExactRequestInputTokens::new(
-                                complete_request_input_tokens(
-                                    input_tokens,
-                                    cache_read_input_tokens,
-                                    cache_write_input_tokens,
-                                ),
-                            ),
+                            tokens: bcode_model::ExactRequestInputTokens::new(u64::from(
+                                input_tokens,
+                            )),
                         });
                     }
                 }
@@ -3607,13 +3472,14 @@ fn apply_anthropic_thinking_fields(
     }
 }
 
-fn bedrock_request_projection(request: &ModelTurnRequest) -> ProviderRequestProjection {
-    let messages_surface =
-        request.provider_context.api_surface == Some(bcode_model::ModelApiSurface::Messages);
-    let emitted_cache_points = if messages_surface {
-        0
-    } else {
-        bedrock_emitted_cache_point_count(request)
+fn bedrock_request_projection(
+    request: &ModelTurnRequest,
+    route: EffectiveBedrockRoute,
+) -> ProviderRequestProjection {
+    let emitted_cache_points = match route {
+        EffectiveBedrockRoute::OpenAiResponses => prompt_cache_point_count(request),
+        EffectiveBedrockRoute::AnthropicMessages => 0,
+        EffectiveBedrockRoute::Converse => bedrock_emitted_cache_point_count(request),
     };
     let sent_messages = request
         .messages
@@ -3623,10 +3489,10 @@ fn bedrock_request_projection(request: &ModelTurnRequest) -> ProviderRequestProj
     ProviderRequestProjection {
         provider: Some("bcode.bedrock".to_string()),
         api_shape: Some(
-            if messages_surface {
-                "bedrock_anthropic_messages"
-            } else {
-                "bedrock_converse"
+            match route {
+                EffectiveBedrockRoute::Converse => "bedrock_converse",
+                EffectiveBedrockRoute::AnthropicMessages => "bedrock_anthropic_messages",
+                EffectiveBedrockRoute::OpenAiResponses => "bedrock_mantle_openai_responses",
             }
             .to_string(),
         ),
@@ -4223,6 +4089,7 @@ impl BedrockTransport {
 #[allow(clippy::struct_excessive_bools)]
 struct Settings {
     transport: Result<BedrockTransport, ProviderError>,
+    transport_explicit: bool,
     mantle_base_url: Option<String>,
     mantle_auth_header: bool,
     force_http1: bool,
@@ -4368,6 +4235,7 @@ impl Settings {
         let (region, region_source) = resolve_configured_region(&value, &first_context_env);
         let transport_value =
             first_context_env(&["BCODE_BEDROCK_TRANSPORT"]).or_else(|| value(&["transport"]));
+        let transport_explicit = transport_value.is_some();
         let transport = BedrockTransport::parse(transport_value.as_deref());
 
         // Resolve endpoint_url with AWS standard variable taking precedence
@@ -4391,6 +4259,7 @@ impl Settings {
                 .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
         Self {
             transport,
+            transport_explicit,
             mantle_base_url,
             mantle_auth_header,
             force_http1,
@@ -5965,6 +5834,34 @@ fn nonnegative_u32(value: i32) -> Option<u32> {
     u32::try_from(value).ok()
 }
 
+fn converse_pricing_details(
+    ordinary_input: Option<u32>,
+    output: Option<u32>,
+    cache_read: Option<u32>,
+    cache_write: Option<u32>,
+) -> Box<[bcode_model::ModelTokenUsageDetail]> {
+    use bcode_model::{ModelPricingBucket, ModelTokenModality, ModelTokenUsageDetail};
+    [
+        (ModelPricingBucket::Input, ordinary_input),
+        (ModelPricingBucket::CacheReadInput, cache_read),
+        (ModelPricingBucket::CacheWriteInput, cache_write),
+        (ModelPricingBucket::Output, output),
+    ]
+    .into_iter()
+    .filter_map(|(bucket, tokens)| {
+        tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| ModelTokenUsageDetail {
+                bucket,
+                modality: ModelTokenModality::Text,
+                tokens,
+                cache_ttl_seconds: None,
+            })
+    })
+    .collect::<Vec<_>>()
+    .into_boxed_slice()
+}
+
 /// Combine Bedrock input-token fields into the complete request input context.
 ///
 /// Bedrock reports `inputTokens` as *non-cached* input whenever prompt caching participates in a
@@ -7145,20 +7042,20 @@ mod tests {
         custom.mantle_base_url = Some("http://127.0.0.1:8080".to_string());
         assert_eq!(
             mantle_anthropic_messages_endpoint(&custom).expect("custom endpoint"),
-            "http://127.0.0.1:8080/anthropic/v1/messages"
+            "http://127.0.0.1:8080/v1/messages"
         );
 
         // Gateway with base path preserves it and appends full Mantle path
         custom.mantle_base_url = Some("https://gateway.example.com/gw".to_string());
         assert_eq!(
             mantle_anthropic_messages_endpoint(&custom).expect("gateway endpoint"),
-            "https://gateway.example.com/gw/anthropic/v1/messages"
+            "https://gateway.example.com/gw/v1/messages"
         );
 
         // OpenAI surface also appends full paths
         assert_eq!(
             mantle_endpoint(&custom, MantleFlavor::OpenAi).expect("custom openai endpoint"),
-            "https://gateway.example.com/gw/openai/v1/responses"
+            "https://gateway.example.com/gw/v1/responses"
         );
     }
 
@@ -7335,14 +7232,194 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn custom_gateway_responses_route_reuses_stable_prefix() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let model_id = "catalog-responses-model";
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test gateway binds");
+        let address = listener.local_addr().expect("test gateway address");
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let server_captured = Arc::clone(&captured);
+        let server = std::thread::spawn(move || {
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("gateway request accepts");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).expect("gateway request reads");
+                    assert!(count > 0, "request ended before headers");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(position) =
+                        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                assert!(headers.starts_with("POST /gw/v1/responses HTTP/1.1"));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-token")
+                );
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .expect("content length");
+                while bytes.len() - header_end < content_length {
+                    let count = stream.read(&mut buffer).expect("gateway body reads");
+                    assert!(count > 0, "request ended before body");
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .expect("Responses body decodes");
+                assert_eq!(body["model"], model_id);
+                assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+                assert!(
+                    body["prompt_cache_key"]
+                        .as_str()
+                        .is_some_and(|key| !key.is_empty())
+                );
+                assert_eq!(body["store"], false);
+                server_captured.lock().expect("capture lock").push(body);
+
+                let details = if request_index == 0 {
+                    serde_json::json!({"cached_tokens": 0, "cache_write_tokens": 9000})
+                } else {
+                    serde_json::json!({"cached_tokens": 9000, "cache_write_tokens": 0})
+                };
+                let event = serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "usage": {
+                            "input_tokens": 10000 + request_index,
+                            "output_tokens": 10,
+                            "total_tokens": 10010 + request_index,
+                            "input_tokens_details": details
+                        }
+                    }
+                });
+                let payload = format!("data: {event}\n\n");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                )
+                .expect("gateway response writes");
+            }
+        });
+
+        let mut request = test_model_turn_request();
+        request.model_id = model_id.to_string();
+        request.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Responses);
+        request.provider_context.settings.insert(
+            "mantle_base_url".to_string(),
+            format!("http://{address}/gw"),
+        );
+        request.provider_context.auth = Some(bcode_model::ProviderAuthContext {
+            credentials: BTreeMap::from([(
+                "bearer_token".to_string(),
+                bcode_model::ProviderAuthCredential {
+                    value: "test-token".to_string(),
+                    source: Some("test".to_string()),
+                },
+            )]),
+            ..bcode_model::ProviderAuthContext::default()
+        });
+        enable_explicit_prompt_cache(&mut request);
+        request.system_prompt = Some("stable prefix ".repeat(1_000));
+
+        let cache = Arc::new(Mutex::new(DiscoveryCache::default()));
+        let mut usages = Vec::new();
+        for suffix in ["first suffix", "second suffix"] {
+            request.messages = vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: suffix.to_string(),
+                }],
+            }];
+            let turn = TurnState::default();
+            assert_eq!(
+                stream_bedrock_turn_inner(&request, &turn, Arc::clone(&cache))
+                    .await
+                    .expect("gateway Responses turn succeeds"),
+                StreamOutcome::Finished
+            );
+            let usage = turn
+                .drain()
+                .into_iter()
+                .find_map(|event| match event {
+                    ProviderTurnEvent::Usage { usage } => Some(usage),
+                    _ => None,
+                })
+                .expect("turn reports usage");
+            usages.push(usage);
+        }
+        server.join().expect("test gateway joins");
+        assert_eq!(usages[0].cache_write_input_tokens, Some(9000));
+        assert_eq!(usages[0].cached_input_tokens, Some(0));
+        assert_eq!(usages[1].cached_input_tokens, Some(9000));
+        assert_eq!(usages[1].cache_write_input_tokens, Some(0));
+        let (first_key, second_key, first_input, second_input) = {
+            let bodies = captured.lock().expect("capture lock");
+            (
+                bodies[0]["prompt_cache_key"].clone(),
+                bodies[1]["prompt_cache_key"].clone(),
+                bodies[0]["input"].clone(),
+                bodies[1]["input"].clone(),
+            )
+        };
+        assert_eq!(first_key, second_key);
+        assert_ne!(first_input, second_input);
+    }
+
     /// Live acceptance test for Bedrock's cache contract.
     ///
-    /// Run with `AWS_BEARER_TOKEN_BEDROCK`, `AWS_ENDPOINT_URL_BEDROCK`, and optionally
-    /// `AWS_BEDROCK_OPENAI_MODEL`; the endpoint may be either a Mantle base URL or the full
-    /// `/openai/v1/responses` URL.
+    /// Run with `AWS_BEARER_TOKEN_BEDROCK`, `AWS_ENDPOINT_URL_BEDROCK`, and
+    /// `AWS_BEDROCK_OPENAI_MODEL`; the endpoint may be a unified gateway base, a Mantle base URL,
+    /// or a full `/v1/responses`/`/openai/v1/responses` URL.
     #[tokio::test]
     #[ignore = "requires live Bedrock Mantle credentials and incurs model usage"]
+    #[allow(clippy::too_many_lines)]
     async fn live_mantle_openai_reuses_explicit_stable_prefix() {
+        fn ordinary_input(usage: &TokenUsage) -> u32 {
+            usage
+                .input_tokens
+                .unwrap_or_default()
+                .saturating_sub(usage.cached_input_tokens.unwrap_or_default())
+                .saturating_sub(usage.cache_write_input_tokens.unwrap_or_default())
+        }
+
+        fn breakpoint_count(value: &serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::Array(values) => values.iter().map(breakpoint_count).sum(),
+                serde_json::Value::Object(values) => {
+                    usize::from(values.contains_key("prompt_cache_breakpoint"))
+                        + values.values().map(breakpoint_count).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+
+        fn percent(numerator: u32, denominator: u32) -> f64 {
+            if denominator == 0 {
+                0.0
+            } else {
+                f64::from(numerator) * 100.0 / f64::from(denominator)
+            }
+        }
+
         async fn send(endpoint: &str, token: &str, body: serde_json::Value) -> TokenUsage {
             let response = reqwest::Client::new()
                 .post(endpoint)
@@ -7369,49 +7446,186 @@ mod tests {
             .expect("AWS_BEARER_TOKEN_BEDROCK is required");
         let base = std::env::var("AWS_ENDPOINT_URL_BEDROCK")
             .expect("AWS_ENDPOINT_URL_BEDROCK is required");
-        let endpoint = if base.trim_end_matches('/').ends_with("/openai/v1/responses") {
+        let trimmed = base.trim_end_matches('/');
+        let endpoint = if trimmed.ends_with("/v1/responses") {
             base
+        } else if trimmed.contains("bedrock-mantle.") && trimmed.ends_with("/openai/v1") {
+            format!("{trimmed}/responses")
         } else {
-            format!("{}/openai/v1/responses", base.trim_end_matches('/'))
+            format!("{trimmed}/v1/responses")
         };
         let model = std::env::var("AWS_BEDROCK_OPENAI_MODEL")
             .expect("AWS_BEDROCK_OPENAI_MODEL is required");
         let mut request = test_model_turn_request();
         enable_explicit_prompt_cache(&mut request);
+        request.prompt_cache.cache_system_prompt = true;
+        let cache_run_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock follows Unix epoch")
+            .as_nanos();
+        request.prompt_cache.key = Some(format!(
+            "bcode:live-cache-efficiency:{}:{cache_run_id}",
+            std::process::id()
+        ));
         request.model_id.clone_from(&model);
         request.system_prompt = Some("stable cache acceptance instruction. ".repeat(1_500));
-        request.messages = vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: "first changing suffix".to_string(),
-            }],
-        }];
-        let first = send(
-            &endpoint,
-            &token,
-            build_mantle_openai_request(&request, &model).expect("first request should build"),
-        )
-        .await;
+        request.messages = vec![
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "stable conversation prefix one. ".repeat(300),
+                    },
+                    ContentBlock::CachePoint {
+                        hint: bcode_model::PromptCachePoint {
+                            label: Some("stable-prefix-one".to_string()),
+                            ttl_seconds: Some(30 * 60),
+                        },
+                    },
+                ],
+            },
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "stable conversation prefix two. ".repeat(300),
+                    },
+                    ContentBlock::CachePoint {
+                        hint: bcode_model::PromptCachePoint {
+                            label: Some("stable-prefix-two".to_string()),
+                            ttl_seconds: Some(30 * 60),
+                        },
+                    },
+                ],
+            },
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "first changing suffix".to_string(),
+                }],
+            },
+        ];
+        let first_body =
+            build_mantle_openai_request(&request, &model).expect("first request should build");
+        assert_eq!(first_body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(first_body["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(
+            breakpoint_count(&first_body),
+            3,
+            "developer and two rolling conversation breakpoints must reach the wire"
+        );
+        let first_cache_key = first_body["prompt_cache_key"].clone();
+        let first = send(&endpoint, &token, first_body).await;
         assert!(
             first.cache_write_input_tokens.unwrap_or_default() > 0,
             "first request must write an eligible prefix: {first:?}"
         );
 
-        request.messages = vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: "second changing suffix".to_string(),
-            }],
+        request
+            .messages
+            .last_mut()
+            .expect("changing suffix message")
+            .content = vec![ContentBlock::Text {
+            text: "second changing suffix".to_string(),
         }];
-        let second = send(
+        let second_body =
+            build_mantle_openai_request(&request, &model).expect("second request should build");
+        assert_eq!(breakpoint_count(&second_body), 3);
+        assert_eq!(
+            first_cache_key, second_body["prompt_cache_key"],
+            "same stable prefix must retain one cache identity"
+        );
+        let second = send(&endpoint, &token, second_body).await;
+        let first_written = first.cache_write_input_tokens.unwrap_or_default();
+        let first_read = first.cached_input_tokens.unwrap_or_default();
+        let first_total = first.input_tokens.unwrap_or_default();
+        let first_ordinary = ordinary_input(&first);
+        assert_eq!(
+            first_read, 0,
+            "unique initial cache identity must start cold: {first:?}"
+        );
+        assert!(
+            first_written >= first_total.saturating_mul(95) / 100,
+            "cold initial request must write at least 95% of its input: write={first_written}, total={first_total}, first={first:?}"
+        );
+        assert!(
+            first_ordinary <= first_total / 20,
+            "cold initial request ordinary remainder must be at most 5%: ordinary={first_ordinary}, total={first_total}, first={first:?}"
+        );
+        let second_read = second.cached_input_tokens.unwrap_or_default();
+        let second_written = second.cache_write_input_tokens.unwrap_or_default();
+        let second_total = second.input_tokens.unwrap_or_default();
+        let second_ordinary = ordinary_input(&second);
+        let write_reuse_floor = first_written.saturating_mul(95) / 100;
+        assert!(
+            second_read >= write_reuse_floor,
+            "same-prefix follow-up must reuse at least 95% of the initial cache write: first_write={first_written}, second_read={second_read}, first={first:?}, second={second:?}"
+        );
+        assert!(
+            second_written <= first_written / 20,
+            "same-prefix follow-up must not rewrite more than 5% of the initial cached prefix: first_write={first_written}, second_write={second_written}, second={second:?}"
+        );
+        assert!(
+            second_ordinary <= second_total / 20,
+            "same-prefix follow-up ordinary input must be at most 5% of total input: ordinary={second_ordinary}, total={second_total}, second={second:?}"
+        );
+        assert!(
+            percent(second_read, second_total) >= 90.0,
+            "same-prefix follow-up cache hit rate must be at least 90%: read={second_read}, total={second_total}, second={second:?}"
+        );
+
+        let input_rate = 4_400_000_u64;
+        let cache_read_rate = 440_000_u64;
+        let second_effective_input_cost = u64::from(second_ordinary)
+            .saturating_mul(input_rate)
+            .saturating_add(u64::from(second_read).saturating_mul(cache_read_rate))
+            .saturating_add(u64::from(second_written).saturating_mul(5_500_000));
+        let second_uncached_input_cost = u64::from(second_total).saturating_mul(input_rate);
+        assert!(
+            second_effective_input_cost * 2 < second_uncached_input_cost,
+            "cache reuse must reduce modeled follow-up input cost by more than 50%: effective={second_effective_input_cost}, uncached={second_uncached_input_cost}"
+        );
+
+        println!(
+            "request,total_input,cache_read,cache_write,ordinary_input,hit_rate\ninitial,{},{},{},{},{:.2}%\nfollow_up,{},{},{},{},{:.2}%",
+            first_total,
+            first_read,
+            first_written,
+            first_ordinary,
+            percent(first_read, first_total),
+            second_total,
+            second_read,
+            second_written,
+            second_ordinary,
+            percent(second_read, second_total),
+        );
+
+        request.prompt_cache.key = Some(format!(
+            "bcode:live-cache-isolation:{}:{cache_run_id}",
+            std::process::id()
+        ));
+        let isolated = send(
             &endpoint,
             &token,
-            build_mantle_openai_request(&request, &model).expect("second request should build"),
+            build_mantle_openai_request(&request, &model)
+                .expect("isolated-key request should build"),
         )
         .await;
+        let isolated_total = isolated.input_tokens.unwrap_or_default();
+        let isolated_read = isolated.cached_input_tokens.unwrap_or_default();
+        let isolated_write = isolated.cache_write_input_tokens.unwrap_or_default();
+        assert_eq!(
+            isolated_read, 0,
+            "a changed cache identity must not read the prior prefix: {isolated:?}"
+        );
         assert!(
-            second.cached_input_tokens.unwrap_or_default() > 0,
-            "same-prefix follow-up must read cached input: {second:?}"
+            isolated_write >= write_reuse_floor,
+            "a changed cache identity must rewrite at least 95% of the independently cacheable prefix: initial_write={first_written}, isolated_write={isolated_write}, isolated={isolated:?}"
+        );
+        println!(
+            "isolated,{isolated_total},{isolated_read},{isolated_write},{},{:.2}%",
+            ordinary_input(&isolated),
+            percent(isolated_read, isolated_total),
         );
     }
 
@@ -7759,7 +7973,7 @@ mod tests {
         local.mantle_base_url = Some("http://localhost:8080".to_string());
         assert_eq!(
             mantle_endpoint(&local, MantleFlavor::OpenAi).expect("local endpoint"),
-            "http://localhost:8080/openai/v1/responses"
+            "http://localhost:8080/v1/responses"
         );
     }
 
@@ -7874,6 +8088,7 @@ mod tests {
     fn test_settings() -> Settings {
         Settings {
             transport: Ok(BedrockTransport::Runtime),
+            transport_explicit: false,
             mantle_base_url: None,
             mantle_auth_header: false,
             force_http1: false,
@@ -8665,12 +8880,19 @@ mod tests {
             event,
             ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 492
         )));
+        // Normalized usage exposes complete model-visible input while pricing details preserve
+        // Bedrock's native disjoint ordinary/cache buckets.
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderTurnEvent::Usage { usage }
-                if usage.input_tokens == Some(12)
+                if usage.input_tokens == Some(492)
                     && usage.cached_input_tokens == Some(400)
                     && usage.cache_write_input_tokens == Some(80)
+                    && usage.pricing_context.request_input_tokens == Some(492)
+                    && usage.details.iter().any(|detail| {
+                        detail.bucket == bcode_model::ModelPricingBucket::Input
+                            && detail.tokens == 12
+                    })
         )));
     }
 
@@ -9973,11 +10195,9 @@ mod tests {
     }
 
     #[test]
-    fn custom_runtime_gateway_omits_responses_explicit_cache_controls() {
+    fn responses_custom_gateway_preserves_explicit_cache_controls() {
         let mut request = test_model_turn_request();
         enable_explicit_prompt_cache(&mut request);
-        request.prompt_cache.cache_system_prompt = true;
-        request.prompt_cache.cache_tools = true;
         request.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Responses);
         request.system_prompt = Some("stable instructions".to_string());
         request.messages = vec![ModelMessage {
@@ -9991,39 +10211,27 @@ mod tests {
                 },
             ],
         }];
-        request.tools = vec![ToolDefinition {
-            name: "filesystem.read".to_string(),
-            description: "read".to_string(),
-            input_schema: serde_json::json!({"type":"object"}),
-        }];
+        let mut settings = test_settings();
+        settings.endpoint_url = Some("https://gateway.example.com/gw".to_string());
+        settings.mantle_base_url = Some("https://gateway.example.com/gw".to_string());
 
-        let mut effective = request.clone();
-        disable_prompt_cache(&mut effective);
-        let projected = build_converse_request(
-            &effective,
-            "catalog-responses-model".to_string(),
-            Some("us-east-1"),
-        )
-        .expect("custom gateway Converse request should build");
-
-        assert!(
-            !projected
-                .system
-                .iter()
-                .any(|block| matches!(block, SystemContentBlock::CachePoint(_)))
+        let route = resolve_bedrock_route(&request, &settings).expect("gateway route resolves");
+        assert_eq!(route, EffectiveBedrockRoute::OpenAiResponses);
+        let projected = bedrock_request_projection(&request, route);
+        assert_eq!(
+            projected.api_shape.as_deref(),
+            Some("bedrock_mantle_openai_responses")
         );
-        assert!(!projected.messages.iter().any(|message| {
-            message
-                .content()
-                .iter()
-                .any(|block| matches!(block, BedrockContentBlock::CachePoint(_)))
-        }));
-        assert!(projected.tool_config.as_ref().is_some_and(|config| {
-            !config
-                .tools()
-                .iter()
-                .any(|tool| matches!(tool, Tool::CachePoint(_)))
-        }));
+        assert_eq!(projected.emitted_cache_point_count, Some(1));
+        assert_eq!(projected.dropped_cache_point_count, Some(0));
+        let wire = build_mantle_openai_request(&request, "catalog-responses-model")
+            .expect("gateway Responses request should build");
+        assert_eq!(wire["prompt_cache_options"]["mode"], "explicit");
+        assert!(wire["prompt_cache_key"].as_str().is_some());
+        assert_eq!(
+            wire["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
     }
 
     #[test]
@@ -10032,7 +10240,6 @@ mod tests {
         // routing and picker membership must work on the default transport with no environment
         // variables. Requiring `BCODE_BEDROCK_TRANSPORT=mantle_openai` would hide clearly supported
         // models behind configuration.
-        let default_transport = BedrockTransport::Runtime;
         let default_settings = test_settings();
 
         let mut responses_request = test_model_turn_request();
@@ -10042,42 +10249,54 @@ mod tests {
             .insert("bcode_request_kind".to_string(), "compaction".to_string());
         responses_request.provider_context.api_surface =
             Some(bcode_model::ModelApiSurface::Responses);
-        assert!(
-            uses_mantle_openai_surface(&responses_request, default_transport, &default_settings),
+        assert_eq!(
+            resolve_bedrock_route(&responses_request, &default_settings).expect("Responses route"),
+            EffectiveBedrockRoute::OpenAiResponses,
             "a Responses-surface model must route to OpenAI Responses on the default AWS endpoint"
         );
         let mut gateway_settings = default_settings.clone();
         gateway_settings.endpoint_url = Some("https://gateway.example.com/gw".to_string());
         gateway_settings.mantle_base_url = Some("https://gateway.example.com/gw".to_string());
-        assert!(
-            !uses_mantle_openai_surface(&responses_request, default_transport, &gateway_settings),
-            "a custom Runtime gateway must keep catalog Responses models on Converse"
+        assert_eq!(
+            resolve_bedrock_route(&responses_request, &gateway_settings)
+                .expect("gateway Responses route"),
+            EffectiveBedrockRoute::OpenAiResponses,
+            "a custom endpoint must not change a catalog Responses model's wire surface"
         );
 
         // Converse models are unaffected.
         let converse_request = test_model_turn_request();
-        assert!(!uses_mantle_openai_surface(
-            &converse_request,
-            default_transport,
-            &default_settings
-        ));
+        assert_eq!(
+            resolve_bedrock_route(&converse_request, &default_settings).expect("Converse route"),
+            EffectiveBedrockRoute::Converse
+        );
 
         // Messages-surface models still route to the Anthropic adapter, not Responses.
         let mut messages_request = test_model_turn_request();
         messages_request.provider_context.api_surface =
             Some(bcode_model::ModelApiSurface::Messages);
-        assert!(!uses_mantle_openai_surface(
-            &messages_request,
-            default_transport,
-            &default_settings
-        ));
+        assert_eq!(
+            resolve_bedrock_route(&messages_request, &default_settings).expect("Messages route"),
+            EffectiveBedrockRoute::AnthropicMessages
+        );
 
-        // The explicit transport still forces the surface for any model.
-        assert!(uses_mantle_openai_surface(
-            &converse_request,
-            BedrockTransport::MantleOpenAi,
-            &default_settings
-        ));
+        // The explicit transport still forces the surface for a model without a conflicting
+        // surface contract.
+        let mut explicit_mantle = default_settings.clone();
+        explicit_mantle.transport = Ok(BedrockTransport::MantleOpenAi);
+        explicit_mantle.transport_explicit = true;
+        assert_eq!(
+            resolve_bedrock_route(&converse_request, &explicit_mantle)
+                .expect("explicit Responses route"),
+            EffectiveBedrockRoute::OpenAiResponses
+        );
+
+        // A Responses-only model cannot be silently downgraded to Runtime.
+        let mut explicit_runtime = default_settings.clone();
+        explicit_runtime.transport_explicit = true;
+        let error = resolve_bedrock_route(&responses_request, &explicit_runtime)
+            .expect_err("Responses-only model must reject Runtime override");
+        assert_eq!(error.code, "bedrock_runtime_surface_unsupported");
 
         // Feature negotiation follows the surface, so reasoning summaries and structured output are
         // accepted for a Responses model even on the default transport.
@@ -10085,8 +10304,9 @@ mod tests {
         rich.provider_context.api_surface = Some(bcode_model::ModelApiSurface::Responses);
         rich.parameters.reasoning_summary = Some("detailed".to_string());
         rich.tool_call_policy.parallel = Some(true);
-        let responses_surface =
-            uses_mantle_openai_surface(&rich, default_transport, &default_settings);
+        let responses_surface = resolve_bedrock_route(&rich, &default_settings)
+            .expect("rich Responses route")
+            == EffectiveBedrockRoute::OpenAiResponses;
         validate_bedrock_request(&rich, responses_surface)
             .expect("Responses models accept these features on the default transport");
 
@@ -10320,6 +10540,7 @@ mod tests {
     fn context_bearer_token_is_resolved_from_auth_credentials() {
         let settings = Settings {
             transport: Ok(BedrockTransport::Runtime),
+            transport_explicit: false,
             mantle_base_url: None,
             mantle_auth_header: false,
             force_http1: false,
