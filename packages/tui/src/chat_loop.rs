@@ -4960,6 +4960,7 @@ fn apply_session_stream_resynchronization(
     chat.app
         .replace_latest_transcript_window(&attached.history, has_older);
     chat.app.apply_session_summary(&attached.session);
+    chat.app.apply_usage_summary(&attached.usage_summary);
     chat.app
         .apply_runtime_selection(attached.runtime_selection.clone());
 

@@ -379,8 +379,9 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-contract-aware baseline is epoch `5`. Epochs `3` and `4` are recognized legacy storage and migrate
-under exclusive maintenance ownership by rebuilding all required projections. That rebuild applies
+writer contract is epoch `7`; epoch `6` sessions migrate exclusively by rebuilding the new cumulative
+usage projection alongside every existing required projection. Earlier recognized legacy epochs
+follow the same complete migration chain. That rebuild applies
 terminal tool lifecycle events to the transcript and tool-run projections, so an invocation that
 finished before its result record was persisted no longer remains falsely `running`. The
 session-compatibility projection records its canonical-tail checkpoint and any opaque event
@@ -512,8 +513,11 @@ Each projector advances only its own checkpoint after its projection update succ
 stale, incompatible, or discontinuous required projections reject and roll back the append.
 
 Required projections include current session state, input history, transcript spans, tool runs,
-artifact references, runtime work, request-context occupancy, model context, and turn receipts.
-Normal reads never silently rebuild them.
+artifact references, runtime work, cumulative request-deduplicated session usage and fixed
+request-time cost, request-context occupancy, model context, and turn receipts. Normal reads never
+silently rebuild them. Bounded session attach returns the compact usage summary independently of the
+resident transcript window, so reconnecting or loading older transcript pages cannot change the
+session-wide token or cost totals.
 
 ## Normal bounded reads
 

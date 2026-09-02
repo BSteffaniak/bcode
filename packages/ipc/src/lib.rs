@@ -2733,6 +2733,8 @@ pub enum ResponsePayload {
         #[serde(default)]
         input_history: Vec<SessionInputHistoryEntry>,
         #[serde(default)]
+        usage_summary: Option<Box<bcode_session_models::SessionUsageSummary>>,
+        #[serde(default)]
         import_warnings: Vec<SessionImportWarning>,
         #[serde(default)]
         draft: Option<String>,
@@ -5535,6 +5537,7 @@ mod tests {
             },
             history: Vec::new(),
             input_history: Vec::new(),
+            usage_summary: None,
             import_warnings: Vec::new(),
             draft: None,
             runtime_selection: SessionRuntimeSelection::default(),
@@ -5578,6 +5581,7 @@ mod tests {
             session: summary.clone(),
             history: Vec::new(),
             input_history: Vec::new(),
+            usage_summary: None,
             import_warnings: Vec::new(),
             draft: Some("draft text".to_owned()),
             runtime_selection: SessionRuntimeSelection::default(),
@@ -6647,6 +6651,7 @@ mod tests {
                     session: session.clone(),
                     history: vec![event.clone()],
                     input_history: Vec::new(),
+            usage_summary: None,
                     import_warnings: Vec::new(),
                     draft: Some("draft text".to_owned()),
                     runtime_selection: SessionRuntimeSelection::default(),

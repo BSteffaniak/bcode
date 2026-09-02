@@ -1607,6 +1607,7 @@ impl SessionActor {
         }
         let input_history_started_at = Instant::now();
         let input_history = self.input_history().await?;
+        let usage_summary = self.session_usage_summary().await?;
         if let Some(metrics) = &metrics {
             metrics.record_histogram(
                 "session.actor.attach.input_history_duration_ms",
@@ -1638,6 +1639,7 @@ impl SessionActor {
             session,
             history,
             input_history,
+            usage_summary,
             live_checkpoints: self.state.live_text_checkpoints.values().cloned().collect(),
             events,
             live_events: self.state.live_events.subscribe(),
@@ -1852,6 +1854,36 @@ impl SessionActor {
             )
             .await?,
         ))
+    }
+
+    async fn session_usage_summary(
+        &mut self,
+    ) -> Result<bcode_session_models::SessionUsageSummary, SessionError> {
+        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
+        if let Some(db) = self.existing_session_db().await? {
+            return db.session_usage_summary().await.map_err(SessionError::from);
+        }
+        if let Some(events) = &self.state.events {
+            let mut latest = BTreeMap::new();
+            for event in events {
+                if let SessionEventKind::ModelUsage { usage, .. } = &event.kind {
+                    let key = usage
+                        .request_id
+                        .clone()
+                        .unwrap_or_else(|| format!("event:{}", event.sequence));
+                    latest.insert(key, (event.sequence, usage.clone()));
+                }
+            }
+            return Ok(session_usage_summary_from_observations(
+                latest.into_values(),
+            ));
+        }
+        Err(SessionError::ProjectionStale {
+            session_id: self.state.summary.id,
+            projection: "session_usage",
+            checkpoint: None,
+            expected: expected_last_sequence,
+        })
     }
 
     async fn input_history(&mut self) -> Result<Vec<SessionInputHistoryEntry>, SessionError> {
@@ -2406,6 +2438,41 @@ pub struct SessionSnapshot {
     pub working_directory: PathBuf,
     pub load_status: SessionLoadStatusKind,
     pub owned: bool,
+}
+
+fn session_usage_summary_from_observations(
+    observations: impl Iterator<Item = (u64, bcode_session_models::SessionTokenUsage)>,
+) -> bcode_session_models::SessionUsageSummary {
+    let mut summary = bcode_session_models::SessionUsageSummary::default();
+    let mut latest_sequence = None;
+    for (sequence, usage) in observations {
+        summary.observed_usage_count = summary.observed_usage_count.saturating_add(1);
+        if let Some(tokens) = usage.metered_total_tokens() {
+            summary.cumulative_metered_tokens = summary
+                .cumulative_metered_tokens
+                .saturating_add(u64::from(tokens));
+        }
+        match &usage.cost {
+            Some(bcode_session_models::SessionCostEstimate::Estimated {
+                currency,
+                total_micros,
+                ..
+            }) => {
+                let total = summary.totals_micros.entry(currency.clone()).or_default();
+                *total = total.saturating_add(*total_micros);
+                summary.estimated_usage_count = summary.estimated_usage_count.saturating_add(1);
+            }
+            Some(bcode_session_models::SessionCostEstimate::Unavailable { .. }) => {
+                summary.unavailable_usage_count = summary.unavailable_usage_count.saturating_add(1);
+            }
+            None => {}
+        }
+        if latest_sequence.is_none_or(|latest| sequence > latest) {
+            latest_sequence = Some(sequence);
+            summary.latest_usage = Some(usage);
+        }
+    }
+    summary
 }
 
 impl SessionSnapshot {

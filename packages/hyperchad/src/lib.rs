@@ -601,6 +601,7 @@ async fn hydrate_session_model_status(
 fn view_from_attached_history(attached: &AttachedSessionHistory) -> SessionView {
     let mut view = SessionView::new();
     view.apply_history(&attached.history);
+    view.set_usage_summary(attached.usage_summary.clone());
     apply_projection_window_metadata_to_view(&mut view, attached.projection_window.as_ref());
     let runtime = &attached.runtime_selection;
     view.set_runtime_selection(
@@ -2890,6 +2891,7 @@ mod tests {
             },
             history: Vec::new(),
             input_history: Vec::new(),
+            usage_summary: bcode_session_models::SessionUsageSummary::default(),
             import_warnings: Vec::new(),
             draft: None,
             runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),

@@ -251,6 +251,7 @@ pub struct AttachedSessionHistory {
     pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
+    pub usage_summary: bcode_session_models::SessionUsageSummary,
     pub import_warnings: Vec<SessionImportWarning>,
     pub draft: Option<String>,
     pub runtime_selection: bcode_ipc::SessionRuntimeSelection,
@@ -5101,6 +5102,7 @@ impl ClientConnection {
             ResponsePayload::Attached {
                 history,
                 input_history,
+                usage_summary,
                 import_warnings,
                 draft,
                 runtime_selection,
@@ -5111,6 +5113,10 @@ impl ClientConnection {
                 session,
                 history,
                 input_history,
+                usage_summary: usage_summary.map_or_else(
+                    bcode_session_models::SessionUsageSummary::default,
+                    |summary| *summary,
+                ),
                 import_warnings,
                 draft,
                 runtime_selection,
@@ -5390,6 +5396,7 @@ impl ClientConnection {
             ResponsePayload::Attached {
                 history,
                 input_history,
+                usage_summary,
                 import_warnings,
                 draft,
                 runtime_selection,
@@ -5400,6 +5407,10 @@ impl ClientConnection {
                 session,
                 history,
                 input_history,
+                usage_summary: usage_summary.map_or_else(
+                    bcode_session_models::SessionUsageSummary::default,
+                    |summary| *summary,
+                ),
                 import_warnings,
                 draft,
                 runtime_selection,
@@ -5457,6 +5468,7 @@ impl ClientConnection {
             ResponsePayload::Attached {
                 history,
                 input_history,
+                usage_summary,
                 import_warnings,
                 draft,
                 runtime_selection,
@@ -5467,6 +5479,10 @@ impl ClientConnection {
                 session,
                 history,
                 input_history,
+                usage_summary: usage_summary.map_or_else(
+                    bcode_session_models::SessionUsageSummary::default,
+                    |summary| *summary,
+                ),
                 import_warnings,
                 draft,
                 runtime_selection,

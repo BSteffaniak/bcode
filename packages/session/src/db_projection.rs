@@ -22,18 +22,21 @@ pub enum MaterializedProjection {
     ArtifactReferences,
     /// Runtime-work lifecycle rows.
     RuntimeWork,
+    /// Authoritative cumulative session usage and fixed request-time cost estimates.
+    SessionUsage,
     /// Authoritative current context occupancy.
     RequestContextOccupancy,
 }
 
 impl MaterializedProjection {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::SessionState,
         Self::InputHistory,
         Self::Transcript,
         Self::ToolRuns,
         Self::ArtifactReferences,
         Self::RuntimeWork,
+        Self::SessionUsage,
         Self::RequestContextOccupancy,
     ];
 
@@ -53,7 +56,8 @@ impl MaterializedProjection {
             Self::SessionState
             | Self::InputHistory
             | Self::ArtifactReferences
-            | Self::RuntimeWork => 1,
+            | Self::RuntimeWork
+            | Self::SessionUsage => 1,
         }
     }
 
@@ -67,6 +71,7 @@ impl MaterializedProjection {
             Self::ToolRuns => "tool_runs",
             Self::ArtifactReferences => "artifact_references",
             Self::RuntimeWork => "runtime_work",
+            Self::SessionUsage => "session_usage",
             Self::RequestContextOccupancy => "context_occupancy",
         }
     }
@@ -119,13 +124,14 @@ pub async fn update_projection_checkpoint(
 }
 
 /// Current projections finalized together for each canonical event.
-pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 6] = [
+pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 7] = [
     MaterializedProjection::SessionState,
     MaterializedProjection::InputHistory,
     MaterializedProjection::Transcript,
     MaterializedProjection::ToolRuns,
     MaterializedProjection::ArtifactReferences,
     MaterializedProjection::RuntimeWork,
+    MaterializedProjection::SessionUsage,
 ];
 
 /// One current projection checkpoint row.
@@ -141,7 +147,7 @@ mod tests {
 
     #[test]
     fn projection_inventory_is_complete_and_stable() {
-        assert_eq!(MaterializedProjection::all().len(), 7);
+        assert_eq!(MaterializedProjection::all().len(), 8);
         assert_eq!(
             MaterializedProjection::RequestContextOccupancy.schema_version(),
             4

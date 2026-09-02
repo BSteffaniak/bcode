@@ -583,6 +583,21 @@ impl SessionView {
         }
     }
 
+    /// Replace cumulative runtime accounting from the canonical session usage projection.
+    pub fn set_usage_summary(&mut self, summary: bcode_session_models::SessionUsageSummary) {
+        self.usage_by_request.clear();
+        self.unattributed_metered_tokens = summary.cumulative_metered_tokens;
+        self.snapshot.runtime.cumulative_metered_tokens = summary.cumulative_metered_tokens;
+        self.snapshot.runtime.cost = bcode_session_view_models::SessionCostSummary {
+            totals_micros: summary.totals_micros,
+            estimated_usage_count: summary.estimated_usage_count,
+            unavailable_usage_count: summary.unavailable_usage_count,
+            observed_usage_count: summary.observed_usage_count,
+        };
+        self.snapshot.runtime.latest_usage = summary.latest_usage;
+        self.bump_revision();
+    }
+
     /// Apply canonical session metadata from an attach or catalog response.
     pub fn set_session_summary(&mut self, summary: bcode_session_models::SessionSummary) {
         let title = summary.title().map(ToOwned::to_owned);
@@ -9583,6 +9598,7 @@ mod tests {
             Some("provider".to_owned()),
             Some("requested".to_owned()),
             Some("effective".to_owned()),
+            None,
         );
         view.set_agent_id(Some("build".to_owned()));
         view.set_active_skill_ids(BTreeSet::from(["review".to_owned()]));

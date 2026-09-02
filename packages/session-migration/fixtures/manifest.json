@@ -563,7 +563,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -781,7 +782,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -1001,7 +1003,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": false,
@@ -5460,7 +5463,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -5739,7 +5743,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6023,7 +6028,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6322,7 +6328,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6621,7 +6628,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6920,7 +6928,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7224,7 +7233,8 @@
           2,
           3,
           4,
-          5
+          5,
+          6
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,

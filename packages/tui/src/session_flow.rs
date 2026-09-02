@@ -376,6 +376,7 @@ pub fn complete_switch_session(
                 chat.app.replace_composer_with(&draft);
             }
             chat.app.apply_session_summary(&attached.session);
+            chat.app.apply_usage_summary(&attached.usage_summary);
             chat.app
                 .apply_runtime_selection(attached.runtime_selection.clone());
             chat.app

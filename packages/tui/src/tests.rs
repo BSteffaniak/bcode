@@ -2287,6 +2287,16 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
                 session: session_summary(session_id),
                 history: vec![canonical_event],
                 input_history: Vec::new(),
+                usage_summary: bcode_session_models::SessionUsageSummary {
+                    cumulative_metered_tokens: 1_234,
+                    totals_micros: std::collections::BTreeMap::from([(
+                        "USD".to_owned(),
+                        62_874_262,
+                    )]),
+                    estimated_usage_count: 524,
+                    observed_usage_count: 524,
+                    ..bcode_session_models::SessionUsageSummary::default()
+                },
                 import_warnings: Vec::new(),
                 draft: None,
                 runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
@@ -2299,6 +2309,17 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
     );
 
     assert_eq!(chat.attached_session_id(), Some(session_id));
+    assert_eq!(
+        chat.app.session_view_snapshot().runtime.cost.totals_micros["USD"],
+        62_874_262
+    );
+    assert_eq!(
+        chat.app
+            .session_view_snapshot()
+            .runtime
+            .cumulative_metered_tokens,
+        1_234
+    );
     assert_eq!(chat.attachment.opening_anchor_sequence(), None);
     assert_eq!(chat.app.status(), "jumped to search result");
     assert!(chat.app.transcript_index_for_sequence(7).is_some());
@@ -2337,6 +2358,7 @@ async fn async_session_open_preserves_typed_draft() {
             sequence: 1,
             text: "previous prompt".to_owned(),
         }],
+        usage_summary: bcode_session_models::SessionUsageSummary::default(),
         import_warnings: Vec::new(),
         draft: None,
         runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
@@ -2565,6 +2587,7 @@ async fn async_session_open_completion_preserves_plugin_host() {
         session: session_summary(session_id),
         history: Vec::new(),
         input_history: Vec::new(),
+        usage_summary: bcode_session_models::SessionUsageSummary::default(),
         import_warnings: Vec::new(),
         draft: None,
         runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),

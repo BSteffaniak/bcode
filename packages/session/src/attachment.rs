@@ -2,6 +2,7 @@
 
 use bcode_session_models::{
     SessionEvent, SessionId, SessionInputHistoryEntry, SessionLiveEvent, SessionSummary,
+    SessionUsageSummary,
 };
 use tokio::sync::broadcast;
 
@@ -11,6 +12,7 @@ pub struct SessionAttachment {
     pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
+    pub usage_summary: SessionUsageSummary,
     pub live_checkpoints: Vec<SessionLiveEvent>,
     pub events: broadcast::Receiver<SessionEvent>,
     pub live_events: broadcast::Receiver<SessionLiveEvent>,

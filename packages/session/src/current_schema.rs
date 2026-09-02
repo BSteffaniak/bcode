@@ -73,6 +73,18 @@ fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
         "ALTER TABLE session_state ADD COLUMN reasoning_by_model TEXT",
         "ALTER TABLE session_state DROP COLUMN reasoning_by_model",
     );
+    add_sql_migration(
+        source,
+        "036_session_usage_projection_table",
+        "CREATE TABLE IF NOT EXISTS session_usage_projection (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    summary_json TEXT NOT NULL\n)",
+        "DROP TABLE IF EXISTS session_usage_projection",
+    );
+    add_sql_migration(
+        source,
+        "037_session_usage_requests_table",
+        "CREATE TABLE IF NOT EXISTS session_usage_requests (\n    request_key TEXT PRIMARY KEY NOT NULL,\n    usage_json TEXT NOT NULL,\n    event_seq INTEGER NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
+        "DROP TABLE IF EXISTS session_usage_requests",
+    );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {

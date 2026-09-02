@@ -1181,6 +1181,11 @@ impl BmuxApp {
         self.session_view.snapshot().working_directory.as_deref()
     }
 
+    /// Replace bounded-history accounting with the complete canonical attach summary.
+    pub fn apply_usage_summary(&mut self, summary: &bcode_session_models::SessionUsageSummary) {
+        self.session_view.set_usage_summary(summary.clone());
+    }
+
     /// Apply canonical session metadata from an attach/list response.
     ///
     /// Uses `SessionSummary::title()` as the single source of truth for the

@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 7;
 
 use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
@@ -2857,6 +2857,29 @@ pub struct SessionTokenUsage {
     /// Reasoning tokens reported separately by a provider, when available.
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
+}
+
+/// Compact canonical accounting state derived from all model-usage events in a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsageSummary {
+    /// Cumulative metered tokens across the latest canonical observation for every request.
+    #[serde(default)]
+    pub cumulative_metered_tokens: u64,
+    /// Estimated totals grouped by ISO 4217 currency code.
+    #[serde(default)]
+    pub totals_micros: BTreeMap<String, u64>,
+    /// Number of represented usage observations carrying complete fixed estimates.
+    #[serde(default)]
+    pub estimated_usage_count: u64,
+    /// Number of represented usage observations whose estimate is explicitly unavailable.
+    #[serde(default)]
+    pub unavailable_usage_count: u64,
+    /// Number of represented canonical usage observations.
+    #[serde(default)]
+    pub observed_usage_count: u64,
+    /// Most recently committed canonical usage observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_usage: Option<SessionTokenUsage>,
 }
 
 impl SessionTokenUsage {

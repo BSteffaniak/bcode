@@ -388,7 +388,7 @@ if ! diff -u "${current_event_kind_inventory}" "${current_event_kind_mapping}" \
   violations=1
 fi
 
-if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6' packages/session/models/src/lib.rs \
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 7' packages/session/models/src/lib.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH: u32 = bcode_session_migration_target::CURRENT_WRITER_EPOCH' packages/session-migration/src/inventory.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH.*CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session-migration-target/src/lib.rs \
   || ! rg -q 'RELEASED_HISTORICAL_ROOTS' packages/session-migration/src/inventory.rs \
