@@ -44502,6 +44502,84 @@ library = "test"
     }
 
     #[test]
+    fn prompt_cache_auto_advances_breakpoint_through_tool_loop_history() {
+        let session_id = SessionId::new();
+        let mut messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "implement the requested change".to_string(),
+            }],
+        }];
+        let mut planned_prefix_ends = Vec::new();
+
+        for round in 0..8 {
+            messages.push(ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: bcode_model::ToolCall {
+                        id: format!("call-{round}"),
+                        name: "filesystem.read".to_string(),
+                        arguments: serde_json::json!({"path": format!("src/file-{round}.rs")}),
+                    },
+                }],
+            });
+            messages.push(ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    result: bcode_model::ToolResult {
+                        call_id: format!("call-{round}"),
+                        output: format!("stable tool output for round {round} ").repeat(128),
+                        is_error: false,
+                        content: Vec::new(),
+                    },
+                }],
+            });
+
+            let hints = plan_prompt_cache(
+                &mut messages,
+                bcode_model::PromptCacheMode::Auto,
+                session_id,
+                true,
+                true,
+            );
+            assert_eq!(
+                hints.key.as_deref(),
+                Some(format!("bcode:{session_id}").as_str())
+            );
+            let points = messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, message)| {
+                    message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let newest = points
+                .last()
+                .copied()
+                .expect("tool-loop history needs a cache point");
+            assert!(
+                newest < messages.len() - 1,
+                "the mutable tail must remain after the newest cache point"
+            );
+            planned_prefix_ends.push(newest);
+        }
+
+        assert!(
+            planned_prefix_ends.windows(2).all(|pair| pair[1] > pair[0]),
+            "the newest cacheable prefix must advance as completed tool rounds accumulate: {planned_prefix_ends:?}"
+        );
+        assert!(
+            planned_prefix_ends.last().copied().unwrap_or_default() >= messages.len() - 4,
+            "the rolling point must remain near the completed tool-loop tail: points={planned_prefix_ends:?}, messages={} ",
+            messages.len()
+        );
+    }
+
+    #[test]
     fn prompt_cache_auto_does_not_add_points_without_explicit_support() {
         let mut messages = (0..6)
             .map(|index| ModelMessage {
