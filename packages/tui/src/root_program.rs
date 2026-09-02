@@ -2588,7 +2588,11 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         session_id, result, ..
                     } if navigation_session == Some(*session_id) => Some((
                         *session_id,
-                        result.as_ref().map(|_| ()).map_err(ToString::to_string),
+                        result
+                            .as_ref()
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(ToString::to_string),
                     )),
                     _ => None,
                 };

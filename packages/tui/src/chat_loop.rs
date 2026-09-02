@@ -2407,7 +2407,7 @@ pub fn apply_effect_result(
             if result.is_ok() {
                 loop_state.artifact_stream.retain_session(Some(session_id));
             }
-            if let Ok((attached, _)) = &result {
+            if let Ok((attached, _)) = result.as_ref() {
                 let presentation = chat.app.plugin_presentation();
                 for event in &attached.history {
                     loop_state.artifact_stream.observe_finalized_artifact(
@@ -2432,7 +2432,7 @@ pub fn apply_effect_result(
                     );
                 }
             }
-            session_flow::complete_switch_session(chat, session_id, has_older_history, result);
+            session_flow::complete_switch_session(chat, session_id, has_older_history, *result);
             loop_state.interactive_surface = None;
             loop_state.interactive_surface_queue.clear();
         }

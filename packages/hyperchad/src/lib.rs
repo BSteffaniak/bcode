@@ -1016,7 +1016,7 @@ pub fn router_from_state(state: HyperChadAppState) -> Router {
         })
         .with_route("/actions/interaction", move |request| {
             let state = interaction_state.clone();
-            async move { state.handle_interaction(request).await }
+            async move { Box::pin(state.handle_interaction(request)).await }
         });
     #[cfg(feature = "renderer-html-actix")]
     let router = router.with_route(
@@ -2023,18 +2023,29 @@ async fn send_watched_snapshot(
 }
 
 async fn watch_session_updates(context: SessionWatchContext) -> Result<(), ClientError> {
+    let Some((watcher, attached, initial_view)) =
+        Box::pin(attach_watch_with_retry(&context, "attach")).await?
+    else {
+        return Ok(());
+    };
+    let view = Box::new(initial_view);
+
+    Box::pin(watch_session_event_loop(&context, watcher, attached, view)).await
+}
+
+async fn watch_session_event_loop(
+    context: &SessionWatchContext,
+    mut watcher: SessionWatcher,
+    mut attached: AttachedSessionHistory,
+    mut view: Box<SessionView>,
+) -> Result<(), ClientError> {
     let SessionWatchContext {
         client,
         session_id,
         renderer_tx,
         interaction_controllers,
         ..
-    } = &context;
-    let Some((mut watcher, mut attached, mut view)) =
-        Box::pin(attach_watch_with_retry(&context, "attach")).await?
-    else {
-        return Ok(());
-    };
+    } = context;
 
     loop {
         let presentation_deadline =
@@ -2042,15 +2053,15 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
         let event = if let Some(deadline) = presentation_deadline {
             let delay = deadline.saturating_duration_since(std::time::Instant::now());
             tokio::select! {
-                event = watcher.next_event() => Some(event),
+                event = watcher.next_event() => Some(event.map(Box::new)),
                 () = tokio::time::sleep(delay) => None,
             }
         } else {
-            Some(watcher.next_event().await)
+            Some(watcher.next_event().await.map(Box::new))
         };
         let Some(event) = event else {
             if view.advance_streaming_presentation(std::time::Instant::now())
-                && !send_watched_snapshot(&context, &mut attached, &view).await?
+                && !send_watched_snapshot(context, &mut attached, &view).await?
             {
                 return Ok(());
             }
@@ -2064,7 +2075,7 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
                 }
                 tracing::warn!("HyperChad session watcher disconnected for {session_id}: {error}");
                 if !send_connection_update(
-                    &context,
+                    context,
                     &attached,
                     &view,
                     bcode_session_view_models::SessionConnectionViewStatus::Reconnecting,
@@ -2075,15 +2086,15 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
                 }
                 tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
                 let Some((new_watcher, new_attached, new_view)) =
-                    Box::pin(attach_watch_with_retry(&context, "reconnect")).await?
+                    Box::pin(attach_watch_with_retry(context, "reconnect")).await?
                 else {
                     return Ok(());
                 };
                 watcher = new_watcher;
                 attached = new_attached;
-                view = new_view;
+                *view = new_view;
                 if !send_connection_update(
-                    &context,
+                    context,
                     &attached,
                     &view,
                     bcode_session_view_models::SessionConnectionViewStatus::Attached,
@@ -2096,11 +2107,11 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
             }
         };
 
-        let resync = apply_watched_event(&mut view, *session_id, event);
+        let resync = apply_watched_event(&mut view, *session_id, *event);
 
         if resync {
             if !send_connection_update(
-                &context,
+                context,
                 &attached,
                 &view,
                 bcode_session_view_models::SessionConnectionViewStatus::Resyncing,
@@ -2109,10 +2120,14 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
             {
                 return Ok(());
             }
-            let Some(state) = Box::pin(attach_watch_with_retry(&context, "resync")).await? else {
+            let Some((new_watcher, new_attached, new_view)) =
+                Box::pin(attach_watch_with_retry(context, "resync")).await?
+            else {
                 return Ok(());
             };
-            (watcher, attached, view) = state;
+            watcher = new_watcher;
+            attached = new_attached;
+            *view = new_view;
         } else {
             hydrate_session_model_status(client, *session_id, &mut view).await?;
             hydrate_pending_permissions(client, *session_id, &mut view).await?;
@@ -2120,7 +2135,7 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
                 .await?;
         }
 
-        if !send_watched_snapshot(&context, &mut attached, &view).await? {
+        if !send_watched_snapshot(context, &mut attached, &view).await? {
             return Ok(());
         }
     }

@@ -458,7 +458,7 @@ pub enum TuiEffectResult {
         /// Whether older history exists before the attached window.
         has_older_history: bool,
         /// Attach result and event-stream task.
-        result: Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError>,
+        result: Box<Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError>>,
     },
     /// User configuration load completed.
     ConfigLoaded {
@@ -1003,7 +1003,7 @@ impl TuiEffect {
             Self::OpenSession { session_id, .. } => TuiEffectResult::SessionOpened {
                 session_id,
                 has_older_history: true,
-                result: Err(TuiError::Client(client_error)),
+                result: Box::new(Err(TuiError::Client(client_error))),
             },
             Self::LoadDraftStatus { .. } => TuiEffectResult::DraftStatusLoaded {
                 daemon_connected: false,
@@ -1486,19 +1486,21 @@ impl TuiEffect {
             } => TuiEffectResult::SessionOpened {
                 session_id,
                 has_older_history: true,
-                result: history_flow::attach_session_event_stream_with_window_request(
-                    &client,
-                    session_id,
-                    event_sender,
-                    initial_window_request,
-                    |snapshot| {
-                        let _result =
-                            streaming_sender.try_send(TuiEffectResult::SessionOpenProgress {
-                                snapshot: snapshot.clone(),
-                            });
-                    },
-                )
-                .await,
+                result: Box::new(
+                    history_flow::attach_session_event_stream_with_window_request(
+                        &client,
+                        session_id,
+                        event_sender,
+                        initial_window_request,
+                        |snapshot| {
+                            let _result =
+                                streaming_sender.try_send(TuiEffectResult::SessionOpenProgress {
+                                    snapshot: snapshot.clone(),
+                                });
+                        },
+                    )
+                    .await,
+                ),
             },
             Self::LoadConfig => TuiEffectResult::ConfigLoaded {
                 config: Box::new(bcode_config::load_config().map_err(|error| error.to_string())),

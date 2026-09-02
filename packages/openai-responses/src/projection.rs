@@ -834,6 +834,17 @@ mod tests {
             [assistant, tool]
         }
 
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Array(values) => values.iter_mut().for_each(strip),
+                serde_json::Value::Object(values) => {
+                    values.remove("prompt_cache_breakpoint");
+                    values.values_mut().for_each(strip);
+                }
+                _ => {}
+            }
+        }
+
         let mut first = Vec::new();
         first.extend(tool_round(0, true));
         first.extend(tool_round(1, true));
@@ -851,16 +862,6 @@ mod tests {
 
         let strip_controls = |items: Vec<ResponsesInputItem>| {
             let mut value = serde_json::to_value(items).expect("wire serializes");
-            fn strip(value: &mut serde_json::Value) {
-                match value {
-                    serde_json::Value::Array(values) => values.iter_mut().for_each(strip),
-                    serde_json::Value::Object(values) => {
-                        values.remove("prompt_cache_breakpoint");
-                        values.values_mut().for_each(strip);
-                    }
-                    _ => {}
-                }
-            }
             strip(&mut value);
             value.as_array().expect("wire input is an array").clone()
         };

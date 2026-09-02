@@ -44621,7 +44621,7 @@ library = "test"
                 .copied()
                 .expect("tool-loop history needs a cache point");
             assert!(
-                newest <= messages.len() - 1,
+                newest < messages.len(),
                 "the newest cache point must remain within completed history"
             );
             planned_prefix_ends.push(newest);

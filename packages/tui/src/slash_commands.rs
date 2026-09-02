@@ -1105,6 +1105,7 @@ mod tests {
             requested_model_id: Some("model".to_owned()),
             effective_model_id: Some("model".to_owned()),
             model_id: Some("model".to_owned()),
+            display_name: None,
             context_window: None,
             context_occupancy: None,
             request_context_error: None,

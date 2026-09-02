@@ -7385,6 +7385,7 @@ mod tests {
             requested_model_id: None,
             effective_model_id: None,
             model_id: None,
+            display_name: None,
             context_window: None,
             context_occupancy: None,
             request_context_error: None,
