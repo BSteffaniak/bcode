@@ -3877,16 +3877,132 @@ pub fn endpoint_from_env_value(value: &str) -> Result<IpcEndpoint, serde_json::E
     serde_json::from_str(value)
 }
 
+/// Non-secret environment variables whose values currently affect daemon-wide startup behavior.
+///
+/// Credential values and request-only context are deliberately excluded. Values should leave this
+/// list when their behavior becomes fully request-scoped so compatible clients can multiplex again.
+const DAEMON_STARTUP_ENV_VARS: &[&str] = &[
+    "BCODE_BEDROCK_TRANSPORT",
+    "BCODE_BEDROCK_MODEL",
+    "BEDROCK_MODEL",
+    "BCODE_BEDROCK_MODELS",
+    "BEDROCK_MODELS",
+    "BCODE_BEDROCK_REGION",
+    "BEDROCK_REGION",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "BCODE_BEDROCK_ENDPOINT_URL",
+    "BEDROCK_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_BEDROCK",
+    "BCODE_BEDROCK_MANTLE_BASE_URL",
+    "BCODE_OPENAI_AUTH_MODE",
+    "BCODE_OPENAI_BASE_URL",
+    "OPENAI_BASE_URL",
+    "BCODE_OPENAI_MODEL",
+    "OPENAI_MODEL",
+    "BCODE_OPENAI_MODELS",
+    "OPENAI_MODELS",
+    "BCODE_OPENAI_DIALECT",
+    "OPENAI_DIALECT",
+    "BCODE_XAI_AUTH_MODE",
+    "BCODE_XAI_BASE_URL",
+    "XAI_BASE_URL",
+    "BCODE_XAI_MODEL",
+    "XAI_MODEL",
+    "BCODE_XAI_MODELS",
+    "XAI_MODELS",
+];
+
+/// Return the secret-safe identity of daemon-wide startup configuration.
+#[must_use]
+pub fn daemon_startup_scope_id() -> String {
+    let config = bcode_config::load_config()
+        .ok()
+        .and_then(|config| serde_json::to_value(config).ok())
+        .map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                for excluded in ["auth", "client", "presentation", "state", "tui"] {
+                    object.remove(excluded);
+                }
+            }
+            redact_daemon_scope_secrets(&mut value);
+            value.to_string()
+        })
+        .unwrap_or_default();
+    daemon_startup_scope_id_for(
+        &config,
+        DAEMON_STARTUP_ENV_VARS.iter().filter_map(|name| {
+            env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| ((*name).to_string(), value))
+        }),
+    )
+}
+
+fn redact_daemon_scope_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (name, value) in object {
+                let normalized = name.to_ascii_lowercase();
+                let secret_field = ["credential", "password", "secret"]
+                    .iter()
+                    .any(|needle| normalized.contains(needle))
+                    || normalized == "token"
+                    || normalized.ends_with("_token")
+                    || normalized.ends_with("api_key")
+                    || normalized.ends_with("access_key")
+                    || normalized.ends_with("private_key");
+                if secret_field {
+                    *value = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_daemon_scope_secrets(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_daemon_scope_secrets(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn daemon_startup_scope_id_for(
+    effective_config: &str,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(effective_config.as_bytes());
+    let mut environment = environment.into_iter().collect::<Vec<_>>();
+    environment.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, value) in environment {
+        hasher.update([0]);
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..16].to_owned()
+}
+
 /// Return the daemon namespace for this produced artifact and IPC protocol version.
 #[must_use]
 pub fn daemon_namespace() -> String {
-    daemon_namespace_for(&ArtifactId::current())
+    daemon_namespace_for_scope(&ArtifactId::current(), &daemon_startup_scope_id())
+}
+
+/// Return the daemon namespace for one exact produced artifact and startup scope.
+#[must_use]
+pub fn daemon_namespace_for_scope(artifact_id: &ArtifactId, startup_scope_id: &str) -> String {
+    format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{artifact_id}-{startup_scope_id}")
 }
 
 /// Return the daemon namespace for one exact produced artifact.
 #[must_use]
 pub fn daemon_namespace_for(artifact_id: &ArtifactId) -> String {
-    format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{artifact_id}")
+    daemon_namespace_for_scope(artifact_id, &daemon_startup_scope_id())
 }
 
 /// Return the stable identity of the durable runtime scope this process uses.
@@ -4126,16 +4242,77 @@ mod tests {
     }
 
     #[test]
-    fn daemon_namespace_uses_exact_artifact_identity() {
+    fn daemon_namespace_uses_exact_artifact_and_startup_scope_identity() {
         let artifact_id = ArtifactId::parse("artifact-a").expect("artifact identity");
         assert_eq!(
-            daemon_namespace_for(&artifact_id),
-            format!("ipc-v{CURRENT_PROTOCOL_VERSION}-artifact-a")
+            daemon_namespace_for_scope(&artifact_id, "scope-a"),
+            format!("ipc-v{CURRENT_PROTOCOL_VERSION}-artifact-a-scope-a")
         );
         assert_eq!(
             daemon_namespace(),
             daemon_namespace_for(&ArtifactId::current())
         );
+    }
+
+    #[test]
+    fn daemon_scope_secret_redaction_preserves_non_secret_semantics() {
+        let mut first = serde_json::json!({
+            "provider": {
+                "api_key": "first-secret",
+                "model": "model-a",
+                "nested": [{"refresh_token": "refresh-a"}],
+            }
+        });
+        let mut second = serde_json::json!({
+            "provider": {
+                "api_key": "second-secret",
+                "model": "model-a",
+                "nested": [{"refresh_token": "refresh-b"}],
+            }
+        });
+        redact_daemon_scope_secrets(&mut first);
+        redact_daemon_scope_secrets(&mut second);
+        assert_eq!(first, second);
+
+        second["provider"]["model"] = serde_json::json!("model-b");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn daemon_startup_scope_is_stable_order_independent_and_semantic() {
+        let first = daemon_startup_scope_id_for(
+            "config-a",
+            [
+                ("BCODE_BEDROCK_MODEL".to_string(), "model-a".to_string()),
+                (
+                    "AWS_ENDPOINT_URL_BEDROCK".to_string(),
+                    "https://example.test".to_string(),
+                ),
+            ],
+        );
+        let reordered = daemon_startup_scope_id_for(
+            "config-a",
+            [
+                (
+                    "AWS_ENDPOINT_URL_BEDROCK".to_string(),
+                    "https://example.test".to_string(),
+                ),
+                ("BCODE_BEDROCK_MODEL".to_string(), "model-a".to_string()),
+            ],
+        );
+        let other_model = daemon_startup_scope_id_for(
+            "config-a",
+            [("BCODE_BEDROCK_MODEL".to_string(), "model-b".to_string())],
+        );
+        let other_config = daemon_startup_scope_id_for(
+            "config-b",
+            [("BCODE_BEDROCK_MODEL".to_string(), "model-a".to_string())],
+        );
+
+        assert_eq!(first, reordered);
+        assert_ne!(first, other_model);
+        assert_ne!(first, other_config);
+        assert_eq!(first.len(), 16);
     }
 
     #[cfg(unix)]
