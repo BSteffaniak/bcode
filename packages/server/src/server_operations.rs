@@ -131,6 +131,10 @@ impl StopBlocked {
     }
 
     /// Secret-safe public operation error message.
+    ///
+    /// The blocker category is deliberately not exposed here: it is reported through
+    /// `ServerStatus::idle_shutdown_blocker` and the daemon log, where the caller already holds
+    /// daemon-level visibility, rather than in the error a bare stop request receives.
     #[must_use]
     pub const fn message() -> &'static str {
         "daemon has active work and cannot stop in the requested mode"

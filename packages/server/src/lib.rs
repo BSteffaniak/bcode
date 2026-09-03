@@ -1075,6 +1075,15 @@ impl TraceStore {
         Self { root }
     }
 
+    /// A store with no configured root never writes blobs.
+    ///
+    /// An empty root would otherwise resolve relative paths against the process working
+    /// directory, silently scattering `<session>/blobs/` trees wherever the daemon (or a test)
+    /// happens to run.
+    fn is_disabled(&self) -> bool {
+        self.root.as_os_str().is_empty()
+    }
+
     fn write_json_blob(
         &self,
         session_id: SessionId,
@@ -1106,6 +1115,9 @@ impl TraceStore {
     ) -> Option<TraceBlobRef> {
         use sha2::{Digest as _, Sha256};
 
+        if self.is_disabled() {
+            return None;
+        }
         let bytes = if max_bytes == 0 {
             bytes
         } else if bytes.len() > max_bytes {
@@ -1216,6 +1228,9 @@ impl WorkflowPermissionResolver<'_> {
             return Ok(None);
         }
         loop {
+            let notified = pending.notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
             let decision = *pending.decision.lock().await;
             if let Some(approved) = decision {
                 return Ok(approved.then(|| WorkflowPolicyGrant {
@@ -1225,7 +1240,7 @@ impl WorkflowPermissionResolver<'_> {
                 }));
             }
             tokio::select! {
-                () = pending.notify.notified() => {}
+                () = &mut notified => {}
                 () = self.cancellation.cancelled() => {
                     interaction_operations::cancel_pending_permission(
                         self.state,
@@ -3848,10 +3863,11 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
         WorkflowStoreError::RunNotFound { .. } => {
             ("workflow_run_not_found", "workflow run was not found")
         }
-        WorkflowStoreError::InvalidRunTransition { .. } => (
-            "workflow_invalid_transition",
-            "workflow run cannot perform the requested transition",
-        ),
+        // The current and target statuses are normalized enum names, so the store's own
+        // message is secret-free and tells the operator exactly which transition was refused.
+        WorkflowStoreError::InvalidRunTransition { .. } => {
+            return ErrorResponse::new("workflow_invalid_transition", error.to_string());
+        }
         WorkflowStoreError::CancellationPreventsControl => (
             "workflow_cancellation_prevents_control",
             "workflow cancellation prevents the requested state change",
@@ -26008,6 +26024,12 @@ async fn request_tool_permission(
     .await;
     let wait_start = Instant::now();
     loop {
+        // Register as a waiter before reading the decision. `notify_waiters` wakes only tasks
+        // already registered, so checking first and registering afterwards could miss a decision
+        // committed in between and wait forever.
+        let notified = pending.notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
         let decision = *pending.decision.lock().await;
         if let Some(decision) = decision {
             let duration_ms = elapsed_ms(wait_start);
@@ -26043,7 +26065,7 @@ async fn request_tool_permission(
             return decision;
         }
         tokio::select! {
-            () = pending.notify.notified() => {}
+            () = &mut notified => {}
             () = cancel_state.cancelled() => {
                 if !interaction_operations::cancel_pending_permission(
                     state,
@@ -45339,13 +45361,20 @@ library = "test"
         assert!(datetime.contains("2026-01-02T03:04:05+00:00"));
     }
 
-    #[test]
-    fn coding_system_prompt_preserves_complete_repository_files_by_default() {
-        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    /// Root of this Git checkout, which owns the `AGENTS.md` and `INVARIANTS.md` the coding
+    /// prompt embeds. Tests that need those files must not depend on the test process cwd, which
+    /// is the crate directory under `cargo test`.
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .expect("workspace root")
-            .to_path_buf();
+            .to_path_buf()
+    }
+
+    #[test]
+    fn coding_system_prompt_preserves_complete_repository_files_by_default() {
+        let cwd = workspace_root();
         let agents = fs::read_to_string(cwd.join("AGENTS.md")).expect("AGENTS.md");
         let invariants = fs::read_to_string(cwd.join("INVARIANTS.md")).expect("INVARIANTS.md");
 
@@ -45366,7 +45395,7 @@ library = "test"
 
     #[test]
     fn coding_system_prompt_applies_explicit_repository_limits() {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = workspace_root();
         let config = bcode_config::SystemPromptConfig {
             repository_instructions_max_chars: std::num::NonZeroUsize::new(200),
             repository_invariants_max_chars: std::num::NonZeroUsize::new(300),
@@ -45381,7 +45410,7 @@ library = "test"
 
     #[test]
     fn coding_system_prompt_includes_invariants_with_replacement_mode() {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = workspace_root();
         let mut config = bcode_config::SystemPromptConfig {
             mode: bcode_config::SystemPromptMode::Replace,
             text: Some("custom base".to_owned()),
@@ -47573,6 +47602,35 @@ library = "test"
     }
 
     #[test]
+    fn trace_store_without_root_writes_nothing() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let session_id = SessionId::new();
+        let store = TraceStore::new(PathBuf::new());
+
+        assert!(
+            store
+                .write_json_blob(session_id, "probe", &serde_json::json!({"x": 1}), 0)
+                .is_none()
+        );
+        assert!(
+            store
+                .write_text_blob(session_id, "probe", "text", 0)
+                .is_none()
+        );
+        assert!(
+            !cwd.join(session_id.to_string()).exists(),
+            "an unrooted trace store must not create `<session>/blobs` under the working directory"
+        );
+
+        let rooted = tempfile::tempdir().expect("trace root");
+        let store = TraceStore::new(rooted.path().to_path_buf());
+        let blob = store
+            .write_text_blob(session_id, "probe", "text", 0)
+            .expect("rooted store writes");
+        assert!(rooted.path().join(&blob.path).exists());
+    }
+
+    #[test]
     fn server_stop_errors_are_stable_and_secret_safe() {
         assert_eq!(server_operations::StopBlocked::code(), "daemon_busy");
         assert_eq!(
@@ -48039,7 +48097,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    async fn abandoned_model_turn_is_redispatched_from_its_canonical_trigger() {
+    async fn abandoned_model_turn_without_execution_descriptor_is_terminalized_not_redispatched() {
+        // A turn admitted before the daemon restart carries no versioned execution descriptor, so
+        // replaying it under the new daemon's startup model/provider defaults could retarget the
+        // request. Recovery must terminalize it as an explicit interrupted error instead.
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(root.path()).expect("persistent session manager");
         let session = sessions
@@ -48080,17 +48141,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
         recover_abandoned_session_runtime_work(&state, session.id)
             .await
             .expect("recover turn");
-        for _ in 0..100 {
-            if sessions
-                .active_runtime_work(session.id)
-                .await
-                .expect("active work")
-                .is_empty()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
 
         let history = sessions.session_history(session.id).await.expect("history");
         assert_eq!(
@@ -48101,24 +48151,47 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     SessionEventKind::ModelTurnStarted { turn_id: id } if id == &turn_id
                 ))
                 .count(),
-            1
+            1,
+            "recovery must not re-admit the abandoned turn"
         );
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ModelTurnFinished {
-                turn_id: id,
-                outcome: ModelTurnOutcome::Completed,
-                ..
-            } if id == &turn_id
-        )));
-        assert!(!history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ModelTurnFinished {
-                turn_id: id,
-                outcome: ModelTurnOutcome::Error,
-                ..
-            } if id == &turn_id
-        )));
+        assert!(
+            history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: id,
+                    outcome: ModelTurnOutcome::Error,
+                    message: Some(message),
+                } if id == &turn_id && message.contains("daemon stopped before runtime work finished")
+            )),
+            "abandoned turn must reach an explicit interrupted terminal outcome: {history:#?}"
+        );
+        assert!(
+            history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::RuntimeWorkFinished { work_id: id, status: RuntimeWorkStatus::Failed, .. }
+                    if id == &work_id
+            )),
+            "abandoned runtime work must be finished"
+        );
+        assert!(
+            sessions
+                .active_runtime_work(session.id)
+                .await
+                .expect("active work")
+                .is_empty(),
+            "no runtime work may remain active after recovery"
+        );
+        assert!(
+            !history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: id,
+                    outcome: ModelTurnOutcome::Completed,
+                    ..
+                } if id == &turn_id
+            )),
+            "recovery must not fabricate a completed outcome under daemon defaults"
+        );
     }
 
     #[tokio::test]
@@ -49090,18 +49163,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state: &ServerState,
         permission: &PendingPermission,
     ) {
-        state
-            .pending_permissions
-            .lock()
-            .await
-            .remove(&permission.summary.permission_id);
-        interaction_operations::resolve_permission(
-            state,
-            &permission.summary.permission_id,
-            true,
-            false,
-        )
-        .await;
+        assert!(
+            interaction_operations::resolve_permission(
+                state,
+                &permission.summary.permission_id,
+                true,
+                false,
+            )
+            .await,
+            "pending permission {} must still be resolvable",
+            permission.summary.permission_id
+        );
     }
 
     fn pending_permission_for_batch(
@@ -50582,7 +50654,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             assert!(matches!(
                 stop,
                 Err(bcode_client::ClientError::Server { code, message })
-                    if code == "daemon_busy" && message.contains("active session migration")
+                    if code == server_operations::StopBlocked::code()
+                        && message == server_operations::StopBlocked::message()
             ));
         }
         drop(initiator);
@@ -54513,6 +54586,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut startup_config = bcode_config::BcodeConfig::default();
         startup_config.model.prompt_cache.mode = bcode_model::PromptCacheMode::Off;
         startup_config.model.tool_output.context_chars = 1_000;
+        // Tests assert on the diagnostic provider-event and compaction traces, which the daemon
+        // persists only at debug observability. Production defaults keep those gated.
+        let observability = bcode_config::ObservabilityConfig {
+            level: bcode_config::ObservabilityLevel::Debug,
+            ..bcode_config::ObservabilityConfig::default()
+        };
         ServerState::new(
             sessions,
             plugins,
@@ -54527,7 +54606,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
-                observability: bcode_config::ObservabilityConfig::default(),
+                observability,
                 session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
                 model_streaming: bcode_config::StreamingConfig::default(),
@@ -56192,7 +56271,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .reconcile_receipt_backed_attempts_async(&observer, 10, 4)
             .await
             .expect("reconcile");
-        assert_eq!(summary.succeeded.len(), 1);
+        assert_eq!(
+            summary.succeeded.len(),
+            1,
+            "reconciliation summary: {summary:#?}"
+        );
         assert_eq!(
             store
                 .run_summary("observe-run")
@@ -65497,12 +65580,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .session_history(session_id)
             .await
             .expect("history");
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::TraceEvent { trace }
-                if matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. }
-                    if event_type == "structured_result_correction_started")
-        )));
+        assert!(
+            history.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::TraceEvent { trace }
+                    if matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. }
+                        if event_type == "structured_result_correction_started")
+            )),
+            "correction must be traced: {history:#?}"
+        );
     }
 
     #[tokio::test]
@@ -67836,7 +67922,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .create_session(Some("bypass".to_owned()), test_working_directory())
             .await
             .expect("session");
-        let state = test_server_state(sessions);
+        // This test verifies the standard-level trace gate, so it must not inherit the debug
+        // observability the shared test state enables for trace-asserting tests.
+        let mut state = test_server_state(sessions);
+        state.observability = bcode_config::ObservabilityConfig::default();
         let call = bcode_model::ToolCall {
             id: "bypass-call".to_owned(),
             name: "test.mutate".to_owned(),

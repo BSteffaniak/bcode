@@ -35,13 +35,36 @@ const MAINTENANCE_PROVIDER_SLICES_BEFORE_YIELD: usize = 1;
 /// blocks newly arriving readers; maintenance must not additionally spin waiting for the
 /// ordinary-waiter count to reach zero. Ordinary ingestion legitimately requeues retryable
 /// work indefinitely, so such a spin can livelock and never admit maintenance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SessionSearchWorkScheduler {
     maintenance_gate: Mutex<()>,
     work_gate: RwLock<()>,
+    /// Maximum sessions selected per historical-backfill catalog page.
+    ///
+    /// Production uses the portable `MAX_BACKFILL_SESSIONS` bound. Tests lower it so multi-page
+    /// traversal can be exercised without materializing hundreds of persistent sessions.
+    backfill_page_size: usize,
+}
+
+impl Default for SessionSearchWorkScheduler {
+    fn default() -> Self {
+        Self::with_backfill_page_size(MAX_BACKFILL_SESSIONS)
+    }
 }
 
 impl SessionSearchWorkScheduler {
+    pub(crate) fn with_backfill_page_size(backfill_page_size: usize) -> Self {
+        Self {
+            maintenance_gate: Mutex::default(),
+            work_gate: RwLock::default(),
+            backfill_page_size: backfill_page_size.clamp(1, MAX_BACKFILL_SESSIONS),
+        }
+    }
+
+    const fn backfill_page_size(&self) -> usize {
+        self.backfill_page_size
+    }
+
     async fn run_ordinary<T>(&self, work: impl std::future::Future<Output = T>) -> T {
         let guard = self.work_gate.read().await;
         let result = work.await;
@@ -620,6 +643,7 @@ pub async fn backfill_provider_with_cancellation(
             retryable: true,
         })?;
     let starting_cursor = request.cursor.clone();
+    let page_size = state.session_search_work.backfill_page_size();
     let mut summaries = state
         .sessions
         .session_summaries_page(
@@ -630,11 +654,11 @@ pub async fn backfill_provider_with_cancellation(
                 .cursor
                 .as_ref()
                 .map(|cursor| (cursor.updated_at_ms, cursor.session_id)),
-            MAX_BACKFILL_SESSIONS,
+            page_size,
         )
         .await;
-    let selection_truncated = summaries.len() > MAX_BACKFILL_SESSIONS;
-    summaries.truncate(MAX_BACKFILL_SESSIONS);
+    let selection_truncated = summaries.len() > page_size;
+    summaries.truncate(page_size);
     let next_cursor = selection_truncated
         .then(|| summaries.last())
         .flatten()
@@ -4251,11 +4275,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn complete_backfill_traverses_more_than_two_catalog_pages_without_skipping_sessions() {
+        // Pagination behaviour does not depend on the page size, and each persistent session is a
+        // real database, so exercise three pages with a small page instead of 500+ sessions.
+        const PAGE_SIZE: usize = 4;
         let _guard = SEARCH_TEST_LOCK.lock().await;
         APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
-        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let mut state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        state.session_search_work = SessionSearchWorkScheduler::with_backfill_page_size(PAGE_SIZE);
         let workspace = tempfile::tempdir().expect("workspace");
-        let session_count = MAX_BACKFILL_SESSIONS * 2 + 1;
+        let session_count = PAGE_SIZE * 2 + 1;
         for index in 0..session_count {
             let session = state
                 .sessions

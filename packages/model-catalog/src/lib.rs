@@ -2037,6 +2037,16 @@ mod tests {
         );
     }
 
+    /// Bedrock exposes `OpenAI` models both as bare ids and as per-region or global inference
+    /// profiles (`us.`, `eu.`, `apac.`, `global.`). All of them are `OpenAI` models.
+    fn is_bedrock_openai_model_id(model_id: &str) -> bool {
+        ["", "us.", "eu.", "apac.", "global."].iter().any(|prefix| {
+            model_id
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with("openai."))
+        })
+    }
+
     #[test]
     fn bedrock_openai_responses_models_resolve_with_region_prefixes() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
@@ -2044,15 +2054,19 @@ mod tests {
             .provider("bedrock")
             .expect("bedrock provider exists");
 
-        // Bare ids, per-region inference-profile prefixes, and the cross-region `global.` prefix
-        // must all resolve to the same catalog entry.
+        // Regional inference profiles with their own pricing are exact catalog entries and win
+        // outright. Prefixes without a dedicated entry (`eu.`, `apac.`, and any profile of a model
+        // that only has a bare entry) resolve through the bare entry's `*needle*` alias. Every
+        // form must stay on the OpenAI Responses surface.
         for (model_id, expected_entry) in [
             ("openai.gpt-5.6-sol", "openai.gpt-5.6-sol"),
-            ("us.openai.gpt-5.6-sol", "openai.gpt-5.6-sol"),
+            ("us.openai.gpt-5.6-sol", "us.openai.gpt-5.6-sol"),
+            ("global.openai.gpt-5.6-sol", "global.openai.gpt-5.6-sol"),
             ("eu.openai.gpt-5.6-terra", "openai.gpt-5.6-terra"),
             ("apac.openai.gpt-5.6-luna", "openai.gpt-5.6-luna"),
-            ("global.openai.gpt-5.5", "openai.gpt-5.5"),
-            ("us.openai.gpt-5.4", "openai.gpt-5.4"),
+            ("global.openai.gpt-5.5", "global.openai.gpt-5.5"),
+            ("us.openai.gpt-5.4", "us.openai.gpt-5.4"),
+            ("eu.openai.gpt-5.4", "openai.gpt-5.4"),
             ("us.openai.gpt-oss-120b", "openai.gpt-oss-120b"),
             ("us.openai.gpt-oss-20b", "openai.gpt-oss-20b"),
         ] {
@@ -2077,16 +2091,18 @@ mod tests {
             .provider("bedrock")
             .expect("bedrock provider exists");
 
-        // The provider file carries a broad `*claude*` fallback. OpenAI ids must never land on it.
+        // The provider file carries a broad `*claude*` fallback. OpenAI ids must never land on it,
+        // whether they resolve to a bare entry, a regional entry, or through an alias.
         for model_id in [
             "openai.gpt-5.6-sol",
             "us.openai.gpt-5.5",
+            "eu.openai.gpt-5.5",
             "openai.gpt-oss-safeguard-120b",
         ] {
             let entry = find_provider_model(provider, model_id)
                 .unwrap_or_else(|| panic!("{model_id} should resolve"));
             assert!(
-                entry.model_id.starts_with("openai."),
+                is_bedrock_openai_model_id(&entry.model_id),
                 "{model_id} resolved to non-OpenAI entry {}",
                 entry.model_id
             );
@@ -2646,7 +2662,7 @@ mod tests {
 
         // Claude entries must not leak onto the OpenAI surface either.
         assert!(
-            ids.iter().all(|id| id.starts_with("openai.")),
+            ids.iter().all(|id| is_bedrock_openai_model_id(id)),
             "only OpenAI models declare the Mantle OpenAI target; got {ids:?}"
         );
     }

@@ -5286,32 +5286,31 @@ mod tests {
 
     #[tokio::test]
     async fn storage_compatibility_classifies_clean_legacy_prefix() {
+        // A legacy store is one whose ledger stops exactly before the storage-contract migration.
+        // Derive that suffix from the current schema so this test tracks new migrations instead
+        // of maintaining a hand-typed list that silently goes stale.
+        const FIRST_CONTRACT_MIGRATION: &str = "026_session_storage_contract_table";
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
             .await
             .expect("open session db");
+        let post_legacy_migration_ids = session_migrations()
+            .migrations()
+            .await
+            .expect("current session migrations")
+            .into_iter()
+            .map(|migration| migration.id().to_owned())
+            .skip_while(|id| id != FIRST_CONTRACT_MIGRATION)
+            .map(DatabaseValue::String)
+            .collect::<Vec<_>>();
+        assert!(
+            post_legacy_migration_ids.len() > 1,
+            "the contract migration must exist and be followed by later migrations"
+        );
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
-            .where_in(
-                "id",
-                vec![
-                    DatabaseValue::String("026_session_storage_contract_table".to_owned()),
-                    DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
-                    DatabaseValue::String("028_session_compatibility_state".to_owned()),
-                    DatabaseValue::String("029_session_compatibility_issues".to_owned()),
-                    DatabaseValue::String("030_session_state_visibility_column".to_owned()),
-                    DatabaseValue::String(
-                        "031_session_state_execution_provenance_column".to_owned(),
-                    ),
-                    DatabaseValue::String("032_terminal_tool_lifecycle_projection".to_owned()),
-                    DatabaseValue::String("033_session_migration_receipts_table".to_owned()),
-                    DatabaseValue::String(
-                        "034_session_state_model_selection_source_column".to_owned(),
-                    ),
-                    DatabaseValue::String("035_session_state_reasoning_by_model_column".to_owned()),
-                ],
-            )
+            .where_in("id", post_legacy_migration_ids)
             .execute(db.database())
             .await
             .expect("remove contract migrations");

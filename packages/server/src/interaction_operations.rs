@@ -594,12 +594,17 @@ pub async fn wait_for_tool_exchange_resolution(
     cancel_state: &TurnCancelState,
 ) -> ToolExchangeResolution {
     loop {
+        // Register before reading so a resolution committed between the read and the wait is
+        // not lost: `notify_waiters` only wakes already-registered waiters.
+        let notified = notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
         let value = resolution_slot.lock().await.clone();
         if let Some(resolution) = value {
             return resolution;
         }
         tokio::select! {
-            () = notify.notified() => {}
+            () = &mut notified => {}
             () = cancel_state.cancelled() => {
                 return abort_tool_exchange(
                     state,

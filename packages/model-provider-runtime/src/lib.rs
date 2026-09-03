@@ -284,9 +284,11 @@ pub fn select_structured_json_candidate(
 
 /// Catalog and select one structured candidate with deterministic ambiguity handling.
 ///
-/// Primitive JSON contracts are intentionally unsupported for embedded scanning because arbitrary
-/// prose contains too many ambiguous primitive tokens. Callers that need primitive output should
-/// require exact JSON at their own boundary.
+/// When the entire trimmed text is one JSON value that satisfies `is_valid`, it is accepted
+/// regardless of shape, so exact primitive contracts (a bare number, string, or boolean) work
+/// when the provider returns exactly that value. Primitive JSON contracts are intentionally
+/// unsupported for *embedded* scanning because arbitrary prose contains too many ambiguous
+/// primitive tokens; only objects and arrays are cataloged from fences and surrounding text.
 ///
 /// # Errors
 ///
@@ -297,20 +299,12 @@ pub fn extract_structured_json_candidate(
     mut is_valid: impl FnMut(&serde_json::Value) -> bool,
 ) -> Result<serde_json::Value, String> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim())
-        && is_structured_result_shape(&value)
         && is_valid(&value)
     {
         return Ok(value);
     }
     let candidates = catalog_structured_json_candidates(text)?;
     select_structured_json_candidate(&candidates, is_valid)
-}
-
-const fn is_structured_result_shape(value: &serde_json::Value) -> bool {
-    matches!(
-        value,
-        serde_json::Value::Object(_) | serde_json::Value::Array(_)
-    )
 }
 
 const fn structured_candidate_rank(envelope: StructuredCandidateEnvelope) -> u8 {
@@ -1491,6 +1485,32 @@ mod output_position_tests {
         assert!(extract_structured_json_candidate("```rust\n{}\n```", |_| true).is_err());
         assert!(
             extract_structured_json_candidate("prefix {\"one\":1} {\"two\":2}", |_| true).is_err()
+        );
+    }
+
+    #[test]
+    fn structured_candidate_extraction_accepts_exact_primitives_but_never_scans_for_them() {
+        // An exact primitive is unambiguous and satisfies scalar contracts such as `u32`.
+        assert_eq!(
+            extract_structured_json_candidate("1", serde_json::Value::is_u64)
+                .expect("exact number"),
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            extract_structured_json_candidate(" true \n", serde_json::Value::is_boolean)
+                .expect("exact boolean"),
+            serde_json::json!(true)
+        );
+        // An exact primitive that fails the caller's contract is not silently accepted.
+        assert!(extract_structured_json_candidate("1", serde_json::Value::is_string).is_err());
+        // Primitives embedded in prose remain unsupported: only objects and arrays are cataloged.
+        assert!(
+            extract_structured_json_candidate("The answer is 1.", serde_json::Value::is_u64)
+                .is_err()
+        );
+        assert!(
+            extract_structured_json_candidate("```json\n1\n```", serde_json::Value::is_u64)
+                .is_err()
         );
     }
 

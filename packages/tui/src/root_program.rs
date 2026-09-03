@@ -5368,7 +5368,7 @@ mod tests {
             .active_interactive_surface_work_shape_for_test();
         let summary = latency_summary(&samples);
         let draw_summary = latency_summary(&draw_samples);
-        eprintln!(
+        println!(
             "{}",
             serde_json::json!({
                 "kind": "bcode_question_interaction_committed_presentation_latency",
@@ -5526,7 +5526,7 @@ mod tests {
         let draw = latency_summary(&draw_samples);
         let within_budget = total["p99_ms"].as_f64().expect("numeric p99")
             <= LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0;
-        eprintln!(
+        println!(
             "{}",
             serde_json::json!({
                 "kind": "bcode_inline_question_transcript_scroll_performance",
