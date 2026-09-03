@@ -324,14 +324,38 @@ operation state. Every production run persists an immutable target artifact plus
 coordinator generation and fencing token. Scheduling, continuation, and startup restoration qualify
 that authority before entering a mutation cycle and recheck it throughout the cycle; stale or foreign
 authority cannot dispatch, observe, cancel, resume, or terminalize the run. Authority transfer is a
-same-artifact compare-and-swap to the next generation and occurs only after canonical session-owner
-evidence proves the prior daemon ended. Agent-turn receipts additionally persist the exact daemon
-artifact and daemon-instance identity that accepted the turn. A daemon with a different artifact, or
-a replacement daemon while the recorded session owner remains live or unverifiable, defers
-observation without mutating the attempt. This keeps the workflow database canonical across
-artifact-isolated daemons without letting one artifact recover or terminalize another artifact's
-live work. Prepared mutation without a trustworthy receipt or externally provable outcome becomes
-`repair_required`; it is not retried automatically.
+compare-and-swap to the next generation and occurs only after canonical evidence proves the prior
+daemon ended. Two forms exist:
+
+* **Same-artifact transfer** preserves the target artifact and requires session-owner evidence that
+  the prior coordinator ended. It is the normal replacement-daemon path and may recover live work.
+* **Cross-artifact reassignment** changes the target artifact and is allowed only for a *quiescent*
+  run: one with no `prepared`, `admitted`, or `running` attempt. It requires both session-owner
+  lease observations and the daemon registry to agree that the prior coordinator ended (a lost
+  lease alone is not enough), and it persists an `authority_reassigned` event carrying that
+  evidence. A quiescent run is durable data rather than live work, so no artifact-specific receipt
+  interpretation is pending and no other artifact's live work is recovered or terminalized.
+
+Agent-turn receipts additionally persist the exact daemon artifact and daemon-instance identity that
+accepted the turn. A daemon with a different artifact, or a replacement daemon while the recorded
+session owner remains live or unverifiable, defers observation without mutating the attempt and
+reports the owning daemon in a typed `workflow_owned_by_live_daemon` error so operators can act on
+it. This keeps the workflow database canonical across artifact-isolated daemons without letting one
+artifact recover or terminalize another artifact's live work, while ensuring a run can never become
+permanently uncontrollable merely because the build that started it is gone. Prepared mutation
+without a trustworthy receipt or externally provable outcome becomes `repair_required`; it is not
+retried automatically.
+
+A paused run holds no live process resources. Pausing suspends the run's session-level runtime
+work registration (`RuntimeWorkStatus::Suspended`) so the coordinating daemon can reach quiescence,
+release session ownership, and shut down when idle; resuming re-registers the work under the same
+identifier. Daemon startup settles run-level registrations inherited from a prior daemon for every
+quiescent (terminal or paused) run.
+
+`bcode workflow reconcile-orphans` is the explicit maintenance operation for nonterminal runs whose
+coordinator verifiably ended. It reports each candidate with its evidence and, only with `--apply`,
+reassigns and cancels them (a `repair_required` run is reassigned but keeps its status for
+attempt-level repair). Runs owned by a live or unverifiable daemon are always skipped.
 
 Full replay, projection rebuild, receipt investigation, forced retry, and ambiguity resolution are
 explicit doctor/reconcile/repair operations. Maintenance acquires exclusive workflow-store

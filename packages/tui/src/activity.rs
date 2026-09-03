@@ -143,7 +143,8 @@ pub fn runtime_work_detail(runtime_work: &[RuntimeWorkView]) -> Option<String> {
         RuntimeWorkStatus::Completed
         | RuntimeWorkStatus::Cancelled
         | RuntimeWorkStatus::Failed
-        | RuntimeWorkStatus::TimedOut => return None,
+        | RuntimeWorkStatus::TimedOut
+        | RuntimeWorkStatus::Suspended => return None,
     };
     let detail = match (work.label.is_empty(), work.message.as_deref()) {
         (true, Some(message)) => message.to_owned(),
@@ -170,7 +171,8 @@ const fn runtime_work_priority(work: &RuntimeWorkView) -> u8 {
             RuntimeWorkStatus::Completed
             | RuntimeWorkStatus::Cancelled
             | RuntimeWorkStatus::Failed
-            | RuntimeWorkStatus::TimedOut,
+            | RuntimeWorkStatus::TimedOut
+            | RuntimeWorkStatus::Suspended,
             _,
         ) => 8,
     }

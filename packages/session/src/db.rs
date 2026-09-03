@@ -7055,13 +7055,18 @@ mod tests {
                 ExpectedHistory::PersistedEventError,
             ),
             (
+                "current-schema-v46.json",
+                include_str!("../fixtures/migrations/current-schema-v46.json"),
+                ExpectedHistory::PersistedEventError,
+            ),
+            (
                 "future-schema-v44.json",
                 include_str!("../fixtures/migrations/future-schema-v44.json"),
                 ExpectedHistory::PersistedEventError,
             ),
             (
-                "future-schema-v46.json",
-                include_str!("../fixtures/migrations/future-schema-v46.json"),
+                "future-schema-v47.json",
+                include_str!("../fixtures/migrations/future-schema-v47.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (

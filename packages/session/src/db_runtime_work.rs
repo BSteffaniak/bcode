@@ -36,6 +36,7 @@ pub const fn runtime_work_status_name(status: RuntimeWorkStatus) -> &'static str
         RuntimeWorkStatus::Failed => "failed",
         RuntimeWorkStatus::TimedOut => "timed_out",
         RuntimeWorkStatus::Cancelled => "cancelled",
+        RuntimeWorkStatus::Suspended => "suspended",
     }
 }
 
@@ -48,6 +49,7 @@ pub fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
         "failed" => RuntimeWorkStatus::Failed,
         "timed_out" => RuntimeWorkStatus::TimedOut,
         "cancelled" => RuntimeWorkStatus::Cancelled,
+        "suspended" => RuntimeWorkStatus::Suspended,
         _ => RuntimeWorkStatus::Running,
     }
 }
@@ -66,6 +68,7 @@ mod tests {
             RuntimeWorkStatus::Failed,
             RuntimeWorkStatus::TimedOut,
             RuntimeWorkStatus::Cancelled,
+            RuntimeWorkStatus::Suspended,
         ] {
             assert_eq!(
                 parse_runtime_work_status(runtime_work_status_name(status)),

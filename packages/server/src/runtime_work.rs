@@ -338,6 +338,32 @@ impl RuntimeWorkManager {
         self.active.lock().await.len()
     }
 
+    /// Return active work snapshots across every session, tagged with their owning session.
+    pub async fn active_all(&self) -> Vec<(SessionId, RuntimeWorkSnapshot)> {
+        self.active
+            .lock()
+            .await
+            .iter()
+            .map(|((session_id, work_id), work)| {
+                (
+                    *session_id,
+                    RuntimeWorkSnapshot {
+                        work_id: work_id.clone(),
+                        kind: work.spec.kind,
+                        label: work.spec.label.clone(),
+                        tool_call_id: work.spec.tool_call_id.clone(),
+                        status: if work.cancelled {
+                            RuntimeWorkStatus::Cancelling
+                        } else {
+                            RuntimeWorkStatus::Running
+                        },
+                        cancellable: work.spec.cancellation.is_cancellable(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Return active work snapshots for a session.
     pub async fn active_for_session(&self, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {
         self.active

@@ -3896,6 +3896,27 @@ impl BcodeClient {
         }
     }
 
+    /// Explicitly reconcile nonterminal workflow runs whose coordinator daemon verifiably ended.
+    ///
+    /// With `apply == false` this only reports what would change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn reconcile_orphaned_workflow_runs(
+        &self,
+        apply: bool,
+        limit: usize,
+    ) -> Result<bcode_ipc::OrphanedWorkflowRunReport, ClientError> {
+        match self
+            .send_request(Request::ReconcileOrphanedWorkflowRuns { apply, limit })
+            .await?
+        {
+            ResponsePayload::OrphanedWorkflowRunsReconciled { report } => Ok(report),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Pause one running workflow before further scheduler admission.
     ///
     /// # Errors

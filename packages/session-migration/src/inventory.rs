@@ -1457,7 +1457,7 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 45;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 46;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
@@ -1498,7 +1498,7 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
             (11, live)
         }
         "runtime_work_progress" => (18, live),
-        "session_derived" => (CURRENT_EVENT_SCHEMA, CURRENT_EVENT_SCHEMA),
+        "session_derived" => (46, CURRENT_EVENT_SCHEMA),
         "session_forked" => (22, live),
         "session_imported" => (16, live),
         "session_renamed" | "trace_event" => (7, live),
@@ -2259,7 +2259,7 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6];
 /// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.

@@ -551,6 +551,34 @@ pub struct WorkflowExecutionAuthority {
     pub fencing_token: String,
 }
 
+/// Durable evidence that a run's recorded coordinator daemon ended.
+///
+/// Persisted with every cross-artifact authority reassignment so operators can audit why a run
+/// changed hands. Every field is derived from canonical session-owner observations or daemon
+/// registry state; none is inferred from the run's own contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndedOwnerEvidence {
+    /// Coordinator daemon instance that no longer owns the run.
+    pub ended_daemon_instance_id: String,
+    /// Artifact the ended coordinator belonged to.
+    pub ended_target_artifact_id: String,
+    /// How the prior owner's end was established.
+    pub liveness: EndedOwnerLiveness,
+    /// Whether the ended artifact's executable image was still available when reassigned.
+    pub artifact_image_available: bool,
+}
+
+/// How a prior coordinator's end was proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndedOwnerLiveness {
+    /// Session-owner observations positively reported the recorded daemon process as ended.
+    ObservedEnded,
+    /// No session-owner observation named the recorded daemon and no daemon registry record
+    /// claims that instance; the owner left no live trace.
+    NoLiveTrace,
+}
+
 /// Durable workflow run creation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewWorkflowRun {
@@ -4017,6 +4045,88 @@ impl WorkflowStore {
                 "workflow execution authority transfer lost its ownership race: {run_id}"
             )))
         }
+    }
+
+    /// Atomically reassign one quiescent run from a coordinator that verifiably ended to a
+    /// coordinator on a different daemon artifact.
+    ///
+    /// This is the cross-artifact counterpart of [`Self::transfer_execution_authority`]. It is
+    /// permitted only when the run holds no live attempt (`prepared`, `admitted`, or `running`),
+    /// because such a run is durable data rather than live work and no artifact-specific receipt
+    /// interpretation is pending. The caller must have already proven that the recorded
+    /// coordinator daemon ended; that evidence is persisted as a `authority_reassigned` event so
+    /// the reassignment is auditable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the replacement generation is not `expected.generation + 1`, when the
+    /// run still has a live attempt, when the current authority is stale, or when persistence
+    /// fails.
+    pub fn reassign_execution_authority_from_ended_owner(
+        &mut self,
+        run_id: &str,
+        expected: &WorkflowExecutionAuthority,
+        replacement: &WorkflowExecutionAuthority,
+        evidence: &EndedOwnerEvidence,
+        reassigned_at_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        if replacement.generation != expected.generation.saturating_add(1) {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow execution authority reassignment is invalid".to_string(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let live_attempts: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM workflow_attempts \
+             WHERE run_id = ?1 AND status IN ('prepared', 'admitted', 'running')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if live_attempts > 0 {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow run still has {live_attempts} live attempt(s) and cannot be reassigned: {run_id}"
+            )));
+        }
+        let changed = transaction.execute(
+            "UPDATE workflow_runs SET target_artifact_id = ?6, coordinator_daemon_instance_id = ?7, \
+             coordinator_generation = ?8, coordinator_fencing_token = ?9, updated_at_ms = ?10 \
+             WHERE run_id = ?1 AND target_artifact_id = ?2 \
+               AND coordinator_daemon_instance_id = ?3 AND coordinator_generation = ?4 \
+               AND coordinator_fencing_token = ?5 AND status IN ('running', 'paused', 'repair_required')",
+            rusqlite::params![
+                run_id,
+                &expected.target_artifact_id,
+                &expected.daemon_instance_id,
+                expected.generation,
+                &expected.fencing_token,
+                &replacement.target_artifact_id,
+                &replacement.daemon_instance_id,
+                replacement.generation,
+                &replacement.fencing_token,
+                reassigned_at_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow execution authority reassignment lost its ownership race: {run_id}"
+            )));
+        }
+        append_event(
+            &transaction,
+            run_id,
+            "authority_reassigned",
+            &serde_json::json!({
+                "from": expected,
+                "to": replacement,
+                "evidence": evidence,
+                "reassigned_at_ms": reassigned_at_ms,
+            })
+            .to_string(),
+            reassigned_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Idempotently create one durable workflow run using a caller-stable identity.
@@ -9532,6 +9642,66 @@ impl WorkflowStore {
         }
         transaction.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Return bounded nonterminal runs (`running`, `paused`, `repair_required`) oldest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the limit is invalid, a row is malformed, or the bounded query fails.
+    pub fn nonterminal_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowRunSummary>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
+             parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
+             single_active, authored_provenance_json, terminal_output_id, \
+             terminal_output_checksum_sha256, authorization_profile_json, authorization_ceiling, status, cancellation_requested_at_ms, \
+             created_at_ms, updated_at_ms FROM workflow_runs \
+             WHERE status IN ('running', 'paused', 'repair_required') \
+             ORDER BY updated_at_ms ASC, run_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], run_summary_from_row)?
+            .map(|row| {
+                row.map_err(WorkflowStoreError::from)
+                    .and_then(parse_run_summary)
+            })
+            .collect()
+    }
+
+    /// Return bounded quiescent runs that belong to persisted parent sessions.
+    ///
+    /// Quiescent runs hold no live process resources: every terminal status plus `paused`.
+    /// Callers use this to reconcile run-level runtime work registrations after a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the limit is invalid, a row is malformed, or the bounded query fails.
+    pub fn quiescent_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowRunSummary>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
+             parent_session_id, parent_session_generation, owner_plugin_id, workflow_kind, scope_key, display_label, \
+             single_active, authored_provenance_json, terminal_output_id, \
+             terminal_output_checksum_sha256, authorization_profile_json, authorization_ceiling, status, cancellation_requested_at_ms, \
+             created_at_ms, updated_at_ms FROM workflow_runs \
+             WHERE parent_session_id IS NOT NULL \
+               AND status IN ('completed', 'failed', 'cancelled', 'repair_required', 'paused') \
+             ORDER BY updated_at_ms DESC, run_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], run_summary_from_row)?
+            .map(|row| {
+                row.map_err(WorkflowStoreError::from)
+                    .and_then(parse_run_summary)
+            })
+            .collect()
     }
 
     /// Return bounded terminal runs that belong to persisted parent sessions.
@@ -18037,6 +18207,117 @@ mod tests {
         store
             .verify_execution_authority("run-1", &replacement)
             .expect("current authority");
+    }
+
+    #[test]
+    fn cross_artifact_reassignment_requires_quiescent_run_and_is_audited() {
+        let (_temp, mut store) = initialized_store();
+        let initial = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact-old".to_string(),
+            daemon_instance_id: "daemon-old".to_string(),
+            generation: 1,
+            fencing_token: "token-old".to_string(),
+        };
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET target_artifact_id = ?2, \
+                 coordinator_daemon_instance_id = ?3, coordinator_generation = ?4, \
+                 coordinator_fencing_token = ?5 WHERE run_id = ?1",
+                rusqlite::params![
+                    "run-1",
+                    &initial.target_artifact_id,
+                    &initial.daemon_instance_id,
+                    initial.generation,
+                    &initial.fencing_token,
+                ],
+            )
+            .expect("seed authority");
+        let replacement = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact-new".to_string(),
+            daemon_instance_id: "daemon-new".to_string(),
+            generation: 2,
+            fencing_token: "token-new".to_string(),
+        };
+        let evidence = EndedOwnerEvidence {
+            ended_daemon_instance_id: "daemon-old".to_string(),
+            ended_target_artifact_id: "artifact-old".to_string(),
+            liveness: EndedOwnerLiveness::NoLiveTrace,
+            artifact_image_available: false,
+        };
+
+        // Same-artifact transfer must still refuse an artifact change.
+        assert!(
+            store
+                .transfer_execution_authority("run-1", &initial, &replacement, 20)
+                .is_err()
+        );
+
+        // A live attempt pins the run to its original artifact.
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        let refused = store
+            .reassign_execution_authority_from_ended_owner(
+                "run-1",
+                &initial,
+                &replacement,
+                &evidence,
+                21,
+            )
+            .expect_err("live attempt must block reassignment");
+        assert!(refused.to_string().contains("live attempt"));
+        assert_eq!(
+            store.execution_authority("run-1").expect("authority"),
+            Some(initial.clone())
+        );
+
+        // Once the attempt is settled the run is quiescent and may be reassigned.
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_attempts SET status = 'failed', terminal_at_ms = 22 \
+                 WHERE dispatch_identity = ?1",
+                [&identity],
+            )
+            .expect("settle attempt");
+        store
+            .reassign_execution_authority_from_ended_owner(
+                "run-1",
+                &initial,
+                &replacement,
+                &evidence,
+                23,
+            )
+            .expect("reassign quiescent run");
+        assert_eq!(
+            store.execution_authority("run-1").expect("authority"),
+            Some(replacement.clone())
+        );
+        store
+            .verify_execution_authority("run-1", &replacement)
+            .expect("new authority is current");
+        assert!(store.verify_execution_authority("run-1", &initial).is_err());
+        let audit = store
+            .event_history("run-1", None, 100)
+            .expect("events")
+            .into_iter()
+            .find(|event| event.event_type == "authority_reassigned")
+            .expect("reassignment is audited");
+        assert_eq!(audit.payload["evidence"]["liveness"], "no_live_trace");
+        assert_eq!(audit.payload["from"]["target_artifact_id"], "artifact-old");
+        assert_eq!(audit.payload["to"]["target_artifact_id"], "artifact-new");
+
+        // Stale expected authority loses the compare-and-swap.
+        assert!(
+            store
+                .reassign_execution_authority_from_ended_owner(
+                    "run-1",
+                    &initial,
+                    &replacement,
+                    &evidence,
+                    24,
+                )
+                .is_err()
+        );
     }
 
     #[test]

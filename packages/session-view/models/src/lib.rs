@@ -1530,13 +1530,7 @@ impl RuntimeWorkView {
     /// Return whether this work has reached a terminal status.
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        matches!(
-            self.status,
-            RuntimeWorkStatus::Completed
-                | RuntimeWorkStatus::Cancelled
-                | RuntimeWorkStatus::Failed
-                | RuntimeWorkStatus::TimedOut
-        )
+        self.status.is_terminal()
     }
 }
 

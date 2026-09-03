@@ -650,13 +650,7 @@ impl SessionView {
     /// Replace active runtime work from an authoritative daemon snapshot.
     pub fn set_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
         for snapshot in snapshots {
-            if matches!(
-                snapshot.status,
-                bcode_session_models::RuntimeWorkStatus::Completed
-                    | bcode_session_models::RuntimeWorkStatus::Cancelled
-                    | bcode_session_models::RuntimeWorkStatus::Failed
-                    | bcode_session_models::RuntimeWorkStatus::TimedOut
-            ) {
+            if snapshot.status.is_terminal() {
                 self.terminal_runtime_work.insert(snapshot.work_id.clone());
             } else {
                 self.terminal_runtime_work.remove(&snapshot.work_id);
@@ -664,15 +658,7 @@ impl SessionView {
         }
         let runtime_work = snapshots
             .iter()
-            .filter(|snapshot| {
-                !matches!(
-                    snapshot.status,
-                    bcode_session_models::RuntimeWorkStatus::Completed
-                        | bcode_session_models::RuntimeWorkStatus::Cancelled
-                        | bcode_session_models::RuntimeWorkStatus::Failed
-                        | bcode_session_models::RuntimeWorkStatus::TimedOut
-                )
-            })
+            .filter(|snapshot| !snapshot.status.is_inactive())
             .map(|snapshot| bcode_session_view_models::RuntimeWorkView {
                 work_id: snapshot.work_id.clone(),
                 kind: snapshot.kind,
@@ -2090,10 +2076,18 @@ impl SessionView {
                     updated_at_ms: *requested_at_ms,
                 });
             }
-            SessionEventKind::RuntimeWorkFinished { work_id, .. } => {
-                if !self.terminal_runtime_work.insert(work_id.clone()) {
+            SessionEventKind::RuntimeWorkFinished {
+                work_id, status, ..
+            } => {
+                if status.is_terminal() {
+                    if !self.terminal_runtime_work.insert(work_id.clone()) {
+                        return;
+                    }
+                } else if self.terminal_runtime_work.contains(work_id) {
                     return;
                 }
+                // Suspended work is inactive but may resume under the same identifier, so it
+                // leaves the active list without becoming a stable terminal outcome.
                 self.finish_runtime_work(work_id);
             }
             SessionEventKind::WorkingDirectoryChanged {

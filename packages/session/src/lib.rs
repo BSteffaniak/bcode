@@ -7135,12 +7135,16 @@ mod tests {
                 include_str!("../fixtures/migrations/current-schema-v45.json"),
             ),
             (
+                "current-schema-v46.json",
+                include_str!("../fixtures/migrations/current-schema-v46.json"),
+            ),
+            (
                 "future-schema-v44.json",
                 include_str!("../fixtures/migrations/future-schema-v44.json"),
             ),
             (
-                "future-schema-v46.json",
-                include_str!("../fixtures/migrations/future-schema-v46.json"),
+                "future-schema-v47.json",
+                include_str!("../fixtures/migrations/future-schema-v47.json"),
             ),
             (
                 "malformed-json-v39.json",

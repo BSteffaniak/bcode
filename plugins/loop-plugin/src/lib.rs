@@ -241,6 +241,30 @@ fn format_workflow_inspection_status(inspection: &bcode_ipc::WorkflowRunInspecti
             inspection.mutation_approvals.len()
         );
     }
+    if let Some(coordinator) = &inspection.coordinator
+        && matches!(
+            inspection.run.status,
+            bcode_workflow_store::RunStatus::Running
+                | bcode_workflow_store::RunStatus::Paused
+                | bcode_workflow_store::RunStatus::RepairRequired
+        )
+    {
+        if coordinator.owned_by_this_daemon {
+            status.push_str(" · owned by this daemon");
+        } else if coordinator.controllable_from_this_daemon {
+            let _ = write!(
+                status,
+                " · previous owner daemon {} ended; /loop stop or /loop resume will take it over",
+                coordinator.daemon_instance_id
+            );
+        } else {
+            let _ = write!(
+                status,
+                " · owned by another live daemon {} (artifact {}); stop that daemon with `bcode server stop-all --yes` to control it here",
+                coordinator.daemon_instance_id, coordinator.target_artifact_id
+            );
+        }
+    }
     status
 }
 
@@ -309,6 +333,15 @@ fn control_loop(
                 Ok(None) => status_response("no loop found for this session"),
                 Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),
             }
+        }
+        Err(LoopIpcError::Client(ClientError::Server { code, message }))
+            if code == "workflow_owned_by_live_daemon" =>
+        {
+            status_response(&format!(
+                "{message}. If that daemon is a stale build with no other clients, `bcode server stop-all --yes` \
+                 stops it and this loop becomes controllable here; `bcode workflow reconcile-orphans` lists \
+                 loops whose daemon already ended."
+            ))
         }
         Err(LoopIpcError::Client(ClientError::Server { message, .. })) => status_response(&message),
         Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),
@@ -527,6 +560,13 @@ enum LoopSurfaceCompletion {
             bcode_plugin_sdk::tui::PluginTuiHostError,
         >,
     },
+    /// The existing loop was asked to cancel so a replacement loop can start.
+    ReplaceCancel(
+        Result<
+            bcode_plugin_sdk::tui::PluginWorkflowControlResult,
+            bcode_plugin_sdk::tui::PluginTuiHostError,
+        >,
+    ),
 }
 
 struct LoopSurface {
@@ -539,6 +579,11 @@ struct LoopSurface {
     failed_workflow_start: Option<PluginWorkflowStartRequest>,
     pending_workflow_lookup: bool,
     active_workflow: Option<bcode_plugin_sdk::tui::PluginWorkflowSummary>,
+    /// Set after the user confirms replacing the active loop; the start request is held here
+    /// until the existing run is confirmed terminal.
+    replace_armed: bool,
+    pending_replace_cancel: Option<PluginWorkflowStartRequest>,
+    replace_cancel_in_flight: bool,
     completions: Arc<Mutex<Vec<LoopSurfaceCompletion>>>,
     status: String,
     prompt_area: Rect,
@@ -559,6 +604,9 @@ impl LoopSurface {
             failed_workflow_start: None,
             pending_workflow_lookup: false,
             active_workflow: None,
+            replace_armed: false,
+            pending_replace_cancel: None,
+            replace_cancel_in_flight: false,
             completions: Arc::new(Mutex::new(Vec::new())),
             status: "checking for an active loop…".to_owned(),
             prompt_area: Rect::new(0, 0, 0, 0),
@@ -595,7 +643,7 @@ impl LoopSurface {
     }
 
     fn start(&mut self) -> PluginTuiAction {
-        if self.pending_workflow_start.is_some() {
+        if self.pending_workflow_start.is_some() || self.pending_replace_cancel.is_some() {
             "a durable loop start is already in progress".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         }
@@ -608,7 +656,18 @@ impl LoopSurface {
             "an active persisted session is required".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         };
-        if self.active_workflow.as_ref().is_some_and(|run| {
+        if legacy_state_exists(session_id) {
+            unsupported_legacy_message().clone_into(&mut self.status);
+            return PluginTuiAction::Redraw;
+        }
+        let request = match self.build_start_request(session_id) {
+            Ok(request) => request,
+            Err(status) => {
+                self.status = status;
+                return PluginTuiAction::Redraw;
+            }
+        };
+        if let Some(active) = self.active_workflow.as_ref().filter(|run| {
             matches!(
                 run.status,
                 PluginWorkflowStatus::Running
@@ -616,37 +675,43 @@ impl LoopSurface {
                     | PluginWorkflowStatus::RepairRequired
             )
         }) {
-            "this session already has an active loop".clone_into(&mut self.status);
+            if !self.replace_armed {
+                // First press explains; second press replaces. Nothing is cancelled until the
+                // user confirms, and the new loop starts only after the old run is terminal.
+                self.replace_armed = true;
+                self.status = format!(
+                    "this session already has a {} loop ({}); press start again to cancel it and start this one",
+                    format!("{:?}", active.status).to_lowercase(),
+                    active.run_id
+                );
+                return PluginTuiAction::Redraw;
+            }
+            self.replace_armed = false;
+            self.pending_replace_cancel = Some(request);
+            "cancelling the existing loop before starting a new one".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         }
-        if legacy_state_exists(session_id) {
-            unsupported_legacy_message().clone_into(&mut self.status);
-            return PluginTuiAction::Redraw;
-        }
+        self.replace_armed = false;
+        self.pending_workflow_start = Some(request);
+        "starting durable loop workflow".clone_into(&mut self.status);
+        PluginTuiAction::Redraw
+    }
+
+    fn build_start_request(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<PluginWorkflowStartRequest, String> {
         let prompt = input_text(&self.prompt);
         let condition = input_text(&self.condition);
         let limit = input_text(&self.limit);
         let Ok(max_iterations) = limit.parse::<u64>() else {
             self.field = Field::Limit;
-            "maximum iterations must be a number".clone_into(&mut self.status);
-            return PluginTuiAction::Redraw;
+            return Err("maximum iterations must be a number".to_owned());
         };
-        let input = match LoopWorkflowInput::new(prompt, condition, max_iterations) {
-            Ok(input) => input,
-            Err(error) => {
-                self.status = error;
-                return PluginTuiAction::Redraw;
-            }
-        };
-        let spec = match loop_workflow_spec(&input) {
-            Ok(spec) => spec,
-            Err(error) => {
-                self.status = error;
-                return PluginTuiAction::Redraw;
-            }
-        };
+        let input = LoopWorkflowInput::new(prompt, condition, max_iterations)?;
+        let spec = loop_workflow_spec(&input)?;
         let initial = loop_workflow_initial_value(&input);
-        let request = match PluginWorkflowStartRequest::typed(
+        PluginWorkflowStartRequest::typed(
             &spec,
             &initial,
             session_id,
@@ -658,16 +723,38 @@ impl LoopSurface {
                 single_active: true,
             },
             Some(uuid::Uuid::new_v4().to_string()),
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                self.status = format!("invalid durable loop request: {error}");
-                return PluginTuiAction::Redraw;
-            }
+        )
+        .map_err(|error| format!("invalid durable loop request: {error}"))
+    }
+
+    fn begin_replace_cancel(&mut self, host: &dyn PluginTuiHost) {
+        if self.pending_replace_cancel.is_none() || self.replace_cancel_in_flight {
+            return;
+        }
+        let Some(session_id) = self.session_id else {
+            return;
         };
-        self.pending_workflow_start = Some(request);
-        "starting durable loop workflow".clone_into(&mut self.status);
-        PluginTuiAction::Redraw
+        self.replace_cancel_in_flight = true;
+        let lookup = PluginWorkflowBinding {
+            owner_plugin_id: PLUGIN_ID.to_string(),
+            workflow_kind: WORKFLOW_KIND.to_string(),
+            scope_key: session_id.to_string(),
+            display_label: Some("Loop".to_string()),
+            single_active: true,
+        }
+        .lookup();
+        let completion = Arc::clone(&self.completions);
+        let future = host.control_associated_workflow(
+            lookup,
+            bcode_plugin_sdk::tui::PluginWorkflowControlAction::Cancel,
+        );
+        host.spawn(Box::pin(async move {
+            let result = future.await;
+            completion
+                .lock()
+                .expect("loop surface completion lock")
+                .push(LoopSurfaceCompletion::ReplaceCancel(result));
+        }));
     }
 
     fn begin_workflow_lookup(&mut self, host: &dyn PluginTuiHost) {
@@ -694,6 +781,11 @@ impl LoopSurface {
                 .expect("loop surface completion lock")
                 .push(LoopSurfaceCompletion::WorkflowLookup(result));
         }));
+    }
+
+    fn begin_pending_host_work(&mut self, host: &dyn PluginTuiHost) {
+        self.begin_replace_cancel(host);
+        self.begin_workflow_start(host);
     }
 
     fn begin_workflow_start(&mut self, host: &dyn PluginTuiHost) {
@@ -757,6 +849,43 @@ impl LoopSurface {
                         action = PluginTuiAction::Redraw;
                     }
                 },
+                LoopSurfaceCompletion::ReplaceCancel(result) => {
+                    self.replace_cancel_in_flight = false;
+                    let Some(request) = self.pending_replace_cancel.take() else {
+                        continue;
+                    };
+                    match result {
+                        Ok(control) => {
+                            let terminal = control.run.as_ref().is_none_or(|run| {
+                                !matches!(
+                                    run.status,
+                                    PluginWorkflowStatus::Running
+                                        | PluginWorkflowStatus::Paused
+                                        | PluginWorkflowStatus::RepairRequired
+                                )
+                            });
+                            self.active_workflow = control.run;
+                            if terminal {
+                                self.pending_workflow_start = Some(request);
+                                "previous loop cancelled; starting the new loop"
+                                    .clone_into(&mut self.status);
+                            } else {
+                                // Cancellation was recorded but attempts are still draining;
+                                // the run will settle without a live process. Keep the request
+                                // so the next start press retries once it is terminal.
+                                self.failed_workflow_start = Some(request);
+                                "previous loop is cancelling; press start again once it settles"
+                                    .clone_into(&mut self.status);
+                            }
+                        }
+                        Err(error) => {
+                            self.status = format!(
+                                "could not cancel the existing loop: {error}; use /loop status for the owner"
+                            );
+                        }
+                    }
+                    action = PluginTuiAction::Redraw;
+                }
             }
         }
         action
@@ -912,7 +1041,7 @@ impl PluginTuiSurface for LoopSurface {
 
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         self.begin_workflow_lookup(host);
-        self.begin_workflow_start(host);
+        self.begin_pending_host_work(host);
         self.apply_completions()
     }
 
@@ -931,7 +1060,7 @@ impl PluginTuiSurface for LoopSurface {
             }
             if stroke.key == KeyCode::Enter && stroke.modifiers.ctrl {
                 let action = self.start();
-                self.begin_workflow_start(host);
+                self.begin_pending_host_work(host);
                 return action;
             }
             if stroke.key == KeyCode::Enter && self.field != Field::Limit {
@@ -940,11 +1069,14 @@ impl PluginTuiSurface for LoopSurface {
             }
             if stroke.key == KeyCode::Enter && self.field == Field::Limit {
                 let action = self.start();
-                self.begin_workflow_start(host);
+                self.begin_pending_host_work(host);
                 return action;
             }
+            // Any other key disarms a pending replace so a stray second Enter cannot cancel a
+            // loop the user did not mean to replace.
+            self.replace_armed = false;
         }
-        self.begin_workflow_start(host);
+        self.begin_pending_host_work(host);
         self.focus_from_click(event);
         if self.field != Field::Limit
             && matches!(event, Event::Mouse(mouse) if mouse.position.x >= self.active_area().x && mouse.position.x < self.active_area().right() && mouse.position.y >= self.active_area().y && mouse.position.y < self.active_area().bottom() && matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown))

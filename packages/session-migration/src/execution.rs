@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn historical_usage_without_trustworthy_attribution_is_explicitly_unavailable() {
         let payload = format!(
-            r#"{{"schema_version":45,"sequence":1,"timestamp_ms":2,"session_id":"{SESSION_ID}","provenance":null,"kind":{{"model_usage":{{"turn_id":"turn","usage":{{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}}}}}}"#
+            r#"{{"schema_version":46,"sequence":1,"timestamp_ms":2,"session_id":"{SESSION_ID}","provenance":null,"kind":{{"model_usage":{{"turn_id":"turn","usage":{{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}}}}}}"#
         );
         let decoded = decode_for_migration(&payload, |payload| {
             serde_json::from_str(payload).map_err(|error| error.to_string())
@@ -428,8 +428,8 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 46);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 45);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 47);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 46);
         assert_eq!(
             metadata.source_schema,
             crate::LATEST_HISTORICAL_EVENT_SCHEMA

@@ -1826,6 +1826,28 @@ if rg -n 'bcode_workflow' packages/daemon-lifecycle/Cargo.toml packages/daemon-l
   violations=1
 fi
 
+# A paused workflow run must not pin its daemon as active runtime work: pausing suspends the
+# run-level registration, resuming re-registers it, and startup settles inherited registrations
+# for every quiescent (terminal or paused) run. Cross-artifact authority reassignment is limited
+# to quiescent runs (no live attempts) and is audited.
+if ! rg -U 'RunStatus::Paused => \(\s*RuntimeWorkStatus::Suspended' packages/server/src/lib.rs >/dev/null \
+  || ! grep -F 'settle_restored_quiescent_workflow_runtime_work(&state).await;' packages/server/src/lib.rs >/dev/null \
+  || ! grep -F 'pub fn quiescent_runs(' packages/workflow-store/src/lib.rs >/dev/null \
+  || ! grep -F 'paused_workflow_suspends_root_runtime_work_without_terminalizing_it' packages/server/src/lib.rs >/dev/null \
+  || ! grep -F 'quiescent_startup_settlement_releases_paused_run_work_left_by_prior_daemon' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: paused workflow runs must suspend their runtime work so daemons can reach quiescence." >&2
+  violations=1
+fi
+if ! grep -F 'pub fn reassign_execution_authority_from_ended_owner(' packages/workflow-store/src/lib.rs >/dev/null \
+  || ! grep -F 'live attempt(s) and cannot be reassigned' packages/workflow-store/src/lib.rs >/dev/null \
+  || ! grep -F '"authority_reassigned",' packages/workflow-store/src/lib.rs >/dev/null \
+  || ! grep -F 'cross_artifact_reassignment_requires_quiescent_run_and_is_audited' packages/workflow-store/src/lib.rs >/dev/null \
+  || ! grep -F 'PriorOwnerLiveness::LiveOrUnverifiable => {' packages/server/src/workflow_operations.rs >/dev/null \
+  || ! grep -F 'WorkflowOwnedByLiveDaemon {' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: cross-artifact workflow authority reassignment must be quiescent-only, evidence-gated, and audited." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

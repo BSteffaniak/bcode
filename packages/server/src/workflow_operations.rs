@@ -2411,6 +2411,122 @@ pub struct AuthorityGuard {
     pub _session_ownership: Option<bcode_session::SessionOwnershipGuard>,
 }
 
+/// How the current daemon relates to a run's recorded coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorOwnerLiveness {
+    /// Canonical evidence shows the recorded coordinator is still live or cannot be classified.
+    LiveOrUnverifiable,
+    /// A session-owner observation positively classified the recorded coordinator as stale.
+    ObservedEnded,
+    /// No lease observation and no live daemon record name the recorded coordinator instance.
+    NoLiveTrace,
+}
+
+/// Classify whether the run's recorded coordinator daemon still exists.
+///
+/// Two independent canonical sources are consulted: session-owner lease observations for the
+/// run's parent session, and the daemon registry's live records. A daemon whose lease was lost
+/// but whose process is still registered as live counts as live. Ambiguity fails closed.
+async fn prior_owner_liveness(
+    state: &ServerState,
+    session_id: super::SessionId,
+    current: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<PriorOwnerLiveness, super::ServerError> {
+    let root = state.sessions.session_store_root().ok_or_else(|| {
+        bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow ownership transfer requires a persistent session store".to_string(),
+        )
+    })?;
+    let observations = bcode_session::lease::session_owner_observations(&root, session_id)
+        .map_err(|error| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
+        })?;
+    let mut observed_ended = false;
+    for observation in observations {
+        if observation.owner.daemon_instance_id.as_deref()
+            != Some(current.daemon_instance_id.as_str())
+        {
+            continue;
+        }
+        match observation.liveness {
+            bcode_session::lease::SessionOwnerLiveness::Live
+            | bcode_session::lease::SessionOwnerLiveness::Unverifiable => {
+                return Ok(PriorOwnerLiveness::LiveOrUnverifiable);
+            }
+            bcode_session::lease::SessionOwnerLiveness::Stale => observed_ended = true,
+        }
+    }
+    // A lease can be lost while the daemon process survives, so consult the daemon registry
+    // before concluding the owner is gone. Only the record naming the recorded coordinator is
+    // probed: classifying every registry record costs a bounded endpoint probe per record.
+    let state_dir = bcode_config::default_state_dir();
+    for (_, record) in bcode_daemon_lifecycle::read_records(&state_dir) {
+        if record.instance_id != current.daemon_instance_id {
+            continue;
+        }
+        match bcode_daemon_lifecycle::classify_daemon_record(&record).await {
+            bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+            | bcode_daemon_lifecycle::DaemonRecordClassification::ResponsiveIdentityMismatch
+            | bcode_daemon_lifecycle::DaemonRecordClassification::Unverifiable => {
+                return Ok(PriorOwnerLiveness::LiveOrUnverifiable);
+            }
+            bcode_daemon_lifecycle::DaemonRecordClassification::UnreachableStale => {
+                observed_ended = true;
+            }
+        }
+    }
+    Ok(if observed_ended {
+        PriorOwnerLiveness::ObservedEnded
+    } else {
+        PriorOwnerLiveness::NoLiveTrace
+    })
+}
+
+fn current_artifact_id(state: &ServerState) -> String {
+    state.daemon_status.artifact_id.as_ref().map_or_else(
+        || state.daemon_status.build_fingerprint.clone(),
+        ToString::to_string,
+    )
+}
+
+fn run_parent_session_id(
+    state: &ServerState,
+    run_id: &str,
+) -> Result<super::SessionId, super::ServerError> {
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?
+        .ok_or_else(|| bcode_workflow_store::WorkflowStoreError::RunNotFound {
+            run_id: run_id.to_string(),
+        })?;
+    run.parent_session_id
+        .as_deref()
+        .and_then(|value| value.parse::<super::SessionId>().ok())
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "workflow run has no canonical parent session for ownership transfer".to_string(),
+            )
+            .into()
+        })
+}
+
+/// Resolve the current daemon's durable execution authority for one run.
+///
+/// * Same daemon instance: returns the recorded authority.
+/// * Same artifact, different (ended) instance: same-artifact compare-and-swap transfer.
+/// * Different artifact: allowed only when the recorded coordinator verifiably ended and the run
+///   holds no live attempt. The run is then reassigned to this artifact with an audited evidence
+///   record. Live or unverifiable prior owners are refused with an error that names them.
+///
+/// # Errors
+///
+/// Returns an error when the recorded coordinator is live or unverifiable, when the run still has
+/// live attempts on another artifact, when session ownership cannot be acquired, or when the
+/// compare-and-swap loses a race.
 pub async fn execution_authority(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
@@ -2423,72 +2539,23 @@ pub async fn execution_authority(
     let Some(current) = current else {
         return Ok(None);
     };
-    let artifact_id = state.daemon_status.artifact_id.as_ref().map_or_else(
-        || state.daemon_status.build_fingerprint.clone(),
-        ToString::to_string,
-    );
-    if current.target_artifact_id != artifact_id {
-        return Err(
-            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
-                "workflow run targets another daemon artifact: {run_id}"
-            ))
-            .into(),
-        );
-    }
     if current.daemon_instance_id == state.daemon_status.instance_id {
         return Ok(Some(AuthorityGuard {
             authority: current,
             _session_ownership: None,
         }));
     }
-    let run = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .run_summary(run_id)?
-        .ok_or_else(|| bcode_workflow_store::WorkflowStoreError::RunNotFound {
+    let artifact_id = current_artifact_id(state);
+    let session_id = run_parent_session_id(state, run_id)?;
+    let liveness = prior_owner_liveness(state, session_id, &current).await?;
+    if liveness == PriorOwnerLiveness::LiveOrUnverifiable {
+        return Err(super::ServerError::WorkflowOwnedByLiveDaemon {
             run_id: run_id.to_string(),
-        })?;
-    let session_id = run
-        .parent_session_id
-        .as_deref()
-        .and_then(|value| value.parse::<super::SessionId>().ok())
-        .ok_or_else(|| {
-            bcode_workflow_store::WorkflowStoreError::InvalidData(
-                "workflow run has no canonical parent session for ownership transfer".to_string(),
-            )
-        })?;
-    let root = state.sessions.session_store_root().ok_or_else(|| {
-        bcode_workflow_store::WorkflowStoreError::InvalidData(
-            "workflow ownership transfer requires a persistent session store".to_string(),
-        )
-    })?;
-    let prior_owner_live = bcode_session::lease::session_owner_observations(&root, session_id)
-        .map_err(|error| bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string()))?
-        .into_iter()
-        .any(|observation| {
-            observation.owner.daemon_instance_id.as_deref()
-                == Some(current.daemon_instance_id.as_str())
-                && matches!(
-                    observation.liveness,
-                    bcode_session::lease::SessionOwnerLiveness::Live
-                        | bcode_session::lease::SessionOwnerLiveness::Unverifiable
-                )
+            daemon_instance_id: current.daemon_instance_id.clone(),
+            target_artifact_id: current.target_artifact_id.clone(),
+            same_artifact: current.target_artifact_id == artifact_id,
         });
-    if prior_owner_live {
-        return Err(
-            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
-                "workflow run remains owned by another live daemon: {run_id}"
-            ))
-            .into(),
-        );
     }
-    let replacement = bcode_workflow_store::WorkflowExecutionAuthority {
-        target_artifact_id: current.target_artifact_id.clone(),
-        daemon_instance_id: state.daemon_status.instance_id.clone(),
-        generation: current.generation.saturating_add(1),
-        fencing_token: uuid::Uuid::new_v4().to_string(),
-    };
     let session_ownership = state
         .sessions
         .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
@@ -2496,16 +2563,53 @@ pub async fn execution_authority(
         .map_err(|error| {
             bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
         })?;
-    state
+    let replacement = bcode_workflow_store::WorkflowExecutionAuthority {
+        target_artifact_id: artifact_id.clone(),
+        daemon_instance_id: state.daemon_status.instance_id.clone(),
+        generation: current.generation.saturating_add(1),
+        fencing_token: uuid::Uuid::new_v4().to_string(),
+    };
+    let now_ms = super::current_unix_millis();
+    let mut store = state
         .workflow_store
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .transfer_execution_authority(
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.target_artifact_id == artifact_id {
+        store.transfer_execution_authority(run_id, &current, &replacement, now_ms)?;
+    } else {
+        let evidence = bcode_workflow_store::EndedOwnerEvidence {
+            ended_daemon_instance_id: current.daemon_instance_id.clone(),
+            ended_target_artifact_id: current.target_artifact_id.clone(),
+            liveness: match liveness {
+                PriorOwnerLiveness::ObservedEnded => {
+                    bcode_workflow_store::EndedOwnerLiveness::ObservedEnded
+                }
+                PriorOwnerLiveness::NoLiveTrace | PriorOwnerLiveness::LiveOrUnverifiable => {
+                    bcode_workflow_store::EndedOwnerLiveness::NoLiveTrace
+                }
+            },
+            artifact_image_available: bcode_daemon_lifecycle::artifact_image_is_available(
+                &bcode_config::default_state_dir(),
+                &current.target_artifact_id,
+            ),
+        };
+        store.reassign_execution_authority_from_ended_owner(
             run_id,
             &current,
             &replacement,
-            super::current_unix_millis(),
+            &evidence,
+            now_ms,
         )?;
+        tracing::info!(
+            target: "bcode_server::workflow",
+            run_id,
+            from_artifact = %current.target_artifact_id,
+            from_instance = %current.daemon_instance_id,
+            liveness = ?evidence.liveness,
+            "reassigned quiescent workflow run from an ended coordinator on another artifact"
+        );
+    }
+    drop(store);
     Ok(Some(AuthorityGuard {
         authority: replacement,
         _session_ownership: Some(session_ownership),
@@ -3123,7 +3227,116 @@ pub async fn cancel_run(
         (recorded, attempts)
     };
     super::propagate_persisted_workflow_cancellation(state, attempts).await?;
+    super::settle_workflow_runtime_work(state, run_id).await?;
     Ok(recorded)
+}
+
+/// Explicit maintenance: reconcile nonterminal runs whose recorded coordinator verifiably ended.
+///
+/// Each nonterminal run is classified with the same evidence `execution_authority` uses. Runs
+/// whose coordinator is live or unverifiable, runs that still hold live attempts on another
+/// artifact, and runs already owned by this daemon are reported as skipped. When `apply` is set,
+/// every orphaned run is reassigned to this daemon (audited) and cancelled; a `repair_required`
+/// run keeps that status because it still needs explicit attempt-level repair.
+///
+/// # Errors
+///
+/// Returns an error when the workflow store cannot enumerate runs.
+pub async fn reconcile_orphaned_runs(
+    state: &std::sync::Arc<ServerState>,
+    apply: bool,
+    limit: usize,
+) -> Result<bcode_ipc::OrphanedWorkflowRunReport, super::ServerError> {
+    let runs = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .nonterminal_runs(limit)?;
+    let mut report = bcode_ipc::OrphanedWorkflowRunReport {
+        applied: apply,
+        ..Default::default()
+    };
+    for run in runs {
+        let skip = |reason: String| bcode_ipc::SkippedWorkflowRun {
+            run_id: run.run_id.clone(),
+            status: run.status,
+            reason,
+        };
+        let authority = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execution_authority(&run.run_id)?;
+        let Some(authority) = authority else {
+            report
+                .skipped
+                .push(skip("run has no durable execution authority".to_string()));
+            continue;
+        };
+        if authority.daemon_instance_id == state.daemon_status.instance_id {
+            report
+                .skipped
+                .push(skip("run is owned by this daemon".to_string()));
+            continue;
+        }
+        let Ok(session_id) = run_parent_session_id(state, &run.run_id) else {
+            report
+                .skipped
+                .push(skip("run has no canonical parent session".to_string()));
+            continue;
+        };
+        match prior_owner_liveness(state, session_id, &authority).await? {
+            PriorOwnerLiveness::LiveOrUnverifiable => {
+                report.skipped.push(skip(format!(
+                    "coordinator daemon {} (artifact {}) is live or unverifiable",
+                    authority.daemon_instance_id, authority.target_artifact_id
+                )));
+                continue;
+            }
+            PriorOwnerLiveness::ObservedEnded | PriorOwnerLiveness::NoLiveTrace => {}
+        }
+        let orphan = bcode_ipc::OrphanedWorkflowRun {
+            run_id: run.run_id.clone(),
+            workflow_kind: run
+                .binding
+                .as_ref()
+                .map(|binding| binding.workflow_kind.clone()),
+            parent_session_id: run.parent_session_id.clone(),
+            status: run.status,
+            ended_daemon_instance_id: authority.daemon_instance_id.clone(),
+            ended_target_artifact_id: authority.target_artifact_id.clone(),
+            artifact_image_available: bcode_daemon_lifecycle::artifact_image_is_available(
+                &bcode_config::default_state_dir(),
+                &authority.target_artifact_id,
+            ),
+            updated_at_ms: run.updated_at_ms,
+        };
+        if !apply {
+            report.reconciled.push(orphan);
+            continue;
+        }
+        // Reassignment goes through the same fenced path every control operation uses, so a
+        // run that still holds live attempts on the ended artifact is refused here too.
+        if let Err(error) = execution_authority(state, &run.run_id).await {
+            report
+                .skipped
+                .push(skip(format!("authority reassignment refused: {error}")));
+            continue;
+        }
+        if run.status == bcode_workflow_store::RunStatus::RepairRequired {
+            // Ownership is now local; the run still needs explicit attempt repair.
+            report.reconciled.push(orphan);
+            continue;
+        }
+        if let Err(error) = cancel_run(state, &run.run_id).await {
+            report.skipped.push(skip(format!(
+                "cancellation after reassignment failed: {error}"
+            )));
+            continue;
+        }
+        report.reconciled.push(orphan);
+    }
+    Ok(report)
 }
 
 /// Pause a workflow run while holding its durable execution authority.
@@ -3136,12 +3349,18 @@ pub async fn pause_run(
             "active workflow has no durable execution authority".to_string(),
         )
     })?;
-    state
+    let changed = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pause_run(run_id, super::current_unix_millis())
-        .map_err(super::ServerError::from)
+        .pause_run(run_id, super::current_unix_millis())?;
+    if changed {
+        // An explicitly paused run with in-flight attempts keeps its node work registered until
+        // those attempts observe the pause; the run-level registration is suspended now so a
+        // fully paused run never pins the daemon.
+        super::settle_workflow_runtime_work(state, run_id).await?;
+    }
+    Ok(changed)
 }
 
 /// Resume a workflow run and continue scheduling it without transport framing.
@@ -3178,6 +3397,21 @@ pub async fn resume_run(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .resume_run(run_id, super::current_unix_millis())?;
+    if changed
+        && let Some(parent_session_id) = run
+            .parent_session_id
+            .as_deref()
+            .and_then(|value| value.parse::<super::SessionId>().ok())
+    {
+        // Pausing suspended the run-level runtime work; a resumed run is live again.
+        super::register_workflow_runtime_work(
+            state,
+            parent_session_id,
+            run_id,
+            format!("workflow {} v{}", run.definition_id, run.definition_version),
+        )
+        .await;
+    }
     super::drive_workflow_run(state, run_id).await?;
     Ok(changed)
 }
@@ -3523,6 +3757,9 @@ pub async fn control_associated_run(
                     (recorded, attempts)
                 };
                 super::propagate_persisted_workflow_cancellation(state, attempts).await?;
+                // A quiescent run cancels immediately; settle its runtime work so the daemon does
+                // not keep a phantom registration for a run that is already terminal.
+                super::settle_workflow_runtime_work(state, &run.run_id).await?;
                 recorded
             }
         }
@@ -4948,6 +5185,39 @@ pub async fn inspect_run(
         }
         child_sessions.push(summary);
     }
+    let authority = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_authority(run_id)?;
+    let coordinator = match authority {
+        Some(authority) => {
+            let owned_by_this_daemon =
+                authority.daemon_instance_id == state.daemon_status.instance_id;
+            let controllable_from_this_daemon = if owned_by_this_daemon {
+                true
+            } else {
+                match run
+                    .parent_session_id
+                    .as_deref()
+                    .and_then(|value| value.parse::<super::SessionId>().ok())
+                {
+                    Some(session_id) => matches!(
+                        prior_owner_liveness(state, session_id, &authority).await?,
+                        PriorOwnerLiveness::ObservedEnded | PriorOwnerLiveness::NoLiveTrace
+                    ),
+                    None => false,
+                }
+            };
+            Some(bcode_ipc::WorkflowCoordinatorStatus {
+                target_artifact_id: authority.target_artifact_id,
+                daemon_instance_id: authority.daemon_instance_id,
+                owned_by_this_daemon,
+                controllable_from_this_daemon,
+            })
+        }
+        None => None,
+    };
     Ok(bcode_ipc::WorkflowRunInspection {
         run,
         definition,
@@ -4965,6 +5235,7 @@ pub async fn inspect_run(
         descendant_runs,
         repeat_outcomes,
         child_sessions,
+        coordinator,
     })
 }
 

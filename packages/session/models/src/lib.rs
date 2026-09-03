@@ -291,7 +291,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 46;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 47;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -1998,6 +1998,35 @@ pub enum RuntimeWorkStatus {
     TimedOut,
     /// Work was cancelled.
     Cancelled,
+    /// Work is durably suspended and holds no live process resources.
+    ///
+    /// Suspended work is not active: it does not block idle shutdown or session ownership
+    /// release. Resuming re-registers the work under the same identifier with a new
+    /// `RuntimeWorkStarted` event.
+    Suspended,
+}
+
+impl RuntimeWorkStatus {
+    /// Return whether this status means the work holds no live process resources.
+    ///
+    /// Inactive work never blocks idle shutdown or session ownership release. `Suspended` is
+    /// inactive but not terminal: it may be resumed.
+    #[must_use]
+    pub const fn is_inactive(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::TimedOut | Self::Cancelled | Self::Suspended
+        )
+    }
+
+    /// Return whether this status is a final outcome that can never resume.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::TimedOut | Self::Cancelled
+        )
+    }
 }
 
 /// Source provenance for an event imported from another agent/tool.

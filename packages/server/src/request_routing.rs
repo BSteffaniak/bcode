@@ -534,6 +534,11 @@ pub enum RuntimeAndModelRequest {
     CancelWorkflowRun {
         run_id: String,
     },
+    /// Explicit maintenance: reconcile nonterminal runs whose coordinator verifiably ended.
+    ReconcileOrphanedWorkflowRuns {
+        apply: bool,
+        limit: usize,
+    },
     /// Pause one running workflow before further scheduler admission.
     PauseWorkflowRun {
         run_id: String,
@@ -1188,6 +1193,9 @@ impl RoutedRequest {
                     run_id,
                 }))
             }
+            Request::ReconcileOrphanedWorkflowRuns { apply, limit } => Self::RuntimeAndModel(
+                Box::new(RuntimeAndModelRequest::ReconcileOrphanedWorkflowRuns { apply, limit }),
+            ),
             Request::PauseWorkflowRun { run_id } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::PauseWorkflowRun {
                     run_id,

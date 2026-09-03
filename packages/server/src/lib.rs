@@ -225,6 +225,18 @@ pub enum ServerError {
     WorkflowComputationCancelled(String),
     #[error("authored-workflow computation control is invalid: {0}")]
     WorkflowComputationControlInvalid(String),
+    /// A run's recorded coordinator daemon is still live (or cannot be proven ended), so this
+    /// daemon must not control the run. The error names the owner so operators can act on it.
+    #[error(
+        "workflow run {run_id} is owned by live daemon {daemon_instance_id} (artifact {target_artifact_id}); \
+         control it from that daemon or stop it with `bcode server stop-all --yes`"
+    )]
+    WorkflowOwnedByLiveDaemon {
+        run_id: String,
+        daemon_instance_id: String,
+        target_artifact_id: String,
+        same_artifact: bool,
+    },
     #[error("model catalog error: {0}")]
     ModelCatalog(#[from] bcode_model_catalog::Error),
     #[error("model turn completion channel closed: {0}")]
@@ -1986,8 +1998,19 @@ impl ServerState {
             Vec::new()
         };
         let status = catalog_status_to_ipc(self.sessions.catalog_status());
+        // Take each lock in its own statement: a guard created inside the struct literal would
+        // live until the literal completes, and `idle_shutdown_blocker` re-locks `clients`.
+        let connected_client_count = self.clients.lock().await.len();
+        let active_runtime_work = self
+            .runtime_work
+            .active_all()
+            .await
+            .into_iter()
+            .map(|(session_id, work)| bcode_ipc::SessionRuntimeWork { session_id, work })
+            .collect();
+        let idle_shutdown_blocker = self.idle_shutdown_blocker().await;
         ServerStatus {
-            connected_client_count: self.clients.lock().await.len(),
+            connected_client_count,
             sessions,
             session_catalog_loaded: matches!(status, SessionCatalogStatus::Loaded),
             session_catalog_status: status.clone(),
@@ -2004,6 +2027,8 @@ impl ServerState {
             daemon: self.daemon_status.clone(),
             metrics: self.metrics.snapshot(),
             metrics_report: Box::new(self.metrics.report()),
+            active_runtime_work,
+            idle_shutdown_blocker,
         }
     }
 
@@ -2203,6 +2228,7 @@ impl ServerState {
         let state = Arc::clone(self);
         tokio::spawn(async move {
             let mut idle_since: Option<Instant> = None;
+            let mut last_blocker: Option<String> = None;
             let check_interval = idle_after.min(Duration::from_secs(30));
             let mut shutdown = state.subscribe_shutdown();
             loop {
@@ -2212,10 +2238,17 @@ impl ServerState {
                 }
                 if let Some(blocker) = state.idle_shutdown_blocker().await {
                     if idle_since.take().is_some() {
-                        tracing::debug!(target: "bcode_server::idle_shutdown", blocker, "daemon no longer idle; idle shutdown timer reset");
+                        tracing::info!(target: "bcode_server::idle_shutdown", blocker, "daemon no longer idle; idle shutdown timer reset");
+                    }
+                    // Blockers are low-volume state transitions; log once per distinct blocker
+                    // so a daemon that never reaches idle explains itself in its log.
+                    if last_blocker.as_deref() != Some(blocker.as_str()) {
+                        tracing::info!(target: "bcode_server::idle_shutdown", blocker, "idle shutdown deferred");
+                        last_blocker = Some(blocker);
                     }
                     continue;
                 }
+                last_blocker = None;
                 let now = Instant::now();
                 let since = idle_since.get_or_insert_with(|| {
                     tracing::info!(target: "bcode_server::idle_shutdown", idle_after_secs = idle_after.as_secs(), "daemon idle; idle shutdown timer started");
@@ -3589,7 +3622,7 @@ async fn run_with_static_bundled_inner(
     interrupt_stale_ralph_runs_best_effort(&state);
     let workflow_recovery_started_at = Instant::now();
     restore_workflow_runtime_work(&state).await;
-    finish_restored_terminal_workflow_runtime_work(&state).await;
+    settle_restored_quiescent_workflow_runtime_work(&state).await;
     tracing::debug!(
         target: "bcode_server::startup",
         elapsed_ms = workflow_recovery_started_at.elapsed().as_millis(),
@@ -3879,6 +3912,10 @@ fn request_error_response(error: &ServerError) -> ErrorResponse {
             "workflow_computation_control_invalid",
             "workflow computation control request is invalid",
         ),
+        // The owning daemon identity is operator-actionable and secret-free, so it is included.
+        ServerError::WorkflowOwnedByLiveDaemon { .. } => {
+            return ErrorResponse::new("workflow_owned_by_live_daemon", error.to_string());
+        }
         _ => ("request_failed", "request failed"),
     };
     ErrorResponse::new(code, message)
@@ -4189,6 +4226,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowRuns { .. } => "list_workflow_runs",
         Request::WorkflowRunOutputs { .. } => "workflow_run_outputs",
         Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
+        Request::ReconcileOrphanedWorkflowRuns { .. } => "reconcile_orphaned_workflow_runs",
         Request::PauseWorkflowRun { .. } => "pause_workflow_run",
         Request::ResumeWorkflowRun { .. } => "resume_workflow_run",
         Request::DoctorWorkflowRun { .. } => "doctor_workflow_run",
@@ -5737,6 +5775,15 @@ async fn handle_workflow_run_request(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::WorkflowRunOutputs { outputs }),
+            )
+            .await
+        }
+        RuntimeAndModelRequest::ReconcileOrphanedWorkflowRuns { apply, limit } => {
+            let report = workflow_operations::reconcile_orphaned_runs(state, apply, limit).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::OrphanedWorkflowRunsReconciled { report }),
             )
             .await
         }
@@ -8069,6 +8116,7 @@ async fn finish_ralph_runner_lifecycle(
         RuntimeWorkStatus::Cancelled => "cancelled",
         RuntimeWorkStatus::Failed => "blocked",
         RuntimeWorkStatus::TimedOut => "timed out",
+        RuntimeWorkStatus::Suspended => "suspended",
         RuntimeWorkStatus::Running | RuntimeWorkStatus::Queued | RuntimeWorkStatus::Cancelling => {
             "stopped"
         }
@@ -14182,7 +14230,7 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         "workflow.scheduler.drive.duration_ms",
         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
-    finish_terminal_workflow_runtime_work(state, run_id).await?;
+    settle_workflow_runtime_work(state, run_id).await?;
     Ok(())
 }
 
@@ -14202,7 +14250,12 @@ fn workflow_terminal_failure_message(state: &ServerState, run_id: &str) -> Optio
         })
 }
 
-async fn finish_terminal_workflow_runtime_work(
+/// Reconcile the run-level runtime work registration with the run's durable status.
+///
+/// Terminal runs finish their work with the matching terminal status. Paused runs suspend their
+/// work so the daemon can become quiescent without losing the durable run. Running runs leave the
+/// registration untouched.
+async fn settle_workflow_runtime_work(
     state: &ServerState,
     run_id: &str,
 ) -> Result<(), ServerError> {
@@ -14222,9 +14275,16 @@ async fn finish_terminal_workflow_runtime_work(
         return Ok(());
     };
     let (status, message) = match run.status {
-        bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused => {
+        bcode_workflow_store::RunStatus::Running => {
             return Ok(());
         }
+        // A paused run is durable state that needs no live process. Suspending its runtime work
+        // lets the daemon reach quiescence and release session ownership; resuming re-registers
+        // the work under the same identifier.
+        bcode_workflow_store::RunStatus::Paused => (
+            RuntimeWorkStatus::Suspended,
+            Some("workflow run is paused; resume or cancel it to continue".to_string()),
+        ),
         bcode_workflow_store::RunStatus::Completed => (RuntimeWorkStatus::Completed, None),
         bcode_workflow_store::RunStatus::Failed => (
             RuntimeWorkStatus::Failed,
@@ -29518,19 +29578,16 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
                 continue;
             }
             Err(error) => {
-                // Deferral is expected while another live daemon owns the run. A run fenced to an
-                // artifact that can no longer be launched is instead unrecoverable, so surface it
-                // rather than hiding the condition at debug level.
-                if workflow_run_artifact_is_launchable(state, &run_id) {
-                    tracing::debug!(run_id, %error, "workflow recovery deferred without mutation");
-                } else {
-                    tracing::warn!(
-                        run_id,
-                        %error,
-                        "workflow run is fenced to a daemon artifact that is no longer launchable; \
-                         it cannot be recovered or terminalized by this daemon"
-                    );
-                }
+                // Deferral is expected while another live daemon owns the run, or while a run
+                // on another artifact still has live attempts that only that artifact can
+                // interpret. Quiescent runs from ended coordinators are reassigned above.
+                tracing::info!(
+                    target: "bcode_server::workflow",
+                    run_id,
+                    %error,
+                    launchable = workflow_run_artifact_is_launchable(state, &run_id),
+                    "workflow recovery deferred without mutation"
+                );
                 continue;
             }
         };
@@ -29596,16 +29653,18 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
     }
 }
 
-async fn finish_restored_terminal_workflow_runtime_work(state: &ServerState) {
+/// Settle run-level runtime work left registered by a prior daemon for runs that are now
+/// quiescent (terminal or paused), so restarted daemons do not inherit phantom active work.
+async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
     let runs = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .terminal_runs(1_000);
+        .quiescent_runs(1_000);
     let runs = match runs {
         Ok(runs) => runs,
         Err(error) => {
-            tracing::warn!("failed to discover terminal workflow runtime work: {error}");
+            tracing::warn!("failed to discover quiescent workflow runtime work: {error}");
             return;
         }
     };
@@ -29635,7 +29694,7 @@ async fn finish_restored_terminal_workflow_runtime_work(state: &ServerState) {
             format!("workflow {} v{}", run.definition_id, run.definition_version),
         )
         .await;
-        if let Err(error) = finish_terminal_workflow_runtime_work(state, &run.run_id).await {
+        if let Err(error) = settle_workflow_runtime_work(state, &run.run_id).await {
             tracing::warn!(run_id = %run.run_id, "failed to finish terminal workflow work: {error}");
         }
     }
@@ -30078,6 +30137,7 @@ const fn runtime_work_status_label(status: RuntimeWorkStatus) -> &'static str {
         RuntimeWorkStatus::Failed => "failed",
         RuntimeWorkStatus::Cancelled => "cancelled",
         RuntimeWorkStatus::TimedOut => "timed_out",
+        RuntimeWorkStatus::Suspended => "suspended",
     }
 }
 
@@ -58773,7 +58833,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
 
-        finish_terminal_workflow_runtime_work(&state, "terminal-work-run")
+        settle_workflow_runtime_work(&state, "terminal-work-run")
             .await
             .expect("finish root work");
 
@@ -58797,6 +58857,215 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         if work_id == &WorkId::new("workflow:terminal-work-run")
                             && *status == RuntimeWorkStatus::Completed
                 ))
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_workflow_suspends_root_runtime_work_without_terminalizing_it() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("paused workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema::of::<u32>();
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "paused-work".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "node".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "node".to_string(),
+                    name: "node".to_string(),
+                    kind: bcode_workflow::NodeKind::Task,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::Value::Null,
+                },
+            )]),
+            entries: vec!["node".to_string()],
+            exits: vec!["node".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("paused-work", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "paused-work-run".to_string(),
+                definition_id: "paused-work".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                execution_authority: None,
+                created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        assert!(store.pause_run("paused-work-run", 2).expect("pause"));
+        let state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        register_workflow_runtime_work(
+            &state,
+            session.id,
+            "paused-work-run",
+            "paused workflow".to_string(),
+        )
+        .await;
+        assert_eq!(state.runtime_work.active_count().await, 1);
+
+        settle_workflow_runtime_work(&state, "paused-work-run")
+            .await
+            .expect("settle paused work");
+
+        assert_eq!(
+            state.runtime_work.active_count().await,
+            0,
+            "a paused run must not pin the daemon as active runtime work"
+        );
+        assert_eq!(state.idle_shutdown_blocker().await, None);
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id, status, .. }
+                if work_id == &WorkId::new("workflow:paused-work-run")
+                    && *status == RuntimeWorkStatus::Suspended
+        )));
+        let projected = state
+            .sessions
+            .active_runtime_work(session.id)
+            .await
+            .expect("projection");
+        assert!(
+            projected.is_empty(),
+            "suspended work must leave the canonical active projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiescent_startup_settlement_releases_paused_run_work_left_by_prior_daemon() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(Some("restart".to_string()), test_working_directory())
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema::of::<u32>();
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "restart-work".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "node".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "node".to_string(),
+                    name: "node".to_string(),
+                    kind: bcode_workflow::NodeKind::Task,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::Value::Null,
+                },
+            )]),
+            entries: vec!["node".to_string()],
+            exits: vec!["node".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("restart-work", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "restart-work-run".to_string(),
+                definition_id: "restart-work".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                execution_authority: None,
+                created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_string(),
+                    profile_id: "build".to_string(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        assert!(store.pause_run("restart-work-run", 2).expect("pause"));
+        // Simulate a prior daemon that registered the run work and then died without
+        // settling it: the canonical projection still shows the work as running.
+        sessions
+            .append_runtime_work_started(
+                session.id,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: WorkId::new("workflow:restart-work-run"),
+                    kind: RuntimeWorkKind::Workflow,
+                    label: "restart workflow".to_string(),
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(1),
+                    cancellable: true,
+                },
+            )
+            .await
+            .expect("phantom start");
+        assert_eq!(
+            sessions
+                .active_runtime_work(session.id)
+                .await
+                .expect("projection")
+                .len(),
+            1
+        );
+        let state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+
+        settle_restored_quiescent_workflow_runtime_work(&state).await;
+
+        assert_eq!(state.runtime_work.active_count().await, 0);
+        assert!(
+            state
+                .sessions
+                .active_runtime_work(session.id)
+                .await
+                .expect("projection")
+                .is_empty(),
+            "restart must settle paused-run work inherited from a dead daemon"
         );
     }
 

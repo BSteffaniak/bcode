@@ -791,6 +791,15 @@ pub enum Request {
     CancelWorkflowRun {
         run_id: String,
     },
+    /// Explicit maintenance: find nonterminal workflow runs whose recorded coordinator daemon
+    /// verifiably ended and, when `apply` is set, reassign each to this daemon and cancel it.
+    ///
+    /// Runs whose coordinator is still live or unverifiable, and runs that still hold live
+    /// attempts on another artifact, are reported as skipped and never mutated.
+    ReconcileOrphanedWorkflowRuns {
+        apply: bool,
+        limit: usize,
+    },
     /// Pause one running workflow before further scheduler admission.
     PauseWorkflowRun {
         run_id: String,
@@ -1250,6 +1259,22 @@ pub struct ServerStatus {
     /// Rich dashboard-ready metrics report.
     #[serde(default = "default_metrics_report_box")]
     pub metrics_report: Box<bcode_metrics::MetricsReport>,
+    /// Runtime work currently registered as active on this daemon, across all sessions.
+    ///
+    /// This is the same set the daemon consults when deciding whether it is idle, so a
+    /// non-empty list explains why idle shutdown or session ownership release is deferred.
+    #[serde(default)]
+    pub active_runtime_work: Vec<SessionRuntimeWork>,
+    /// Why the daemon currently refuses idle-only shutdown, if anything blocks it.
+    #[serde(default)]
+    pub idle_shutdown_blocker: Option<String>,
+}
+
+/// One active runtime work registration together with its owning session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeWork {
+    pub session_id: SessionId,
+    pub work: RuntimeWorkSnapshot,
 }
 
 fn default_metrics_report_box() -> Box<bcode_metrics::MetricsReport> {
@@ -2579,6 +2604,39 @@ pub struct WorkflowTerminalOutputInspection {
     pub created_at_ms: u64,
 }
 
+/// Result of one explicit orphaned-workflow-run reconciliation pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanedWorkflowRunReport {
+    /// Whether mutations were applied (`true`) or only planned (`false`).
+    pub applied: bool,
+    /// Runs whose coordinator verifiably ended and that were (or would be) reassigned and
+    /// cancelled.
+    pub reconciled: Vec<OrphanedWorkflowRun>,
+    /// Nonterminal runs that were inspected but left untouched, with the reason.
+    pub skipped: Vec<SkippedWorkflowRun>,
+}
+
+/// One nonterminal run whose coordinator daemon verifiably ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanedWorkflowRun {
+    pub run_id: String,
+    pub workflow_kind: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub status: bcode_workflow_store::RunStatus,
+    pub ended_daemon_instance_id: String,
+    pub ended_target_artifact_id: String,
+    pub artifact_image_available: bool,
+    pub updated_at_ms: u64,
+}
+
+/// One nonterminal run that reconciliation deliberately left alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedWorkflowRun {
+    pub run_id: String,
+    pub status: bcode_workflow_store::RunStatus,
+    pub reason: String,
+}
+
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
@@ -2606,6 +2664,25 @@ pub struct WorkflowRunInspection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repeat_outcomes: Vec<bcode_workflow_store::WorkflowRepeatOutcomeSummary>,
     pub child_sessions: Vec<SessionSummary>,
+    /// Which daemon currently coordinates this run and whether it is this daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator: Option<WorkflowCoordinatorStatus>,
+}
+
+/// Normalized ownership status of one workflow run's coordinator daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCoordinatorStatus {
+    /// Artifact the run is fenced to.
+    pub target_artifact_id: String,
+    /// Daemon instance recorded as the current coordinator.
+    pub daemon_instance_id: String,
+    /// Whether the responding daemon is that coordinator.
+    pub owned_by_this_daemon: bool,
+    /// Whether the responding daemon could take control of the run on demand.
+    ///
+    /// `false` means another daemon still owns the run (or ownership cannot be verified), and
+    /// control requests from this daemon will be refused until that daemon ends.
+    pub controllable_from_this_daemon: bool,
 }
 
 /// Lifecycle transition applied to one workflow run found through a generic binding.
@@ -3054,6 +3131,9 @@ pub enum ResponsePayload {
     },
     WorkflowRunCancellationRequested {
         recorded: bool,
+    },
+    OrphanedWorkflowRunsReconciled {
+        report: OrphanedWorkflowRunReport,
     },
     WorkflowRunPaused {
         changed: bool,
@@ -6036,6 +6116,8 @@ mod tests {
                     },
                     metrics: MetricsSnapshot::default(),
                     metrics_report: Box::default(),
+                    active_runtime_work: Vec::new(),
+                    idle_shutdown_blocker: None,
                 },
             }),
             Response::Ok(ResponsePayload::SessionList {

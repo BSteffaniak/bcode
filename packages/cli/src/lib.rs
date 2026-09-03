@@ -553,6 +553,16 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         WorkflowCommand::CancelComputation { operation_id } => {
             print_json(&client.cancel_workflow_computation(operation_id).await?)?;
         }
+        WorkflowCommand::ReconcileOrphans { apply, limit, json } => {
+            let report = client
+                .reconcile_orphaned_workflow_runs(apply, limit)
+                .await?;
+            if json {
+                print_json(&report)?;
+            } else {
+                print_orphaned_workflow_report(&report);
+            }
+        }
         WorkflowCommand::MigrateStore => {
             print_json(
                 &bcode_workflow_store::WorkflowStore::migrate_schema_14_to_current_in_state_dir(
@@ -2480,7 +2490,9 @@ fn init_tracing() {
             } else if foreground_server {
                 "info".to_string()
             } else {
-                "off".to_string()
+                // Background daemons are otherwise silent; lifecycle transitions that explain why
+                // a daemon is still alive are low-volume and always worth a log line.
+                "off,bcode_server::idle_shutdown=info".to_string()
             }
         });
     let (env_filter, invalid_filter) = match tracing_subscriber::EnvFilter::try_new(filter) {
@@ -2915,6 +2927,21 @@ enum WorkflowCommand {
     CancelComputation {
         #[arg(long)]
         operation_id: String,
+    },
+    /// Explicit maintenance: find nonterminal workflow runs whose coordinator daemon verifiably
+    /// ended (for example a loop paused under a build that no longer runs) and, with `--apply`,
+    /// reassign them to the current daemon and cancel them so their sessions can start new
+    /// loops. Without `--apply` this only reports what would change.
+    ReconcileOrphans {
+        /// Apply the reassignment and cancellation instead of only reporting.
+        #[arg(long)]
+        apply: bool,
+        /// Maximum nonterminal runs to inspect.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print the structured report as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -9872,6 +9899,10 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
         }
     }
     print_runtime_summary(&status.plugin_runtime, verbose);
+    print_active_runtime_work(
+        &status.active_runtime_work,
+        status.idle_shutdown_blocker.as_deref(),
+    );
     if verbose {
         print_metrics_summary(&status.metrics);
     }
@@ -9931,6 +9962,8 @@ struct ServerDiagnosis {
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
     plugin_runtime: Vec<bcode_plugin::PluginExecutorStatus>,
+    active_runtime_work: Vec<bcode_ipc::SessionRuntimeWork>,
+    idle_shutdown_blocker: Option<String>,
     metrics: bcode_metrics::MetricsSnapshot,
     observations: Vec<DiagnosticObservation>,
 }
@@ -9996,6 +10029,8 @@ impl ServerDiagnosis {
             selected_provider_plugin_id: status.selected_provider_plugin_id,
             selected_model_id: status.selected_model_id,
             plugin_runtime: status.plugin_runtime,
+            active_runtime_work: status.active_runtime_work,
+            idle_shutdown_blocker: status.idle_shutdown_blocker,
             metrics: status.metrics,
             observations,
         })
@@ -10162,7 +10197,85 @@ fn print_server_diagnosis(diagnosis: &ServerDiagnosis) {
         }
     }
     print_runtime_summary(&diagnosis.plugin_runtime, true);
+    print_active_runtime_work(
+        &diagnosis.active_runtime_work,
+        diagnosis.idle_shutdown_blocker.as_deref(),
+    );
     print_metrics_summary(&diagnosis.metrics);
+}
+
+fn print_orphaned_workflow_report(report: &bcode_ipc::OrphanedWorkflowRunReport) {
+    let verb = if report.applied {
+        "reconciled"
+    } else {
+        "would reconcile"
+    };
+    println!(
+        "{verb} {} orphaned workflow run(s); skipped {}",
+        report.reconciled.len(),
+        report.skipped.len()
+    );
+    for run in &report.reconciled {
+        println!(
+            "  {} {:?} kind={} session={} ended-daemon={} artifact={} image={}",
+            run.run_id,
+            run.status,
+            run.workflow_kind.as_deref().unwrap_or("<none>"),
+            run.parent_session_id.as_deref().unwrap_or("<none>"),
+            run.ended_daemon_instance_id,
+            run.ended_target_artifact_id,
+            if run.artifact_image_available {
+                "present"
+            } else {
+                "missing"
+            }
+        );
+    }
+    if !report.skipped.is_empty() {
+        println!("skipped:");
+        for run in &report.skipped {
+            println!("  {} {:?}: {}", run.run_id, run.status, run.reason);
+        }
+    }
+    if !report.applied && !report.reconciled.is_empty() {
+        println!("re-run with --apply to reassign and cancel the runs listed above");
+    }
+}
+
+fn print_active_runtime_work(work: &[bcode_ipc::SessionRuntimeWork], blocker: Option<&str>) {
+    if work.is_empty() {
+        println!("runtime work: none");
+    } else {
+        println!("runtime work: {} active registration(s)", work.len());
+        for entry in work {
+            println!(
+                "  {} {:?} {} [{}] session={}",
+                entry.work.work_id,
+                entry.work.kind,
+                entry.work.label,
+                runtime_work_status_word(entry.work.status),
+                entry.session_id
+            );
+        }
+    }
+    match blocker {
+        Some(blocker) => println!("idle shutdown: blocked ({blocker})"),
+        None => println!("idle shutdown: eligible"),
+    }
+}
+
+const fn runtime_work_status_word(status: bcode_session_models::RuntimeWorkStatus) -> &'static str {
+    use bcode_session_models::RuntimeWorkStatus;
+    match status {
+        RuntimeWorkStatus::Queued => "queued",
+        RuntimeWorkStatus::Running => "running",
+        RuntimeWorkStatus::Cancelling => "cancelling",
+        RuntimeWorkStatus::Completed => "completed",
+        RuntimeWorkStatus::Failed => "failed",
+        RuntimeWorkStatus::TimedOut => "timed_out",
+        RuntimeWorkStatus::Cancelled => "cancelled",
+        RuntimeWorkStatus::Suspended => "suspended",
+    }
 }
 
 fn print_metrics_summary(metrics: &bcode_metrics::MetricsSnapshot) {
@@ -19468,6 +19581,8 @@ mod latency_diagnosis_tests {
             daemon: bcode_ipc::DaemonStatus::default(),
             metrics,
             metrics_report: Box::default(),
+            active_runtime_work: Vec::new(),
+            idle_shutdown_blocker: None,
         }
     }
 
