@@ -2264,10 +2264,15 @@ mod tests {
             visibility: bcode_model::ModelVisibility::Visible,
         };
 
-        for (model_id, billing_scope) in [
-            ("anthropic.claude-fable-5-1", "in_region"),
-            ("us.anthropic.claude-fable-5-1", "geo"),
-            ("global.anthropic.claude-fable-5-1", "global"),
+        for (model_id, billing_scope, expected_five_minute, expected_one_hour) in [
+            ("anthropic.claude-fable-5-1", "in_region", 148_200, 157_200),
+            ("us.anthropic.claude-fable-5-1", "geo", 135_850, 144_100),
+            (
+                "global.anthropic.claude-fable-5-1",
+                "global",
+                123_500,
+                131_000,
+            ),
         ] {
             let model = catalog.enrich_model_with_defaults("bedrock", model_info(model_id));
             assert_eq!(model.display_name, "Claude Fable 5.1", "{model_id}");
@@ -2278,7 +2283,7 @@ mod tests {
             let pricing = model
                 .pricing
                 .expect("published Fable ID should have pricing");
-            for (ttl, expected_total) in [(300, 123_500), (3_600, 131_000)] {
+            for (ttl, expected_total) in [(300, expected_five_minute), (3_600, expected_one_hour)] {
                 let usage = bcode_model::TokenUsage {
                     input_tokens: Some(11_000),
                     output_tokens: Some(1_000),

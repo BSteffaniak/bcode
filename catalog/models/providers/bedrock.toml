@@ -240,21 +240,94 @@ thinking_mode = "adaptive"
 [models."anthropic.claude-fable-5-1".pricing]
 currency = "USD"
 unit = "per_million_tokens"
-input_micros = 10000000
-cached_input_micros = 250000
-output_micros = 50000000
-revision = "anthropic-2026-09-01"
+revision = "aws-price-list-2026-09-01"
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "input"
 modality = "text"
 invocation_class = "on_demand"
+billing_scope = "in_region"
+price_micros = 12000000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+billing_scope = "in_region"
+price_micros = 300000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+cache_ttl_seconds = 300
+billing_scope = "in_region"
+price_micros = 15000000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+cache_ttl_seconds = 3600
+billing_scope = "in_region"
+price_micros = 24000000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+billing_scope = "in_region"
+price_micros = 60000000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+billing_scope = "geo"
+price_micros = 11000000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+billing_scope = "geo"
+price_micros = 275000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+cache_ttl_seconds = 300
+billing_scope = "geo"
+price_micros = 13750000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+cache_ttl_seconds = 3600
+billing_scope = "geo"
+price_micros = 22000000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+billing_scope = "geo"
+price_micros = 55000000
+
+[[models."anthropic.claude-fable-5-1".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+billing_scope = "global"
 price_micros = 10000000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "cache_read_input"
 modality = "text"
 invocation_class = "on_demand"
+billing_scope = "global"
 price_micros = 250000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
@@ -262,6 +335,7 @@ bucket = "cache_write_input"
 modality = "text"
 invocation_class = "on_demand"
 cache_ttl_seconds = 300
+billing_scope = "global"
 price_micros = 12500000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
@@ -269,12 +343,14 @@ bucket = "cache_write_input"
 modality = "text"
 invocation_class = "on_demand"
 cache_ttl_seconds = 3600
+billing_scope = "global"
 price_micros = 20000000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "output"
 modality = "text"
 invocation_class = "on_demand"
+billing_scope = "global"
 price_micros = 50000000
 
 [models."anthropic.claude-fable-5-1".capabilities]
