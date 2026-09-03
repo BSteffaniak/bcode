@@ -447,7 +447,7 @@ impl ModelCatalogResolver {
         if let Some(model_id) = preferred
             && !models.iter().any(|model| model.model_id == model_id)
         {
-            models.push(bcode_model::ModelInfo {
+            let model = bcode_model::ModelInfo {
                 model_id: model_id.to_string(),
                 display_name: model_id.to_string(),
                 is_default: false,
@@ -462,7 +462,12 @@ impl ModelCatalogResolver {
                 pricing: None,
                 api_surface: None,
                 visibility: bcode_model::ModelVisibility::Visible,
-            });
+            };
+            models.push(enrich_preserved_model(
+                &catalog,
+                &list.catalog.policy,
+                model,
+            ));
         }
         let provider_default = models
             .iter()
@@ -480,6 +485,40 @@ impl ModelCatalogResolver {
             models,
             catalog: list.catalog,
         }
+    }
+}
+
+fn enrich_preserved_model(
+    catalog: &ModelCatalog,
+    policy: &bcode_model::ModelCatalogPolicy,
+    model: bcode_model::ModelInfo,
+) -> bcode_model::ModelInfo {
+    match policy {
+        bcode_model::ModelCatalogPolicy::Unmapped => model,
+        bcode_model::ModelCatalogPolicy::EnrichOnly {
+            provider_id,
+            target,
+            ..
+        } => match target {
+            Some(target) => catalog.enrich_model_for_target(
+                provider_id,
+                model,
+                &model_support_target_from_hint(target),
+            ),
+            None => catalog.enrich_model_with_defaults(provider_id, model),
+        },
+        bcode_model::ModelCatalogPolicy::ExpandAll { provider_id } => {
+            catalog.enrich_model_with_defaults(provider_id, model)
+        }
+        bcode_model::ModelCatalogPolicy::ExpandSupported {
+            provider_id,
+            target,
+            ..
+        } => catalog.enrich_model_for_target(
+            provider_id,
+            model,
+            &model_support_target_from_hint(target),
+        ),
     }
 }
 
@@ -2328,6 +2367,45 @@ mod tests {
         // The Messages surface must still be reported so routing stays correct.
         assert_eq!(
             claude.api_surface,
+            Some(bcode_model::ModelApiSurface::Messages)
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_fable_missing_from_active_provider_view_is_catalog_enriched() {
+        let resolver = ModelCatalogResolver::embedded();
+        let model_list = resolver
+            .resolve_selection(
+                bcode_model::ModelList {
+                    models: Vec::new(),
+                    catalog: bcode_model::ModelCatalogHints {
+                        policy: bcode_model::ModelCatalogPolicy::ExpandSupported {
+                            provider_id: "bedrock".to_string(),
+                            target: bcode_model::ModelCatalogSupportHint {
+                                provider: "bedrock".to_string(),
+                                auth_mode: "bearer_token".to_string(),
+                                api_surface: "responses".to_string(),
+                                integration: Some("bcode".to_string()),
+                            },
+                            authority: bcode_model::ModelListAuthority::Authoritative,
+                        },
+                    },
+                },
+                Some("global.anthropic.claude-fable-5-1"),
+                None,
+            )
+            .await;
+        let fable = model_list
+            .models
+            .iter()
+            .find(|model| model.model_id == "global.anthropic.claude-fable-5-1")
+            .expect("selected Fable must remain present");
+
+        assert_eq!(fable.display_name, "Claude Fable 5.1");
+        assert_eq!(fable.context_window, Some(1_000_000));
+        assert_eq!(fable.max_output_tokens, Some(128_000));
+        assert_eq!(
+            fable.api_surface,
             Some(bcode_model::ModelApiSurface::Messages)
         );
     }
