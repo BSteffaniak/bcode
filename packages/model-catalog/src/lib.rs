@@ -337,6 +337,19 @@ impl ModelCatalogResolver {
         Some(identity)
     }
 
+    /// Resolve the catalog-known output-token limit for one model.
+    ///
+    /// This bounded lookup keeps request construction aligned with catalog identity when a live
+    /// provider model snapshot omits limits or reports an alias/inference-profile identifier.
+    pub async fn model_max_output_tokens(&self, provider_id: &str, model_id: &str) -> Option<u32> {
+        self.catalog
+            .read()
+            .await
+            .model(provider_id, model_id)
+            .and_then(|entry| entry.max_output_tokens)
+            .filter(|limit| *limit > 0)
+    }
+
     /// Resolve catalog-known reasoning capabilities for one model.
     ///
     /// This is a bounded single-entry lookup used when a live provider model list cannot confirm
@@ -2681,6 +2694,17 @@ mod tests {
                 .take(3)
                 .collect::<Vec<_>>(),
             vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_output_limit_lookup_resolves_fable_inference_profile_alias() {
+        let resolver = ModelCatalogResolver::embedded();
+        assert_eq!(
+            resolver
+                .model_max_output_tokens("bedrock", "global.anthropic.claude-fable-5-1")
+                .await,
+            Some(128_000)
         );
     }
 

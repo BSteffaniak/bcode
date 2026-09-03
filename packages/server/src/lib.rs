@@ -20536,7 +20536,7 @@ async fn build_model_turn_request(
     let pricing = target.pricing.clone();
     let catalog_provider_id = target.catalog_provider_id.clone();
     let catalog_identity = target.catalog_identity.clone();
-    let model_cache_info = target.cache;
+    let model_cache_info = target.cache.clone();
     let prompt_cache_timer = state.metrics.timer();
     let prompt_cache = plan_prompt_cache(
         &mut messages,
@@ -20552,7 +20552,7 @@ async fn build_model_turn_request(
         prompt_cache_timer.elapsed_ms(),
         metric_labels.clone(),
     );
-    let model_id = target.model_id;
+    let model_id = target.model_id.clone();
     let reasoning_capabilities = resolve_model_reasoning_info(
         state,
         provider_plugin_id,
@@ -20561,13 +20561,8 @@ async fn build_model_turn_request(
     )
     .await;
     let parameters_timer = state.metrics.timer();
-    let resolved_max_output_tokens = resolve_model_max_output_tokens(
-        state,
-        provider_plugin_id,
-        selected_model_id,
-        &selection.provider_context,
-    )
-    .await;
+    let resolved_max_output_tokens =
+        target.effective_max_output_tokens(&selection.provider_context);
     let parameters = resolve_model_reasoning_parameters(
         selection,
         reasoning_capabilities.as_ref(),
@@ -21359,38 +21354,6 @@ fn catalog_provider_id_for_policy(policy: &bcode_model::ModelCatalogPolicy) -> O
         | bcode_model::ModelCatalogPolicy::ExpandSupported { provider_id, .. }
         | bcode_model::ModelCatalogPolicy::ExpandAll { provider_id } => Some(provider_id.clone()),
     }
-}
-
-/// Resolve the output token limit for the selected model.
-///
-/// Precedence matches [`model_status_for_selection`] so request construction and context
-/// accounting agree on one limit: an explicit `model_metadata` override wins, then the
-/// provider-reported model limit.
-async fn resolve_model_max_output_tokens(
-    state: &ServerState,
-    provider_plugin_id: Option<&str>,
-    selected_model_id: Option<&str>,
-    provider_context: &bcode_model::ProviderRequestContext,
-) -> Option<u32> {
-    let model_id = selected_model_id?;
-    if let Some(max_output_tokens) =
-        model_metadata_override(provider_context, model_id).max_output_tokens
-    {
-        return Some(max_output_tokens);
-    }
-    let models = resolved_provider_models(
-        state,
-        provider_plugin_id.map(ToOwned::to_owned),
-        bcode_model::ModelListRequest {
-            provider_context: provider_context.clone(),
-            selected_model_id: Some(model_id.to_owned()),
-        },
-    )
-    .await
-    .ok()?;
-    select_model_info(&models.models, Some(model_id))
-        .and_then(|model| model.max_output_tokens)
-        .filter(|max_output_tokens| *max_output_tokens > 0)
 }
 
 async fn resolve_model_reasoning_info(
@@ -54331,6 +54294,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
+            max_output_tokens: None,
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -54405,6 +54369,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "anthropic.claude-opus-5".to_string(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
+            max_output_tokens: None,
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
@@ -65404,6 +65369,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: "model".to_owned(),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
+            max_output_tokens: None,
             pricing: None,
             catalog_provider_id: None,
             catalog_identity: None,
