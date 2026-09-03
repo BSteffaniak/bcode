@@ -2265,7 +2265,8 @@ mod tests {
         };
 
         for (model_id, billing_scope, expected_five_minute, expected_one_hour) in [
-            ("anthropic.claude-fable-5-1", "in_region", 148_200, 157_200),
+            // Bare id bills at the signing region's (us-east-1) Standard rate, same as `us.`.
+            ("anthropic.claude-fable-5-1", "in_region", 135_850, 144_100),
             ("us.anthropic.claude-fable-5-1", "geo", 135_850, 144_100),
             (
                 "global.anthropic.claude-fable-5-1",

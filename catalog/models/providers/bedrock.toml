@@ -238,6 +238,12 @@ api_surface = "messages"
 thinking_mode = "adaptive"
 
 [models."anthropic.claude-fable-5-1".pricing]
+# AWS Price List ("Claude Fable 5.1 (Amazon Bedrock Edition)", Standard tier,
+# effective 2026-09-01). Two billing classes: `global.` is Global CRIS; the bare
+# and `us.` IDs bill at the signing region's Standard rate. Bcode's default
+# Bedrock region is us-east-1, whose Standard rate is encoded for both
+# `in_region` and `geo`. GovCloud regions bill 12 / 60 / 0.30 / 15 / 24 and are
+# intentionally not encoded; a GovCloud deployment must override these rules.
 currency = "USD"
 unit = "per_million_tokens"
 revision = "aws-price-list-2026-09-01"
@@ -247,14 +253,14 @@ bucket = "input"
 modality = "text"
 invocation_class = "on_demand"
 billing_scope = "in_region"
-price_micros = 12000000
+price_micros = 11000000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "cache_read_input"
 modality = "text"
 invocation_class = "on_demand"
 billing_scope = "in_region"
-price_micros = 300000
+price_micros = 275000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "cache_write_input"
@@ -262,7 +268,7 @@ modality = "text"
 invocation_class = "on_demand"
 cache_ttl_seconds = 300
 billing_scope = "in_region"
-price_micros = 15000000
+price_micros = 13750000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "cache_write_input"
@@ -270,14 +276,14 @@ modality = "text"
 invocation_class = "on_demand"
 cache_ttl_seconds = 3600
 billing_scope = "in_region"
-price_micros = 24000000
+price_micros = 22000000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "output"
 modality = "text"
 invocation_class = "on_demand"
 billing_scope = "in_region"
-price_micros = 60000000
+price_micros = 55000000
 
 [[models."anthropic.claude-fable-5-1".pricing.rules]]
 bucket = "input"
