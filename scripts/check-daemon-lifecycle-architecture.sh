@@ -11,6 +11,7 @@ ipc = Path("packages/ipc/src/lib.rs").read_text(encoding="utf-8")
 lifecycle = Path("packages/daemon-lifecycle/src/lib.rs").read_text(encoding="utf-8")
 client = Path("packages/client/src/lib.rs").read_text(encoding="utf-8")
 server = Path("packages/server/src/lib.rs").read_text(encoding="utf-8")
+bedrock = Path("plugins/bedrock-provider-plugin/src/lib.rs").read_text(encoding="utf-8")
 tui_sources = "\n".join(
     path.read_text(encoding="utf-8") for path in Path("packages/tui/src").rglob("*.rs")
 )
@@ -64,6 +65,14 @@ required = {
         "DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported" in cli
         and "DaemonControlPolicy::ReviewedForceOnly" in cli
         and "DaemonControlPolicy::PreserveAndRefuse" in cli,
+    "Bedrock request context must not inherit daemon startup config":
+        "let config = request_context\n            .is_none()\n            .then(bcode_config::load_config)" in bedrock,
+    "Bedrock request context must not inherit daemon startup environment":
+        "if request_context.is_some() {\n                request_value" in bedrock,
+    "abandoned model turns without execution descriptors must not replay under daemon defaults":
+        "Runtime work recorded before an admitted turn carried a versioned, secret-free execution" in server
+        and "const fn enqueue_recovered_model_turn(" in server
+        and "false\n}" in server,
     "CLI startup must not eagerly materialize the daemon image":
         "ensure_current_executable_cached()" not in cli,
 }

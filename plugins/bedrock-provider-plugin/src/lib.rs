@@ -2118,7 +2118,12 @@ async fn bedrock_client(settings: &Settings) -> Client {
 }
 
 async fn bedrock_sdk_config(settings: &Settings) -> aws_config::SdkConfig {
-    let mut config = bedrock_sdk_config_with_region(settings, settings.region.clone()).await;
+    let request_scoped = settings.config_source.starts_with("request/");
+    let initial_region = settings
+        .region
+        .clone()
+        .or_else(|| request_scoped.then(|| DEFAULT_REGION.to_string()));
+    let mut config = bedrock_sdk_config_with_region(settings, initial_region).await;
     if config.region().is_none() {
         tracing::debug!(
             target: "bcode_bedrock::config",
@@ -2146,6 +2151,11 @@ async fn bedrock_sdk_config_with_region(
     }
     if let Some(credentials) = client_context_credentials(settings) {
         loader = loader.credentials_provider(credentials);
+    } else if settings.config_source.starts_with("request/") && settings.aws_profile.is_none() {
+        // A per-turn request must not inherit credentials from the daemon launcher's environment.
+        // Named profiles remain daemon-resolved; transient credentials arrive explicitly in the
+        // request context and are kept in memory only.
+        loader = loader.no_credentials();
     }
     loader.load().await
 }
@@ -4293,7 +4303,14 @@ impl Settings {
 
     #[allow(clippy::too_many_lines)]
     fn resolve_context(request_context: Option<&ProviderRequestContext>) -> Self {
-        let config = bcode_config::load_config().ok();
+        // A supplied request context is the authoritative per-turn configuration boundary. The
+        // daemon may serve clients with different provider profiles concurrently, so consulting
+        // daemon startup config here would make whichever client launched it first affect other
+        // clients' requests.
+        let config = request_context
+            .is_none()
+            .then(bcode_config::load_config)
+            .and_then(Result::ok);
         let resolved = config
             .as_ref()
             .map(bcode_config::BcodeConfig::resolved_model_selection);
@@ -4354,8 +4371,15 @@ impl Settings {
             })
         };
         let first_context_env = |keys: &[&str]| {
-            first_nonempty(keys.iter().filter_map(|key| request_env.get(*key).cloned()))
-                .or_else(|| first_nonempty(keys.iter().filter_map(|key| std::env::var(key).ok())))
+            let request_value =
+                first_nonempty(keys.iter().filter_map(|key| request_env.get(*key).cloned()));
+            if request_context.is_some() {
+                request_value
+            } else {
+                request_value.or_else(|| {
+                    first_nonempty(keys.iter().filter_map(|key| std::env::var(key).ok()))
+                })
+            }
         };
         let default_model = first_context_env(&["BCODE_BEDROCK_MODEL", "BEDROCK_MODEL"])
             .or_else(|| value(&["model", "model_id"]))
@@ -10698,6 +10722,92 @@ mod tests {
             }
             other => panic!("the default picker must expand Responses models, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn request_scoped_sdk_config_does_not_inherit_daemon_credentials_or_region() {
+        let settings = Settings {
+            transport: Ok(BedrockTransport::Runtime),
+            transport_explicit: false,
+            mantle_base_url: None,
+            mantle_auth_header: false,
+            force_http1: false,
+            default_model: None,
+            model_ids: Vec::new(),
+            model_ids_are_explicit: false,
+            region: None,
+            region_source: RegionSource::AwsSdkDefaultChain,
+            aws_profile: None,
+            endpoint_url: None,
+            auth_credentials: BTreeMap::new(),
+            env: BTreeMap::new(),
+            config_source: "request/config/environment".to_string(),
+        };
+
+        let config = bedrock_sdk_config(&settings).await;
+
+        assert_eq!(config.region().map(Region::as_ref), Some(DEFAULT_REGION));
+        assert!(config.credentials_provider().is_none());
+    }
+
+    #[test]
+    fn request_contexts_isolate_bedrock_routes_within_one_plugin_instance() {
+        let responses = ProviderRequestContext {
+            settings: BTreeMap::from([
+                (
+                    "model".to_string(),
+                    format!("{}{}", "openai.gpt-5", ".6-sol"),
+                ),
+                ("transport".to_string(), "mantle_openai".to_string()),
+                (
+                    "mantle_base_url".to_string(),
+                    "https://openai.example.test".to_string(),
+                ),
+            ]),
+            ..ProviderRequestContext::default()
+        };
+        let messages = ProviderRequestContext {
+            settings: BTreeMap::from([
+                (
+                    "model".to_string(),
+                    format!("{}{}", "global.anthropic.claude-fable-5", "-1"),
+                ),
+                ("transport".to_string(), "mantle_anthropic".to_string()),
+                (
+                    "mantle_base_url".to_string(),
+                    "https://messages.example.test".to_string(),
+                ),
+            ]),
+            ..ProviderRequestContext::default()
+        };
+
+        let responses = Settings::resolve_from_context(&responses);
+        let messages = Settings::resolve_from_context(&messages);
+
+        assert_eq!(
+            responses.default_model.as_deref(),
+            Some(concat!("openai.gpt-5", ".6-sol"))
+        );
+        assert_eq!(
+            responses.mantle_base_url.as_deref(),
+            Some("https://openai.example.test")
+        );
+        assert!(matches!(
+            responses.transport,
+            Ok(BedrockTransport::MantleOpenAi)
+        ));
+        assert_eq!(
+            messages.default_model.as_deref(),
+            Some(concat!("global.anthropic.claude-fable-5", "-1"))
+        );
+        assert_eq!(
+            messages.mantle_base_url.as_deref(),
+            Some("https://messages.example.test")
+        );
+        assert!(matches!(
+            messages.transport,
+            Ok(BedrockTransport::MantleAnthropic)
+        ));
     }
 
     #[test]

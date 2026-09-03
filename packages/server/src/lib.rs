@@ -3716,69 +3716,16 @@ async fn recover_abandoned_session_runtime_work_best_effort(
     }
 }
 
-async fn enqueue_recovered_model_turn(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-    work: &bcode_session::db::RuntimeWorkProjection,
-) -> Result<bool, ServerError> {
-    let Some(turn_id) = work.label.strip_prefix("model turn ") else {
-        return Ok(false);
-    };
-    let sequence_prefix = format!("{session_id}-");
-    let Some(sequence) = turn_id
-        .strip_prefix(&sequence_prefix)
-        .and_then(|value| value.parse::<u64>().ok())
-    else {
-        return Ok(false);
-    };
-    let mut events = state
-        .sessions
-        .session_events_range(session_id, sequence, sequence, 1)
-        .await?;
-    let Some(user_event) = events.pop() else {
-        return Ok(false);
-    };
-    let client_id = match &user_event.kind {
-        SessionEventKind::UserMessage { client_id, .. } => *client_id,
-        _ => return Ok(false),
-    };
-    let cancel_state = Arc::new(TurnCancelState::default());
-    register_recovered_model_runtime_work(
-        state,
-        session_id,
-        work.work_id.clone(),
-        turn_id.to_owned(),
-        Arc::clone(&cancel_state),
-    )
-    .await;
-    let ownership = state
-        .sessions
-        .acquire_session_ownership(
-            session_id,
-            bcode_session::SessionOwnershipKind::QueuedCommand,
-        )
-        .await?;
-    let handle = session_runtime_handle(state, session_id).await;
-    handle.queued_followups.fetch_add(1, Ordering::AcqRel);
-    if handle
-        .followup_commands
-        .send(FollowupCommand::ExecuteTurn {
-            client_id,
-            runtime_context: None,
-            user_event: Box::new(user_event),
-            queued_steering: None,
-            cancel_state: Some(cancel_state),
-            completion: None,
-            recovering: true,
-            ownership,
-        })
-        .await
-        .is_err()
-    {
-        state.runtime_work.finish(session_id, &work.work_id).await;
-        return Ok(false);
-    }
-    Ok(true)
+const fn enqueue_recovered_model_turn(
+    _state: &Arc<ServerState>,
+    _session_id: SessionId,
+    _work: &bcode_session::db::RuntimeWorkProjection,
+) -> bool {
+    // Runtime work recorded before an admitted turn carried a versioned, secret-free execution
+    // descriptor cannot be reconstructed safely. In particular, using the new daemon's startup
+    // model/provider context could retarget the turn to another Bedrock surface or credential
+    // identity. Return false so recovery terminalizes the abandoned work instead of guessing.
+    false
 }
 
 async fn recover_abandoned_session_runtime_work(
@@ -3823,7 +3770,7 @@ async fn recover_abandoned_session_runtime_work(
         }
         if work.kind == RuntimeWorkKind::ModelTurn
             && work.parent_work_id.is_none()
-            && enqueue_recovered_model_turn(state, session_id, &work).await?
+            && enqueue_recovered_model_turn(state, session_id, &work)
         {
             continue;
         }

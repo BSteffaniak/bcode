@@ -13,6 +13,18 @@ Bcode daemon availability is split across explicit owners:
 
 The embedded plugin-surface server is a separate explicit integration mode. It does not publish a normal daemon record and is not an availability fallback.
 
+## Request-scoped provider execution
+
+* **`bcode_model::ProviderRequestContext`** owns the complete per-turn provider profile. When that
+  context is supplied, provider plugins treat it as authoritative and must not fall back to daemon
+  process environment or startup model defaults. The context is snapshotted when work is queued and
+  remains transient; credential values are never persisted to session history.
+* **Model request-target resolution** owns exact model identity and catalog-resolved API surface.
+  Bedrock Responses, Messages, and Converse requests may therefore execute concurrently in one
+  daemon without deriving route semantics from endpoint hostnames or daemon startup environment.
+* **Recovery** fails closed when abandoned historical work lacks a versioned, secret-free execution
+  descriptor. It must not replay a turn using the replacement daemon's provider defaults.
+
 ## Identity model
 
 The exact produced-artifact identity is distinct from:
