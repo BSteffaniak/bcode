@@ -702,8 +702,23 @@ fn merge_settings_env(
             copy_setting_to_env(auth_profile, env, "base_url", "BCODE_XAI_BASE_URL");
         }
         Some("aws" | "bedrock") => {
-            copy_setting_to_env(auth_profile, env, "profile", "AWS_PROFILE");
-            copy_setting_to_env(auth_profile, env, "profile", "BCODE_BEDROCK_AWS_PROFILE");
+            // `profile` names an AWS named profile only for the AWS credential-chain backends.
+            // For vault-backed profiles (`sshenv`) the same key names the vault storage profile,
+            // and exporting it as `AWS_PROFILE` would point the SigV4 chain at a nonexistent
+            // `~/.aws/config` profile, breaking control-plane discovery. Vault-backed profiles
+            // opt in with an explicit `aws_profile` setting.
+            let aws_profile_key = if auth_profile.backend == "sshenv" {
+                "aws_profile"
+            } else {
+                "profile"
+            };
+            copy_setting_to_env(auth_profile, env, aws_profile_key, "AWS_PROFILE");
+            copy_setting_to_env(
+                auth_profile,
+                env,
+                aws_profile_key,
+                "BCODE_BEDROCK_AWS_PROFILE",
+            );
             copy_setting_to_env(auth_profile, env, "region", "AWS_REGION");
             copy_setting_to_env(auth_profile, env, "region", "BCODE_BEDROCK_REGION");
             copy_setting_to_env(
@@ -1467,6 +1482,53 @@ mod tests {
                 .get("api_key")
                 .map(|storage| storage.key.as_str()),
             Some("TEST_PROVIDER_KEY")
+        );
+    }
+
+    #[test]
+    fn aws_profile_env_mapping_distinguishes_vault_profile_from_aws_named_profile() {
+        let mut settings = BTreeMap::from([
+            ("provider".to_string(), "aws".to_string()),
+            ("profile".to_string(), "bedrock".to_string()),
+        ]);
+        let mut env = BTreeMap::new();
+        // The AWS credential-chain backend: `profile` is an AWS named profile.
+        let chain_profile = bcode_config::AuthProfileConfig {
+            backend: "aws_default_chain".to_string(),
+            settings: settings.clone(),
+            ..bcode_config::AuthProfileConfig::default()
+        };
+        merge_settings_env(&chain_profile, &mut env);
+        assert_eq!(env.get("AWS_PROFILE").map(String::as_str), Some("bedrock"));
+        assert_eq!(
+            env.get("BCODE_BEDROCK_AWS_PROFILE").map(String::as_str),
+            Some("bedrock")
+        );
+
+        // The vault backend: `profile` is the vault storage profile and must not leak into the
+        // AWS SDK profile selection, which would point SigV4 at a nonexistent `~/.aws` profile.
+        let mut env = BTreeMap::new();
+        let vault_profile = bcode_config::AuthProfileConfig {
+            backend: "sshenv".to_string(),
+            settings: settings.clone(),
+            ..bcode_config::AuthProfileConfig::default()
+        };
+        merge_settings_env(&vault_profile, &mut env);
+        assert!(!env.contains_key("AWS_PROFILE"));
+        assert!(!env.contains_key("BCODE_BEDROCK_AWS_PROFILE"));
+
+        // An explicit `aws_profile` opts a vault-backed profile into AWS named-profile selection.
+        settings.insert("aws_profile".to_string(), "america-admin".to_string());
+        let mut env = BTreeMap::new();
+        let vault_profile = bcode_config::AuthProfileConfig {
+            backend: "sshenv".to_string(),
+            settings,
+            ..bcode_config::AuthProfileConfig::default()
+        };
+        merge_settings_env(&vault_profile, &mut env);
+        assert_eq!(
+            env.get("AWS_PROFILE").map(String::as_str),
+            Some("america-admin")
         );
     }
 

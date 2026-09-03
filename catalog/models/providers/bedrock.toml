@@ -597,6 +597,53 @@ text_output = true
 tool_use = true
 structured_outputs = true
 
+[models."deepseek.r1"]
+model_id = "deepseek.r1"
+display_name = "DeepSeek-R1"
+aliases = ["*deepseek.r1*", "*deepseek-r1*"]
+status = "stable"
+bcode_support = "supported"
+family = "deepseek"
+context_window = 128000
+max_output_tokens = 32768
+
+[models."deepseek.r1".capabilities]
+text_input = true
+text_output = true
+reasoning = true
+
+[models."deepseek.v3"]
+model_id = "deepseek.v3"
+display_name = "DeepSeek-V3"
+aliases = ["*deepseek.v3*", "*deepseek-v3*", "*deepseek*"]
+status = "stable"
+bcode_support = "supported"
+family = "deepseek"
+context_window = 128000
+max_output_tokens = 32768
+
+[models."deepseek.v3".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
+[models."qwen.qwen3"]
+model_id = "qwen.qwen3"
+display_name = "Qwen3"
+aliases = ["*qwen3*", "*qwen*"]
+status = "stable"
+bcode_support = "supported"
+family = "qwen"
+context_window = 128000
+max_output_tokens = 32768
+
+[models."qwen.qwen3".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+
 # OpenAI models on Bedrock ("bedrock-mantle"). These are served through the OpenAI Responses API
 # on the mantle endpoint at `https://bedrock-mantle.<region>.api.aws/openai/v1/responses`. Note
 # that AWS documents this as the `openai/v1/responses` path, which differs from the `v1/responses`

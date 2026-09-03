@@ -4380,6 +4380,18 @@ impl Settings {
         let request_auth_attributes = request_auth
             .map(|auth| auth.attributes.clone())
             .unwrap_or_default();
+        let vault_backed_auth = request_auth
+            .and_then(|auth| auth.backend.as_deref())
+            .or_else(|| {
+                config.as_ref().and_then(|config| {
+                    resolved
+                        .as_ref()
+                        .and_then(|selection| selection.auth_profile.as_ref())
+                        .and_then(|auth_profile| config.auth.profiles.get(auth_profile))
+                        .map(|auth| auth.backend.as_str())
+                })
+            })
+            .is_some_and(|backend| backend == "sshenv");
         let request_auth_credentials = request_auth
             .map(|auth| {
                 auth.credentials
@@ -4486,8 +4498,17 @@ impl Settings {
             model_ids_are_explicit: model_ids_value.is_some(),
             region,
             region_source,
-            aws_profile: first_context_env(&["BCODE_BEDROCK_AWS_PROFILE", "AWS_PROFILE"])
-                .or_else(|| value(&["profile", "aws_profile"])),
+            // For vault-backed auth profiles, `profile` names the vault storage profile rather
+            // than an AWS named profile; only an explicit `aws_profile` selects one.
+            aws_profile: first_context_env(&["BCODE_BEDROCK_AWS_PROFILE", "AWS_PROFILE"]).or_else(
+                || {
+                    if vault_backed_auth {
+                        value(&["aws_profile"])
+                    } else {
+                        value(&["profile", "aws_profile"])
+                    }
+                },
+            ),
             endpoint_url,
             auth_credentials: request_auth_credentials,
             env: request_env,
@@ -4841,7 +4862,14 @@ impl BedrockProviderPlugin {
             };
         }
         let discovered = match self.runtime.as_ref() {
-            Ok(runtime) => discovery_for_picker_nonblocking(runtime, &self.discovery, &settings),
+            Ok(runtime) => {
+                let discovered =
+                    discovery_for_picker_nonblocking(runtime, &self.discovery, &settings);
+                if discovered.models.is_empty() {
+                    self.report_empty_picker_discovery(runtime, &settings);
+                }
+                discovered
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "bcode_bedrock::discovery",
@@ -4877,6 +4905,38 @@ impl BedrockProviderPlugin {
         json_response(&self.validate_config(&request.provider_context))
     }
 
+    /// Explain why the interactive picker received no live Bedrock models.
+    ///
+    /// The picker path is bounded and must not block on AWS, so it cannot surface the discovery
+    /// error itself. When a failure has been recorded for this configuration it is logged at
+    /// `warn` so an unexpectedly small picker is diagnosable; a still-pending discovery is logged
+    /// at `info`.
+    fn report_empty_picker_discovery(&self, runtime: &ProviderRuntime, settings: &Settings) {
+        let settings = settings.clone();
+        let Ok(key) = runtime.block_on(async move { discovery_cache_key(&settings).await }) else {
+            return;
+        };
+        if let Some(failure) = last_discovery_failure(&self.discovery, &key) {
+            tracing::warn!(
+                target: "bcode_bedrock::discovery",
+                region = %key.region,
+                bearer_auth = key.bearer_auth,
+                code = %failure.code,
+                category = ?failure.category,
+                error = %failure.message,
+                age_secs = failure.failed_at.elapsed().as_secs(),
+                "Bedrock model picker has no live models because discovery failed; showing catalog fallback models only"
+            );
+        } else {
+            tracing::info!(
+                target: "bcode_bedrock::discovery",
+                region = %key.region,
+                bearer_auth = key.bearer_auth,
+                "Bedrock model discovery has not completed yet; the model picker will fill in on the next open"
+            );
+        }
+    }
+
     fn validate_config(&self, provider_context: &ProviderRequestContext) -> ValidateConfigResponse {
         let settings = Settings::resolve_from_context(provider_context);
         let mut validation = settings.transport.clone().map(|_| ());
@@ -4907,14 +4967,16 @@ impl BedrockProviderPlugin {
                 source.as_str().to_string(),
             );
         }
-        if validation.is_ok()
+        let discovery_matters = validation.is_ok()
             && settings
                 .transport
                 .as_ref()
                 .is_ok_and(|transport| *transport == BedrockTransport::Runtime)
-            && !settings.model_ids_are_explicit
-            && settings.default_model.is_none()
-        {
+            && !settings.model_ids_are_explicit;
+        // Discovery decides picker membership whenever the model list is not explicit. It only
+        // decides *validity* when there is no configured default model to fall back on.
+        let discovery_required = discovery_matters && settings.default_model.is_none();
+        if discovery_matters {
             match self
                 .runtime
                 .as_ref()
@@ -4939,10 +5001,13 @@ impl BedrockProviderPlugin {
                 }
                 Err(error) => {
                     metadata.insert("model_discovery_error".to_string(), error.message.clone());
-                    if matches!(
-                        error.category,
-                        ProviderErrorCategory::Auth | ProviderErrorCategory::Config
-                    ) {
+                    metadata.insert("model_discovery_error_code".to_string(), error.code.clone());
+                    if discovery_required
+                        && matches!(
+                            error.category,
+                            ProviderErrorCategory::Auth | ProviderErrorCategory::Config
+                        )
+                    {
                         validation = Err(error);
                     }
                 }
@@ -5149,6 +5214,19 @@ struct ModelDiscovery {
 struct DiscoveryCache {
     entries: BTreeMap<DiscoveryCacheKey, CachedDiscovery>,
     compatibility: PersistedCompatibilityCache,
+    /// Most recent discovery failure per key, retained so diagnostics can explain an empty or
+    /// fallback-only picker without re-running control-plane discovery.
+    failures: BTreeMap<DiscoveryCacheKey, DiscoveryFailure>,
+    /// In-flight discovery tasks per key so concurrent callers share one control-plane round trip.
+    inflight: BTreeMap<DiscoveryCacheKey, Arc<tokio::sync::Semaphore>>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveryFailure {
+    code: String,
+    category: ProviderErrorCategory,
+    message: String,
+    failed_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -5156,6 +5234,10 @@ struct DiscoveryCacheKey {
     region: String,
     aws_profile: Option<String>,
     endpoint_url: Option<String>,
+    /// Discovery ran with a Bedrock API key rather than the `SigV4` credential chain. Different
+    /// principals can see different model sets, so results are cached separately.
+    #[serde(default)]
+    bearer_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5206,6 +5288,8 @@ struct CandidateModel {
     priority: i32,
     /// Service-provided recency timestamp when available.
     date_key: i64,
+    /// Non-visible candidates remain resolvable by explicit ID but are omitted from the picker.
+    visibility: bcode_model::ModelVisibility,
 }
 
 fn warm_discovery_cache(
@@ -5222,13 +5306,11 @@ fn warm_discovery_cache(
         return;
     }
     runtime.spawn(async move {
-        if let Err(error) = get_or_refresh_discovery(&cache, &settings).await {
-            tracing::debug!(
-                target: "bcode_bedrock::discovery",
-                error = %error.message,
-                "background Bedrock model discovery failed"
-            );
+        let key = discovery_cache_key(&settings).await;
+        if cached_discovery(&cache, &key).is_some() {
+            return;
         }
+        refresh_discovery_shared(&cache, &settings, key).await;
     });
 }
 
@@ -5250,13 +5332,19 @@ fn get_or_refresh_discovery_sync(
         })?
 }
 
-/// Return the discovered model list for the interactive picker without blocking on AWS.
+/// Upper bound the interactive picker waits for an in-flight discovery before falling back.
 ///
-/// The model picker is an interactive, bounded path, so it must not block on paginated Bedrock
-/// API calls. This returns whatever is cached immediately (even if stale) and spawns a background
-/// refresh when the cache is missing or expired. The first open before any cache is warmed
-/// returns an empty live list (the host still enriches from the bundled catalog); subsequent opens
-/// return the full discovered list once the background refresh completes.
+/// Discovery is normally warmed at plugin activation, so this wait only matters on the very
+/// first picker open (or after a profile switch) and keeps the picker path bounded.
+const PICKER_DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
+
+/// Return the discovered model list for the interactive picker with bounded waiting.
+///
+/// The model picker is an interactive, bounded path, so it must not block indefinitely on
+/// paginated Bedrock API calls. A fresh cache is returned immediately; a stale cache is returned
+/// immediately while a refresh runs in the background. When nothing is cached yet, the picker
+/// waits at most [`PICKER_DISCOVERY_WAIT`] for the (shared, deduplicated) discovery task before
+/// returning an empty live list, which the host still expands from the bundled catalog.
 fn discovery_for_picker_nonblocking(
     runtime: &ProviderRuntime,
     cache: &Arc<Mutex<DiscoveryCache>>,
@@ -5268,17 +5356,33 @@ fn discovery_for_picker_nonblocking(
         let settings = settings.clone();
         async move { discovery_cache_key(&settings).await }
     });
-    if let Ok(key) = key {
-        if let Some(discovery) = cached_discovery(&cache, &key) {
-            return discovery;
-        }
-        if let Some(stale) = stale_cached_discovery(&cache, &key) {
-            spawn_discovery_refresh(runtime, cache, settings, key);
-            return stale;
-        }
-        spawn_discovery_refresh(runtime, cache, settings, key);
+    let Ok(key) = key else {
+        return ModelDiscovery::default();
+    };
+    if let Some(discovery) = cached_discovery(&cache, &key) {
+        return discovery;
     }
-    ModelDiscovery::default()
+    if let Some(stale) = stale_cached_discovery(&cache, &key) {
+        spawn_discovery_refresh(runtime, cache, settings, key);
+        return stale;
+    }
+    // Run discovery as an independent task so a picker timeout never cancels it mid-flight; the
+    // picker only bounds how long it waits for the result.
+    let task = runtime.spawn({
+        let cache = Arc::clone(&cache);
+        let key = key.clone();
+        async move { refresh_discovery_shared(&cache, &settings, key).await }
+    });
+    let waited = runtime.block_on({
+        let cache = Arc::clone(&cache);
+        async move {
+            drop(tokio::time::timeout(PICKER_DISCOVERY_WAIT, task).await);
+            cached_discovery(&cache, &key)
+        }
+    });
+    // Discovery may still be running (or failed and was recorded); the spawned task keeps going
+    // in the background so the next open sees its result.
+    waited.ok().flatten().unwrap_or_default()
 }
 
 fn spawn_discovery_refresh(
@@ -5288,15 +5392,88 @@ fn spawn_discovery_refresh(
     key: DiscoveryCacheKey,
 ) {
     runtime.spawn(async move {
-        match discover_models(&settings).await {
-            Ok(discovery) => store_discovery(&cache, key, discovery),
-            Err(error) => tracing::debug!(
-                target: "bcode_bedrock::discovery",
-                error = %error.message,
-                "background Bedrock model discovery refresh failed"
-            ),
-        }
+        refresh_discovery_shared(&cache, &settings, key).await;
     });
+}
+
+/// Run discovery for one cache key, sharing a single in-flight task between concurrent callers.
+///
+/// Records the outcome in the cache: successes store the model list, failures store a
+/// [`DiscoveryFailure`] so `validate_config` and the picker diagnostics can explain an empty
+/// live list without re-running the control-plane calls.
+async fn refresh_discovery_shared(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    settings: &Settings,
+    key: DiscoveryCacheKey,
+) {
+    let inflight = {
+        let Ok(mut guard) = cache.lock() else {
+            return;
+        };
+        let existing = guard.inflight.get(&key).map(Arc::clone);
+        if existing.is_none() {
+            guard
+                .inflight
+                .insert(key.clone(), Arc::new(tokio::sync::Semaphore::new(0)));
+        }
+        existing
+    };
+    if let Some(done) = inflight {
+        // The owner closes the semaphore on completion; acquiring on a closed semaphore returns
+        // immediately, so a waiter registering after completion cannot hang.
+        drop(done.acquire().await);
+        return;
+    }
+    let outcome = discover_models(settings).await;
+    match outcome {
+        Ok(discovery) => {
+            tracing::info!(
+                target: "bcode_bedrock::discovery",
+                region = %key.region,
+                bearer_auth = key.bearer_auth,
+                model_count = discovery.models.len(),
+                "Bedrock model discovery completed"
+            );
+            store_discovery(cache, key.clone(), discovery);
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "bcode_bedrock::discovery",
+                region = %key.region,
+                bearer_auth = key.bearer_auth,
+                code = %error.code,
+                category = ?error.category,
+                error = %error.message,
+                "Bedrock model discovery failed; the model picker will show catalog fallback models only"
+            );
+            if let Ok(mut guard) = cache.lock() {
+                guard.failures.insert(
+                    key.clone(),
+                    DiscoveryFailure {
+                        code: error.code,
+                        category: error.category,
+                        message: error.message,
+                        failed_at: Instant::now(),
+                    },
+                );
+            }
+        }
+    }
+    let done = cache
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.inflight.remove(&key));
+    if let Some(done) = done {
+        done.close();
+    }
+}
+
+/// Most recent recorded discovery failure for one cache key.
+fn last_discovery_failure(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: &DiscoveryCacheKey,
+) -> Option<DiscoveryFailure> {
+    cache.lock().ok()?.failures.get(key).cloned()
 }
 
 /// Return a cached discovery ignoring the freshness TTL, applying compatibility filtering.
@@ -5320,7 +5497,19 @@ async fn get_or_refresh_discovery(
     if let Some(discovery) = cached_discovery(cache, &key) {
         return Ok(discovery);
     }
-    let discovery = discover_models(settings).await?;
+    let discovery = discover_models(settings).await.inspect_err(|error| {
+        if let Ok(mut guard) = cache.lock() {
+            guard.failures.insert(
+                key.clone(),
+                DiscoveryFailure {
+                    code: error.code.clone(),
+                    category: error.category,
+                    message: error.message.clone(),
+                    failed_at: Instant::now(),
+                },
+            );
+        }
+    })?;
     store_discovery(cache, key.clone(), discovery.clone());
     Ok(cached_discovery(cache, &key).unwrap_or(discovery))
 }
@@ -5373,7 +5562,11 @@ fn filtered_discovery(
             model
         })
         .collect::<Vec<_>>();
-    let default_model_id = models.first().map(|model| model.model_id.clone());
+    let default_model_id = models
+        .iter()
+        .find(|model| model.visibility == bcode_model::ModelVisibility::Visible)
+        .or_else(|| models.first())
+        .map(|model| model.model_id.clone());
     ModelDiscovery {
         models,
         default_model_id,
@@ -5400,6 +5593,7 @@ fn store_discovery(
             .extend(cache.compatibility.unsupported_streaming_for(&key));
         unsupported_prompt_cache_models
             .extend(cache.compatibility.unsupported_prompt_cache_for(&key));
+        cache.failures.remove(&key);
         cache.entries.insert(
             key,
             CachedDiscovery {
@@ -5698,6 +5892,7 @@ async fn discovery_cache_key(settings: &Settings) -> DiscoveryCacheKey {
             .map_or_else(|| DEFAULT_REGION.to_string(), ToString::to_string),
         aws_profile: settings.aws_profile.clone(),
         endpoint_url: settings.endpoint_url.clone(),
+        bearer_auth: client_context_bearer_token(settings).is_some(),
     }
 }
 
@@ -5721,7 +5916,8 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             .then_with(|| left.model_id.cmp(&right.model_id))
     });
     let default_model_id = candidates
-        .first()
+        .iter()
+        .find(|candidate| candidate.visibility == bcode_model::ModelVisibility::Visible)
         .map(|candidate| candidate.model_id.clone());
     let models: Vec<ModelInfo> = candidates
         .into_iter()
@@ -5739,7 +5935,7 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
             metadata_source: None,
             pricing: None,
             api_surface: None,
-            visibility: bcode_model::ModelVisibility::Visible,
+            visibility: candidate.visibility,
         })
         .collect();
     Ok(ModelDiscovery {
@@ -5748,9 +5944,27 @@ async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, Provider
     })
 }
 
+/// Build the Bedrock control-plane client used for model discovery.
+///
+/// Bedrock API keys (`AWS_BEARER_TOKEN_BEDROCK`) are authorized for `ListFoundationModels` and
+/// `ListInferenceProfiles` through `bedrock:CallWithBearerToken`, so a bearer credential is
+/// attached exactly like the runtime client does. Without this, bearer-only auth profiles fall
+/// back to the `SigV4` chain and discovery fails silently, leaving the picker with only catalog
+/// fallback membership.
 async fn bedrock_control_client(settings: &Settings) -> bedrock::Client {
     let config = bedrock_sdk_config(settings).await;
-    bedrock::Client::new(&config)
+    client_context_bearer_token(settings).map_or_else(
+        || bedrock::Client::new(&config),
+        |token| {
+            let config = bedrock::config::Builder::from(&config)
+                .bearer_token(bedrock::config::Token::new(token, None))
+                .auth_scheme_preference([
+                    aws_smithy_runtime_api::client::auth::http::HTTP_BEARER_AUTH_SCHEME_ID,
+                ])
+                .build();
+            bedrock::Client::from_conf(config)
+        },
+    )
 }
 
 async fn discover_inference_profiles(
@@ -5780,6 +5994,7 @@ async fn discover_inference_profiles(
                 display_name,
                 priority: 2,
                 date_key,
+                visibility: bcode_model::ModelVisibility::Visible,
             });
         }
         next_token = response.next_token().map(ToString::to_string);
@@ -5798,37 +6013,67 @@ async fn discover_foundation_models(
         .send()
         .await
         .map_err(|error| bedrock_discovery_error(&error))?;
-    let mut candidates = Vec::new();
-    for model in response.model_summaries() {
-        let supports_text_output = model
-            .output_modalities()
-            .iter()
-            .any(|modality| modality.as_str() == "TEXT");
-        if !supports_text_output || model.response_streaming_supported() != Some(true) {
-            continue;
-        }
-        let legacy = model
-            .model_lifecycle()
-            .is_some_and(|lifecycle| lifecycle.status().as_str() == "LEGACY");
-        if legacy {
-            continue;
-        }
-        let model_id = model.model_id().to_string();
-        let display_name = model
-            .model_name()
-            .map_or_else(|| model_id.clone(), ToString::to_string);
-        let date_key = model
-            .model_lifecycle()
-            .and_then(|lifecycle| lifecycle.start_of_life_time())
-            .map_or(0, aws_smithy_types::DateTime::secs);
-        candidates.push(CandidateModel {
-            model_id,
-            display_name,
-            priority: 1,
-            date_key,
-        });
+    Ok(response
+        .model_summaries()
+        .iter()
+        .filter_map(foundation_model_candidate)
+        .collect())
+}
+
+/// Classify one `ListFoundationModels` summary as a picker candidate.
+///
+/// Membership is intentionally broad: anything that produces text and is not retired is listed.
+/// Streaming support is only used to exclude models AWS explicitly reports as non-streaming; an
+/// unreported value stays listed and the runtime compatibility probe prunes real failures.
+///
+/// Bare model IDs whose supported inference types include neither `ON_DEMAND` nor `PROVISIONED`
+/// (the newer Claude generations are inference-profile only) cannot be invoked directly; they are
+/// kept but marked unsupported so the `us.`/`global.` profile entries surface in the picker
+/// instead of duplicates that fail on send.
+fn foundation_model_candidate(
+    model: &bedrock::types::FoundationModelSummary,
+) -> Option<CandidateModel> {
+    let supports_text_output = model
+        .output_modalities()
+        .iter()
+        .any(|modality| modality.as_str() == "TEXT");
+    if !supports_text_output || model.response_streaming_supported() == Some(false) {
+        return None;
     }
-    Ok(candidates)
+    let legacy = model
+        .model_lifecycle()
+        .is_some_and(|lifecycle| lifecycle.status().as_str() == "LEGACY");
+    if legacy {
+        return None;
+    }
+    let inference_types = model.inference_types_supported();
+    let directly_invocable = inference_types.is_empty()
+        || inference_types
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "ON_DEMAND" | "PROVISIONED"));
+    let model_id = model.model_id().to_string();
+    let display_name = model
+        .model_name()
+        .map_or_else(|| model_id.clone(), ToString::to_string);
+    let date_key = model
+        .model_lifecycle()
+        .and_then(|lifecycle| lifecycle.start_of_life_time())
+        .map_or(0, aws_smithy_types::DateTime::secs);
+    Some(CandidateModel {
+        model_id,
+        display_name,
+        priority: 1,
+        date_key,
+        visibility: if directly_invocable {
+            bcode_model::ModelVisibility::Visible
+        } else {
+            bcode_model::ModelVisibility::Unsupported {
+                reason: "Bedrock serves this model only through an inference profile; select the \
+                         regional (`us.`/`eu.`/`apac.`) or `global.` profile ID instead"
+                    .to_string(),
+            }
+        },
+    })
 }
 
 fn resolved_sdk_region(
@@ -10691,6 +10936,7 @@ mod tests {
             region: "us-east-1".to_string(),
             aws_profile: None,
             endpoint_url: None,
+            bearer_auth: false,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
         compatibility.mark_prompt_cache_unsupported(&key, "model", "no cache", 10);
@@ -10922,6 +11168,194 @@ mod tests {
     }
 
     #[test]
+    fn vault_backed_auth_profile_name_is_not_treated_as_an_aws_named_profile() {
+        let vault_context = ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext {
+                backend: Some("sshenv".to_string()),
+                attributes: BTreeMap::from([
+                    ("provider".to_string(), "aws".to_string()),
+                    ("profile".to_string(), "bedrock".to_string()),
+                ]),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            ..ProviderRequestContext::default()
+        };
+        let settings = Settings::resolve_from_context(&vault_context);
+        assert_eq!(settings.aws_profile, None);
+
+        let mut explicit = vault_context;
+        explicit
+            .auth
+            .as_mut()
+            .expect("auth context")
+            .attributes
+            .insert("aws_profile".to_string(), "america-admin".to_string());
+        let settings = Settings::resolve_from_context(&explicit);
+        assert_eq!(settings.aws_profile.as_deref(), Some("america-admin"));
+
+        let chain_context = ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext {
+                backend: Some("aws_default_chain".to_string()),
+                attributes: BTreeMap::from([
+                    ("provider".to_string(), "aws".to_string()),
+                    ("profile".to_string(), "bedrock".to_string()),
+                ]),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            ..ProviderRequestContext::default()
+        };
+        let settings = Settings::resolve_from_context(&chain_context);
+        assert_eq!(settings.aws_profile.as_deref(), Some("bedrock"));
+    }
+
+    #[test]
+    fn discovery_cache_key_separates_bearer_token_from_sigv4_principals() {
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let sigv4 = ProviderRequestContext {
+            settings: BTreeMap::from([("region".to_string(), "us-east-1".to_string())]),
+            ..ProviderRequestContext::default()
+        };
+        let mut bearer = sigv4.clone();
+        bearer.auth = Some(bcode_model::ProviderAuthContext {
+            credentials: BTreeMap::from([(
+                "bearer_token".to_string(),
+                bcode_model::ProviderAuthCredential {
+                    value: "test-token".to_string(),
+                    source: Some("test".to_string()),
+                },
+            )]),
+            ..bcode_model::ProviderAuthContext::default()
+        });
+        let sigv4 = Settings::resolve_from_context(&sigv4);
+        let bearer = Settings::resolve_from_context(&bearer);
+        let (sigv4_key, bearer_key) = runtime
+            .block_on(async move {
+                (
+                    discovery_cache_key(&sigv4).await,
+                    discovery_cache_key(&bearer).await,
+                )
+            })
+            .expect("cache keys");
+        assert!(!sigv4_key.bearer_auth);
+        assert!(bearer_key.bearer_auth);
+        assert_ne!(sigv4_key, bearer_key);
+    }
+
+    #[test]
+    fn foundation_model_candidates_list_broadly_and_mark_profile_only_ids_unsupported() {
+        use bedrock::types::{
+            FoundationModelLifecycle, FoundationModelLifecycleStatus, FoundationModelSummary,
+            InferenceType, ModelModality,
+        };
+        let summary = |id: &str| {
+            FoundationModelSummary::builder()
+                .model_arn(format!("arn:aws:bedrock:us-east-1::foundation-model/{id}"))
+                .model_id(id)
+                .model_name(id)
+                .output_modalities(ModelModality::Text)
+        };
+
+        // On-demand text model with unreported streaming support stays listed: the runtime
+        // compatibility probe, not discovery, decides whether streaming tool use works.
+        let nova = summary("amazon.nova-pro-v1:0")
+            .inference_types_supported(InferenceType::OnDemand)
+            .build()
+            .expect("summary");
+        let candidate = foundation_model_candidate(&nova).expect("listed");
+        assert_eq!(candidate.visibility, bcode_model::ModelVisibility::Visible);
+
+        // Explicitly non-streaming models are excluded.
+        let batch_only = summary("example.batch-only")
+            .inference_types_supported(InferenceType::OnDemand)
+            .response_streaming_supported(false)
+            .build()
+            .expect("summary");
+        assert!(foundation_model_candidate(&batch_only).is_none());
+
+        // Retired models are excluded.
+        let legacy = summary("anthropic.claude-v2")
+            .inference_types_supported(InferenceType::OnDemand)
+            .model_lifecycle(
+                FoundationModelLifecycle::builder()
+                    .status(FoundationModelLifecycleStatus::Legacy)
+                    .build()
+                    .expect("lifecycle"),
+            )
+            .build()
+            .expect("summary");
+        assert!(foundation_model_candidate(&legacy).is_none());
+
+        // Image-only models are excluded.
+        let image = FoundationModelSummary::builder()
+            .model_arn("arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-image")
+            .model_id("amazon.titan-image")
+            .output_modalities(ModelModality::Image)
+            .inference_types_supported(InferenceType::OnDemand)
+            .build()
+            .expect("summary");
+        assert!(foundation_model_candidate(&image).is_none());
+
+        // Inference-profile-only bare IDs stay resolvable but are not offered in the picker.
+        let profile_only = summary("anthropic.claude-fable-5-1")
+            .inference_types_supported(InferenceType::from("INFERENCE_PROFILE"))
+            .response_streaming_supported(true)
+            .build()
+            .expect("summary");
+        let candidate = foundation_model_candidate(&profile_only).expect("listed");
+        assert!(matches!(
+            candidate.visibility,
+            bcode_model::ModelVisibility::Unsupported { .. }
+        ));
+
+        // A model that reports no inference types at all is treated as invocable.
+        let unknown = summary("example.unknown-inference")
+            .build()
+            .expect("summary");
+        let candidate = foundation_model_candidate(&unknown).expect("listed");
+        assert_eq!(candidate.visibility, bcode_model::ModelVisibility::Visible);
+    }
+
+    #[test]
+    fn filtered_discovery_defaults_to_the_first_visible_model() {
+        let model = |id: &str, visibility: bcode_model::ModelVisibility| ModelInfo {
+            model_id: id.to_string(),
+            display_name: id.to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            max_image_input_base64_bytes: None,
+            capabilities: bedrock_model_capabilities(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility,
+        };
+        let discovery = ModelDiscovery {
+            models: vec![
+                model(
+                    "anthropic.claude-fable-5-1",
+                    bcode_model::ModelVisibility::Unsupported {
+                        reason: "profile only".to_string(),
+                    },
+                ),
+                model(
+                    "us.anthropic.claude-fable-5-1",
+                    bcode_model::ModelVisibility::Visible,
+                ),
+            ],
+            default_model_id: None,
+        };
+        let filtered = filtered_discovery(&discovery, &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(
+            filtered.default_model_id.as_deref(),
+            Some("us.anthropic.claude-fable-5-1")
+        );
+    }
+
+    #[test]
     fn mantle_transports_request_surface_specific_catalog_expansion_for_the_picker() {
         // Mantle has no control-plane model listing, so each explicit surface expands matching
         // authoritative catalog membership rather than exposing only a configured model ID.
@@ -11080,6 +11514,7 @@ mod tests {
             region: "us-east-1".to_string(),
             aws_profile: Some("work".to_string()),
             endpoint_url: None,
+            bearer_auth: false,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
         compatibility.mark_streaming_tool_unsupported(&key, "bad-model", "unsupported", 10);
@@ -11104,6 +11539,7 @@ mod tests {
             region: "us-east-1".to_string(),
             aws_profile: None,
             endpoint_url: None,
+            bearer_auth: false,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
         compatibility.mark_prompt_cache_unsupported(&key, "no-cache", "unsupported", 10);
@@ -11317,6 +11753,7 @@ mod tests {
             region: "us-east-1".to_string(),
             aws_profile: None,
             endpoint_url: None,
+            bearer_auth: false,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
         compatibility.mark_streaming_tool_unsupported(&key, "model", "first", 10);
@@ -11336,6 +11773,7 @@ mod tests {
             region: "us-east-1".to_string(),
             aws_profile: None,
             endpoint_url: None,
+            bearer_auth: false,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
         compatibility.mark_streaming_tool_unsupported(&key, "stale", "old", 1);
@@ -11359,6 +11797,7 @@ mod tests {
             region: "us-east-1".to_string(),
             aws_profile: None,
             endpoint_url: Some("https://example.com".to_string()),
+            bearer_auth: false,
         };
         let mut compatibility = PersistedCompatibilityCache::default();
         compatibility.mark_streaming_tool_unsupported(&key, "model", "message", now_unix_seconds());
