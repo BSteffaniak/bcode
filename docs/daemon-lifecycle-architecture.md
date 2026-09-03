@@ -18,7 +18,6 @@ The embedded plugin-surface server is a separate explicit integration mode. It d
 The exact produced-artifact identity is distinct from:
 
 * source/build fingerprint;
-* daemon startup scope identity — normalized non-secret daemon-wide configuration;
 * IPC protocol version;
 * session event schema version;
 * storage writer epoch;
@@ -26,15 +25,8 @@ The exact produced-artifact identity is distinct from:
 * executable SHA-256;
 * daemon process instance identity.
 
-Default namespaces derive from protocol version, exact artifact ID, and a normalized secret-safe
-startup-scope fingerprint. That fingerprint includes daemon-wide effective configuration and an
-explicit allowlist of non-secret routing environment values; it excludes credentials, state
-location selection, client/presentation settings, and working-directory context. Clients with
-equivalent startup semantics multiplex onto one daemon, while incompatible provider/plugin/policy
-startup semantics coexist as separate daemons. Values leave this fingerprint as their behavior
-becomes safely request-scoped.
-
-Default endpoints derive from the namespace and the identity of the resolved **runtime scope** — the pair
+Default namespaces derive from protocol version plus exact artifact ID. Default endpoints derive from
+protocol version, exact artifact ID, and the identity of the resolved **runtime scope** — the pair
 `(state root, config directory)` — so daemons serving different scopes coexist without sharing
 endpoints, registries, or coordination state. Endpoint discovery is O(1) and does not inspect
 executable bytes. `Hello` advertises the intended artifact ID and runtime scope identity, and both
