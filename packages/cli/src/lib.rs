@@ -10260,9 +10260,15 @@ struct DaemonCleanupSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonControlPolicy {
+    /// The current build can decode the daemon protocol; stop over IPC.
     GracefulIpc,
-    ReviewedForceOnly,
+    /// The current build cannot decode the daemon protocol, but independent process evidence
+    /// exactly identifies the daemon. Graceful stop is delegated to the daemon's own retained
+    /// content-addressed executable; forced termination remains a reviewed explicit action.
+    DelegatedGraceful,
+    /// Identity is mismatched or unverifiable; preserve the record and refuse control.
     PreserveAndRefuse,
+    /// Positive evidence proves the process is gone; prune the registry record.
     PruneStale,
 }
 
@@ -10275,7 +10281,7 @@ const fn daemon_control_policy(
             DaemonControlPolicy::GracefulIpc
         }
         bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported => {
-            DaemonControlPolicy::ReviewedForceOnly
+            DaemonControlPolicy::DelegatedGraceful
         }
         bcode_daemon_lifecycle::DaemonRecordClassification::ResponsiveIdentityMismatch
         | bcode_daemon_lifecycle::DaemonRecordClassification::Unverifiable => {
@@ -10283,6 +10289,47 @@ const fn daemon_control_policy(
         }
         bcode_daemon_lifecycle::DaemonRecordClassification::UnreachableStale => {
             DaemonControlPolicy::PruneStale
+        }
+    }
+}
+
+async fn cleanup_delegated_graceful_daemon(
+    record: &bcode_daemon_lifecycle::DaemonRecord,
+    classification: bcode_daemon_lifecycle::DaemonRecordClassification,
+    stop_current: bool,
+    verbose: bool,
+    summary: &mut DaemonCleanupSummary,
+) {
+    if !stop_current {
+        // `cleanup` only stops idle daemons. This build cannot ask a protocol-unsupported daemon
+        // whether it is idle, so preserve it.
+        summary.skipped = summary.skipped.saturating_add(1);
+        if verbose {
+            summary.messages.push(format!(
+                "preserved {}: {classification:?} (use `bcode server stop-all --yes` to stop it through its own executable)",
+                record.namespace
+            ));
+        }
+        return;
+    }
+    match stop_protocol_unsupported_daemon_via_own_executable(record).await {
+        Ok(()) => {
+            summary.stopped = summary.stopped.saturating_add(1);
+            if verbose {
+                summary.messages.push(format!(
+                    "stopped {} through its own executable",
+                    record.namespace
+                ));
+            }
+        }
+        Err(error) => {
+            summary.skipped = summary.skipped.saturating_add(1);
+            if verbose {
+                summary.messages.push(format!(
+                    "skipped {}: delegated stop failed: {error}",
+                    record.namespace
+                ));
+            }
         }
     }
 }
@@ -10341,7 +10388,17 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
                     summary.skipped = summary.skipped.saturating_add(1);
                 }
             }
-            DaemonControlPolicy::ReviewedForceOnly | DaemonControlPolicy::PreserveAndRefuse => {
+            DaemonControlPolicy::DelegatedGraceful => {
+                cleanup_delegated_graceful_daemon(
+                    &record,
+                    classification,
+                    stop_current,
+                    verbose,
+                    &mut summary,
+                )
+                .await;
+            }
+            DaemonControlPolicy::PreserveAndRefuse => {
                 summary.skipped = summary.skipped.saturating_add(1);
                 if verbose {
                     summary.messages.push(format!(
@@ -10603,10 +10660,12 @@ async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), Cl
         classification,
         bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
     ) {
-        return Err(CliError::InvalidArguments(format!(
-            "daemon {} is process-verified but protocol-unsupported; use `bcode session kill-owner {session_id}` after reviewing its identity",
+        stop_protocol_unsupported_daemon_via_own_executable(&record).await?;
+        println!(
+            "stopped session owner {} through its own executable",
             record.instance_id
-        )));
+        );
+        return Ok(());
     }
     if !matches!(
         classification,
@@ -10630,6 +10689,87 @@ async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), Cl
     wait_for_daemon_exit(&record).await?;
     println!("stopped session owner {}", record.instance_id);
     Ok(())
+}
+
+/// Gracefully stop a process-verified daemon whose protocol this build cannot decode by
+/// delegating the stop request to the daemon's own retained executable.
+///
+/// The record must still classify as `HistoricalProcessVerifiedProtocolUnsupported`, and the
+/// recorded executable path must be an immutable content-addressed daemon image whose bytes still
+/// match the recorded digest. That executable speaks the daemon's exact protocol, so it can request
+/// a graceful stop the same way the daemon's own clients would, and the daemon keeps its normal
+/// refusal semantics for in-flight work.
+///
+/// # Errors
+///
+/// * The record no longer classifies as process-verified and protocol-unsupported.
+/// * The record has no executable path or digest.
+/// * The executable path is not a content-addressed daemon image, or its bytes no longer match the
+///   recorded digest.
+/// * The delegated stop command fails to launch or exits unsuccessfully.
+/// * The daemon does not exit within the bounded wait.
+async fn stop_protocol_unsupported_daemon_via_own_executable(
+    expected: &bcode_daemon_lifecycle::DaemonRecord,
+) -> Result<(), CliError> {
+    let classification = bcode_daemon_lifecycle::classify_daemon_record(expected).await;
+    if !matches!(
+        classification,
+        bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+    ) {
+        return Err(CliError::InvalidArguments(format!(
+            "refusing delegated stop because daemon identity is {classification:?}"
+        )));
+    }
+    let executable = expected.executable_path.as_deref().ok_or_else(|| {
+        CliError::InvalidArguments(format!(
+            "daemon {} has no recorded executable path for delegated stop",
+            expected.instance_id
+        ))
+    })?;
+    let digest = expected.executable_digest.as_deref().ok_or_else(|| {
+        CliError::InvalidArguments(format!(
+            "daemon {} has no recorded executable digest for delegated stop",
+            expected.instance_id
+        ))
+    })?;
+    if !bcode_daemon_lifecycle::executable_path_matches_digest(executable, digest) {
+        return Err(CliError::InvalidArguments(format!(
+            "refusing delegated stop for daemon {}: executable {} is not a content-addressed daemon image",
+            expected.instance_id,
+            executable.display()
+        )));
+    }
+    let actual_digest = bcode_daemon_lifecycle::executable_sha256(executable)?;
+    if actual_digest != digest {
+        return Err(CliError::InvalidArguments(format!(
+            "refusing delegated stop for daemon {}: executable {} no longer matches its recorded digest",
+            expected.instance_id,
+            executable.display()
+        )));
+    }
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(executable)
+            .args(["server", "stop"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    )
+    .await
+    .map_err(|_| {
+        CliError::InvalidArguments(format!(
+            "delegated stop for daemon {} did not complete within 5 seconds",
+            expected.instance_id
+        ))
+    })??;
+    if !status.success() {
+        return Err(CliError::InvalidArguments(format!(
+            "delegated stop for daemon {} exited with {status}",
+            expected.instance_id
+        )));
+    }
+    wait_for_daemon_exit(expected).await
 }
 
 async fn wait_for_daemon_exit(
@@ -17169,7 +17309,7 @@ mod web_command_tests {
         );
         assert_eq!(
             daemon_control_policy(Classification::HistoricalProcessVerifiedProtocolUnsupported),
-            DaemonControlPolicy::ReviewedForceOnly
+            DaemonControlPolicy::DelegatedGraceful
         );
         assert_eq!(
             daemon_control_policy(Classification::ResponsiveIdentityMismatch),

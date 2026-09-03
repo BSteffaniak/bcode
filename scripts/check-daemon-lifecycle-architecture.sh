@@ -63,8 +63,16 @@ required = {
         and "DaemonControlPolicy::GracefulIpc" in cli,
     "protocol-unsupported and ambiguous historical evidence must remain conservative":
         "DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported" in cli
-        and "DaemonControlPolicy::ReviewedForceOnly" in cli
+        and "DaemonControlPolicy::DelegatedGraceful" in cli
         and "DaemonControlPolicy::PreserveAndRefuse" in cli,
+    # A daemon whose protocol this build cannot decode is stopped only by delegating a graceful
+    # request to its own retained image, never by signalling the PID directly, and only after the
+    # image is re-verified as content-addressed and digest-matching.
+    "protocol-unsupported daemons must stop through their own verified executable":
+        "async fn stop_protocol_unsupported_daemon_via_own_executable(" in cli
+        and "bcode_daemon_lifecycle::executable_path_matches_digest(executable, digest)" in cli
+        and "bcode_daemon_lifecycle::executable_sha256(executable)?" in cli
+        and ".args([\"server\", \"stop\"])" in cli,
     "Bedrock request context must not inherit daemon startup config":
         "let config = request_context\n            .is_none()\n            .then(bcode_config::load_config)" in bedrock,
     "Bedrock request context must not inherit daemon startup environment":
