@@ -801,8 +801,15 @@ async fn stream_mantle_anthropic_turn(
             last_error = Some(error);
             continue;
         }
-        return read_mantle_anthropic_stream(response, turn, name_map.clone(), synthetic.clone())
-            .await;
+        return read_mantle_anthropic_stream(
+            response,
+            turn,
+            name_map.clone(),
+            synthetic.clone(),
+            provider_request.prompt_cache.ttl_seconds,
+            model_id,
+        )
+        .await;
     }
     Err(last_error.unwrap_or_else(|| {
         provider_error(
@@ -1868,9 +1875,16 @@ async fn read_mantle_anthropic_stream(
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
     synthetic: Option<SyntheticStructuredOutput>,
+    cache_ttl_seconds: Option<u64>,
+    model_id: &str,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut decoder = MantleSseDecoder::default();
-    let mut accumulator = AnthropicMessagesAccumulator::new(name_map, synthetic);
+    let mut accumulator = AnthropicMessagesAccumulator::new_with_pricing_context(
+        name_map,
+        synthetic,
+        cache_ttl_seconds,
+        Some(bcode_model::model_billing_scope_from_effective_id(model_id)),
+    );
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -2029,7 +2043,15 @@ async fn send_bedrock_messages_request(
         .send()
         .await
         .map_err(|error| bedrock_messages_sdk_error(&error))?;
-    read_anthropic_messages_stream(response.body, turn, name_map, synthetic).await
+    read_anthropic_messages_stream(
+        response.body,
+        turn,
+        name_map,
+        synthetic,
+        request.prompt_cache.ttl_seconds,
+        model_id,
+    )
+    .await
 }
 
 fn bedrock_messages_native_structured_output_rejected(error: &ProviderError) -> bool {
@@ -2203,8 +2225,15 @@ async fn read_anthropic_messages_stream(
     turn: &TurnState,
     name_map: BTreeMap<String, String>,
     synthetic: Option<SyntheticStructuredOutput>,
+    cache_ttl_seconds: Option<u64>,
+    model_id: &str,
 ) -> Result<StreamOutcome, ProviderError> {
-    let mut accumulator = AnthropicMessagesAccumulator::new(name_map, synthetic);
+    let mut accumulator = AnthropicMessagesAccumulator::new_with_pricing_context(
+        name_map,
+        synthetic,
+        cache_ttl_seconds,
+        Some(bcode_model::model_billing_scope_from_effective_id(model_id)),
+    );
     loop {
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
@@ -2284,6 +2313,10 @@ struct AnthropicMessagesAccumulator {
     stop_reason: Option<StopReason>,
     /// Latest cumulative usage for this provider request.
     usage: Option<TokenUsage>,
+    /// Effective cache retention used for Anthropic cache writes.
+    cache_ttl_seconds: Option<u64>,
+    /// Billing scope derived from the exact effective Bedrock model identifier.
+    billing_scope: Option<String>,
     usage_state: UsageEmissionState,
     name_map: BTreeMap<String, String>,
 }
@@ -2295,9 +2328,19 @@ struct UsageEmissionState {
 }
 
 impl AnthropicMessagesAccumulator {
+    #[cfg(test)]
     const fn new(
         name_map: BTreeMap<String, String>,
         synthetic: Option<SyntheticStructuredOutput>,
+    ) -> Self {
+        Self::new_with_pricing_context(name_map, synthetic, None, None)
+    }
+
+    const fn new_with_pricing_context(
+        name_map: BTreeMap<String, String>,
+        synthetic: Option<SyntheticStructuredOutput>,
+        cache_ttl_seconds: Option<u64>,
+        billing_scope: Option<String>,
     ) -> Self {
         Self {
             tool_calls: BTreeMap::new(),
@@ -2309,6 +2352,8 @@ impl AnthropicMessagesAccumulator {
             synthetic,
             stop_reason: None,
             usage: None,
+            cache_ttl_seconds,
+            billing_scope,
             usage_state: UsageEmissionState {
                 final_usage: false,
                 exact_input: false,
@@ -2579,7 +2624,8 @@ impl AnthropicMessagesAccumulator {
             (previous, current) => current.or(previous),
         };
         let previous = self.usage.take().unwrap_or_default();
-        let input_tokens = merge(previous.input_tokens, read("input_tokens"));
+        let previous_ordinary_input = previous.uncached_input_tokens();
+        let ordinary_input_tokens = merge(previous_ordinary_input, read("input_tokens"));
         let output_tokens = merge(previous.output_tokens, read("output_tokens"));
         let cached_input_tokens = merge(
             previous.cached_input_tokens,
@@ -2589,22 +2635,32 @@ impl AnthropicMessagesAccumulator {
             previous.cache_write_input_tokens,
             read("cache_creation_input_tokens"),
         );
+        let input_tokens = ordinary_input_tokens.map(|ordinary| {
+            ordinary
+                .saturating_add(cached_input_tokens.unwrap_or_default())
+                .saturating_add(cache_write_input_tokens.unwrap_or_default())
+        });
+        let cache_ttl_seconds = (cache_write_input_tokens.unwrap_or_default() > 0)
+            .then_some(self.cache_ttl_seconds.unwrap_or(300));
+        let details = anthropic_messages_pricing_details(
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
+            cache_ttl_seconds,
+        );
         self.usage = Some(TokenUsage {
             input_tokens,
             output_tokens,
             cached_input_tokens,
             cache_write_input_tokens,
+            details,
             pricing_context: Box::new(bcode_model::ModelPricingContext {
                 service_tier: Some("standard".to_string()),
                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
-                request_input_tokens: input_tokens.map(|input_tokens| {
-                    complete_request_input_tokens(
-                        input_tokens,
-                        cached_input_tokens,
-                        cache_write_input_tokens,
-                    )
-                }),
-                ..bcode_model::ModelPricingContext::default()
+                request_input_tokens: input_tokens.map(u64::from),
+                billing_scope: self.billing_scope.clone(),
+                cache_ttl_seconds,
             }),
             ..TokenUsage::default()
         });
@@ -6033,6 +6089,50 @@ fn converse_pricing_details(
 /// `inputTokens + cacheReadInputTokens + cacheWriteInputTokens`. Callers must only supply an
 /// `input_tokens` value the provider actually reported, because a cache-only sum would understate
 /// context occupancy.
+fn anthropic_messages_pricing_details(
+    input: Option<u32>,
+    output: Option<u32>,
+    cached: Option<u32>,
+    cache_write: Option<u32>,
+    cache_ttl_seconds: Option<u64>,
+) -> Box<[bcode_model::ModelTokenUsageDetail]> {
+    let Some(input) = input else {
+        return Box::default();
+    };
+    let cached = cached.unwrap_or_default();
+    let cache_write = cache_write.unwrap_or_default();
+    let ordinary = input.saturating_sub(cached).saturating_sub(cache_write);
+    [
+        (bcode_model::ModelPricingBucket::Input, ordinary, None),
+        (
+            bcode_model::ModelPricingBucket::CacheReadInput,
+            cached,
+            None,
+        ),
+        (
+            bcode_model::ModelPricingBucket::CacheWriteInput,
+            cache_write,
+            cache_ttl_seconds,
+        ),
+        (
+            bcode_model::ModelPricingBucket::Output,
+            output.unwrap_or_default(),
+            None,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(bucket, tokens, ttl)| {
+        (tokens > 0).then_some(bcode_model::ModelTokenUsageDetail {
+            bucket,
+            modality: bcode_model::ModelTokenModality::Text,
+            tokens,
+            cache_ttl_seconds: ttl,
+        })
+    })
+    .collect::<Vec<_>>()
+    .into_boxed_slice()
+}
+
 fn complete_request_input_tokens(
     input_tokens: u32,
     cache_read_input_tokens: Option<u32>,
@@ -8656,7 +8756,12 @@ mod tests {
     #[test]
     fn anthropic_messages_exact_input_tokens_include_cache_reads_and_writes() {
         let turn = TurnState::default();
-        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        let mut accumulator = AnthropicMessagesAccumulator::new_with_pricing_context(
+            BTreeMap::new(),
+            None,
+            Some(300),
+            Some("global".to_string()),
+        );
 
         accumulator
             .process(
@@ -8680,16 +8785,22 @@ mod tests {
             event,
             ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 492
         )));
-        // Billing-shaped usage keeps the provider's own field split while threshold pricing uses
-        // the complete model-visible request size.
+        // Normalized input is the complete request total; cache read/write are mutually exclusive
+        // subsets, so shared accounting derives 12 ordinary input tokens.
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderTurnEvent::Usage { usage }
-                if usage.input_tokens == Some(12)
+                if usage.input_tokens == Some(492)
+                    && usage.uncached_input_tokens() == Some(12)
                     && usage.cached_input_tokens == Some(400)
                     && usage.cache_write_input_tokens == Some(80)
                     && usage.pricing_context.request_input_tokens == Some(492)
+                    && usage.pricing_context.cache_ttl_seconds == Some(300)
                     && usage.pricing_context.service_tier.as_deref() == Some("standard")
+                    && usage.details.iter().any(|detail|
+                        detail.bucket == bcode_model::ModelPricingBucket::CacheWriteInput
+                            && detail.tokens == 80
+                            && detail.cache_ttl_seconds == Some(300))
         )));
     }
 

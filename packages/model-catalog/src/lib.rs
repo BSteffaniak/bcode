@@ -2245,6 +2245,76 @@ mod tests {
     }
 
     #[test]
+    fn fable_5_1_pricing_handles_five_minute_and_one_hour_cache_writes() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let model = catalog.enrich_model_with_defaults(
+            "bedrock",
+            bcode_model::ModelInfo {
+                model_id: "global.anthropic.claude-fable-5-1".to_string(),
+                display_name: "Fable".to_string(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                max_image_input_base64_bytes: None,
+                capabilities: std::collections::BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                api_surface: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            },
+        );
+        let pricing = model.pricing.expect("Fable pricing");
+        for (ttl, expected_total) in [(300, 123_500), (3_600, 131_000)] {
+            let usage = bcode_model::TokenUsage {
+                input_tokens: Some(11_000),
+                output_tokens: Some(1_000),
+                cached_input_tokens: Some(4_000),
+                cache_write_input_tokens: Some(1_000),
+                details: vec![
+                    bcode_model::ModelTokenUsageDetail {
+                        bucket: bcode_model::ModelPricingBucket::Input,
+                        modality: bcode_model::ModelTokenModality::Text,
+                        tokens: 6_000,
+                        cache_ttl_seconds: None,
+                    },
+                    bcode_model::ModelTokenUsageDetail {
+                        bucket: bcode_model::ModelPricingBucket::CacheReadInput,
+                        modality: bcode_model::ModelTokenModality::Text,
+                        tokens: 4_000,
+                        cache_ttl_seconds: None,
+                    },
+                    bcode_model::ModelTokenUsageDetail {
+                        bucket: bcode_model::ModelPricingBucket::CacheWriteInput,
+                        modality: bcode_model::ModelTokenModality::Text,
+                        tokens: 1_000,
+                        cache_ttl_seconds: Some(ttl),
+                    },
+                    bcode_model::ModelTokenUsageDetail {
+                        bucket: bcode_model::ModelPricingBucket::Output,
+                        modality: bcode_model::ModelTokenModality::Text,
+                        tokens: 1_000,
+                        cache_ttl_seconds: None,
+                    },
+                ]
+                .into_boxed_slice(),
+                pricing_context: Box::new(bcode_model::ModelPricingContext {
+                    invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                    billing_scope: Some("global".to_string()),
+                    request_input_tokens: Some(11_000),
+                    cache_ttl_seconds: Some(ttl),
+                    ..bcode_model::ModelPricingContext::default()
+                }),
+                ..bcode_model::TokenUsage::default()
+            };
+            let estimate = pricing.estimate_cost(&usage).expect("priced usage");
+            assert_eq!(estimate.total_micros, expected_total, "ttl={ttl}");
+        }
+    }
+
+    #[test]
     fn bedrock_openai_cache_write_usage_has_complete_pricing() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
 
