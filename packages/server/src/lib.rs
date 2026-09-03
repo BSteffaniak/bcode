@@ -54413,7 +54413,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    async fn prompt_profile_applies_only_to_catalog_resolved_opus_five() {
+    async fn prompt_profile_applies_only_to_catalog_resolved_claude_family() {
         let state = test_server_state_with_prompt_profile(SessionManager::default());
         let config = bcode_config::BcodeConfig::default();
         let tools = vec![bcode_model::ToolDefinition {
@@ -54421,10 +54421,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             description: "Run a command".to_string(),
             input_schema: serde_json::json!({}),
         }];
-        let opus_target = model_request_target::ResolvedModelRequestTarget {
+        let claude_target = |entry: &str| model_request_target::ResolvedModelRequestTarget {
             provider_plugin_id: Some("bcode.bedrock".to_string()),
-            requested_model_id: Some("us.anthropic.claude-opus-5-v1:0".to_string()),
-            model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
+            requested_model_id: Some(format!("us.{entry}-v1:0")),
+            model_id: format!("us.{entry}-v1:0"),
             provider_context: bcode_model::ProviderRequestContext::default(),
             cache: bcode_model::ModelCacheInfo::default(),
             max_output_tokens: None,
@@ -54432,45 +54432,50 @@ event_symbol = "bcode_plugin_handle_event_v1"
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: Some(bcode_model_catalog::ModelCatalogIdentity {
                 provider_id: "bedrock".to_string(),
-                catalog_entry_id: "anthropic.claude-opus-5".to_string(),
+                catalog_entry_id: entry.to_string(),
                 family: Some("claude".to_string()),
                 api_surface: Some(bcode_model::ModelApiSurface::Messages),
             }),
         };
-        let response = resolve_prompt_profile(
-            &state,
-            SessionId::new(),
-            "build",
-            &config,
-            &opus_target,
-            &tools,
-        )
-        .await;
-        assert_eq!(
-            response.applied_layers,
-            ["catalog_entry:anthropic.claude-opus-5"]
-        );
-        let prompt = apply_system_prompt_profile("base".to_string(), &response);
-        assert!(prompt.contains("Do not pipe tool output"));
-        let patched = apply_tool_description_profile(tools.clone(), &response);
-        assert!(patched[0].description.contains("Do not pipe tool output"));
-        assert_eq!(patched[0].name, tools[0].name);
-        assert_eq!(patched[0].input_schema, tools[0].input_schema);
+        for entry in [
+            "anthropic.claude-opus-5",
+            "anthropic.claude-sonnet-4",
+            "anthropic.claude-fable-5-1",
+        ] {
+            let response = resolve_prompt_profile(
+                &state,
+                SessionId::new(),
+                "build",
+                &config,
+                &claude_target(entry),
+                &tools,
+            )
+            .await;
+            assert_eq!(response.applied_layers, ["family:claude"], "{entry}");
+            assert_eq!(
+                apply_system_prompt_profile("base".to_string(), &response),
+                "base",
+                "{entry}: the bundled profile is tool-description only"
+            );
+            let patched = apply_tool_description_profile(tools.clone(), &response);
+            assert!(patched[0].description.contains("Do not pipe"), "{entry}");
+            assert_eq!(patched[0].name, tools[0].name);
+            assert_eq!(patched[0].input_schema, tools[0].input_schema);
+        }
 
-        let mut sonnet_target = opus_target;
-        sonnet_target.model_id = "anthropic.claude-sonnet-4".to_string();
-        sonnet_target.catalog_identity = Some(bcode_model_catalog::ModelCatalogIdentity {
+        let mut nova_target = claude_target("amazon.nova");
+        nova_target.catalog_identity = Some(bcode_model_catalog::ModelCatalogIdentity {
             provider_id: "bedrock".to_string(),
-            catalog_entry_id: "anthropic.claude-sonnet-4".to_string(),
-            family: Some("claude".to_string()),
-            api_surface: Some(bcode_model::ModelApiSurface::Messages),
+            catalog_entry_id: "amazon.nova".to_string(),
+            family: Some("nova".to_string()),
+            api_surface: None,
         });
         let unmodified = resolve_prompt_profile(
             &state,
             SessionId::new(),
             "build",
             &config,
-            &sonnet_target,
+            &nova_target,
             &tools,
         )
         .await;

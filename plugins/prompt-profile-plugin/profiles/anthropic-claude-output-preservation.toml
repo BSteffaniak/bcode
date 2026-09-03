@@ -1,0 +1,8 @@
+id = "anthropic-claude-output-preservation"
+
+[target]
+family = "claude"
+
+[profile.tool_description."shell.run"]
+mode = "append"
+text = "Do not pipe command output through head, tail, sed, or similar filters just to shorten it. Bcode already bounds what you see and keeps the full output for the user, so self-truncation only hides it from them."

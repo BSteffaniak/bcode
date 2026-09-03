@@ -16,23 +16,27 @@ Profiles use exact host-supplied model facts. From lowest to highest precedence,
 5. `prompt_profile.model.<effective-model-id>`
 
 Bcode's model catalog supplies family, catalog-entry, and API-surface identity. The plugin does not
-infer identity from model-ID substrings. A family such as `claude` is shared by Sonnet, Haiku, and
-multiple Opus generations, so it cannot target Opus 5 alone. The bundled default therefore uses
-`catalog_entry."anthropic.claude-opus-5"`.
+infer identity from model-ID substrings. A family such as `claude` is shared by every Anthropic
+generation in the catalog (Opus, Sonnet, Haiku, Fable, Mythos, and the `anthropic.claude` catch-all
+entry), so a family layer is the right scope for guidance that applies to all of them, while
+`catalog_entry` layers target a single generation.
 
 Each layer may append, prepend, or replace stable system-prompt text and model-facing tool
 descriptions. These are presentation changes only: tool names, schemas, authorization facts,
 dispatch, and persisted execution outcomes are unchanged.
 
-## Bundled Opus 5 profile
+## Bundled Claude profile
 
-The bundled profile tells Opus 5 not to pipe tool output through `head`, `tail`, `sed`, or similar
-commands merely to shorten it. Bcode already bounds model-visible tool output while retaining the
-complete output for the user; self-truncation only hides useful output.
+The bundled profile appends guidance to the `shell.run` tool description telling Claude models not
+to pipe command output through `head`, `tail`, `sed`, or similar filters merely to shorten it. Bcode
+already bounds model-visible tool output while retaining the complete output for the user;
+self-truncation only hides useful output. The profile does not touch the system prompt: the
+guidance is about one tool, so it travels with that tool and is absent when the tool is not offered.
 
-The default applies only when catalog resolution identifies
-`anthropic.claude-opus-5`. Models accessed through an unmapped gateway can be targeted explicitly
-with `prompt_profile.model.<effective-model-id>`.
+The default applies whenever catalog resolution reports `family = "claude"`, which covers every
+Anthropic entry in the Bedrock catalog including region-prefixed inference-profile IDs. Models
+accessed through an unmapped gateway resolve without a family and can be targeted explicitly with
+`prompt_profile.model.<effective-model-id>`.
 
 Set `system_prompt.sections.model_profile = false` to disable all profile application for coding
 turns, or disable the `bcode.prompt-profile` plugin to remove all bundled behavior without affecting
@@ -40,12 +44,13 @@ unrelated Bcode capabilities. A single shipped profile can be disabled independe
 
 ```toml
 [prompt_profile.bundled]
-disabled = ["anthropic-claude-opus-5-output-preservation"]
+disabled = ["anthropic-claude-output-preservation"]
 ```
 
-Bundled profile documents live under `plugins/prompt-profile-plugin/profiles/`; the Opus 5 prompt
-text and target are defined in
-`anthropic-claude-opus-5-output-preservation.toml`, separately from runtime code.
+Bundled profile documents live under `plugins/prompt-profile-plugin/profiles/`; the Claude prompt
+text and target are defined in `anthropic-claude-output-preservation.toml`, separately from runtime
+code. A bundled document targets either `[target] family = "<catalog-family>"` or
+`[target] catalog_entry = "<catalog-entry-id>"`.
 
 Prompt profiles are applied to ordinary coding turns. Utility prompts such as invariant selection,
 compaction, title generation, or other internal model requests are intentionally outside this

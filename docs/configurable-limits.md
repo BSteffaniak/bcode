@@ -18,7 +18,7 @@ This inventory classifies Bcode operational limits so hardcoded defaults do not 
 | `system_prompt.repository_invariants_max_chars` | Prompt assembly | Unlimited | Optional prompt limit | Truncates `INVARIANTS.md` only when configured. |
 | `system_prompt.git_status_max_chars` | Prompt assembly | 4,000 chars | Configurable bounded default | Truncates generated Git status with a visible marker. |
 | `system_prompt.sections.model_profile` | Prompt profiles | `true` | Feature control | Disables model-scoped system-prompt and tool-description text when false. |
-| `prompt_profile.*` | Prompt profiles | Bundled Opus 5 profile | Declarative text policy | Exact model layers compose bounded model-facing text; see `docs/model-prompt-profiles.md`. |
+| `prompt_profile.*` | Prompt profiles | Bundled Claude family profile | Declarative text policy | Exact model layers compose bounded model-facing text; see `docs/model-prompt-profiles.md`. |
 | `skills.max_context_bytes` | Skills | Unlimited | Optional prompt limit | Truncates model-visible skill context only when configured. |
 | `skills.prompt.max_bytes` | Skills | Unlimited | Optional prompt limit | Truncates the available-skill catalog only when configured. |
 | `skills.prompt.max_description_chars` | Skills | Unlimited | Optional prompt limit | Truncates catalog descriptions only when configured. |

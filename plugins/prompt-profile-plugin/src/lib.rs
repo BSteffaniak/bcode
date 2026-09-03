@@ -181,6 +181,14 @@ mod tests {
         entry: Option<&str>,
         config: Option<&bcode_config::BcodeConfig>,
     ) -> ResolvePromptProfileRequest {
+        request_with_family(entry, Some("claude"), config)
+    }
+
+    fn request_with_family(
+        entry: Option<&str>,
+        family: Option<&str>,
+        config: Option<&bcode_config::BcodeConfig>,
+    ) -> ResolvePromptProfileRequest {
         ResolvePromptProfileRequest {
             session_id: bcode_session_models::SessionId::new(),
             agent_id: "build".to_string(),
@@ -190,7 +198,7 @@ mod tests {
                 catalog_entry_id: entry.map(str::to_string),
                 requested_model_id: None,
                 effective_model_id: "us.anthropic.claude-opus-5-v1:0".to_string(),
-                family: Some("claude".to_string()),
+                family: family.map(str::to_string),
                 api_surface: None,
             },
             tools: vec![bcode_tool::ToolDefinition {
@@ -264,7 +272,7 @@ mod tests {
                 text: "bad".to_string(),
             },
         );
-        let response = resolve_profile(&request_with_config(None, Some(&config)));
+        let response = resolve_profile(&request_with_family(None, None, Some(&config)));
         assert!(response.tool_description_overrides.is_empty());
         assert_eq!(response.diagnostics.len(), 1);
     }
@@ -276,7 +284,7 @@ mod tests {
             .prompt_profile
             .bundled
             .disabled
-            .insert("anthropic-claude-opus-5-output-preservation".to_string());
+            .insert("anthropic-claude-output-preservation".to_string());
         assert_eq!(
             resolve_profile(&request_with_config(
                 Some("anthropic.claude-opus-5"),
@@ -287,14 +295,32 @@ mod tests {
     }
 
     #[test]
-    fn bundled_default_is_scoped_to_opus_five_catalog_entry() {
-        assert!(
-            !resolve_profile(&request(Some("anthropic.claude-opus-5")))
-                .system_prompt_appends
-                .is_empty()
+    fn bundled_default_is_scoped_to_claude_family() {
+        for entry in [
+            "anthropic.claude-opus-5",
+            "anthropic.claude-sonnet-4",
+            "anthropic.claude-fable-5-1",
+        ] {
+            let response = resolve_profile(&request(Some(entry)));
+            assert_eq!(response.applied_layers, ["family:claude"], "{entry}");
+            assert!(response.system_prompt_appends.is_empty(), "{entry}");
+            assert!(response.system_prompt_prepends.is_empty(), "{entry}");
+            assert_eq!(response.system_prompt_replacement, None, "{entry}");
+            let overrides = &response.tool_description_overrides["shell.run"];
+            assert_eq!(overrides.len(), 1, "{entry}");
+            assert_eq!(overrides[0].mode, TextOverrideMode::Append, "{entry}");
+            assert!(overrides[0].text.contains("Do not pipe"), "{entry}");
+        }
+        assert_eq!(
+            resolve_profile(&request_with_family(
+                Some("amazon.nova"),
+                Some("nova"),
+                None
+            )),
+            PromptProfileResponse::default()
         );
         assert_eq!(
-            resolve_profile(&request(Some("anthropic.claude-sonnet-4"))),
+            resolve_profile(&request_with_family(None, None, None)),
             PromptProfileResponse::default()
         );
     }
