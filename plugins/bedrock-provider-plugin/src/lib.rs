@@ -460,7 +460,7 @@ fn validate_bedrock_request(
             "Bedrock max_output_tokens must fit in a signed 32-bit integer",
         ));
     }
-    validate_bedrock_cache_ttl(request)?;
+    validate_bedrock_cache_ttl(request, responses_surface)?;
     validate_fable_5_1_request(request)?;
     validate_declared_bedrock_features(request, responses_surface)?;
     validate_tool_choice_registration(request)
@@ -470,8 +470,17 @@ fn validate_declared_bedrock_features(
     request: &ModelTurnRequest,
     responses_surface: bool,
 ) -> Result<(), ProviderError> {
+    let mut surface_support = bedrock_feature_support_for(responses_surface);
+    if !request.prompt_cache.supported_ttl_seconds.is_empty() {
+        surface_support.prompt_cache.insert(
+            bcode_model::PromptCacheFeature::Ttl,
+            bcode_model::CapabilitySupport::supported(
+                bcode_model::CapabilitySource::BundledCatalog,
+            ),
+        );
+    }
     let unsupported = request
-        .explicitly_unsupported_features(&bedrock_feature_support_for(responses_surface))
+        .explicitly_unsupported_features(&surface_support)
         .into_iter()
         .filter(|feature| {
             !matches!(
@@ -491,7 +500,10 @@ fn validate_declared_bedrock_features(
     })
 }
 
-fn validate_bedrock_cache_ttl(request: &ModelTurnRequest) -> Result<(), ProviderError> {
+fn validate_bedrock_cache_ttl(
+    request: &ModelTurnRequest,
+    responses_surface: bool,
+) -> Result<(), ProviderError> {
     let ttl_values = request
         .messages
         .iter()
@@ -505,9 +517,14 @@ fn validate_bedrock_cache_ttl(request: &ModelTurnRequest) -> Result<(), Provider
     if ttl_values.is_empty() {
         return Ok(());
     }
-    if is_claude_fable_5_1(&request.model_id)
-        && ttl_values.iter().all(|ttl| matches!(ttl, 300 | 3_600))
-    {
+    if !ttl_values.is_subset(&request.prompt_cache.supported_ttl_seconds) {
+        return Err(provider_error(
+            "bedrock_cache_ttl_unsupported",
+            ProviderErrorCategory::UnsupportedFeature,
+            "the requested cache TTL is not present in the host-resolved model capabilities",
+        ));
+    }
+    if responses_surface || ttl_values.iter().all(|ttl| matches!(ttl, 300 | 3_600)) {
         return Ok(());
     }
     Err(provider_error(
@@ -749,12 +766,13 @@ async fn stream_mantle_anthropic_turn(
     if settings.mantle_auth_header {
         request_builder = request_builder.bearer_auth(&token);
     }
-    let (provider_request, synthetic) = if request.structured_output.is_some() {
+    let (mut provider_request, synthetic) = if request.structured_output.is_some() {
         let (fallback, synthetic) = bedrock_messages_structured_fallback_request(request)?;
         (fallback, Some(synthetic))
     } else {
         (request.clone(), None)
     };
+    bound_anthropic_messages_cache_points(&mut provider_request);
     let mut last_error = None;
     for model_id in &selection.model_ids {
         let response = request_builder
@@ -3209,6 +3227,33 @@ fn anthropic_messages_max_tokens(request: &ModelTurnRequest) -> Result<u32, Prov
     })
 }
 
+const ANTHROPIC_MESSAGES_MAX_CACHE_POINTS: usize = 4;
+
+fn bound_anthropic_messages_cache_points(request: &mut ModelTurnRequest) {
+    let reserved = usize::from(
+        request.prompt_cache.cache_system_prompt
+            && request
+                .system_prompt
+                .as_ref()
+                .is_some_and(|prompt| !prompt.trim().is_empty()),
+    ) + usize::from(request.prompt_cache.cache_tools && !request.tools.is_empty());
+    let keep = ANTHROPIC_MESSAGES_MAX_CACHE_POINTS.saturating_sub(reserved);
+    let mut remaining = prompt_cache_point_count(request).saturating_sub(keep);
+    if remaining == 0 {
+        return;
+    }
+    for message in &mut request.messages {
+        message.content.retain(|block| {
+            if remaining > 0 && matches!(block, ContentBlock::CachePoint { .. }) {
+                remaining -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
 fn build_anthropic_messages_request_value(
     request: &ModelTurnRequest,
     model_id: &str,
@@ -3565,10 +3610,14 @@ fn bedrock_request_projection(
     request: &ModelTurnRequest,
     route: EffectiveBedrockRoute,
 ) -> ProviderRequestProjection {
-    let emitted_cache_points = match route {
-        EffectiveBedrockRoute::OpenAiResponses => prompt_cache_point_count(request),
-        EffectiveBedrockRoute::AnthropicMessages => 0,
-        EffectiveBedrockRoute::Converse => bedrock_emitted_cache_point_count(request),
+    let total_cache_points = bedrock_emitted_cache_point_count(request);
+    let (emitted_cache_points, dropped_cache_points) = match route {
+        EffectiveBedrockRoute::OpenAiResponses => (prompt_cache_point_count(request), 0),
+        EffectiveBedrockRoute::AnthropicMessages => (
+            total_cache_points.min(ANTHROPIC_MESSAGES_MAX_CACHE_POINTS),
+            total_cache_points.saturating_sub(ANTHROPIC_MESSAGES_MAX_CACHE_POINTS),
+        ),
+        EffectiveBedrockRoute::Converse => (total_cache_points, 0),
     };
     let sent_messages = request
         .messages
@@ -3591,7 +3640,7 @@ fn bedrock_request_projection(
         omitted_message_count: Some(request.messages.len().saturating_sub(sent_messages)),
         cache_point_count: Some(prompt_cache_point_count(request)),
         emitted_cache_point_count: Some(emitted_cache_points),
-        dropped_cache_point_count: Some(0),
+        dropped_cache_point_count: Some(dropped_cache_points),
         used_previous_response_id: false,
         ..ProviderRequestProjection::default()
     }
@@ -7182,6 +7231,7 @@ mod tests {
     fn enable_explicit_prompt_cache(request: &mut ModelTurnRequest) {
         request.prompt_cache.mode = bcode_model::PromptCacheMode::Aggressive;
         request.prompt_cache.ttl_seconds = Some(30 * 60);
+        request.prompt_cache.supported_ttl_seconds = BTreeSet::from([30 * 60]);
         request.metadata.insert(
             "model_cache_capabilities".to_string(),
             "prompt_cache_key,explicit_cache_points,cache_usage_reporting".to_string(),
@@ -9729,6 +9779,7 @@ mod tests {
                 mode: bcode_model::PromptCacheMode::Auto,
                 key: None,
                 ttl_seconds: None,
+                supported_ttl_seconds: BTreeSet::new(),
                 cache_system_prompt: true,
                 cache_tools: true,
             },
@@ -10247,6 +10298,70 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_messages_bounds_cache_points_and_keeps_newest_boundaries() {
+        let mut request = test_model_turn_request();
+        request.system_prompt = Some("stable system".to_string());
+        request.prompt_cache.cache_system_prompt = true;
+        request.prompt_cache.cache_tools = true;
+        request.tools.push(ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "read".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        request.messages = (0..5)
+            .map(|index| ModelMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: format!("boundary {index}"),
+                    },
+                    ContentBlock::CachePoint {
+                        hint: bcode_model::PromptCachePoint::default(),
+                    },
+                ],
+            })
+            .collect();
+
+        bound_anthropic_messages_cache_points(&mut request);
+
+        assert_eq!(bedrock_emitted_cache_point_count(&request), 4);
+        let retained = request
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
+            })
+            .map(|message| match &message.content[0] {
+                ContentBlock::Text { text } => text.as_str(),
+                _ => panic!("expected text boundary"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained, vec!["boundary 3", "boundary 4"]);
+
+        let mut unbounded = request.clone();
+        unbounded.messages = (0..5)
+            .map(|index| ModelMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: format!("boundary {index}"),
+                    },
+                    ContentBlock::CachePoint {
+                        hint: bcode_model::PromptCachePoint::default(),
+                    },
+                ],
+            })
+            .collect();
+        let projection =
+            bedrock_request_projection(&unbounded, EffectiveBedrockRoute::AnthropicMessages);
+        assert_eq!(projection.emitted_cache_point_count, Some(4));
+        assert_eq!(projection.dropped_cache_point_count, Some(3));
+    }
+
+    #[test]
     fn fable_5_1_serializes_adaptive_max_effort() {
         let mut request = test_model_turn_request();
         request.model_id = "global.anthropic.claude-fable-5-1".to_string();
@@ -10269,6 +10384,7 @@ mod tests {
         request.model_id = "global.anthropic.claude-fable-5-1".to_string();
         request.prompt_cache.cache_system_prompt = true;
         request.prompt_cache.ttl_seconds = Some(3_600);
+        request.prompt_cache.supported_ttl_seconds = BTreeSet::from([300, 3_600]);
         request.system_prompt = Some("stable system".to_string());
         validate_bedrock_request(&request, false).expect("one-hour TTL is supported");
         let body =
@@ -10277,8 +10393,23 @@ mod tests {
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
 
+        request.prompt_cache.ttl_seconds = Some(300);
+        validate_bedrock_request(&request, false).expect("five-minute TTL is supported");
+
+        request.prompt_cache.supported_ttl_seconds.clear();
+        let error = validate_bedrock_request(&request, false)
+            .expect_err("TTL without host-resolved support must fail closed");
+        assert_eq!(error.code, "bedrock_cache_ttl_unsupported");
+
+        request.prompt_cache.supported_ttl_seconds = BTreeSet::from([300, 3_600]);
         request.prompt_cache.ttl_seconds = Some(600);
-        let error = validate_bedrock_request(&request, false).expect_err("unknown TTL must fail");
+        let error = validate_bedrock_request(&request, false)
+            .expect_err("unadvertised TTL must fail closed");
+        assert_eq!(error.code, "bedrock_cache_ttl_unsupported");
+
+        request.prompt_cache.supported_ttl_seconds = BTreeSet::from([600]);
+        let error = validate_bedrock_request(&request, false)
+            .expect_err("unsupported wire TTL must fail closed");
         assert_eq!(error.code, "bedrock_cache_ttl_unsupported");
     }
 

@@ -1002,6 +1002,7 @@ where
         mode: PromptCacheMode::Aggressive,
         key: Some("conformance-cache".to_string()),
         ttl_seconds: Some(60),
+        supported_ttl_seconds: BTreeSet::from([60]),
         cache_system_prompt: true,
         cache_tools: true,
     };

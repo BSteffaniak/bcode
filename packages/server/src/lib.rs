@@ -20590,7 +20590,6 @@ async fn build_model_turn_request(
     let catalog_provider_id = target.catalog_provider_id.clone();
     let catalog_identity = target.catalog_identity.clone();
     let model_cache_info = target.cache;
-    let prompt_cache_ttl_seconds = model_cache_info.ttl_seconds.iter().next_back().copied();
     let prompt_cache_timer = state.metrics.timer();
     let prompt_cache = plan_prompt_cache(
         &mut messages,
@@ -20599,7 +20598,7 @@ async fn build_model_turn_request(
         model_cache_info
             .capabilities
             .contains(&bcode_model::ModelCacheCapability::ExplicitCachePoints),
-        prompt_cache_ttl_seconds,
+        &model_cache_info.ttl_seconds,
     );
     state.metrics.record_histogram_with_labels(
         "model.request_build.prompt_cache_plan_duration_ms",
@@ -21954,7 +21953,7 @@ fn plan_prompt_cache(
     mode: bcode_model::PromptCacheMode,
     session_id: SessionId,
     explicit_cache_points: bool,
-    ttl_seconds: Option<u64>,
+    supported_ttl_seconds: &BTreeSet<u64>,
 ) -> bcode_model::PromptCacheHints {
     // Cache points are provider-request projection artifacts. A tool round rebuild may receive
     // messages projected for an earlier round, so remove them before applying the current policy.
@@ -21969,7 +21968,9 @@ fn plan_prompt_cache(
     }
 
     let explicit_cache_points = explicit_cache_points && mode.is_enabled();
-    let ttl_seconds = explicit_cache_points.then_some(ttl_seconds).flatten();
+    let ttl_seconds = explicit_cache_points
+        .then(|| supported_ttl_seconds.iter().next_back().copied())
+        .flatten();
     if explicit_cache_points {
         for index in conversation_cache_point_indices(messages) {
             messages[index].content.push(ContentBlock::CachePoint {
@@ -21985,6 +21986,7 @@ fn plan_prompt_cache(
         mode,
         key: Some(format!("bcode:{session_id}")),
         ttl_seconds,
+        supported_ttl_seconds: supported_ttl_seconds.clone(),
         cache_system_prompt: true,
         cache_tools: true,
     }
@@ -38878,12 +38880,13 @@ library = "test"
             bcode_model::PromptCacheMode::Aggressive,
             SessionId::new(),
             true,
-            Some(30 * 60),
+            &BTreeSet::from([30 * 60]),
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Aggressive);
         assert_eq!(prompt_cache_point_count_in_messages(&messages), 3);
         assert_eq!(hints.ttl_seconds, Some(30 * 60));
+        assert_eq!(hints.supported_ttl_seconds, BTreeSet::from([30 * 60]));
         assert!(hints.key.is_some());
     }
 
@@ -38903,7 +38906,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             true,
-            None,
+            &BTreeSet::new(),
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
@@ -44458,7 +44461,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             true,
-            None,
+            &BTreeSet::new(),
         );
 
         assert!(hints.cache_system_prompt);
@@ -44485,7 +44488,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             true,
-            None,
+            &BTreeSet::new(),
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
@@ -44508,7 +44511,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             session_id,
             true,
-            Some(30 * 60),
+            &BTreeSet::from([30 * 60]),
         );
         let first_points = first_round
             .iter()
@@ -44534,7 +44537,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             session_id,
             true,
-            Some(30 * 60),
+            &BTreeSet::from([30 * 60]),
         );
         let second_points = second_round
             .iter()
@@ -44599,7 +44602,7 @@ library = "test"
                 bcode_model::PromptCacheMode::Auto,
                 session_id,
                 true,
-                Some(30 * 60),
+                &BTreeSet::from([30 * 60]),
             );
             assert_eq!(
                 hints.key.as_deref(),
@@ -44654,7 +44657,7 @@ library = "test"
             bcode_model::PromptCacheMode::Auto,
             SessionId::new(),
             false,
-            None,
+            &BTreeSet::new(),
         );
 
         assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
@@ -44677,7 +44680,7 @@ library = "test"
             bcode_model::PromptCacheMode::Aggressive,
             SessionId::new(),
             true,
-            None,
+            &BTreeSet::new(),
         );
 
         assert!(hints.cache_system_prompt);

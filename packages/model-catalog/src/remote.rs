@@ -332,8 +332,20 @@ fn overlay_provider(local: &mut ProviderCatalog, remote: &ProviderCatalog) {
     }
 
     for (model_id, remote_entry) in &remote.models {
-        if let Some(local_entry) = local.models.get_mut(model_id) {
-            overlay_entry(local_entry, remote_entry);
+        let matching_key = matching_local_model_key(local, model_id);
+        if let Some(matching_key) = matching_key {
+            let local_entry = local
+                .models
+                .get_mut(&matching_key)
+                .expect("matching model key came from this provider");
+            if matching_key == *model_id {
+                overlay_entry(local_entry, remote_entry);
+            } else {
+                // A remote deployment/profile id may match an embedded canonical model alias.
+                // Preserve the canonical model's newer semantic metadata instead of allowing a
+                // broad or stale deployment record to shadow it as a separate exact entry.
+                local_entry.aliases.insert(model_id.clone());
+            }
         } else {
             let mut entry = remote_entry.clone();
             mark_remote_only(&mut entry);
@@ -342,11 +354,48 @@ fn overlay_provider(local: &mut ProviderCatalog, remote: &ProviderCatalog) {
     }
 }
 
+pub fn matching_local_model_key(local: &ProviderCatalog, model_id: &str) -> Option<String> {
+    if local.models.contains_key(model_id) {
+        return Some(model_id.to_string());
+    }
+    local
+        .models
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .aliases
+                .iter()
+                .filter_map(|alias| alias_match_specificity(alias, model_id))
+                .max()
+                .map(|specificity| (specificity, key))
+        })
+        .max_by_key(|(specificity, _key)| *specificity)
+        .map(|(_specificity, key)| key.clone())
+}
+
+fn alias_match_specificity(alias: &str, model_id: &str) -> Option<usize> {
+    if alias == model_id {
+        return Some(usize::MAX);
+    }
+    if let Some(needle) = alias
+        .strip_prefix('*')
+        .and_then(|value| value.strip_suffix('*'))
+    {
+        return model_id.contains(needle).then_some(needle.len());
+    }
+    alias
+        .strip_suffix('*')
+        .filter(|prefix| model_id.starts_with(prefix))
+        .map(str::len)
+}
+
 fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
     let local_supported_by = local.supported_by.clone();
     let local_deployments = local.deployments.clone();
+    let local_aliases = local.aliases.clone();
     local.display_name.clone_from(&remote.display_name);
     local.aliases.clone_from(&remote.aliases);
+    local.aliases.extend(local_aliases);
     local.status = remote.status;
     local.bcode_support = remote.bcode_support;
     local.context_window = remote.context_window.or(local.context_window);
@@ -373,9 +422,9 @@ fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
     if remote.pricing.is_some() {
         local.pricing.clone_from(&remote.pricing);
     }
-    local.capabilities = remote.capabilities.clone();
-    if remote.reasoning.is_some() {
-        local.reasoning.clone_from(&remote.reasoning);
+    local.capabilities = crate::merge_capabilities(&local.capabilities, &remote.capabilities);
+    if let Some(remote_reasoning) = &remote.reasoning {
+        local.reasoning = Some(merge_reasoning(local.reasoning.as_ref(), remote_reasoning));
     }
     local.supported_by.clone_from(&remote.supported_by);
     local.supported_by.extend(local_supported_by);
@@ -394,10 +443,14 @@ fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
             }
             if deployment.capabilities != bcode_model_catalog_models::CatalogCapabilities::default()
             {
-                existing.capabilities.clone_from(&deployment.capabilities);
+                existing.capabilities =
+                    crate::merge_capabilities(&existing.capabilities, &deployment.capabilities);
             }
-            if deployment.reasoning.is_some() {
-                existing.reasoning.clone_from(&deployment.reasoning);
+            if let Some(remote_reasoning) = &deployment.reasoning {
+                existing.reasoning = Some(merge_reasoning(
+                    existing.reasoning.as_ref(),
+                    remote_reasoning,
+                ));
             }
             if deployment.pricing.is_some() {
                 existing.pricing.clone_from(&deployment.pricing);
@@ -409,6 +462,36 @@ fn overlay_entry(local: &mut ModelCatalogEntry, remote: &ModelCatalogEntry) {
     local.live = Some(remote_live_metadata(
         remote.live.clone().unwrap_or_default(),
     ));
+}
+
+fn merge_reasoning(
+    local: Option<&bcode_model_catalog_models::CatalogReasoning>,
+    remote: &bcode_model_catalog_models::CatalogReasoning,
+) -> bcode_model_catalog_models::CatalogReasoning {
+    let Some(local) = local else {
+        return remote.clone();
+    };
+    bcode_model_catalog_models::CatalogReasoning {
+        effort_values: local
+            .effort_values
+            .union(&remote.effort_values)
+            .cloned()
+            .collect(),
+        default_effort: remote
+            .default_effort
+            .clone()
+            .or_else(|| local.default_effort.clone()),
+        summary_values: local
+            .summary_values
+            .union(&remote.summary_values)
+            .cloned()
+            .collect(),
+        default_summary: remote
+            .default_summary
+            .clone()
+            .or_else(|| local.default_summary.clone()),
+        raw_reasoning_supported: local.raw_reasoning_supported || remote.raw_reasoning_supported,
+    }
 }
 
 fn mark_remote_only(entry: &mut ModelCatalogEntry) {

@@ -2635,6 +2635,9 @@ pub struct PromptCacheHints {
     /// Requested minimum cache lifetime in seconds.
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+    /// Model-supported explicit cache lifetimes resolved by the host.
+    #[serde(default)]
+    pub supported_ttl_seconds: BTreeSet<u64>,
     /// Whether the stable system prompt prefix should end with a provider cache point.
     #[serde(default)]
     pub cache_system_prompt: bool,

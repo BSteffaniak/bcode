@@ -794,25 +794,32 @@ fn find_provider_model<'a>(
             .models
             .values()
             .filter_map(|entry| {
-                if entry.aliases.contains(model_id) {
-                    return Some((usize::MAX, entry));
-                }
-                entry.aliases.iter().find_map(|alias| {
-                    if let Some(needle) = alias
-                        .strip_prefix('*')
-                        .and_then(|value| value.strip_suffix('*'))
-                    {
-                        return model_id.contains(needle).then_some((needle.len(), entry));
-                    }
-                    alias
-                        .strip_suffix('*')
-                        .filter(|prefix| model_id.starts_with(prefix))
-                        .map(|prefix| (prefix.len(), entry))
-                })
+                entry
+                    .aliases
+                    .iter()
+                    .filter_map(|alias| alias_match_specificity(alias, model_id))
+                    .max()
+                    .map(|specificity| (specificity, entry))
             })
-            .max_by_key(|(prefix_len, _entry)| *prefix_len)
-            .map(|(_prefix_len, entry)| entry)
+            .max_by_key(|(specificity, _entry)| *specificity)
+            .map(|(_specificity, entry)| entry)
     })
+}
+
+fn alias_match_specificity(alias: &str, model_id: &str) -> Option<usize> {
+    if alias == model_id {
+        return Some(usize::MAX);
+    }
+    if let Some(needle) = alias
+        .strip_prefix('*')
+        .and_then(|value| value.strip_suffix('*'))
+    {
+        return model_id.contains(needle).then_some(needle.len());
+    }
+    alias
+        .strip_suffix('*')
+        .filter(|prefix| model_id.starts_with(prefix))
+        .map(str::len)
 }
 
 fn matching_deployment<'a>(
@@ -907,10 +914,10 @@ fn enrich_from_entry_for_target(
             },
         );
     }
-    model
-        .cache
-        .capabilities
-        .extend(cache_info_from_catalog(&entry.capabilities).capabilities);
+    merge_model_cache(&mut model.cache, &entry.capabilities);
+    if let Some(deployment) = deployment {
+        merge_model_cache(&mut model.cache, &deployment.capabilities);
+    }
     if model.pricing.is_none() {
         model.pricing = pricing_from_catalog(
             deployment
@@ -919,14 +926,13 @@ fn enrich_from_entry_for_target(
             remote,
         );
     }
-    if model.reasoning.is_none() {
-        model.reasoning = reasoning_from_catalog_parts(
-            deployment
-                .and_then(|deployment| deployment.reasoning.as_ref())
-                .or(entry.reasoning.as_ref()),
-            entry.thinking_mode,
-        );
-    }
+    let catalog_reasoning = reasoning_from_catalog_parts(
+        deployment
+            .and_then(|deployment| deployment.reasoning.as_ref())
+            .or(entry.reasoning.as_ref()),
+        entry.thinking_mode,
+    );
+    model.reasoning = merge_model_reasoning(model.reasoning.take(), catalog_reasoning);
     if entry.status == CatalogModelStatus::Deprecated {
         model.visibility = bcode_model::ModelVisibility::Unsupported {
             reason: "model is deprecated in catalog".to_string(),
@@ -1000,20 +1006,14 @@ fn enrich_from_entry(mut model: ModelInfo, entry: &ModelCatalogEntry) -> ModelIn
             CapabilitySource::BundledCatalog
         },
     );
-    model
-        .cache
-        .capabilities
-        .extend(cache_info_from_catalog(&entry.capabilities).capabilities);
+    merge_model_cache(&mut model.cache, &entry.capabilities);
     if model.pricing.is_none()
         && let Some(pricing) = pricing_from_catalog(entry.pricing.as_ref(), remote)
     {
         model.pricing = Some(pricing);
     }
-    if model.reasoning.is_none()
-        && let Some(reasoning) = reasoning_from_catalog(entry)
-    {
-        model.reasoning = Some(reasoning);
-    }
+    let catalog_reasoning = reasoning_from_catalog(entry);
+    model.reasoning = merge_model_reasoning(model.reasoning.take(), catalog_reasoning);
     if entry.status == CatalogModelStatus::Deprecated {
         model.visibility = bcode_model::ModelVisibility::Unsupported {
             reason: "model is deprecated in catalog".to_string(),
@@ -1256,6 +1256,12 @@ fn capabilities_from_catalog(
     result
 }
 
+fn merge_model_cache(cache: &mut ModelCacheInfo, capabilities: &CatalogCapabilities) {
+    let catalog = cache_info_from_catalog(capabilities);
+    cache.capabilities.extend(catalog.capabilities);
+    cache.ttl_seconds.extend(catalog.ttl_seconds);
+}
+
 fn cache_info_from_catalog(capabilities: &CatalogCapabilities) -> ModelCacheInfo {
     let mut cache = ModelCacheInfo {
         ttl_seconds: capabilities.prompt_cache_ttl_seconds.clone(),
@@ -1398,6 +1404,30 @@ fn flat_catalog_pricing_rules(pricing: &CatalogPricing) -> Vec<bcode_model::Mode
         })
     })
     .collect()
+}
+
+fn merge_model_reasoning(
+    discovered: Option<ModelReasoningInfo>,
+    catalog: Option<ModelReasoningInfo>,
+) -> Option<ModelReasoningInfo> {
+    match (discovered, catalog) {
+        (None, None) => None,
+        (Some(reasoning), None) | (None, Some(reasoning)) => Some(reasoning),
+        (Some(mut discovered), Some(catalog)) => {
+            discovered.control = catalog.control.or(discovered.control);
+            discovered.effort_values.extend(catalog.effort_values);
+            discovered.effort_values =
+                bcode_model::ordered_reasoning_effort_values(&discovered.effort_values);
+            discovered.default_effort = catalog.default_effort.or(discovered.default_effort);
+            discovered.visible_summary_supported |= catalog.visible_summary_supported;
+            discovered.summary_values.extend(catalog.summary_values);
+            discovered.summary_values.sort();
+            discovered.summary_values.dedup();
+            discovered.default_summary = catalog.default_summary.or(discovered.default_summary);
+            discovered.raw_reasoning_supported |= catalog.raw_reasoning_supported;
+            Some(discovered)
+        }
+    }
 }
 
 fn reasoning_from_catalog(entry: &ModelCatalogEntry) -> Option<ModelReasoningInfo> {
@@ -1694,10 +1724,24 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
 
         for live_model in snapshot.models.values() {
             let live_target = live_model.target.as_ref().or(snapshot.target.as_ref());
+            let matching_key = remote::matching_local_model_key(provider, &live_model.model_id)
+                .unwrap_or_else(|| live_model.model_id.clone());
+            let is_alias_match = matching_key != live_model.model_id;
             let entry = provider
                 .models
-                .entry(live_model.model_id.clone())
+                .entry(matching_key)
                 .or_insert_with(|| live_model_entry(live_model, snapshot));
+            if is_alias_match {
+                // Live deployment facts must not replace canonical semantic capabilities.
+                entry.aliases.insert(live_model.model_id.clone());
+                entry.live = Some(LiveModelMetadata {
+                    status: live_model.status.clone(),
+                    regions: live_model.regions.clone(),
+                    last_seen_at: Some(snapshot.generated_at.clone()),
+                    source: Some("provider_live".to_string()),
+                });
+                continue;
+            }
             if entry.display_name.trim().is_empty()
                 && let Some(display_name) = &live_model.display_name
             {
@@ -2641,6 +2685,58 @@ mod tests {
     }
 
     #[test]
+    fn remote_profile_id_uses_most_specific_embedded_model_alias() {
+        let mut local = load_embedded_catalog().expect("embedded catalog should load");
+        let mut remote = local.clone();
+        remote
+            .providers
+            .retain(|provider_id, _| provider_id == "bedrock");
+        let mut stale_entry = local.providers["bedrock"].models["anthropic.claude-fable-5"].clone();
+        stale_entry.model_id = "global.anthropic.claude-fable-5-1".to_string();
+        stale_entry.display_name = "stale broad Fable metadata".to_string();
+        let remote_provider = remote
+            .providers
+            .get_mut("bedrock")
+            .expect("remote Bedrock catalog");
+        remote_provider.models.clear();
+        remote_provider.models.insert(
+            "global.anthropic.claude-fable-5-1".to_string(),
+            stale_entry.clone(),
+        );
+        let mut stale_canonical = stale_entry;
+        stale_canonical.model_id = "anthropic.claude-fable-5-1".to_string();
+        stale_canonical.aliases.clear();
+        stale_canonical.capabilities = CatalogCapabilities::default();
+        stale_canonical.reasoning = None;
+        remote_provider
+            .models
+            .insert("anthropic.claude-fable-5-1".to_string(), stale_canonical);
+
+        overlay_remote_catalog(&mut local, &remote);
+        let provider = &local.providers["bedrock"];
+        assert!(
+            !provider
+                .models
+                .contains_key("global.anthropic.claude-fable-5-1")
+        );
+        let catalog = ModelCatalog::new(local);
+        let resolved = catalog
+            .model("bedrock", "global.anthropic.claude-fable-5-1")
+            .expect("profile id should resolve");
+        assert_eq!(resolved.model_id, "anthropic.claude-fable-5-1");
+        assert_eq!(
+            resolved.capabilities.prompt_cache_ttl_seconds,
+            BTreeSet::from([300, 3_600])
+        );
+        assert!(
+            resolved
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.effort_values.contains("max"))
+        );
+    }
+
+    #[test]
     fn gpt_5_6_sol_resolves_operational_limits_for_chatgpt_codex() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let target = ModelSupportTarget::new(
@@ -2906,7 +3002,19 @@ status = "stable"
             "us.anthropic.claude-fable-5-1",
             "global.anthropic.claude-fable-5-1",
         ] {
-            let enriched = catalog.enrich_model("bedrock", discovered_model(model_id));
+            let mut discovered = discovered_model(model_id);
+            discovered.reasoning = Some(bcode_model::ModelReasoningInfo {
+                control: Some(bcode_model::ReasoningControl::Adaptive),
+                effort_values: vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                ],
+                source: bcode_model::ModelReasoningCapabilitySource::KnownModelTable,
+                ..Default::default()
+            });
+            let enriched = catalog.enrich_model("bedrock", discovered);
             assert_eq!(enriched.context_window, Some(1_000_000));
             assert_eq!(enriched.max_output_tokens, Some(128_000));
             assert_eq!(
@@ -2916,6 +3024,7 @@ status = "stable"
             let reasoning = enriched.reasoning.expect("reasoning metadata");
             assert!(reasoning.effort_values.iter().any(|value| value == "max"));
             assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+            assert_eq!(enriched.cache.ttl_seconds, BTreeSet::from([300, 3_600]));
             assert!(matches!(
                 enriched
                     .feature_support
