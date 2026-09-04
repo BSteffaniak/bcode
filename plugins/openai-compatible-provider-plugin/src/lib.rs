@@ -7358,8 +7358,24 @@ fn context_has_chatgpt_auth(context: &ProviderRequestContext) -> bool {
             .is_some_and(|mode| mode == "chatgpt")
 }
 
-#[allow(clippy::too_many_lines)]
 fn openai_auth_settings(
+    saved: &SavedOpenAiAuth,
+    context: &ProviderRequestContext,
+) -> (AuthSettings, AuthDiagnostics) {
+    let (auth, mut diagnostics) = openai_auth_settings_unannotated(saved, context);
+    if matches!(auth, AuthSettings::ApiKey(_)) && saved_openai_auth_is_chatgpt(saved) {
+        // Runtime API-key material wins by precedence, but silently dropping a saved ChatGPT/Codex
+        // login also flips the dialect to chat_completions. Make the shadowing visible in the
+        // auth trace so a resulting request rejection is traceable to its cause.
+        diagnostics.detail.push_str(
+            "; saved ChatGPT/Codex subscription auth is shadowed by this API-key credential",
+        );
+    }
+    (auth, diagnostics)
+}
+
+#[allow(clippy::too_many_lines)]
+fn openai_auth_settings_unannotated(
     saved: &SavedOpenAiAuth,
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {

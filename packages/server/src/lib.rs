@@ -19760,8 +19760,30 @@ async fn session_model_selection_with_runtime_context(
     {
         return model_selection_from_runtime_context(state, context);
     }
-    overlay_transient_provider_context(&mut selection.provider_context, context.provider_context);
+    // The client's transient auth is resolved from the client's own default model profile. It is
+    // only meaningful for the provider that profile targets; stamping it onto a sticky selection
+    // for a different provider would shadow that provider's saved credentials with foreign ones.
+    if runtime_context_targets_selection(&context, &selection) {
+        overlay_transient_provider_context(
+            &mut selection.provider_context,
+            context.provider_context,
+        );
+    }
     selection
+}
+
+/// Whether a client's runtime context is scoped to the same provider as a selection.
+///
+/// Transient auth is provider-scoped, so a differing model on the same provider still applies. A
+/// context that names no provider is treated as applicable to any selection.
+fn runtime_context_targets_selection(
+    context: &ClientRuntimeContext,
+    selection: &SessionModelSelection,
+) -> bool {
+    context
+        .selected_provider_plugin_id
+        .as_ref()
+        .is_none_or(|provider| Some(provider) == selection.provider_plugin_id.as_ref())
 }
 
 async fn workflow_runtime_context(
@@ -54193,6 +54215,139 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .and_then(|auth| auth.credentials.get("bearer_token"))
                 .map(|credential| credential.value.as_str()),
             Some("secret-token")
+        );
+        assert_eq!(
+            selection
+                .provider_context
+                .env
+                .get("AWS_BEARER_TOKEN_BEDROCK")
+                .map(String::as_str),
+            Some("secret-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn client_runtime_auth_for_another_provider_does_not_overlay_sticky_selection() {
+        // Regression: a client whose default profile targets provider A must not stamp A's API
+        // key material onto a sticky session for provider B. Doing so shadowed B's saved
+        // credentials (e.g. ChatGPT/Codex vault auth) and flipped the request dialect.
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("sticky foreign provider auth".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        let sticky_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([("dialect".to_owned(), "chatgpt_codex".to_owned())]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.openai-compatible".to_owned()),
+                model_id: Some("gpt-5.6".to_owned()),
+                provider_context: sticky_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .insert(session_id, SessionModelSelectionOrigin::User);
+
+        let selection = session_model_selection_with_runtime_context(
+            &state,
+            session_id,
+            Some(ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                selected_model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    auth_profile: Some("bedrock".to_owned()),
+                    auth: Some(bcode_model::ProviderAuthContext {
+                        credentials: BTreeMap::from([(
+                            "api_key".to_owned(),
+                            bcode_model::ProviderAuthCredential {
+                                value: "foreign-key".to_owned(),
+                                source: Some("OPENAI_API_KEY".to_owned()),
+                            },
+                        )]),
+                        ..bcode_model::ProviderAuthContext::default()
+                    }),
+                    env: BTreeMap::from([("OPENAI_API_KEY".to_owned(), "foreign-key".to_owned())]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..ClientRuntimeContext::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            selection.provider_plugin_id.as_deref(),
+            Some("bcode.openai-compatible")
+        );
+        assert_eq!(selection.model_id.as_deref(), Some("gpt-5.6"));
+        assert_eq!(
+            selection.provider_context, sticky_context,
+            "foreign-provider client auth must not be overlaid onto a sticky selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_runtime_auth_for_same_provider_overlays_sticky_model_mismatch() {
+        // Transient auth is provider-scoped: a client defaulting to a different model on the same
+        // provider still supplies usable credentials for the sticky model.
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("sticky same provider auth".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                model_id: Some("us.openai.gpt-5.6-sol".to_owned()),
+                ..SessionModelSelection::default()
+            },
+        );
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .insert(session_id, SessionModelSelectionOrigin::User);
+
+        let selection = session_model_selection_with_runtime_context(
+            &state,
+            session_id,
+            Some(ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                selected_model_id: Some("global.anthropic.claude-fable-5-1".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    auth_profile: Some("bedrock".to_owned()),
+                    env: BTreeMap::from([(
+                        "AWS_BEARER_TOKEN_BEDROCK".to_owned(),
+                        "secret-token".to_owned(),
+                    )]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..ClientRuntimeContext::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(selection.model_id.as_deref(), Some("us.openai.gpt-5.6-sol"));
+        assert_eq!(
+            selection.provider_context.auth_profile.as_deref(),
+            Some("bedrock")
         );
         assert_eq!(
             selection
