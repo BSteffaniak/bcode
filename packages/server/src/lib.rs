@@ -20163,7 +20163,7 @@ async fn session_model_selection_with_runtime_context(
     // The client's transient auth is resolved from the client's own default model profile. It is
     // only meaningful for the provider that profile targets; stamping it onto a sticky selection
     // for a different provider would shadow that provider's saved credentials with foreign ones.
-    if runtime_context_targets_selection(&context, &selection) {
+    if runtime_context_targets_selection(state, &context, &selection) {
         overlay_transient_provider_context(
             &mut selection.provider_context,
             context.provider_context,
@@ -20172,18 +20172,26 @@ async fn session_model_selection_with_runtime_context(
     selection
 }
 
-/// Whether a client's runtime context is scoped to the same provider as a selection.
+/// Whether a client's runtime context is scoped to the same provider a selection will execute on.
 ///
 /// Transient auth is provider-scoped, so a differing model on the same provider still applies. A
-/// context that names no provider is treated as applicable to any selection.
+/// selection without an explicit provider executes on the daemon's unique provider route, so that
+/// route is the comparison target. When neither side names a provider the overlay is kept, which
+/// preserves the prior behavior for contexts that cannot be disambiguated.
 fn runtime_context_targets_selection(
+    state: &ServerState,
     context: &ClientRuntimeContext,
     selection: &SessionModelSelection,
 ) -> bool {
-    context
-        .selected_provider_plugin_id
-        .as_ref()
-        .is_none_or(|provider| Some(provider) == selection.provider_plugin_id.as_ref())
+    let Some(context_provider) = context.selected_provider_plugin_id.as_deref() else {
+        return true;
+    };
+    let effective_provider = selection.provider_plugin_id.clone().or_else(|| {
+        unique_model_provider_route(state)
+            .ok()
+            .map(|(plugin_id, _)| plugin_id)
+    });
+    effective_provider.is_none_or(|provider| provider == context_provider)
 }
 
 async fn workflow_runtime_context(
@@ -54694,6 +54702,68 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             selection.provider_context, sticky_context,
             "foreign-provider client auth must not be overlaid onto a sticky selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_runtime_auth_for_another_provider_does_not_overlay_auto_provider_selection() {
+        // `/model <id>` submits `<auto>` for the provider, which persists as `None`. The selection
+        // then executes on the daemon's unique provider route, so that route is what a foreign
+        // client context must be compared against rather than treating `None` as a wildcard.
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("sticky auto provider auth".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state_with_fake_provider(sessions);
+        assert_eq!(
+            unique_model_provider_route(&state)
+                .map(|(plugin_id, _)| plugin_id)
+                .as_deref(),
+            Ok("bcode.fake-provider")
+        );
+        let sticky_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([("dialect".to_owned(), "chatgpt_codex".to_owned())]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: None,
+                model_id: Some("fake-echo".to_owned()),
+                provider_context: sticky_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        state
+            .session_model_selection_origins
+            .lock()
+            .await
+            .insert(session_id, SessionModelSelectionOrigin::User);
+
+        let selection = session_model_selection_with_runtime_context(
+            &state,
+            session_id,
+            Some(ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.bedrock".to_owned()),
+                provider_context: bcode_model::ProviderRequestContext {
+                    auth_profile: Some("bedrock".to_owned()),
+                    env: BTreeMap::from([("OPENAI_API_KEY".to_owned(), "foreign-key".to_owned())]),
+                    ..bcode_model::ProviderRequestContext::default()
+                },
+                ..ClientRuntimeContext::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(selection.provider_plugin_id, None);
+        assert_eq!(
+            selection.provider_context, sticky_context,
+            "foreign-provider client auth must not be overlaid onto an auto-provider selection"
         );
     }
 
