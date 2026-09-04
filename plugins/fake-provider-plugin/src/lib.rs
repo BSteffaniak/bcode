@@ -325,11 +325,23 @@ impl FakeProviderPlugin {
             .is_some_and(|value| value == "true");
         let structured_output_execution =
             configured_structured_output_execution(&request.provider_context.settings);
-        json_response(&models(
+        let mut list = models(
             has_context_window,
             subset_reasoning,
             structured_output_execution,
-        ))
+        );
+        // The fake provider is catalog-unmapped, so it must honor the selected model itself:
+        // the host takes the listing's default as the request target.
+        if let Some(selected) = request
+            .selected_model_id
+            .as_deref()
+            .filter(|selected| list.models.iter().any(|model| model.model_id == *selected))
+        {
+            for model in &mut list.models {
+                model.is_default = model.model_id == selected;
+            }
+        }
+        json_response(&list)
     }
 
     fn compact_context(request: &ServiceRequest) -> ServiceResponse {

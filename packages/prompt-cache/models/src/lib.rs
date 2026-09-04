@@ -195,6 +195,56 @@ impl CacheRoundObservation {
         self
     }
 
+    /// Build an observation from a persisted session usage record.
+    ///
+    /// Session usage is converted to the normalized [`TokenUsage`] shape first so the same
+    /// accounting rules apply to live and historical observations. Persisted usage carries no
+    /// request projection, so point accounting fields stay `None`.
+    #[must_use]
+    pub fn from_session_usage(
+        round: usize,
+        usage: &bcode_session_models::SessionTokenUsage,
+    ) -> Self {
+        let details = usage
+            .pricing_usage_details
+            .iter()
+            .filter_map(|detail| {
+                Some(bcode_model::ModelTokenUsageDetail {
+                    bucket: match detail.bucket.as_str() {
+                        "input" => ModelPricingBucket::Input,
+                        "cache_read_input" => ModelPricingBucket::CacheReadInput,
+                        "cache_write_input" => ModelPricingBucket::CacheWriteInput,
+                        "output" => ModelPricingBucket::Output,
+                        _ => return None,
+                    },
+                    modality: match detail.modality.as_str() {
+                        "image" => bcode_model::ModelTokenModality::Image,
+                        "audio" => bcode_model::ModelTokenModality::Audio,
+                        "video" => bcode_model::ModelTokenModality::Video,
+                        _ => bcode_model::ModelTokenModality::Text,
+                    },
+                    tokens: detail.tokens,
+                    cache_ttl_seconds: detail.cache_ttl_seconds,
+                })
+            })
+            .collect::<Vec<_>>();
+        let normalized = TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
+            details: details.into_boxed_slice(),
+            pricing_context: Box::new(bcode_model::ModelPricingContext {
+                request_input_tokens: usage.pricing_context.request_input_tokens,
+                cache_ttl_seconds: usage.pricing_context.cache_ttl_seconds,
+                ..bcode_model::ModelPricingContext::default()
+            }),
+            reasoning_tokens: usage.reasoning_tokens,
+        };
+        Self::from_provider_usage(round, &normalized, None)
+    }
+
     /// Whether the provider reported any cached input for this round.
     #[must_use]
     pub fn has_cache_read(&self) -> bool {

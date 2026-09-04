@@ -47,6 +47,75 @@ pub struct EvalSuite {
     /// Case definitions.
     #[serde(default)]
     pub cases: Vec<EvalCase>,
+    /// Cross-variant measurement comparisons evaluated within one run.
+    #[serde(default)]
+    pub comparisons: Vec<EvalComparisonCriterion>,
+}
+
+/// Follow-up turn configuration for agent variants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalFollowUpConfig {
+    /// Prompt sent on the same session after the main turn completes.
+    pub prompt: String,
+    /// Stop and restart the isolated daemon before sending the follow-up.
+    ///
+    /// Exercises session resume: the follow-up must reconnect through normal application
+    /// boundaries and continue the same canonical session.
+    #[serde(default)]
+    pub restart_daemon: bool,
+}
+
+/// One cross-variant measurement comparison evaluated within a run.
+///
+/// The `variant` measurement is divided by the `baseline_variant` measurement (both averaged
+/// across repetitions and cases). Exactly one of `max_ratio` or `min_ratio` must be set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalComparisonCriterion {
+    /// Stable criterion id used in diagnostics.
+    pub id: String,
+    /// Measurement key compared between variants.
+    pub metric: String,
+    /// Variant whose measurement is the numerator.
+    pub variant: String,
+    /// Variant whose measurement is the denominator.
+    pub baseline_variant: String,
+    /// Inclusive maximum allowed `variant / baseline_variant` ratio.
+    #[serde(default)]
+    pub max_ratio: Option<f64>,
+    /// Inclusive minimum allowed `variant / baseline_variant` ratio.
+    #[serde(default)]
+    pub min_ratio: Option<f64>,
+    /// Whether a failed comparison fails the run.
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+/// Outcome of one cross-variant comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalComparisonResult {
+    /// Criterion id.
+    pub id: String,
+    /// Measurement key compared.
+    pub metric: String,
+    /// Numerator variant.
+    pub variant: String,
+    /// Denominator variant.
+    pub baseline_variant: String,
+    /// Numerator measurement, when present.
+    #[serde(default)]
+    pub variant_value: Option<f64>,
+    /// Denominator measurement, when present.
+    #[serde(default)]
+    pub baseline_value: Option<f64>,
+    /// Observed ratio, when both values were present and the baseline was non-zero.
+    #[serde(default)]
+    pub ratio: Option<f64>,
+    /// Whether the criterion held.
+    pub passed: bool,
+    /// Whether this criterion was required.
+    pub required: bool,
+    /// Human-readable explanation.
+    pub detail: String,
 }
 
 /// Run defaults for a suite or invocation.
@@ -242,6 +311,15 @@ pub struct EvalVariant {
     /// Additional environment variables for execution.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// TOML configuration overlay applied to the isolated daemon for agent variants.
+    ///
+    /// The overlay is delivered through the process environment only; it never creates or
+    /// modifies declarative configuration files. Requires isolated daemon mode.
+    #[serde(default)]
+    pub config_toml: Option<String>,
+    /// Optional follow-up turn sent on the same session after the main turn completes.
+    #[serde(default)]
+    pub follow_up: Option<EvalFollowUpConfig>,
     /// Prompt overlays used by agent-like command templates.
     #[serde(default)]
     pub prompt_overlay: EvalPromptOverlay,
@@ -381,6 +459,12 @@ pub enum EvalJudgeConfig {
         /// Whether this judge is required for correctness.
         #[serde(default = "default_true")]
         required: bool,
+        /// Variants this judge applies to. Empty means every variant.
+        ///
+        /// Judges for variants not listed here are recorded as passed-and-skipped so a
+        /// variant-specific expectation (for example cache reuse) does not fail its control.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        variants: Vec<String>,
     },
 }
 
@@ -568,7 +652,10 @@ pub struct EvalRunResult {
     pub manifest: EvalRunManifest,
     /// Variant results.
     pub variants: Vec<EvalVariantRunResult>,
-    /// Whether all variants passed all required checks.
+    /// Cross-variant comparison outcomes declared by the suite.
+    #[serde(default)]
+    pub comparisons: Vec<EvalComparisonResult>,
+    /// Whether all variants passed all required checks, including required comparisons.
     pub passed: bool,
 }
 

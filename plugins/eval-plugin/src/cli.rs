@@ -41,7 +41,12 @@ pub fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = EvalCli::from_arg_matches(&matches).map_err(|e| e.to_string())?;
-        run(cli.command).map_err(|e| e.to_string())
+        // Eval execution is synchronous and drives its own current-thread runtimes for agent
+        // and direct-tool variants, so it must not run on the host CLI's async runtime thread.
+        tokio::task::spawn_blocking(move || run(cli.command))
+            .await
+            .map_err(|error| format!("eval command task failed: {error}"))?
+            .map_err(|e| e.to_string())
     })
 }
 fn surface_outcome(kind: &str, run: Option<PathBuf>) -> StaticCliOutcome {

@@ -42,14 +42,14 @@ pub struct LoadSdkEvalRunResponse {
 
 use bcode_eval_models::{
     CURRENT_IMPROVEMENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION, EvalArtifactRef, EvalBaseline,
-    EvalCase, EvalCaseRunResult, EvalComparisonReport, EvalComparisonVariant, EvalDiagnostic,
-    EvalDiagnosticSeverity, EvalExecutorKind, EvalImprovementCampaign, EvalImprovementDelta,
-    EvalImprovementDeltaKind, EvalImprovementGeneration, EvalImprovementMetricDelta,
-    EvalImprovementMetricDeltaSet, EvalImprovementObjective, EvalImprovementRisk,
-    EvalImprovementVerdict, EvalImprovementVerdictStatus, EvalIsolation, EvalJudgeConfig,
-    EvalJudgeResult, EvalMeasurementSet, EvalMetricDirection, EvalObservation, EvalRegexTarget,
-    EvalRegressionReport, EvalRepetitionResult, EvalRunManifest, EvalRunResult, EvalSuite,
-    EvalVariant, EvalVariantRunResult,
+    EvalCase, EvalCaseRunResult, EvalComparisonReport, EvalComparisonResult, EvalComparisonVariant,
+    EvalDiagnostic, EvalDiagnosticSeverity, EvalExecutorKind, EvalImprovementCampaign,
+    EvalImprovementDelta, EvalImprovementDeltaKind, EvalImprovementGeneration,
+    EvalImprovementMetricDelta, EvalImprovementMetricDeltaSet, EvalImprovementObjective,
+    EvalImprovementRisk, EvalImprovementVerdict, EvalImprovementVerdictStatus, EvalIsolation,
+    EvalJudgeConfig, EvalJudgeResult, EvalMeasurementSet, EvalMetricDirection, EvalObservation,
+    EvalRegexTarget, EvalRegressionReport, EvalRepetitionResult, EvalRunManifest, EvalRunResult,
+    EvalSuite, EvalVariant, EvalVariantRunResult,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use regex::Regex;
@@ -181,6 +181,84 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
                 variant.id
             )));
         }
+        if let Some(config_toml) = &variant.config_toml {
+            if variant.executor != EvalExecutorKind::Agent {
+                return Err(EvalError::Validation(format!(
+                    "variant {} sets config_toml but only agent variants accept a config overlay",
+                    variant.id
+                )));
+            }
+            if agent_daemon_isolation_mode(variant) == "shared" {
+                return Err(EvalError::Validation(format!(
+                    "variant {} sets config_toml with daemon_isolation = \"shared\"; a config \
+                     overlay can only be applied to an isolated daemon",
+                    variant.id
+                )));
+            }
+            toml::from_str::<toml::Value>(config_toml).map_err(|error| {
+                EvalError::Validation(format!(
+                    "variant {} config_toml is not valid TOML: {error}",
+                    variant.id
+                ))
+            })?;
+        }
+        if let Some(follow_up) = &variant.follow_up {
+            if variant.executor != EvalExecutorKind::Agent {
+                return Err(EvalError::Validation(format!(
+                    "variant {} sets follow_up but only agent variants send follow-up turns",
+                    variant.id
+                )));
+            }
+            if follow_up.prompt.trim().is_empty() {
+                return Err(EvalError::Validation(format!(
+                    "variant {} follow_up.prompt must not be empty",
+                    variant.id
+                )));
+            }
+            if follow_up.restart_daemon && agent_daemon_isolation_mode(variant) == "shared" {
+                return Err(EvalError::Validation(format!(
+                    "variant {} sets follow_up.restart_daemon with daemon_isolation = \"shared\"; \
+                     only an isolated daemon may be restarted by an eval",
+                    variant.id
+                )));
+            }
+        }
+    }
+    let mut comparison_ids = std::collections::BTreeSet::new();
+    for comparison in &suite.comparisons {
+        validate_id("comparison", &comparison.id)?;
+        if !comparison_ids.insert(&comparison.id) {
+            return Err(EvalError::Validation(format!(
+                "duplicate comparison id {}",
+                comparison.id
+            )));
+        }
+        for variant in [&comparison.variant, &comparison.baseline_variant] {
+            if !variant_ids.contains(variant) {
+                return Err(EvalError::Validation(format!(
+                    "comparison {} references unknown variant {variant}",
+                    comparison.id
+                )));
+            }
+        }
+        if comparison.variant == comparison.baseline_variant {
+            return Err(EvalError::Validation(format!(
+                "comparison {} compares variant {} with itself",
+                comparison.id, comparison.variant
+            )));
+        }
+        if comparison.max_ratio.is_none() == comparison.min_ratio.is_none() {
+            return Err(EvalError::Validation(format!(
+                "comparison {} must set exactly one of max_ratio or min_ratio",
+                comparison.id
+            )));
+        }
+        if comparison.metric.trim().is_empty() {
+            return Err(EvalError::Validation(format!(
+                "comparison {} metric must not be empty",
+                comparison.id
+            )));
+        }
     }
     let mut case_ids = std::collections::BTreeSet::new();
     for case in &suite.cases {
@@ -196,6 +274,18 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
                 "case {} must define at least one judge",
                 case.id
             )));
+        }
+        for judge in &case.judges {
+            if let EvalJudgeConfig::MetricThreshold { variants, .. } = judge {
+                for variant in variants {
+                    if !variant_ids.contains(variant) {
+                        return Err(EvalError::Validation(format!(
+                            "case {} metric_threshold judge references unknown variant {variant}",
+                            case.id
+                        )));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -263,16 +353,27 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
         }
         variants.push(aggregate_variant(&suite, variant, case_results));
     }
-    let passed = variants.iter().all(|variant| {
+    let variants_passed = variants.iter().all(|variant| {
         variant
             .cases
             .iter()
             .all(|case| case.repetitions.iter().all(|rep| rep.passed))
     });
+    let comparisons = evaluate_comparisons(&suite, &variants);
+    let comparisons_passed = comparisons
+        .iter()
+        .all(|comparison| comparison.passed || !comparison.required);
+    for comparison in &comparisons {
+        progress(format!(
+            "comparison {}: passed={} {}",
+            comparison.id, comparison.passed, comparison.detail
+        ));
+    }
     let result = EvalRunResult {
         manifest,
         variants,
-        passed,
+        comparisons,
+        passed: variants_passed && comparisons_passed,
     };
     write_json(output_dir.join("summary.json"), &result)?;
     fs::write(
@@ -287,6 +388,70 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
         display_from_current_dir(output_dir.join("summary.md"))
     ));
     Ok(result)
+}
+
+/// Evaluate suite-level cross-variant comparisons against aggregated variant measurements.
+#[must_use]
+pub fn evaluate_comparisons(
+    suite: &EvalSuite,
+    variants: &[EvalVariantRunResult],
+) -> Vec<EvalComparisonResult> {
+    suite
+        .comparisons
+        .iter()
+        .map(|criterion| {
+            let lookup = |variant_id: &str| {
+                variants
+                    .iter()
+                    .find(|variant| variant.variant_id == variant_id)
+                    .and_then(|variant| variant.measurements.get(&criterion.metric).copied())
+            };
+            let variant_value = lookup(&criterion.variant);
+            let baseline_value = lookup(&criterion.baseline_variant);
+            let ratio = match (variant_value, baseline_value) {
+                (Some(value), Some(baseline)) if baseline != 0.0 => Some(value / baseline),
+                _ => None,
+            };
+            let (passed, detail) = ratio.map_or_else(
+                || {
+                    (
+                        false,
+                        format!(
+                            "metric {} unavailable for comparison (variant={variant_value:?}, baseline={baseline_value:?})",
+                            criterion.metric
+                        ),
+                    )
+                },
+                |ratio| {
+                    let within_max = criterion.max_ratio.is_none_or(|max| ratio <= max);
+                    let within_min = criterion.min_ratio.is_none_or(|min| ratio >= min);
+                    let bound = criterion.max_ratio.map_or_else(
+                        || format!(">= {:.3}", criterion.min_ratio.unwrap_or_default()),
+                        |max| format!("<= {max:.3}"),
+                    );
+                    (
+                        within_max && within_min,
+                        format!(
+                            "{} / {} {} = {ratio:.3} (expected {bound})",
+                            criterion.variant, criterion.baseline_variant, criterion.metric
+                        ),
+                    )
+                },
+            );
+            EvalComparisonResult {
+                id: criterion.id.clone(),
+                metric: criterion.metric.clone(),
+                variant: criterion.variant.clone(),
+                baseline_variant: criterion.baseline_variant.clone(),
+                variant_value,
+                baseline_value,
+                ratio,
+                passed,
+                required: criterion.required,
+                detail,
+            }
+        })
+        .collect()
 }
 
 fn run_case_variant(
@@ -387,7 +552,15 @@ fn run_repetition(
         case.judges.len()
     ));
     for judge in &case.judges {
-        let judge_result = run_judge(judge, suite_dir, rep_dir, &workspace, &diff, &measurements)?;
+        let judge_result = run_judge(
+            judge,
+            suite_dir,
+            rep_dir,
+            &workspace,
+            &diff,
+            &measurements,
+            &variant.id,
+        )?;
         progress(format!(
             "judge finished: variant={} case={} rep={} kind={} passed={} required={}",
             variant.id,
@@ -619,16 +792,25 @@ fn variant_artifact_dir(rep_dir: &Path) -> &Path {
     rep_dir.parent().and_then(Path::parent).unwrap_or(rep_dir)
 }
 
+fn agent_daemon_isolation_mode(variant: &EvalVariant) -> &str {
+    variant
+        .metadata
+        .get("daemon_isolation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("isolated")
+}
+
 fn prepare_agent_daemon_isolation(
     variant: &EvalVariant,
     rep_dir: &Path,
 ) -> Result<Vec<EnvVarGuard>, EvalError> {
-    let mode = variant
-        .metadata
-        .get("daemon_isolation")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("isolated");
-    if mode == "shared" {
+    if agent_daemon_isolation_mode(variant) == "shared" {
+        if variant.config_toml.is_some() {
+            return Err(EvalError::Validation(format!(
+                "variant {} cannot apply config_toml to a shared daemon",
+                variant.id
+            )));
+        }
         return Ok(Vec::new());
     }
     let variant_dir = variant_artifact_dir(rep_dir);
@@ -649,7 +831,7 @@ fn prepare_agent_daemon_isolation(
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.clone());
     let endpoint_value = bcode_ipc::endpoint_env_value(&endpoint)
         .map_err(|error| EvalError::Validation(error.to_string()))?;
-    Ok(vec![
+    let mut guards = vec![
         EnvVarGuard::set_path("BCODE_STATE_DIR", &state_dir),
         EnvVarGuard::set_path("BCODE_AUTH_SUBSCRIPTIONS", &auth_subscriptions),
         EnvVarGuard::set_path("BCODE_AUTH_VAULT", &auth_vault),
@@ -659,7 +841,24 @@ fn prepare_agent_daemon_isolation(
             bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV,
             bcode_ipc::daemon_namespace(),
         ),
-    ])
+    ];
+    if let Some(config_toml) = &variant.config_toml {
+        // The overlay reaches the spawned daemon through its environment only, so it never
+        // touches declarative configuration files. Any overlay already present in the process
+        // environment is merged below the variant's so variant settings win.
+        let merged = std::env::var(bcode_config::BCODE_CONFIG_TOML_ENV)
+            .ok()
+            .filter(|existing| !existing.trim().is_empty())
+            .map_or_else(
+                || config_toml.clone(),
+                |existing| format!("{existing}\n\n{config_toml}"),
+            );
+        guards.push(EnvVarGuard::set_value(
+            bcode_config::BCODE_CONFIG_TOML_ENV,
+            merged,
+        ));
+    }
+    Ok(guards)
 }
 
 fn toml_key(key: &str) -> String {
@@ -1140,6 +1339,39 @@ async fn execute_agent_variant_async(
             message: "agent turn timed out before ModelTurnFinished".into(),
         });
     }
+    let mut artifacts = vec![
+        EvalArtifactRef {
+            kind: "transcript".into(),
+            path: PathBuf::from("transcript.jsonl"),
+        },
+        EvalArtifactRef {
+            kind: "tool_calls".into(),
+            path: PathBuf::from("tool-calls.jsonl"),
+        },
+    ];
+    let mut follow_up_timed_out = false;
+    if let Some(follow_up) = &variant.follow_up
+        && !telemetry.timed_out
+    {
+        let outcome = run_agent_follow_up(AgentFollowUpInput {
+            client: &client,
+            case,
+            variant,
+            repetition,
+            rep_dir,
+            session_id: session.id,
+            follow_up,
+            timeout,
+        })
+        .await?;
+        follow_up_timed_out = outcome.timed_out;
+        measurements.extend(outcome.measurements);
+        diagnostics.extend(outcome.diagnostics);
+        artifacts.push(EvalArtifactRef {
+            kind: "follow_up_transcript".into(),
+            path: PathBuf::from("follow-up-transcript.jsonl"),
+        });
+    }
     append_observation(
         rep_dir,
         &EvalObservation {
@@ -1149,24 +1381,151 @@ async fn execute_agent_variant_async(
                 "session_id": session.id,
                 "event_count": events.len(),
                 "timed_out": telemetry.timed_out,
+                "follow_up_timed_out": follow_up_timed_out,
             }),
         },
     )?;
+    let timed_out = telemetry.timed_out || follow_up_timed_out;
     Ok(ExecutionOutput {
-        exit_code: Some(if telemetry.timed_out { 124 } else { 0 }),
+        exit_code: Some(if timed_out { 124 } else { 0 }),
         measurements,
         diagnostics,
-        artifacts: vec![
-            EvalArtifactRef {
-                kind: "transcript".into(),
-                path: PathBuf::from("transcript.jsonl"),
-            },
-            EvalArtifactRef {
-                kind: "tool_calls".into(),
-                path: PathBuf::from("tool-calls.jsonl"),
-            },
-        ],
+        artifacts,
     })
+}
+
+struct AgentFollowUpInput<'a> {
+    client: &'a bcode_client::BcodeClient,
+    case: &'a EvalCase,
+    variant: &'a EvalVariant,
+    repetition: u32,
+    rep_dir: &'a Path,
+    session_id: bcode_session_models::SessionId,
+    follow_up: &'a bcode_eval_models::EvalFollowUpConfig,
+    timeout: std::time::Duration,
+}
+
+struct AgentFollowUpOutcome {
+    measurements: EvalMeasurementSet,
+    diagnostics: Vec<EvalDiagnostic>,
+    timed_out: bool,
+}
+
+/// Send the variant's follow-up prompt on the same session, optionally restarting the isolated
+/// daemon first so the turn exercises session resume through normal client boundaries.
+async fn run_agent_follow_up(
+    input: AgentFollowUpInput<'_>,
+) -> Result<AgentFollowUpOutcome, EvalError> {
+    let AgentFollowUpInput {
+        client,
+        case,
+        variant,
+        repetition,
+        rep_dir,
+        session_id,
+        follow_up,
+        timeout,
+    } = input;
+    let mut diagnostics = Vec::new();
+    if follow_up.restart_daemon {
+        progress(format!(
+            "agent follow-up: variant={} case={} rep={} restarting isolated daemon",
+            variant.id, case.id, repetition
+        ));
+        client
+            .server_stop()
+            .await
+            .map_err(|error| EvalError::Client(format!("daemon stop before follow-up: {error}")))?;
+        wait_for_daemon_exit(timeout).await?;
+        client.ensure_daemon_available().await.map_err(|error| {
+            EvalError::Client(format!("daemon restart before follow-up: {error}"))
+        })?;
+        append_observation(
+            rep_dir,
+            &EvalObservation {
+                unix_ms: unix_ms(),
+                source: "agent_daemon_restarted".into(),
+                payload: serde_json::json!({ "session_id": session_id }),
+            },
+        )?;
+    }
+    let start_sequence = latest_session_sequence(client, session_id).await?;
+    let start = Instant::now();
+    progress(format!(
+        "agent follow-up: variant={} case={} rep={} session={session_id} sending prompt",
+        variant.id, case.id, repetition
+    ));
+    client
+        .send_user_message(
+            session_id,
+            follow_up.prompt.clone(),
+            bcode_ipc::PromptPlacement::FollowUp,
+        )
+        .await
+        .map_err(|error| EvalError::Client(error.to_string()))?;
+    let events = wait_for_agent_turn(
+        client,
+        session_id,
+        start_sequence,
+        timeout,
+        variant,
+        rep_dir,
+    )
+    .await?;
+    write_session_events_jsonl(&rep_dir.join("follow-up-transcript.jsonl"), &events)?;
+    let telemetry = session_telemetry(&events);
+    let mut measurements = telemetry
+        .measurements
+        .into_iter()
+        .map(|(key, value)| (format!("follow_up.{key}"), value))
+        .collect::<EvalMeasurementSet>();
+    measurements.insert(
+        "follow_up.agent_wall_time_ms".into(),
+        start.elapsed().as_millis() as f64,
+    );
+    measurements.insert(
+        "follow_up.daemon_restarted".into(),
+        if follow_up.restart_daemon { 1.0 } else { 0.0 },
+    );
+    diagnostics.extend(
+        telemetry
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| EvalDiagnostic {
+                severity: diagnostic.severity,
+                message: format!("follow-up: {}", diagnostic.message),
+            }),
+    );
+    if telemetry.timed_out {
+        diagnostics.push(EvalDiagnostic {
+            severity: EvalDiagnosticSeverity::Error,
+            message: "follow-up turn timed out before ModelTurnFinished".into(),
+        });
+    }
+    Ok(AgentFollowUpOutcome {
+        measurements,
+        diagnostics,
+        timed_out: telemetry.timed_out,
+    })
+}
+
+/// Wait until the isolated daemon stops answering status requests.
+///
+/// Uses a client that never auto-starts a daemon; otherwise every status probe would resurrect
+/// the daemon it is waiting on.
+async fn wait_for_daemon_exit(timeout: std::time::Duration) -> Result<(), EvalError> {
+    let probe = bcode_client::BcodeClient::default_endpoint()
+        .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+    let deadline = Instant::now() + timeout;
+    while probe.server_status().await.is_ok() {
+        if Instant::now() >= deadline {
+            return Err(EvalError::Client(
+                "isolated daemon did not exit before the follow-up timeout".into(),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
 }
 
 async fn latest_session_sequence(
@@ -1341,6 +1700,7 @@ fn write_tool_calls_jsonl(
         if matches!(
             event.kind,
             bcode_session_models::SessionEventKind::ToolCallRequested { .. }
+                | bcode_session_models::SessionEventKind::PositionedToolCallRequested { .. }
                 | bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { .. }
                 | bcode_session_models::SessionEventKind::PermissionRequested { .. }
                 | bcode_session_models::SessionEventKind::PermissionResolved { .. }
@@ -1412,9 +1772,15 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
     let mut cache_write_input_tokens = 0_u32;
     let mut reasoning_tokens = 0_u32;
     let mut turn_finished = false;
+    let mut cache_rounds: Vec<(Option<String>, bcode_session_models::SessionTokenUsage)> =
+        Vec::new();
     for event in events {
         match &event.kind {
-            bcode_session_models::SessionEventKind::ToolCallRequested { tool_name, .. } => {
+            bcode_session_models::SessionEventKind::ToolCallRequested { tool_name, .. }
+            | bcode_session_models::SessionEventKind::PositionedToolCallRequested {
+                tool_name,
+                ..
+            } => {
                 *tool_counts.entry(tool_name.clone()).or_default() += 1;
             }
             bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { record }
@@ -1437,6 +1803,7 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
                     .saturating_add(usage.cache_write_input_tokens.unwrap_or_default());
                 reasoning_tokens =
                     reasoning_tokens.saturating_add(usage.reasoning_tokens.unwrap_or_default());
+                record_cache_round(&mut cache_rounds, usage);
             }
             bcode_session_models::SessionEventKind::ModelTurnFinished {
                 outcome, message, ..
@@ -1493,7 +1860,38 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
     telemetry
         .measurements
         .insert("reasoning_tokens".into(), f64::from(reasoning_tokens));
+    // Per-round cache behavior is judged by the prompt-cache domain so evals, live verification,
+    // and CI share one definition of every ratio.
+    let observations = cache_rounds
+        .iter()
+        .enumerate()
+        .map(|(round, (_, usage))| {
+            bcode_prompt_cache::CacheRoundObservation::from_session_usage(round, usage)
+        })
+        .collect::<Vec<_>>();
     telemetry
+        .measurements
+        .extend(bcode_prompt_cache::analysis::measure_rounds(&observations));
+    telemetry
+}
+
+/// Keep the latest usage observation for each provider request so intermediate cumulative
+/// snapshots do not count as separate cache rounds.
+fn record_cache_round(
+    rounds: &mut Vec<(Option<String>, bcode_session_models::SessionTokenUsage)>,
+    usage: &bcode_session_models::SessionTokenUsage,
+) {
+    if let Some(request_id) = &usage.request_id
+        && let Some(existing) = rounds
+            .iter_mut()
+            .find(|(existing_id, _)| existing_id.as_deref() == Some(request_id.as_str()))
+    {
+        if usage.observation_ordinal >= existing.1.observation_ordinal {
+            existing.1 = usage.clone();
+        }
+        return;
+    }
+    rounds.push((usage.request_id.clone(), usage.clone()));
 }
 
 fn run_judge(
@@ -1503,6 +1901,7 @@ fn run_judge(
     workspace: &Path,
     diff: &str,
     measurements: &EvalMeasurementSet,
+    variant_id: &str,
 ) -> Result<EvalJudgeResult, EvalError> {
     let start = Instant::now();
     let mut judge_measurements = EvalMeasurementSet::new();
@@ -1614,22 +2013,42 @@ fn run_judge(
             min,
             max,
             required,
+            variants,
         } => {
-            let value = measurements.get(metric).copied();
-            let passed = value.is_some_and(|value| {
-                min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
-            });
-            EvalJudgeResult {
-                kind: "metric_threshold".into(),
-                passed,
-                required: *required,
-                score: Some(if passed { 1.0 } else { 0.0 }),
-                measurements: EvalMeasurementSet::new(),
-                diagnostics: diagnostic_if_failed(
+            if !variants.is_empty() && !variants.iter().any(|id| id == variant_id) {
+                EvalJudgeResult {
+                    kind: "metric_threshold".into(),
+                    passed: true,
+                    required: false,
+                    score: None,
+                    measurements: EvalMeasurementSet::new(),
+                    diagnostics: vec![EvalDiagnostic {
+                        severity: EvalDiagnosticSeverity::Info,
+                        message: format!(
+                            "metric {metric} threshold does not apply to variant {variant_id}"
+                        ),
+                    }],
+                    artifacts: Vec::new(),
+                }
+            } else {
+                let value = measurements.get(metric).copied();
+                let passed = value.is_some_and(|value| {
+                    min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
+                });
+                EvalJudgeResult {
+                    kind: "metric_threshold".into(),
                     passed,
-                    &format!("metric {metric} was outside threshold"),
-                ),
-                artifacts: Vec::new(),
+                    required: *required,
+                    score: Some(if passed { 1.0 } else { 0.0 }),
+                    measurements: EvalMeasurementSet::new(),
+                    diagnostics: diagnostic_if_failed(
+                        passed,
+                        &format!(
+                            "metric {metric} was outside threshold (value={value:?}, min={min:?}, max={max:?})"
+                        ),
+                    ),
+                    artifacts: Vec::new(),
+                }
             }
         }
     };
@@ -3202,6 +3621,26 @@ pub fn render_summary_markdown(result: &EvalRunResult) -> String {
         ));
     }
 
+    if !result.comparisons.is_empty() {
+        out.push_str("\n## Comparisons\n\n");
+        out.push_str("| Comparison | Metric | Variant | Baseline | Ratio | Required | Passed |\n");
+        out.push_str("|---|---|---|---|---:|---|---|\n");
+        for comparison in &result.comparisons {
+            out.push_str(&format!(
+                "| {} | `{}` | {} | {} | {} | {} | {} |\n",
+                comparison.id,
+                comparison.metric,
+                comparison.variant,
+                comparison.baseline_variant,
+                comparison
+                    .ratio
+                    .map_or_else(|| "n/a".to_string(), |ratio| format!("{ratio:.3}")),
+                if comparison.required { "yes" } else { "no" },
+                if comparison.passed { "yes" } else { "no" },
+            ));
+        }
+    }
+
     if let Some(baseline) = baseline {
         out.push_str("\n## Efficiency Deltas\n\n");
         out.push_str(&format!("Baseline: `{baseline}`\n\n"));
@@ -3371,6 +3810,20 @@ pub fn render_terminal_summary(result: &EvalRunResult) -> String {
             format_duration_ms(metrics.avg_wall_ms),
             metrics.avg_tool_calls,
             metrics.tool_errors,
+        ));
+    }
+    for comparison in &result.comparisons {
+        out.push_str(&format!(
+            "comparison {}: {} {}\n",
+            comparison.id,
+            if comparison.passed {
+                "pass"
+            } else if comparison.required {
+                "FAIL"
+            } else {
+                "fail (optional)"
+            },
+            comparison.detail
         ));
     }
     out
@@ -3797,6 +4250,307 @@ fn relative_artifact(run_dir: &Path, kind: &str, path: &Path) -> EvalArtifactRef
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_suite(extra: &str) -> Result<EvalSuite, EvalError> {
+        let base = r#"
+schema_version = 1
+id = "s"
+name = "S"
+
+[[variants]]
+id = "cached"
+executor = "agent"
+
+[[variants]]
+id = "control"
+executor = "agent"
+
+[[cases]]
+id = "c"
+prompt = "hi"
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "tool_call_count"
+min = 1
+"#;
+        let suite: EvalSuite = toml::from_str(&format!("{base}\n{extra}"))?;
+        validate_suite(&suite)?;
+        Ok(suite)
+    }
+
+    #[test]
+    fn config_toml_overlay_requires_agent_and_isolated_daemon() {
+        minimal_suite(
+            r#"
+[[variants]]
+id = "cmd"
+executor = "command"
+command = "true"
+config_toml = "[model]\nprofile = 'x'\n"
+"#,
+        )
+        .expect_err("command variant must reject config_toml");
+
+        let error = minimal_suite(
+            r#"
+[[variants]]
+id = "shared"
+executor = "agent"
+config_toml = "[model]\nprofile = 'x'\n"
+metadata = { daemon_isolation = "shared" }
+"#,
+        )
+        .expect_err("shared daemon must reject config_toml");
+        assert!(error.to_string().contains("shared"), "{error}");
+
+        let error = minimal_suite(
+            r#"
+[[variants]]
+id = "bad"
+executor = "agent"
+config_toml = "not = [valid"
+"#,
+        )
+        .expect_err("invalid TOML overlay");
+        assert!(error.to_string().contains("not valid TOML"), "{error}");
+    }
+
+    #[test]
+    fn follow_up_restart_requires_isolated_daemon() {
+        let error = minimal_suite(
+            r#"
+[[variants]]
+id = "shared"
+executor = "agent"
+metadata = { daemon_isolation = "shared" }
+
+[variants.follow_up]
+prompt = "again"
+restart_daemon = true
+"#,
+        )
+        .expect_err("shared daemon cannot be restarted");
+        assert!(error.to_string().contains("restart_daemon"), "{error}");
+    }
+
+    #[test]
+    fn comparisons_are_validated() {
+        let error = minimal_suite(
+            r#"
+[[comparisons]]
+id = "x"
+metric = "m"
+variant = "cached"
+baseline_variant = "missing"
+max_ratio = 0.5
+"#,
+        )
+        .expect_err("unknown baseline variant");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+
+        let error = minimal_suite(
+            r#"
+[[comparisons]]
+id = "x"
+metric = "m"
+variant = "cached"
+baseline_variant = "control"
+"#,
+        )
+        .expect_err("needs exactly one bound");
+        assert!(error.to_string().contains("exactly one"), "{error}");
+
+        let error = minimal_suite(
+            r#"
+[[comparisons]]
+id = "x"
+metric = "m"
+variant = "cached"
+baseline_variant = "control"
+max_ratio = 0.5
+min_ratio = 0.1
+"#,
+        )
+        .expect_err("needs exactly one bound");
+        assert!(error.to_string().contains("exactly one"), "{error}");
+
+        minimal_suite(
+            r#"
+[[comparisons]]
+id = "x"
+metric = "m"
+variant = "cached"
+baseline_variant = "control"
+max_ratio = 0.5
+"#,
+        )
+        .expect("valid comparison");
+    }
+
+    #[test]
+    fn metric_threshold_variant_scope_must_reference_known_variants() {
+        let error = minimal_suite(
+            r#"
+[[cases]]
+id = "scoped"
+prompt = "hi"
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "m"
+min = 1
+variants = ["nope"]
+"#,
+        )
+        .expect_err("unknown judge variant");
+        assert!(
+            error.to_string().contains("unknown variant nope"),
+            "{error}"
+        );
+    }
+
+    fn variant_result(id: &str, metric: &str, value: f64) -> EvalVariantRunResult {
+        EvalVariantRunResult {
+            variant_id: id.to_string(),
+            cases: Vec::new(),
+            pass_rate: 1.0,
+            measurements: BTreeMap::from([(metric.to_string(), value)]),
+            score: bcode_eval_models::EvalScore {
+                correctness: 1.0,
+                efficiency: 1.0,
+                speed: 1.0,
+                cost: 1.0,
+                stability: 1.0,
+                overall: 1.0,
+            },
+        }
+    }
+
+    #[test]
+    fn comparisons_evaluate_ratios_and_fail_closed_on_missing_metrics() {
+        let suite = minimal_suite(
+            r#"
+[[comparisons]]
+id = "lower"
+metric = "m"
+variant = "cached"
+baseline_variant = "control"
+max_ratio = 0.35
+
+[[comparisons]]
+id = "higher"
+metric = "m"
+variant = "control"
+baseline_variant = "cached"
+min_ratio = 2.0
+required = false
+"#,
+        )
+        .expect("suite");
+        let variants = vec![
+            variant_result("cached", "m", 10.0),
+            variant_result("control", "m", 100.0),
+        ];
+        let results = evaluate_comparisons(&suite, &variants);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].passed, "{}", results[0].detail);
+        assert!((results[0].ratio.unwrap() - 0.1).abs() < 1e-9);
+        assert!(results[1].passed);
+        assert!(!results[1].required);
+
+        let missing = vec![
+            variant_result("cached", "other", 10.0),
+            variant_result("control", "m", 100.0),
+        ];
+        let results = evaluate_comparisons(&suite, &missing);
+        assert!(!results[0].passed);
+        assert!(results[0].ratio.is_none());
+        assert!(results[0].detail.contains("unavailable"));
+
+        let zero_baseline = vec![
+            variant_result("cached", "m", 10.0),
+            variant_result("control", "m", 0.0),
+        ];
+        assert!(!evaluate_comparisons(&suite, &zero_baseline)[0].passed);
+    }
+
+    fn usage_event(
+        sequence: u64,
+        request_id: &str,
+        ordinal: u32,
+        input: u32,
+        cached: u32,
+        written: Option<u32>,
+    ) -> bcode_session_models::SessionEvent {
+        bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ModelUsage {
+                turn_id: "t".into(),
+                usage: bcode_session_models::SessionTokenUsage {
+                    request_id: Some(request_id.into()),
+                    observation_ordinal: ordinal,
+                    input_tokens: Some(input),
+                    output_tokens: Some(5),
+                    cached_input_tokens: Some(cached),
+                    cache_write_input_tokens: written,
+                    ..bcode_session_models::SessionTokenUsage::default()
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn session_telemetry_derives_cache_rounds_from_latest_usage_per_request() {
+        let events = vec![
+            usage_event(1, "r0", 0, 1_000, 0, Some(1_000)),
+            // A superseded intermediate snapshot for the same request must not add a round.
+            usage_event(2, "r1", 0, 1_200, 0, None),
+            usage_event(3, "r1", 1, 1_200, 1_000, Some(200)),
+            usage_event(4, "r2", 0, 1_400, 1_200, Some(200)),
+        ];
+        let telemetry = session_telemetry(&events);
+        let measurements = &telemetry.measurements;
+        assert!((measurements[bcode_prompt_cache::measurement::ROUND_COUNT] - 3.0).abs() < 1e-9);
+        assert!(
+            (measurements[bcode_prompt_cache::measurement::HIT_ROUND_RATIO] - 1.0).abs() < 1e-9
+        );
+        assert!(
+            (measurements[bcode_prompt_cache::measurement::CACHED_INPUT_TOKENS] - 2_200.0).abs()
+                < 1e-9
+        );
+        assert!(
+            (measurements[bcode_prompt_cache::measurement::UNCACHED_INPUT_TOKENS] - 0.0).abs()
+                < 1e-9
+        );
+        // Legacy aggregate counters still sum every observation as before.
+        assert!((measurements["cached_input_tokens"] - 2_200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoped_metric_threshold_skips_other_variants() {
+        let judge = EvalJudgeConfig::MetricThreshold {
+            metric: "m".into(),
+            min: Some(1.0),
+            max: None,
+            required: true,
+            variants: vec!["cached".into()],
+        };
+        let temp = std::env::temp_dir();
+        let empty = EvalMeasurementSet::new();
+        let skipped = run_judge(&judge, &temp, &temp, &temp, "", &empty, "control").expect("judge");
+        assert!(skipped.passed);
+        assert!(!skipped.required);
+        assert!(skipped.score.is_none());
+
+        let applied = run_judge(&judge, &temp, &temp, &temp, "", &empty, "cached").expect("judge");
+        assert!(!applied.passed);
+        assert!(applied.required);
+    }
 
     #[test]
     fn direct_tool_preparation_uses_versioned_opaque_workspace_context() {

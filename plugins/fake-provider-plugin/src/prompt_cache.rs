@@ -157,13 +157,45 @@ pub fn provider_feature_claims() -> Vec<(PromptCacheFeature, CapabilitySupport)>
 /// Process-wide simulator shared by every cache-model turn.
 ///
 /// Cache entries are partitioned by the request's cache key, so independent sessions do not
-/// observe each other's entries even though they share this store.
+/// observe each other's entries even though they share this store. When `BCODE_STATE_DIR` is
+/// set, entries are also persisted beneath it so a restarted daemon sees the same cache a real
+/// provider would still hold; a cache that vanished on restart would hide resume regressions.
 static SIMULATOR: Mutex<Option<PromptCacheSimulator>> = Mutex::new(None);
 
-/// Forget every simulated cache entry.
+const SIMULATOR_STATE_FILE: &str = "fake-provider-prompt-cache.json";
+
+fn simulator_state_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("BCODE_STATE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(|dir| std::path::PathBuf::from(dir).join(SIMULATOR_STATE_FILE))
+}
+
+fn load_simulator() -> PromptCacheSimulator {
+    simulator_state_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn persist_simulator(simulator: &PromptCacheSimulator) {
+    let Some(path) = simulator_state_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(simulator) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// Forget every simulated cache entry, including any persisted beneath `BCODE_STATE_DIR`.
 pub fn reset() {
     if let Ok(mut simulator) = SIMULATOR.lock() {
-        *simulator = None;
+        *simulator = Some(PromptCacheSimulator::default());
+    }
+    if let Some(path) = simulator_state_path() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -182,56 +214,69 @@ pub fn validate(
 
 /// Serve one turn through the simulator, pushing the complete event stream onto `turn`.
 ///
-/// The response is deterministic: a pending tool call is answered with the next `cache_probe`
-/// call when the last message is a user message and tools are offered; otherwise a short text
+/// The response is deterministic. A user prompt beginning with `read-files` followed by
+/// whitespace-separated paths drives a real tool loop: each round calls the first offered tool
+/// (normally `filesystem.read`) on the next unread path until every path has a tool result, then
+/// replies with text. Otherwise a required/named tool choice produces one call, an `Auto` prompt
+/// mentioning `probe` produces a `cache_probe` style call, and everything else is a short text
 /// reply. Usage always comes from the simulator so cache accounting reflects the real prefix.
 pub fn serve_turn(
     profile: &PromptCacheSimulatorProfile,
     request: &ModelTurnRequest,
     push: &dyn Fn(ProviderTurnEvent),
 ) {
-    let last_role = request.messages.last().map(|message| message.role);
-    let tool_choice = &request.tool_call_policy.choice;
-    let wants_tool_call = last_role == Some(MessageRole::User)
-        && !request.tools.is_empty()
-        && match tool_choice {
-            ToolChoice::None => false,
-            ToolChoice::Required | ToolChoice::Tool { .. } => true,
-            ToolChoice::Auto => last_user_text(&request.messages).contains("probe"),
-        };
-    let (text, tool_call): (String, Option<ToolCall>) = if wants_tool_call {
-        let next_index = request
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
-            .count();
-        let tool_name = match tool_choice {
-            ToolChoice::Tool { name } => name.clone(),
-            _ => request.tools[0].name.clone(),
-        };
-        (
-            String::new(),
-            Some(ToolCall {
-                id: format!("fake-cache-probe-{next_index}"),
-                name: tool_name,
-                arguments: serde_json::json!({"index": next_index}),
-            }),
-        )
+    let user_text = last_user_text(&request.messages);
+    let completed_calls = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
+        .count();
+    let tool_call = if request.tools.is_empty()
+        || matches!(request.tool_call_policy.choice, ToolChoice::None)
+    {
+        None
+    } else if let Some(paths) = user_text.strip_prefix("read-files") {
+        paths
+            .split_whitespace()
+            .nth(completed_calls)
+            .map(|path| ToolCall {
+                id: format!("fake-cache-read-{completed_calls}"),
+                name: request.tools[0].name.clone(),
+                arguments: serde_json::json!({ "path": path }),
+            })
     } else {
-        (
-            format!("fake cache reply: {}", last_user_text(&request.messages)),
-            None,
-        )
+        let last_role = request.messages.last().map(|message| message.role);
+        let wants_tool_call = last_role == Some(MessageRole::User)
+            && match &request.tool_call_policy.choice {
+                ToolChoice::None => false,
+                ToolChoice::Required | ToolChoice::Tool { .. } => true,
+                ToolChoice::Auto => user_text.contains("probe"),
+            };
+        wants_tool_call.then(|| ToolCall {
+            id: format!("fake-cache-probe-{completed_calls}"),
+            name: match &request.tool_call_policy.choice {
+                ToolChoice::Tool { name } => name.clone(),
+                _ => request.tools[0].name.clone(),
+            },
+            arguments: serde_json::json!({"index": completed_calls}),
+        })
+    };
+    let text = if tool_call.is_some() {
+        String::new()
+    } else {
+        format!("fake cache reply: {user_text}")
     };
     let output_tokens = u32::try_from(text.split_whitespace().count().max(1)).unwrap_or(u32::MAX);
     let SimulatedCacheRound { usage, projection } = {
         let mut guard = SIMULATOR
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
-            .get_or_insert_with(PromptCacheSimulator::default)
-            .serve(profile, request, output_tokens)
+        let simulator = guard.get_or_insert_with(load_simulator);
+        let round = simulator.serve(profile, request, output_tokens);
+        persist_simulator(simulator);
+        drop(guard);
+        round
     };
     push(ProviderTurnEvent::RequestProjection { projection });
     if let Some(call) = tool_call {

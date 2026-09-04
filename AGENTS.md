@@ -153,6 +153,7 @@ Minimum expected validation once Rust crates exist:
 - `scripts/check-router-architecture.sh` for router domain package layout, portable router models, or routing engine dependency changes
 - `scripts/check-context-accounting-architecture.sh` for model request context estimation, provider usage, occupancy, or context display changes
 - `scripts/check-prompt-cache-architecture.sh` for prompt-cache expectations, planning, analysis, simulation, cache capability declarations, or provider cache conformance changes
+- `scripts/check-prompt-cache-eval.sh` for host cache planning, eval cache telemetry, eval config overlays/comparisons/follow-ups, or fake-provider cache model changes (offline end-to-end run)
 - `scripts/check-structured-output-architecture.sh` for structured output, strict tool schemas, capability fidelity, schema dialects, or provider-side structured-output adaptation
 - `scripts/check-plugin-auth-architecture.sh` for plugin auth contracts, registration, profile resolution, vault custody, secret delivery, or runtime auth metadata changes
 - `scripts/check-plugin-abi-safety.sh` for native plugin ABI, callback lifetime, registrar threading, or unsafe-boundary changes

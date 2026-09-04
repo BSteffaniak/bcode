@@ -1,0 +1,142 @@
+schema_version = 1
+id = "prompt-cache"
+name = "Prompt Cache Reuse"
+description = """
+Verify that a real Bcode session reuses provider prompt cache across a deterministic
+filesystem-read tool loop. The `cached` variant runs with prompt caching enabled and is compared
+against the `control` variant with caching disabled. Per-round cache measurements come from the
+prompt-cache domain (`bcode_prompt_cache::analysis`), so the thresholds here are the same ones the
+live `bcode model verify-cache` suite uses.
+
+The control comparison assumes an explicit-breakpoint cache (Anthropic-style), where `mode = "off"`
+stops the host from placing breakpoints and therefore stops reuse. Automatic-prefix providers
+(OpenAI-style) cache regardless of host hints, so for them `control` reuses just as much as
+`cached`; run `bcode model verify-cache` for those models instead of this suite.
+
+Run against the offline fake provider (CI) by pointing the config at `bcode.fake-provider` with
+model `fake-cache-explicit`, or against a live explicit-cache model by configuring that
+provider/model as the default before running the suite.
+"""
+
+[run]
+repetitions = 1
+timeout_ms = 300000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+
+[score]
+correctness = 0.70
+efficiency = 0.20
+speed = 0.05
+cost = 0.0
+stability = 0.05
+correctness_required = true
+
+[[score.metrics]]
+metric = "prompt_cache.uncached_input_tokens"
+direction = "lower_is_better"
+weight = 2
+target = 20000
+
+[regression]
+min_pass_rate = 1.0
+max_token_increase_percent = 15.0
+max_latency_increase_percent = 50.0
+fail_on_new_failure = true
+
+[[variants]]
+id = "cached"
+name = "Prompt cache enabled"
+executor = "agent"
+profile = "build"
+allowed_tools = ["filesystem.read"]
+config_toml = """
+[model.prompt_cache]
+mode = "auto"
+"""
+metadata = { agent_id = "build", permission_mode = "approve" }
+
+[variants.follow_up]
+prompt = "Reply with exactly: follow-up complete."
+restart_daemon = true
+
+[[variants]]
+id = "control"
+name = "Prompt cache disabled"
+executor = "agent"
+profile = "build"
+allowed_tools = ["filesystem.read"]
+config_toml = """
+[model.prompt_cache]
+mode = "off"
+"""
+metadata = { agent_id = "build", permission_mode = "approve" }
+
+# The cached variant must send far less ordinary input than the uncached control across the
+# same tool loop. The bound is deliberately loose so a real cache passes comfortably while a
+# broken one (no reuse) fails: with no reuse the ratio is 1.0.
+[[comparisons]]
+id = "cached-input-below-control"
+metric = "prompt_cache.uncached_input_tokens"
+variant = "cached"
+baseline_variant = "control"
+max_ratio = 0.35
+
+[[cases]]
+id = "read-loop-12"
+name = "Twelve-file read loop"
+fixture = "workspace"
+prompt = "read-files probe-00.txt probe-01.txt probe-02.txt probe-03.txt probe-04.txt probe-05.txt probe-06.txt probe-07.txt probe-08.txt probe-09.txt probe-10.txt probe-11.txt"
+timeout_ms = 300000
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "tool_call_count"
+min = 12
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "tool_error_count"
+max = 0
+required = true
+
+# Every provider round after the first should read from cache once caching is on. These judges
+# apply to the `cached` variant only; the run-level comparison above ties it to `control`.
+[[cases.judges]]
+type = "metric_threshold"
+metric = "prompt_cache.hit_round_ratio"
+min = 0.9
+required = true
+variants = ["cached"]
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "prompt_cache.late_uncached_ratio"
+max = 0.15
+required = true
+variants = ["cached"]
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "prompt_cache.write_amplification"
+max = 3.0
+required = true
+variants = ["cached"]
+
+# After the isolated daemon restarts, the same-session follow-up must still hit the cache.
+[[cases.judges]]
+type = "metric_threshold"
+metric = "follow_up.prompt_cache.cached_input_tokens"
+min = 1
+required = true
+variants = ["cached"]
+
+# With caching disabled no round may claim cached input.
+[[cases.judges]]
+type = "metric_threshold"
+metric = "prompt_cache.cached_input_tokens"
+max = 0
+required = true
+variants = ["control"]

@@ -11,8 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_model = { workspace = true }
-serde       = { workspace = true, features = ["derive"] }
+bcode_model          = { workspace = true }
+bcode_session_models = { workspace = true }
+serde                = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -95,8 +95,32 @@ Three consumers run the suite:
 
 `analyze_rounds` and `analyze_warm_repeat` take `CacheRoundObservation`s built from normalized
 `TokenUsage` (via `uncached_input_tokens()` / `has_valid_input_breakdown()`) and
-`ProviderRequestProjection`. Measurements use stable string keys from
-`bcode_prompt_cache_models::measurement` so they can flow into eval artifacts unchanged.
+`ProviderRequestProjection`. `CacheRoundObservation::from_session_usage` builds the same
+observation from persisted session usage so eval telemetry and live verification judge identical
+numbers. Measurements use stable string keys from `bcode_prompt_cache_models::measurement` so they
+can flow into eval artifacts unchanged.
+
+## End-to-end eval
+
+`fixtures/evals/prompt-cache/suite.toml` runs a real Bcode session through a twelve-file
+`filesystem.read` loop twice: `cached` with `[model.prompt_cache] mode = "auto"` and `control`
+with `mode = "off"`, via per-variant `config_toml` overlays on isolated daemons. The `cached`
+variant also restarts its daemon and sends a same-session follow-up, which must still hit the
+cache. Judges assert hit ratio, late-tail, write amplification, and post-restart reuse for
+`cached`, zero reuse for `control`, and a run-level `[[comparisons]]` entry requires cached
+uncached-input to be at most 35% of control.
+
+The suite is model-agnostic across explicit-breakpoint caches: point the daemon configuration at
+any such provider/model. Automatic-prefix providers cache regardless of host hints, so their
+`control` variant reuses as much as `cached`; verify those with `bcode model verify-cache`, whose
+`mode_off` scenario only asserts what the host controls. CI runs the suite against the fake
+provider's `fake-cache-explicit` model (`scripts/check-prompt-cache-eval.sh`), which persists its
+simulated cache beneath `BCODE_STATE_DIR` so a restarted daemon sees the same entries a real
+provider would. Live runs use the same suite against a credentialed model:
+
+```sh
+bcode eval run fixtures/evals/prompt-cache/suite.toml
+```
 
 ## Adding a cache-capable model
 

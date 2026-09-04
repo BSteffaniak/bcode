@@ -48,7 +48,19 @@ if ! rg -q 'prompt_cache_min_prefix_tokens' packages/model-catalog/src/lib.rs; t
   fail "catalog validation must require prompt_cache_min_prefix_tokens for explicit-cache entries"
 fi
 
-# 6. The prompt-cache crates stay renderer- and daemon-neutral.
+# 6. Eval telemetry derives cache measurements through the prompt-cache domain, and the offline
+#    end-to-end suite exists so host planning regressions surface without credentials.
+if ! rg -q 'bcode_prompt_cache::analysis::measure_rounds' packages/eval/src/lib.rs; then
+  fail "eval cache telemetry must come from bcode_prompt_cache::analysis"
+fi
+if [[ ! -f fixtures/evals/prompt-cache/suite.toml ]]; then
+  fail "the prompt-cache eval suite fixture is missing"
+fi
+if ! rg -q 'prompt_cache\.' fixtures/evals/prompt-cache/suite.toml; then
+  fail "the prompt-cache eval suite must assert prompt_cache.* measurements"
+fi
+
+# 7. The prompt-cache crates stay renderer- and daemon-neutral.
 if rg -n 'bcode_tui|bcode_server|bcode_client|bcode_ipc|ratatui|bcode_eval' \
   packages/prompt-cache/Cargo.toml packages/prompt-cache/models/Cargo.toml; then
   fail "bcode_prompt_cache must not depend on renderers, the daemon, IPC, or evals"

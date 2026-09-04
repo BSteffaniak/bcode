@@ -74,12 +74,18 @@ pub struct SimulatedCacheRound {
 }
 
 /// Deterministic prompt cache keyed by caller cache key and prefix hash.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PromptCacheSimulator {
     entries: BTreeMap<String, BTreeMap<u64, u64>>,
 }
 
 impl PromptCacheSimulator {
+    /// Number of cached prefixes across every cache key.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entries.values().map(BTreeMap::len).sum()
+    }
+
     /// Validate a request's cache hints against the profile without mutating cache state.
     ///
     /// # Errors

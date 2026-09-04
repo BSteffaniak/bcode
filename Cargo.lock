@@ -1812,6 +1812,7 @@ dependencies = [
  "bcode_eval_models",
  "bcode_ipc",
  "bcode_plugin_sdk",
+ "bcode_prompt_cache",
  "bcode_session_models",
  "bcode_tool",
  "regex",
@@ -1850,6 +1851,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "toml 1.1.4+spec-1.1.0",
 ]
 
@@ -2362,6 +2364,7 @@ name = "bcode_prompt_cache_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
+ "bcode_session_models",
  "serde",
  "serde_json",
 ]

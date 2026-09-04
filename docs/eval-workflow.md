@@ -85,6 +85,72 @@ Agent eval repetitions use isolated daemon state by default:
 Set variant metadata `daemon_isolation = "shared"` only for local debugging.
 Shared mode can reuse an already-running daemon and may not enforce eval policy.
 
+### Configuration overlays
+
+`config_toml` applies a TOML overlay to the isolated daemon for one variant. It
+travels through the daemon's environment (`BCODE_CONFIG_TOML`) only, so it never
+creates or modifies declarative configuration files, and it is rejected together
+with `daemon_isolation = "shared"`. Use it to compare runtime settings such as
+prompt-cache mode across otherwise identical variants:
+
+```toml
+[[variants]]
+id = "cached"
+executor = "agent"
+config_toml = """
+[model.prompt_cache]
+mode = "auto"
+"""
+```
+
+### Follow-up turns and daemon restart
+
+`[variants.follow_up]` sends a second prompt on the same session after the main
+turn completes. Its telemetry lands under `follow_up.*` measurements and a
+`follow-up-transcript.jsonl` artifact. With `restart_daemon = true` the isolated
+daemon is stopped and started again first, so the follow-up exercises session
+resume through normal client boundaries:
+
+```toml
+[variants.follow_up]
+prompt = "Reply with exactly: follow-up complete."
+restart_daemon = true
+```
+
+### Prompt-cache telemetry
+
+Every agent repetition also reports per-round prompt-cache measurements derived
+by `bcode_prompt_cache::analysis` from the session's `model_usage` events
+(`prompt_cache.hit_round_ratio`, `prompt_cache.uncached_input_tokens`,
+`prompt_cache.late_uncached_ratio`, `prompt_cache.write_amplification`, and so
+on). These are the same measurements `bcode model verify-cache` reports, so a
+threshold that holds in live verification can be asserted in an eval unchanged.
+See `docs/prompt-cache-architecture.md` and `fixtures/evals/prompt-cache/`.
+
+### Variant-scoped metric judges
+
+`metric_threshold` judges accept `variants = ["id", ...]`. The judge applies
+only to those variants and is recorded as passed-and-not-required for others,
+so a variant-specific expectation (cache reuse) does not fail its control.
+
+## Cross-variant comparisons
+
+`[[comparisons]]` declares run-level assertions between variants of the same
+run. Each divides the `variant` measurement by the `baseline_variant`
+measurement (both averaged across cases and repetitions) and checks it against
+exactly one of `max_ratio` or `min_ratio`. Required comparisons fail the run;
+results are persisted in `summary.json` under `comparisons` and rendered in
+`summary.md`.
+
+```toml
+[[comparisons]]
+id = "cached-input-below-control"
+metric = "prompt_cache.uncached_input_tokens"
+variant = "cached"
+baseline_variant = "control"
+max_ratio = 0.35
+```
+
 Example agent variants:
 
 ```toml
