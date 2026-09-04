@@ -1526,6 +1526,8 @@ struct Settings {
     auth: AuthSettings,
     auth_diagnostics: AuthDiagnostics,
     dialect: OpenAiCompatibleDialect,
+    /// How `dialect` was chosen; recorded so a dialect-gated rejection can explain itself.
+    dialect_source: DialectSource,
     base_url: String,
     default_model: Option<String>,
     fallback_model: String,
@@ -1543,6 +1545,36 @@ enum OpenAiCompatibleDialect {
     ChatCompletions,
     ResponsesApi,
     ChatGptCodex,
+}
+
+/// Why a request resolved to its dialect. Diagnostic only; never affects request shaping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialectSource {
+    /// ChatGPT/Codex subscription auth forces the Codex dialect.
+    ChatGptAuth,
+    /// An xAI model id forces the Responses API against api.x.ai.
+    XaiModel,
+    /// Explicit `dialect` / `openai.dialect` provider setting.
+    ProviderSetting,
+    /// Explicit `BCODE_OPENAI_DIALECT` / `OPENAI_DIALECT` environment variable.
+    Environment,
+    /// A dialect value was configured but did not parse; the default applied.
+    UnrecognizedSetting,
+    /// Nothing selected a dialect; the plugin default applied.
+    Default,
+}
+
+impl DialectSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatGptAuth => "chatgpt_auth",
+            Self::XaiModel => "xai_model",
+            Self::ProviderSetting => "provider_setting",
+            Self::Environment => "environment",
+            Self::UnrecognizedSetting => "unrecognized_setting_default",
+            Self::Default => "default",
+        }
+    }
 }
 
 impl OpenAiCompatibleDialect {
@@ -1705,6 +1737,7 @@ fn auth_trace_metadata(settings: &Settings, context: &ProviderRequestContext) ->
         "context_auth_credential_sources": context_auth_credential_sources(auth),
         "base_url": settings.base_url,
         "dialect": settings.dialect.metadata_value(),
+        "dialect_source": settings.dialect_source.as_str(),
     })
     .to_string()
 }
@@ -3780,7 +3813,97 @@ fn verify_response_from_provider_error(error: &ProviderError) -> bcode_model::Ve
     }
 }
 
+/// Validate a turn against the resolved dialect, annotating any rejection with how auth and
+/// dialect were resolved.
+///
+/// Dialect-gated rejections are only actionable if the caller can see *why* the request landed on
+/// that dialect. The annotation reports which credential source won, which dialect resulted and
+/// what selected it, and which reasoning controls the host attached, without exposing secrets.
 fn validate_openai_request(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> Result<(), ProviderError> {
+    validate_openai_request_inner(settings, request)
+        .map_err(|error| annotate_request_resolution(error, settings, request))
+}
+
+fn annotate_request_resolution(
+    mut error: ProviderError,
+    settings: &Settings,
+    request: &ModelTurnRequest,
+) -> ProviderError {
+    let context = &mut error.diagnostic_context;
+    context.insert(
+        "dialect".to_string(),
+        settings.dialect.metadata_value().to_string(),
+    );
+    context.insert(
+        "dialect_source".to_string(),
+        settings.dialect_source.as_str().to_string(),
+    );
+    context.insert(
+        "auth_source".to_string(),
+        settings.auth_diagnostics.source.clone(),
+    );
+    context.insert(
+        "auth_mode".to_string(),
+        settings.auth_diagnostics.mode.clone(),
+    );
+    context.insert(
+        "auth_detail".to_string(),
+        settings.auth_diagnostics.detail.clone(),
+    );
+    context.insert(
+        "auth_kind".to_string(),
+        match settings.auth {
+            AuthSettings::Missing => "missing",
+            AuthSettings::ApiKey(_) => "api_key",
+            AuthSettings::ChatGpt { .. } => "chatgpt",
+        }
+        .to_string(),
+    );
+    if let Some(profile) = request.provider_context.auth_profile.as_deref() {
+        context.insert("context_auth_profile".to_string(), profile.to_string());
+    }
+    if let Some(auth) = request.provider_context.auth.as_ref() {
+        let credentials = auth.credentials.keys().cloned().collect::<Vec<_>>();
+        context.insert(
+            "context_auth_credentials".to_string(),
+            if credentials.is_empty() {
+                "none".to_string()
+            } else {
+                credentials.join(",")
+            },
+        );
+        if let Some(scheme) = auth.scheme.as_deref() {
+            context.insert("context_auth_scheme".to_string(), scheme.to_string());
+        }
+    } else {
+        context.insert("context_auth_credentials".to_string(), "absent".to_string());
+    }
+    let auth_env_keys = request
+        .provider_context
+        .env
+        .keys()
+        .filter(|key| key.contains("API_KEY") || key.contains("CODEX") || key.contains("AUTH_MODE"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !auth_env_keys.is_empty() {
+        context.insert("context_auth_env_keys".to_string(), auth_env_keys.join(","));
+    }
+    if let Some(effort) = request.parameters.reasoning_effort_value.as_deref() {
+        context.insert("requested_reasoning_effort".to_string(), effort.to_string());
+    }
+    if let Some(summary) = request.parameters.reasoning_summary.as_deref() {
+        context.insert(
+            "requested_reasoning_summary".to_string(),
+            summary.to_string(),
+        );
+    }
+    error
+}
+
+fn validate_openai_request_inner(
     settings: &Settings,
     request: &ModelTurnRequest,
 ) -> Result<(), ProviderError> {
@@ -3808,7 +3931,11 @@ fn validate_openai_request(
         return Err(provider_error(
             "reasoning_controls_unsupported",
             ProviderErrorCategory::UnsupportedFeature,
-            "custom reasoning effort and reasoning summaries require the Responses API",
+            format!(
+                "custom reasoning effort and reasoning summaries require the Responses API, but this request resolved to the chat_completions dialect via {} with {} auth; use ChatGPT/Codex auth or set dialect=responses_api",
+                settings.dialect_source.as_str(),
+                settings.auth_diagnostics.mode,
+            ),
         ));
     }
     if !matches!(settings.dialect, OpenAiCompatibleDialect::ChatCompletions)
@@ -3995,12 +4122,14 @@ async fn stream_chat_completion_inner(
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
     let mut settings = settings_for_context(&request.provider_context);
-    validate_openai_request(&settings, request)?;
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    // Trace auth resolution before validation so a dialect/auth-gated rejection still leaves a
+    // record of how this request resolved.
     turn.push(ProviderTurnEvent::ProviderMetadata {
         key: "diagnostic.auth".to_string(),
         value: auth_trace_metadata(&settings, &request.provider_context),
     });
+    validate_openai_request(&settings, request)?;
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
     if matches!(settings.auth, AuthSettings::Missing) {
         let mut error = provider_error(
             "missing_openai_auth",
@@ -7282,9 +7411,12 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
             DEFAULT_BASE_URL.to_string()
         }
     });
-    let dialect = if force_xai {
+    let (dialect, dialect_source) = if force_xai {
         // xAI models must use the Responses API against api.x.ai; never Codex.
-        OpenAiCompatibleDialect::ResponsesApi
+        (
+            OpenAiCompatibleDialect::ResponsesApi,
+            DialectSource::XaiModel,
+        )
     } else {
         resolve_dialect(&auth, context)
     };
@@ -7304,6 +7436,7 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
         auth,
         auth_diagnostics,
         dialect,
+        dialect_source,
         base_url,
         default_model,
         fallback_model,
@@ -8143,19 +8276,36 @@ fn parse_positive_duration_secs(value: &str) -> Option<Duration> {
 fn resolve_dialect(
     auth: &AuthSettings,
     context: &ProviderRequestContext,
-) -> OpenAiCompatibleDialect {
+) -> (OpenAiCompatibleDialect, DialectSource) {
     if matches!(auth, AuthSettings::ChatGpt { .. }) {
-        return OpenAiCompatibleDialect::ChatGptCodex;
+        return (
+            OpenAiCompatibleDialect::ChatGptCodex,
+            DialectSource::ChatGptAuth,
+        );
     }
-    first_context_or_env(
-        context,
-        OPENAI_DIALECT_SETTING,
-        OPENAI_NAMESPACED_DIALECT_SETTING,
-        ["BCODE_OPENAI_DIALECT", "OPENAI_DIALECT"],
+    let configured = context
+        .settings
+        .get(OPENAI_NAMESPACED_DIALECT_SETTING)
+        .or_else(|| context.settings.get(OPENAI_DIALECT_SETTING))
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (value.clone(), DialectSource::ProviderSetting))
+        .or_else(|| {
+            first_context_env(context, ["BCODE_OPENAI_DIALECT", "OPENAI_DIALECT"])
+                .map(|value| (value, DialectSource::Environment))
+        });
+    let Some((value, source)) = configured else {
+        return (
+            OpenAiCompatibleDialect::ChatCompletions,
+            DialectSource::Default,
+        );
+    };
+    parse_dialect(&value).map_or(
+        (
+            OpenAiCompatibleDialect::ChatCompletions,
+            DialectSource::UnrecognizedSetting,
+        ),
+        |dialect| (dialect, source),
     )
-    .as_deref()
-    .and_then(parse_dialect)
-    .unwrap_or(OpenAiCompatibleDialect::ChatCompletions)
 }
 
 fn parse_dialect(value: &str) -> Option<OpenAiCompatibleDialect> {
@@ -9806,6 +9956,34 @@ mod tests {
         request.parameters.reasoning_summary = Some("auto".to_string());
         let error = validate_openai_request(&chat, &request).expect_err("summary must fail");
         assert_eq!(error.code, "reasoning_controls_unsupported");
+        assert!(
+            error
+                .message
+                .contains("chat_completions dialect via provider_setting"),
+            "rejection must explain how the dialect was selected: {}",
+            error.message
+        );
+        for (key, expected) in [
+            ("dialect", "chat_completions"),
+            ("dialect_source", "provider_setting"),
+            ("auth_kind", "api_key"),
+            ("auth_source", "test"),
+            ("context_auth_credentials", "absent"),
+            ("requested_reasoning_summary", "auto"),
+        ] {
+            assert_eq!(
+                error.diagnostic_context.get(key).map(String::as_str),
+                Some(expected),
+                "diagnostic_context[{key}]"
+            );
+        }
+        assert!(
+            !error
+                .diagnostic_context
+                .values()
+                .any(|value| value == "token"),
+            "resolution diagnostics must never carry credential values"
+        );
 
         request.parameters = bcode_model::ModelParameters::default();
         request.provider_context.request.insert(
@@ -9814,6 +9992,58 @@ mod tests {
         );
         let error = validate_openai_request(&chat, &request).expect_err("options must fail");
         assert_eq!(error.code, "chat_provider_options_unsupported");
+    }
+
+    #[test]
+    fn dialect_resolution_reports_its_source() {
+        let api_key = test_api_key_auth();
+        let (dialect, source) =
+            resolve_dialect(&test_chatgpt_auth(), &ProviderRequestContext::default());
+        assert_eq!(dialect, OpenAiCompatibleDialect::ChatGptCodex);
+        assert_eq!(source, DialectSource::ChatGptAuth);
+
+        let mut context = ProviderRequestContext::default();
+        assert_eq!(
+            resolve_dialect(&api_key, &context),
+            (
+                OpenAiCompatibleDialect::ChatCompletions,
+                DialectSource::Default
+            )
+        );
+
+        context
+            .settings
+            .insert("dialect".to_string(), "responses_api".to_string());
+        assert_eq!(
+            resolve_dialect(&api_key, &context),
+            (
+                OpenAiCompatibleDialect::ResponsesApi,
+                DialectSource::ProviderSetting
+            )
+        );
+
+        context
+            .settings
+            .insert("dialect".to_string(), "not-a-dialect".to_string());
+        assert_eq!(
+            resolve_dialect(&api_key, &context),
+            (
+                OpenAiCompatibleDialect::ChatCompletions,
+                DialectSource::UnrecognizedSetting
+            )
+        );
+
+        context.settings.clear();
+        context
+            .env
+            .insert("BCODE_OPENAI_DIALECT".to_string(), "responses".to_string());
+        assert_eq!(
+            resolve_dialect(&api_key, &context),
+            (
+                OpenAiCompatibleDialect::ResponsesApi,
+                DialectSource::Environment
+            )
+        );
     }
 
     #[test]
@@ -10054,6 +10284,7 @@ mod tests {
                 detail: "test".to_string(),
             },
             dialect,
+            dialect_source: DialectSource::ProviderSetting,
             base_url: DEFAULT_BASE_URL.to_string(),
             default_model: Some("model".to_string()),
             fallback_model: "model".to_string(),
