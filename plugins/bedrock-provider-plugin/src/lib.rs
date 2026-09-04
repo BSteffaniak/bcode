@@ -10327,6 +10327,44 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_follow_the_request_context_api_surface() {
+        use bcode_model::{CapabilityExecution, CapabilitySupport, StructuredOutputMode};
+
+        // The host negotiates against the target context, whose `api_surface` is resolved from
+        // the model catalog. A Messages-surface model must advertise the tool-free execution
+        // shape so the host strips tools before the structured round.
+        let messages_context = bcode_model::ProviderRequestContext {
+            api_surface: Some(bcode_model::ModelApiSurface::Messages),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let capabilities = capabilities_for_context(&messages_context);
+        assert!(matches!(
+            capabilities
+                .feature_support
+                .structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Supported {
+                execution: CapabilityExecution::ToolFreeProviderRound,
+                ..
+            }
+        ));
+
+        // A context without a resolved surface (what clients send before target resolution)
+        // reports the default Converse shape. Negotiating against it for a Messages model would
+        // produce a `Direct` execution the Messages adapter cannot honor with tools present.
+        let capabilities =
+            capabilities_for_context(&bcode_model::ProviderRequestContext::default());
+        assert!(matches!(
+            capabilities
+                .feature_support
+                .structured_output(StructuredOutputMode::StrictJsonSchema),
+            CapabilitySupport::Supported {
+                execution: CapabilityExecution::Direct,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn bedrock_structured_output_capabilities_report_surface_fidelity() {
         use bcode_model::{
             CapabilityExecution, CapabilityFidelity, CapabilityMechanism, CapabilitySupport,

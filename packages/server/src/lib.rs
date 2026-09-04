@@ -21197,13 +21197,13 @@ async fn build_model_turn_request(
         );
     }
     // One provider `capabilities` + `models` round trip serves every feature negotiation below.
-    let feature_negotiation = resolve_model_feature_negotiation(
-        state,
-        provider_plugin_id,
-        &model_id,
-        &selection.provider_context,
-    )
-    .await;
+    // Negotiate against the *target* context: it carries the catalog-resolved API surface, so the
+    // provider reports the claims for the surface this request will actually use. The client's
+    // selection context leaves `api_surface` unset, which the provider reads as its default
+    // surface and can report the wrong structured-output execution shape.
+    let feature_negotiation =
+        resolve_model_feature_negotiation(state, provider_plugin_id, &model_id, &provider_context)
+            .await;
     let parallel_capabilities =
         parallel_tool_call_capabilities_from_negotiation(feature_negotiation.as_ref(), true);
     let desired_structured_output =
