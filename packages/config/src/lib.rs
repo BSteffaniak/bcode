@@ -506,9 +506,9 @@ impl BcodeConfig {
                 .map(|_| ModelSelectionSource::Config),
             selected_model_id: self.model.model_id.clone(),
             model_profile: self.model.profile.clone(),
-            auth_profile: None,
-            auth_pool: None,
-            settings: BTreeMap::new(),
+            auth_profile: self.model.auth_profile.clone(),
+            auth_pool: self.model.auth_pool.clone(),
+            settings: self.model.settings.clone(),
             request: BTreeMap::new(),
             reasoning: self.model.reasoning.clone(),
         };
@@ -525,9 +525,15 @@ impl BcodeConfig {
                     name: profile_name.clone(),
                 });
             }
-            selection.auth_profile.clone_from(&profile.auth_profile);
-            selection.auth_pool.clone_from(&profile.auth_pool);
-            selection.settings = profile.settings.clone();
+            if profile.auth_profile.is_some() {
+                selection.auth_profile.clone_from(&profile.auth_profile);
+            }
+            if profile.auth_pool.is_some() {
+                selection.auth_pool.clone_from(&profile.auth_pool);
+            }
+            selection
+                .settings
+                .extend(profile.settings.iter().map(|(k, v)| (k.clone(), v.clone())));
             selection.request = provider_request_values_from_json(&profile.request);
             selection.reasoning = merge_reasoning_config(&self.model.reasoning, &profile.reasoning);
         }
@@ -3206,6 +3212,7 @@ pub enum AuthMode {
 /// Model selection configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "model")]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Default model provider plugin id.
     #[serde(default)]
@@ -3213,6 +3220,18 @@ pub struct ModelConfig {
     /// Default provider-specific model id.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Default auth profile name from `auth.profiles`, used when the active model profile does
+    /// not select one.
+    #[serde(default)]
+    pub auth_profile: Option<String>,
+    /// Default auth pool name from `auth.pools`, used when the active model profile does not
+    /// select one.
+    #[serde(default)]
+    pub auth_pool: Option<String>,
+    /// Default provider-specific settings, merged beneath the active model profile's settings.
+    #[config_doc(map_key = "<setting>")]
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
     /// Default provider reasoning effort/thinking level.
     #[config_doc(values("low", "medium", "high"))]
     #[serde(default)]
@@ -10529,6 +10548,105 @@ profile = "work"
         );
 
         restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn resolves_top_level_model_auth_and_settings_without_a_profile() {
+        // Regression: a single-provider config that attaches auth directly to `[model]` must
+        // resolve that auth. These keys were previously silently dropped, so the provider ran
+        // with no credentials while `[auth.profiles.*]` looked correctly configured.
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-5.6-sol"
+auth_profile = "openai"
+auth_pool = "openai"
+
+[model.settings]
+dialect = "chatgpt_codex"
+
+[auth.profiles.openai]
+backend = "sshenv"
+scheme = "chatgpt"
+"#,
+        )
+        .expect("top-level model auth config should parse");
+
+        let selection = config.resolved_model_selection();
+        assert_eq!(selection.auth_profile.as_deref(), Some("openai"));
+        assert_eq!(selection.auth_pool.as_deref(), Some("openai"));
+        assert_eq!(
+            selection.settings.get("dialect").map(String::as_str),
+            Some("chatgpt_codex")
+        );
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn active_model_profile_overrides_top_level_model_auth_and_merges_settings() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let previous_env = clear_provider_env();
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model]
+profile = "work"
+auth_profile = "personal"
+auth_pool = "personal-pool"
+
+[model.settings]
+dialect = "responses_api"
+request_timeout_secs = "30"
+
+[model.profiles.work]
+provider_plugin_id = "bcode.openai-compatible"
+auth_profile = "work"
+
+[model.profiles.work.settings]
+dialect = "chatgpt_codex"
+"#,
+        )
+        .expect("layered model auth config should parse");
+
+        let selection = config.resolved_model_selection();
+        assert_eq!(selection.auth_profile.as_deref(), Some("work"));
+        // The profile does not name a pool, so the top-level default remains in effect.
+        assert_eq!(selection.auth_pool.as_deref(), Some("personal-pool"));
+        assert_eq!(
+            selection.settings.get("dialect").map(String::as_str),
+            Some("chatgpt_codex"),
+            "profile settings win over top-level settings"
+        );
+        assert_eq!(
+            selection
+                .settings
+                .get("request_timeout_secs")
+                .map(String::as_str),
+            Some("30"),
+            "top-level settings not shadowed by the profile are retained"
+        );
+
+        restore_provider_env(previous_env);
+    }
+
+    #[test]
+    fn unknown_model_keys_are_rejected_instead_of_silently_dropped() {
+        let error = toml::from_str::<BcodeConfig>(
+            r#"
+[model]
+provider_plugin_id = "bcode.openai-compatible"
+auth_profil = "openai"
+"#,
+        )
+        .expect_err("misspelled [model] key must not be accepted");
+        let message = error.to_string();
+        assert!(
+            message.contains("auth_profil"),
+            "error must name the offending key: {message}"
+        );
     }
 
     #[test]

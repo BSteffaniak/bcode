@@ -4128,21 +4128,26 @@ async fn stream_chat_completion_inner(
         key: "diagnostic.auth".to_string(),
         value: auth_trace_metadata(&settings, &request.provider_context),
     });
-    validate_openai_request(&settings, request)?;
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    // Missing auth is checked before dialect validation: with no credentials the dialect is only
+    // a default, so a dialect-gated rejection would misattribute what is really an auth failure.
     if matches!(settings.auth, AuthSettings::Missing) {
         let mut error = provider_error(
             "missing_openai_auth",
             ProviderErrorCategory::Auth,
-            "run `bcode auth login openai` (or `bcode auth login xai`) for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY) for API-key auth",
+            format!(
+                "no OpenAI-compatible credentials were resolved for this request (auth source: {}; {}); run `bcode auth login openai` (or `bcode auth login xai`) for ChatGPT subscription auth, reference an `auth_profile` from the active model selection, or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY) for API-key auth",
+                settings.auth_diagnostics.source, settings.auth_diagnostics.detail,
+            ),
         );
         error.failure = Some(Box::new(openai_failure_context(
             &settings,
             bcode_model::ProviderFailureCapability::ModelInvocation,
             "run `bcode auth login openai`/`bcode auth login xai` or configure the documented API-key environment variable",
         )));
-        return Err(error);
+        return Err(annotate_request_resolution(error, &settings, request));
     }
+    validate_openai_request(&settings, request)?;
+    refresh_chatgpt_auth_if_needed(&mut settings).await?;
     let client = model_stream_client(settings.request_timeout).map_err(|error| {
         provider_error(
             "client_build_failed",
