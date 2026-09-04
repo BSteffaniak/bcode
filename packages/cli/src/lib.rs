@@ -4178,41 +4178,45 @@ enum ModelCommand {
     /// Runs the capability-derived prompt-cache scenario suite (cold/warm requests, growing
     /// conversation, tool loop, TTL matrix, mode off, budget overflow) and fails when any
     /// applicable scenario fails. Models that do not advertise caching are skipped.
-    VerifyCache {
-        /// Maximum number of models to verify after filtering.
-        #[arg(long)]
-        max_models: Option<usize>,
-        /// Model id wildcard filter. Supports `*` globs.
-        #[arg(long)]
-        id_pattern: Option<String>,
-        /// Print candidate models without sending verification requests.
-        #[arg(long)]
-        dry_run: bool,
-        /// Number of tool rounds in the tool-loop scenario.
-        #[arg(long, default_value_t = 6)]
-        tool_rounds: usize,
-        /// Number of appended exchanges in the growing-conversation scenario.
-        #[arg(long, default_value_t = 4)]
-        conversation_turns: usize,
-        /// Override the minimum cacheable prefix when the catalog does not declare one.
-        #[arg(long)]
-        min_prefix_tokens: Option<u64>,
-        /// Print the complete JSON report instead of a summary table.
-        #[arg(long)]
-        json: bool,
-        /// Output JSON report path.
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Per-turn timeout in seconds.
-        #[arg(long, default_value_t = 120)]
-        timeout_seconds: u64,
-    },
+    VerifyCache(VerifyCacheArgs),
     Set {
         session_id: SessionId,
         model_id: String,
         #[arg(long)]
         provider: Option<String>,
     },
+}
+
+/// Arguments for `bcode model verify-cache`.
+#[derive(Debug, clap::Args)]
+struct VerifyCacheArgs {
+    /// Maximum number of models to verify after filtering.
+    #[arg(long)]
+    max_models: Option<usize>,
+    /// Model id wildcard filter. Supports `*` globs.
+    #[arg(long)]
+    id_pattern: Option<String>,
+    /// Print candidate models without sending verification requests.
+    #[arg(long)]
+    dry_run: bool,
+    /// Number of tool rounds in the tool-loop scenario.
+    #[arg(long, default_value_t = 6)]
+    tool_rounds: usize,
+    /// Number of appended exchanges in the growing-conversation scenario.
+    #[arg(long, default_value_t = 4)]
+    conversation_turns: usize,
+    /// Override the minimum cacheable prefix when the catalog does not declare one.
+    #[arg(long)]
+    min_prefix_tokens: Option<u64>,
+    /// Print the complete JSON report instead of a summary table.
+    #[arg(long)]
+    json: bool,
+    /// Output JSON report path.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Per-turn timeout in seconds.
+    #[arg(long, default_value_t = 120)]
+    timeout_seconds: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -5345,27 +5349,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                 timeout_seconds,
             )?;
         }
-        ModelCommand::VerifyCache {
-            max_models,
-            id_pattern,
-            dry_run,
-            tool_rounds,
-            conversation_turns,
-            min_prefix_tokens,
-            json,
-            output,
-            timeout_seconds,
-        } => verify_model_caches(&VerifyCacheArgs {
-            max_models,
-            id_pattern,
-            dry_run,
-            tool_rounds,
-            conversation_turns,
-            min_prefix_tokens,
-            json,
-            output,
-            timeout_seconds,
-        })?,
+        ModelCommand::VerifyCache(args) => verify_model_caches(&args).await?,
         other => {
             ensure_server_running().await?;
             match other {
@@ -5382,7 +5366,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                     model_id,
                 } => set_session_model(session_id, provider, model_id).await?,
                 ModelCommand::Verify { .. }
-                | ModelCommand::VerifyCache { .. }
+                | ModelCommand::VerifyCache(_)
                 | ModelCommand::Ignore { .. }
                 | ModelCommand::Unignore { .. }
                 | ModelCommand::Ignored { .. } => unreachable!("handled above"),
@@ -9611,19 +9595,6 @@ fn provider_error_status(error: &bcode_model::ProviderError) -> String {
     .to_string()
 }
 
-/// Arguments for `bcode model verify-cache`.
-struct VerifyCacheArgs {
-    max_models: Option<usize>,
-    id_pattern: Option<String>,
-    dry_run: bool,
-    tool_rounds: usize,
-    conversation_turns: usize,
-    min_prefix_tokens: Option<u64>,
-    json: bool,
-    output: Option<PathBuf>,
-    timeout_seconds: u64,
-}
-
 /// Current schema version for the `verify-cache` CLI report envelope.
 const CLI_VERIFY_CACHE_REPORT_SCHEMA_VERSION: u32 = 1;
 
@@ -9651,7 +9622,51 @@ enum CliVerifyCacheModelResult {
     Error { message: String },
 }
 
-fn verify_model_caches(args: &VerifyCacheArgs) -> Result<(), CliError> {
+/// List candidate models for `verify-cache`, resolved through the model catalog exactly as the
+/// daemon does: catalog-expanded models the provider cannot discover on its own become candidates,
+/// and every candidate carries the catalog's cache claims (mechanism, TTLs, minimum prefix) that
+/// the scenario suite judges by.
+async fn verify_cache_candidates(
+    host: &bcode_plugin::PluginHost,
+    provider_plugin_id: &str,
+    context: &bcode_model::ProviderRequestContext,
+    selected_model_id: Option<&str>,
+    args: &VerifyCacheArgs,
+) -> Result<Vec<bcode_model::ModelInfo>, CliError> {
+    let models: bcode_model::ModelList = host
+        .invoke_service_json(
+            provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_MODELS,
+            &bcode_model::ModelListRequest {
+                provider_context: context.clone(),
+                selected_model_id: selected_model_id.map(ToOwned::to_owned),
+            },
+        )
+        .map_err(plugin_service_call_error)?;
+    let catalog = bcode_model_catalog::ModelCatalogResolver::new(
+        bcode_model_catalog::RemoteCatalogOptions::default(),
+    )
+    .map_err(|error| CliError::PluginCli(format!("model catalog unavailable: {error}")))?;
+    let models = catalog
+        .resolve_selection(models, selected_model_id, None)
+        .await;
+    let mut candidates = models
+        .models
+        .into_iter()
+        .filter(|model| {
+            args.id_pattern
+                .as_deref()
+                .is_none_or(|pattern| wildcard_match(pattern, &model.model_id))
+        })
+        .collect::<Vec<_>>();
+    if let Some(max_models) = args.max_models {
+        candidates.truncate(max_models);
+    }
+    Ok(candidates)
+}
+
+async fn verify_model_caches(args: &VerifyCacheArgs) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let context = configured_provider_context(&config);
     let selection = config.resolved_model_selection();
@@ -9659,43 +9674,32 @@ fn verify_model_caches(args: &VerifyCacheArgs) -> Result<(), CliError> {
         CliError::PluginCli("no model provider is configured; pass --provider".to_string())
     })?;
     let mut host = load_cli_plugin_host()?;
-    let list_request = bcode_model::ModelListRequest {
-        provider_context: context.clone(),
-        selected_model_id: selection.selected_model_id,
-    };
-    let models: bcode_model::ModelList = host
-        .invoke_service_json(
-            &provider_plugin_id,
-            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-            bcode_model::OP_MODELS,
-            &list_request,
-        )
-        .map_err(plugin_service_call_error)?;
-    let mut candidates = models
-        .models
-        .into_iter()
-        .map(|model| model.model_id)
-        .filter(|model_id| {
-            args.id_pattern
-                .as_deref()
-                .is_none_or(|pattern| wildcard_match(pattern, model_id))
-        })
-        .collect::<Vec<_>>();
-    if let Some(max_models) = args.max_models {
-        candidates.truncate(max_models);
-    }
+    let candidates = verify_cache_candidates(
+        &host,
+        &provider_plugin_id,
+        &context,
+        selection.selected_model_id.as_deref(),
+        args,
+    )
+    .await?;
 
     let mut results = BTreeMap::new();
     let mut passed = true;
     let mut invoker = CliPluginTurnInvoker { host: &mut host };
-    for model_id in &candidates {
+    for model in &candidates {
+        let model_id = &model.model_id;
         let result = if args.dry_run {
             CliVerifyCacheModelResult::DryRun
         } else {
+            let mut provider_context = context.clone();
+            if provider_context.api_surface.is_none() {
+                provider_context.api_surface = model.api_surface;
+            }
             let options = bcode_prompt_cache::scenarios::PromptCacheScenarioOptions {
                 provider_plugin_id: Some(provider_plugin_id.clone()),
-                provider_context: context.clone(),
+                provider_context,
                 model_id: Some(model_id.clone()),
+                resolved_model: Some(model.clone()),
                 overrides: bcode_prompt_cache::expectations::PromptCacheExpectationOverrides {
                     min_prefix_tokens: args.min_prefix_tokens,
                     ..Default::default()

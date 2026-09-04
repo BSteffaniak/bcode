@@ -53,6 +53,13 @@ pub struct PromptCacheScenarioOptions {
     pub provider_context: ProviderRequestContext,
     /// Model to test. `None` selects the provider's default or first listed model.
     pub model_id: Option<String>,
+    /// Catalog-resolved model metadata to use instead of the provider's raw listing.
+    ///
+    /// Hosts resolve provider listings through the model catalog, which can expand models the
+    /// provider cannot discover on its own and enrich cache claims. Callers that have already
+    /// performed that resolution pass the result here so the suite judges against the same
+    /// claims the daemon would use; `model_id` is then ignored for lookup.
+    pub resolved_model: Option<ModelInfo>,
     /// Expectation overrides for facts the claim source cannot express.
     pub overrides: PromptCacheExpectationOverrides,
     /// Number of tool rounds in the tool-loop scenario.
@@ -71,6 +78,7 @@ impl Default for PromptCacheScenarioOptions {
             provider_plugin_id: None,
             provider_context: ProviderRequestContext::default(),
             model_id: None,
+            resolved_model: None,
             overrides: PromptCacheExpectationOverrides::default(),
             tool_rounds: 6,
             conversation_turns: 4,
@@ -224,8 +232,12 @@ impl Workload {
             .unwrap_or(usize::MAX)
             .saturating_mul(2)
             .max(STABLE_PREFIX_MIN_WORDS);
-        let mut system_prompt = String::from(
-            "You are a deterministic prompt-cache verification assistant. Reply briefly.\n",
+        // Real provider caches are keyed by content, not by the caller's cache key, so a prefix
+        // reused from an earlier run would already be warm. Salt the stable prefix per suite run
+        // so the cold request is genuinely cold while every scenario within the run shares it.
+        let run_salt = bcode_session_models::SessionId::new();
+        let mut system_prompt = format!(
+            "You are a deterministic prompt-cache verification assistant (run {run_salt}). Reply briefly.\n"
         );
         let mut words = system_prompt.split_whitespace().count();
         let mut word = 0_usize;
@@ -281,7 +293,12 @@ where
                 ..ToolCallRequestPolicy::default()
             },
             tool_schema_mode: None,
-            parameters: ModelParameters::default(),
+            parameters: ModelParameters {
+                // Hosts resolve the model's advertised output limit into every request; some
+                // adapters refuse to substitute a local default.
+                max_output_tokens: self.model.max_output_tokens.map(|limit| limit.min(1_024)),
+                ..ModelParameters::default()
+            },
             structured_output: None,
             context_management: bcode_model::ContextManagementRequest::default(),
             prompt_cache: PromptCacheHints {
@@ -626,6 +643,8 @@ where
             messages.push(user(&format!("Overflow probe message {index}.")));
             messages.push(assistant(&format!("overflow probe reply {index}.")));
         }
+        // Conversations must end on a user turn: some models reject assistant prefill.
+        messages.push(user("Reply with exactly: overflow probe complete."));
         request.messages = messages;
         self.plan(&mut request, PromptCacheMode::Auto);
         let ttl = request.prompt_cache.ttl_seconds;
@@ -703,17 +722,19 @@ where
         scenario: &'static str,
         request: &ModelTurnRequest,
     ) -> Result<CacheRoundObservation, PromptCacheScenarioError> {
-        let (summary, usage) = execute_turn(self.invoker, self.options, scenario, request)?;
+        let outcome = execute_turn(self.invoker, self.options, scenario, request)?;
+        let (summary, usage) = (outcome.summary, outcome.usage);
         if matches!(
             summary.stop_reason,
             StopReason::Error | StopReason::Cancelled
         ) {
+            let detail = outcome.error.map_or_else(
+                || format!("{:?}", summary.error_category),
+                |error| format!("{:?} {}: {}", error.category, error.code, error.message),
+            );
             return Err(PromptCacheScenarioError::Contract {
                 scenario,
-                message: format!(
-                    "turn ended with {:?} ({:?})",
-                    summary.stop_reason, summary.error_category
-                ),
+                message: format!("turn ended with {:?} ({detail})", summary.stop_reason),
             });
         }
         let Some(usage) = usage else {
@@ -735,8 +756,9 @@ where
         scenario: &'static str,
         request: &ModelTurnRequest,
     ) -> Result<Option<ProviderErrorCategory>, PromptCacheScenarioError> {
-        let (summary, _) = execute_turn(self.invoker, self.options, scenario, request)?;
-        Ok(summary.error_category)
+        Ok(execute_turn(self.invoker, self.options, scenario, request)?
+            .summary
+            .error_category)
     }
 }
 
@@ -787,6 +809,9 @@ where
             selected_model_id: options.model_id.clone(),
         },
     )?;
+    if let Some(model) = &options.resolved_model {
+        return Ok((provider, model.clone()));
+    }
     let models: ModelList = invoke(
         invoker,
         options,
@@ -826,10 +851,12 @@ where
     Ok((provider, model))
 }
 
-type TurnOutcome = (
-    bcode_model_provider_runtime::ProviderEventSummary,
-    Option<bcode_model::TokenUsage>,
-);
+struct TurnOutcome {
+    summary: bcode_model_provider_runtime::ProviderEventSummary,
+    usage: Option<bcode_model::TokenUsage>,
+    /// Normalized provider error when the turn failed; carried for diagnostics only.
+    error: Option<bcode_model::ProviderError>,
+}
 
 fn execute_turn<I>(
     invoker: &mut I,
@@ -850,6 +877,7 @@ where
     let deadline = Instant::now() + options.turn_timeout;
     let mut validator = ProviderEventValidator::default();
     let mut usage = None;
+    let mut error = None;
     while !validator.is_terminal() {
         if Instant::now() >= deadline {
             cleanup(invoker, options, scenario, &start.provider_turn_id);
@@ -874,8 +902,10 @@ where
             }
         };
         for event in &response.events {
-            if let ProviderTurnEvent::Usage { usage: snapshot } = event {
-                usage = Some(snapshot.clone());
+            match event {
+                ProviderTurnEvent::Usage { usage: snapshot } => usage = Some(snapshot.clone()),
+                ProviderTurnEvent::Error { error: failure } => error = Some(failure.clone()),
+                _ => {}
             }
         }
         if let Err(error) = validator.observe(&response.events) {
@@ -905,7 +935,11 @@ where
             provider_turn_id: start.provider_turn_id.clone(),
         },
     )?;
-    Ok((summary, usage))
+    Ok(TurnOutcome {
+        summary,
+        usage,
+        error,
+    })
 }
 
 fn cleanup<I>(

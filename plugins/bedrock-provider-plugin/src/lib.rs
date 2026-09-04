@@ -2483,7 +2483,10 @@ impl AnthropicMessagesAccumulator {
                     && let Some(tool) = self.tool_calls.get_mut(&index)
                 {
                     tool.arguments.push_str(json);
-                    if !self.synthetic_call_indexes.contains(&index)
+                    // Anthropic streams an empty `partial_json` when a tool_use block opens;
+                    // an empty delta carries nothing and violates the provider contract.
+                    if !json.is_empty()
+                        && !self.synthetic_call_indexes.contains(&index)
                         && let Some(call_id) = &tool.id
                     {
                         turn.push(ProviderTurnEvent::ToolCallDelta {
@@ -9073,6 +9076,42 @@ mod tests {
         ));
         assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { call } if call.name == "shell.run" && call.arguments["command"] == "pwd")));
         assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::ExactRequestInputTokens { tokens } if tokens.get() == 12)));
+    }
+
+    #[test]
+    fn anthropic_messages_skips_empty_tool_input_deltas() {
+        // Anthropic opens every tool_use block with an empty `partial_json` delta; forwarding it
+        // would violate the provider contract's non-empty tool-call delta rule.
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        accumulator
+            .process(
+                &serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell_run","input":{}}}),
+                &turn,
+            )
+            .expect("tool start should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}),
+                &turn,
+            )
+            .expect("empty delta should process");
+        accumulator
+            .process(
+                &serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}),
+                &turn,
+            )
+            .expect("tool delta should process");
+
+        let deltas = turn
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ToolCallDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec!["{\"command\":\"pwd\"}".to_string()]);
     }
 
     #[test]

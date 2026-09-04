@@ -20,6 +20,7 @@ bcode_hyperchad              = { workspace = true, optional = true }
 bcode_ipc                    = { workspace = true }
 bcode_metrics                = { workspace = true }
 bcode_model                  = { workspace = true }
+bcode_model_catalog          = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin                 = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
