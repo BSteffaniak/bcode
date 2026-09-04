@@ -8095,6 +8095,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_rewrites_coalesce_activity_only_appends_and_converge_on_release() {
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::in_memory();
+        let manager = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            metrics.clone(),
+            SessionLeaseOwnerContext::default(),
+        )
+        .expect("manager should initialize");
+        let session = manager
+            .create_session(Some("coalesced".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let manifest_path = root.join(session.id.to_string()).join("manifest.json");
+        let read_manifest = || -> SessionSummary {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest reads"))
+                    .expect("manifest decodes");
+            serde_json::from_value(value["summary"].clone()).expect("summary decodes")
+        };
+        let writes = || {
+            metrics
+                .snapshot()
+                .counters
+                .get("session.manifest.write_total")
+                .copied()
+                .unwrap_or_default()
+        };
+        let skipped = || {
+            metrics
+                .snapshot()
+                .counters
+                .get("session.manifest.write_skipped_total")
+                .copied()
+                .unwrap_or_default()
+        };
+
+        // A display-field change (title) rewrites the manifest immediately.
+        let writes_before_rename = writes();
+        manager
+            .rename_session(session.id, Some("renamed".to_string()))
+            .await
+            .expect("rename");
+        assert_eq!(writes(), writes_before_rename + 1);
+        assert_eq!(read_manifest().name.as_deref(), Some("renamed"));
+
+        // Activity-only appends within the refresh interval are coalesced while the session is
+        // owned (as during a turn); the manifest keeps the last written activity time rather than
+        // costing a file rewrite per event.
+        let guard = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("ownership guard");
+        let writes_before_activity = writes();
+        let skipped_before_activity = skipped();
+        let manifest_activity_before = read_manifest().updated_at_ms;
+        for index in 0..8_u64 {
+            manager
+                .append_context_compacted(session.id, format!("summary {index}"), 0)
+                .await
+                .expect("append");
+        }
+        assert_eq!(
+            writes(),
+            writes_before_activity,
+            "activity ticks must not rewrite"
+        );
+        assert_eq!(skipped(), skipped_before_activity + 8);
+        assert_eq!(read_manifest().updated_at_ms, manifest_activity_before);
+
+        // Releasing the idle database converges the display cache on the final summary.
+        let latest = manager
+            .session_summary(session.id)
+            .await
+            .expect("summary")
+            .updated_at_ms;
+        assert!(latest > manifest_activity_before);
+        drop(guard);
+        manager
+            .release_idle_session_resources(session.id)
+            .await
+            .expect("release");
+        assert_eq!(read_manifest().updated_at_ms, latest);
+        assert_eq!(writes(), writes_before_activity + 1);
+
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn normal_catalog_read_does_not_initialize_missing_schema() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("root creates");

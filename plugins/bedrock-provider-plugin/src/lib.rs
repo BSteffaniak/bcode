@@ -47,7 +47,7 @@ use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_ID: &str = "bcode.bedrock";
@@ -5337,6 +5337,14 @@ fn get_or_refresh_discovery_sync(
 /// Discovery is normally warmed at plugin activation, so this wait only matters on the very
 /// first picker open (or after a profile switch) and keeps the picker path bounded.
 const PICKER_DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
+/// How long a recorded discovery failure suppresses new control-plane discovery attempts.
+///
+/// Every model request build lists models several times. When live discovery fails (for example
+/// a Bedrock API key without control-plane access, or an offline host), re-running the paginated
+/// discovery calls on each list would add a full network round trip per call while the host still
+/// expands membership from the bundled catalog. A failure is therefore retried at most once per
+/// cooldown; `validate_config` and diagnostics continue to surface the recorded failure.
+const DISCOVERY_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_mins(1);
 
 /// Return the discovered model list for the interactive picker with bounded waiting.
 ///
@@ -5344,7 +5352,9 @@ const PICKER_DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
 /// paginated Bedrock API calls. A fresh cache is returned immediately; a stale cache is returned
 /// immediately while a refresh runs in the background. When nothing is cached yet, the picker
 /// waits at most [`PICKER_DISCOVERY_WAIT`] for the (shared, deduplicated) discovery task before
-/// returning an empty live list, which the host still expands from the bundled catalog.
+/// returning an empty live list, which the host still expands from the bundled catalog. A
+/// discovery failure recorded within [`DISCOVERY_FAILURE_RETRY_COOLDOWN`] returns the empty live
+/// list immediately instead of repeating the failed control-plane calls.
 fn discovery_for_picker_nonblocking(
     runtime: &ProviderRuntime,
     cache: &Arc<Mutex<DiscoveryCache>>,
@@ -5365,6 +5375,9 @@ fn discovery_for_picker_nonblocking(
     if let Some(stale) = stale_cached_discovery(&cache, &key) {
         spawn_discovery_refresh(runtime, cache, settings, key);
         return stale;
+    }
+    if discovery_failure_is_recent(&cache, &key) {
+        return ModelDiscovery::default();
     }
     // Run discovery as an independent task so a picker timeout never cancels it mid-flight; the
     // picker only bounds how long it waits for the result.
@@ -5474,6 +5487,15 @@ fn last_discovery_failure(
     key: &DiscoveryCacheKey,
 ) -> Option<DiscoveryFailure> {
     cache.lock().ok()?.failures.get(key).cloned()
+}
+
+/// Whether discovery for `key` failed within [`DISCOVERY_FAILURE_RETRY_COOLDOWN`].
+fn discovery_failure_is_recent(
+    cache: &Arc<Mutex<DiscoveryCache>>,
+    key: &DiscoveryCacheKey,
+) -> bool {
+    last_discovery_failure(cache, key)
+        .is_some_and(|failure| failure.failed_at.elapsed() < DISCOVERY_FAILURE_RETRY_COOLDOWN)
 }
 
 /// Return a cached discovery ignoring the freshness TTL, applying compatibility filtering.
@@ -5885,15 +5907,70 @@ fn now_unix_seconds() -> u64 {
 }
 
 async fn discovery_cache_key(settings: &Settings) -> DiscoveryCacheKey {
-    let config = bedrock_sdk_config(settings).await;
     DiscoveryCacheKey {
-        region: config
-            .region()
-            .map_or_else(|| DEFAULT_REGION.to_string(), ToString::to_string),
+        region: resolved_discovery_region(settings).await,
         aws_profile: settings.aws_profile.clone(),
         endpoint_url: settings.endpoint_url.clone(),
         bearer_auth: client_context_bearer_token(settings).is_some(),
     }
+}
+
+/// Inputs that determine which region the AWS SDK default chain resolves for discovery.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResolvedRegionKey {
+    region: Option<String>,
+    aws_profile: Option<String>,
+    endpoint_url: Option<String>,
+    request_scoped: bool,
+    explicit_credentials: bool,
+}
+
+const RESOLVED_REGION_TTL: Duration = Duration::from_mins(10);
+
+fn resolved_region_cache() -> &'static Mutex<BTreeMap<ResolvedRegionKey, (String, Instant)>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<ResolvedRegionKey, (String, Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+/// Resolve the discovery region for `settings`, memoizing the AWS SDK default-chain result.
+///
+/// Loading the SDK config walks the full region chain (environment, shared config/credentials
+/// files, and on some hosts an IMDS probe) and is invoked for every `models` service call and
+/// every turn. The result is a pure function of the settings inputs captured in
+/// [`ResolvedRegionKey`], so it is cached for [`RESOLVED_REGION_TTL`] to keep model-request
+/// construction off the SDK bootstrap path.
+async fn resolved_discovery_region(settings: &Settings) -> String {
+    if let Some(region) = settings
+        .region
+        .as_deref()
+        .filter(|region| !region.is_empty())
+    {
+        return region.to_owned();
+    }
+    let key = ResolvedRegionKey {
+        region: settings.region.clone(),
+        aws_profile: settings.aws_profile.clone(),
+        endpoint_url: settings.endpoint_url.clone(),
+        request_scoped: settings.config_source.starts_with("request/"),
+        explicit_credentials: client_context_credentials(settings).is_some(),
+    };
+    if let Some(region) = resolved_region_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+        .filter(|(_, resolved_at)| resolved_at.elapsed() < RESOLVED_REGION_TTL)
+        .map(|(region, _)| region)
+    {
+        return region;
+    }
+    let config = bedrock_sdk_config(settings).await;
+    let region = config
+        .region()
+        .map_or_else(|| DEFAULT_REGION.to_string(), ToString::to_string);
+    if let Ok(mut cache) = resolved_region_cache().lock() {
+        cache.insert(key, (region.clone(), Instant::now()));
+    }
+    region
 }
 
 async fn discover_models(settings: &Settings) -> Result<ModelDiscovery, ProviderError> {
@@ -11079,6 +11156,94 @@ mod tests {
             }
             other => panic!("the default picker must expand Responses models, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recent_discovery_failure_short_circuits_picker_discovery() {
+        let cache = Arc::new(Mutex::new(DiscoveryCache::default()));
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".to_string(),
+            aws_profile: None,
+            endpoint_url: None,
+            bearer_auth: true,
+        };
+        assert!(!discovery_failure_is_recent(&cache, &key));
+        cache.lock().expect("cache").failures.insert(
+            key.clone(),
+            DiscoveryFailure {
+                code: "bedrock_model_discovery_failed".to_string(),
+                category: ProviderErrorCategory::ProviderInternal,
+                message: "request failed".to_string(),
+                failed_at: Instant::now(),
+            },
+        );
+        assert!(discovery_failure_is_recent(&cache, &key));
+        cache
+            .lock()
+            .expect("cache")
+            .failures
+            .get_mut(&key)
+            .expect("recorded failure")
+            .failed_at = Instant::now()
+            .checked_sub(DISCOVERY_FAILURE_RETRY_COOLDOWN)
+            .expect("cooldown fits within process uptime");
+        assert!(!discovery_failure_is_recent(&cache, &key));
+        // A successful discovery clears the recorded failure entirely.
+        store_discovery(&cache, key.clone(), ModelDiscovery::default());
+        assert!(last_discovery_failure(&cache, &key).is_none());
+    }
+
+    #[test]
+    #[ignore = "release-mode `models` service-call profile; run explicitly with --ignored --nocapture"]
+    fn benchmark_models_service_call_with_warm_discovery_cache() {
+        let plugin = BedrockProviderPlugin::default();
+        let mut context = ProviderRequestContext::default();
+        context
+            .settings
+            .insert("region".to_string(), "us-east-1".to_string());
+        let request = ModelListRequest {
+            provider_context: context,
+            selected_model_id: None,
+        };
+        let settings = Settings::resolve_from_context(&request.provider_context);
+        let runtime = plugin.runtime.as_ref().expect("provider runtime");
+        let key = runtime
+            .block_on(async move { discovery_cache_key(&settings).await })
+            .expect("cache key");
+        store_discovery(
+            &plugin.discovery,
+            key,
+            ModelDiscovery {
+                models: model_infos_from_ids(
+                    &["anthropic.claude-fable-5-1".to_string()],
+                    Some("anthropic.claude-fable-5-1"),
+                ),
+                default_model_id: Some("anthropic.claude-fable-5-1".to_string()),
+            },
+        );
+        let _ = plugin.models(&request);
+        let mut settings_us = Vec::new();
+        let mut key_us = Vec::new();
+        let mut models_us = Vec::new();
+        for _ in 0..50 {
+            let started = Instant::now();
+            let settings = Settings::resolve_from_context(&request.provider_context);
+            settings_us.push(started.elapsed().as_micros());
+            let started = Instant::now();
+            let _ = runtime.block_on(async move { discovery_cache_key(&settings).await });
+            key_us.push(started.elapsed().as_micros());
+            let started = Instant::now();
+            let list = plugin.models(&request);
+            models_us.push(started.elapsed().as_micros());
+            assert!(!list.models.is_empty());
+        }
+        settings_us.sort_unstable();
+        key_us.sort_unstable();
+        models_us.sort_unstable();
+        eprintln!(
+            "bedrock_models: settings_p50_us={} cache_key_p50_us={} models_p50_us={} models_max_us={}",
+            settings_us[25], key_us[25], models_us[25], models_us[49]
+        );
     }
 
     #[tokio::test]

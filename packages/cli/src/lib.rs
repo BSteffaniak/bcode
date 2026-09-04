@@ -10042,18 +10042,27 @@ fn diagnostic_observations(status: &ServerStatus) -> Vec<DiagnosticObservation> 
     add_histogram_observation(
         &mut observations,
         status,
-        "session.event_log.append_duration_ms",
+        "session.actor.append_event.duration_ms",
         100,
         "slow_session_event_appends",
-        "session event appends have exceeded 100ms",
+        "canonical session event appends have exceeded 100ms",
+    );
+    add_histogram_average_observation(
+        &mut observations,
+        status,
+        "session.actor.append_event.db_append_duration_ms",
+        15,
+        50,
+        "high_average_session_append_latency",
+        "canonical session appends average over 15ms; check per-append statement count, lock contention, and disk sync cost",
     );
     add_histogram_observation(
         &mut observations,
         status,
-        "session.metadata_index.write_duration_ms",
-        100,
-        "slow_session_metadata_writes",
-        "session metadata index writes have exceeded 100ms",
+        "session.catalog.flush_duration_ms",
+        500,
+        "slow_session_catalog_flush",
+        "session catalog flushes have exceeded 500ms",
     );
     add_histogram_observation(
         &mut observations,
@@ -10062,6 +10071,23 @@ fn diagnostic_observations(status: &ServerStatus) -> Vec<DiagnosticObservation> 
         500,
         "slow_model_request_builds",
         "model request construction has exceeded 500ms",
+    );
+    add_histogram_average_observation(
+        &mut observations,
+        status,
+        "model.provider.service.duration_ms",
+        100,
+        20,
+        "slow_model_provider_service_calls",
+        "model provider control-plane calls (models/capabilities) average over 100ms; request construction repeats them several times per turn",
+    );
+    add_histogram_observation(
+        &mut observations,
+        status,
+        "database.operation.duration_ms",
+        1_000,
+        "slow_database_operation",
+        "a single session database operation has exceeded 1s; check lock contention between daemons",
     );
     add_histogram_observation(
         &mut observations,
@@ -10109,7 +10135,69 @@ fn diagnostic_observations(status: &ServerStatus) -> Vec<DiagnosticObservation> 
             message: "model provider has returned many empty poll responses".to_string(),
         });
     }
+    add_session_search_retry_observation(&mut observations, status);
     observations
+}
+
+/// Flag a session-search ingestion worker that is failing far more often than it succeeds.
+///
+/// A degraded or locked provider used to requeue every dirty session in a hot loop, which was
+/// visible only as steadily rising daemon CPU and database operation counts. The failure/completion
+/// ratio is the direct signal for that regression.
+fn add_session_search_retry_observation(
+    observations: &mut Vec<DiagnosticObservation>,
+    status: &ServerStatus,
+) {
+    let counter = |name: &str| {
+        status
+            .metrics
+            .counters
+            .get(name)
+            .copied()
+            .unwrap_or_default()
+    };
+    let failed = counter("server.session_search.ingestion_session_failed_total");
+    let completed = counter("server.session_search.ingestion_session_completed_total");
+    let requeued = counter("server.session_search.ingestion_session_requeued_total");
+    if failed >= 100 && failed > completed.saturating_mul(4) {
+        observations.push(DiagnosticObservation {
+            severity: DiagnosticSeverity::Warning,
+            code: "session_search_ingestion_retry_storm".to_string(),
+            message: format!(
+                "session-search ingestion failed {failed} times against {completed} completions ({requeued} requeues); run `bcode session search-status` to find the degraded provider"
+            ),
+        });
+    }
+}
+
+/// Flag a histogram whose average exceeds `threshold_ms` once it has enough samples to be stable.
+fn add_histogram_average_observation(
+    observations: &mut Vec<DiagnosticObservation>,
+    status: &ServerStatus,
+    key: &str,
+    threshold_ms: u64,
+    minimum_samples: u64,
+    code: &str,
+    message: &str,
+) {
+    let Some(histogram) = status.metrics.histograms.get(key) else {
+        return;
+    };
+    if histogram.count < minimum_samples {
+        return;
+    }
+    let average_ms = histogram.sum / histogram.count.max(1);
+    if average_ms >= threshold_ms {
+        observations.push(DiagnosticObservation {
+            severity: DiagnosticSeverity::Warning,
+            code: code.to_string(),
+            message: format!(
+                "{message}; average={average_ms}ms over {} samples, max={}ms",
+                histogram.count,
+                histogram.max.unwrap_or_default()
+            ),
+        });
+    }
 }
 
 fn add_histogram_observation(
@@ -19657,6 +19745,101 @@ mod latency_diagnosis_tests {
         assert!(
             observations.is_empty(),
             "a status without metrics must not invent latency findings"
+        );
+    }
+
+    fn status_with_average(key: &str, count: u64, average_ms: u64) -> ServerStatus {
+        let mut metrics = MetricsSnapshot::default();
+        metrics.histograms.insert(
+            key.to_owned(),
+            HistogramSnapshot {
+                count,
+                sum: count * average_ms,
+                min: Some(average_ms),
+                max: Some(average_ms),
+                buckets: Vec::new(),
+            },
+        );
+        status_with_metrics(metrics)
+    }
+
+    #[test]
+    fn high_average_session_append_latency_requires_enough_samples() {
+        let few = diagnostic_observations(&status_with_average(
+            "session.actor.append_event.db_append_duration_ms",
+            10,
+            40,
+        ));
+        assert!(
+            !few.iter()
+                .any(|observation| observation.code == "high_average_session_append_latency"),
+            "a handful of slow appends is not a trend"
+        );
+
+        let sustained = diagnostic_observations(&status_with_average(
+            "session.actor.append_event.db_append_duration_ms",
+            500,
+            19,
+        ));
+        let observation = sustained
+            .iter()
+            .find(|observation| observation.code == "high_average_session_append_latency")
+            .expect("sustained slow appends should be diagnosed");
+        assert!(observation.message.contains("average=19ms"));
+        assert!(observation.message.contains("statement count"));
+    }
+
+    #[test]
+    fn repeated_slow_provider_control_plane_calls_are_reported() {
+        let observations = diagnostic_observations(&status_with_average(
+            "model.provider.service.duration_ms",
+            737,
+            473,
+        ));
+        let observation = observations
+            .iter()
+            .find(|observation| observation.code == "slow_model_provider_service_calls")
+            .expect("slow models/capabilities calls should be diagnosed");
+        assert!(observation.message.contains("several times per turn"));
+    }
+
+    #[test]
+    fn session_search_retry_storm_is_reported_from_failure_ratio() {
+        let mut metrics = MetricsSnapshot::default();
+        metrics.counters.insert(
+            "server.session_search.ingestion_session_failed_total".to_owned(),
+            173_050,
+        );
+        metrics.counters.insert(
+            "server.session_search.ingestion_session_requeued_total".to_owned(),
+            173_049,
+        );
+        metrics.counters.insert(
+            "server.session_search.ingestion_session_completed_total".to_owned(),
+            12,
+        );
+        let observations = diagnostic_observations(&status_with_metrics(metrics));
+        let observation = observations
+            .iter()
+            .find(|observation| observation.code == "session_search_ingestion_retry_storm")
+            .expect("retry storm should be diagnosed");
+        assert!(matches!(observation.severity, DiagnosticSeverity::Warning));
+        assert!(observation.message.contains("search-status"));
+
+        // Ordinary transient failures alongside healthy completions are not a storm.
+        let mut healthy = MetricsSnapshot::default();
+        healthy.counters.insert(
+            "server.session_search.ingestion_session_failed_total".to_owned(),
+            150,
+        );
+        healthy.counters.insert(
+            "server.session_search.ingestion_session_completed_total".to_owned(),
+            1_000,
+        );
+        assert!(
+            !diagnostic_observations(&status_with_metrics(healthy))
+                .iter()
+                .any(|observation| observation.code == "session_search_ingestion_retry_storm")
         );
     }
 }

@@ -261,9 +261,18 @@ reads at most each provider's advertised record limit from forward canonical his
 allowlisted finalized-event projection, validates the portable batch, and invokes `apply_batch`.
 The worker also enforces advertised text limits and can advance through an event-only page using an
 explicit indexed-through sequence without fabricating searchable records. A scheduling slice drains at
-most 16 pages per provider, requeues remaining work, and retries failed sessions after 100 ms, keeping
-catch-up bounded and detached from canonical interaction. Bounded operational metrics record dirty-batch
-size, page events, batch records/text bytes, per-session duration, completion/failure, retry, and slice
+most 16 pages per provider and requeues remaining work. Providers whose status reports a
+non-writable state (degraded, rebuilding, quota exceeded, corrupt, disabled, or unavailable) are
+skipped before any canonical read so an unavailable provider costs no per-attempt session work.
+Retryable failures requeue the session with exponential per-session backoff (100 ms doubling to a
+one-minute cap) and park it after eight consecutive failures until the next canonical commit re-marks
+it; a new commit always clears the backoff. Deferred sessions remain in the bounded dirty set but are
+not due until their backoff elapses, so repeated worker wakeups never re-attempt them early. This
+keeps catch-up bounded and detached from canonical interaction while preventing a persistently
+failing provider from becoming a hot loop of provider discovery and canonical reads. Bounded
+operational metrics record dirty-batch
+size, page events, batch records/text bytes, per-session duration, completion/failure, retry, park,
+and slice
 requeue without session IDs or provider-controlled labels. Retry classification treats stale generation,
 checkpoint conflict, quota exhaustion, disabled content, invalid requests, and typed response
 incompatibility as terminal for the dirty item; only transient transport/service failures retry.
@@ -291,7 +300,10 @@ exact configured content-kind allowlist. Mutable title, activity, working-direct
 fields do not change generation. A changed content allowlist or quota produces explicit degraded,
 rebuild-required status rather than reusing prior coverage; canonical generation mismatch likewise
 produces terminal stale or rebuild-required state before paging and never causes silent reuse or
-merge.
+merge. A failed engine open (for example a Tantivy writer lock still held by another daemon on a
+shared state root) is reported as degraded and remembered, but it is retried at most once per
+30-second cooldown rather than permanently until explicit rebuild, so a transient lock resolves
+without maintenance once the other process exits.
 
 Historical backfill, full rebuild, policy-change reindexing, and purge are explicit cancellable
 maintenance operations. Provider routing is query-time policy, not derived-state identity. Changing a route may leave

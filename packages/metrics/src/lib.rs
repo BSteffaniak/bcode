@@ -28,6 +28,7 @@ const DEFAULT_METRICS_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_METRICS_TOTAL_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_METRICS_RECENT_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const METRICS_MANIFEST_FILE_NAME: &str = "manifest.json";
+const METRICS_WRITER_LOCK_FILE_NAME: &str = "writer.lock";
 const METRICS_EVENT_QUEUE_CAPACITY: usize = 8_192;
 const DATABASE_SLOW_OPERATION_MS: u64 = 100;
 
@@ -1746,6 +1747,21 @@ impl SynchronousMetricsEventLog {
             return Ok(());
         }
         fs::create_dir_all(&self.root_dir)?;
+        // Several daemons (one per artifact identity) share one metrics root. Without a lock each
+        // writer loads, mutates, and rewrites the manifest independently, which clobbers segment
+        // accounting, forces spurious rotations, and orphans segments that pruning never sees.
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(self.root_dir.join(METRICS_WRITER_LOCK_FILE_NAME))?;
+        lock_file.lock()?;
+        let result = self.try_append_events_locked(events);
+        let _ = lock_file.unlock();
+        result
+    }
+
+    fn try_append_events_locked(&self, events: &[MetricEvent]) -> std::io::Result<()> {
         let now_ms = current_unix_millis();
         let mut manifest = self.load_or_initialize_manifest(now_ms);
         let lines = events
@@ -1763,9 +1779,19 @@ impl SynchronousMetricsEventLog {
             .create(true)
             .append(true)
             .open(&active_path)?;
-        for line in lines {
-            writeln!(file, "{line}")?;
+        // A writer that was killed mid-write can leave a partial final line without its newline.
+        // Appending directly after it would glue two records onto one line and lose both, so
+        // terminate the partial line first; the line reader then skips only the damaged record.
+        if !segment_ends_with_newline(&active_path)? {
+            file.write_all(b"\n")?;
         }
+        // Emit the whole batch in one write so an abrupt exit can truncate at most one record.
+        let mut batch = String::with_capacity(usize::try_from(line_bytes).unwrap_or(0));
+        for line in lines {
+            batch.push_str(&line);
+            batch.push('\n');
+        }
+        file.write_all(batch.as_bytes())?;
         let active_bytes = fs::metadata(&active_path).map_or(line_bytes, |metadata| metadata.len());
         let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
         if let Some(segment) = manifest
@@ -1877,6 +1903,40 @@ impl SynchronousMetricsEventLog {
                 return Err(error);
             }
             manifest.total_segment_bytes = compute_total_segment_bytes(&self.root_dir, manifest);
+        }
+        self.prune_untracked_segments(manifest)
+    }
+
+    /// Remove event-log files in the root that no manifest segment references.
+    ///
+    /// Untracked files arise when a manifest is replaced (schema change, concurrent writers before
+    /// locking, or a crash between segment creation and manifest write). They are derived data,
+    /// never read by reports, and would otherwise grow without bound outside the retention budget.
+    fn prune_untracked_segments(&self, manifest: &MetricsEventLogManifest) -> std::io::Result<()> {
+        let tracked = manifest
+            .segments
+            .iter()
+            .map(|segment| segment.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for entry in fs::read_dir(&self.root_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let is_segment = name == "events.jsonl"
+                || (name.starts_with("events_")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl")));
+            if !is_segment || tracked.contains(name) {
+                continue;
+            }
+            if let Err(error) = fs::remove_file(entry.path())
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -2020,6 +2080,23 @@ fn next_segment_index(segments: &[MetricsEventLogSegment]) -> u64 {
         })
         .max()
         .map_or(0, |index| index.saturating_add(1))
+}
+
+/// Whether `path` is empty or its final byte is a newline; a missing file counts as empty.
+fn segment_ends_with_newline(path: &Path) -> std::io::Result<bool> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 fn compute_total_segment_bytes(root_dir: &Path, manifest: &MetricsEventLogManifest) -> u64 {
@@ -2680,6 +2757,95 @@ mod tests {
         assert_eq!(report.events.len(), 20);
         let values: Vec<i64> = report.events.iter().map(|event| event.value).collect();
         assert_eq!(values, (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn untracked_segments_and_legacy_log_are_pruned_within_retention_budget() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Orphans left behind by a replaced manifest: a legacy single-file log and stray segments.
+        fs::write(dir.path().join("events.jsonl"), b"{\"legacy\":true}\n").expect("legacy log");
+        fs::write(dir.path().join("events_41.jsonl"), b"{\"orphan\":true}\n").expect("orphan");
+        fs::write(dir.path().join("unrelated.txt"), b"keep me").expect("unrelated file");
+
+        let metrics = MetricsRegistry::with_event_log(dir.path().join("events.jsonl"));
+        metrics.record_event("test.event", 1, MetricLabels::new());
+        assert_eq!(
+            metrics.flush_persistence(),
+            MetricsPersistenceStatus::default()
+        );
+
+        assert!(!dir.path().join("events.jsonl").exists());
+        assert!(!dir.path().join("events_41.jsonl").exists());
+        assert!(dir.path().join("unrelated.txt").exists());
+        let manifest: MetricsEventLogManifest = serde_json::from_slice(
+            &fs::read(dir.path().join(METRICS_MANIFEST_FILE_NAME)).expect("manifest"),
+        )
+        .expect("manifest parses");
+        assert!(dir.path().join(&manifest.active_segment).exists());
+        assert_eq!(metrics.report().events.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_writers_on_one_root_keep_manifest_accounting_consistent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = MetricsEventLogConfig {
+            segment_max_bytes: 512,
+            total_max_bytes: 64 * 1024,
+            recent_read_max_bytes: 64 * 1024,
+        };
+        // Independent `SynchronousMetricsEventLog` instances model separate daemon processes that
+        // share one metrics root without sharing the in-process writer registry.
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let log = SynchronousMetricsEventLog::new(dir.path().to_path_buf(), config);
+            workers.push(thread::spawn(move || {
+                for index in 0..50 {
+                    let mut labels = MetricLabels::new();
+                    labels.insert("worker".to_owned(), worker.to_string());
+                    log.try_append_events(&[MetricEvent {
+                        unix_ms: current_unix_millis(),
+                        name: "concurrent.event".to_owned(),
+                        kind: MetricKind::Event,
+                        value: index,
+                        labels,
+                    }])
+                    .expect("append");
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        let manifest: MetricsEventLogManifest = serde_json::from_slice(
+            &fs::read(dir.path().join(METRICS_MANIFEST_FILE_NAME)).expect("manifest"),
+        )
+        .expect("manifest parses");
+        assert_eq!(manifest.event_count, 200);
+        let mut segment_files = 0;
+        let mut persisted_events = 0;
+        for entry in fs::read_dir(dir.path()).expect("read dir") {
+            let name = entry.expect("entry").file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("events_") {
+                segment_files += 1;
+                persisted_events += fs::read_to_string(dir.path().join(&*name))
+                    .expect("segment")
+                    .lines()
+                    .count();
+            }
+        }
+        assert_eq!(segment_files, manifest.segments.len(), "no orphan segments");
+        assert_eq!(
+            persisted_events, 200,
+            "every event lands in a tracked segment"
+        );
+        assert!(
+            manifest
+                .segments
+                .iter()
+                .all(|segment| segment.event_count > 0),
+            "no spurious empty rotations: {manifest:?}"
+        );
     }
 
     #[tokio::test]

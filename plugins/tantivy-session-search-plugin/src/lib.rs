@@ -47,6 +47,12 @@ const REBUILD_CONFIRMATION: &str = "rebuild-bcode.tantivy-session-search";
 const CHECKPOINT_FILE: &str = "provider-state.json";
 const REBUILD_MARKER_FILE: &str = "rebuild-in-progress";
 const INDEX_DIRECTORY: &str = "index";
+/// Minimum interval between engine open attempts after a failed open.
+///
+/// A failed open is remembered so status and ingestion stay bounded, but it is not permanent:
+/// the most common failure on a shared state root is a transient `LockBusy` from another process
+/// still holding the index writer lock, which resolves once that process exits.
+const ENGINE_OPEN_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -301,7 +307,19 @@ impl Fields {
 enum EngineState {
     Uninitialized,
     Ready(Arc<SearchEngine>),
-    Failed(String),
+    Failed {
+        message: String,
+        failed_at: std::time::Instant,
+    },
+}
+
+impl EngineState {
+    fn failed(error: &impl std::fmt::Display) -> Self {
+        Self::Failed {
+            message: bounded_message(&error.to_string()),
+            failed_at: std::time::Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -472,7 +490,7 @@ impl TantivySessionSearchPlugin {
                     )
                     .collect();
             }
-            EngineState::Failed(message) => {
+            EngineState::Failed { message, .. } => {
                 response.state = SearchProviderState::Degraded;
                 response.degraded_reason = Some(bounded_message(message));
             }
@@ -902,7 +920,7 @@ impl TantivySessionSearchPlugin {
         match SearchEngine::open(root.clone(), config) {
             Ok(engine) => {
                 if let Err(error) = std::fs::remove_file(root.join(REBUILD_MARKER_FILE)) {
-                    *guard = EngineState::Failed(bounded_message(&error.to_string()));
+                    *guard = EngineState::failed(&error);
                     drop(guard);
                     return ServiceResponse::error("rebuild_failed", error.to_string());
                 }
@@ -916,7 +934,7 @@ impl TantivySessionSearchPlugin {
                 })
             }
             Err(error) => {
-                *guard = EngineState::Failed(bounded_message(&error.to_string()));
+                *guard = EngineState::failed(&error);
                 drop(guard);
                 error_response(&error)
             }
@@ -974,18 +992,25 @@ impl TantivySessionSearchPlugin {
             .engine
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(*guard, EngineState::Uninitialized) {
+        let should_open = match &*guard {
+            EngineState::Uninitialized => true,
+            EngineState::Failed { failed_at, .. } => {
+                failed_at.elapsed() >= ENGINE_OPEN_RETRY_COOLDOWN
+            }
+            EngineState::Ready(_) => false,
+        };
+        if should_open {
             match SearchEngine::open(root, config) {
                 Ok(engine) => *guard = EngineState::Ready(Arc::new(engine)),
                 Err(error) => {
-                    *guard = EngineState::Failed(bounded_message(&error.to_string()));
+                    *guard = EngineState::failed(&error);
                     return Err(error);
                 }
             }
         }
         match &*guard {
             EngineState::Ready(engine) => Ok(Arc::clone(engine)),
-            EngineState::Failed(message) => Err(ProviderError::index(message)),
+            EngineState::Failed { message, .. } => Err(ProviderError::index(message)),
             EngineState::Uninitialized => Err(ProviderError::index(
                 "provider initialization did not reach a terminal state",
             )),
@@ -2249,6 +2274,37 @@ mod tests {
         let status = plugin.status(&config(root.path()));
         assert_eq!(status.state, SearchProviderState::Degraded);
         assert!(status.degraded_reason.is_some());
+    }
+
+    #[test]
+    fn failed_engine_open_is_remembered_but_retried_after_cooldown() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        // Hold the index writer lock from a second engine so the plugin's open fails with
+        // `LockBusy`, the same transient failure another daemon on a shared state root produces.
+        let holder = SearchEngine::open(root.path().to_path_buf(), &config).expect("lock holder");
+        let plugin = TantivySessionSearchPlugin::default();
+        assert!(plugin.ready_engine(&config).is_err());
+        assert_eq!(plugin.status(&config).state, SearchProviderState::Degraded);
+
+        // Within the cooldown the remembered failure is returned without reopening.
+        drop(holder);
+        assert!(plugin.ready_engine(&config).is_err());
+
+        // Once the cooldown elapses the next call reopens and recovers instead of staying degraded
+        // until an explicit rebuild.
+        {
+            let mut guard = plugin.engine.write().expect("engine state");
+            if let EngineState::Failed { failed_at, .. } = &mut *guard {
+                *failed_at = std::time::Instant::now()
+                    .checked_sub(ENGINE_OPEN_RETRY_COOLDOWN)
+                    .expect("cooldown fits within process uptime");
+            } else {
+                panic!("engine must remember the failed open");
+            }
+        }
+        assert!(plugin.ready_engine(&config).is_ok());
+        assert_eq!(plugin.status(&config).state, SearchProviderState::Ready);
     }
 
     #[test]

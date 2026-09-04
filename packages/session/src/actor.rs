@@ -20,6 +20,31 @@ use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const SESSION_DATABASE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How far `updated_at_ms` may drift before an activity-only change rewrites `manifest.json`.
+const MANIFEST_ACTIVITY_REFRESH_INTERVAL_MS: u64 = 5_000;
+
+/// The subset of a session summary that `manifest.json` exists to cache.
+///
+/// `display` covers every field a picker or catalog fallback renders; `updated_at_ms` is tracked
+/// separately so pure activity ticks can be coalesced instead of rewriting the file per event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestSummaryIdentity {
+    display: SessionSummary,
+    updated_at_ms: u64,
+}
+
+impl ManifestSummaryIdentity {
+    fn from_summary(summary: &SessionSummary) -> Self {
+        let mut display = summary.clone();
+        display.client_count = 0;
+        display.updated_at_ms = 0;
+        Self {
+            display,
+            updated_at_ms: summary.updated_at_ms,
+        }
+    }
+}
 const MAX_ACTIVE_TEXT_STREAM_KEYS: usize = 32;
 const MAX_ACTIVE_TEXT_STREAM_TOMBSTONES: usize = 64;
 const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY: usize = 256 * 1024;
@@ -202,6 +227,7 @@ impl SessionHandle {
             lease: lease.map(Arc::new),
             ownership_guards: BTreeMap::new(),
             db: None,
+            last_manifest_summary: None,
             commands: receiver,
             ownership_releases,
             ownership_release_receiver,
@@ -711,6 +737,11 @@ struct SessionActor {
     lease: Option<Arc<SessionLeaseGuard>>,
     ownership_guards: BTreeMap<SessionOwnershipKind, u64>,
     db: Option<SessionDb>,
+    /// Summary identity of the most recent successfully written `manifest.json`.
+    ///
+    /// The manifest is a disposable display cache; tracking what it currently contains lets the
+    /// append path skip rewriting it when a durable event did not change any manifest field.
+    last_manifest_summary: Option<ManifestSummaryIdentity>,
     commands: mpsc::Receiver<SessionCommand>,
     ownership_releases: mpsc::UnboundedSender<OwnershipRelease>,
     ownership_release_receiver: mpsc::UnboundedReceiver<OwnershipRelease>,
@@ -1101,6 +1132,9 @@ impl SessionActor {
         let Some(db) = self.db.take() else {
             return DatabaseRelease::AlreadyReleased;
         };
+        // The database is going idle, so make the display cache converge on the final summary
+        // even when recent appends deferred an activity-only manifest rewrite.
+        self.flush_deferred_manifest().await;
         if let Err(error) = db.close().await {
             tracing::warn!(
                 session_id = %self.state.summary.id,
@@ -1406,12 +1440,26 @@ impl SessionActor {
             .and_then(|provenance| provenance.source_timestamp_ms)
             .unwrap_or(activity_timestamp_ms);
         let event = if let Some(store) = self.store.clone() {
+            let lock_started_at = Instant::now();
             let _write_guard = crate::lease::acquire_session_write_lock(
                 &store.root_path(),
                 self.state.summary.id,
             )?;
+            if let Some(metrics) = &metrics {
+                metrics.record_histogram(
+                    "session.actor.append_event.write_lock_duration_ms",
+                    elapsed_ms(lock_started_at),
+                );
+            }
+            let readiness_started_at = Instant::now();
             self.ensure_session_db_for_write().await?;
             self.refresh_state_from_db_for_write().await?;
+            if let Some(metrics) = &metrics {
+                metrics.record_histogram(
+                    "session.actor.append_event.readiness_duration_ms",
+                    elapsed_ms(readiness_started_at),
+                );
+            }
             let mut event = self.state.build_next_event(kind, event_timestamp_ms);
             event.provenance = provenance;
             let db_append_started_at = Instant::now();
@@ -1442,7 +1490,14 @@ impl SessionActor {
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.retire_live_text_checkpoint_for_durable_event(&event.kind);
+        let manifest_started_at = Instant::now();
         self.update_manifest_and_schedule_catalog().await;
+        if let Some(metrics) = &metrics {
+            metrics.record_histogram(
+                "session.actor.append_event.manifest_duration_ms",
+                elapsed_ms(manifest_started_at),
+            );
+        }
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         if let Some(metrics) = &metrics {
@@ -1454,16 +1509,64 @@ impl SessionActor {
         Ok(event)
     }
 
-    async fn update_manifest_and_schedule_catalog(&self) {
+    /// Write the manifest now if any deferred activity-only refresh is pending.
+    async fn flush_deferred_manifest(&mut self) {
         let Some(store) = &self.store else {
             return;
         };
         let summary = self.state.summary();
-        if let Err(error) = store.write_session_manifest(summary.clone()).await {
+        let identity = ManifestSummaryIdentity::from_summary(&summary);
+        if self.last_manifest_summary.as_ref() == Some(&identity) {
+            return;
+        }
+        if store.write_session_manifest(summary).await.is_ok() {
             store
                 .metrics()
-                .increment_counter("session.manifest.write_error_total");
-            eprintln!("failed to write session manifest: {error}");
+                .increment_counter("session.manifest.write_total");
+            self.last_manifest_summary = Some(identity);
+        }
+    }
+
+    /// Refresh the disposable `manifest.json` display cache and enqueue the catalog update.
+    ///
+    /// `manifest.json` mirrors the session summary for discovery when the catalog is unavailable.
+    /// Most appends (assistant deltas, tool lifecycle, usage) change only `updated_at_ms`, and
+    /// rewriting the file for each one is a blocking write+rename on the append hot path. The
+    /// manifest is therefore rewritten when any display field other than activity time changes,
+    /// when the activity time has drifted by more than [`MANIFEST_ACTIVITY_REFRESH_INTERVAL_MS`],
+    /// or on ownership release (see [`Self::flush_deferred_manifest`]), so it converges shortly
+    /// after activity stops without costing a write per event. The catalog coordinator coalesces
+    /// its own updates independently.
+    async fn update_manifest_and_schedule_catalog(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let summary = self.state.summary();
+        let identity = ManifestSummaryIdentity::from_summary(&summary);
+        let stale = match &self.last_manifest_summary {
+            None => true,
+            Some(last) => {
+                last.display != identity.display
+                    || summary.updated_at_ms.saturating_sub(last.updated_at_ms)
+                        >= MANIFEST_ACTIVITY_REFRESH_INTERVAL_MS
+            }
+        };
+        if stale {
+            if let Err(error) = store.write_session_manifest(summary.clone()).await {
+                store
+                    .metrics()
+                    .increment_counter("session.manifest.write_error_total");
+                eprintln!("failed to write session manifest: {error}");
+            } else {
+                store
+                    .metrics()
+                    .increment_counter("session.manifest.write_total");
+                self.last_manifest_summary = Some(identity);
+            }
+        } else {
+            store
+                .metrics()
+                .increment_counter("session.manifest.write_skipped_total");
         }
         store.schedule_catalog_summary(summary).await;
     }

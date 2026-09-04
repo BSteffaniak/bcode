@@ -3628,13 +3628,11 @@ impl PluginRuntimeHost {
             active_session = ?resource_permit.active_session,
             "plugin resource slot acquired"
         );
+        let span = self.metrics.span("plugin.invocation").labels(metric_labels);
         let result = executor
             .invoke_service_scoped(interface_id, operation, payload, class, scope, None, bridge)
             .await;
-        self.metrics
-            .span("plugin.invocation")
-            .labels(metric_labels)
-            .finish_result(&result);
+        span.finish_result(&result);
         result
     }
 
@@ -3736,6 +3734,10 @@ impl PluginRuntimeHost {
             active_session = ?resource_permit.active_session,
             "plugin resource slot acquired"
         );
+        let start_span = self
+            .metrics
+            .span("plugin.invocation.start")
+            .labels(metric_labels);
         let result = executor
             .start_service_with_events_scoped(
                 interface_id,
@@ -3752,10 +3754,7 @@ impl PluginRuntimeHost {
                 event_receiver,
             )
             .await;
-        self.metrics
-            .span("plugin.invocation.start")
-            .labels(metric_labels)
-            .finish_result(&result);
+        start_span.finish_result(&result);
         let mut invocation = result?;
         invocation.resource_permit = Some(Arc::new(resource_permit));
         Ok(invocation)

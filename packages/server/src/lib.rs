@@ -4376,6 +4376,7 @@ async fn handle_request(
 ) -> Result<(), ServerError> {
     let labels = request_metric_labels(&request);
     let context = request_metrics_context(&request, request_id, client_id, *attached_session);
+    let span = state.metrics.span("ipc.request").labels(labels);
     let result = Box::pin(state.metrics.in_context(context, async {
         Box::pin(dispatch_routed_request(
             RoutedRequest::from_request(request),
@@ -4388,11 +4389,7 @@ async fn handle_request(
         .await
     }))
     .await;
-    state
-        .metrics
-        .span("ipc.request")
-        .labels(labels)
-        .finish_result(&result);
+    span.finish_result(&result);
     result
 }
 
@@ -20766,14 +20763,16 @@ async fn build_model_turn_request(
             selected_model_id.to_string(),
         );
     }
-    let parallel_capabilities = resolve_parallel_tool_call_capabilities(
+    // One provider `capabilities` + `models` round trip serves every feature negotiation below.
+    let feature_negotiation = resolve_model_feature_negotiation(
         state,
         provider_plugin_id,
         &model_id,
         &selection.provider_context,
-        true,
     )
     .await;
+    let parallel_capabilities =
+        parallel_tool_call_capabilities_from_negotiation(feature_negotiation.as_ref(), true);
     let desired_structured_output =
         execution
             .structured_output
@@ -20783,15 +20782,11 @@ async fn build_model_turn_request(
                 schema: request.schema.clone(),
                 strict: request.strict,
             });
-    let resolved_features = resolve_model_feature_capabilities(
-        state,
-        provider_plugin_id,
-        &model_id,
-        &provider_context,
+    let resolved_features = model_feature_capabilities_from_negotiation(
+        feature_negotiation.as_ref(),
         desired_structured_output.as_ref(),
         !tools.is_empty(),
-    )
-    .await;
+    );
     let structured_output = if desired_structured_output.is_some()
         && !resolved_features.structured_output_is_guaranteed()
     {
@@ -21211,50 +21206,12 @@ fn supported_reasoning_value<'a>(
     (supported.is_empty() || supported.iter().any(|value| value == requested)).then_some(requested)
 }
 
-async fn resolve_model_feature_capabilities(
-    state: &ServerState,
-    provider_plugin_id: Option<&str>,
-    selected_model_id: &str,
-    provider_context: &bcode_model::ProviderRequestContext,
+fn model_feature_capabilities_from_negotiation(
+    negotiation: Option<&ModelFeatureNegotiation>,
     structured_output: Option<&bcode_model::StructuredOutputRequest>,
     has_tools: bool,
 ) -> bcode_model::ResolvedModelFeatureCapabilities {
-    let Some(provider_plugin_id) = provider_plugin_id else {
-        return bcode_model::ResolvedModelFeatureCapabilities::default();
-    };
-    let provider = state
-        .plugins
-        .invoke_service_json::<
-            bcode_model::ProviderCapabilitiesRequest,
-            bcode_model::ProviderCapabilities,
-        >(
-            provider_plugin_id,
-            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-            bcode_model::OP_CAPABILITIES,
-            &bcode_model::ProviderCapabilitiesRequest {
-                provider_context: provider_context.clone(),
-                selected_model_id: Some(selected_model_id.to_owned()),
-            },
-        )
-        .await
-        .ok();
-    let model = resolved_provider_models(
-        state,
-        Some(provider_plugin_id.to_owned()),
-        bcode_model::ModelListRequest {
-            provider_context: provider_context.clone(),
-            selected_model_id: Some(selected_model_id.to_owned()),
-        },
-    )
-    .await
-    .ok()
-    .and_then(|models| {
-        models
-            .models
-            .into_iter()
-            .find(|model| model.model_id == selected_model_id)
-    });
-    let Some((provider, model)) = provider.as_ref().zip(model.as_ref()) else {
+    let Some(ModelFeatureNegotiation { provider, model }) = negotiation else {
         return bcode_model::ResolvedModelFeatureCapabilities::default();
     };
     let structured_output = structured_output.map(|request| {
@@ -21360,6 +21317,7 @@ async fn append_negotiated_feature_fidelity_events(
     }
 }
 
+#[cfg(test)]
 async fn resolve_parallel_tool_call_capabilities(
     state: &ServerState,
     provider_plugin_id: Option<&str>,
@@ -21367,49 +21325,73 @@ async fn resolve_parallel_tool_call_capabilities(
     provider_context: &bcode_model::ProviderRequestContext,
     runtime: bool,
 ) -> bcode_model::ParallelToolCallCapabilities {
-    let provider = if let Some(provider_plugin_id) = provider_plugin_id {
-        state
-            .plugins
-            .invoke_service_json::<bcode_model::ProviderCapabilitiesRequest, bcode_model::ProviderCapabilities>(
-                provider_plugin_id,
-                bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-                bcode_model::OP_CAPABILITIES,
-                &bcode_model::ProviderCapabilitiesRequest {
-                    provider_context: provider_context.clone(),
-                    selected_model_id: Some(selected_model_id.to_owned()),
-                },
-            )
-            .await
-            .ok()
-    } else {
-        None
-    };
+    let negotiation = resolve_model_feature_negotiation(
+        state,
+        provider_plugin_id,
+        selected_model_id,
+        provider_context,
+    )
+    .await;
+    parallel_tool_call_capabilities_from_negotiation(negotiation.as_ref(), runtime)
+}
+
+/// Provider and model feature-support facts shared by every per-request feature negotiation.
+///
+/// Resolving these costs one `capabilities` and one `models` provider call, so request construction
+/// resolves them once and negotiates every feature from the same snapshot.
+struct ModelFeatureNegotiation {
+    provider: bcode_model::ProviderCapabilities,
+    model: bcode_model::ModelInfo,
+}
+
+async fn resolve_model_feature_negotiation(
+    state: &ServerState,
+    provider_plugin_id: Option<&str>,
+    selected_model_id: &str,
+    provider_context: &bcode_model::ProviderRequestContext,
+) -> Option<ModelFeatureNegotiation> {
+    let provider_plugin_id = provider_plugin_id?;
+    let provider = state
+        .plugins
+        .invoke_service_json::<bcode_model::ProviderCapabilitiesRequest, bcode_model::ProviderCapabilities>(
+            provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_CAPABILITIES,
+            &bcode_model::ProviderCapabilitiesRequest {
+                provider_context: provider_context.clone(),
+                selected_model_id: Some(selected_model_id.to_owned()),
+            },
+        )
+        .await
+        .ok()?;
     let model = resolved_provider_models(
         state,
-        provider_plugin_id.map(ToOwned::to_owned),
+        Some(provider_plugin_id.to_owned()),
         bcode_model::ModelListRequest {
             provider_context: provider_context.clone(),
             selected_model_id: Some(selected_model_id.to_owned()),
         },
     )
     .await
-    .ok()
-    .and_then(|models| {
-        models
-            .models
-            .into_iter()
-            .find(|model| model.model_id == selected_model_id)
-    });
+    .ok()?
+    .models
+    .into_iter()
+    .find(|model| model.model_id == selected_model_id)?;
+    Some(ModelFeatureNegotiation { provider, model })
+}
+
+fn parallel_tool_call_capabilities_from_negotiation(
+    negotiation: Option<&ModelFeatureNegotiation>,
+    runtime: bool,
+) -> bcode_model::ParallelToolCallCapabilities {
     let feature =
         bcode_model::RequestedModelFeature::ToolChoice(bcode_model::ToolChoiceMode::Parallel);
-    let support = provider
-        .as_ref()
-        .zip(model.as_ref())
-        .map(|(provider, model)| {
-            provider
-                .feature_support
-                .negotiate(&model.feature_support, feature)
-        });
+    let support = negotiation.map(|negotiation| {
+        negotiation
+            .provider
+            .feature_support
+            .negotiate(&negotiation.model.feature_support, feature)
+    });
     let supported = match support {
         Some(bcode_model::NegotiatedFeatureSupport::Guaranteed { .. }) => Some(true),
         Some(bcode_model::NegotiatedFeatureSupport::Unsupported { .. }) => Some(false),

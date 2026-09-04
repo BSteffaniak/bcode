@@ -509,8 +509,28 @@ append path validates:
 * every required projection schema;
 * every required projection checkpoint against the prior canonical tail.
 
-Each projector advances only its own checkpoint after its projection update succeeds. Missing,
-stale, incompatible, or discontinuous required projections reject and roll back the append.
+Each projector advances its checkpoint only after its projection update succeeds. Within one append
+transaction, all checkpointed projections are advanced together by a single multi-row upsert once
+every projection update has succeeded; this preserves the same atomic outcome (no checkpoint is
+visible without its projection, and any failure rolls back the complete append) while keeping the
+number of statements per canonical append bounded. Each Turso statement is a full round trip, so the
+append hot path treats statement count as a first-class cost. Missing, stale, incompatible, or
+discontinuous required projections reject and roll back the append.
+
+Turso opens a fresh connection per transaction, and on its default `temp_store` every
+`INSERT ... RETURNING`/`UPSERT` result buffer is an ephemeral table backed by a new temporary
+directory per statement. Bcode sets `PRAGMA temp_store = MEMORY` on every session and catalog
+connection and at the start of every append/maintenance transaction. Temp objects never outlive a
+statement, so this changes no durability property of canonical rows or the WAL; it removes a
+`mkdir`/`open`/`fcntl`/`rmdir` cycle from each write statement. The release-mode
+`benchmark_canonical_append_path` test (run explicitly with `--ignored`) is the reference
+measurement for this path.
+
+`manifest.json` is refreshed from the append path only when a display field changes or the
+activity timestamp has drifted beyond a short interval; releasing the idle database handle writes
+the final summary. Because the manifest is a disposable display cache and the catalog coordinator
+coalesces independently, this cannot change canonical history or discovery correctness — a session
+directory is discovered from `session.db` regardless of manifest freshness.
 
 Required projections include current session state, input history, transcript spans, tool runs,
 artifact references, runtime work, cumulative request-deduplicated session usage and fixed

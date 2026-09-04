@@ -794,6 +794,7 @@ impl GlobalSessionDb {
         deleted: impl IntoIterator<Item = SessionId>,
     ) -> SessionDbResult<()> {
         let transaction = self.db.begin_transaction().await?;
+        configure_turso_connection(&*transaction).await?;
         let result = async {
             for session_id in deleted {
                 transaction
@@ -1243,6 +1244,7 @@ impl SessionDb {
         #[cfg(test)]
         abort_at_migration_crash_boundary("transaction_start");
         let tx = db.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
         let mut target = SessionMigrationTarget::new(&*tx, &metrics);
         report_migration_stage(
             progress.as_ref(),
@@ -1399,6 +1401,7 @@ impl SessionDb {
         let db = db?;
         let db: Box<dyn Database> =
             Box::new(ObservedDatabase::new(db, metrics, "session", "turso"));
+        configure_turso_connection(&*db).await?;
         Ok(Self {
             session_id,
             db: Arc::new(db),
@@ -2137,14 +2140,11 @@ impl SessionDb {
             return Ok(());
         }
         let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
         validate_storage_writer_contract(&*tx).await?;
         for (event, activity_timestamp_ms) in events {
             validate_append_preconditions_without_writer(&*tx, event).await?;
-            insert_event(&*tx, event, *activity_timestamp_ms).await?;
-            project_materialized_event(&*tx, event).await?;
-            project_model_context_event(&*tx, event).await?;
-            project_context_occupancy_event(&*tx, event).await?;
-            project_turn_receipt(&*tx, event).await?;
+            append_event_projections(&*tx, event, *activity_timestamp_ms).await?;
             validate_append_postconditions(&*tx, event).await?;
         }
         tx.commit().await?;
@@ -2164,13 +2164,10 @@ impl SessionDb {
         writer_epoch: u32,
     ) -> SessionDbResult<()> {
         let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
         validate_storage_writer_contract_for_epoch(&*tx, writer_epoch).await?;
         validate_append_preconditions_without_writer(&*tx, event).await?;
-        insert_event(&*tx, event, activity_timestamp_ms).await?;
-        project_materialized_event(&*tx, event).await?;
-        project_model_context_event(&*tx, event).await?;
-        project_context_occupancy_event(&*tx, event).await?;
-        project_turn_receipt(&*tx, event).await?;
+        append_event_projections(&*tx, event, activity_timestamp_ms).await?;
         validate_append_postconditions(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
@@ -2710,6 +2707,7 @@ impl SessionDb {
         _write: &crate::lease::SessionWriteGuard,
     ) -> SessionDbResult<usize> {
         let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
         let events = strict_events(&*tx).await?;
         validate_contiguous_canonical_events(&events)?;
         rebuild_model_context_projection_from_events(&*tx, &events).await?;
@@ -2731,6 +2729,7 @@ impl SessionDb {
         _write: &crate::lease::SessionWriteGuard,
     ) -> SessionDbResult<usize> {
         let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
         let event_count = rebuild_model_context_projection(&*tx).await?;
         tx.commit().await?;
         Ok(event_count)
@@ -3824,6 +3823,19 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
     validate_storage_writer_contract_for_epoch(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
 }
 
+/// Apply per-connection Turso settings to a freshly opened append transaction.
+///
+/// Turso opens a new connection for every transaction. On the default `temp_store`, every
+/// `INSERT ... RETURNING` and `UPSERT` materializes its result buffer in an ephemeral table backed
+/// by a brand-new temporary *directory* (`mkdir`, `open`, `fcntl` lock, `unlink`, `rmdir`) per
+/// statement, which profiled as the single largest cost of a canonical append. The ephemeral
+/// buffers here hold at most a handful of rows, so memory-backed temp storage is strictly cheaper
+/// and has no durability implications: temp objects never outlive the statement.
+async fn configure_turso_connection(db: &dyn Database) -> SessionDbResult<()> {
+    db.exec_raw("PRAGMA temp_store = MEMORY").await?;
+    Ok(())
+}
+
 async fn validate_append_preconditions_without_writer(
     db: &dyn Database,
     event: &SessionEvent,
@@ -4052,7 +4064,8 @@ async fn finalize_migration_context_occupancy(
     Ok(())
 }
 
-async fn project_context_occupancy_event(
+/// Reconcile the authoritative context-occupancy row for `event` without advancing its checkpoint.
+async fn project_context_occupancy_row(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
@@ -4110,9 +4123,25 @@ async fn project_context_occupancy_event(
         )
         .execute(db)
         .await?;
-    update_projection_checkpoint(db, MaterializedProjection::RequestContextOccupancy, event)
-        .await?;
     Ok(())
+}
+
+/// Project one canonical event into every derived read model and checkpoint them together.
+///
+/// This is the durable append hot path. Each statement is a full Turso round trip, so the base
+/// projections and the occupancy projection share one multi-row checkpoint write instead of
+/// advancing checkpoints one projection at a time.
+async fn append_event_projections(
+    db: &dyn Database,
+    event: &SessionEvent,
+    activity_timestamp_ms: Option<u64>,
+) -> SessionDbResult<()> {
+    insert_event(db, event, activity_timestamp_ms).await?;
+    project_event(db, event, true).await?;
+    project_model_context_event(db, event).await?;
+    project_context_occupancy_row(db, event).await?;
+    upsert_projection_checkpoints(db, MaterializedProjection::all(), event).await?;
+    project_turn_receipt(db, event).await
 }
 
 async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
@@ -4162,8 +4191,17 @@ async fn project_migration_materialized_checkpoints_at_tail(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    let rows = BASE_MATERIALIZED_PROJECTIONS
-        .into_iter()
+    upsert_projection_checkpoints(db, &BASE_MATERIALIZED_PROJECTIONS, event).await
+}
+
+/// Advance the supplied projection checkpoints to `event` in one multi-row upsert.
+async fn upsert_projection_checkpoints(
+    db: &dyn Database,
+    projections: &[MaterializedProjection],
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let rows = projections
+        .iter()
         .map(|projection| {
             vec![
                 (
@@ -4246,17 +4284,6 @@ fn remember_reasoning_in_projection(
         let evicted = order.remove(0);
         memory.remove(&evicted);
     }
-}
-
-async fn project_materialized_event(
-    db: &dyn Database,
-    event: &SessionEvent,
-) -> SessionDbResult<()> {
-    project_event(db, event, true).await?;
-    for projection in BASE_MATERIALIZED_PROJECTIONS {
-        update_projection_checkpoint(db, projection, event).await?;
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6805,6 +6832,98 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "release-mode append-path benchmark; run explicitly with --ignored --nocapture"]
+    async fn benchmark_canonical_append_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metrics = MetricsRegistry::in_memory();
+        // Optionally benchmark against a disposable copy of a real session database so index
+        // sizes and payload distributions match production rather than an empty file.
+        let (session_id, db) = if let (Some(path), Ok(session_id)) = (
+            std::env::var_os("BCODE_APPEND_BENCHMARK_DB").map(std::path::PathBuf::from),
+            std::env::var("BCODE_APPEND_BENCHMARK_SESSION_ID"),
+        ) {
+            let session_id = session_id
+                .parse::<SessionId>()
+                .expect("benchmark session ID must be valid");
+            let db = SessionDb::open_existing_turso_observed(session_id, &path, metrics.clone())
+                .await
+                .expect("open benchmark database copy");
+            (session_id, db)
+        } else {
+            let session_id = SessionId::new();
+            let db = SessionDb::open_turso_in_root_observed(
+                session_id,
+                temp_dir.path(),
+                metrics.clone(),
+            )
+            .await
+            .expect("open session db");
+            db.append_event(&event(
+                session_id,
+                0,
+                SessionEventKind::SessionCreated {
+                    name: None,
+                    working_directory: std::path::PathBuf::from("."),
+                },
+            ))
+            .await
+            .expect("append created event");
+            (session_id, db)
+        };
+        let first_sequence = db
+            .last_event_sequence()
+            .await
+            .expect("tail")
+            .map_or(1, |sequence| sequence + 1);
+        let iterations = std::env::var("BCODE_APPEND_BENCHMARK_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(200);
+        let operations_before = metrics
+            .snapshot()
+            .counters
+            .get("database.operation.total")
+            .copied()
+            .unwrap_or_default();
+        let mut samples_us = Vec::with_capacity(usize::try_from(iterations).unwrap_or(200));
+        for sequence in first_sequence..first_sequence + iterations {
+            let kind = if sequence % 4 == 0 {
+                SessionEventKind::AssistantMessage {
+                    text: "x".repeat(2_048),
+                }
+            } else {
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "benchmark prompt text".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                }
+            };
+            let started_at = std::time::Instant::now();
+            db.append_event(&event(session_id, sequence, kind))
+                .await
+                .expect("append benchmark event");
+            samples_us.push(started_at.elapsed().as_micros());
+        }
+        samples_us.sort_unstable();
+        let percentile = |p: usize| samples_us[(samples_us.len() - 1) * p / 100];
+        let operations_after = metrics
+            .snapshot()
+            .counters
+            .get("database.operation.total")
+            .copied()
+            .unwrap_or_default();
+        eprintln!(
+            "canonical_append: n={} p50_us={} p95_us={} p99_us={} max_us={} db_ops_per_append={}",
+            samples_us.len(),
+            percentile(50),
+            percentile(95),
+            percentile(99),
+            samples_us[samples_us.len() - 1],
+            operations_after.saturating_sub(operations_before) / iterations
+        );
+    }
+
+    #[tokio::test]
     async fn reopening_legacy_database_keeps_projection_missing_until_explicit_reindex() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -8357,12 +8476,15 @@ mod tests {
                 text: "canonical tail".to_string(),
             },
         );
-        project_materialized_event(db.database(), &tail_event)
+        project_event(db.database(), &tail_event, true)
             .await
             .expect("project non-model read models");
-        project_context_occupancy_event(db.database(), &tail_event)
+        project_context_occupancy_row(db.database(), &tail_event)
             .await
             .expect("project occupancy read model");
+        upsert_projection_checkpoints(db.database(), MaterializedProjection::all(), &tail_event)
+            .await
+            .expect("checkpoint non-model read models");
         let canonical_columns = [
             "event_seq",
             "event_type",

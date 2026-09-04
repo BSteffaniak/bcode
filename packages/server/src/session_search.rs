@@ -25,6 +25,10 @@ use crate::ServerState;
 const MAX_DIRTY_SESSION_SEARCH_SESSIONS: usize = 1_024;
 const MAX_INCREMENTAL_BATCHES_PER_SESSION: usize = 16;
 const INCREMENTAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Upper bound for per-session retry backoff after repeated retryable ingestion failures.
+const INCREMENTAL_RETRY_MAX_DELAY: Duration = Duration::from_mins(1);
+/// Consecutive retryable failures tolerated before a dirty session is parked until new commits.
+const INCREMENTAL_RETRY_MAX_ATTEMPTS: u32 = 8;
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_PROVIDER_SLICES_BEFORE_YIELD: usize = 1;
 
@@ -1174,18 +1178,73 @@ pub(crate) fn generation_fingerprint(summary: &bcode_session_models::SessionSumm
 struct DirtySessionSearchState {
     sessions: BTreeSet<bcode_session_models::SessionId>,
     rescan_required: bool,
+    /// Retry backoff for sessions whose most recent ingestion attempt failed retryably.
+    retries: BTreeMap<bcode_session_models::SessionId, DirtySessionRetry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirtySessionRetry {
+    attempts: u32,
+    not_before: Instant,
 }
 
 /// Bounded, coalescing handoff from committed canonical mutations to asynchronous search work.
 #[derive(Debug, Default)]
 pub(crate) struct SessionSearchDirtyQueue {
     state: Mutex<DirtySessionSearchState>,
-    notify: Notify,
+    notify: std::sync::Arc<Notify>,
 }
 
 impl SessionSearchDirtyQueue {
     pub(crate) async fn mark_committed(&self, session_id: bcode_session_models::SessionId) {
         let mut state = self.state.lock().await;
+        // A new canonical commit invalidates any retry backoff accumulated for this session.
+        state.retries.remove(&session_id);
+        Self::enqueue_locked(&mut state, session_id);
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    /// Requeue a session after a retryable ingestion failure with exponential backoff.
+    ///
+    /// Returns the delay before the session becomes due again, or `None` when the session has
+    /// exhausted its retry budget and is parked until the next canonical commit re-marks it.
+    async fn mark_retry(&self, session_id: bcode_session_models::SessionId) -> Option<Duration> {
+        let mut state = self.state.lock().await;
+        let attempts = state
+            .retries
+            .get(&session_id)
+            .map_or(1, |retry| retry.attempts.saturating_add(1));
+        if attempts > INCREMENTAL_RETRY_MAX_ATTEMPTS {
+            state.retries.remove(&session_id);
+            return None;
+        }
+        let delay = incremental_retry_delay(attempts);
+        state.retries.insert(
+            session_id,
+            DirtySessionRetry {
+                attempts,
+                not_before: Instant::now() + delay,
+            },
+        );
+        Self::enqueue_locked(&mut state, session_id);
+        drop(state);
+        let notify = std::sync::Arc::clone(&self.notify);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            notify.notify_one();
+        });
+        Some(delay)
+    }
+
+    async fn mark_ingested(&self, session_id: bcode_session_models::SessionId) {
+        self.state.lock().await.retries.remove(&session_id);
+    }
+
+    fn enqueue_locked(
+        state: &mut DirtySessionSearchState,
+        session_id: bcode_session_models::SessionId,
+    ) {
         if state.sessions.contains(&session_id) {
             return;
         }
@@ -1194,17 +1253,27 @@ impl SessionSearchDirtyQueue {
             return;
         }
         state.sessions.insert(session_id);
-        drop(state);
-        self.notify.notify_one();
     }
 
     pub(crate) async fn mark_rescan_required(&self) {
         self.state.lock().await.rescan_required = true;
     }
 
+    /// Drain the sessions that are due now; sessions still inside a retry backoff stay queued.
     async fn take(&self) -> Vec<bcode_session_models::SessionId> {
+        let now = Instant::now();
         let mut state = self.state.lock().await;
-        std::mem::take(&mut state.sessions).into_iter().collect()
+        let (due, deferred): (BTreeSet<_>, BTreeSet<_>) = std::mem::take(&mut state.sessions)
+            .into_iter()
+            .partition(|session_id| {
+                state
+                    .retries
+                    .get(session_id)
+                    .is_none_or(|retry| retry.not_before <= now)
+            });
+        state.sessions = deferred;
+        drop(state);
+        due.into_iter().collect()
     }
 
     pub(crate) async fn notified(&self) {
@@ -1219,6 +1288,28 @@ impl SessionSearchDirtyQueue {
             state.rescan_required,
         )
     }
+
+    #[cfg(test)]
+    async fn retry_attempts(&self, session_id: bcode_session_models::SessionId) -> u32 {
+        self.state
+            .lock()
+            .await
+            .retries
+            .get(&session_id)
+            .map_or(0, |retry| retry.attempts)
+    }
+}
+
+/// Exponential backoff for repeated retryable ingestion failures of one session.
+///
+/// The first retry keeps the historical 100 ms delay; each further consecutive failure doubles it
+/// up to [`INCREMENTAL_RETRY_MAX_DELAY`], so a provider that stays unavailable costs bounded work
+/// instead of a hot loop of discovery, canonical reads, and failed applies.
+fn incremental_retry_delay(attempt: u32) -> Duration {
+    let multiplier = 1_u32 << attempt.saturating_sub(1).min(16);
+    INCREMENTAL_RETRY_DELAY
+        .saturating_mul(multiplier)
+        .min(INCREMENTAL_RETRY_MAX_DELAY)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1302,6 +1393,9 @@ fn classify_ingestion_call_error(error: bcode_plugin::PluginServiceCallError) ->
 
 pub(crate) async fn process_dirty_sessions(state: &ServerState) {
     let session_ids = state.session_search_dirty.take().await;
+    if session_ids.is_empty() {
+        return;
+    }
     state.metrics.record_histogram(
         "server.session_search.dirty_batch_sessions",
         u64::try_from(session_ids.len()).unwrap_or(u64::MAX),
@@ -1310,6 +1404,7 @@ pub(crate) async fn process_dirty_sessions(state: &ServerState) {
         let started = Instant::now();
         match ingest_session_tail(state, session_id).await {
             Ok(()) => {
+                state.session_search_dirty.mark_ingested(session_id).await;
                 state
                     .metrics
                     .increment_counter("server.session_search.ingestion_session_completed_total");
@@ -1318,20 +1413,39 @@ pub(crate) async fn process_dirty_sessions(state: &ServerState) {
                 state
                     .metrics
                     .increment_counter("server.session_search.ingestion_session_failed_total");
-                tracing::warn!(
-                    target: "bcode_server::session_search",
-                    %session_id,
-                    retryable = error.retryable_error(),
-                    error = %bounded_message(&error.to_string()),
-                    "asynchronous session-search ingestion failed"
-                );
                 if error.retryable_error() {
-                    tokio::time::sleep(INCREMENTAL_RETRY_DELAY).await;
-                    state.session_search_dirty.mark_committed(session_id).await;
-                    state.metrics.increment_counter(
-                        "server.session_search.ingestion_session_requeued_total",
-                    );
+                    // Backoff is tracked per session and honored by `take`, so a persistently
+                    // failing provider never blocks this worker or hot-loops canonical reads.
+                    if let Some(delay) = state.session_search_dirty.mark_retry(session_id).await {
+                        tracing::warn!(
+                            target: "bcode_server::session_search",
+                            %session_id,
+                            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                            error = %bounded_message(&error.to_string()),
+                            "asynchronous session-search ingestion failed; retry scheduled"
+                        );
+                        state.metrics.increment_counter(
+                            "server.session_search.ingestion_session_requeued_total",
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "bcode_server::session_search",
+                            %session_id,
+                            error = %bounded_message(&error.to_string()),
+                            "asynchronous session-search ingestion exhausted retries; parked until the next canonical commit"
+                        );
+                        state.metrics.increment_counter(
+                            "server.session_search.ingestion_session_parked_total",
+                        );
+                    }
                 } else {
+                    tracing::warn!(
+                        target: "bcode_server::session_search",
+                        %session_id,
+                        retryable = false,
+                        error = %bounded_message(&error.to_string()),
+                        "asynchronous session-search ingestion failed"
+                    );
                     state.metrics.increment_counter(
                         "server.session_search.ingestion_session_terminal_failed_total",
                     );
@@ -1351,6 +1465,7 @@ async fn ingest_session_tail(
     session_id: bcode_session_models::SessionId,
 ) -> Result<(), IngestionError> {
     let inventory = list_providers(state).await;
+    let mut unavailable_provider = None;
     let providers = inventory
         .providers
         .into_iter()
@@ -1360,9 +1475,37 @@ async fn ingest_session_tail(
                 .features
                 .contains(&SearchFeature::IncrementalIngestion)
         })
+        .filter(|provider| {
+            // A provider that already reports itself unable to accept writes cannot ingest this
+            // batch; skipping it avoids paying canonical reads and a failing apply to learn that.
+            let accepts_writes = matches!(
+                provider.status.state,
+                bcode_session_search::SearchProviderState::Ready
+                    | bcode_session_search::SearchProviderState::CatchingUp
+                    | bcode_session_search::SearchProviderState::Stale
+            );
+            if !accepts_writes {
+                unavailable_provider = Some((
+                    provider.plugin_id.clone(),
+                    provider.status.state,
+                    provider.status.degraded_reason.clone(),
+                ));
+            }
+            accepts_writes
+        })
         .collect::<Vec<_>>();
     if providers.is_empty() {
-        return Ok(());
+        return match unavailable_provider {
+            // Every ingesting provider is currently unavailable; retry with backoff so the
+            // session is indexed once the provider recovers, without a hot loop.
+            Some((plugin_id, provider_state, reason)) => Err(IngestionError::retryable(format!(
+                "session-search provider {plugin_id} is {provider_state:?}{}",
+                reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ))),
+            None => Ok(()),
+        };
     }
     let summary = state
         .sessions
@@ -4847,6 +4990,71 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_ingestion_skips_degraded_provider_and_backs_off_without_canonical_reads() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state =
+            state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::IncompatiblePolicy)]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("degraded provider".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "not ingestible yet".to_owned(), 0)
+            .await
+            .expect("append event");
+
+        state.session_search_dirty.mark_committed(session.id).await;
+        process_dirty_sessions(&state).await;
+
+        assert_eq!(
+            APPLY_BATCH_CALLS.load(Ordering::SeqCst),
+            0,
+            "a provider that reports itself degraded must not receive apply_batch"
+        );
+        let counters = state.metrics.snapshot().counters;
+        assert_eq!(
+            counters
+                .get("server.session_search.ingestion_session_requeued_total")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            state.session_search_dirty.retry_attempts(session.id).await,
+            1
+        );
+        // The session stays queued but is not due until its backoff elapses, so repeated
+        // worker wakeups cost no provider or canonical work.
+        assert_eq!(
+            state.session_search_dirty.snapshot().await.0,
+            vec![session.id]
+        );
+        process_dirty_sessions(&state).await;
+        assert_eq!(
+            counters
+                .get("server.session_search.ingestion_session_failed_total")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .metrics
+                .snapshot()
+                .counters
+                .get("server.session_search.ingestion_session_failed_total")
+                .copied(),
+            Some(1),
+            "a deferred session must not be re-attempted before its backoff elapses"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_failure_modes_never_report_false_complete_coverage() {
         let _guard = SEARCH_TEST_LOCK.lock().await;
         for (behavior, expected) in [
@@ -5339,6 +5547,68 @@ pub(crate) mod tests {
         let (sessions, rescan_required) = queue.snapshot().await;
         assert!(sessions.is_empty());
         assert!(!rescan_required);
+    }
+
+    #[test]
+    fn incremental_retry_delay_backs_off_exponentially_and_saturates() {
+        assert_eq!(incremental_retry_delay(1), INCREMENTAL_RETRY_DELAY);
+        assert_eq!(incremental_retry_delay(2), INCREMENTAL_RETRY_DELAY * 2);
+        assert_eq!(incremental_retry_delay(5), INCREMENTAL_RETRY_DELAY * 16);
+        assert_eq!(incremental_retry_delay(64), INCREMENTAL_RETRY_MAX_DELAY);
+        assert_eq!(
+            incremental_retry_delay(u32::MAX),
+            INCREMENTAL_RETRY_MAX_DELAY
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_session_retry_defers_due_time_parks_after_budget_and_resets_on_commit() {
+        let queue = SessionSearchDirtyQueue::default();
+        let session_id = SessionId::new();
+
+        // A retryable failure keeps the session queued but not due until its backoff elapses.
+        assert_eq!(
+            queue.mark_retry(session_id).await,
+            Some(INCREMENTAL_RETRY_DELAY)
+        );
+        assert_eq!(queue.retry_attempts(session_id).await, 1);
+        assert!(queue.take().await.is_empty(), "session must not be due yet");
+        assert_eq!(queue.snapshot().await.0, vec![session_id]);
+
+        // Consecutive failures grow the delay and eventually exhaust the budget.
+        for attempt in 2..=INCREMENTAL_RETRY_MAX_ATTEMPTS {
+            assert_eq!(
+                queue.mark_retry(session_id).await,
+                Some(incremental_retry_delay(attempt))
+            );
+        }
+        assert_eq!(queue.mark_retry(session_id).await, None);
+        assert_eq!(queue.retry_attempts(session_id).await, 0);
+
+        // A new canonical commit clears the backoff and makes the session immediately due.
+        queue.mark_committed(session_id).await;
+        assert_eq!(queue.retry_attempts(session_id).await, 0);
+        assert_eq!(queue.take().await, vec![session_id]);
+        assert!(queue.snapshot().await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dirty_session_retry_becomes_due_after_backoff_elapses() {
+        let queue = SessionSearchDirtyQueue::default();
+        let session_id = SessionId::new();
+        assert_eq!(
+            queue.mark_retry(session_id).await,
+            Some(INCREMENTAL_RETRY_DELAY)
+        );
+        assert!(queue.take().await.is_empty());
+        // The retry schedules a wakeup once the backoff elapses; wait for it instead of sleeping.
+        tokio::time::timeout(INCREMENTAL_RETRY_DELAY * 20, queue.notified())
+            .await
+            .expect("retry wakeup must fire after backoff");
+        assert_eq!(queue.take().await, vec![session_id]);
+        // Success clears the retry record so the next failure starts from the first delay.
+        queue.mark_ingested(session_id).await;
+        assert_eq!(queue.retry_attempts(session_id).await, 0);
     }
 
     #[tokio::test]
