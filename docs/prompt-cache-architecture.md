@@ -131,6 +131,10 @@ bcode eval run fixtures/evals/prompt-cache/suite.toml
 3. Run the live scenario suite against the model and fix adapter behavior until every applicable
    scenario passes.
 
+The repository skill `.bcode/skills/verify-prompt-cache` walks agents through running both harnesses,
+interpreting every scenario and measurement, and tracing failures to the catalog, planner, adapter,
+or provider.
+
 ## Related documents
 
 * `docs/model-provider-contract.md` — conformance and capability truthfulness
