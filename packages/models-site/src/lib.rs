@@ -52,7 +52,9 @@ pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad:
 
 /// Build catalog API artifacts next to the HyperChad-generated static site.
 ///
-/// Optional live snapshots can be provided with `--live <dir>`.
+/// The `HyperChad` runner owns the process CLI and rejects unknown flags, so live snapshots are
+/// supplied through the `BCODE_MODEL_CATALOG_LIVE_DIR` environment variable rather than a `--live`
+/// argument.
 ///
 /// # Errors
 ///

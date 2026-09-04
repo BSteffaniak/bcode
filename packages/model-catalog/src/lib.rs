@@ -1743,42 +1743,42 @@ pub fn load_live_snapshots(live_dir: &Path) -> Result<Vec<LiveCatalogSnapshot>> 
 }
 
 /// Merge generated live snapshots into a catalog document.
-///
-/// # Panics
-///
-/// Panics if a provider referenced by a snapshot does not exist after auto-creation logic.
 pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCatalogSnapshot]) {
     for snapshot in snapshots {
-        // Auto-create provider if it does not exist (live data is the source of truth for new providers)
-        if !catalog.providers.contains_key(&snapshot.provider_id) {
-            catalog.providers.insert(
-                snapshot.provider_id.clone(),
-                ProviderCatalog {
-                    provider_id: snapshot.provider_id.clone(),
-                    display_name: snapshot.provider_id.clone(),
-                    kind: CatalogProviderKind::Other,
-                    website_url: None,
-                    default_model_id: None,
-                    default_codex_model_id: None,
-                    fallback_model_ids: Vec::new(),
-                    defaults: None,
-                    error_handling:
-                        bcode_model_catalog_models::ProviderErrorHandlingMetadata::default(),
-                    models: std::collections::BTreeMap::new(),
-                },
-            );
-        }
-
+        // Auto-create provider if it does not exist (live data is the source of truth for new
+        // providers).
         let provider = catalog
             .providers
-            .get_mut(&snapshot.provider_id)
-            .expect("provider was just inserted or already existed");
+            .entry(snapshot.provider_id.clone())
+            .or_insert_with(|| ProviderCatalog {
+                provider_id: snapshot.provider_id.clone(),
+                display_name: snapshot.provider_id.clone(),
+                kind: CatalogProviderKind::Other,
+                website_url: None,
+                default_model_id: None,
+                default_codex_model_id: None,
+                fallback_model_ids: Vec::new(),
+                defaults: None,
+                error_handling: bcode_model_catalog_models::ProviderErrorHandlingMetadata::default(
+                ),
+                models: std::collections::BTreeMap::new(),
+            });
 
         for live_model in snapshot.models.values() {
             let live_target = live_model.target.as_ref().or(snapshot.target.as_ref());
             let matching_key = remote::matching_local_model_key(provider, &live_model.model_id)
                 .unwrap_or_else(|| live_model.model_id.clone());
             let is_alias_match = matching_key != live_model.model_id;
+            if is_alias_match
+                && !is_versioned_form_of(&live_model.model_id, &matching_key)
+                && let Some(entry) = priced_family_alias_entry(provider, &matching_key, live_model)
+            {
+                provider.models.insert(
+                    live_model.model_id.clone(),
+                    with_live_metadata(entry, live_model, snapshot),
+                );
+                continue;
+            }
             let entry = provider
                 .models
                 .entry(matching_key)
@@ -1786,6 +1786,12 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
             if is_alias_match {
                 // Live deployment facts must not replace canonical semantic capabilities.
                 entry.aliases.insert(live_model.model_id.clone());
+                if entry.pricing.is_none()
+                    && live_model.pricing.is_some()
+                    && is_versioned_form_of(&live_model.model_id, &entry.model_id)
+                {
+                    entry.pricing.clone_from(&live_model.pricing);
+                }
                 entry.live = Some(LiveModelMetadata {
                     status: live_model.status.clone(),
                     regions: live_model.regions.clone(),
@@ -1801,34 +1807,7 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
             }
             entry.aliases.extend(live_model.aliases.iter().cloned());
             if let Some(target) = live_target {
-                let deployment = entry
-                    .deployments
-                    .iter_mut()
-                    .find(|deployment| deployment.target == *target);
-                if let Some(deployment) = deployment {
-                    deployment.context_window =
-                        live_model.context_window.or(deployment.context_window);
-                    deployment.max_output_tokens = live_model
-                        .max_output_tokens
-                        .or(deployment.max_output_tokens);
-                    if live_model.reasoning.is_some() {
-                        deployment.reasoning.clone_from(&live_model.reasoning);
-                    }
-                    if live_model.pricing.is_some() {
-                        deployment.pricing.clone_from(&live_model.pricing);
-                    }
-                    deployment.capabilities =
-                        merge_capabilities(&deployment.capabilities, &live_model.capabilities);
-                } else {
-                    entry.deployments.push(ModelDeployment {
-                        target: target.clone(),
-                        context_window: live_model.context_window,
-                        max_output_tokens: live_model.max_output_tokens,
-                        capabilities: live_model.capabilities.clone(),
-                        reasoning: live_model.reasoning.clone(),
-                        pricing: live_model.pricing.clone(),
-                    });
-                }
+                merge_live_deployment(entry, target, live_model);
             } else {
                 if entry.context_window.is_none() {
                     entry.context_window = live_model.context_window;
@@ -1852,6 +1831,107 @@ pub fn merge_live_snapshots(catalog: &mut CatalogDocument, snapshots: &[LiveCata
             });
         }
     }
+}
+
+/// Merge a target-scoped live model into the matching deployment, creating one when absent.
+fn merge_live_deployment(
+    entry: &mut ModelCatalogEntry,
+    target: &ModelSupportTarget,
+    live_model: &bcode_model_catalog_models::LiveModel,
+) {
+    let deployment = entry
+        .deployments
+        .iter_mut()
+        .find(|deployment| deployment.target == *target);
+    if let Some(deployment) = deployment {
+        deployment.context_window = live_model.context_window.or(deployment.context_window);
+        deployment.max_output_tokens = live_model
+            .max_output_tokens
+            .or(deployment.max_output_tokens);
+        if live_model.reasoning.is_some() {
+            deployment.reasoning.clone_from(&live_model.reasoning);
+        }
+        if live_model.pricing.is_some() {
+            deployment.pricing.clone_from(&live_model.pricing);
+        }
+        deployment.capabilities =
+            merge_capabilities(&deployment.capabilities, &live_model.capabilities);
+    } else {
+        entry.deployments.push(ModelDeployment {
+            target: target.clone(),
+            context_window: live_model.context_window,
+            max_output_tokens: live_model.max_output_tokens,
+            capabilities: live_model.capabilities.clone(),
+            reasoning: live_model.reasoning.clone(),
+            pricing: live_model.pricing.clone(),
+        });
+    }
+}
+
+/// Build a dedicated catalog entry for a priced live model that only matched a curated family
+/// alias glob.
+///
+/// Pricing is per SKU, while alias entries are typically family globs (`*nova*`, `*llama3*`) that
+/// cover many differently priced SKUs. The priced live model gets its own entry that inherits the
+/// family's curated semantics, so the exact-key match wins over the glob during enrichment
+/// without mutating the family entry. Returns `None` when the live model carries no pricing or
+/// the curated family already has pricing (for example Fable 5.1's per-scope rules), which stays
+/// authoritative.
+fn priced_family_alias_entry(
+    provider: &ProviderCatalog,
+    family_key: &str,
+    live_model: &bcode_model_catalog_models::LiveModel,
+) -> Option<ModelCatalogEntry> {
+    live_model.pricing.as_ref()?;
+    let family = provider.models.get(family_key)?;
+    if family.pricing.is_some() {
+        return None;
+    }
+    let mut entry = family.clone();
+    entry.model_id.clone_from(&live_model.model_id);
+    entry.aliases.clear();
+    // The derived entry exists to enrich this live ID when discovered. It must not be expanded
+    // into pickers as a catalog-only model, or the concrete family entry (for example the Mantle
+    // `openai.gpt-oss-120b`) would appear twice.
+    entry.supported_by.clear();
+    entry.deployments.clear();
+    entry.pricing.clone_from(&live_model.pricing);
+    if entry.context_window.is_none() {
+        entry.context_window = live_model.context_window;
+    }
+    if entry.max_output_tokens.is_none() {
+        entry.max_output_tokens = live_model.max_output_tokens;
+    }
+    Some(entry)
+}
+
+/// Whether a live model ID is a versioned form of a concrete catalog model ID.
+///
+/// Bedrock appends `-<version>:<minor>` to on-demand IDs (`openai.gpt-oss-120b-1:0`), while the
+/// catalog keys the model without it. Such an entry is a specific model rather than a family
+/// glob, so live pricing belongs on the entry itself.
+fn is_versioned_form_of(live_model_id: &str, catalog_model_id: &str) -> bool {
+    live_model_id
+        .strip_prefix(catalog_model_id)
+        .is_some_and(|suffix| {
+            suffix
+                .strip_prefix('-')
+                .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit() || c == ':'))
+        })
+}
+
+fn with_live_metadata(
+    mut entry: ModelCatalogEntry,
+    live_model: &bcode_model_catalog_models::LiveModel,
+    snapshot: &LiveCatalogSnapshot,
+) -> ModelCatalogEntry {
+    entry.live = Some(LiveModelMetadata {
+        status: live_model.status.clone(),
+        regions: live_model.regions.clone(),
+        last_seen_at: Some(snapshot.generated_at.clone()),
+        source: Some("provider_live".to_string()),
+    });
+    entry
 }
 
 fn live_model_entry(
@@ -4015,6 +4095,115 @@ status = "stable"
             document.providers["bedrock"].models["anthropic.claude"].pricing,
             Some(expected)
         );
+    }
+
+    #[test]
+    fn live_bedrock_pricing_reaches_glob_enriched_family_models() {
+        // `ListFoundationModels` IDs match bundled family globs (`*nova*`, `*llama3*`, ...). Live
+        // AWS price-list pricing must still reach the discovered model through that alias match
+        // while the family's curated capabilities remain authoritative.
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let nova_pricing = bcode_model_catalog_models::CatalogPricing {
+            currency: "USD".to_string(),
+            unit: bcode_model_catalog_models::CatalogPricingUnit::PerMillionTokens,
+            input_micros: Some(800_000),
+            cached_input_micros: Some(200_000),
+            cache_write_input_micros: None,
+            output_micros: Some(3_200_000),
+            context_threshold_tokens: None,
+            revision: Some("2026-09-01T00:00:00Z".to_string()),
+            rules: Vec::new(),
+        };
+        let mut snapshot = LiveCatalogSnapshot::empty("bedrock", "2026-09-01T00:00:00Z");
+        snapshot.models.insert(
+            "amazon.nova-pro-v1:0".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "model_id": "amazon.nova-pro-v1:0",
+                "display_name": "Nova Pro",
+                "capabilities": {"text_input": true, "text_output": true, "tool_use": false},
+                "pricing": nova_pricing
+            }))
+            .expect("live model"),
+        );
+        merge_live_snapshots(&mut document, &[snapshot]);
+        let catalog = ModelCatalog::new(document);
+
+        let discovered = bcode_model::ModelInfo {
+            model_id: "amazon.nova-pro-v1:0".to_string(),
+            display_name: "Nova Pro".to_string(),
+            is_default: false,
+            context_window: None,
+            max_output_tokens: None,
+            max_image_input_base64_bytes: None,
+            capabilities: std::collections::BTreeSet::new(),
+            feature_support: bcode_model::ModelFeatureSupport::default(),
+            reasoning: None,
+            cache: bcode_model::ModelCacheInfo::default(),
+            metadata_source: None,
+            pricing: None,
+            api_surface: None,
+            visibility: bcode_model::ModelVisibility::Visible,
+        };
+        let enriched = catalog.enrich_model("bedrock", discovered);
+        let pricing = enriched
+            .pricing
+            .expect("live pricing reaches the Nova Pro model");
+        assert_eq!(pricing.input.map(|price| price.micros), Some(800_000));
+        assert_eq!(pricing.output.map(|price| price.micros), Some(3_200_000));
+        // Family capabilities are curated, so live `tool_use: false` must not remove tool calls.
+        assert!(
+            enriched
+                .capabilities
+                .contains(&bcode_model::ModelCapability::ToolCalls)
+        );
+        assert_eq!(enriched.context_window, Some(300_000));
+    }
+
+    #[test]
+    fn live_pricing_for_versioned_id_lands_on_the_concrete_catalog_model() {
+        // `openai.gpt-oss-120b-1:0` is the on-demand form of the concrete catalog model
+        // `openai.gpt-oss-120b`. Pricing must land on that entry (so both the bare Mantle ID and
+        // the versioned Converse ID are priced) without creating a duplicate picker entry.
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let mut snapshot = LiveCatalogSnapshot::empty("bedrock", "2026-09-01T00:00:00Z");
+        snapshot.models.insert(
+            "openai.gpt-oss-120b-1:0".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "model_id": "openai.gpt-oss-120b-1:0",
+                "display_name": "gpt-oss-120b",
+                "pricing": {
+                    "currency": "USD",
+                    "unit": "per_million_tokens",
+                    "input_micros": 150_000,
+                    "output_micros": 600_000
+                }
+            }))
+            .expect("live model"),
+        );
+        merge_live_snapshots(&mut document, &[snapshot]);
+        assert!(
+            !document.providers["bedrock"]
+                .models
+                .contains_key("openai.gpt-oss-120b-1:0")
+        );
+        let entry = &document.providers["bedrock"].models["openai.gpt-oss-120b"];
+        assert_eq!(
+            entry
+                .pricing
+                .as_ref()
+                .and_then(|pricing| pricing.input_micros),
+            Some(150_000)
+        );
+        assert!(entry.aliases.contains("openai.gpt-oss-120b-1:0"));
+        assert!(is_versioned_form_of(
+            "openai.gpt-oss-120b-1:0",
+            "openai.gpt-oss-120b"
+        ));
+        assert!(!is_versioned_form_of("amazon.nova-pro-v1:0", "amazon.nova"));
+        assert!(!is_versioned_form_of(
+            "openai.gpt-oss-120b",
+            "openai.gpt-oss-120b"
+        ));
     }
 
     #[test]

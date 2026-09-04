@@ -5,9 +5,8 @@
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (output_dir, live_dir) = static_paths_from_args();
-    if let Some(output_dir) = output_dir.as_deref() {
-        bcode_models_site::build_catalog_artifacts(output_dir, live_dir.as_deref())?;
+    if let Some(output_dir) = static_output_dir_from_args().as_deref() {
+        bcode_models_site::build_catalog_artifacts(output_dir, live_dir_from_env().as_deref())?;
     }
 
     let runtime = switchy::unsync::runtime::Builder::new().build()?;
@@ -22,20 +21,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn static_paths_from_args() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
-    let mut output = None;
-    let mut live = None;
+/// Mirror `HyperChad`'s `gen --output <dir>` argument so catalog artifacts land beside the site.
+///
+/// Only flags `HyperChad` itself accepts may appear on the command line; its `clap` parser runs
+/// afterwards and rejects anything else.
+fn static_output_dir_from_args() -> Option<std::path::PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--output" {
-            output = args.next().map(Into::into);
-        } else if let Some(value) = arg.strip_prefix("--output=") {
-            output = Some(value.into());
-        } else if arg == "--live" {
-            live = args.next().map(Into::into);
-        } else if let Some(value) = arg.strip_prefix("--live=") {
-            live = Some(value.into());
+        if arg == "--output" || arg == "-o" {
+            return args.next().map(Into::into);
+        }
+        if let Some(value) = arg.strip_prefix("--output=") {
+            return Some(value.into());
         }
     }
-    (output, live)
+    None
+}
+
+fn live_dir_from_env() -> Option<std::path::PathBuf> {
+    std::env::var_os("BCODE_MODEL_CATALOG_LIVE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(Into::into)
 }

@@ -14,6 +14,12 @@ owned by the Rust model-discovery/catalog domain. Deployments run `bcode-model-d
 that versioned snapshot only as a pricing seed and joins it to current inventory by exact model ID;
 it does not parse AWS pricing products.
 
+The Rust discovery reads both AWS Price List offers: `AmazonBedrock` (first-party and open-weight
+models) and `AmazonBedrockFoundationModels` (Marketplace-listed models, which is where every
+Anthropic model newer than Claude 3 is priced). Inventory names are matched to price-list names
+by normalized display name, model ID, and variant-qualifier stripping (`Llama 3.1 70B Instruct` →
+`Llama 3.1 70B`).
+
 A refresh fails before writing R2 if the seed is missing, has an unsupported schema, contains no
 pricing, or does not price any currently discovered model. The existing R2 snapshot therefore
 remains the last known-good value. A newly introduced model may remain unpriced until the next

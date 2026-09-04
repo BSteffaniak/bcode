@@ -58,10 +58,15 @@ jobs:
           python3 -c 'import json; data=json.load(open("target/model-live/bedrock.json")); models=list(data["models"].values()); priced=[model for model in models if model.get("pricing")]; assert models, "Bedrock discovery returned no models"; assert priced, "Bedrock discovery returned no priced models"; print(f"validated {len(priced)}/{len(models)} priced Bedrock models")'
 
       - name: Build static models site
-        run: cargo run --release -p bcode_models_site -- gen --output dist --live target/model-live
+        run: cargo run --release -p bcode_models_site -- gen --output dist
 
-      - name: Build catalog artifacts
+      - name: Build catalog artifacts with live snapshots
         run: cargo run --release -p bcode_model_catalog -- build --output dist/v1 --live target/model-live
+
+      - name: Verify published Bedrock pricing seed
+        run: |
+          test -f dist/v1/live/bedrock.json
+          python3 -c 'import json; data=json.load(open("dist/v1/live/bedrock.json")); models=list(data["models"].values()); priced=[model for model in models if model.get("pricing")]; assert priced, "published Bedrock live seed has no priced models"; print(f"published {len(priced)}/{len(models)} priced Bedrock models")'
 
       - name: Check Worker syntax and tests
         run: |
