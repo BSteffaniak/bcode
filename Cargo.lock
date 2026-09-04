@@ -1859,6 +1859,7 @@ dependencies = [
  "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
+ "bcode_prompt_cache",
  "bcode_session_models",
  "jsonschema",
  "serde",
@@ -2342,6 +2343,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_prompt_cache"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_fake_provider_plugin",
+ "bcode_model",
+ "bcode_model_provider_runtime",
+ "bcode_plugin_sdk",
+ "bcode_prompt_cache_models",
+ "bcode_session_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_prompt_cache_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_prompt_profile"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2492,6 +2516,7 @@ dependencies = [
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_project_instructions",
+ "bcode_prompt_cache",
  "bcode_prompt_profile",
  "bcode_prompt_profile_plugin",
  "bcode_provider_auth",

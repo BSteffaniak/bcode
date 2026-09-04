@@ -998,20 +998,30 @@ where
         &model.model_id,
         "Reply with a short cache conformance response.",
     );
+    // Only request TTLs the model advertises; an invented TTL is a request error, not a cache
+    // conformance signal. Likewise, only place an explicit message point when the model claims
+    // explicit cache points: automatic-prefix caches legitimately reject them.
+    let ttl_seconds = model.cache.ttl_seconds.iter().next_back().copied();
+    let explicit_points = model
+        .cache
+        .capabilities
+        .contains(&bcode_model::ModelCacheCapability::ExplicitCachePoints);
     request.prompt_cache = PromptCacheHints {
         mode: PromptCacheMode::Aggressive,
         key: Some("conformance-cache".to_string()),
-        ttl_seconds: Some(60),
-        supported_ttl_seconds: BTreeSet::from([60]),
+        ttl_seconds,
+        supported_ttl_seconds: model.cache.ttl_seconds.clone(),
         cache_system_prompt: true,
         cache_tools: true,
     };
-    request.messages[0].content.push(ContentBlock::CachePoint {
-        hint: PromptCachePoint {
-            label: Some("conformance".to_string()),
-            ttl_seconds: Some(60),
-        },
-    });
+    if explicit_points {
+        request.messages[0].content.push(ContentBlock::CachePoint {
+            hint: PromptCachePoint {
+                label: Some("conformance".to_string()),
+                ttl_seconds,
+            },
+        });
+    }
     request.tools.push(ToolDefinition {
         name: "conformance.cache".to_string(),
         description: "Stable cache conformance tool.".to_string(),
@@ -1039,7 +1049,7 @@ where
         .emitted_cache_point_count
         .unwrap_or_default()
         .saturating_add(projection.dropped_cache_point_count.unwrap_or_default());
-    if explicit == 0 || accounted < explicit {
+    if explicit_points && (explicit == 0 || accounted < explicit) {
         return violation(
             PROMPT_CACHING,
             "request projection did not account for explicit cache points",

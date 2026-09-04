@@ -485,6 +485,12 @@ pub struct CatalogCapabilities {
     /// Supported prompt-cache TTL values in seconds.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub prompt_cache_ttl_seconds: BTreeSet<u64>,
+    /// Minimum stable prefix length, in tokens, before the provider caches a prefix.
+    ///
+    /// Shorter prefixes are accepted by the provider but never written to or read from its
+    /// prompt cache, so hosts should not spend cache breakpoints on them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_min_prefix_tokens: Option<u64>,
     /// Supports native provider web search.
     #[serde(default)]
     pub native_web_search: bool,

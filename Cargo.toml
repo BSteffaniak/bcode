@@ -40,6 +40,8 @@ members = [
     "packages/agent-permissions",
     "packages/code-review/models",
     "packages/agent-profile",
+    "packages/prompt-cache",
+    "packages/prompt-cache/models",
     "packages/prompt-profile",
     "packages/agent-runtime",
     "packages/bcode",
@@ -207,6 +209,8 @@ bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-f
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_project_instructions              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/project-instructions" }
+bcode_prompt_cache                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/prompt-cache" }
+bcode_prompt_cache_models               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/prompt-cache/models" }
 bcode_prompt_profile                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/prompt-profile" }
 bcode_prompt_profile_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompt-profile-plugin" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
@@ -276,12 +280,11 @@ bmux_tui_components = { default-features = false, git = "https://github.com/BSte
 bmux_tui_runtime = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies
+anyhow = { version = "1.0.102", default-features = false }
 arboard = { version = "3.6.1", default-features = false, features = [
     "image-data",
 ] }
 async-trait = { version = "0.1.89", default-features = false }
-anyhow = { version = "1.0.102", default-features = false }
-axum = { version = "0.8.9", default-features = false }
 aws-config = { version = "1.8.16", default-features = false, features = [
     "credentials-process",
     "rt-tokio",
@@ -301,23 +304,24 @@ aws-smithy-runtime-api = { version = "1.14.0", default-features = false, feature
     "client",
 ] }
 aws-smithy-types = { version = "1.4.7", default-features = false }
+axum = { version = "0.8.9", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
-bytes = { version = "1.11.1", default-features = false }
 brush-parser = { version = "0.4.0", default-features = false }
+bytes = { version = "1.11.1", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = [
     "clock",
     "std",
 ] }
 clap = { version = "4.5.40", default-features = false }
-futures-util = { version = "0.3.32", default-features = false }
 cmake = { version = "0.1.54", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 devicons = { version = "0.6.12", default-features = false }
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.32", default-features = false }
 git2 = { version = "0.20.3", default-features = false }
 globset = { version = "0.4.18", default-features = false }
-httpdate = { version = "1.0.3", default-features = false }
 http = { version = "1.4.0", default-features = false }
+httpdate = { version = "1.0.3", default-features = false }
 hyperchad = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_color = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 hyperchad_docs_config = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
@@ -433,9 +437,9 @@ toml_edit = { version = "0.23.7", default-features = false, features = [
     "parse",
     "serde",
 ] }
-tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tower = { version = "0.5.3", default-features = false }
 tower-http = { version = "0.6.10", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-appender = { version = "0.2.3", default-features = false }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [

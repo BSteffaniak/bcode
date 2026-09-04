@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["data-structures"]
+description = "Portable prompt-cache expectation, observation, and verification report types for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "prompt-cache", "models"]
+license     = { workspace = true }
+name        = "bcode_prompt_cache_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_model = { workspace = true }
+serde       = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

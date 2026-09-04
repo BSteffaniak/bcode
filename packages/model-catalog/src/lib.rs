@@ -12,10 +12,11 @@ use bcode_model::{
 };
 use bcode_model_catalog_models::{
     BcodeSupportStatus, CatalogCapabilities, CatalogDocument, CatalogModelStatus, CatalogPricing,
-    CatalogProviderKind, LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogEntry,
-    ModelDeployment, ModelSupportTarget, ProviderCatalog,
+    CatalogPricingBucket, CatalogProviderKind, LiveCatalogSnapshot, LiveModelMetadata,
+    ModelCatalogEntry, ModelDeployment, ModelSupportTarget, ProviderCatalog,
 };
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1312,11 +1313,19 @@ fn merge_model_cache(cache: &mut ModelCacheInfo, capabilities: &CatalogCapabilit
     let catalog = cache_info_from_catalog(capabilities);
     cache.capabilities.extend(catalog.capabilities);
     cache.ttl_seconds.extend(catalog.ttl_seconds);
+    if let Some(min_prefix) = catalog.min_prefix_tokens {
+        cache.min_prefix_tokens = Some(
+            cache
+                .min_prefix_tokens
+                .map_or(min_prefix, |existing| existing.min(min_prefix)),
+        );
+    }
 }
 
 fn cache_info_from_catalog(capabilities: &CatalogCapabilities) -> ModelCacheInfo {
     let mut cache = ModelCacheInfo {
         ttl_seconds: capabilities.prompt_cache_ttl_seconds.clone(),
+        min_prefix_tokens: capabilities.prompt_cache_min_prefix_tokens,
         ..ModelCacheInfo::default()
     };
     if capabilities.prompt_cache {
@@ -1662,7 +1671,77 @@ pub fn validate_catalog(catalog: &CatalogDocument) -> Result<()> {
                     )));
                 }
             }
+            validate_prompt_cache_declaration(provider_id, model_id, model)?;
         }
+    }
+    Ok(())
+}
+
+/// Reject prompt-cache declarations whose capability, TTL, and pricing facts disagree.
+///
+/// TTL-specific cache-write pricing rules only make sense for TTLs the model advertises, and an
+/// advertised TTL without a matching priced rule would leave cache-write cost estimation silently
+/// incomplete. Explicit cache breakpoints are only useful when the host knows the provider's
+/// minimum cacheable prefix, so explicit-cache entries must declare it.
+fn validate_prompt_cache_declaration(
+    provider_id: &str,
+    model_id: &str,
+    model: &ModelCatalogEntry,
+) -> Result<()> {
+    let capabilities = &model.capabilities;
+    if !capabilities.prompt_cache {
+        if capabilities.explicit_prompt_cache
+            || !capabilities.prompt_cache_ttl_seconds.is_empty()
+            || capabilities.prompt_cache_min_prefix_tokens.is_some()
+        {
+            return Err(Error::Validation(format!(
+                "model '{model_id}' for provider '{provider_id}' declares explicit cache \
+                 breakpoints, cache TTLs, or a minimum cache prefix without `prompt_cache = true`"
+            )));
+        }
+        return Ok(());
+    }
+    if capabilities.explicit_prompt_cache && capabilities.prompt_cache_min_prefix_tokens.is_none() {
+        return Err(Error::Validation(format!(
+            "model '{model_id}' for provider '{provider_id}' declares `explicit_prompt_cache = \
+             true` without `prompt_cache_min_prefix_tokens`; the host needs the provider's \
+             minimum cacheable prefix to place breakpoints that can actually be reused"
+        )));
+    }
+    if capabilities
+        .prompt_cache_min_prefix_tokens
+        .is_some_and(|tokens| tokens == 0)
+    {
+        return Err(Error::Validation(format!(
+            "model '{model_id}' for provider '{provider_id}' declares a zero minimum cache prefix"
+        )));
+    }
+    let priced_ttls = model
+        .pricing
+        .iter()
+        .flat_map(|pricing| &pricing.rules)
+        .filter(|rule| rule.bucket == CatalogPricingBucket::CacheWriteInput)
+        .filter_map(|rule| rule.cache_ttl_seconds)
+        .collect::<BTreeSet<_>>();
+    if let Some(unadvertised) = priced_ttls
+        .difference(&capabilities.prompt_cache_ttl_seconds)
+        .next()
+    {
+        return Err(Error::Validation(format!(
+            "model '{model_id}' for provider '{provider_id}' prices cache writes for TTL \
+             {unadvertised}s that `prompt_cache_ttl_seconds` does not advertise"
+        )));
+    }
+    if !priced_ttls.is_empty()
+        && let Some(unpriced) = capabilities
+            .prompt_cache_ttl_seconds
+            .difference(&priced_ttls)
+            .next()
+    {
+        return Err(Error::Validation(format!(
+            "model '{model_id}' for provider '{provider_id}' advertises cache TTL {unpriced}s \
+             without a matching TTL-specific cache-write pricing rule"
+        )));
     }
     Ok(())
 }
@@ -2011,6 +2090,13 @@ pub(crate) fn merge_capabilities(
             .union(&right.prompt_cache_ttl_seconds)
             .copied()
             .collect(),
+        prompt_cache_min_prefix_tokens: match (
+            left.prompt_cache_min_prefix_tokens,
+            right.prompt_cache_min_prefix_tokens,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => right.or(left),
+        },
         native_web_search: left.native_web_search || right.native_web_search,
     }
 }
@@ -4145,6 +4231,113 @@ status = "stable"
 
         let error = validate_catalog(&document).expect_err("duplicate target must fail");
         assert!(error.to_string().contains("duplicate deployment target"));
+    }
+
+    #[test]
+    fn catalog_validation_requires_min_prefix_for_explicit_cache_entries() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let model = document
+            .providers
+            .get_mut("bedrock")
+            .and_then(|provider| provider.models.get_mut("anthropic.claude-fable-5-1"))
+            .expect("Fable 5.1 entry");
+        model.capabilities.prompt_cache_min_prefix_tokens = None;
+
+        let error = validate_catalog(&document).expect_err("explicit cache needs min prefix");
+        assert!(
+            error
+                .to_string()
+                .contains("without `prompt_cache_min_prefix_tokens`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn catalog_validation_requires_priced_ttls_to_be_advertised() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let model = document
+            .providers
+            .get_mut("bedrock")
+            .and_then(|provider| provider.models.get_mut("anthropic.claude-fable-5-1"))
+            .expect("Fable 5.1 entry");
+        model.capabilities.prompt_cache_ttl_seconds = BTreeSet::from([300]);
+
+        let error = validate_catalog(&document).expect_err("priced TTL must be advertised");
+        assert!(
+            error
+                .to_string()
+                .contains("prices cache writes for TTL 3600s"),
+            "{error}"
+        );
+
+        let model = document
+            .providers
+            .get_mut("bedrock")
+            .and_then(|provider| provider.models.get_mut("anthropic.claude-fable-5-1"))
+            .expect("Fable 5.1 entry");
+        model.capabilities.prompt_cache_ttl_seconds = BTreeSet::from([300, 3_600, 86_400]);
+
+        let error = validate_catalog(&document).expect_err("advertised TTL must be priced");
+        assert!(
+            error
+                .to_string()
+                .contains("advertises cache TTL 86400s without a matching"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn catalog_validation_rejects_cache_details_without_prompt_cache() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let model = document
+            .providers
+            .get_mut("bedrock")
+            .and_then(|provider| provider.models.get_mut("anthropic.claude-fable-5-1"))
+            .expect("Fable 5.1 entry");
+        model.capabilities.prompt_cache = false;
+        model.pricing = None;
+
+        let error = validate_catalog(&document).expect_err("cache details need prompt_cache");
+        assert!(
+            error.to_string().contains("without `prompt_cache = true`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn catalog_min_prefix_tokens_reach_normalized_cache_info() {
+        let catalog = ModelCatalog::new(load_embedded_catalog().expect("embedded catalog"));
+        let fable = catalog
+            .model("bedrock", "anthropic.claude-fable-5-1")
+            .expect("Fable 5.1 entry");
+        let cache = cache_info_from_catalog(&fable.capabilities);
+        assert_eq!(cache.min_prefix_tokens, Some(1_024));
+        assert!(
+            cache
+                .capabilities
+                .contains(&ModelCacheCapability::ExplicitCachePoints)
+        );
+
+        let mut merged = ModelCacheInfo {
+            min_prefix_tokens: Some(4_096),
+            ..ModelCacheInfo::default()
+        };
+        merge_model_cache(&mut merged, &fable.capabilities);
+        assert_eq!(merged.min_prefix_tokens, Some(1_024));
+
+        let mut left = fable.capabilities.clone();
+        left.prompt_cache_min_prefix_tokens = Some(2_048);
+        let mut right = fable.capabilities.clone();
+        right.prompt_cache_min_prefix_tokens = None;
+        assert_eq!(
+            merge_capabilities(&left, &right).prompt_cache_min_prefix_tokens,
+            Some(2_048)
+        );
+        right.prompt_cache_min_prefix_tokens = Some(1_024);
+        assert_eq!(
+            merge_capabilities(&left, &right).prompt_cache_min_prefix_tokens,
+            Some(1_024)
+        );
     }
 
     #[test]

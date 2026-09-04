@@ -4,6 +4,8 @@
 
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
+pub mod prompt_cache;
+
 use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
     ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
@@ -376,6 +378,35 @@ impl FakeProviderPlugin {
         json_response(&capabilities(execution))
     }
 
+    /// Serve a cache-model turn through the deterministic prompt-cache simulator.
+    fn start_cache_model_turn(
+        &self,
+        profile: &bcode_prompt_cache::simulation::PromptCacheSimulatorProfile,
+        request: &ModelTurnRequest,
+        positioned_output: bool,
+    ) -> ServiceResponse {
+        if let Err(error) = prompt_cache::validate(profile, request) {
+            return json_response(&StartTurnResponse {
+                provider_turn_id: insert_fake_error_turn(&self.state, error),
+            });
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("fake provider state lock should not be poisoned");
+        state.next_turn += 1;
+        let provider_turn_id = format!("fake-turn-{}", state.next_turn);
+        let turn = FakeTurn::default();
+        if positioned_output {
+            turn.enable_positioned_output();
+        }
+        state.turns.insert(provider_turn_id.clone(), turn.clone());
+        drop(state);
+        turn.push(ProviderTurnEvent::TurnStarted);
+        prompt_cache::serve_turn(profile, request, &|event| turn.push(event));
+        json_response(&StartTurnResponse { provider_turn_id })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
@@ -386,6 +417,9 @@ impl FakeProviderPlugin {
             return json_response(&StartTurnResponse {
                 provider_turn_id: insert_fake_error_turn(&self.state, error),
             });
+        }
+        if let Some(profile) = prompt_cache::profile_for(&request.model_id) {
+            return self.start_cache_model_turn(&profile, &request, positioned_output);
         }
         if let Some(error) = validate_fake_parallel_tool_policy(&request) {
             return error;
@@ -1257,11 +1291,8 @@ fn unsupported_fake_error(code: &str, message: &str) -> ProviderError {
     }
 }
 
-fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
-    if let Some((code, message)) = unsupported_fake_sampling_parameters(&request.parameters) {
-        return Some(unsupported_fake_error(code, message));
-    }
-    let unsupported = if matches!(
+fn carries_prompt_cache_hints(request: &ModelTurnRequest) -> bool {
+    matches!(
         request.prompt_cache.mode,
         bcode_model::PromptCacheMode::Aggressive
     ) || request.prompt_cache.cache_system_prompt
@@ -1271,7 +1302,16 @@ fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
                 .content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
-        }) {
+        })
+}
+
+fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
+    if let Some((code, message)) = unsupported_fake_sampling_parameters(&request.parameters) {
+        return Some(unsupported_fake_error(code, message));
+    }
+    let unsupported = if carries_prompt_cache_hints(request)
+        && !prompt_cache::is_cache_model(&request.model_id)
+    {
         Some((
             "fake_prompt_cache_unsupported",
             "fake provider does not implement prompt caching",
@@ -1337,9 +1377,21 @@ fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
             retry: None,
         });
     }
+    let cache_model = prompt_cache::profile_for(&request.model_id);
+    let feature_support = cache_model
+        .as_ref()
+        .map_or_else(fake_feature_support, |profile| {
+            prompt_cache::feature_support(profile)
+        });
     request
-        .explicitly_unsupported_features(&fake_feature_support())
-        .first()
+        .explicitly_unsupported_features(&feature_support)
+        .into_iter()
+        // Cache hints are advisory: the provider contract lets an adapter ignore hints its
+        // surface cannot express, and the cache simulator validates the ones that matter.
+        .find(|feature| {
+            cache_model.is_none()
+                || !matches!(feature, bcode_model::RequestedModelFeature::PromptCache(_))
+        })
         .map(|feature| ProviderError {
             code: "fake_feature_unsupported".to_string(),
             category: ProviderErrorCategory::UnsupportedFeature,
@@ -1909,6 +1961,12 @@ fn fake_feature_support_for_execution(
 fn capabilities(
     structured_output_execution: bcode_model::CapabilityExecution,
 ) -> ProviderCapabilities {
+    // Provider-scope cache claims are the union of what any fake model can do; `fake-echo` keeps
+    // its own model-scope rejection so negotiation still fails closed for it.
+    let mut feature_support = fake_feature_support_for_execution(structured_output_execution);
+    feature_support.prompt_cache = prompt_cache::provider_feature_claims()
+        .into_iter()
+        .collect();
     ProviderCapabilities {
         provider_id: "bcode.fake-provider".to_string(),
         display_name: "Bcode Fake Provider".to_string(),
@@ -1918,10 +1976,11 @@ fn capabilities(
             ProviderCapability::ParallelToolCalls,
             ProviderCapability::Cancellation,
             ProviderCapability::JsonMode,
+            ProviderCapability::PromptCaching,
         ]
         .into_iter()
         .collect(),
-        feature_support: fake_feature_support_for_execution(structured_output_execution),
+        feature_support,
         auth_schemes: BTreeSet::new(),
         retry_rules: Vec::new(),
         metadata: BTreeMap::new(),
@@ -1970,7 +2029,10 @@ fn models(
             pricing: None,
             api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
-        }],
+        }]
+        .into_iter()
+        .chain(prompt_cache::models())
+        .collect(),
         catalog: bcode_model::ModelCatalogHints::default(),
     }
 }

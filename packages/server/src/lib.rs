@@ -21041,14 +21041,17 @@ async fn build_model_turn_request(
     let catalog_identity = target.catalog_identity.clone();
     let model_cache_info = target.cache.clone();
     let prompt_cache_timer = state.metrics.timer();
-    let prompt_cache = plan_prompt_cache(
+    let prompt_cache = bcode_prompt_cache::planning::plan_prompt_cache(
         &mut messages,
-        config.model.effective_prompt_cache_mode(),
-        session_id,
-        model_cache_info
-            .capabilities
-            .contains(&bcode_model::ModelCacheCapability::ExplicitCachePoints),
-        &model_cache_info.ttl_seconds,
+        &bcode_prompt_cache::planning::PromptCachePlanInput {
+            mode: config.model.effective_prompt_cache_mode(),
+            cache_key: prompt_cache_key(session_id),
+            cache: &model_cache_info,
+            system_prompt: Some(system_prompt.as_str()),
+            tool_definition_tokens: bcode_prompt_cache::planning::estimated_tool_definition_tokens(
+                &tools,
+            ),
+        },
     );
     state.metrics.record_histogram_with_labels(
         "model.request_build.prompt_cache_plan_duration_ms",
@@ -22387,84 +22390,12 @@ fn stable_hash(value: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn plan_prompt_cache(
-    messages: &mut [ModelMessage],
-    mode: bcode_model::PromptCacheMode,
-    session_id: SessionId,
-    explicit_cache_points: bool,
-    supported_ttl_seconds: &BTreeSet<u64>,
-) -> bcode_model::PromptCacheHints {
-    // Cache points are provider-request projection artifacts. A tool round rebuild may receive
-    // messages projected for an earlier round, so remove them before applying the current policy.
-    for message in messages.iter_mut() {
-        message
-            .content
-            .retain(|block| !matches!(block, ContentBlock::CachePoint { .. }));
-    }
-
-    if !mode.is_enabled() {
-        return bcode_model::PromptCacheHints::default();
-    }
-
-    let explicit_cache_points = explicit_cache_points && mode.is_enabled();
-    let ttl_seconds = explicit_cache_points
-        .then(|| supported_ttl_seconds.iter().next_back().copied())
-        .flatten();
-    if explicit_cache_points {
-        for index in conversation_cache_point_indices(messages) {
-            messages[index].content.push(ContentBlock::CachePoint {
-                hint: bcode_model::PromptCachePoint {
-                    label: Some("conversation_prefix".to_string()),
-                    ttl_seconds,
-                },
-            });
-        }
-    }
-
-    bcode_model::PromptCacheHints {
-        mode,
-        key: Some(format!("bcode:{session_id}")),
-        ttl_seconds,
-        supported_ttl_seconds: supported_ttl_seconds.clone(),
-        cache_system_prompt: true,
-        cache_tools: true,
-    }
-}
-
-fn conversation_cache_point_indices(messages: &[ModelMessage]) -> Vec<usize> {
-    const MAX_CONVERSATION_CACHE_POINTS: usize = 3;
-    const MIN_MESSAGES_FOR_CONVERSATION_CACHE: usize = 3;
-    if messages.len() < MIN_MESSAGES_FOR_CONVERSATION_CACHE {
-        return Vec::new();
-    }
-    let mutable_tail = messages
-        .last()
-        .is_some_and(|message| message.role != MessageRole::Tool);
-    messages
-        .iter()
-        .enumerate()
-        .rev()
-        .skip(usize::from(mutable_tail))
-        .filter_map(|(index, message)| {
-            let cacheable_user = matches!(message.role, MessageRole::User)
-                && message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        ContentBlock::Text { text } if !text.trim().is_empty()
-                    )
-                });
-            let completed_tool_result = matches!(message.role, MessageRole::Tool)
-                && message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
-            (cacheable_user || completed_tool_result).then_some(index)
-        })
-        .take(MAX_CONVERSATION_CACHE_POINTS)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+/// Stable provider cache partition key for one session.
+///
+/// Every request in a session shares this key so provider caches can reuse entries across turns
+/// and tool rounds without leaking entries between sessions.
+fn prompt_cache_key(session_id: SessionId) -> String {
+    format!("bcode:{session_id}")
 }
 
 fn model_id_for_provider_request(selected_model_id: Option<&str>) -> String {
@@ -39306,61 +39237,6 @@ library = "test"
     }
 
     #[test]
-    fn aggressive_prompt_cache_adds_conversation_cache_point() {
-        let mut messages = (0..6)
-            .map(|index| ModelMessage {
-                role: if index % 2 == 0 {
-                    MessageRole::User
-                } else {
-                    MessageRole::Assistant
-                },
-                content: vec![ContentBlock::Text {
-                    text: format!("message {index}"),
-                }],
-            })
-            .collect::<Vec<_>>();
-
-        let hints = plan_prompt_cache(
-            &mut messages,
-            bcode_model::PromptCacheMode::Aggressive,
-            SessionId::new(),
-            true,
-            &BTreeSet::from([30 * 60]),
-        );
-
-        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Aggressive);
-        assert_eq!(prompt_cache_point_count_in_messages(&messages), 3);
-        assert_eq!(hints.ttl_seconds, Some(30 * 60));
-        assert_eq!(hints.supported_ttl_seconds, BTreeSet::from([30 * 60]));
-        assert!(hints.key.is_some());
-    }
-
-    #[test]
-    fn auto_prompt_cache_uses_explicit_points_when_supported() {
-        let mut messages = (0..6)
-            .map(|index| ModelMessage {
-                role: MessageRole::User,
-                content: vec![ContentBlock::Text {
-                    text: format!("message {index}"),
-                }],
-            })
-            .collect::<Vec<_>>();
-
-        let hints = plan_prompt_cache(
-            &mut messages,
-            bcode_model::PromptCacheMode::Auto,
-            SessionId::new(),
-            true,
-            &BTreeSet::new(),
-        );
-
-        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
-        assert_eq!(prompt_cache_point_count_in_messages(&messages), 3);
-        assert_eq!(hints.ttl_seconds, None);
-        assert!(hints.key.is_some());
-    }
-
-    #[test]
     fn provider_state_restart_reloads_compaction_rebase_and_prevents_stale_reuse() {
         let path = std::env::temp_dir().join(format!(
             "bcode-provider-state-compaction-restart-{}.json",
@@ -39757,14 +39633,6 @@ library = "test"
         assert_eq!(rounds.provider_round(), 2);
         assert_eq!(rounds.completed_tool_rounds(), 1);
         assert_eq!(rounds.begin_tool_round(), Err(1));
-    }
-
-    fn prompt_cache_point_count_in_messages(messages: &[ModelMessage]) -> usize {
-        messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter(|block| matches!(block, ContentBlock::CachePoint { .. }))
-            .count()
     }
 
     #[test]
@@ -44895,245 +44763,6 @@ library = "test"
             select_model_info(&models, None).map(|model| model.model_id),
             Some("default".to_string())
         );
-    }
-
-    #[test]
-    fn prompt_cache_auto_marks_stable_sections_without_history() {
-        let mut messages = Vec::new();
-
-        let hints = plan_prompt_cache(
-            &mut messages,
-            bcode_model::PromptCacheMode::Auto,
-            SessionId::new(),
-            true,
-            &BTreeSet::new(),
-        );
-
-        assert!(hints.cache_system_prompt);
-        assert!(hints.cache_tools);
-        assert_eq!(messages.len(), 0);
-    }
-
-    #[test]
-    fn prompt_cache_planning_removes_stale_points_before_applying_auto() {
-        let mut messages = vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![
-                ContentBlock::Text {
-                    text: "stable message".to_string(),
-                },
-                ContentBlock::CachePoint {
-                    hint: bcode_model::PromptCachePoint::default(),
-                },
-            ],
-        }];
-
-        let hints = plan_prompt_cache(
-            &mut messages,
-            bcode_model::PromptCacheMode::Auto,
-            SessionId::new(),
-            true,
-            &BTreeSet::new(),
-        );
-
-        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
-        assert_eq!(prompt_cache_point_count_in_messages(&messages), 0);
-    }
-
-    #[test]
-    fn prompt_cache_auto_rolls_breakpoints_without_marking_mutable_tail() {
-        let session_id = SessionId::new();
-        let mut first_round = (0..6)
-            .map(|index| ModelMessage {
-                role: MessageRole::User,
-                content: vec![ContentBlock::Text {
-                    text: format!("message {index}"),
-                }],
-            })
-            .collect::<Vec<_>>();
-        let first_hints = plan_prompt_cache(
-            &mut first_round,
-            bcode_model::PromptCacheMode::Auto,
-            session_id,
-            true,
-            &BTreeSet::from([30 * 60]),
-        );
-        let first_points = first_round
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| {
-                message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-
-        let mut second_round = first_round;
-        second_round.push(ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: "mutable tail".to_string(),
-            }],
-        });
-        let second_hints = plan_prompt_cache(
-            &mut second_round,
-            bcode_model::PromptCacheMode::Auto,
-            session_id,
-            true,
-            &BTreeSet::from([30 * 60]),
-        );
-        let second_points = second_round
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| {
-                message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(first_points, vec![2, 3, 4]);
-        assert_eq!(second_points, vec![3, 4, 5]);
-        assert_eq!(first_hints.key, second_hints.key);
-        assert_eq!(second_hints.ttl_seconds, Some(30 * 60));
-        assert!(!matches!(
-            second_round
-                .last()
-                .and_then(|message| message.content.last()),
-            Some(ContentBlock::CachePoint { .. })
-        ));
-    }
-
-    #[test]
-    fn prompt_cache_auto_advances_breakpoint_through_tool_loop_history() {
-        let session_id = SessionId::new();
-        let mut messages = vec![ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text {
-                text: "implement the requested change".to_string(),
-            }],
-        }];
-        let mut planned_prefix_ends = Vec::new();
-
-        for round in 0..8 {
-            messages.push(ModelMessage {
-                role: MessageRole::Assistant,
-                content: vec![ContentBlock::ToolCall {
-                    call: bcode_model::ToolCall {
-                        id: format!("call-{round}"),
-                        name: "filesystem.read".to_string(),
-                        arguments: serde_json::json!({"path": format!("src/file-{round}.rs")}),
-                    },
-                }],
-            });
-            messages.push(ModelMessage {
-                role: MessageRole::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    result: bcode_model::ToolResult {
-                        call_id: format!("call-{round}"),
-                        output: format!("stable tool output for round {round} ").repeat(128),
-                        is_error: false,
-                        content: Vec::new(),
-                    },
-                }],
-            });
-
-            let hints = plan_prompt_cache(
-                &mut messages,
-                bcode_model::PromptCacheMode::Auto,
-                session_id,
-                true,
-                &BTreeSet::from([30 * 60]),
-            );
-            assert_eq!(
-                hints.key.as_deref(),
-                Some(format!("bcode:{session_id}").as_str())
-            );
-            let points = messages
-                .iter()
-                .enumerate()
-                .filter_map(|(index, message)| {
-                    message
-                        .content
-                        .iter()
-                        .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
-                        .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            let newest = points
-                .last()
-                .copied()
-                .expect("tool-loop history needs a cache point");
-            assert!(
-                newest < messages.len(),
-                "the newest cache point must remain within completed history"
-            );
-            planned_prefix_ends.push(newest);
-        }
-
-        assert!(
-            planned_prefix_ends.windows(2).all(|pair| pair[1] > pair[0]),
-            "the newest cacheable prefix must advance as completed tool rounds accumulate: {planned_prefix_ends:?}"
-        );
-        assert!(
-            planned_prefix_ends.last().copied().unwrap_or_default() >= messages.len() - 4,
-            "the rolling point must remain near the completed tool-loop tail: points={planned_prefix_ends:?}, messages={} ",
-            messages.len()
-        );
-    }
-
-    #[test]
-    fn prompt_cache_auto_does_not_add_points_without_explicit_support() {
-        let mut messages = (0..6)
-            .map(|index| ModelMessage {
-                role: MessageRole::User,
-                content: vec![ContentBlock::Text {
-                    text: format!("message {index}"),
-                }],
-            })
-            .collect::<Vec<_>>();
-
-        let hints = plan_prompt_cache(
-            &mut messages,
-            bcode_model::PromptCacheMode::Auto,
-            SessionId::new(),
-            false,
-            &BTreeSet::new(),
-        );
-
-        assert_eq!(hints.mode, bcode_model::PromptCacheMode::Auto);
-        assert_eq!(prompt_cache_point_count_in_messages(&messages), 0);
-    }
-
-    #[test]
-    fn prompt_cache_aggressive_marks_conversation_prefix() {
-        let mut messages = (0..6)
-            .map(|index| ModelMessage {
-                role: MessageRole::User,
-                content: vec![ContentBlock::Text {
-                    text: format!("message {index}"),
-                }],
-            })
-            .collect::<Vec<_>>();
-
-        let hints = plan_prompt_cache(
-            &mut messages,
-            bcode_model::PromptCacheMode::Aggressive,
-            SessionId::new(),
-            true,
-            &BTreeSet::new(),
-        );
-
-        assert!(hints.cache_system_prompt);
-        assert_eq!(prompt_cache_point_count_in_messages(&messages), 3);
-        assert!(!matches!(
-            messages[5].content.last(),
-            Some(ContentBlock::CachePoint { .. })
-        ));
     }
 
     #[test]

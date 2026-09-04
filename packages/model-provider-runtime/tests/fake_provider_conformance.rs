@@ -115,6 +115,37 @@ fn bundled_fake_provider_passes_reusable_public_conformance_suite() {
 }
 
 #[test]
+fn bundled_fake_cache_models_pass_public_conformance_including_prompt_caching() {
+    for model_id in ["fake-cache-explicit", "fake-cache-prefix"] {
+        let report = run_provider_conformance_suite(
+            &mut FakePluginInvoker::default(),
+            &ProviderConformanceOptions {
+                model_id: Some(model_id.to_string()),
+                ..ProviderConformanceOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{model_id} should satisfy the provider contract: {error}"));
+
+        assert_eq!(report.model.model_id, model_id);
+        assert!(
+            report.cases.iter().all(|case| {
+                case.outcome == ProviderConformanceOutcome::Passed
+                    || matches!(case.outcome, ProviderConformanceOutcome::Skipped { .. })
+            }),
+            "{model_id}: {:#?}",
+            report.cases
+        );
+        assert!(
+            report.cases.iter().any(|case| {
+                case.name == "prompt caching" && case.outcome == ProviderConformanceOutcome::Passed
+            }),
+            "{model_id} must exercise the prompt caching case: {:#?}",
+            report.cases
+        );
+    }
+}
+
+#[test]
 fn suite_reports_actionable_case_and_cleans_up_after_event_violation() {
     let mut invoker = FakePluginInvoker::with_poll_behavior(PollBehavior::OmitTurnStarted);
     let error =

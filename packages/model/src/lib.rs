@@ -1670,6 +1670,12 @@ pub struct ModelCacheInfo {
     /// Provider/model-supported explicit prompt-cache TTLs in seconds.
     #[serde(default)]
     pub ttl_seconds: BTreeSet<u64>,
+    /// Minimum stable prefix length, in tokens, before the provider caches a prefix.
+    ///
+    /// `None` means the minimum is unknown; hosts should then apply their own conservative
+    /// default rather than assuming every prefix is cacheable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_prefix_tokens: Option<u64>,
 }
 
 /// Provider cache/continuation capability.

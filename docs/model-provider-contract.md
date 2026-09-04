@@ -317,3 +317,10 @@ violations, and every failure identifies its conformance case.
 
 Bundled providers must run this same public harness. Credential-gated network acceptance remains a
 separate layer because deterministic conformance must not depend on an external service.
+
+Prompt caching has a deeper, capability-derived suite in `bcode_prompt_cache::scenarios` (see
+`docs/prompt-cache-architecture.md`). The conformance suite's `prompt caching` case checks that
+cache hints and point accounting are honored on one request; the scenario suite checks that the
+cache actually produces reads across repeated, growing, and tool-loop requests, honors advertised
+TTLs, fails closed on unadvertised ones, and stays within its point budget. Providers advertising
+`PromptCaching` should pass both against a deterministic test double.

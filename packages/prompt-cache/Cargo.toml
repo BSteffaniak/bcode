@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Prompt-cache planning, expectations, simulation, and verification for bcode model providers"
+edition     = { workspace = true }
+keywords    = ["bcode", "model", "prompt-cache", "provider"]
+license     = { workspace = true }
+name        = "bcode_prompt_cache"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_model                  = { workspace = true }
+bcode_model_provider_runtime = { workspace = true }
+bcode_prompt_cache_models    = { workspace = true }
+bcode_session_models         = { workspace = true }
+serde                        = { workspace = true, features = ["derive"] }
+serde_json                   = { workspace = true }
+
+[dev-dependencies]
+bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_plugin_sdk           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+# Deterministic reference cache used by test providers and round-trip verification.
+simulation = []

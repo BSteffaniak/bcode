@@ -6853,6 +6853,8 @@ fn openai_model_cache_info(dialect: OpenAiCompatibleDialect) -> bcode_model::Mod
     }
     bcode_model::ModelCacheInfo {
         capabilities,
+        // OpenAI automatic prefix caching applies to prompts of at least 1024 tokens.
+        min_prefix_tokens: Some(1_024),
         ..bcode_model::ModelCacheInfo::default()
     }
 }

@@ -372,6 +372,8 @@ structured_outputs = true
 prompt_cache = true
 explicit_prompt_cache = true
 prompt_cache_ttl_seconds = [300, 3600]
+# Anthropic caches prefixes of at least 1024 tokens on Opus/Sonnet-class models.
+prompt_cache_min_prefix_tokens = 1024
 reasoning = true
 
 [models."anthropic.claude-fable-5-1".reasoning]
@@ -694,6 +696,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."openai.gpt-6-astra".reasoning]
 effort_values = ["low", "medium", "high", "xhigh", "max"]
@@ -732,6 +736,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."us.openai.gpt-6-astra".reasoning]
 effort_values = ["low", "medium", "high", "xhigh", "max"]
@@ -770,6 +776,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."global.openai.gpt-6-astra".reasoning]
 effort_values = ["low", "medium", "high", "xhigh", "max"]
@@ -807,6 +815,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -845,6 +855,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."us.openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -883,6 +895,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."global.openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -920,6 +934,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -958,6 +974,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."us.openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -996,6 +1014,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."global.openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -1034,6 +1054,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -1072,6 +1094,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."us.openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
@@ -1111,6 +1135,8 @@ structured_outputs = true
 reasoning = true
 prompt_cache = true
 explicit_prompt_cache = true
+# OpenAI caches prefixes of at least 1024 tokens.
+prompt_cache_min_prefix_tokens = 1024
 
 [models."global.openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]

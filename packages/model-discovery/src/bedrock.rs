@@ -254,6 +254,7 @@ fn capabilities_from_summary(summary: &FoundationModelSummary) -> CatalogCapabil
         prompt_cache: false,
         explicit_prompt_cache: false,
         prompt_cache_ttl_seconds: BTreeSet::new(),
+        prompt_cache_min_prefix_tokens: None,
         native_web_search: false,
     }
 }
