@@ -563,18 +563,27 @@ impl NegotiatedFeatureSupport {
         matches!(self, Self::Guaranteed { .. })
     }
 
+    /// Return the scope that could not guarantee the feature, when it is not guaranteed.
+    #[must_use]
+    pub const fn shortfall_scope(&self) -> Option<CapabilityScope> {
+        match self {
+            Self::Guaranteed { .. } => None,
+            Self::Unsupported { scope, .. } | Self::Unknown { scope } => Some(*scope),
+        }
+    }
+
     /// Describe why a feature is not guaranteed, distinguishing an explicit rejection from a
-    /// missing claim so a catalog omission is never mistaken for a real incompatibility.
+    /// missing claim so an absent capability claim is never mistaken for a real incompatibility.
     ///
-    /// `feature` is a human-readable feature name; `catalog_key` names the catalog capability
-    /// flag that would supply the missing model claim.
+    /// `feature` is a human-readable feature name. The description names only the scope and the
+    /// supplied provider/model identifiers; remediation guidance belongs to the layer that knows
+    /// where claims originate.
     ///
     /// Returns `None` when the feature is guaranteed.
     #[must_use]
     pub fn shortfall_description(
         &self,
         feature: &str,
-        catalog_key: &str,
         provider_id: &str,
         model_id: &str,
     ) -> Option<String> {
@@ -589,13 +598,11 @@ impl NegotiatedFeatureSupport {
                 }
             }),
             Self::Unknown { scope } => Some(match scope {
-                CapabilityScope::Model => format!(
-                    "model {model_id} declares no {feature} capability in the model catalog; \
-                     add `{catalog_key} = true` to its catalog entry if the provider surface can \
-                     serve it"
-                ),
+                CapabilityScope::Model => {
+                    format!("model {model_id} has no {feature} capability claim")
+                }
                 CapabilityScope::Provider => {
-                    format!("provider {provider_id} reported no {feature} capability claim")
+                    format!("provider {provider_id} has no {feature} capability claim")
                 }
             }),
         }
@@ -3793,56 +3800,44 @@ mod tests {
         let unknown_model = NegotiatedFeatureSupport::Unknown {
             scope: super::CapabilityScope::Model,
         };
-        let message = unknown_model
-            .shortfall_description(
-                "structured output",
-                "structured_outputs",
-                "bcode.bedrock",
-                "m",
-            )
-            .expect("unknown is a shortfall");
-        assert!(message.contains("model m declares no structured output capability"));
-        assert!(message.contains("`structured_outputs = true`"));
+        assert_eq!(
+            unknown_model.shortfall_scope(),
+            Some(super::CapabilityScope::Model)
+        );
+        assert_eq!(
+            unknown_model.shortfall_description("structured output", "bcode.bedrock", "m"),
+            Some("model m has no structured output capability claim".to_string())
+        );
 
         let unknown_provider = NegotiatedFeatureSupport::Unknown {
             scope: super::CapabilityScope::Provider,
         };
-        let message = unknown_provider
-            .shortfall_description(
-                "structured output",
-                "structured_outputs",
-                "bcode.bedrock",
-                "m",
-            )
-            .expect("unknown is a shortfall");
-        assert!(message.contains("provider bcode.bedrock reported no structured output"));
-        assert!(!message.contains("catalog"));
+        assert_eq!(
+            unknown_provider.shortfall_description("structured output", "bcode.bedrock", "m"),
+            Some("provider bcode.bedrock has no structured output capability claim".to_string())
+        );
 
         let unsupported = NegotiatedFeatureSupport::Unsupported {
             scope: super::CapabilityScope::Provider,
             source: super::CapabilitySource::BundledCatalog,
             reason: "surface lacks schema enforcement".to_string(),
         };
-        let message = unsupported
-            .shortfall_description(
-                "structured output",
-                "structured_outputs",
-                "bcode.bedrock",
-                "m",
-            )
-            .expect("unsupported is a shortfall");
         assert_eq!(
-            message,
-            "provider bcode.bedrock does not support structured output: surface lacks schema enforcement"
+            unsupported.shortfall_description("structured output", "bcode.bedrock", "m"),
+            Some(
+                "provider bcode.bedrock does not support structured output: surface lacks schema enforcement"
+                    .to_string()
+            )
         );
 
         let guaranteed = super::negotiate_feature_claims(
             &super::CapabilitySupport::supported(super::CapabilitySource::BundledCatalog),
             &super::CapabilitySupport::supported(super::CapabilitySource::BundledCatalog),
         );
+        assert_eq!(guaranteed.shortfall_scope(), None);
         assert!(
             guaranteed
-                .shortfall_description("structured output", "structured_outputs", "p", "m")
+                .shortfall_description("structured output", "p", "m")
                 .is_none()
         );
     }

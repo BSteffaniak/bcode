@@ -20790,26 +20790,12 @@ async fn build_model_turn_request(
     let structured_output = if desired_structured_output.is_some()
         && !resolved_features.structured_output_is_guaranteed()
     {
-        // Name the failing scope so a catalog omission (`Unknown`) reads differently from a
-        // provider or model that genuinely rejects the feature (`Unsupported`).
         let provider_label = provider_plugin_id.unwrap_or("<none>");
-        let detail = resolved_features
-            .structured_output
-            .as_ref()
-            .and_then(|support| {
-                support.shortfall_description(
-                    "structured output",
-                    "structured_outputs",
-                    provider_label,
-                    &model_id,
-                )
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "provider {provider_label} or model {model_id} capabilities could not be \
-                     resolved for negotiation"
-                )
-            });
+        let detail = structured_output_shortfall_detail(
+            resolved_features.structured_output.as_ref(),
+            provider_label,
+            &model_id,
+        );
         return Err(bcode_session::SessionError::EventSerialization(format!(
             "requested structured output is not guaranteed by the selected provider surface and model: {detail}"
         )));
@@ -21223,6 +21209,42 @@ fn supported_reasoning_value<'a>(
         return None;
     }
     (supported.is_empty() || supported.iter().any(|value| value == requested)).then_some(requested)
+}
+
+/// Explain why structured output could not be guaranteed for one request.
+///
+/// The portable negotiation result names only the failing scope. The server knows that model-side
+/// claims for bundled catalog models come from the model catalog, so a missing *model* claim gets
+/// the remediation hint here rather than in the model crate: an omitted `structured_outputs` flag
+/// must read differently from a provider or model that genuinely rejects the feature.
+fn structured_output_shortfall_detail(
+    support: Option<&bcode_model::NegotiatedFeatureSupport>,
+    provider_id: &str,
+    model_id: &str,
+) -> String {
+    let Some(support) = support else {
+        return format!(
+            "provider {provider_id} or model {model_id} capabilities could not be resolved for \
+             negotiation"
+        );
+    };
+    let Some(mut detail) =
+        support.shortfall_description("structured output", provider_id, model_id)
+    else {
+        return "structured output is guaranteed".to_string();
+    };
+    if matches!(
+        support,
+        bcode_model::NegotiatedFeatureSupport::Unknown {
+            scope: bcode_model::CapabilityScope::Model
+        }
+    ) {
+        detail.push_str(
+            "; if the provider surface can serve it, add `structured_outputs = true` to the \
+             model's catalog entry",
+        );
+    }
+    detail
 }
 
 fn model_feature_capabilities_from_negotiation(
@@ -45475,6 +45497,53 @@ library = "test"
 
         assert!(!stable.contains("Repository invariants:"));
         assert!(!stable.contains("Shared rendering remains renderer-neutral"));
+    }
+
+    #[test]
+    fn structured_output_shortfall_detail_names_scope_and_hints_catalog_only_for_missing_model_claims()
+     {
+        let missing_model_claim = bcode_model::NegotiatedFeatureSupport::Unknown {
+            scope: bcode_model::CapabilityScope::Model,
+        };
+        let detail = structured_output_shortfall_detail(
+            Some(&missing_model_claim),
+            "bcode.bedrock",
+            "global.anthropic.claude-fable-5-1",
+        );
+        assert!(
+            detail.contains(
+                "model global.anthropic.claude-fable-5-1 has no structured output capability claim"
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("add `structured_outputs = true`"),
+            "{detail}"
+        );
+
+        let missing_provider_claim = bcode_model::NegotiatedFeatureSupport::Unknown {
+            scope: bcode_model::CapabilityScope::Provider,
+        };
+        let detail = structured_output_shortfall_detail(Some(&missing_provider_claim), "p", "m");
+        assert!(
+            detail.starts_with("provider p has no structured output capability claim"),
+            "{detail}"
+        );
+        assert!(!detail.contains("catalog"), "{detail}");
+
+        let rejected = bcode_model::NegotiatedFeatureSupport::Unsupported {
+            scope: bcode_model::CapabilityScope::Model,
+            source: bcode_model::CapabilitySource::ProviderApi,
+            reason: "model refuses JSON schema".to_string(),
+        };
+        let detail = structured_output_shortfall_detail(Some(&rejected), "p", "m");
+        assert_eq!(
+            detail,
+            "model m does not support structured output: model refuses JSON schema"
+        );
+
+        let detail = structured_output_shortfall_detail(None, "p", "m");
+        assert!(detail.contains("could not be resolved"), "{detail}");
     }
 
     #[test]

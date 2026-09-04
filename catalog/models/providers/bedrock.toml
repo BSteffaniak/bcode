@@ -163,9 +163,6 @@ text_input = true
 image_input = true
 text_output = true
 tool_use = true
-# Served through the Bedrock Messages adapter's tool-free synthetic round, like every other
-# Anthropic entry here; this is not a claim of provider-native JSON Schema enforcement.
-structured_outputs = true
 reasoning = true
 
 # Adaptive-thinking models must advertise effort values: the host only sends
@@ -194,9 +191,6 @@ text_input = true
 image_input = true
 text_output = true
 tool_use = true
-# Served through the Bedrock Messages adapter's tool-free synthetic round, like every other
-# Anthropic entry here; this is not a claim of provider-native JSON Schema enforcement.
-structured_outputs = true
 reasoning = true
 
 [models."anthropic.claude-sonnet-5".reasoning]
@@ -221,9 +215,6 @@ text_input = true
 image_input = true
 text_output = true
 tool_use = true
-# Served through the Bedrock Messages adapter's tool-free synthetic round, like every other
-# Anthropic entry here; this is not a claim of provider-native JSON Schema enforcement.
-structured_outputs = true
 reasoning = true
 
 [models."anthropic.claude-haiku-5".reasoning]
@@ -405,9 +396,6 @@ text_input = true
 image_input = true
 text_output = true
 tool_use = true
-# Served through the Bedrock Messages adapter's tool-free synthetic round, like every other
-# Anthropic entry here; this is not a claim of provider-native JSON Schema enforcement.
-structured_outputs = true
 reasoning = true
 
 [models."anthropic.claude-fable-5".reasoning]
@@ -432,9 +420,6 @@ text_input = true
 image_input = true
 text_output = true
 tool_use = true
-# Served through the Bedrock Messages adapter's tool-free synthetic round, like every other
-# Anthropic entry here; this is not a claim of provider-native JSON Schema enforcement.
-structured_outputs = true
 reasoning = true
 
 [models."anthropic.claude-mythos-5".reasoning]
