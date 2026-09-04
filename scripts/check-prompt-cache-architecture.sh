@@ -37,6 +37,10 @@ fi
 if ! rg -q 'run_prompt_cache_scenarios' packages/prompt-cache/tests/fake_provider_round_trip.rs; then
   fail "the prompt-cache round-trip test must run the scenario suite against the fake cache models"
 fi
+# The live entry point is a thin adapter over the same suite; it must not grow its own checks.
+if ! rg -q 'bcode_prompt_cache::scenarios::run_prompt_cache_scenarios' packages/cli/src/lib.rs; then
+  fail "bcode model verify-cache must run bcode_prompt_cache::scenarios rather than a CLI-local suite"
+fi
 
 # 5. Explicit-cache catalog entries declare their minimum cacheable prefix so the planner never
 #    spends breakpoints on unhittable prefixes. Enforced at load time; keep the guard in sync.

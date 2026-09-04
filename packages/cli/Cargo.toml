@@ -23,6 +23,7 @@ bcode_model                  = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin                 = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
+bcode_prompt_cache           = { workspace = true }
 bcode_provider_auth          = { workspace = true }
 bcode_provider_auth_models   = { workspace = true }
 bcode_server                 = { workspace = true }

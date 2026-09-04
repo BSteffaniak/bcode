@@ -1556,6 +1556,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_prompt_cache",
  "bcode_provider_auth",
  "bcode_provider_auth_models",
  "bcode_server",

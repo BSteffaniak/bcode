@@ -80,7 +80,16 @@ Three consumers run the suite:
   simulator. This is the CI proof that planner, scenarios, analyzer, and simulator agree.
 * `packages/model-provider-runtime/tests/fake_provider_conformance.rs` requires the public
   provider conformance suite's `prompt caching` case to pass for those models.
-* `bcode model verify-cache` (planned) runs it against any configured live provider.
+* `bcode model verify-cache` runs it against the configured live provider (credentials required)
+  and prints a per-scenario table or, with `--json` / `--output`, a versioned report envelope
+  containing every model's `PromptCacheVerificationReport`. It exits non-zero when any applicable
+  scenario fails or a model's suite cannot run. Use `--id-pattern` to select models,
+  `--tool-rounds` / `--conversation-turns` to lengthen workloads, and `--min-prefix-tokens` to
+  supply a minimum for models whose catalog entry omits one.
+
+  ```sh
+  bcode model verify-cache --id-pattern 'global.anthropic.claude-fable-5-1' --tool-rounds 12
+  ```
 
 ## Analysis
 
