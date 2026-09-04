@@ -1662,6 +1662,25 @@ pub fn validate_catalog(catalog: &CatalogDocument) -> Result<()> {
                     )));
                 }
             }
+            // A supported, tool-using Anthropic Messages-surface model reaches structured output
+            // through the provider's adapter-mediated tool-free round. Omitting the catalog flag
+            // makes negotiation report `Unknown`, which fails every structured-output request
+            // (for example a loop evaluation node) before any provider call. Require the decision
+            // to be explicit so a new entry cannot silently regress it.
+            if provider_id == "bedrock"
+                && model.api_surface
+                    == Some(bcode_model_catalog_models::CatalogApiSurface::Messages)
+                && model.bcode_support == BcodeSupportStatus::Supported
+                && model.capabilities.tool_use
+                && !model.capabilities.structured_outputs
+            {
+                return Err(Error::Validation(format!(
+                    "model '{model_id}' for provider '{provider_id}' is a supported tool-using \
+                     Messages-surface model but does not declare `structured_outputs = true`; the \
+                     Bedrock Messages adapter serves structured output for such models, so declare \
+                     it (or mark the model partially supported) rather than leaving negotiation unknown"
+                )));
+            }
         }
     }
     Ok(())
@@ -3418,6 +3437,20 @@ status = "stable"
                     .prompt_cache(bcode_model::PromptCacheFeature::Ttl)
                     .is_guaranteed()
             );
+            // A loop evaluation node requests strict JSON-schema output; the model-side claim must
+            // be present so negotiation with the Bedrock Messages adapter can succeed.
+            for mode in [
+                bcode_model::StructuredOutputMode::JsonSchema,
+                bcode_model::StructuredOutputMode::StrictJsonSchema,
+            ] {
+                assert!(
+                    enriched
+                        .feature_support
+                        .structured_output(mode)
+                        .is_guaranteed(),
+                    "{model_id} must declare structured output for {mode:?}"
+                );
+            }
         }
     }
 
@@ -4131,6 +4164,54 @@ status = "stable"
 
         let error = validate_catalog(&document).expect_err("duplicate target must fail");
         assert!(error.to_string().contains("duplicate deployment target"));
+    }
+
+    #[test]
+    fn bedrock_messages_surface_models_must_declare_structured_output_explicitly() {
+        // Every bundled Messages-surface Anthropic entry opts in; the adapter serves them all.
+        let document = load_embedded_catalog().expect("embedded catalog should load");
+        let bedrock = document.providers.get("bedrock").expect("bedrock provider");
+        let messages_models = bedrock
+            .models
+            .values()
+            .filter(|model| {
+                model.api_surface == Some(bcode_model_catalog_models::CatalogApiSurface::Messages)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            messages_models.len() >= 2,
+            "the guard must cover the real Messages-surface entries"
+        );
+        for model in &messages_models {
+            assert!(
+                model.capabilities.structured_outputs,
+                "{} must declare structured_outputs so loop evaluation nodes negotiate",
+                model.model_id
+            );
+        }
+
+        // Dropping the flag from one supported tool-using entry fails catalog validation with an
+        // actionable message instead of degrading to an `Unknown` negotiation at request time.
+        let mut document = document;
+        let fable = document
+            .providers
+            .get_mut("bedrock")
+            .and_then(|provider| provider.models.get_mut("anthropic.claude-fable-5-1"))
+            .expect("Fable entry");
+        fable.capabilities.structured_outputs = false;
+        let error = validate_catalog(&document).expect_err("missing flag must fail validation");
+        let message = error.to_string();
+        assert!(message.contains("anthropic.claude-fable-5-1"), "{message}");
+        assert!(message.contains("structured_outputs = true"), "{message}");
+
+        // A model Bcode only partially supports may legitimately leave the decision open.
+        let fable = document
+            .providers
+            .get_mut("bedrock")
+            .and_then(|provider| provider.models.get_mut("anthropic.claude-fable-5-1"))
+            .expect("Fable entry");
+        fable.bcode_support = bcode_model_catalog_models::BcodeSupportStatus::PartiallySupported;
+        validate_catalog(&document).expect("partially supported entries are not forced");
     }
 
     #[test]

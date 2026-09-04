@@ -562,6 +562,44 @@ impl NegotiatedFeatureSupport {
     pub const fn is_guaranteed(&self) -> bool {
         matches!(self, Self::Guaranteed { .. })
     }
+
+    /// Describe why a feature is not guaranteed, distinguishing an explicit rejection from a
+    /// missing claim so a catalog omission is never mistaken for a real incompatibility.
+    ///
+    /// `feature` is a human-readable feature name; `catalog_key` names the catalog capability
+    /// flag that would supply the missing model claim.
+    ///
+    /// Returns `None` when the feature is guaranteed.
+    #[must_use]
+    pub fn shortfall_description(
+        &self,
+        feature: &str,
+        catalog_key: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<String> {
+        match self {
+            Self::Guaranteed { .. } => None,
+            Self::Unsupported { scope, reason, .. } => Some(match scope {
+                CapabilityScope::Provider => {
+                    format!("provider {provider_id} does not support {feature}: {reason}")
+                }
+                CapabilityScope::Model => {
+                    format!("model {model_id} does not support {feature}: {reason}")
+                }
+            }),
+            Self::Unknown { scope } => Some(match scope {
+                CapabilityScope::Model => format!(
+                    "model {model_id} declares no {feature} capability in the model catalog; \
+                     add `{catalog_key} = true` to its catalog entry if the provider surface can \
+                     serve it"
+                ),
+                CapabilityScope::Provider => {
+                    format!("provider {provider_id} reported no {feature} capability claim")
+                }
+            }),
+        }
+    }
 }
 
 /// Provider-neutral model parameter keys used in capability negotiation.
@@ -3748,6 +3786,65 @@ mod tests {
             super::CapabilitySupport::supported(super::CapabilitySource::ProviderApi),
         );
         assert!(provider.negotiate(&model, feature).is_guaranteed());
+    }
+
+    #[test]
+    fn negotiation_shortfall_distinguishes_missing_claims_from_rejections() {
+        let unknown_model = NegotiatedFeatureSupport::Unknown {
+            scope: super::CapabilityScope::Model,
+        };
+        let message = unknown_model
+            .shortfall_description(
+                "structured output",
+                "structured_outputs",
+                "bcode.bedrock",
+                "m",
+            )
+            .expect("unknown is a shortfall");
+        assert!(message.contains("model m declares no structured output capability"));
+        assert!(message.contains("`structured_outputs = true`"));
+
+        let unknown_provider = NegotiatedFeatureSupport::Unknown {
+            scope: super::CapabilityScope::Provider,
+        };
+        let message = unknown_provider
+            .shortfall_description(
+                "structured output",
+                "structured_outputs",
+                "bcode.bedrock",
+                "m",
+            )
+            .expect("unknown is a shortfall");
+        assert!(message.contains("provider bcode.bedrock reported no structured output"));
+        assert!(!message.contains("catalog"));
+
+        let unsupported = NegotiatedFeatureSupport::Unsupported {
+            scope: super::CapabilityScope::Provider,
+            source: super::CapabilitySource::BundledCatalog,
+            reason: "surface lacks schema enforcement".to_string(),
+        };
+        let message = unsupported
+            .shortfall_description(
+                "structured output",
+                "structured_outputs",
+                "bcode.bedrock",
+                "m",
+            )
+            .expect("unsupported is a shortfall");
+        assert_eq!(
+            message,
+            "provider bcode.bedrock does not support structured output: surface lacks schema enforcement"
+        );
+
+        let guaranteed = super::negotiate_feature_claims(
+            &super::CapabilitySupport::supported(super::CapabilitySource::BundledCatalog),
+            &super::CapabilitySupport::supported(super::CapabilitySource::BundledCatalog),
+        );
+        assert!(
+            guaranteed
+                .shortfall_description("structured output", "structured_outputs", "p", "m")
+                .is_none()
+        );
     }
 
     #[test]

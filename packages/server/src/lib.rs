@@ -20790,10 +20790,29 @@ async fn build_model_turn_request(
     let structured_output = if desired_structured_output.is_some()
         && !resolved_features.structured_output_is_guaranteed()
     {
-        return Err(bcode_session::SessionError::EventSerialization(
-            "requested structured output is not guaranteed by the selected provider surface and model"
-                .to_string(),
-        ));
+        // Name the failing scope so a catalog omission (`Unknown`) reads differently from a
+        // provider or model that genuinely rejects the feature (`Unsupported`).
+        let provider_label = provider_plugin_id.unwrap_or("<none>");
+        let detail = resolved_features
+            .structured_output
+            .as_ref()
+            .and_then(|support| {
+                support.shortfall_description(
+                    "structured output",
+                    "structured_outputs",
+                    provider_label,
+                    &model_id,
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "provider {provider_label} or model {model_id} capabilities could not be \
+                     resolved for negotiation"
+                )
+            });
+        return Err(bcode_session::SessionError::EventSerialization(format!(
+            "requested structured output is not guaranteed by the selected provider surface and model: {detail}"
+        )));
     } else {
         desired_structured_output
     };
