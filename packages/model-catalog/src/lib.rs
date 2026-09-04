@@ -2139,6 +2139,10 @@ mod tests {
         // that only has a bare entry) resolve through the bare entry's `*needle*` alias. Every
         // form must stay on the OpenAI Responses surface.
         for (model_id, expected_entry) in [
+            ("openai.gpt-6-astra", "openai.gpt-6-astra"),
+            ("us.openai.gpt-6-astra", "us.openai.gpt-6-astra"),
+            ("global.openai.gpt-6-astra", "global.openai.gpt-6-astra"),
+            ("eu.openai.gpt-6-astra", "openai.gpt-6-astra"),
             ("openai.gpt-5.6-sol", "openai.gpt-5.6-sol"),
             ("us.openai.gpt-5.6-sol", "us.openai.gpt-5.6-sol"),
             ("global.openai.gpt-5.6-sol", "global.openai.gpt-5.6-sol"),
@@ -2174,6 +2178,7 @@ mod tests {
         // The provider file carries a broad `*claude*` fallback. OpenAI ids must never land on it,
         // whether they resolve to a bare entry, a regional entry, or through an alias.
         for model_id in [
+            "openai.gpt-6-astra",
             "openai.gpt-5.6-sol",
             "us.openai.gpt-5.5",
             "eu.openai.gpt-5.5",
@@ -2319,6 +2324,7 @@ mod tests {
             .expect("bedrock provider exists");
 
         for (model_id, context_window, max_output_tokens) in [
+            ("openai.gpt-6-astra", 1_000_000, 128_000),
             ("openai.gpt-5.6-sol", 1_000_000, 128_000),
             ("openai.gpt-5.6-terra", 1_000_000, 128_000),
             ("openai.gpt-5.6-luna", 1_000_000, 128_000),
@@ -2446,6 +2452,9 @@ mod tests {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
 
         for model_id in [
+            "openai.gpt-6-astra",
+            "us.openai.gpt-6-astra",
+            "global.openai.gpt-6-astra",
             "openai.gpt-5.6-sol",
             "us.openai.gpt-5.6-sol",
             "global.openai.gpt-5.6-sol",
@@ -2932,6 +2941,73 @@ mod tests {
     }
 
     #[test]
+    fn bundled_catalog_includes_gpt_6_astra_as_codex_default() {
+        let catalog = ModelCatalog::load_bundled().expect("catalog should load");
+        let provider = catalog.provider("openai").expect("openai provider exists");
+
+        let entry = catalog
+            .model("openai", "gpt-6-astra")
+            .expect("gpt-6-astra should be in the embedded OpenAI catalog");
+        assert_eq!(entry.context_window, Some(1_050_000));
+        assert_eq!(entry.max_output_tokens, Some(128_000));
+        assert_eq!(
+            entry
+                .reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.effort_values.clone()),
+            Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            ),
+            "Astra does not advertise a `none` effort"
+        );
+        assert_eq!(
+            provider.default_codex_model_id.as_deref(),
+            Some("gpt-6-astra")
+        );
+
+        // The `gpt-6` alias resolves to Astra, and both deployments carry the full window.
+        let aliased = catalog
+            .model("openai", "gpt-6")
+            .expect("gpt-6 alias should resolve");
+        assert_eq!(aliased.model_id, "gpt-6-astra");
+        assert_eq!(entry.deployments.len(), 2);
+        for deployment in &entry.deployments {
+            assert_eq!(deployment.context_window, Some(1_050_000));
+            assert_eq!(deployment.max_output_tokens, Some(128_000));
+        }
+    }
+
+    #[test]
+    fn openai_gpt_6_astra_uses_catalog_owned_long_context_rules() {
+        let catalog = ModelCatalog::load_bundled().expect("bundled catalog");
+        let model = catalog
+            .provider_models_as_model_info("openai")
+            .into_iter()
+            .find(|model| model.model_id == "gpt-6-astra")
+            .expect("GPT-6 Astra");
+        let pricing = model.pricing.expect("catalog pricing");
+        let usage = bcode_model::TokenUsage {
+            input_tokens: Some(300_000),
+            output_tokens: Some(10_000),
+            pricing_context: Box::new(bcode_model::ModelPricingContext {
+                request_input_tokens: Some(300_000),
+                invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                ..bcode_model::ModelPricingContext::default()
+            }),
+            ..bcode_model::TokenUsage::default()
+        };
+        let estimate = pricing
+            .estimate_cost(&usage)
+            .expect("long-context estimate");
+        // 300K input at 2x ($20/M) plus 10K output at 1.5x ($75/M).
+        assert_eq!(estimate.total_micros, 6_750_000);
+        assert_eq!(pricing.rules.len(), 8);
+    }
+
+    #[test]
     fn openai_gpt_5_6_uses_catalog_owned_long_context_rules() {
         let catalog = ModelCatalog::load_bundled().expect("bundled catalog");
         let model = catalog
@@ -2958,7 +3034,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_fallback_prefers_gpt_5_6_sol_then_terra_then_5_5() {
+    fn openai_fallback_prefers_gpt_6_astra_then_gpt_5_6_sol_then_terra() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let provider = catalog.provider("openai").expect("openai provider exists");
 
@@ -2968,7 +3044,7 @@ mod tests {
                 .iter()
                 .take(3)
                 .collect::<Vec<_>>(),
-            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5"]
+            vec!["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]
         );
     }
 

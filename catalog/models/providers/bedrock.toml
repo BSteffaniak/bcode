@@ -664,6 +664,124 @@ structured_outputs = true
 # `global.`) resolve to the same entry. `find_provider_model` prefers the longest matching needle,
 # so these specific globs win over broader family entries.
 
+# Pricing for the GPT-6 Astra entries below is extrapolated: OpenAI list rates
+# (10 / 1 / 12.5 / 50 per 1M tokens) are authoritative for the `global.` profile,
+# and the bare and `us.` IDs apply the same 1.1x regional Standard-tier uplift that
+# the GPT-5.6 entries and Claude Fable 5.1 in-region rows carry. Verify against the
+# AWS Price List once AWS publishes GPT-6 Astra rates.
+[models."openai.gpt-6-astra"]
+model_id = "openai.gpt-6-astra"
+display_name = "GPT-6 Astra"
+aliases = ["*gpt-6-astra*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."openai.gpt-6-astra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+explicit_prompt_cache = true
+
+[models."openai.gpt-6-astra".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+[models."openai.gpt-6-astra".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 11000000
+cached_input_micros = 1100000
+cache_write_input_micros = 13750000
+output_micros = 55000000
+
+# US cross-region inference profile
+[models."us.openai.gpt-6-astra"]
+model_id = "us.openai.gpt-6-astra"
+display_name = "GPT-6 Astra (US)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."us.openai.gpt-6-astra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+explicit_prompt_cache = true
+
+[models."us.openai.gpt-6-astra".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+[models."us.openai.gpt-6-astra".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 11000000
+cached_input_micros = 1100000
+cache_write_input_micros = 13750000
+output_micros = 55000000
+
+# Global cross-region inference profile
+[models."global.openai.gpt-6-astra"]
+model_id = "global.openai.gpt-6-astra"
+display_name = "GPT-6 Astra (Global)"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1000000
+max_output_tokens = 128000
+api_surface = "responses"
+supported_by = [{ provider = "bedrock", auth_mode = "bearer_token", api_surface = "responses", integration = "bcode" }]
+
+[models."global.openai.gpt-6-astra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+explicit_prompt_cache = true
+
+[models."global.openai.gpt-6-astra".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+[models."global.openai.gpt-6-astra".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 10000000
+cached_input_micros = 1000000
+cache_write_input_micros = 12500000
+output_micros = 50000000
+
 [models."openai.gpt-5.6-sol"]
 model_id = "openai.gpt-5.6-sol"
 display_name = "GPT-5.6 Sol"

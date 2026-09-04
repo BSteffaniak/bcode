@@ -7,6 +7,7 @@ API, not through `ConverseStream`. Bcode reaches them with a dedicated Bedrock t
 
 | Bedrock model id | Context | Surface |
 | --- | --- | --- |
+| `openai.gpt-6-astra` | 1M | Responses only |
 | `openai.gpt-5.6-sol` | 1M | Responses only |
 | `openai.gpt-5.6-terra` | 1M | Responses only |
 | `openai.gpt-5.6-luna` | 1M | Responses only |
@@ -17,7 +18,7 @@ API, not through `ConverseStream`. Bcode reaches them with a dedicated Bedrock t
 | `openai.gpt-oss-safeguard-120b` | 128K | Converse only |
 | `openai.gpt-oss-safeguard-20b` | 128K | Converse only |
 
-The GPT-5.x tier is unreachable through `ConverseStream`; AWS reports `bedrock-runtime: No` for
+The GPT-6 and GPT-5.x tiers are unreachable through `ConverseStream`; AWS reports `bedrock-runtime: No` for
 those models. The `gpt-oss-*` pair supports both surfaces and Bcode prefers Mantle, matching the AWS
 recommendation to use `bedrock-mantle` whenever possible. The Safeguard variants report
 `Responses: No` and are content-moderation models rather than coding models, so they route through
@@ -26,11 +27,15 @@ Converse and are marked unsupported in the model catalog.
 Per-region inference-profile prefixes (`us.`, `eu.`, `apac.`, `global.`) resolve to the same catalog
 entries, so `us.openai.gpt-5.6-sol` carries the same metadata as `openai.gpt-5.6-sol`.
 
+GPT-6 Astra pricing in the catalog is extrapolated from the OpenAI list rates until AWS publishes
+Bedrock rates: the `global.` profile bills at the OpenAI list rate, and the bare and `us.` IDs carry
+the same regional Standard-tier uplift as the GPT-5.6 entries.
+
 ## Configure
 
 No transport configuration is required. Routing follows the model: the catalog marks Mantle-only
 `OpenAI` models with `api_surface = "responses"`, so selecting one sends the turn to the Mantle
-Responses endpoint automatically, and `/model` / `/models` list all seven alongside the Converse
+Responses endpoint automatically, and `/model` / `/models` list all eight alongside the Converse
 models that `ListFoundationModels` reports.
 
 All you need is a Bedrock API key:
@@ -130,7 +135,7 @@ input tokens.
 
 ```sh
 AWS_BEARER_TOKEN_BEDROCK="<key>" \
-  bcode-model-catalog verify --provider bedrock --id-pattern 'openai.gpt-5.6*'
+  bcode-model-catalog verify --provider bedrock --id-pattern 'openai.gpt-*'
 ```
 
 Verification posts a tiny Responses request to the Mantle endpoint. Because Mantle exposes no model

@@ -3,8 +3,9 @@ display_name = "OpenAI"
 kind = "open_ai_compatible"
 website_url = "https://openai.com"
 default_model_id = "gpt-4.1-mini"
-default_codex_model_id = "gpt-5.6-sol"
+default_codex_model_id = "gpt-6-astra"
 fallback_model_ids = [
+  "gpt-6-astra",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.5",
@@ -428,6 +429,121 @@ native_web_search = true
 
 [models."o4-mini".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort = "medium"
+summary_values = ["auto", "concise", "detailed"]
+default_summary = "auto"
+
+[models."gpt-6-astra"]
+model_id = "gpt-6-astra"
+display_name = "GPT-6 Astra"
+aliases = ["gpt-6", "gpt-6-astra*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1050000
+max_output_tokens = 128000
+supported_by = [
+  { provider = "openai", auth_mode = "chatgpt_subscription", api_surface = "chatgpt_codex", integration = "bcode" },
+  { provider = "openai", auth_mode = "api_key", api_surface = "responses_api", integration = "bcode" },
+]
+
+[[models."gpt-6-astra".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+context_window = 1050000
+max_output_tokens = 128000
+
+[[models."gpt-6-astra".deployments]]
+provider = "openai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+context_window = 1050000
+max_output_tokens = 128000
+
+[models."gpt-6-astra".pricing]
+# OpenAI list pricing (platform.openai.com/docs/models/gpt-6-astra, 2026-09-03).
+# Prompts above 272K input tokens bill 2x input and cache rates and 1.5x output
+# for the whole request.
+currency = "USD"
+unit = "per_million_tokens"
+context_threshold_tokens = 272000
+input_micros = 10000000
+cached_input_micros = 1000000
+cache_write_input_micros = 12500000
+output_micros = 50000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 10000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 20000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 1000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 2000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 12500000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 25000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 50000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 75000000
+
+[models."gpt-6-astra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-6-astra".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
 default_summary = "auto"
