@@ -981,17 +981,17 @@ impl SessionManager {
             )
         };
         if refreshed_summary {
-            // Session loading sits at the bottom of a deep async chain (IPC dispatch through
-            // session mutation). Each `async fn` inlines its callee's future into its own state,
-            // so the database-opening tail is boxed to keep the combined stack frame bounded.
-            Box::pin(self.refresh_summary_session(session_id, store, &handle)).await?;
+            // The actor's cached handle (opened once if needed) reloads state and validates
+            // readiness; the manager must not open a second connection to the same file. Boxed
+            // because session loading sits at the bottom of a deep async chain.
+            let refresh_timer = self.metrics.timer();
+            Box::pin(handle.reload_state_and_validate_write_readiness()).await?;
+            self.metrics.record_histogram(
+                "session.manager.ensure_loaded.summary_refresh_duration_ms",
+                refresh_timer.elapsed_ms(),
+            );
         } else if !snapshot.owned {
-            let db = Box::pin(db::SessionDb::open_existing_turso_in_root(
-                session_id,
-                &store.root_path(),
-            ))
-            .await?;
-            db.validate_write_readiness().await?;
+            Box::pin(handle.validate_write_readiness()).await?;
         }
         record_ensure_loaded_duration(
             &self.metrics,
@@ -1005,29 +1005,34 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Acquire the compatibility lease for a persistent session load using one open database.
+    ///
+    /// The compatibility check before the lease and the re-check after it use the same handle,
+    /// which is then returned so the caller can validate readiness, load state, and seed the
+    /// actor without reopening the file.
     async fn acquire_session_lease_for_load(
         &self,
         session_id: SessionId,
         store: &SessionStoreExecutor,
-    ) -> Result<SessionLeaseGuard, SessionError> {
+    ) -> Result<(SessionLeaseGuard, db::SessionDb), SessionError> {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
         let root = store.root_path();
-        let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+        let db = db::SessionDb::open_existing_turso_in_root_observed(
+            session_id,
+            &root,
+            self.metrics.clone(),
+        )
+        .await?;
         let compatibility = db.storage_compatibility().await?;
-        drop(db);
         match compatibility {
             Current { .. } => match self
-                .acquire_current_session_lease(session_id, store, &root)
+                .acquire_current_session_lease(session_id, store, &root, &db)
                 .await?
             {
-                SessionLeaseLoadOutcome::Acquired(lease) => Ok(*lease),
+                SessionLeaseLoadOutcome::Acquired(lease) => Ok((*lease, db)),
                 SessionLeaseLoadOutcome::Retry => {
-                    let compatibility =
-                        db::SessionDb::open_existing_turso_in_root(session_id, &root)
-                            .await?
-                            .storage_compatibility()
-                            .await?;
+                    let compatibility = db.storage_compatibility().await?;
                     match compatibility {
                         Current { .. } => Err(db::SessionDbError::MigrationHistoryIncompatible {
                             reason: "session storage changed while acquiring ownership".to_owned(),
@@ -1054,14 +1059,14 @@ impl SessionManager {
         session_id: SessionId,
         store: &SessionStoreExecutor,
         root: &Path,
+        db: &db::SessionDb,
     ) -> Result<SessionLeaseLoadOutcome, SessionError> {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
         let lease = lease::acquire_session_lease(root, session_id, store.lease_owner())?;
-        let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
-            .await?
-            .storage_compatibility()
-            .await?;
+        // Re-read through the same connection: a migration that completed between the first
+        // check and lease acquisition is visible via the shared WAL without reopening the file.
+        let rechecked = db.storage_compatibility().await?;
         match rechecked {
             Current { .. } => Ok(SessionLeaseLoadOutcome::Acquired(Box::new(lease))),
             KnownLegacy { .. } => {
@@ -1073,34 +1078,6 @@ impl SessionManager {
         }
     }
 
-    async fn refresh_summary_session(
-        &self,
-        session_id: SessionId,
-        store: &SessionStoreExecutor,
-        handle: &SessionHandle,
-    ) -> Result<(), SessionError> {
-        let db_open_timer = self.metrics.timer();
-        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
-        db.validate_write_readiness().await?;
-        self.metrics.record_histogram(
-            "session.manager.ensure_loaded.summary_refresh_db_open_duration_ms",
-            db_open_timer.elapsed_ms(),
-        );
-        let state_load_timer = self.metrics.timer();
-        let state = self.load_db_session_state(session_id, &db).await?;
-        self.metrics.record_histogram(
-            "session.manager.ensure_loaded.summary_refresh_state_load_duration_ms",
-            state_load_timer.elapsed_ms(),
-        );
-        let replace_timer = self.metrics.timer();
-        handle.replace_state(state).await?;
-        self.metrics.record_histogram(
-            "session.manager.ensure_loaded.summary_refresh_replace_state_duration_ms",
-            replace_timer.elapsed_ms(),
-        );
-        Ok(())
-    }
-
     async fn load_persistent_session(
         &self,
         session_id: SessionId,
@@ -1109,7 +1086,7 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let load_timer = self.metrics.timer();
         let lease_timer = self.metrics.timer();
-        let lease = self
+        let (lease, db) = self
             .acquire_session_lease_for_load(session_id, store)
             .await?;
         self.metrics.record_histogram(
@@ -1117,7 +1094,6 @@ impl SessionManager {
             lease_timer.elapsed_ms(),
         );
         let db_open_timer = self.metrics.timer();
-        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         db.validate_write_readiness().await?;
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.db_open_duration_ms",
@@ -1135,9 +1111,11 @@ impl SessionManager {
         );
         let insert_timer = self.metrics.timer();
         let mut inner = self.inner.lock().await;
+        // The handle that validated this load becomes the actor's write handle, so the first
+        // append does not reopen the file.
         inner.sessions.insert(
             session_id,
-            SessionHandle::new(state, Some(store.clone()), Some(lease)),
+            SessionHandle::new_with_db(state, Some(store.clone()), Some(lease), Some(db)),
         );
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.insert_handle_duration_ms",
@@ -1251,7 +1229,6 @@ impl SessionManager {
     }
 
     /// Return first-class health for one session without event-log replay or repair.
-    #[allow(clippy::too_many_lines)]
     pub async fn session_health(&self, session_id: SessionId) -> SessionHealth {
         let Some(store) = &self.store else {
             return if self.inner.lock().await.sessions.contains_key(&session_id) {
@@ -1265,6 +1242,15 @@ impl SessionManager {
         if !db_path.exists() {
             return SessionHealth::NotFound;
         }
+        // A loaded session already holds (or will hold) the exclusive Turso file lock through its
+        // actor. Probing health through that cached handle avoids a second open that would either
+        // wait on our own lock or collide with it; unloaded sessions still probe directly.
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle
+            && let Ok(health) = handle.health(root.clone()).await
+        {
+            return health;
+        }
         let db = match db::SessionDb::open_existing_turso_in_root(session_id, &root).await {
             Ok(db) => db,
             Err(error) => {
@@ -1273,87 +1259,102 @@ impl SessionManager {
                 };
             }
         };
-        let expected_writer_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
-        match db.storage_compatibility().await {
-            Ok(db::SessionStorageCompatibility::Current { .. }) => {}
-            Ok(db::SessionStorageCompatibility::KnownLegacy { writer_epoch }) => {
-                let owners = match lease::active_session_owners(&root, session_id) {
-                    Ok(owners) => owners,
-                    Err(error) => {
-                        return SessionHealth::RepairRequired {
-                            reason: error.to_string(),
-                        };
-                    }
-                };
-                if owners.is_empty() {
-                    return SessionHealth::Migratable {
-                        source: writer_epoch,
-                        target: expected_writer_epoch,
+        session_health_from_db(&db, &root, session_id).await
+    }
+}
+
+/// Compute bounded session health from one open session database.
+///
+/// Shared by the manager (unloaded sessions) and the session actor (loaded sessions, through the
+/// cached write handle) so both report identical classifications.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn session_health_from_db(
+    db: &db::SessionDb,
+    root: &Path,
+    session_id: SessionId,
+) -> SessionHealth {
+    let expected_writer_epoch = u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
+    match db.storage_compatibility().await {
+        Ok(db::SessionStorageCompatibility::Current { .. }) => {}
+        Ok(db::SessionStorageCompatibility::KnownLegacy { writer_epoch }) => {
+            let owners = match lease::active_session_owners(root, session_id) {
+                Ok(owners) => owners,
+                Err(error) => {
+                    return SessionHealth::RepairRequired {
+                        reason: error.to_string(),
                     };
                 }
-                return SessionHealth::BlockedOwner {
+            };
+            if owners.is_empty() {
+                return SessionHealth::Migratable {
                     source: writer_epoch,
                     target: expected_writer_epoch,
-                    owners,
                 };
             }
-            Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
-                return SessionHealth::WriterIncompatible { actual, expected };
-            }
-            Err(error) => {
-                return SessionHealth::RepairRequired {
-                    reason: error.to_string(),
-                };
-            }
+            return SessionHealth::BlockedOwner {
+                source: writer_epoch,
+                target: expected_writer_epoch,
+                owners,
+            };
         }
-        let expected = match db.last_event_sequence().await {
-            Ok(Some(sequence)) => sequence,
-            Ok(None) => 0,
-            Err(error) => {
-                return SessionHealth::RepairRequired {
-                    reason: error.to_string(),
-                };
-            }
-        };
-        let session_state = match db.session_state().await {
-            Ok(Some(state)) if state.last_event_seq >= expected => state,
-            Ok(Some(state)) => {
-                return SessionHealth::ProjectionStale {
-                    projection: "session_state",
-                    checkpoint: Some(state.last_event_seq),
-                    expected,
-                };
-            }
-            Ok(None) => {
-                return SessionHealth::ProjectionStale {
-                    projection: "session_state",
-                    checkpoint: None,
-                    expected,
-                };
-            }
-            Err(error) => {
-                return SessionHealth::RepairRequired {
-                    reason: error.to_string(),
-                };
-            }
-        };
-        debug_assert!(session_state.last_event_seq >= expected);
-        match db
-            .materialized_projection_checkpoint(db::MaterializedProjection::ArtifactReferences)
-            .await
-        {
-            Ok(Some(checkpoint)) if checkpoint == expected => SessionHealth::Ready,
-            Ok(checkpoint) => SessionHealth::ProjectionStale {
-                projection: "artifact_references",
-                checkpoint,
-                expected,
-            },
-            Err(error) => SessionHealth::RepairRequired {
+        Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
+            return SessionHealth::WriterIncompatible { actual, expected };
+        }
+        Err(error) => {
+            return SessionHealth::RepairRequired {
                 reason: error.to_string(),
-            },
+            };
         }
     }
+    let expected = match db.last_event_sequence().await {
+        Ok(Some(sequence)) => sequence,
+        Ok(None) => 0,
+        Err(error) => {
+            return SessionHealth::RepairRequired {
+                reason: error.to_string(),
+            };
+        }
+    };
+    let session_state = match db.session_state().await {
+        Ok(Some(state)) if state.last_event_seq >= expected => state,
+        Ok(Some(state)) => {
+            return SessionHealth::ProjectionStale {
+                projection: "session_state",
+                checkpoint: Some(state.last_event_seq),
+                expected,
+            };
+        }
+        Ok(None) => {
+            return SessionHealth::ProjectionStale {
+                projection: "session_state",
+                checkpoint: None,
+                expected,
+            };
+        }
+        Err(error) => {
+            return SessionHealth::RepairRequired {
+                reason: error.to_string(),
+            };
+        }
+    };
+    debug_assert!(session_state.last_event_seq >= expected);
+    match db
+        .materialized_projection_checkpoint(db::MaterializedProjection::ArtifactReferences)
+        .await
+    {
+        Ok(Some(checkpoint)) if checkpoint == expected => SessionHealth::Ready,
+        Ok(checkpoint) => SessionHealth::ProjectionStale {
+            projection: "artifact_references",
+            checkpoint,
+            expected,
+        },
+        Err(error) => SessionHealth::RepairRequired {
+            reason: error.to_string(),
+        },
+    }
+}
 
+impl SessionManager {
     /// Require this session to be ready for a durable turn-admission append.
     ///
     /// # Errors
@@ -6572,6 +6573,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loading_and_probing_a_session_opens_its_database_once() {
+        // Turso opens take an exclusive file lock, so every redundant open is a window in which a
+        // concurrent daemon collides with this one. Loading a persistent session must reuse one
+        // handle for compatibility, lease re-check, readiness, state load, the first append, and
+        // health probes; only an unloaded session may open its own probe connection.
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::in_memory();
+        let manager = SessionManager::persistent_with_metrics_and_lease_owner(
+            &root,
+            metrics.clone(),
+            SessionLeaseOwnerContext::default(),
+        )
+        .expect("manager should initialize");
+        let session = manager
+            .create_session(Some("single open".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        manager
+            .release_idle_session_resources(session.id)
+            .await
+            .expect("release");
+        // Evict the handle so the next access is a cold persistent load.
+        manager.inner.lock().await.sessions.remove(&session.id);
+        let opens = || count_session_db_opens(&metrics);
+        let baseline_opens = opens();
+        let guard = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("ownership guard");
+        manager
+            .append_context_compacted(session.id, "first append after cold load".to_owned(), 0)
+            .await
+            .expect("append");
+        assert_eq!(
+            opens() - baseline_opens,
+            1,
+            "cold load plus first append must open the session database exactly once"
+        );
+        let before_health = opens();
+        assert_eq!(
+            manager.session_health(session.id).await,
+            SessionHealth::Ready
+        );
+        assert_eq!(
+            opens(),
+            before_health,
+            "health on a loaded session must reuse the actor's handle"
+        );
+        drop(guard);
+        manager.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    fn count_session_db_opens(metrics: &MetricsRegistry) -> u64 {
+        metrics
+            .snapshot()
+            .counters
+            .get("session.db.open_total")
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
     async fn busy_session_does_not_pin_an_unrelated_idle_session_database() {
         // Bcode intentionally runs long-lived daemons that serve many sessions at once, so an
         // active session must never keep an unrelated idle session's database held. Otherwise one
@@ -8173,6 +8237,15 @@ mod tests {
             .updated_at_ms;
         assert!(latest > manifest_activity_before);
         drop(guard);
+        // Guard drop notifies the actor asynchronously; wait for ownership to clear before
+        // asking for release so the release is not reported as blocked by the stale guard.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while manager.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guard drop should release ownership");
         manager
             .release_idle_session_resources(session.id)
             .await

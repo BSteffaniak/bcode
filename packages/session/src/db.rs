@@ -1391,6 +1391,7 @@ impl SessionDb {
     ) -> SessionDbResult<Self> {
         let open_started = std::time::Instant::now();
         let db = init_turso_local_with_retry(path).await;
+        metrics.increment_counter("session.db.open_total");
         DatabaseMetrics::new(metrics.clone(), "session", "turso").record(
             DatabaseOperation::Open,
             None,
@@ -6912,14 +6913,24 @@ mod tests {
             .get("database.operation.total")
             .copied()
             .unwrap_or_default();
+        // Isolate what one transaction's connection churn costs versus the statements inside it.
+        let mut begin_commit_us = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let started_at = std::time::Instant::now();
+            let tx = db.database().begin_transaction().await.expect("begin");
+            tx.commit().await.expect("commit");
+            begin_commit_us.push(started_at.elapsed().as_micros());
+        }
+        begin_commit_us.sort_unstable();
         eprintln!(
-            "canonical_append: n={} p50_us={} p95_us={} p99_us={} max_us={} db_ops_per_append={}",
+            "canonical_append: n={} p50_us={} p95_us={} p99_us={} max_us={} db_ops_per_append={} empty_tx_p50_us={}",
             samples_us.len(),
             percentile(50),
             percentile(95),
             percentile(99),
             samples_us[samples_us.len() - 1],
-            operations_after.saturating_sub(operations_before) / iterations
+            operations_after.saturating_sub(operations_before) / iterations,
+            begin_commit_us[50]
         );
     }
 

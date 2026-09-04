@@ -532,6 +532,27 @@ the final summary. Because the manifest is a disposable display cache and the ca
 coalesces independently, this cannot change canonical history or discovery correctness — a session
 directory is discovered from `session.db` regardless of manifest freshness.
 
+## Connection lifetime
+
+Turso takes an exclusive `fcntl` lock on `session.db` for every non-read-only open, and Bcode runs
+without Turso's experimental multi-process WAL. A held connection therefore excludes every other
+process — other daemon artifact versions, doctor/repair, migration — until it is dropped. That is
+why the invariant *released session ownership is completely released* is enforced by closing the
+connection whenever ownership ends (quiescent release after a top-level mutation, idle timeout, or
+shutdown), rather than by pooling connections across ownership boundaries.
+
+Inside one ownership span the opposite rule applies: the session actor owns exactly one
+`SessionDb` and every path reuses it. A persistent load opens the database once and threads that
+handle through compatibility check, lease re-check, write-readiness validation, projected-state load,
+and into the actor as its write handle. Summary refresh, write-readiness re-validation, bounded
+history reads, and health probes for a loaded session all route through the actor's cached handle
+instead of opening a second connection to the same file. Only an *unloaded* session may be probed
+with a short-lived direct open. The `session.db.open_total` counter is the reference measurement:
+`loading_and_probing_a_session_opens_its_database_once` asserts one open per cold load and zero for
+subsequent health probes. Per-transaction `connect()` calls inside Turso create logical connections
+on the already-open database (shared pager, WAL, and page cache) and cost single-digit microseconds;
+they are not file opens and are not pooled.
+
 Required projections include current session state, input history, transcript spans, tool runs,
 artifact references, runtime work, cumulative request-deduplicated session usage and fixed
 request-time cost, request-context occupancy, model context, and turn receipts. Normal reads never

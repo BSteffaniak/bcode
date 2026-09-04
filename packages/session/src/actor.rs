@@ -215,6 +215,22 @@ impl SessionHandle {
         store: Option<SessionStoreExecutor>,
         lease: Option<SessionLeaseGuard>,
     ) -> Self {
+        Self::new_with_db(state, store, lease, None)
+    }
+
+    /// Create a handle whose actor starts with an already-open session database.
+    ///
+    /// Loading a persistent session validates storage compatibility, readiness, and projected
+    /// state through one database handle; passing that handle along lets the actor's first write
+    /// reuse it instead of opening the file again. Turso opens take an exclusive file lock, so
+    /// every avoided reopen is also one fewer window in which a concurrent daemon can collide.
+    #[must_use]
+    pub(crate) fn new_with_db(
+        state: SessionState,
+        store: Option<SessionStoreExecutor>,
+        lease: Option<SessionLeaseGuard>,
+        db: Option<SessionDb>,
+    ) -> Self {
         let snapshot = Arc::new(RwLock::new(SessionSnapshot::from_state(
             &state,
             lease.is_some(),
@@ -226,7 +242,7 @@ impl SessionHandle {
             store,
             lease: lease.map(Arc::new),
             ownership_guards: BTreeMap::new(),
-            db: None,
+            db,
             last_manifest_summary: None,
             commands: receiver,
             ownership_releases,
@@ -283,6 +299,30 @@ impl SessionHandle {
     /// ready for the next append.
     pub async fn validate_write_readiness(&self) -> Result<(), SessionError> {
         self.send(SessionCommand::ValidateWriteReadiness).await?
+    }
+
+    /// Reload persisted state through the actor's cached database and validate append readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session database error when the session is unowned, the writer contract or
+    /// required projections are not ready, or the session-state projection is stale.
+    pub(crate) async fn reload_state_and_validate_write_readiness(
+        &self,
+    ) -> Result<(), SessionError> {
+        self.send(SessionCommand::ReloadStateAndValidateWriteReadiness)
+            .await?
+    }
+
+    /// Compute bounded session health through the actor's cached database handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session database does not exist or cannot be opened; the caller
+    /// then falls back to its own probe.
+    pub(crate) async fn health(&self, root: PathBuf) -> Result<super::SessionHealth, SessionError> {
+        self.send(|reply| SessionCommand::Health { root, reply })
+            .await?
     }
 
     pub async fn append_event(
@@ -549,14 +589,6 @@ impl SessionHandle {
             .await
     }
 
-    pub async fn replace_state(&self, state: SessionState) -> Result<(), SessionError> {
-        self.send(|reply| SessionCommand::ReplaceState {
-            state: Box::new(state),
-            reply,
-        })
-        .await
-    }
-
     pub async fn release_idle_resources(&self) -> Result<bool, SessionError> {
         self.send(SessionCommand::ReleaseIdleResources).await
     }
@@ -658,6 +690,11 @@ enum SessionCommand {
     },
     ComposerDraft(oneshot::Sender<Result<Option<String>, SessionError>>),
     ValidateWriteReadiness(oneshot::Sender<Result<(), SessionError>>),
+    ReloadStateAndValidateWriteReadiness(oneshot::Sender<Result<(), SessionError>>),
+    Health {
+        root: PathBuf,
+        reply: oneshot::Sender<Result<super::SessionHealth, SessionError>>,
+    },
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     HistoryPage {
         query: SessionHistoryQuery,
@@ -711,10 +748,6 @@ enum SessionCommand {
     PublishLive {
         event: SessionLiveEventKind,
         reply: oneshot::Sender<Option<SessionLiveEvent>>,
-    },
-    ReplaceState {
-        state: Box<SessionState>,
-        reply: oneshot::Sender<()>,
     },
     ReleaseIdleResources(oneshot::Sender<bool>),
     ReleaseDatabaseResources(oneshot::Sender<bool>),
@@ -894,6 +927,12 @@ impl SessionActor {
             SessionCommand::ValidateWriteReadiness(reply) => {
                 let _ = reply.send(self.validate_write_readiness().await);
             }
+            SessionCommand::ReloadStateAndValidateWriteReadiness(reply) => {
+                let _ = reply.send(self.reload_state_and_validate_write_readiness().await);
+            }
+            SessionCommand::Health { root, reply } => {
+                let _ = reply.send(self.health(&root).await);
+            }
             SessionCommand::History(reply) => {
                 let _ = reply.send(self.history().await);
             }
@@ -984,10 +1023,6 @@ impl SessionActor {
             }
             SessionCommand::PublishLive { event, reply } => {
                 let _ = reply.send(self.publish_live_event(event));
-            }
-            SessionCommand::ReplaceState { state, reply } => {
-                self.replace_persisted_state(*state);
-                let _ = reply.send(());
             }
             SessionCommand::ReleaseIdleResources(reply) => {
                 let _ = reply.send(self.release_idle_resources().await);
@@ -1274,6 +1309,85 @@ impl SessionActor {
         self.ensure_ownership()?;
         let db = self.session_db_for_write().await?;
         db.validate_write_readiness().await?;
+        Ok(())
+    }
+
+    /// Reload persisted state through the cached write handle and validate append readiness.
+    ///
+    /// This is the actor-side counterpart of a manager-level summary refresh: it reuses the
+    /// actor's open database (opening it once if needed) instead of the caller opening a second
+    /// connection to the same file, which would take a second exclusive lock cycle.
+    async fn reload_state_and_validate_write_readiness(&mut self) -> Result<(), SessionError> {
+        self.ensure_ownership()?;
+        self.ensure_session_db_for_write().await?;
+        {
+            let db = self
+                .db
+                .as_ref()
+                .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+            db.validate_write_readiness().await?;
+        }
+        self.reload_state_from_db().await?;
+        self.state.load_status = SessionLoadStatusKind::Current;
+        self.refresh_snapshot();
+        Ok(())
+    }
+
+    /// Bounded health through the cached database, opening it once if the file exists.
+    ///
+    /// Unlike write paths this does not require ownership: health is a read-only probe, and the
+    /// actor holding the handle is exactly what makes a second manager-side open redundant.
+    async fn health(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Result<super::SessionHealth, SessionError> {
+        let session_id = self.state.summary.id;
+        let db = self
+            .existing_session_db()
+            .await?
+            .ok_or(SessionError::NotFound(session_id))?;
+        Ok(super::session_health_from_db(db, root, session_id).await)
+    }
+
+    /// Replace in-memory state from the durable session-state projection unconditionally.
+    async fn reload_state_from_db(&mut self) -> Result<(), SessionError> {
+        let session_id = self.state.summary.id;
+        let summary_created_at_ms = self.state.summary.created_at_ms;
+        let summary_updated_at_ms = self.state.summary.updated_at_ms;
+        let Some(db) = self.db.as_ref() else {
+            return Err(SessionError::DbUnavailable(session_id));
+        };
+        let Some(db_state) = db.session_state().await? else {
+            return Err(SessionError::ProjectionStale {
+                session_id,
+                projection: "session_state",
+                checkpoint: None,
+                expected: db.last_event_sequence().await?.unwrap_or(0),
+            });
+        };
+        let expected_last_sequence = db
+            .last_event_sequence()
+            .await?
+            .unwrap_or(db_state.last_event_seq);
+        if db_state.last_event_seq < expected_last_sequence {
+            return Err(SessionError::ProjectionStale {
+                session_id,
+                projection: "session_state",
+                checkpoint: Some(db_state.last_event_seq),
+                expected: expected_last_sequence,
+            });
+        }
+        let activity_bounds = db.activity_bounds().await?;
+        let created_at_ms = activity_bounds
+            .map(|(created_at_ms, _)| created_at_ms)
+            .or(db_state.updated_at_ms)
+            .unwrap_or(summary_created_at_ms);
+        let updated_at_ms = db_state
+            .updated_at_ms
+            .or_else(|| activity_bounds.map(|(_, updated_at_ms)| updated_at_ms))
+            .unwrap_or(summary_updated_at_ms);
+        let state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
+        self.replace_persisted_state(state);
         Ok(())
     }
 
