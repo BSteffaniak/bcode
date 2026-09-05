@@ -21437,138 +21437,23 @@ async fn select_host_auth_pool_candidate(
     provider_plugin_id: Option<&str>,
     context: &mut bcode_model::ProviderRequestContext,
 ) {
-    if context.auth_candidates.is_empty() {
-        return;
-    }
-    if let Some(pool) = context.auth_pool.as_deref()
-        && let Some(preferred) = bcode_config::load_runtime_auth_subscriptions()
-            .pools
-            .get(pool)
-            .and_then(|entry| entry.preferred_profile.as_deref())
-        && let Some(position) = context
-            .auth_candidates
-            .iter()
-            .position(|candidate| candidate.profile.as_deref() == Some(preferred))
-    {
-        let candidate = context.auth_candidates.remove(position);
-        context.auth_candidates.insert(0, candidate);
-    }
-    refresh_auth_usage_windows_for_priming(state, provider_plugin_id, context).await;
-    let Some(selection) = bcode_provider_auth::auth_pool_routing::select_auth_pool_candidate(
-        &bcode_provider_auth::auth_pool_routing::AuthPoolSelectionInput {
-            pool: context.auth_pool.as_deref(),
-            primary_profile: context
-                .auth_candidates
-                .first()
-                .and_then(|candidate| candidate.profile.as_deref()),
-            routing: &context.auth_pool_routing,
-            candidates: &context.auth_candidates,
-        },
-    ) else {
-        return;
+    use bcode_provider_auth::auth_pool_routing::{
+        apply_auth_pool_selection, prepare_auth_pool_usage, record_auth_pool_usage,
     };
-    let Some(candidate) = context
-        .auth_candidates
-        .iter()
-        .find(|candidate| candidate.profile == selection.profile)
-    else {
-        return;
-    };
-    context.auth_profile.clone_from(&candidate.profile);
-    context.auth = Some(candidate.auth.clone());
-    context.env = candidate.env.clone();
-    context.auth_pool_selection_reason = Some(
-        match selection.reason {
-            bcode_provider_auth::auth_pool_routing::AuthPoolSelectionReason::Priming => "priming",
-            bcode_provider_auth::auth_pool_routing::AuthPoolSelectionReason::Strategy => "strategy",
-        }
-        .to_string(),
-    );
-}
-
-async fn refresh_auth_usage_windows_for_priming(
-    state: &ServerState,
-    provider_plugin_id: Option<&str>,
-    context: &bcode_model::ProviderRequestContext,
-) {
-    if !context.auth_pool_routing.priming_enabled
-        || !context.auth_pool_routing.priming_provider_windows
-    {
-        return;
-    }
-    let provider_plugin_id = provider_plugin_id.map(str::to_string);
-    for candidate in &context.auth_candidates {
-        let fallback_reprime_after = context
-            .auth_pool_routing
-            .priming_reprime_after
-            .as_deref()
-            .or(context
-                .auth_pool_routing
-                .priming_fallback_reprime_after
-                .as_deref())
-            .and_then(parse_duration);
-        if !bcode_provider_auth::auth_pool_state::profile_needs_priming_with_windows(
-            context.auth_pool.as_deref(),
-            candidate.profile.as_deref(),
-            &context.auth_pool_routing.priming_required_windows,
-            fallback_reprime_after,
-        ) {
-            continue;
-        }
-        let mut candidate_context = context.clone();
-        candidate_context
-            .auth_profile
-            .clone_from(&candidate.profile);
-        candidate_context.auth = Some(candidate.auth.clone());
-        candidate_context.env = candidate.env.clone();
-        let request = bcode_model::AuthUsageRequest {
-            provider_context: candidate_context,
-            meter_ids: context
-                .auth_pool_routing
-                .priming_required_windows
-                .keys()
-                .cloned()
-                .collect(),
-        };
-        let Ok(response) =
+    for request in prepare_auth_pool_usage(context) {
+        if let Ok(response) =
             invoke_model_provider_json_blocking::<_, bcode_model::AuthUsageResponse>(
                 state,
-                provider_plugin_id.clone(),
+                provider_plugin_id.map(str::to_owned),
                 OP_AUTH_USAGE,
-                request,
+                request.clone(),
             )
             .await
-        else {
-            continue;
-        };
-        if response.supported {
-            bcode_provider_auth::auth_pool_state::record_profile_usage_windows(
-                context.auth_pool.as_deref(),
-                candidate.profile.as_deref(),
-                &response.meters,
-            );
+        {
+            record_auth_pool_usage(&request, &response);
         }
     }
-}
-
-fn parse_duration(value: &str) -> Option<std::time::Duration> {
-    let trimmed = value.trim();
-    let (number, multiplier) = trimmed
-        .strip_suffix('d')
-        .map_or_else(|| (trimmed, 1), |number| (number, 86_400));
-    let (number, multiplier) = number
-        .strip_suffix('h')
-        .map_or((number, multiplier), |number| (number, 3_600));
-    let (number, multiplier) = number
-        .strip_suffix('m')
-        .map_or((number, multiplier), |number| (number, 60));
-    let (number, multiplier) = number
-        .strip_suffix('s')
-        .map_or((number, multiplier), |number| (number, 1));
-    number
-        .parse::<u64>()
-        .ok()
-        .map(|seconds| std::time::Duration::from_secs(seconds.saturating_mul(multiplier)))
+    apply_auth_pool_selection(context);
 }
 
 fn insert_reasoning_metadata(

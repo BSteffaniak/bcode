@@ -5,6 +5,137 @@ use bcode_model::{ProviderAuthCandidate, ProviderAuthPoolRouting};
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Prepare pool ordering and return best-effort usage probes needed before selection.
+///
+/// Callers invoke these provider-owned operations, record successful responses with
+/// [`record_auth_pool_usage`], then call [`apply_auth_pool_selection`] before starting a turn.
+#[must_use]
+pub fn prepare_auth_pool_usage(
+    context: &mut bcode_model::ProviderRequestContext,
+) -> Vec<bcode_model::AuthUsageRequest> {
+    if let Some(pool) = context.auth_pool.as_deref()
+        && let Some(preferred) = bcode_config::load_runtime_auth_subscriptions()
+            .pools
+            .get(pool)
+            .and_then(|entry| entry.preferred_profile.as_deref())
+    {
+        prefer_candidate(context, preferred);
+    }
+    if !context.auth_pool_routing.priming_enabled
+        || !context.auth_pool_routing.priming_provider_windows
+    {
+        return Vec::new();
+    }
+    let fallback_reprime_after = context
+        .auth_pool_routing
+        .priming_reprime_after
+        .as_deref()
+        .or(context
+            .auth_pool_routing
+            .priming_fallback_reprime_after
+            .as_deref())
+        .and_then(parse_duration);
+    context
+        .auth_candidates
+        .iter()
+        .filter_map(|candidate| {
+            if !auth_pool_state::profile_needs_priming_with_windows(
+                context.auth_pool.as_deref(),
+                candidate.profile.as_deref(),
+                &context.auth_pool_routing.priming_required_windows,
+                fallback_reprime_after,
+            ) {
+                return None;
+            }
+            let mut candidate_context = context.clone();
+            candidate_context
+                .auth_profile
+                .clone_from(&candidate.profile);
+            candidate_context.auth = Some(candidate.auth.clone());
+            candidate_context.env.clone_from(&candidate.env);
+            Some(bcode_model::AuthUsageRequest {
+                provider_context: candidate_context,
+                meter_ids: context
+                    .auth_pool_routing
+                    .priming_required_windows
+                    .keys()
+                    .cloned()
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn prefer_candidate(context: &mut bcode_model::ProviderRequestContext, preferred: &str) {
+    if let Some(position) = context
+        .auth_candidates
+        .iter()
+        .position(|candidate| candidate.profile.as_deref() == Some(preferred))
+    {
+        let candidate = context.auth_candidates.remove(position);
+        context.auth_candidates.insert(0, candidate);
+    }
+}
+
+/// Record a supported usage probe without treating unsupported discovery as an auth failure.
+pub fn record_auth_pool_usage(
+    request: &bcode_model::AuthUsageRequest,
+    response: &bcode_model::AuthUsageResponse,
+) {
+    if response.supported {
+        auth_pool_state::record_profile_usage_windows(
+            request.provider_context.auth_pool.as_deref(),
+            request.provider_context.auth_profile.as_deref(),
+            &response.meters,
+        );
+    }
+}
+
+/// Apply current pool routing to a request, retaining all candidates for provider-owned fallback.
+pub fn apply_auth_pool_selection(context: &mut bcode_model::ProviderRequestContext) {
+    let state = auth_pool_state::load_state();
+    apply_auth_pool_selection_with_state(context, &state, unix_now());
+}
+
+fn apply_auth_pool_selection_with_state(
+    context: &mut bcode_model::ProviderRequestContext,
+    state: &AuthPoolState,
+    now: u64,
+) {
+    let Some(selection) = select_auth_pool_candidate_with_state(
+        &AuthPoolSelectionInput {
+            pool: context.auth_pool.as_deref(),
+            primary_profile: context
+                .auth_candidates
+                .first()
+                .and_then(|candidate| candidate.profile.as_deref()),
+            routing: &context.auth_pool_routing,
+            candidates: &context.auth_candidates,
+        },
+        state,
+        now,
+    ) else {
+        return;
+    };
+    let Some(candidate) = context
+        .auth_candidates
+        .iter()
+        .find(|candidate| candidate.profile == selection.profile)
+    else {
+        return;
+    };
+    context.auth_profile.clone_from(&candidate.profile);
+    context.auth = Some(candidate.auth.clone());
+    context.env.clone_from(&candidate.env);
+    context.auth_pool_selection_reason = Some(
+        match selection.reason {
+            AuthPoolSelectionReason::Priming => "priming",
+            AuthPoolSelectionReason::Strategy => "strategy",
+        }
+        .to_string(),
+    );
+}
+
 /// Reason a candidate was selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPoolSelectionReason {
@@ -257,6 +388,43 @@ mod tests {
             routing,
             candidates,
         }
+    }
+
+    #[test]
+    fn preparation_selects_preferred_material_and_preserves_fallbacks() {
+        let mut preferred = candidate("preferred");
+        preferred
+            .env
+            .insert("credential-source".into(), "preferred".into());
+        let mut context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("configured".into()),
+            auth_pool: Some("pool".into()),
+            auth_candidates: vec![candidate("configured"), preferred.clone()],
+            ..Default::default()
+        };
+        prefer_candidate(&mut context, "preferred");
+        let candidates = context.auth_candidates.clone();
+        apply_auth_pool_selection_with_state(&mut context, &AuthPoolState::default(), 100);
+        assert_eq!(context.auth_profile, preferred.profile);
+        assert_eq!(context.auth, Some(preferred.auth));
+        assert_eq!(context.env, preferred.env);
+        assert_eq!(
+            context.auth_pool_selection_reason.as_deref(),
+            Some("strategy")
+        );
+        assert_eq!(context.auth_candidates, candidates);
+    }
+
+    #[test]
+    fn preparation_without_candidates_preserves_explicit_auth() {
+        let mut context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("explicit".into()),
+            env: BTreeMap::from([("credential-source".into(), "explicit".into())]),
+            ..Default::default()
+        };
+        let original = context.clone();
+        apply_auth_pool_selection_with_state(&mut context, &AuthPoolState::default(), 100);
+        assert_eq!(context, original);
     }
 
     #[test]

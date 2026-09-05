@@ -3,6 +3,16 @@
 Bcode exposes provider auth quota/usage through the model-provider service operation `OP_AUTH_USAGE`.
 Providers that can inspect subscription, account, or credential usage should implement this operation and return normalized meters and windows. The CLI, cache, status display, and routing/priming policy can then consume the data without provider-specific code.
 
+## Turn authentication preparation
+
+Session requests and CLI model verification use `bcode_provider_auth::auth_pool_routing`
+for the same pre-turn preparation: refresh the runtime pool preference, probe usage needed for
+priming on a best-effort basis, then apply current cooldown/strategy/priming selection. The selected
+profile, auth material, environment, and selection reason move together. Candidates remain intact
+for provider-owned fallback; preparation neither retries turns nor interprets provider auth errors.
+CLI verification applies this at each typed `BlockingModelProviderInvoker::start_turn`, including
+all prompt-cache scenario rounds, rather than relying only on the configured profile.
+
 ## Operation
 
 Request type: `bcode_model::AuthUsageRequest`

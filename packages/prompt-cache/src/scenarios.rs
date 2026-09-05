@@ -867,13 +867,9 @@ fn execute_turn<I>(
 where
     I: BlockingModelProviderInvoker,
 {
-    let start: StartTurnResponse = invoke(
-        invoker,
-        options,
-        scenario,
-        bcode_model::OP_START_TURN,
-        request,
-    )?;
+    let start: StartTurnResponse = invoker
+        .start_turn(options.provider_plugin_id.as_deref(), request)
+        .map_err(|message| PromptCacheScenarioError::Invocation { scenario, message })?;
     let deadline = Instant::now() + options.turn_timeout;
     let mut validator = ProviderEventValidator::default();
     let mut usage = None;

@@ -9817,6 +9817,28 @@ struct CliPluginTurnInvoker<'a> {
 }
 
 impl BlockingModelProviderInvoker for CliPluginTurnInvoker<'_> {
+    fn start_turn(
+        &mut self,
+        provider_plugin_id: Option<&str>,
+        request: &bcode_model::ModelTurnRequest,
+    ) -> Result<bcode_model::StartTurnResponse, String> {
+        use bcode_provider_auth::auth_pool_routing::{
+            apply_auth_pool_selection, prepare_auth_pool_usage, record_auth_pool_usage,
+        };
+        let mut request = request.clone();
+        for usage_request in prepare_auth_pool_usage(&mut request.provider_context) {
+            if let Ok(response) = self.invoke_json::<_, bcode_model::AuthUsageResponse>(
+                provider_plugin_id,
+                bcode_model::OP_AUTH_USAGE,
+                &usage_request,
+            ) {
+                record_auth_pool_usage(&usage_request, &response);
+            }
+        }
+        apply_auth_pool_selection(&mut request.provider_context);
+        self.invoke_json(provider_plugin_id, bcode_model::OP_START_TURN, &request)
+    }
+
     fn invoke_json<Q, R>(
         &mut self,
         provider_plugin_id: Option<&str>,

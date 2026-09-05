@@ -30,9 +30,21 @@ fn simulator_guard() -> MutexGuard<'static, ()> {
 #[derive(Default)]
 struct FakePluginInvoker {
     plugin: FakeProviderPlugin,
+    starting_prepared_turn: bool,
 }
 
 impl BlockingModelProviderInvoker for FakePluginInvoker {
+    fn start_turn(
+        &mut self,
+        provider_plugin_id: Option<&str>,
+        request: &bcode_model::ModelTurnRequest,
+    ) -> Result<bcode_model::StartTurnResponse, String> {
+        self.starting_prepared_turn = true;
+        let result = self.invoke_json(provider_plugin_id, bcode_model::OP_START_TURN, request);
+        self.starting_prepared_turn = false;
+        result
+    }
+
     fn invoke_json<Q, R>(
         &mut self,
         _provider_plugin_id: Option<&str>,
@@ -43,6 +55,10 @@ impl BlockingModelProviderInvoker for FakePluginInvoker {
         Q: serde::Serialize,
         R: serde::de::DeserializeOwned,
     {
+        assert!(
+            operation != bcode_model::OP_START_TURN || self.starting_prepared_turn,
+            "every scenario turn must pass through host preparation"
+        );
         let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
             plugin_id: "bcode.fake-provider".to_string(),
             request: ServiceRequest {

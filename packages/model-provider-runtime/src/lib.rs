@@ -1318,6 +1318,19 @@ pub enum SingleTurnStatus {
 
 /// Blocking provider invoker used by the reusable single-turn executor.
 pub trait BlockingModelProviderInvoker {
+    /// Start a turn, allowing the host adapter to prepare request authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider invocation fails.
+    fn start_turn(
+        &mut self,
+        provider_plugin_id: Option<&str>,
+        request: &bcode_model::ModelTurnRequest,
+    ) -> Result<bcode_model::StartTurnResponse, String> {
+        self.invoke_json(provider_plugin_id, bcode_model::OP_START_TURN, request)
+    }
+
     /// Invoke one typed model provider operation.
     ///
     /// # Errors
@@ -1372,11 +1385,8 @@ where
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: request.metadata,
     };
-    let start_response: bcode_model::StartTurnResponse = invoker.invoke_json(
-        request.provider_plugin_id.as_deref(),
-        bcode_model::OP_START_TURN,
-        &turn_request,
-    )?;
+    let start_response =
+        invoker.start_turn(request.provider_plugin_id.as_deref(), &turn_request)?;
     let mut text = String::new();
     let mut last_error = None;
     loop {
