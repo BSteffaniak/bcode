@@ -74,6 +74,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 mod context_compaction;
+mod turn_routing;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
@@ -169,6 +170,7 @@ pub struct OpenAiCompatibleProviderPlugin {
 #[derive(Debug, Default)]
 struct OpenAiCompatibleProviderState {
     next_turn: u64,
+    routing: turn_routing::TurnRouting,
     turns: BTreeMap<String, TurnState>,
     auth_flows: BTreeMap<String, OpenAiAuthFlowState>,
 }
@@ -184,6 +186,7 @@ impl Default for OpenAiCompatibleProviderPlugin {
 
 #[derive(Debug, Clone, Default)]
 struct TurnState {
+    routing: turn_routing::TurnRouting,
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
     positioned_output: Arc<AtomicBool>,
@@ -1410,7 +1413,10 @@ impl OpenAiCompatibleProviderPlugin {
             .expect("openai-compatible provider state lock should not be poisoned");
         state.next_turn += 1;
         let provider_turn_id = format!("openai-compatible-turn-{}", state.next_turn);
-        let turn = TurnState::default();
+        let turn = TurnState {
+            routing: state.routing.clone(),
+            ..TurnState::default()
+        };
         if positioned_output {
             turn.enable_positioned_output();
         }
@@ -3729,6 +3735,7 @@ async fn verify_model_inner(
                 api_key,
                 &turn_request,
                 &request.model_id,
+                None,
             )
             .await?;
         }
@@ -3739,6 +3746,7 @@ async fn verify_model_inner(
                 access_token,
                 &turn_request,
                 &request.model_id,
+                None,
             )
             .await?;
         }
@@ -4164,14 +4172,27 @@ async fn stream_chat_completion_inner(
             read_stream_events(response, turn, request).await
         }
         (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ResponsesApi) => {
-            let response =
-                send_responses_request(&client, &settings, api_key, request, &model_id).await?;
+            let response = send_responses_request(
+                &client,
+                &settings,
+                api_key,
+                request,
+                &model_id,
+                Some(&turn.routing),
+            )
+            .await?;
             read_responses_stream_events(response, turn, request, settings.dialect).await
         }
         (AuthSettings::ChatGpt { access_token, .. }, OpenAiCompatibleDialect::ChatGptCodex) => {
-            let response =
-                send_responses_request(&client, &settings, access_token, request, &model_id)
-                    .await?;
+            let response = send_responses_request(
+                &client,
+                &settings,
+                access_token,
+                request,
+                &model_id,
+                Some(&turn.routing),
+            )
+            .await?;
             read_responses_stream_events(response, turn, request, settings.dialect).await
         }
         (AuthSettings::ChatGpt { .. }, _) => Err(provider_error(
@@ -4300,8 +4321,30 @@ async fn send_responses_request(
     access_token: &str,
     request: &ModelTurnRequest,
     model_id: &str,
+    routing: Option<&turn_routing::TurnRouting>,
 ) -> Result<reqwest::Response, ProviderError> {
-    let url = responses_endpoint(settings);
+    send_responses_request_to(
+        client,
+        settings,
+        access_token,
+        request,
+        model_id,
+        routing,
+        &responses_endpoint(settings),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_responses_request_to(
+    client: &Client,
+    settings: &Settings,
+    access_token: &str,
+    request: &ModelTurnRequest,
+    model_id: &str,
+    routing: Option<&turn_routing::TurnRouting>,
+    url: &str,
+) -> Result<reqwest::Response, ProviderError> {
     let request_body = build_responses_request(settings, request, model_id)?;
     let mut builder = client
         .post(url)
@@ -4312,6 +4355,30 @@ async fn send_responses_request(
         .header("session_id", request.session_id.to_string());
     if settings.dialect.uses_codex_request_shape() {
         builder = builder.header("OpenAI-Beta", "responses=experimental");
+    }
+    let scope = settings
+        .dialect
+        .uses_codex_request_shape()
+        .then(|| turn_routing::Scope {
+            session: request.session_id.to_string(),
+            turn: request
+                .metadata
+                .get(bcode_model::APPLICATION_TURN_ID_METADATA_KEY)
+                .cloned()
+                .unwrap_or_else(|| request.turn_id.clone()),
+            endpoint: url.to_string(),
+            model: model_id.to_string(),
+            profile: request.provider_context.auth_profile.clone(),
+            account: match &settings.auth {
+                AuthSettings::ChatGpt { account_id, .. } => account_id.clone(),
+                _ => None,
+            },
+        });
+    if let Some(token) = scope
+        .as_ref()
+        .and_then(|scope| routing.and_then(|routing| routing.get(scope)))
+    {
+        builder = builder.header(turn_routing::HEADER, token);
     }
     let mut builder = builder.json(&request_body);
     if let AuthSettings::ChatGpt {
@@ -4340,6 +4407,11 @@ async fn send_responses_request(
     {
         enrich_unexpected_stream_response_error(&mut error, response).await;
         return Err(error);
+    }
+    if let (Some(routing), Some(scope), Some(token)) =
+        (routing, scope, headers.get(turn_routing::HEADER))
+    {
+        routing.capture(scope, token);
     }
     Ok(response)
 }
@@ -10280,6 +10352,88 @@ mod tests {
             created: Some(created),
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn codex_replays_routing_header_across_requests_but_not_application_turns() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            for expected in [false, true, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    assert!(!line.is_empty());
+                    headers.push_str(&line);
+                }
+                assert_eq!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("x-codex-turn-state: route-token"),
+                    expected
+                );
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|v| v.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                drop(reader);
+                std::io::Write::write_all(&mut stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\nx-codex-turn-state: route-token\r\n\r\n").unwrap();
+            }
+        });
+        let mut settings = test_settings(
+            AuthSettings::ApiKey("test".into()),
+            OpenAiCompatibleDialect::ChatGptCodex,
+        );
+        settings.base_url = format!("http://{address}");
+        let mut request = verification_turn_request(&bcode_model::VerifyModelRequest {
+            model_id: "test-model".into(),
+            prompt: "test".into(),
+            timeout_seconds: None,
+            provider_context: ProviderRequestContext::default(),
+            metadata: BTreeMap::new(),
+        });
+        request.metadata.insert(
+            bcode_model::APPLICATION_TURN_ID_METADATA_KEY.into(),
+            "application-one".into(),
+        );
+        let client = Client::new();
+        let routing = turn_routing::TurnRouting::default();
+        for round in 0..3 {
+            request.turn_id = format!("request-{round}");
+            if round == 2 {
+                request.metadata.insert(
+                    bcode_model::APPLICATION_TURN_ID_METADATA_KEY.into(),
+                    "application-two".into(),
+                );
+            }
+            send_responses_request_to(
+                &client,
+                &settings,
+                "test",
+                &request,
+                "test-model",
+                Some(&routing),
+                &format!("http://{address}/responses"),
+            )
+            .await
+            .unwrap();
+        }
+        worker.join().unwrap();
     }
 
     fn test_settings(auth: AuthSettings, dialect: OpenAiCompatibleDialect) -> Settings {

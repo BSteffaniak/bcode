@@ -153,6 +153,31 @@ GPT-5.4 was rejected as unsupported for the tested ChatGPT account. That account
 is not sufficient evidence to remove support globally. A direct subprocess check confirmed failed
 verification exits with status 1; earlier shell-wrapped status observations were misleading.
 
+## Codex turn routing
+
+The OpenAI-compatible plugin captures `x-codex-turn-state` on successful Codex responses and
+replays the first token for subsequent requests in the same application turn. This follows
+OpenAI Codex's turn-scoped sticky-routing contract, not a Luna-specific cache heuristic.
+The host supplies normalized `application_turn_id` metadata across tool rounds, separate from
+per-request IDs. Callers without that metadata use the request turn ID as their scope.
+
+Tokens remain ephemeral and provider-private: they are never persisted, logged, or placed in
+frontend events. Routes are scoped by session, application turn, endpoint, model, auth profile,
+and account, with a 256-entry bound, one-hour idle expiry, and a 16-KiB token limit. A new user turn
+cannot inherit the prior turn's route. Eviction loses an optimization rather than changing
+conversation history or retry behavior.
+
+Initial single-profile Luna verification after adding this handling passed two of three runs;
+the remaining run still dropped cached input to zero. Three further release-binary runs using the
+normal `openai.toml` pool likewise passed twice and failed once (zero cached tokens at round 7).
+Sticky routing is therefore a protocol correction, not proof that Luna's intermittent cache misses
+are resolved. Live reports do not yet establish whether the provider supplied a routing header on
+the failing requests; wire-level presence/replay diagnostics are the next required evidence.
+
+Reference: OpenAI Codex `codex-rs/core/src/client.rs`, `ModelClientSession` documentation,
+revision `be2684ede0c3aa3e7789c4d83ad6a98ff5fe5b87`: replay the first `x-codex-turn-state`
+response token throughout one turn, never across turns.
+
 ## Related documents
 
 * `docs/model-provider-contract.md` — conformance and capability truthfulness

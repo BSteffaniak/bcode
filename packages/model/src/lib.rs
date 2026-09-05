@@ -2603,6 +2603,12 @@ impl ResolvedModelFeatureCapabilities {
     }
 }
 
+/// Request metadata identifying the application turn across its provider/tool rounds.
+///
+/// Providers may scope ephemeral routing to this identity. It changes on the next application
+/// turn and is distinct from the per-request `ModelTurnRequest::turn_id`.
+pub const APPLICATION_TURN_ID_METADATA_KEY: &str = "application_turn_id";
+
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {

@@ -21119,6 +21119,10 @@ async fn build_model_turn_request(
     );
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
+    metadata.insert(
+        bcode_model::APPLICATION_TURN_ID_METADATA_KEY.to_string(),
+        format!("{session_id}-{}", trigger_event.sequence),
+    );
     insert_reasoning_metadata(&mut metadata, &parameters);
     insert_model_cache_metadata(&mut metadata, &model_cache_info);
     if !static_context.prompt_profile_layers.is_empty() {
