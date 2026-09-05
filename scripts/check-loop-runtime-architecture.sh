@@ -1199,17 +1199,37 @@ if ! grep -F 'TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA' packages/tool/src/contracts
   violations=1
 fi
 
+# BEGIN session-result compatibility guard (also exercised by its fixture test).
 # The provider stream trace projection names a current provider event, not a
 # historical session result. Exempt only that exact match arm; keep every other
 # legacy spelling forbidden, including session variants and serialized payloads.
-if rg -n '(^|[^A-Za-z])SessionEventKind::ToolCallFinished|"tool_call_finished"|\bsemantic_migration\b|MigrateSemanticResults' \
+removed_session_result_pattern='(^|[^A-Za-z])SessionEventKind::ToolCallFinished|"tool_call_finished"|\bsemantic_migration\b|MigrateSemanticResults'
+removed_session_result_matches="$(mktemp)"
+removed_session_result_status=0
+rg -n "${removed_session_result_pattern}" \
   packages/session packages/session-view packages/ipc packages/server packages/tui packages/hyperchad packages/cli packages/eval plugins/blims-plugin plugins/code-review-plugin \
-  --glob '*.rs' | grep -Ev '^packages/server/src/lib\.rs:[0-9]+:[[:space:]]*ProviderTurnEvent::ToolCallFinished \{ \.\. \} => "tool_call_finished",[[:space:]]*$' \
-  >/tmp/bcode-removed-session-result-compatibility.txt; then
-  echo "Runtime architecture violation: removed legacy session result compatibility was reintroduced." >&2
-  cat /tmp/bcode-removed-session-result-compatibility.txt >&2
+  --glob '*.rs' >"${removed_session_result_matches}" || removed_session_result_status=$?
+if [[ ${removed_session_result_status} -gt 1 ]]; then
+  echo "Runtime architecture violation: session result compatibility scan failed." >&2
   violations=1
+elif [[ ${removed_session_result_status} -eq 0 ]]; then
+  # Filter the full path and complete line, not an arbitrary occurrence of the tag.
+  removed_session_filter_status=0
+  grep -Ev '^packages/server/src/lib\.rs:[0-9]+:[[:space:]]*ProviderTurnEvent::ToolCallFinished \{ \.\. \} => "tool_call_finished",[[:space:]]*$' \
+    "${removed_session_result_matches}" >"${removed_session_result_matches}.filtered" || removed_session_filter_status=$?
+  if [[ ${removed_session_filter_status} -gt 1 ]]; then
+    echo "Runtime architecture violation: session result compatibility filter failed." >&2
+    violations=1
+  fi
+  if [[ -s "${removed_session_result_matches}.filtered" ]]; then
+    echo "Runtime architecture violation: removed legacy session result compatibility was reintroduced." >&2
+    cat "${removed_session_result_matches}.filtered" >&2
+    violations=1
+  fi
+  rm -f "${removed_session_result_matches}.filtered"
 fi
+rm -f "${removed_session_result_matches}"
+# END session-result compatibility guard
 
 if ! grep -F 'generic_records_reopen_to_identical_canonical_and_bounded_projections' packages/session/src/db.rs >/dev/null ||
    ! grep -F 'durable_mixed_history_replays_to_byte_identical_generic_snapshots' packages/session-view/src/lib.rs >/dev/null; then

@@ -854,6 +854,70 @@ async fn explicit_safe_tool_cache_preserves_complete_steps_without_reexecution()
     )));
 }
 
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct AbortProbeCache {
+    lookups: AtomicUsize,
+    aborts: AtomicUsize,
+}
+
+#[cfg(feature = "testing")]
+impl ModelResponseCache for AbortProbeCache {
+    fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+
+    fn put(
+        &self,
+        _request: &AgentTurnRequest,
+        _response: &GenerateTextResponse,
+    ) -> bcode::Result<()> {
+        panic!("pending generation must not store a response")
+    }
+
+    fn abort(&self, _request: &AgentTurnRequest) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+#[ignore = "known defect: buffered future drop does not abort cache reservation; requires reservation-owned cleanup"]
+async fn dropping_buffered_generation_after_cache_miss_releases_reservation() {
+    use bcode::testing::{ScriptedProvider, ScriptedProviderTurn};
+
+    let cache = Arc::new(AbortProbeCache::default());
+    let agent = Agent::builder().response_cache(cache.clone()).build();
+    let mut provider = ScriptedProvider::new([ScriptedProviderTurn::new().pending()]);
+    let probe = provider.probe();
+    let mut generation = Box::pin(agent.generate_text_with_provider(&mut provider, "drop miss"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = &mut generation => panic!("generation unexpectedly completed: {result:?}"),
+                () = tokio::task::yield_now() => {
+                    if !probe.requests().is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("provider starts after cache miss");
+    assert_eq!(cache.lookups.load(Ordering::SeqCst), 1);
+    drop(generation);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while cache.aborts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping generation must release cache reservation");
+    assert_eq!(cache.aborts.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn abandoned_single_flight_lease_expires() {
     let cache = InMemoryModelResponseCache::new(

@@ -39,6 +39,37 @@ fn tool_provider() -> ScriptedProvider {
     ])
 }
 
+#[tokio::test]
+async fn scripted_tool_probe_releases_success_error_delay_and_exhaustion() {
+    for outcomes in [
+        vec![ScriptedToolOutcome::text("ok")],
+        vec![ScriptedToolOutcome::Error("fixture failure".into())],
+        vec![ScriptedToolOutcome::text("delayed").after(Duration::from_millis(1))],
+        vec![],
+    ] {
+        let tool = ScriptedTool::new(outcomes);
+        let probe = tool.probe();
+        assert_eq!(probe.active_invocation_count(), 0);
+        let session_id = "00000000-0000-4000-8000-000000000126"
+            .parse()
+            .expect("fixture ID");
+        let agent = tool
+            .register(
+                bcode::AgentBuilder::from_context(session_id, "/".into()),
+                tool_definition(),
+            )
+            .custom_permission_policy(ScriptedPermissionPolicy::new([PermissionDecision::Allow]))
+            .build();
+        let response = agent
+            .run(&mut tool_provider(), "run fixture")
+            .await
+            .expect("tool result permits continuation");
+        assert_eq!(response.text, "after tool");
+        assert_eq!(probe.invocation_count(), 1);
+        assert_eq!(probe.active_invocation_count(), 0);
+    }
+}
+
 #[test]
 fn request_identity_scripts_reject_duplicates_and_empty_turn_ids() {
     let identity = bcode::ProviderRequestIdentity {
@@ -234,6 +265,7 @@ async fn scripted_tool_delay_error_and_cancellation_are_network_free() {
         let item = stream.next().await.expect("stream remains active");
         assert!(!matches!(item, bcode::TextStreamItem::Error(_)));
     }
+    assert_eq!(pending_probe.active_invocation_count(), 1);
     cancellation.cancel();
     let mut terminal = None;
     while let Some(item) = stream.next().await {
@@ -245,6 +277,7 @@ async fn scripted_tool_delay_error_and_cancellation_are_network_free() {
         terminal,
         Some(BcodeError::Runtime(RuntimeError::Cancelled))
     ));
+    assert_eq!(pending_probe.active_invocation_count(), 0);
 }
 
 #[tokio::test]

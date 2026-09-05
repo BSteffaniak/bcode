@@ -73,6 +73,73 @@ async fn recorder_supports_explicit_partial_consumption() {
 }
 
 #[tokio::test]
+async fn recorder_budget_preserves_partial_status_and_observed_exhaustion() {
+    let completed = record_text_stream(stream_text_builder().prompt("hello").run(
+        ScriptedProvider::new([ScriptedProviderTurn::complete_text("answer")]),
+    ))
+    .await;
+    let exact_budget = completed.items().len();
+    let exact = TextStreamRecorder::new(stream_text_builder().prompt("hello").run(
+        ScriptedProvider::new([ScriptedProviderTurn::complete_text("answer")]),
+    ))
+    .finish_up_to(exact_budget)
+    .await;
+    assert!(matches!(
+        exact.items().last(),
+        Some(TextStreamItem::Finished(_))
+    ));
+    assert!(!exact.is_exhausted());
+    assert!(exact.assert_finished().is_err());
+    for limit in [0, 1, 100] {
+        let stream = stream_text_builder()
+            .prompt("hello")
+            .run(ScriptedProvider::new([
+                ScriptedProviderTurn::complete_text("answer"),
+            ]));
+        let transcript = TextStreamRecorder::new(stream).finish_up_to(limit).await;
+        assert!(transcript.items().len() <= limit);
+        if limit == 100 {
+            transcript.assert_finished().expect("observed exhaustion");
+        } else {
+            assert!(!transcript.is_exhausted());
+            assert!(transcript.assert_finished().is_err());
+            assert_eq!(transcript.items().len(), limit);
+        }
+    }
+}
+
+#[tokio::test]
+async fn recorder_budget_is_additional_to_existing_items() {
+    for additional in [0, 1, 100] {
+        let stream = stream_text_builder()
+            .prompt("hello")
+            .run(ScriptedProvider::new([
+                ScriptedProviderTurn::complete_text("answer"),
+            ]));
+        let mut recorder = TextStreamRecorder::new(stream);
+        assert_eq!(recorder.consume_up_to(1).await, 1);
+        let transcript = recorder.finish_up_to(additional).await;
+        assert!(matches!(
+            transcript.items().first(),
+            Some(TextStreamItem::Event(AgentEvent::TurnStarted))
+        ));
+        if additional == 100 {
+            assert_eq!(
+                transcript
+                    .assert_finished()
+                    .expect("complete transcript")
+                    .text,
+                "answer"
+            );
+        } else {
+            assert_eq!(transcript.items().len(), 1 + additional);
+            assert!(!transcript.is_exhausted());
+            assert!(transcript.assert_finished().is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn recorder_cancels_and_asserts_typed_terminal_state() {
     let cancellation = CancellationToken::new();
     let stream = stream_text_builder()

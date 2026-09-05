@@ -62,6 +62,13 @@ async fn run() -> bcode::Result<()> {
             ProviderTurnEvent::TurnFinished {
                 stop_reason: bcode::StopReason::EndTurn,
             },
+            // A malformed provider batch must not reopen or overwrite completion.
+            ProviderTurnEvent::TextDelta {
+                text: "late text must not appear".into(),
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: bcode::StopReason::Cancelled,
+            },
         ])]);
     let probe = provider.probe();
     let session_id = "00000000-0000-4000-8000-000000000001"
@@ -77,36 +84,801 @@ async fn run() -> bcode::Result<()> {
         .model("test-model")
         .build();
 
-    let response = agent.run(&mut provider.clone(), "hello").await?;
+    let transcript = TextStreamRecorder::new(agent.stream_text_with_provider(provider, "hello"))
+        .finish_up_to(100)
+        .await;
+    let response = transcript
+        .assert_finished()
+        .expect("coherent successful stream");
     assert_eq!(response.text, "scripted answer");
+    let deltas: Vec<_> = transcript
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            bcode::AgentEvent::TextDelta(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, ["scripted answer"]);
     probe
         .assert_requests(&[ScriptedRequestExpectation::new()
             .provider_plugin_id("test-provider")
             .model_id("test-model")])
         .expect("captured request");
     probe.assert_finish_count(1).expect("provider cleanup");
+    run_response_cache_scenario().await?;
+    run_rate_limit_scenarios().await?;
+    run_retry_scenarios().await?;
+    run_response_cache_failure().await?;
     run_terminal_scenarios().await?;
-    run_tool_scenarios().await?;
+    run_tool_scenarios(false).await?;
+    run_tool_scenarios(true).await?;
+    for capacity in [1, 2, 4, 32] {
+        run_backpressure_scenario(
+            std::num::NonZeroUsize::new(capacity).expect("positive capacity"),
+        )
+        .await?;
+    }
+    run_pending_tool_cancellation(ToolCancellation::Explicit).await?;
+    run_pending_tool_cancellation(ToolCancellation::StreamDrop).await?;
+    run_pending_tool_cancellation(ToolCancellation::RecorderBudget).await?;
+    run_pending_tool_cancellation(ToolCancellation::Deadline).await?;
+    for operation in [ProviderFailure::Event, ProviderFailure::Poll] {
+        for partial_output in [false, true] {
+            run_provider_error(operation, partial_output).await?;
+        }
+    }
+    run_provider_error(ProviderFailure::Start, false).await?;
+    run_pre_cancelled().await?;
+    run_sibling_cancellation().await?;
     Ok(())
 }
 
-async fn run_tool_scenarios() -> bcode::Result<()> {
-    for allowed in [true, false] {
-        let session_id = "00000000-0000-4000-8000-000000000003"
+async fn run_sibling_cancellation() -> bcode::Result<()> {
+    let mut streams = Vec::new();
+    for index in 0..2 {
+        let session_id = format!("00000000-0000-4000-8000-00000000000{}", index + 8)
+            .parse()
+            .expect("fixture ID");
+        let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+            session_id,
+            turn_id: format!("sibling-{index}"),
+        }])?;
+        let agent = AgentBuilder::from_context(session_id, "/".into())
+            .runtime(
+                AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)),
+            )
+            .provider_plugin("test-provider")
+            .model("test-model")
+            .build();
+        let turn = ScriptedProviderTurn::new().events([ProviderTurnEvent::TextDelta {
+            text: format!("sibling-{index}"),
+        }]);
+        let provider = ScriptedProvider::new([turn.pending()]);
+        let probe = provider.probe();
+        let cancellation = bcode::CancellationToken::new();
+        let recorder = TextStreamRecorder::new(agent.stream_text_with_provider_and_cancellation(
+            provider,
+            "concurrent streams",
+            cancellation.clone(),
+        ));
+        streams.push((recorder, cancellation, probe));
+    }
+    // Both producers have been spawned before either consumer is drained.
+    for (recorder, _, _) in &mut streams {
+        assert_eq!(recorder.consume_up_to(2).await, 2);
+    }
+    streams[0].1.cancel();
+    for (index, (recorder, cancellation, probe)) in streams.into_iter().enumerate() {
+        // The second provider cannot finish by itself: its script remains pending.
+        // Check after the first stream's terminal has been consumed, then explicitly
+        // cancel the sibling rather than relying on a delay to establish overlap.
+        if index == 1 {
+            assert!(!cancellation.is_cancelled());
+            probe
+                .assert_cancellation_count(0)
+                .expect("sibling was not cancelled");
+            probe
+                .assert_finish_count(0)
+                .expect("sibling remains active");
+            cancellation.cancel();
+        }
+        let transcript = recorder.finish_up_to(100).await;
+        transcript
+            .assert_cancelled()
+            .expect("explicitly selected stream cancelled");
+        transcript
+            .assert_event_order(&[
+                bcode::AgentEvent::TurnStarted,
+                bcode::AgentEvent::TextDelta(format!("sibling-{index}")),
+            ])
+            .expect("each stream receives only its own ordered events");
+        probe
+            .assert_finish_count(1)
+            .expect("each provider finishes once");
+        probe
+            .assert_cancellation_count(1)
+            .expect("each explicit cancellation delivered once");
+        assert_eq!(probe.requests().len(), 1);
+        assert_eq!(
+            probe.requests()[0].request.turn_id,
+            format!("sibling-{index}")
+        );
+    }
+    Ok(())
+}
+
+async fn run_response_cache_scenario() -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000008"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new((0..3).map(|index| ProviderRequestIdentity {
+        session_id,
+        turn_id: format!("cache-{index}"),
+    }))?;
+    let cache = Arc::new(bcode::InMemoryModelResponseCache::new(
+        Duration::from_secs(1),
+        std::num::NonZeroUsize::new(2).expect("positive capacity"),
+    ));
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .response_cache(cache)
+        .build();
+    let mut provider = ScriptedProvider::new([
+        ScriptedProviderTurn::complete_text("before expiry"),
+        ScriptedProviderTurn::complete_text("after expiry"),
+    ]);
+    let probe = provider.probe();
+    for _ in 0..2 {
+        let response = agent
+            .generate_text_with_provider(&mut provider, "cached")
+            .await?;
+        assert_eq!(response.text, "before expiry");
+        assert_eq!(probe.requests().len(), 1, "hit must not dispatch provider");
+        probe
+            .assert_finish_count(1)
+            .expect("miss provider released");
+    }
+    let streaming_provider =
+        ScriptedProvider::new([ScriptedProviderTurn::complete_text("stream bypasses cache")]);
+    let streaming_probe = streaming_provider.probe();
+    let transcript =
+        TextStreamRecorder::new(agent.stream_text_with_provider(streaming_provider, "cached"))
+            .finish_up_to(100)
+            .await;
+    assert_eq!(
+        transcript.assert_finished().expect("stream succeeds").text,
+        "stream bypasses cache"
+    );
+    assert_eq!(streaming_probe.requests().len(), 1);
+    streaming_probe
+        .assert_finish_count(1)
+        .expect("stream provider released");
+    streaming_probe
+        .assert_cancellation_count(0)
+        .expect("stream not cancelled");
+    let response = agent
+        .generate_text_with_provider(&mut provider, "cached")
+        .await?;
+    assert_eq!(
+        response.text, "before expiry",
+        "stream must not overwrite cache"
+    );
+    assert_eq!(probe.requests().len(), 1, "buffered entry remains cached");
+    switchy::unsync::time::sleep(Duration::from_secs(2)).await;
+    let response = agent
+        .generate_text_with_provider(&mut provider, "cached")
+        .await?;
+    assert_eq!(response.text, "after expiry");
+    assert_eq!(
+        probe.requests().len(),
+        2,
+        "expired entry must dispatch provider"
+    );
+    probe
+        .assert_finish_count(2)
+        .expect("both providers released");
+    probe.assert_cancellation_count(0).expect("no cancellation");
+    Ok(())
+}
+
+async fn run_response_cache_failure() -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000009"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new((0..2).map(|index| ProviderRequestIdentity {
+        session_id,
+        turn_id: format!("cache-failure-{index}"),
+    }))?;
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .response_cache(Arc::new(bcode::InMemoryModelResponseCache::new(
+            Duration::from_secs(60),
+            std::num::NonZeroUsize::new(2).expect("positive capacity"),
+        )))
+        .build();
+    let error = bcode::ProviderError {
+        code: "cache_fixture_failure".into(),
+        category: bcode::ProviderErrorCategory::ProviderInternal,
+        message: "cache fixture failure".into(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    };
+    let mut provider = ScriptedProvider::new([
+        ScriptedProviderTurn::start_error(error),
+        ScriptedProviderTurn::complete_text("recovered cache miss"),
+    ]);
+    let probe = provider.probe();
+    let failure = agent
+        .generate_text_with_provider(&mut provider, "recover")
+        .await
+        .expect_err("scripted provider start must fail");
+    assert!(
+        matches!(
+            failure,
+            bcode::BcodeError::Runtime(bcode::RuntimeError::Provider { ref code, .. })
+                if code == "cache_fixture_failure"
+        ),
+        "unexpected failure: {failure:?}"
+    );
+    assert_eq!(probe.requests().len(), 1);
+    probe
+        .assert_finish_count(0)
+        .expect("failed start has no provider handle");
+    // A leaked miss lease must not be allowed to expire and mask missing abort cleanup.
+    let started = switchy::time::instant_now();
+    for _ in 0..2 {
+        let response = agent
+            .generate_text_with_provider(&mut provider, "recover")
+            .await?;
+        assert_eq!(response.text, "recovered cache miss");
+        assert_eq!(probe.requests().len(), 2, "recovery is cached");
+    }
+    assert!(switchy::time::instant_now().duration_since(started) < Duration::from_secs(30));
+    probe
+        .assert_finish_count(1)
+        .expect("recovered provider released");
+    probe.assert_cancellation_count(0).expect("no cancellation");
+    Ok(())
+}
+
+struct FixtureRateLimiter(std::result::Result<bcode::ApplicationRateLimitDecision, String>);
+
+impl bcode::ApplicationRateLimiter for FixtureRateLimiter {
+    fn check(
+        &self,
+        request: &bcode::AgentTurnRequest,
+    ) -> std::result::Result<bcode::ApplicationRateLimitDecision, String> {
+        assert_eq!(request.model_id, "test-model");
+        self.0.clone()
+    }
+}
+
+async fn run_rate_limit_scenarios() -> bcode::Result<()> {
+    for outcome in 0..3 {
+        let decision = match outcome {
+            0 => Ok(bcode::ApplicationRateLimitDecision::Allow),
+            1 => Ok(bcode::ApplicationRateLimitDecision::Deny {
+                reason: "fixture quota".into(),
+                retry_at_unix: Some(1_700_000_001),
+            }),
+            _ => Err("fixture unavailable".into()),
+        };
+        let session_id = "00000000-0000-4000-8000-000000000010"
+            .parse()
+            .expect("fixture ID");
+        let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+            session_id,
+            turn_id: format!("rate-limit-{outcome}"),
+        }])?;
+        let agent = AgentBuilder::from_context(session_id, "/".into())
+            .runtime(
+                AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)),
+            )
+            .provider_plugin("test-provider")
+            .model("test-model")
+            .middleware_layer(bcode::RateLimitMiddleware::new(
+                "fixture",
+                Arc::new(FixtureRateLimiter(decision)),
+            ))
+            .build();
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("admitted")]);
+        let probe = provider.probe();
+        let result = agent
+            .generate_text_with_provider(&mut provider, "limited")
+            .await;
+        match outcome {
+            0 => assert_eq!(result?.text, "admitted"),
+            1 => assert!(
+                matches!(result, Err(bcode::BcodeError::RateLimited { limiter_id, reason, retry_at_unix: Some(1_700_000_001) }) if limiter_id == "fixture" && reason == "fixture quota")
+            ),
+            _ => assert!(
+                matches!(result, Err(bcode::BcodeError::RateLimiter { limiter_id, message }) if limiter_id == "fixture" && message == "fixture unavailable")
+            ),
+        }
+        let admitted = usize::from(outcome == 0);
+        assert_eq!(
+            probe.requests().len(),
+            admitted,
+            "only admitted requests dispatch"
+        );
+        probe
+            .assert_finish_count(admitted)
+            .expect("only admitted provider finishes");
+        probe
+            .assert_cancellation_count(0)
+            .expect("no provider cancellation");
+    }
+    Ok(())
+}
+
+async fn run_retry_scenarios() -> bcode::Result<()> {
+    for (retryable, retries, exhausted, hint_ms) in [
+        (true, 1, false, None),
+        (true, 0, false, None),
+        (false, 1, false, None),
+        (true, 1, true, None),
+        (true, 1, false, Some(50)),
+    ] {
+        let session_id = "00000000-0000-4000-8000-000000000011"
             .parse()
             .expect("fixture ID");
         let identities =
             ScriptedRequestIdentities::new((0..2).map(|index| ProviderRequestIdentity {
                 session_id,
+                turn_id: format!("retry-{retryable}-{retries}-{index}"),
+            }))?;
+        let agent = AgentBuilder::from_context(session_id, "/".into())
+            .runtime(
+                AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)),
+            )
+            .provider_plugin("test-provider")
+            .model("test-model")
+            .retry_policy(
+                bcode::RetryPolicy::new(retries, Duration::from_millis(10))
+                    .with_max_delay(Duration::from_millis(100)),
+            )
+            .build();
+        let error = bcode::ProviderError {
+            code: "retry_fixture".into(),
+            category: bcode::ProviderErrorCategory::ProviderInternal,
+            message: "retry fixture".into(),
+            retryable,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: hint_ms.map(|delay| {
+                Box::new(bcode::ProviderRetryHint {
+                    retry_after_ms: Some(delay),
+                    retry_at_unix: None,
+                    source: Some("fixture".into()),
+                })
+            }),
+        };
+        let mut turns = vec![ScriptedProviderTurn::start_error(error.clone())];
+        if exhausted {
+            let mut final_error = error;
+            final_error.code = "retry_exhausted".into();
+            turns.push(ScriptedProviderTurn::start_error(final_error));
+        }
+        turns.push(ScriptedProviderTurn::complete_text("retry recovered"));
+        let mut provider = ScriptedProvider::new(turns);
+        let probe = provider.probe();
+        let started = switchy::time::instant_now();
+        let result = agent
+            .generate_text_with_provider(&mut provider, "retry")
+            .await;
+        let retried = retryable && retries > 0;
+        let recovered = retried && !exhausted;
+        if retried {
+            assert!(
+                switchy::time::instant_now().duration_since(started)
+                    >= Duration::from_millis(hint_ms.unwrap_or(10))
+            );
+        }
+        if recovered {
+            assert_eq!(result?.text, "retry recovered");
+        } else {
+            let expected_code = if exhausted {
+                "retry_exhausted"
+            } else {
+                "retry_fixture"
+            };
+            assert!(
+                matches!(result, Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Provider { code, .. })) if code == expected_code)
+            );
+        }
+        assert_eq!(probe.requests().len(), 1 + usize::from(retried));
+        probe
+            .assert_finish_count(usize::from(recovered))
+            .expect("only successful start is finished");
+        probe.assert_cancellation_count(0).expect("no cancellation");
+    }
+    Ok(())
+}
+
+async fn run_pre_cancelled() -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000007"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+        session_id,
+        turn_id: "pre-cancelled-0".into(),
+    }])?;
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .build();
+    let provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("must not start")]);
+    let probe = provider.probe();
+    let cancellation = bcode::CancellationToken::new();
+    cancellation.cancel();
+    let transcript = TextStreamRecorder::new(agent.stream_text_with_provider_and_cancellation(
+        provider,
+        "already cancelled",
+        cancellation,
+    ))
+    .finish_up_to(100)
+    .await;
+    transcript
+        .assert_cancelled()
+        .expect("coherent pre-start cancellation");
+    probe
+        .assert_requests(&[])
+        .expect("no provider request after cancellation");
+    probe
+        .assert_finish_count(0)
+        .expect("no provider round to finish");
+    probe
+        .assert_cancellation_count(0)
+        .expect("no provider round to cancel");
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ProviderFailure {
+    Start,
+    Poll,
+    Event,
+}
+
+async fn run_provider_error(operation: ProviderFailure, partial_output: bool) -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000006"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+        session_id,
+        turn_id: "provider-error-0".into(),
+    }])?;
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .retry_policy(bcode::RetryPolicy::new(
+            u32::from(partial_output),
+            Duration::from_millis(10),
+        ))
+        .build();
+    let error = bcode::ProviderError {
+        code: "fixture_failure".into(),
+        category: bcode::ProviderErrorCategory::ProviderInternal,
+        message: "fixture failure".into(),
+        retryable: partial_output,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    };
+    let deltas = partial_output.then(|| ProviderTurnEvent::TextDelta {
+        text: "partial".into(),
+    });
+    let turn = match operation {
+        ProviderFailure::Start => ScriptedProviderTurn::start_error(error),
+        ProviderFailure::Poll => ScriptedProviderTurn::new().events(deltas).poll_error(error),
+        ProviderFailure::Event => ScriptedProviderTurn::new().events(
+            deltas
+                .into_iter()
+                .chain([ProviderTurnEvent::Error { error }]),
+        ),
+    };
+    let provider = ScriptedProvider::new([
+        turn,
+        ScriptedProviderTurn::complete_text("must not retry visible output"),
+    ]);
+    let probe = provider.probe();
+    let transcript =
+        TextStreamRecorder::new(agent.stream_text_with_provider(provider, "fail after text"))
+            .finish_up_to(100)
+            .await;
+    let error = transcript
+        .assert_runtime_error()
+        .expect("coherent error terminal");
+    let source = if partial_output {
+        let bcode::RuntimeError::ProviderAfterOutput(source) = error else {
+            panic!("expected provider failure after output, got {error:?}");
+        };
+        source.as_ref()
+    } else {
+        error
+    };
+    assert!(
+        matches!(source, bcode::RuntimeError::Provider { code, .. } if code == "fixture_failure")
+    );
+    let deltas: Vec<_> = transcript
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            bcode::AgentEvent::TextDelta(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        if partial_output {
+            vec!["partial"]
+        } else {
+            vec![]
+        }
+    );
+    let started = usize::from(!matches!(operation, ProviderFailure::Start));
+    probe
+        .assert_finish_count(started)
+        .expect("finish only a started turn");
+    probe
+        .assert_cancellation_count(started)
+        .expect("cancel only a started turn");
+    probe
+        .assert_requests(&[ScriptedRequestExpectation::new()
+            .provider_plugin_id("test-provider")
+            .model_id("test-model")])
+        .expect("no extra provider request");
+    Ok(())
+}
+
+enum ToolCancellation {
+    Explicit,
+    StreamDrop,
+    RecorderBudget,
+    Deadline,
+}
+
+async fn run_pending_tool_cancellation(mode: ToolCancellation) -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000005"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+        session_id,
+        turn_id: "pending-tool-0".into(),
+    }])?;
+    let tool = ScriptedTool::new([ScriptedToolOutcome::PendingUntilCancelled]);
+    let probe = tool.probe();
+    let permissions = ScriptedPermissionPolicy::new([bcode::PermissionDecision::Allow]);
+    let permission_probe = permissions.clone();
+    let builder = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_plugin("test-provider")
+        .model("test-model");
+    // A deadline must not rescue broken drop-cancellation in the other scenarios.
+    let builder = if matches!(mode, ToolCancellation::Deadline) {
+        builder.timeout(Duration::from_secs(2))
+    } else {
+        builder
+    };
+    let agent = tool
+        .register(
+            builder,
+            bcode::ToolDefinition {
+                name: "scripted".into(),
+                description: "Fixture tool".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        )
+        .custom_permission_policy(permissions)
+        .build();
+    let provider = ScriptedProvider::new([ScriptedProviderTurn::new().events([
+        ProviderTurnEvent::ToolCallFinished {
+            call: bcode::ToolCall {
+                id: "pending-call".into(),
+                name: "scripted".into(),
+                arguments: serde_json::json!({"input": 1}),
+            },
+        },
+        ProviderTurnEvent::TurnFinished {
+            stop_reason: bcode::StopReason::ToolCall,
+        },
+    ])]);
+    let provider_probe = provider.probe();
+    let cancellation = bcode::CancellationToken::new();
+    let stream = agent.stream_text_with_provider_and_cancellation(
+        provider,
+        "cancel active tool",
+        cancellation.clone(),
+    );
+    // Observe invocation admission before cancellation; a fixed yield count cannot
+    // establish that the permission and tool path was actually reached.
+    for _ in 0..1_000 {
+        if probe.invocation_count() == 1 {
+            break;
+        }
+        switchy::unsync::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(probe.invocation_count(), 1);
+    assert_eq!(probe.active_invocation_count(), 1);
+    assert_eq!(permission_probe.requests().len(), 1);
+    match mode {
+        ToolCancellation::Deadline => {
+            let transcript = TextStreamRecorder::new(stream).finish_up_to(100).await;
+            assert!(matches!(
+                transcript
+                    .assert_runtime_error()
+                    .expect("coherent tool deadline terminal"),
+                bcode::RuntimeError::Timeout { .. }
+            ));
+        }
+        ToolCancellation::StreamDrop => drop(stream),
+        ToolCancellation::RecorderBudget => {
+            let transcript = TextStreamRecorder::new(stream).finish_up_to(1).await;
+            assert_eq!(transcript.items().len(), 1);
+            assert!(!transcript.is_exhausted());
+            assert!(transcript.assert_finished().is_err());
+        }
+        ToolCancellation::Explicit => {
+            cancellation.cancel();
+            let transcript = TextStreamRecorder::new(stream).finish_up_to(100).await;
+            transcript
+                .assert_cancelled()
+                .expect("active tool cancellation reaches coherent terminal");
+        }
+    }
+    for _ in 0..1_000 {
+        if probe.active_invocation_count() == 0 {
+            break;
+        }
+        switchy::unsync::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(probe.active_invocation_count(), 0, "tool future released");
+    provider_probe
+        .assert_requests(&[ScriptedRequestExpectation::new()
+            .provider_plugin_id("test-provider")
+            .model_id("test-model")])
+        .expect("no provider continuation after tool cancellation");
+    provider_probe
+        .assert_finish_count(1)
+        .expect("initial provider round finished once");
+    Ok(())
+}
+
+async fn run_backpressure_scenario(capacity: std::num::NonZeroUsize) -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000004"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+        session_id,
+        turn_id: "backpressure-0".into(),
+    }])?;
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(
+            AgentRuntime::new()
+                .with_provider_request_identity_source(Arc::new(identities))
+                .with_stream_buffer_capacity(capacity),
+        )
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .build();
+    let provider = ScriptedProvider::new([ScriptedProviderTurn::new()
+        .events((0..8).map(|index| ProviderTurnEvent::TextDelta {
+            text: index.to_string(),
+        }))
+        .events([ProviderTurnEvent::TurnFinished {
+            stop_reason: bcode::StopReason::EndTurn,
+        }])]);
+    let probe = provider.probe();
+    let stream = agent.stream_text_with_provider(provider, "buffered burst");
+    // Wait for observable provider cleanup, not an assumed number of scheduler
+    // yields. The consumer remains detached while the bounded producer fills.
+    for _ in 0..1_000 {
+        if probe.assert_finish_count(1).is_ok() {
+            break;
+        }
+        switchy::unsync::time::sleep(Duration::from_millis(1)).await;
+    }
+    probe
+        .assert_finish_count(1)
+        .expect("producer finished within fixture budget");
+    let transcript = TextStreamRecorder::new(stream).finish_up_to(100).await;
+    if capacity.get() == 32 {
+        let response = transcript.assert_finished().expect("burst fits buffer");
+        assert_eq!(response.text, "01234567");
+        let deltas: Vec<_> = transcript
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                bcode::AgentEvent::TextDelta(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            (0..8).map(|index| index.to_string()).collect::<Vec<_>>()
+        );
+        probe
+            .assert_cancellation_count(0)
+            .expect("successful burst is not cancelled");
+    } else {
+        transcript
+            .assert_backpressure_overflow(capacity.get())
+            .expect("overflow is typed and terminal, not silent event loss");
+        probe
+            .assert_cancellation_count(1)
+            .expect("overflow cancels provider work");
+    }
+    probe
+        .assert_requests(&[ScriptedRequestExpectation::new()
+            .provider_plugin_id("test-provider")
+            .model_id("test-model")])
+        .expect("overflow does not start another request");
+    Ok(())
+}
+
+async fn run_tool_scenarios(retry: bool) -> bcode::Result<()> {
+    for (decision, outcome, expected_error, expected) in [
+        (
+            Some(bcode::PermissionDecision::Allow),
+            ScriptedToolOutcome::text("tool output"),
+            false,
+            "tool output",
+        ),
+        (
+            Some(bcode::PermissionDecision::Deny("fixture denial".into())),
+            ScriptedToolOutcome::text("must not execute"),
+            true,
+            "tool execution denied: fixture denial",
+        ),
+        (
+            Some(bcode::PermissionDecision::Allow),
+            ScriptedToolOutcome::text("delayed output").after(Duration::from_millis(3)),
+            false,
+            "delayed output",
+        ),
+        (
+            Some(bcode::PermissionDecision::Allow),
+            ScriptedToolOutcome::Error("fixture failure".into()),
+            true,
+            "fixture failure",
+        ),
+        (
+            None,
+            ScriptedToolOutcome::text("exhaustion must not execute"),
+            true,
+            "tool execution denied: scripted permission decisions exhausted",
+        ),
+    ] {
+        let allowed = matches!(decision, Some(bcode::PermissionDecision::Allow));
+        let session_id = "00000000-0000-4000-8000-000000000003"
+            .parse()
+            .expect("fixture ID");
+        let identities =
+            ScriptedRequestIdentities::new((0..3).map(|index| ProviderRequestIdentity {
+                session_id,
                 turn_id: format!("tool-{allowed}-{index}"),
             }))?;
-        let permissions = ScriptedPermissionPolicy::new([if allowed {
-            bcode::PermissionDecision::Allow
-        } else {
-            bcode::PermissionDecision::Deny("fixture denial".into())
-        }]);
+        let permissions = ScriptedPermissionPolicy::new(decision);
         let permission_probe = permissions.clone();
-        let tool = ScriptedTool::new([ScriptedToolOutcome::text("tool output")]);
+        let tool = ScriptedTool::new([outcome]);
         let tool_probe = tool.probe();
         let agent = tool
             .register(
@@ -116,7 +888,8 @@ async fn run_tool_scenarios() -> bcode::Result<()> {
                             .with_provider_request_identity_source(Arc::new(identities)),
                     )
                     .provider_plugin("test-provider")
-                    .model("test-model"),
+                    .model("test-model")
+                    .retry_policy(bcode::RetryPolicy::new(1, Duration::from_millis(10))),
                 bcode::ToolDefinition {
                     name: "scripted".into(),
                     description: "Fixture tool".into(),
@@ -125,44 +898,93 @@ async fn run_tool_scenarios() -> bcode::Result<()> {
             )
             .custom_permission_policy(permissions)
             .build();
-        let mut provider = ScriptedProvider::new([
-            ScriptedProviderTurn::new().events([
-                ProviderTurnEvent::ToolCallFinished {
-                    call: bcode::ToolCall {
-                        id: "call-1".into(),
-                        name: "scripted".into(),
-                        arguments: serde_json::json!({"input": 1}),
-                    },
+        let mut turns = vec![ScriptedProviderTurn::new().events([
+            ProviderTurnEvent::ToolCallFinished {
+                call: bcode::ToolCall {
+                    id: "call-1".into(),
+                    name: "scripted".into(),
+                    arguments: serde_json::json!({"input": 1}),
                 },
-                ProviderTurnEvent::TurnFinished {
-                    stop_reason: bcode::StopReason::ToolCall,
-                },
-            ]),
-            ScriptedProviderTurn::complete_text("after tool"),
-        ]);
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: bcode::StopReason::ToolCall,
+            },
+        ])];
+        if retry {
+            turns.push(ScriptedProviderTurn::start_error(bcode::ProviderError {
+                code: "continuation_retry".into(),
+                category: bcode::ProviderErrorCategory::ProviderInternal,
+                message: "fixture continuation failure".into(),
+                retryable: true,
+                provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
+                retry: None,
+            }));
+        }
+        turns.push(ScriptedProviderTurn::complete_text("after tool"));
+        let mut provider = ScriptedProvider::new(turns);
         let probe = provider.probe();
         let response = agent.run(&mut provider, "use tool").await?;
         assert_eq!(response.text, "after tool");
         assert_eq!(tool_probe.invocation_count(), usize::from(allowed));
+        assert_eq!(
+            tool_probe.active_invocation_count(),
+            0,
+            "completed tool invocation released"
+        );
         let requests = permission_probe.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].context.session_id, session_id);
-        let expected = if allowed {
-            "tool output"
-        } else {
-            "tool execution denied: fixture denial"
-        };
         assert!(response.steps.iter().any(|step| matches!(
             step,
             bcode::GenerationStep::ToolResult { result, .. }
-                if result.is_error != allowed && result.output == expected
+                if result.is_error == expected_error &&
+                    (if allowed && expected_error { result.output.contains(expected) }
+                     else { result.output == expected })
         )));
         if allowed {
             assert_eq!(tool_probe.invocations()[0].request.arguments["input"], 1);
         }
+        let provider_requests = probe.requests();
+        assert_eq!(
+            provider_requests.len(),
+            2 + usize::from(retry),
+            "exact continuation attempts"
+        );
+        if retry {
+            assert_eq!(
+                provider_requests[1].request.messages, provider_requests[2].request.messages,
+                "retry preserves the committed tool result"
+            );
+        }
+        let results: Vec<_> = provider_requests[1]
+            .request
+            .messages
+            .iter()
+            .filter(|message| message.role == bcode::MessageRole::Tool)
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                bcode::ModelContentBlock::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1, "one tool result delivered to provider");
+        assert_eq!(results[0].is_error, expected_error);
+        assert!(
+            response.steps.iter().any(|step| matches!(
+                step, bcode::GenerationStep::ToolResult { result, .. } if result == results[0]
+            )),
+            "continuation must carry the actual runtime result"
+        );
         probe
             .assert_finish_count(2)
             .expect("both provider requests finished");
+        probe
+            .assert_cancellation_count(0)
+            .expect("successful continuation does not cancel providers");
     }
     Ok(())
 }
@@ -207,11 +1029,10 @@ async fn run_terminal_scenarios() -> bcode::Result<()> {
              bcode::TextStreamItem::Event(bcode::AgentEvent::TextDelta(text))]
                 if text == "before terminal"
         ));
-        let transcript = if cancelled {
-            recorder.cancel_and_finish(&cancellation).await
-        } else {
-            recorder.finish().await
-        };
+        if cancelled {
+            cancellation.cancel();
+        }
+        let transcript = recorder.finish_up_to(100).await;
         transcript
             .assert_terminal_coherence()
             .expect("one stable terminal followed by stream exhaustion");

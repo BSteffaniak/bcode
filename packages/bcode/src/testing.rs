@@ -233,6 +233,21 @@ impl TextStreamRecorder {
         self.finish().await
     }
 
+    /// Consume at most `limit` additional items and return the recorded transcript.
+    ///
+    /// If exhaustion was not observed within the budget, the transcript remains partial
+    /// and dropping the stream requests normal drop cancellation. Reaching the budget
+    /// does not imply successful completion, even if the last item is terminal.
+    /// A zero limit does not poll. This bounds item count, not payload bytes or wait time;
+    /// callers must separately bound those when recording untrusted streams.
+    pub async fn finish_up_to(mut self, limit: usize) -> TextStreamTranscript {
+        self.consume_up_to(limit).await;
+        TextStreamTranscript {
+            items: self.items,
+            exhausted: self.exhausted,
+        }
+    }
+
     /// Consume the stream to exhaustion and return its complete transcript.
     pub async fn finish(mut self) -> TextStreamTranscript {
         while self.consume_next().await {}
@@ -534,6 +549,15 @@ impl ScriptedToolProbe {
         lock_unpoisoned(&self.state).invocations.clone()
     }
 
+    /// Return the number of started invocation futures not yet released.
+    ///
+    /// Zero covers both completed and dropped futures; it does not prove that
+    /// unrelated runtime tasks or external tool effects have been released.
+    #[must_use]
+    pub fn active_invocation_count(&self) -> usize {
+        lock_unpoisoned(&self.state).active_invocations
+    }
+
     /// Return how many scripted invocations started.
     #[must_use]
     pub fn invocation_count(&self) -> usize {
@@ -551,6 +575,15 @@ pub struct ScriptedTool {
 struct ScriptedToolState {
     outcomes: VecDeque<ScriptedToolOutcome>,
     invocations: Vec<CapturedToolInvocation>,
+    active_invocations: usize,
+}
+
+struct ScriptedToolInvocationGuard(Arc<Mutex<ScriptedToolState>>);
+
+impl Drop for ScriptedToolInvocationGuard {
+    fn drop(&mut self) {
+        lock_unpoisoned(&self.0).active_invocations -= 1;
+    }
 }
 
 impl ScriptedTool {
@@ -561,6 +594,7 @@ impl ScriptedTool {
             state: Arc::new(Mutex::new(ScriptedToolState {
                 outcomes: outcomes.into_iter().collect(),
                 invocations: Vec::new(),
+                active_invocations: 0,
             })),
         }
     }
@@ -586,8 +620,10 @@ impl ScriptedTool {
                     state
                         .invocations
                         .push(CapturedToolInvocation { sequence, request });
+                    state.active_invocations += 1;
                     state.outcomes.pop_front()
                 };
+                let _invocation_guard = ScriptedToolInvocationGuard(state);
                 run_scripted_tool_outcome(outcome, scope.cancellation()).await
             }
         })
