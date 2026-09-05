@@ -135,6 +135,24 @@ The repository skill `.bcode/skills/verify-prompt-cache` walks agents through ru
 interpreting every scenario and measurement, and tracing failures to the catalog, planner, adapter,
 or provider.
 
+## Live diagnostic baseline (2026-09-04)
+
+Verification with the release binary, ChatGPT auth, and 12 tool rounds authenticated successfully
+across the tested models. Spark, GPT-5.4-mini, and GPT-5.5 passed all applicable scenarios. Astra
+passed on retry after a warm-repeat miss. Luna and Terra had tool-loop cache drops on both initial
+runs; Sol passed on retry after an initial drop. TTL and point-budget scenarios were skipped for
+these automatic-prefix models, not counted as passes.
+
+A separate no-pool run using one credential profile still reproduced Luna's drop (12,800 cached
+tokens to zero at the fifth request), ruling out pool switching as a necessary cause. Sol and Terra
+passed that run. These observations do not yet isolate provider routing from request adaptation;
+compare consecutive provider request projections before changing capability claims or expectations.
+Do not weaken thresholds to hide these failures. Scenario round ordinals are zero-based.
+
+GPT-5.4 was rejected as unsupported for the tested ChatGPT account. That account-scoped rejection
+is not sufficient evidence to remove support globally. A direct subprocess check confirmed failed
+verification exits with status 1; earlier shell-wrapped status observations were misleading.
+
 ## Related documents
 
 * `docs/model-provider-contract.md` — conformance and capability truthfulness

@@ -108,6 +108,11 @@ fn explicit_cache_model_passes_every_scenario() {
     .expect("scenario suite runs against the explicit fake cache model");
 
     assert_eq!(report.model_id, FAKE_CACHE_EXPLICIT_MODEL_ID);
+    for result in &report.scenarios {
+        for (index, round) in result.rounds.iter().enumerate() {
+            assert_eq!(round.round, index, "{} round ordinal", result.scenario);
+        }
+    }
     let expectations = report.expectations.as_ref().expect("caching advertised");
     assert_eq!(expectations.mechanism, PromptCacheMechanism::ExplicitPoints);
     assert!(expectations.min_prefix_declared);

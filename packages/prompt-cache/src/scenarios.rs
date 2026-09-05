@@ -365,8 +365,8 @@ where
             user("Reply with exactly: cache verification round two."),
         ];
         self.plan(&mut request, PromptCacheMode::Auto);
-        let cold = self.run(scenario::COLD_REQUEST, &request)?;
-        let warm = self.run(scenario::WARM_SAME_PREFIX, &request)?;
+        let cold = self.run(scenario::COLD_REQUEST, 0, &request)?;
+        let warm = self.run(scenario::WARM_SAME_PREFIX, 1, &request)?;
 
         let mut cold_result = PromptCacheScenarioResult {
             scenario: scenario::COLD_REQUEST.to_string(),
@@ -436,7 +436,7 @@ where
                 "Reply with exactly: growing conversation turn {turn}."
             )));
             self.plan(&mut request, PromptCacheMode::Auto);
-            rounds.push(self.run(scenario::GROWING_CONVERSATION, &request)?);
+            rounds.push(self.run(scenario::GROWING_CONVERSATION, turn, &request)?);
         }
         let analysis = analyze_rounds(&rounds, self.expectations);
         Ok(PromptCacheScenarioResult {
@@ -477,7 +477,7 @@ where
             });
             self.plan(&mut request, PromptCacheMode::Auto);
             rounds.push(
-                self.run(scenario::TOOL_LOOP, &request)?
+                self.run(scenario::TOOL_LOOP, round, &request)?
                     .with_tool_round(true),
             );
         }
@@ -521,7 +521,7 @@ where
                     }
                 }
             }
-            let cold = self.run(scenario::TTL_MATRIX, &request)?;
+            let cold = self.run(scenario::TTL_MATRIX, rounds.len(), &request)?;
             if cold.has_cache_write()
                 && cold
                     .cache_ttl_seconds
@@ -591,8 +591,8 @@ where
             user("Reply with exactly: mode off round two."),
         ];
         self.plan(&mut request, PromptCacheMode::Off);
-        let first = self.run(scenario::MODE_OFF, &request)?;
-        let second = self.run(scenario::MODE_OFF, &request)?;
+        let first = self.run(scenario::MODE_OFF, 0, &request)?;
+        let second = self.run(scenario::MODE_OFF, 1, &request)?;
         let mut failures = Vec::new();
         if request
             .messages
@@ -669,7 +669,7 @@ where
             .flat_map(|message| &message.content)
             .filter(|block| matches!(block, ContentBlock::CachePoint { .. }))
             .count();
-        let round = self.run(scenario::BUDGET_OVERFLOW, &request)?;
+        let round = self.run(scenario::BUDGET_OVERFLOW, 0, &request)?;
         let mut failures = Vec::new();
         match (round.emitted_cache_points, round.dropped_cache_points) {
             (Some(emitted), Some(dropped)) => {
@@ -720,6 +720,7 @@ where
     fn run(
         &mut self,
         scenario: &'static str,
+        round: usize,
         request: &ModelTurnRequest,
     ) -> Result<CacheRoundObservation, PromptCacheScenarioError> {
         let outcome = execute_turn(self.invoker, self.options, scenario, request)?;
@@ -744,7 +745,7 @@ where
             });
         };
         Ok(CacheRoundObservation::from_provider_usage(
-            0,
+            round,
             &usage,
             summary.request_projections.last(),
         ))

@@ -160,7 +160,7 @@ pub async fn compact_session_context_with_limit(
 ) -> Result<CompactionCompletion, CompactionError> {
     let config = state.session_config(session_id).await;
     let compaction = effective_compaction_config(&config, selection);
-    compact_session_context_with_policy(
+    Box::pin(compact_session_context_with_policy(
         state,
         session_id,
         selection,
@@ -172,7 +172,7 @@ pub async fn compact_session_context_with_limit(
             keep_recent_tokens: usize::try_from(compaction.keep_recent_tokens)
                 .unwrap_or(usize::MAX),
         },
-    )
+    ))
     .await
 }
 

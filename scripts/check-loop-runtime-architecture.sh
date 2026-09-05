@@ -1198,9 +1198,11 @@ if ! grep -F 'TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA' packages/tool/src/contracts
   violations=1
 fi
 
+# Provider event diagnostic labels are not persisted legacy session result variants.
 if rg -n '(^|[^A-Za-z])SessionEventKind::ToolCallFinished|"tool_call_finished"|\bsemantic_migration\b|MigrateSemanticResults' \
   packages/session packages/session-view packages/ipc packages/server packages/tui packages/hyperchad packages/cli packages/eval plugins/blims-plugin plugins/code-review-plugin \
-  --glob '*.rs' >/tmp/bcode-removed-session-result-compatibility.txt; then
+  --glob '*.rs' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*ProviderTurnEvent::ToolCallFinished \{ \.\. \} => "tool_call_finished",$' \
+  >/tmp/bcode-removed-session-result-compatibility.txt; then
   echo "Runtime architecture violation: removed legacy session result compatibility was reintroduced." >&2
   cat /tmp/bcode-removed-session-result-compatibility.txt >&2
   violations=1
