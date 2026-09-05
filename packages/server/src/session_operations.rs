@@ -517,12 +517,12 @@ pub enum CompactError {
     Server(#[from] super::ServerError),
 }
 
-/// Explicitly compact one session through the canonical queued command path.
+/// Enqueue explicit compaction without waiting for provider execution.
 pub async fn compact(
     state: &Arc<ServerState>,
     client_id: bcode_session_models::ClientId,
     session_id: bcode_session_models::SessionId,
-) -> Result<CompactResult, CompactError> {
+) -> Result<tokio::sync::oneshot::Receiver<Result<String, super::CompactionError>>, CompactError> {
     if let Some(namespace) = state
         .active_session_namespace_mismatch(session_id, client_id)
         .await
@@ -535,7 +535,14 @@ pub async fn compact(
         state.client_runtime_context(client_id).await,
     )
     .await;
-    match super::enqueue_compact_session_command(state, session_id, client_id, selection).await? {
+    Ok(super::enqueue_compact_session_command(state, session_id, client_id, selection).await?)
+}
+
+/// Await the terminal result of an accepted compaction.
+pub async fn complete_compaction(
+    completion: tokio::sync::oneshot::Receiver<Result<String, super::CompactionError>>,
+) -> Result<CompactResult, CompactError> {
+    match completion.await.map_err(super::ServerError::from)? {
         Ok(message) => Ok(CompactResult::Compacted(message)),
         Err(super::CompactionError::PlanUnavailable(reason)) => {
             Ok(CompactResult::Noop(reason.to_string()))

@@ -99,7 +99,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// field name is unchanged; only its derivation widened, and a stale peer computing
 /// the narrower identity now mismatches and is refused rather than silently sharing
 /// a daemon across config directories.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 31;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 32;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -3259,6 +3259,8 @@ pub enum ResponsePayload {
         status: bcode_worktree_models::WorktreeCreateOperationStatus,
     },
     PresentationNoteAppended,
+    /// Compaction has entered the session queue; a terminal response follows on this request.
+    SessionCompactionAccepted,
 }
 
 /// Stable reasons runtime ownership cannot currently be released.

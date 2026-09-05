@@ -11637,7 +11637,7 @@ async fn enqueue_compact_session_command(
     session_id: SessionId,
     client_id: ClientId,
     selection: SessionModelSelection,
-) -> Result<Result<String, CompactionError>, ServerError> {
+) -> Result<oneshot::Receiver<Result<String, CompactionError>>, ServerError> {
     let (response, completion) = oneshot::channel();
     let ownership = state
         .sessions
@@ -11657,7 +11657,7 @@ async fn enqueue_compact_session_command(
         },
     )
     .await?;
-    completion.await.map_err(ServerError::from)
+    Ok(completion)
 }
 
 fn usize_to_u32_saturating(value: usize) -> u32 {
@@ -14471,7 +14471,19 @@ async fn handle_compact_session(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    match session_operations::compact(state, client_id, session_id).await {
+    let result = match session_operations::compact(state, client_id, session_id).await {
+        Ok(completion) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionCompactionAccepted),
+            )
+            .await?;
+            session_operations::complete_compaction(completion).await
+        }
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(session_operations::CompactResult::Compacted(message)) => {
             send_response(
                 writer,

@@ -4228,6 +4228,11 @@ impl BcodeClient {
 
     /// Compact the model-visible context for a session while preserving append-only history.
     ///
+    /// The request deadline applies until the daemon accepts the queued operation. After
+    /// acceptance, this future awaits completion without an execution deadline. Poll it in
+    /// a background task; session runtime subscriptions provide live progress, and normal
+    /// session cancellation remains available. Transport errors are returned without replay.
+    ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
@@ -5599,13 +5604,19 @@ impl ClientConnection {
         let envelope = request_envelope(request_id, &request)?;
         send_envelope(&mut self.stream, &envelope).await?;
 
+        let mut compaction_accepted = false;
         loop {
-            let envelope =
+            // The deadline covers admission, not queued/provider execution. Transport loss
+            // still terminates the wait; never retry potentially accepted work here.
+            let envelope = if compaction_accepted {
+                recv_envelope(&mut self.stream).await?
+            } else {
                 tokio::time::timeout(self.request_timeout, recv_envelope(&mut self.stream))
                     .await
                     .map_err(|_| ClientError::RequestTimeout {
                         timeout: self.request_timeout,
-                    })??;
+                    })??
+            };
             if envelope.kind == EnvelopeKind::Event {
                 self.pending_events
                     .push_back(decode_event(&envelope.payload).map_err(ClientError::from)?);
@@ -5615,6 +5626,16 @@ impl ClientConnection {
                 continue;
             }
             let response: Response = decode_response(&envelope.payload)?;
+            if matches!(
+                response,
+                Response::Ok(ResponsePayload::SessionCompactionAccepted)
+            ) {
+                if !matches!(request, Request::CompactSession { .. }) || compaction_accepted {
+                    return Err(ClientError::UnexpectedResponse);
+                }
+                compaction_accepted = true;
+                continue;
+            }
             return match response {
                 Response::Ok(payload) => Ok(payload),
                 Response::Err(error) => Err(error.into()),
@@ -5979,6 +6000,69 @@ mod client_timeout_tests {
         assert!(matches!(error, ClientError::IncompatibleDaemon { .. }));
         assert!(error.to_string().contains("foreign-artifact"));
 
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_compaction_outlives_request_deadline() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("client.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("request");
+            for payload in [
+                bcode_ipc::ResponsePayload::SessionCompactionAccepted,
+                bcode_ipc::ResponsePayload::SessionCompacted {
+                    compacted: true,
+                    message: "compacted".to_owned(),
+                },
+            ] {
+                let terminal =
+                    matches!(payload, bcode_ipc::ResponsePayload::SessionCompacted { .. });
+                if terminal {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                let envelope = bcode_ipc::response_envelope(
+                    request.request_id,
+                    &bcode_ipc::Response::Ok(payload),
+                )
+                .expect("response");
+                bcode_ipc::send_envelope(&mut stream, &envelope)
+                    .await
+                    .expect("send");
+            }
+        });
+        let stream = bcode_ipc::LocalIpcStream::connect(&endpoint)
+            .await
+            .expect("connect");
+        let mut connection = super::ClientConnection {
+            stream,
+            next_request_id: 1,
+            client_id: None,
+            pending_events: std::collections::VecDeque::new(),
+            request_timeout: Duration::from_millis(50),
+            reconnect_client: None,
+            reconnect_name: std::sync::Arc::from(""),
+            restore_state: super::ConnectionRestoreState::default(),
+        };
+        assert!(matches!(
+            connection
+                .send_request(bcode_ipc::Request::CompactSession {
+                    session_id: SessionId::new(),
+                })
+                .await,
+            Ok(bcode_ipc::ResponsePayload::SessionCompacted {
+                compacted: true,
+                ..
+            })
+        ));
         server.await.expect("server task");
         std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
     }
