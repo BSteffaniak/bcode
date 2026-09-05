@@ -15,6 +15,22 @@ CLI, TUI, HyperChad, or SDK caller
 → typed result or bounded ordered event stream
 ```
 
+## CLI error exit status
+
+`CliError::exit_code` maps returned failures to process status: 1 for runtime/I/O failures, 2 for invalid arguments, JSON, or malformed/unsupported exchange resolutions, 3 for execution-policy turn rejection and recognized authorization denial, and 4 for recognized cancellation. Turn rejection because the session is unavailable is a runtime failure (1). Server-code classification uses exact codes, not substrings: `invalid_exchange_resolution` maps to 2; `authorization_denied` and `workflow_operation_unauthorized` map to 3; `cancelled`, `workflow_computation_cancelled`, and `worktree_create_cancelled` map to 4. Unknown server codes remain runtime failures (1). These statuses do not imply rollback or safe retries of committed operations.
+
+This describes returned-error classification, not complete command parity: signal handling, successful responses containing failed terminal outcomes, and end-to-end authorization/cancellation verification remain separate work.
+
+## Local plugin CLI behavior and evidence
+
+`plugin list` and local `plugin services` inspect selected manifests without loading native libraries. `plugin check` loads selected native plugins and executes activation/deactivation callbacks; it is not a read-only manifest validator. Local `invoke`, `call`, and `publish` use a local plugin host. With `--daemon`, services/invoke/call/publish instead target the running host; combining `--daemon` with local `--root` is rejected rather than silently ignoring the roots.
+
+Explicitly disabled plugins are excluded even when also listed as enabled. Current process tests verify that a disabled plugin with a missing library does not break list/services/check/publish, and that direct invocation by ID or interface fails without a success receipt. A selected plugin with a missing library remains discoverable, but check/invoke/call/publish fail with a native-library-load diagnostic and empty stdout.
+
+CLI-owned plugin output uses fallible writes; output failures return runtime exit status 1 rather than panicking. A plugin service response containing an error also returns runtime exit status 1 in both local and daemon modes, after writing its human or JSON response envelope; successful responses return 0. Plugin-owned error codes are not interpreted as host authorization or cancellation codes. This does not roll back plugin actions: publication, invocation, or lifecycle callbacks may already have completed before a receipt write fails. Callers must not infer retry safety from an output failure. Plugin-generated output is outside these CLI-writer guarantees.
+
+Evidence lives in `packages/bcode/tests/cli_process.rs` and the plugin-output writer tests in `packages/cli/src/lib.rs`. Manifest-only and absent-library fixtures establish discovery, selection, output, and failure behavior—not successful dynamic-plugin execution, permission equivalence, daemon lifecycle behavior, or semantic-controller completion.
+
 ## Classifications
 
 * **Shared application** — daemon-backed product behavior that needs a typed API and, where useful non-interactively, a CLI path.
@@ -45,6 +61,9 @@ CLI, TUI, HyperChad, or SDK caller
 | `session.compact` | `/compact` | Shared application; session/runtime | `SessionViewAction::CompactContext`; typed client method | `session compact SESSION_ID [--json]` | Explicit operation; normal reads never compact implicitly. |
 | `session.select_model` | model picker and `/model` | Shared application; model catalog/session | `SessionViewAction::SetModel`; typed client method | `session set-model SESSION_ID MODEL_ID [--provider ID] [--json]` | Resolution uses the centralized model catalog. |
 | `session.select_reasoning` | thinking/reasoning dialog | Shared application; session/model semantics | `SessionViewAction::SetReasoning`; typed client method | `session set-reasoning SESSION_ID [--effort VALUE] [--summary VALUE] [--json]` | Uses provider-neutral reasoning semantics. |
+| `permission.status` | effective agent-policy inspection | Shared application; agent-profile policy provider | `BcodeClient::agent_policy_status`; `session_operations::agent_policy_status` | `permission status [--json]` | Preserves provider source, fallback indicator, enabled-tool summaries, and degradation diagnostics. This is not authorization for a proposed operation; canonical policy still evaluates operation facts before effects. |
+| `session.discover_agents` | agent picker | Shared application; agent-profile | `BcodeClient::list_agents`; server agent listing operation | `session agents [--json]` | Daemon-resolved profiles, not a CLI registry; no session ID required. |
+| `session.discover_skills` | skills picker and skill inspection | Shared application; skill | `BcodeClient::list_skills`, `describe_skill`; server skill operations | `session skills [--json]`, `session describe-skill SKILL_ID [--json]` | List JSON preserves discovery diagnostics; manifest JSON preserves the typed skill contract. Human discovery diagnostics go to stderr. |
 | `session.select_agent` | `/agent`, plan/build aliases | Shared application; agent profile/session | `SessionViewAction::SetAgent`; typed client method | `session set-agent SESSION_ID AGENT_ID [--json]` | Agent policy and permissions remain authoritative. |
 | `session.auth_pool` | auth-pool picker | Shared application; auth/session | typed client preference method | `session set-auth-pool POOL (--profile PROFILE\|--clear) [--json]` | Secret custody remains provider/plugin-owned. |
 | `session.skills` | skills palette, activate/deactivate | Shared application; skill/session | `ActivateSkill`, `DeactivateSkill`, typed client methods | `session active-skills`, `activate-skill`, and `deactivate-skill`, each with `--json` | Skill identity is typed and plugin/domain-owned. |
@@ -52,7 +71,7 @@ CLI, TUI, HyperChad, or SDK caller
 | `permission.resolve` | permission surface | Shared application; permission | `ResolvePermission`, `ResolvePermissionBatch`; typed client methods | `permission approve ID [--remember] [--json]`, `permission deny ID [--json]`, `permission resolve-batch BATCH_ID (--approve\|--deny) [--json]` | Authorization decision precedes the blocked side effect; batch resolution is canonical and duplicate terminal resolution is safe. |
 | `interaction.inspect` | interactive tool surface | Shared application; plugin/tool exchange | pending exchange client method | `interaction list [--json]` | Request includes producer, schema, version, response policy, and bounded opaque payload. |
 | `interaction.drive` | rich TUI/HyperChad interaction | Shared application with plugin-owned semantics | HyperChad uses a plugin-owned `InteractionInput` controller locally; planned daemon-hosted controller contract still needs JSON snapshots and `InteractionOutput` | CLI gap | Preferred generic fallback. HyperChad validation/activate/change/submit behavior is integration-tested over real IPC, but dynamic daemon-hosted controller discovery and CLI access remain implementation work; unknown schemas are surfaced rather than guessed. |
-| `interaction.resolve_raw` | generic exchange fallback | Shared application; plugin/tool exchange | typed `ToolExchangeResolution` client path | `interaction respond EXCHANGE_ID --payload FILE [--json]` and `interaction cancel EXCHANGE_ID [--json]` | Schema-aware fallback. JSON input is bounded to 256 KiB, `-` reads stdin, unknown versions remain producer-owned, and authorization/compatible-adapter checks precede resumption. |
+| `interaction.resolve_raw` | generic exchange fallback | Shared application; plugin/tool exchange | typed `ToolExchangeResolution` client path | `interaction respond EXCHANGE_ID --payload FILE [--json]` and `interaction cancel EXCHANGE_ID [--json]` | Schema-aware fallback. The CLI reads at most 256 KiB of input JSON; the daemon separately limits the complete encoded resolution to 64 KiB, including envelope overhead and escaping. `-` reads stdin. Unknown versions remain producer-owned, and authorization/compatible-adapter checks precede resumption. |
 | `worktree.list_create_remove` | `/worktree`, create/attach effects | Shared application; worktree | typed start/status/wait/create/remove methods | `worktree list`, `create`, and confirmed `remove`, with `--json` | Paths are confined; branch modes conflict explicitly; creation is addressable/idempotent; optional canonical session attachment/creation is domain-owned. |
 | `workflow.author` | workflow control center/plugin surfaces | Shared application; workflow | typed authoring, validation, publication, and inspection methods | `workflow author` | Workflow contracts and persistence stay domain-owned; JSON is already common but must be inventoried per subcommand. |
 | `workflow.execute` | workflow/Ralph actions | Shared application; workflow/runtime | typed start, inspect, input, approval, output, cancellation methods | `workflow start/inspect-run/run-output/provide-input/resolve-approval/cancel-computation` | Durable workflow authority, permission, idempotency, and cancellation rules apply. |
@@ -151,7 +170,7 @@ bcode permission list --session-id "$session_id" --json
 bcode permission approve PERMISSION_ID --json
 bcode permission resolve-batch BATCH_ID --approve --json
 
-bcode interaction list --json
+bcode interaction list --session-id "$session_id" --json
 bcode interaction respond EXCHANGE_ID --payload response.json --json
 bcode interaction cancel EXCHANGE_ID --json
 ```
@@ -185,6 +204,8 @@ Removal is intentionally confirmation-gated. Paths remain subject to daemon-owne
 
 ### Human-readable use
 
+Search-backfill operation status output with `--json` uses compact JSON followed by a newline. Follow mode emits one flushed JSON Lines record per changed revision; one-shot status remains a single valid JSON value. Output write failures are returned as I/O errors rather than panics.
+
 Omit `--json` for concise human summaries. Machine callers should use JSON/JSON Lines rather than parsing those summaries.
 
 ## Renderer coverage
@@ -215,7 +236,7 @@ The architecture guard requires every current variant below to remain named in t
 
 ### Top-level `Commands`
 
-`Onboard`, `ArtifactId`, `Server`, `Session`, `Web`, `Plugin`, `Theme`, `Model`, `Auth`, `Login`, `Permission`, `Interaction`, `Worktree`, `Workflow`, `RuntimeWork`, `Cancel`, `Attach`, `Tui`, `Send`.
+`Onboard`, `ArtifactId`, `Server`, `State`, `Session`, `Web`, `Plugin`, `Theme`, `Model`, `Auth`, `Login`, `Permission`, `Interaction`, `Worktree`, `Workflow`, `RuntimeWork`, `Cancel`, `Attach`, `Tui`, `Send`.
 
 ### Top-level CLI ownership classification
 
@@ -226,6 +247,7 @@ Every current top-level command family has one explicit primary owner. Subcomman
 | `Onboard` | Frontend user state / credential custody | Local onboarding and settings orchestration; secure imports remain auth/vault-owned and do not mutate canonical sessions implicitly. |
 | `ArtifactId` | Offline/lifecycle | Local produced-artifact identity diagnostic. |
 | `Server` | Offline/lifecycle | Daemon lifecycle coordination; status and live control cross the typed daemon boundary, while startup/retirement owns local process coordination. |
+| `State` | Offline/lifecycle | `state locations [--json]` resolves configured locations and probes availability without creating or repairing state. `state prune-staging [--root ROOT] [--apply] [--json]` delegates interrupted-relocation staging inventory/cleanup to the session-migration owner; mutation requires `--apply`, and live staging is retained. Neither command is routine canonical session access. |
 | `Session` | Shared application, with explicit maintenance subcommands | Routine lifecycle, bounded reads, configuration, search, import, and derivation are daemon-backed; doctor/repair/reindex/migration/reset/release diagnostics remain explicitly named maintenance. |
 | `Web` | Frontend local | HyperChad renderer startup and bind policy; it consumes shared semantics without owning product behavior. |
 | `Plugin` | Plugin development or shared application | List/check and non-daemon service execution are explicit offline plugin development; `--daemon` services/invoke/call/publish use the live plugin-host application boundary. |

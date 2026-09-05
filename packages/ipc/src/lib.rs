@@ -1500,11 +1500,7 @@ impl SessionArtifactRange {
 }
 
 /// Pending renderer-neutral invocation exchange.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingToolExchangeSummary {
-    pub session_id: SessionId,
-    pub request: bcode_session_models::ToolExchangeRequest,
-}
+pub use bcode_session_models::PendingToolExchangeSummary;
 
 /// Plugin service invocation result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4198,6 +4194,31 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn pending_exchange_summary_preserves_domain_identity_and_wire_shape() {
+        let wire = serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "request": {
+                "invocation_id": "invocation",
+                "exchange_id": "exchange",
+                "producer_id": "producer",
+                "schema": "producer.exchange",
+                "schema_version": 42,
+                "payload": { "opaque": [null, true, "λ\ntext", 7] },
+                "response_policy": "required"
+            }
+        });
+        let ipc: PendingToolExchangeSummary =
+            serde_json::from_value(wire.clone()).expect("existing pending exchange wire shape");
+        // Assignment verifies the compatibility export is the domain type, not a copy.
+        let domain: bcode_session_models::PendingToolExchangeSummary = ipc;
+        assert_eq!(domain.request.schema_version, 42);
+        assert_eq!(serde_json::to_value(&domain).unwrap(), wire);
+        let decoded: bcode_session_models::PendingToolExchangeSummary =
+            serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, domain);
+    }
 
     #[test]
     fn artifact_id_validates_portable_identity() {

@@ -37,6 +37,20 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
+/// Pending renderer-neutral invocation exchange associated with a canonical session.
+///
+/// This is an observation, not a reservation or durable resume token. The exchange may
+/// be resolved or cancelled after it is listed. Consumers must interpret the request
+/// using its producer-owned schema identity; observing a schema version does not imply
+/// support for that version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingToolExchangeSummary {
+    /// Canonical session containing the pending exchange.
+    pub session_id: SessionId,
+    /// Producer-owned request, including its schema identity and payload.
+    pub request: ToolExchangeRequest,
+}
+
 /// Stable zero-based position of one semantic output unit within a provider round.
 ///
 /// The host rebases provider-round positions into the application turn's ordering domain.

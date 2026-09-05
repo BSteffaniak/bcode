@@ -1918,15 +1918,7 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
             if json {
                 print_json(&response)?;
             } else {
-                for worktree in response.worktrees {
-                    println!(
-                        "{}\t{}\t{}\t{}",
-                        worktree.path.display(),
-                        worktree.branch.as_deref().unwrap_or("-"),
-                        worktree.commit.as_deref().unwrap_or("-"),
-                        if worktree.is_main { "main" } else { "linked" },
-                    );
-                }
+                write_worktree_list(&mut std::io::stdout().lock(), &response.worktrees)?;
             }
         }
         WorktreeCommand::Create {
@@ -1962,7 +1954,7 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
             if json {
                 print_json(&response)?;
             } else {
-                println!("{}", response.path.display());
+                write_worktree_path(&mut std::io::stdout().lock(), &response.path)?;
             }
         }
         WorktreeCommand::Remove {
@@ -1985,15 +1977,39 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
             if json {
                 print_json(&response)?;
             } else {
-                println!("{}", response.path.display());
+                write_worktree_path(&mut std::io::stdout().lock(), &response.path)?;
             }
         }
     }
     Ok(())
 }
 
+fn write_worktree_list<W: std::io::Write>(
+    output: &mut W,
+    worktrees: &[bcode_worktree_models::WorktreeInfo],
+) -> Result<(), CliError> {
+    for worktree in worktrees {
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}",
+            worktree.path.display(),
+            worktree.branch.as_deref().unwrap_or("-"),
+            worktree.commit.as_deref().unwrap_or("-"),
+            if worktree.is_main { "main" } else { "linked" },
+        )?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn write_worktree_path<W: std::io::Write>(output: &mut W, path: &Path) -> Result<(), CliError> {
+    writeln!(output, "{}", path.display())?;
+    output.flush()?;
+    Ok(())
+}
+
 fn filter_session_exchanges(
-    exchanges: &mut Vec<bcode_ipc::PendingToolExchangeSummary>,
+    exchanges: &mut Vec<bcode_session_models::PendingToolExchangeSummary>,
     session_id: Option<SessionId>,
 ) {
     if let Some(session_id) = session_id {
@@ -2008,23 +2024,7 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
             let client = BcodeClient::default_endpoint();
             let mut exchanges = client.list_pending_tool_exchanges().await?;
             filter_session_exchanges(&mut exchanges, session_id);
-            if json {
-                print_json(&exchanges)?;
-            } else if exchanges.is_empty() {
-                println!("no pending interactions");
-            } else {
-                for exchange in exchanges {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{:?}",
-                        exchange.request.exchange_id,
-                        exchange.session_id,
-                        exchange.request.producer_id,
-                        exchange.request.schema,
-                        exchange.request.schema_version,
-                        exchange.request.response_policy,
-                    );
-                }
-            }
+            write_interaction_list(&mut std::io::stdout().lock(), &exchanges, json)?;
         }
         InteractionCommand::Respond {
             exchange_id,
@@ -2085,11 +2085,48 @@ async fn compatible_interaction_client(
     ))
 }
 
-fn print_interaction_resolution(resolved: bool, json: bool) -> Result<(), CliError> {
+fn write_interaction_list<W: std::io::Write>(
+    output: &mut W,
+    exchanges: &[bcode_session_models::PendingToolExchangeSummary],
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        print_json(&serde_json::json!({ "resolved": resolved }))
+        return write_json_result(output, &exchanges);
+    }
+    if exchanges.is_empty() {
+        writeln!(output, "no pending interactions")?;
     } else {
-        println!("resolved: {resolved}");
+        for exchange in exchanges {
+            writeln!(
+                output,
+                "{}\t{}\t{}\t{}\t{}\t{:?}",
+                exchange.request.exchange_id,
+                exchange.session_id,
+                exchange.request.producer_id,
+                exchange.request.schema,
+                exchange.request.schema_version,
+                exchange.request.response_policy,
+            )?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn print_interaction_resolution(resolved: bool, json: bool) -> Result<(), CliError> {
+    write_interaction_resolution(&mut std::io::stdout().lock(), resolved, json)
+}
+
+fn write_interaction_resolution<W: std::io::Write>(
+    output: &mut W,
+    resolved: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        write_json_result(output, &serde_json::json!({ "resolved": resolved }))
+    } else {
+        writeln!(output, "resolved: {resolved}")?;
+        output.flush()?;
         Ok(())
     }
 }
@@ -4692,6 +4729,8 @@ enum InteractionCommand {
     /// Respond to one exchange with producer-schema JSON from a file or stdin (`-`).
     Respond {
         exchange_id: String,
+        /// JSON file or `-` for stdin. Input is capped at 256 KiB; the daemon separately
+        /// limits the encoded resolution to 64 KiB, including envelope and escaping.
         #[arg(long, value_name = "FILE")]
         payload: PathBuf,
         /// Print the resolution result as JSON.
@@ -4757,6 +4796,7 @@ enum WorktreeCommand {
 
 #[derive(Debug, Subcommand)]
 enum PluginCommand {
+    /// Discover selected local plugin manifests without loading native libraries.
     List {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
@@ -4764,15 +4804,20 @@ enum PluginCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect local service manifests or query services registered by the running host.
     Services {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
-        #[arg(long)]
+        /// Query the running host instead of local plugin roots.
+        #[arg(long, conflicts_with = "root")]
         daemon: bool,
         /// Print structured service summaries as JSON.
         #[arg(long)]
         json: bool,
     },
+    /// Load selected native plugins and run their activation/deactivation callbacks.
+    ///
+    /// This executes plugin code; use `plugin list` for manifest-only discovery.
     Check {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
@@ -4783,7 +4828,8 @@ enum PluginCommand {
     Invoke {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
-        #[arg(long)]
+        /// Invoke on the running host instead of local plugin roots.
+        #[arg(long, conflicts_with = "root")]
         daemon: bool,
         plugin_id: String,
         interface_id: String,
@@ -4796,7 +4842,8 @@ enum PluginCommand {
     Call {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
-        #[arg(long)]
+        /// Call on the running host instead of local plugin roots.
+        #[arg(long, conflicts_with = "root")]
         daemon: bool,
         interface_id: String,
         operation: String,
@@ -4808,7 +4855,8 @@ enum PluginCommand {
     Publish {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
-        #[arg(long)]
+        /// Publish on the running host instead of local plugin roots.
+        #[arg(long, conflicts_with = "root")]
         daemon: bool,
         topic: String,
         payload: Option<String>,
@@ -9119,20 +9167,22 @@ fn list_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliError
             .collect::<Vec<_>>();
         return print_json(&output);
     }
+    let mut output = std::io::stdout().lock();
     if plugins.is_empty() {
-        println!("no plugins discovered");
-        return Ok(());
+        writeln!(output, "no plugins discovered")?;
     }
 
     for plugin in plugins {
-        println!(
+        writeln!(
+            output,
             "{}\t{}\t{}\t{}",
             plugin.manifest.id,
             plugin.manifest.version,
             plugin.manifest.name,
             display_from_current_dir(&plugin.manifest_path)
-        );
+        )?;
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -9146,19 +9196,16 @@ async fn list_plugin_services(
         if json {
             return print_json(&services);
         }
-        if services.is_empty() {
-            println!("no plugin services discovered");
-            return Ok(());
-        }
-        for service in services {
-            println!(
-                "{}\t{}\t{}",
-                service.interface_id,
-                service.plugin_id,
-                service.name.unwrap_or_else(|| "<unnamed>".to_string())
-            );
-        }
-        return Ok(());
+        return write_plugin_services(
+            &mut std::io::stdout().lock(),
+            services.iter().map(|service| {
+                (
+                    service.interface_id.as_str(),
+                    service.plugin_id.as_str(),
+                    service.name.as_deref(),
+                )
+            }),
+        );
     }
 
     let config = bcode_config::load_config()?;
@@ -9181,21 +9228,37 @@ async fn list_plugin_services(
             .collect::<Vec<_>>();
         return print_json(&services);
     }
+    write_plugin_services(
+        &mut std::io::stdout().lock(),
+        plugins.iter().flat_map(|plugin| {
+            plugin.manifest.services.iter().map(|service| {
+                (
+                    service.interface_id.as_str(),
+                    plugin.manifest.id.as_str(),
+                    service.name.as_deref(),
+                )
+            })
+        }),
+    )
+}
+
+fn write_plugin_services<'a, W: std::io::Write>(
+    output: &mut W,
+    services: impl IntoIterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+) -> Result<(), CliError> {
     let mut has_services = false;
-    for plugin in plugins {
-        for service in plugin.manifest.services {
-            has_services = true;
-            println!(
-                "{}\t{}\t{}",
-                service.interface_id,
-                plugin.manifest.id,
-                service.name.unwrap_or_else(|| "<unnamed>".to_string())
-            );
-        }
+    for (interface_id, plugin_id, name) in services {
+        has_services = true;
+        writeln!(
+            output,
+            "{interface_id}\t{plugin_id}\t{}",
+            name.unwrap_or("<unnamed>")
+        )?;
     }
     if !has_services {
-        println!("no plugin services discovered");
+        writeln!(output, "no plugin services discovered")?;
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -9218,7 +9281,9 @@ fn check_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliErro
         return print_json(&checked);
     }
     if plugins.is_empty() {
-        println!("no plugins discovered");
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "no plugins discovered")?;
+        output.flush()?;
         return Ok(());
     }
 
@@ -9226,7 +9291,10 @@ fn check_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliErro
         let loaded = bcode_plugin::load_registered_plugin(&plugin)?;
         loaded.activate()?;
         loaded.deactivate()?;
-        println!("{}\tOK", loaded.manifest().id);
+        // Do not hold the stdout lock while executing plugin lifecycle callbacks.
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "{}\tOK", loaded.manifest().id)?;
+        output.flush()?;
     }
     Ok(())
 }
@@ -9293,20 +9361,38 @@ fn print_service_response(
     response: impl Into<PrintableServiceResponse>,
     json: bool,
 ) -> Result<(), CliError> {
-    let response = response.into();
+    write_service_response(&mut std::io::stdout().lock(), response.into(), json)
+}
+
+fn write_service_response<W: std::io::Write>(
+    output: &mut W,
+    response: PrintableServiceResponse,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        return print_json(&serde_json::json!({
-            "payload": response.payload,
-            "error": response.error.as_ref().map(|error| serde_json::json!({
-                "code": error.code,
-                "message": error.message,
-            })),
-        }));
+        write_json_result(
+            output,
+            &serde_json::json!({
+                "payload": response.payload,
+                "error": response.error.as_ref().map(|error| serde_json::json!({
+                    "code": error.code,
+                    "message": error.message,
+                })),
+            }),
+        )?;
+    } else {
+        if let Some(error) = &response.error {
+            writeln!(output, "ERROR\t{}\t{}", error.code, error.message)?;
+        } else {
+            writeln!(output, "{}", String::from_utf8_lossy(&response.payload))?;
+        }
+        output.flush()?;
     }
     if let Some(error) = response.error {
-        println!("ERROR\t{}\t{}", error.code, error.message);
-    } else {
-        println!("{}", String::from_utf8_lossy(&response.payload));
+        return Err(CliError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
     }
     Ok(())
 }
@@ -9371,10 +9457,19 @@ async fn publish_plugin_event(
 }
 
 fn print_plugin_delivery(delivered: usize, json: bool) -> Result<(), CliError> {
+    write_plugin_delivery(&mut std::io::stdout().lock(), delivered, json)
+}
+
+fn write_plugin_delivery<W: std::io::Write>(
+    output: &mut W,
+    delivered: usize,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        print_json(&serde_json::json!({ "delivered": delivered }))
+        write_json_result(output, &serde_json::json!({ "delivered": delivered }))
     } else {
-        println!("delivered\t{delivered}");
+        writeln!(output, "delivered\t{delivered}")?;
+        output.flush()?;
         Ok(())
     }
 }
@@ -20201,6 +20296,136 @@ mod json_stream_output_tests {
     }
 
     #[test]
+    fn worktree_lists_preserve_rows_and_return_output_errors() {
+        let rows = [
+            bcode_worktree_models::WorktreeInfo {
+                path: "main tree".into(),
+                is_main: true,
+                branch: Some("master".to_owned()),
+                commit: Some("abc123".to_owned()),
+            },
+            bcode_worktree_models::WorktreeInfo {
+                path: "linked".into(),
+                is_main: false,
+                branch: None,
+                commit: None,
+            },
+        ];
+        let mut output = Output::default();
+        super::write_worktree_list(&mut output, &rows).unwrap();
+        assert_eq!(
+            output.bytes,
+            b"main tree\tmaster\tabc123\tmain\nlinked\t-\t-\tlinked\n"
+        );
+        assert_eq!(output.flushes, 1);
+        let mut empty = Output::default();
+        super::write_worktree_list(&mut empty, &[]).unwrap();
+        assert!(empty.bytes.is_empty());
+        assert_eq!(empty.flushes, 1);
+        for fail_write in [true, false] {
+            let mut output = Output {
+                fail_write,
+                fail_flush: !fail_write,
+                ..Output::default()
+            };
+            assert!(matches!(
+                super::write_worktree_list(&mut output, &rows),
+                Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+            ));
+        }
+    }
+
+    #[test]
+    fn worktree_path_receipts_preserve_text_and_return_output_errors() {
+        let path = std::path::Path::new("workspace with spaces/λ");
+        let mut output = Output::default();
+        super::write_worktree_path(&mut output, path).expect("path receipt");
+        assert_eq!(output.bytes, "workspace with spaces/λ\n".as_bytes());
+        assert_eq!(output.flushes, 1);
+        for fail_write in [true, false] {
+            let mut output = Output {
+                fail_write,
+                fail_flush: !fail_write,
+                ..Output::default()
+            };
+            assert!(matches!(
+                super::write_worktree_path(&mut output, path),
+                Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+            ));
+        }
+    }
+
+    #[test]
+    fn json_writers_handle_short_interrupted_and_partial_writes() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            interrupt: bool,
+            stop_at: usize,
+            failure: Option<std::io::ErrorKind>,
+            flushes: usize,
+        }
+        impl std::io::Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                if self.bytes.len() == self.stop_at {
+                    return self.failure.map_or(Ok(0), |kind| Err(kind.into()));
+                }
+                let count = bytes.len().min(2).min(self.stop_at - self.bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let value = serde_json::json!({ "message": "λ\nquoted\"" });
+        for stream in [true, false] {
+            let expected = format!(
+                "{}\n",
+                if stream {
+                    serde_json::to_string(&value).unwrap()
+                } else {
+                    serde_json::to_string_pretty(&value).unwrap()
+                }
+            );
+            for (stop_at, failure) in [
+                (usize::MAX, None),
+                (0, None),
+                (5, None),
+                (5, Some(std::io::ErrorKind::BrokenPipe)),
+            ] {
+                let mut output = ShortWriter {
+                    bytes: Vec::new(),
+                    interrupt: true,
+                    stop_at,
+                    failure,
+                    flushes: 0,
+                };
+                let result = if stream {
+                    write_json_stream_record(&mut output, &value)
+                } else {
+                    super::write_json_result(&mut output, &value)
+                };
+                if stop_at == usize::MAX {
+                    result.expect("short and interrupted writes are retried");
+                    assert_eq!(output.bytes, expected.as_bytes());
+                    assert_eq!(output.flushes, 1);
+                } else {
+                    let expected_kind = failure.unwrap_or(std::io::ErrorKind::WriteZero);
+                    assert!(matches!(result, Err(CliError::Signal(error))
+                        if error.kind() == expected_kind));
+                    assert_eq!(output.bytes, expected.as_bytes()[..stop_at]);
+                    assert_eq!(output.flushes, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn canonical_event_export_is_one_lossless_json_line() {
         let event = bcode_session_models::SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -20219,6 +20444,205 @@ mod json_stream_output_tests {
         assert_eq!(output.flushes, 1);
         let decoded: bcode_session_models::SessionEvent = serde_json::from_str(&text).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn interaction_lists_preserve_formats_and_propagate_output_failures() {
+        let session_id = bcode_session_models::SessionId::new();
+        let exchange = bcode_session_models::PendingToolExchangeSummary {
+            session_id,
+            request: bcode_session_models::ToolExchangeRequest {
+                invocation_id: "invocation".to_owned(),
+                exchange_id: "exchange".to_owned(),
+                producer_id: "producer".to_owned(),
+                schema: "schema".to_owned(),
+                schema_version: 7,
+                payload: serde_json::json!({ "opaque": [1, 2] }),
+                response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+            },
+        };
+        for exchanges in [vec![], vec![exchange]] {
+            for json in [true, false] {
+                let mut output = Output::default();
+                super::write_interaction_list(&mut output, &exchanges, json).unwrap();
+                let expected = if json {
+                    format!("{}\n", serde_json::to_string_pretty(&exchanges).unwrap())
+                } else if exchanges.is_empty() {
+                    "no pending interactions\n".to_owned()
+                } else {
+                    format!("exchange\t{session_id}\tproducer\tschema\t7\tRequired\n")
+                };
+                assert_eq!(output.bytes, expected.as_bytes());
+                assert_eq!(output.flushes, 1);
+                for fail_write in [true, false] {
+                    let mut output = Output {
+                        fail_write,
+                        fail_flush: !fail_write,
+                        ..Output::default()
+                    };
+                    assert!(matches!(
+                        super::write_interaction_list(&mut output, &exchanges, json),
+                        Err(CliError::Signal(error))
+                            if error.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interaction_receipts_preserve_outcomes_and_propagate_output_failures() {
+        for resolved in [true, false] {
+            for json in [true, false] {
+                let mut output = Output::default();
+                super::write_interaction_resolution(&mut output, resolved, json)
+                    .expect("interaction receipt");
+                let expected = if json {
+                    format!("{{\n  \"resolved\": {resolved}\n}}\n")
+                } else {
+                    format!("resolved: {resolved}\n")
+                };
+                assert_eq!(output.bytes, expected.as_bytes());
+                assert_eq!(output.flushes, 1);
+                for fail_write in [true, false] {
+                    let mut output = Output {
+                        fail_write,
+                        fail_flush: !fail_write,
+                        ..Output::default()
+                    };
+                    assert!(matches!(
+                        super::write_interaction_resolution(&mut output, resolved, json),
+                        Err(CliError::Signal(error))
+                            if error.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_service_lists_preserve_rows_and_propagate_failures() {
+        for services in [
+            vec![],
+            vec![
+                ("example/v1", "example", Some("Example")),
+                ("other/v1", "other", None),
+            ],
+        ] {
+            let mut output = Output::default();
+            super::write_plugin_services(&mut output, services.iter().copied()).unwrap();
+            assert_eq!(output.flushes, 1);
+            assert_eq!(
+                output.bytes,
+                if services.is_empty() {
+                    "no plugin services discovered\n"
+                } else {
+                    "example/v1\texample\tExample\nother/v1\tother\t<unnamed>\n"
+                }
+                .as_bytes()
+            );
+            for fail_write in [false, true] {
+                let mut output = Output {
+                    fail_write,
+                    fail_flush: !fail_write,
+                    ..Output::default()
+                };
+                assert!(matches!(
+                    super::write_plugin_services(&mut output, services.iter().copied()),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_delivery_output_preserves_counts_and_propagates_failures() {
+        for delivered in [0, 1, usize::MAX] {
+            for json in [false, true] {
+                let mut output = Output::default();
+                super::write_plugin_delivery(&mut output, delivered, json).unwrap();
+                assert_eq!(output.flushes, 1);
+                let expected = if json {
+                    format!("{{\n  \"delivered\": {delivered}\n}}\n")
+                } else {
+                    format!("delivered\t{delivered}\n")
+                };
+                assert_eq!(output.bytes, expected.as_bytes());
+                for fail_write in [false, true] {
+                    let mut output = Output {
+                        fail_write,
+                        fail_flush: !fail_write,
+                        ..Output::default()
+                    };
+                    assert!(matches!(
+                        super::write_plugin_delivery(&mut output, delivered, json),
+                        Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_service_output_preserves_formats_and_propagates_failures() {
+        for failed in [false, true] {
+            let response = || super::PrintableServiceResponse {
+                payload: vec![b'a', 0xff],
+                error: failed.then(|| super::PrintableServiceError {
+                    code: "test_error".to_owned(),
+                    message: "operation failed".to_owned(),
+                }),
+            };
+            for json in [false, true] {
+                let mut output = Output::default();
+                let result = super::write_service_response(&mut output, response(), json);
+                if failed {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.exit_code(), 1);
+                    assert!(matches!(
+                        error,
+                        CliError::PluginService { code, message }
+                            if code == "test_error" && message == "operation failed"
+                    ));
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(output.flushes, 1);
+                if json {
+                    let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
+                    assert_eq!(value["payload"], serde_json::json!([97, 255]));
+                    assert_eq!(
+                        value["error"],
+                        if failed {
+                            serde_json::json!({"code": "test_error", "message": "operation failed"})
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        output.bytes,
+                        if failed {
+                            "ERROR\ttest_error\toperation failed\n"
+                        } else {
+                            "a\u{fffd}\n"
+                        }
+                        .as_bytes()
+                    );
+                }
+                for fail_write in [false, true] {
+                    let mut output = Output {
+                        fail_write,
+                        fail_flush: !fail_write,
+                        ..Output::default()
+                    };
+                    assert!(matches!(
+                        super::write_service_response(&mut output, response(), json),
+                        Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
@@ -20329,6 +20753,38 @@ mod interaction_cli_tests {
     }
 
     #[test]
+    fn interaction_json_reader_rejects_io_failure_after_valid_prefix() {
+        struct FailedTail {
+            prefix: std::io::Cursor<Vec<u8>>,
+            interrupted: bool,
+        }
+        impl std::io::Read for FailedTail {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.interrupted) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = self.prefix.read(buffer)?;
+                if count == 0 {
+                    Err(std::io::ErrorKind::ConnectionReset.into())
+                } else {
+                    Ok(count)
+                }
+            }
+        }
+        let error = read_json_from_reader(
+            FailedTail {
+                prefix: std::io::Cursor::new(br#"{"answer":true}"#.to_vec()),
+                interrupted: true,
+            },
+            32,
+            "interaction JSON",
+        )
+        .expect_err("valid prefix does not establish complete input");
+        assert!(matches!(error, CliError::Signal(error)
+            if error.kind() == std::io::ErrorKind::ConnectionReset));
+    }
+
+    #[test]
     fn interaction_json_reader_preserves_io_failure() {
         struct FailedReader;
         impl std::io::Read for FailedReader {
@@ -20357,18 +20813,19 @@ mod interaction_cli_tests {
         assert!(matches!(parsed.command, Some(Commands::Interaction {
             command: InteractionCommand::List { session_id: Some(id), json: true }
         }) if id == selected));
-        let make_exchange = |session_id, exchange_id: &str| bcode_ipc::PendingToolExchangeSummary {
-            session_id,
-            request: bcode_session_models::ToolExchangeRequest {
-                invocation_id: "invocation".to_owned(),
-                exchange_id: exchange_id.to_owned(),
-                producer_id: "test.plugin".to_owned(),
-                schema: "test.exchange".to_owned(),
-                schema_version: 7,
-                payload: serde_json::json!({ "opaque": [1, 2] }),
-                response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
-            },
-        };
+        let make_exchange =
+            |session_id, exchange_id: &str| bcode_session_models::PendingToolExchangeSummary {
+                session_id,
+                request: bcode_session_models::ToolExchangeRequest {
+                    invocation_id: "invocation".to_owned(),
+                    exchange_id: exchange_id.to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    schema: "test.exchange".to_owned(),
+                    schema_version: 7,
+                    payload: serde_json::json!({ "opaque": [1, 2] }),
+                    response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+                },
+            };
         let original = vec![
             make_exchange(selected, "first"),
             make_exchange(other, "other"),

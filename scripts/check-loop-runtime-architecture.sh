@@ -1166,8 +1166,9 @@ if rg -n 'InteractiveTool|interactive_tool|PendingInteractive|pending_interactiv
   violations=1
 fi
 
-if ! grep -F 'pub struct PendingToolExchangeSummary' packages/ipc/src/lib.rs >/dev/null ||
-   ! grep -F 'pub request: bcode_session_models::ToolExchangeRequest' packages/ipc/src/lib.rs >/dev/null; then
+if ! grep -F 'pub struct PendingToolExchangeSummary' packages/session/models/src/lib.rs >/dev/null ||
+   ! grep -F 'pub request: ToolExchangeRequest' packages/session/models/src/lib.rs >/dev/null ||
+   ! grep -F 'pub use bcode_session_models::PendingToolExchangeSummary;' packages/ipc/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: pending IPC exchange hydration no longer carries the generic exchange envelope." >&2
   violations=1
 fi

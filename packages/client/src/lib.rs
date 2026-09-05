@@ -8,20 +8,20 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcStream, PendingToolExchangeSummary, PermissionSummary, PluginContributions,
-    PluginServiceResponse, PluginServiceSummary, RalphApproveRequest, RalphCancelRequest,
-    RalphCancelResponse, RalphLifecycleRequest, RalphListIterationsRequest,
-    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
-    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
-    RalphRunStatusResponse, RalphStatusRequest, RalphStatusResponse, Request, Response,
-    ResponsePayload, ServerStopMode, SessionBulkMigrationOperationStatus,
-    SessionBulkMigrationStartRequest, SessionCatalogSourceStatus, SessionCatalogStatus,
-    SessionCompatibilityInventoryRequest, SessionCompatibilityInventoryResponse,
-    SessionImportWarning, WorktreeCreateOperationStatus, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
-    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    LocalIpcStream, PermissionSummary, PluginContributions, PluginServiceResponse,
+    PluginServiceSummary, RalphApproveRequest, RalphCancelRequest, RalphCancelResponse,
+    RalphLifecycleRequest, RalphListIterationsRequest, RalphListIterationsResponse,
+    RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse,
+    RalphRunRequest, RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse,
+    RalphStatusRequest, RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
+    SessionBulkMigrationOperationStatus, SessionBulkMigrationStartRequest,
+    SessionCatalogSourceStatus, SessionCatalogStatus, SessionCompatibilityInventoryRequest,
+    SessionCompatibilityInventoryResponse, SessionImportWarning, WorktreeCreateOperationStatus,
+    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
+    WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory, decode_event,
+    decode_response, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
+use bcode_session_models::PendingToolExchangeSummary;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionDerivationPromptPage,
     SessionDerivationPromptQuery, SessionDerivationRequest, SessionDerivationSourceSnapshot,
@@ -4526,6 +4526,11 @@ impl BcodeClient {
 
     /// List pending renderer-neutral tool exchanges.
     ///
+    /// Results are observations ordered by exchange ID, not reservations. Exchanges
+    /// may resolve or be cancelled before a subsequent resolution request. Request
+    /// payloads retain their producer-owned schema and must not be interpreted as a
+    /// supported older version when that schema is unknown to the caller.
+    ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
@@ -4540,9 +4545,20 @@ impl BcodeClient {
 
     /// Resolve a pending renderer-neutral tool exchange.
     ///
+    /// Returns `true` when this request resolves the pending exchange, or `false` when
+    /// it is already terminal or no longer pending. A `false` result does not confirm
+    /// that an earlier response carried the same payload. Transport failure does not
+    /// establish whether the daemon committed the resolution.
+    ///
+    /// Callers may submit only `Responded` or `Cancelled`; other outcomes are host-owned.
+    /// The daemon limits the complete JSON-encoded resolution to 64 KiB, including
+    /// envelope fields and escaping, and requires a compatible interaction adapter.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
+    /// Returns an error when encoding fails, the daemon cannot be reached, the response
+    /// is unexpected, or the daemon rejects an invalid/oversized resolution or an
+    /// incompatible consumer.
     pub async fn resolve_tool_exchange(
         &self,
         exchange_id: String,

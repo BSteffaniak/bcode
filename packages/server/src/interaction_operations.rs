@@ -11,7 +11,7 @@ use super::{
     SessionId, SkillToolDecision, SkillToolDecisionKey, ToolExchangeResolution, TurnCancelState,
     current_time_ms, publish_session_event,
 };
-use bcode_ipc::PendingToolExchangeSummary;
+use bcode_session_models::PendingToolExchangeSummary;
 
 /// Application-level failure while resolving a pending tool exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,6 +740,45 @@ mod resolution_size_tests {
         MAX_TOOL_EXCHANGE_RESOLUTION_BYTES, ResolutionSizeBudget, validate_resolution_size,
     };
     use std::io::Write as _;
+
+    #[test]
+    fn responded_envelope_obeys_exact_encoded_limit_on_both_paths() {
+        for character in ['a', '\n'] {
+            let empty = super::ToolExchangeResolution::Responded {
+                payload: serde_json::Value::String(String::new()),
+            };
+            let overhead = serde_json::to_vec(&empty).unwrap().len();
+            let encoded_width = if character == '\n' { 2 } else { 1 };
+            let remaining = MAX_TOOL_EXCHANGE_RESOLUTION_BYTES - overhead;
+            let mut payload = character.to_string().repeat(remaining / encoded_width);
+            payload.push_str(&"a".repeat(remaining % encoded_width));
+            let exact = super::ToolExchangeResolution::Responded {
+                payload: serde_json::Value::String(payload.clone()),
+            };
+            assert_eq!(
+                serde_json::to_vec(&exact).unwrap().len(),
+                MAX_TOOL_EXCHANGE_RESOLUTION_BYTES
+            );
+            assert!(super::validate_client_resolution(&exact).is_ok());
+            assert_eq!(
+                super::decode_tool_exchange_resolution(serde_json::to_value(&exact).unwrap())
+                    .unwrap(),
+                exact
+            );
+            payload.push('a');
+            let oversized = super::ToolExchangeResolution::Responded {
+                payload: serde_json::Value::String(payload),
+            };
+            assert_eq!(
+                super::validate_client_resolution(&oversized),
+                Err(super::ResolveToolExchangeError::InvalidResolution)
+            );
+            assert_eq!(
+                super::decode_tool_exchange_resolution(serde_json::to_value(&oversized).unwrap()),
+                Err(super::ResolveToolExchangeError::InvalidResolution)
+            );
+        }
+    }
 
     #[test]
     fn encoded_resolution_size_accepts_exact_limit_and_rejects_next_byte() {

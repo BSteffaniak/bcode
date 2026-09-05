@@ -1285,7 +1285,7 @@ pub struct PendingPermissionBatch {
 
 #[derive(Clone)]
 pub struct PendingToolExchange {
-    pub summary: bcode_ipc::PendingToolExchangeSummary,
+    pub summary: bcode_session_models::PendingToolExchangeSummary,
     pub resolution: Arc<Mutex<Option<ToolExchangeResolution>>>,
     pub notify: Arc<Notify>,
 }
@@ -47055,6 +47055,27 @@ library = "test"
         }
     }
 
+    async fn assert_pending_exchange_observation(
+        state: &ServerState,
+        session_id: SessionId,
+        request: &ToolExchangeRequest,
+    ) -> Vec<bcode_session_models::PendingToolExchangeSummary> {
+        let observed = interaction_operations::list_pending_tool_exchanges(state).await;
+        assert_eq!(
+            observed,
+            vec![bcode_session_models::PendingToolExchangeSummary {
+                session_id,
+                request: request.clone(),
+            }]
+        );
+        assert_eq!(
+            interaction_operations::list_pending_tool_exchanges(state).await,
+            observed,
+            "listing must not consume or alter the pending request"
+        );
+        observed
+    }
+
     #[tokio::test]
     async fn interaction_operation_executes_complete_exchange_lifecycle_without_transport() {
         let state = Arc::new(test_server_state(SessionManager::default()));
@@ -47114,6 +47135,7 @@ library = "test"
         })
         .await
         .expect("exchange should become pending");
+        assert_pending_exchange_observation(&state, session_id, &request).await;
         assert_invalid_resolutions_preserve_pending_exchange(&state, client_id, &request).await;
         assert!(!operation.is_finished());
         assert!(
@@ -47135,6 +47157,11 @@ library = "test"
             }
         );
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        assert!(
+            interaction_operations::list_pending_tool_exchanges(&state)
+                .await
+                .is_empty()
+        );
 
         let mismatched = interaction_operations::execute_tool_exchange(
             state.as_ref(),

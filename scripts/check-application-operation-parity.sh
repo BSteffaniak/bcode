@@ -47,7 +47,8 @@ def enum_variants(path: str, enum_name: str) -> list[str]:
             variant = re.match(r"^([A-Z][A-Za-z0-9_]*)(?:\s*\{|\s*\(|,)", stripped)
             if variant is not None:
                 variants.append(variant.group(1))
-        depth += code.count("{") - code.count("}")
+        # Tuple payload types are not enum variants, even on their own lines.
+        depth += code.count("{") + code.count("(") - code.count("}") - code.count(")")
     return variants
 
 
@@ -98,11 +99,25 @@ classification_section = DOC.split("### Top-level CLI ownership classification",
 if len(classification_section) != 2:
     raise SystemExit("application operation parity check failed: top-level CLI ownership classification is missing")
 classification_text = classification_section[1].split("## Maintenance rules", 1)[0]
+classification_rows: dict[str, list[list[str]]] = {}
+for line in classification_text.splitlines():
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    if cells and re.fullmatch(r"`[A-Z][A-Za-z0-9_]*`", cells[0]):
+        classification_rows.setdefault(cells[0][1:-1], []).append(cells)
 for command in classification_commands:
-    if f"| `{command}` |" not in classification_text:
+    rows = classification_rows.get(command, [])
+    if not rows:
         raise SystemExit(
             f"application operation parity check failed: top-level ownership classification missing: {command}"
         )
+    if len(rows) != 1 or len(rows[0]) != 3 or not all(rows[0]):
+        raise SystemExit(
+            f"application operation parity check failed: top-level ownership classification ambiguous or incomplete: {command}"
+        )
+for command in classification_rows.keys() - set(classification_commands):
+    raise SystemExit(
+        f"application operation parity check failed: stale top-level ownership classification: {command}"
+    )
 
 print("application operation parity inventory is complete for checked source enums")
 PY
