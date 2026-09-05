@@ -1365,6 +1365,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "switchy",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -1433,6 +1434,7 @@ dependencies = [
  "futures 0.3.34",
  "serde",
  "serde_json",
+ "switchy",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -11367,14 +11369,14 @@ version = "0.4.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#a052f5a5b7149a94c6e966bad3a45d001ca9258c"
 dependencies = [
  "switchy_async",
- "switchy_async_macros",
+ "switchy_async_macros 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_database",
  "switchy_database_connection",
  "switchy_fs",
  "switchy_http",
  "switchy_http_models",
  "switchy_mdns",
- "switchy_random",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_schema",
  "switchy_tcp",
  "switchy_telemetry",
@@ -11388,19 +11390,29 @@ dependencies = [
 [[package]]
 name = "switchy_async"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#a052f5a5b7149a94c6e966bad3a45d001ca9258c"
 dependencies = [
  "flume 0.12.0",
  "futures 0.3.34",
  "log 0.4.33",
  "pin-project-lite",
  "scoped-tls",
- "switchy_async_macros",
- "switchy_random",
+ "switchy_async_macros 0.4.0",
+ "switchy_random 0.4.0",
  "switchy_time",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "switchy_async_macros"
+version = "0.4.0"
+dependencies = [
+ "log 0.4.33",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -11509,6 +11521,14 @@ dependencies = [
 [[package]]
 name = "switchy_random"
 version = "0.4.0"
+dependencies = [
+ "log 0.4.33",
+ "rand 0.8.5",
+]
+
+[[package]]
+name = "switchy_random"
+version = "0.4.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#a052f5a5b7149a94c6e966bad3a45d001ca9258c"
 dependencies = [
  "log 0.4.33",
@@ -11569,12 +11589,11 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.4.0"
-source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#a052f5a5b7149a94c6e966bad3a45d001ca9258c"
 dependencies = [
  "chrono",
  "log 0.4.33",
  "scoped-tls",
- "switchy_random",
+ "switchy_random 0.4.0",
 ]
 
 [[package]]
@@ -11606,7 +11625,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#a052f5a5b
 dependencies = [
  "log 0.4.33",
  "switchy_env",
- "switchy_random",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "uuid",
 ]
 

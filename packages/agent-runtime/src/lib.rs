@@ -66,6 +66,8 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use switchy::time::instant_now;
+use switchy::unsync::time::{sleep, timeout as runtime_timeout};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use tracing::Instrument as _;
@@ -1424,6 +1426,27 @@ impl PermissionPolicy for AllowAllPolicy {
     }
 }
 
+/// Identity assigned to one provider request, independent of canonical session storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRequestIdentity {
+    /// Session correlation ID sent to the provider adapter.
+    pub session_id: SessionId,
+    /// Turn correlation ID sent to the provider adapter.
+    pub turn_id: String,
+}
+
+/// Application-owned source of provider request correlation identities.
+///
+/// Implementations must provide distinct identities for distinct requests. Runtime clones
+/// share this source; reproducible callers must also control request ordering.
+pub trait ProviderRequestIdentitySource: std::fmt::Debug + Send + Sync {
+    /// Allocate the next request identity.
+    ///
+    /// # Errors
+    /// Returns an error when an identity cannot be allocated, before provider startup.
+    fn next_identity(&self) -> Result<ProviderRequestIdentity>;
+}
+
 /// Reusable runtime for one or more agent turns.
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
@@ -1431,6 +1454,7 @@ pub struct AgentRuntime {
     stream_buffer_capacity: NonZeroUsize,
     tool_result_policy: ToolResultPolicy,
     turns: TurnScopeOwner,
+    provider_request_identity_source: Option<Arc<dyn ProviderRequestIdentitySource>>,
 }
 
 struct ActiveRuntimeTurn {
@@ -1484,6 +1508,7 @@ impl Default for AgentRuntime {
                 .expect("default stream buffer capacity must be positive"),
             tool_result_policy: ToolResultPolicy::default(),
             turns: TurnScopeOwner::new(),
+            provider_request_identity_source: None,
         }
     }
 }
@@ -1493,6 +1518,19 @@ impl AgentRuntime {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure provider request identity allocation without changing session persistence.
+    ///
+    /// By default each request receives a fresh random session correlation ID and a turn
+    /// ID derived from it. A supplied source replaces that allocation, including its entropy.
+    #[must_use]
+    pub fn with_provider_request_identity_source(
+        mut self,
+        source: Arc<dyn ProviderRequestIdentitySource>,
+    ) -> Self {
+        self.provider_request_identity_source = Some(source);
+        self
     }
 
     /// Configure provider event poll interval.
@@ -1599,7 +1637,7 @@ impl AgentRuntime {
             capacity,
         });
         let parent_span = tracing::Span::current();
-        tokio::spawn(
+        switchy::unsync::task::spawn(
             async move {
                 let catalog = SharedToolCatalog(catalog);
                 let result = runtime
@@ -1758,7 +1796,7 @@ impl AgentRuntime {
         }
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
         let turn_cancellation = request.cancellation.clone();
-        let started = Instant::now();
+        let started = instant_now();
         let timeout = request.timeout;
         let mut provider_round = 0_u32;
         let mut repeated_batches = ToolBatchRepeatGuard::new(request.max_repeated_tool_batches);
@@ -1857,15 +1895,15 @@ impl AgentRuntime {
             observer.before_tool_batch(&calls)?;
             let cancellation = request.cancellation.clone();
             let remaining = timeout
-                .checked_sub(started.elapsed())
+                .checked_sub(instant_now().saturating_duration_since(started))
                 .ok_or(RuntimeError::Timeout { timeout })?;
-            let batch = tokio::select! {
+            let batch = switchy::unsync::select! {
                 biased;
                 () = cancellation.cancelled() => {
                     let _ = self.cancel_turn_scope(scope);
                     return Err(RuntimeError::Cancelled);
                 }
-                () = tokio::time::sleep(remaining) => {
+                () = sleep(remaining) => {
                     let _ = self.cancel_turn_scope(scope);
                     return Err(RuntimeError::Timeout { timeout });
                 }
@@ -2101,7 +2139,7 @@ impl AgentRuntime {
         let task_terminal = Arc::clone(&terminal);
         let runtime = self.clone();
         let parent_span = tracing::Span::current();
-        tokio::spawn(
+        switchy::unsync::task::spawn(
             async move {
                 let stream = StreamOutput {
                     sender: sender.clone(),
@@ -2146,8 +2184,9 @@ impl AgentRuntime {
     where
         P: ModelProviderInvoker + ?Sized,
     {
-        let start = Instant::now();
-        let model_request = model_turn_request(request);
+        let start = instant_now();
+        let model_request =
+            model_turn_request(request, self.provider_request_identity_source.as_deref())?;
         let provider_plugin_id = request.provider_plugin_id.as_deref();
         let start_response =
             start_provider_turn(provider, provider_plugin_id, &model_request, request, scope)
@@ -2286,7 +2325,7 @@ enum EventDisposition {
 
 async fn sleep_after_empty_poll(should_sleep: bool, poll_interval: Duration) {
     if should_sleep {
-        tokio::time::sleep(poll_interval).await;
+        sleep(poll_interval).await;
     }
 }
 
@@ -2367,8 +2406,11 @@ where
                 .finish_turn(context.provider_plugin_id, context.finish_request)
                 .await?;
             record_usage(context, usage.as_ref());
-            let finished_event =
-                finished_event(usage.as_ref(), context.start.elapsed(), stop_reason);
+            let finished_event = finished_event(
+                usage.as_ref(),
+                instant_now().saturating_duration_since(context.start),
+                stop_reason,
+            );
             if !context
                 .scope
                 .emit(ScopedTurnEvent::Runtime(finished_event.clone()))
@@ -2380,7 +2422,7 @@ where
                 text: std::mem::take(text),
                 stop_reason: Some(stop_reason),
                 usage: usage.take(),
-                latency_ms: duration_millis(context.start.elapsed()),
+                latency_ms: duration_millis(instant_now().saturating_duration_since(context.start)),
                 termination_reason: AgentLoopTerminationReason::ProviderStop,
                 events: std::mem::take(events),
             }))
@@ -2507,11 +2549,11 @@ where
         operation = "start",
     );
     async move {
-        tokio::select! {
+        switchy::unsync::select! {
             biased;
             () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
             () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
-            () = tokio::time::sleep(request.timeout) => {
+            () = sleep(request.timeout) => {
                 Err(RuntimeError::Timeout { timeout: request.timeout })
             }
             response = provider.start_turn(provider_plugin_id, model_request) => response,
@@ -2538,7 +2580,11 @@ async fn poll_provider_events<P>(
 where
     P: ModelProviderInvoker + ?Sized,
 {
-    let Some(remaining) = context.request.timeout.checked_sub(context.start.elapsed()) else {
+    let Some(remaining) = context
+        .request
+        .timeout
+        .checked_sub(instant_now().saturating_duration_since(context.start))
+    else {
         cancel_and_finish(
             provider,
             context.provider_plugin_id,
@@ -2561,7 +2607,7 @@ where
         operation = "poll",
     );
     async move {
-        tokio::select! {
+        switchy::unsync::select! {
         biased;
         () = request_cancellation.cancelled() => {
             cancel_and_finish(
@@ -2581,7 +2627,7 @@ where
             ).await;
             Err(RuntimeError::Cancelled)
         }
-        () = tokio::time::sleep(remaining) => {
+        () = sleep(remaining) => {
             cancel_and_finish(
                 provider,
                 context.provider_plugin_id,
@@ -2686,7 +2732,7 @@ impl RuntimePhaseDuration {
         Self {
             phase,
             provider_round,
-            started: Instant::now(),
+            started: instant_now(),
         }
     }
 }
@@ -2696,7 +2742,7 @@ impl Drop for RuntimePhaseDuration {
         tracing::debug!(
             provider_round = ?self.provider_round,
             phase = self.phase,
-            duration_ms = duration_millis(self.started.elapsed()),
+            duration_ms = duration_millis(instant_now().saturating_duration_since(self.started)),
             "canonical runtime phase completed"
         );
     }
@@ -2753,7 +2799,7 @@ where
         .collect::<Vec<_>>();
     let authorization_future = authorization.authorize_batch(&requests, scope);
     let cancellation = scope.control().cancellation();
-    let decisions = tokio::select! {
+    let decisions = switchy::unsync::select! {
         biased;
         () = cancellation.cancelled() => {
             record_scheduler_cancellations(scope, prepared.len(), 0);
@@ -2820,10 +2866,10 @@ where
         let preparation_scope = PreparationScope::new(scope.clone(), host_context.to_vec());
         let preparation = invoker.prepare_tool(&tool, &preparation_request, &preparation_scope);
         let cancellation = scope.control().cancellation();
-        let prepared_result = tokio::select! {
+        let prepared_result = switchy::unsync::select! {
             biased;
             () = cancellation.cancelled() => Err(RuntimeError::Cancelled),
-            result = tokio::time::timeout(preparation_timeout, preparation) => result.unwrap_or_else(
+            result = runtime_timeout(preparation_timeout, preparation) => result.unwrap_or_else(
                 |_| Err(RuntimeError::ToolPreparationTimeout {
                     tool_name: call.name.clone(),
                     timeout: preparation_timeout,
@@ -3013,11 +3059,11 @@ where
 {
     let remaining = remaining_turn_duration(started, timeout)?;
     let scope_cancellation = scope.control().cancellation();
-    tokio::select! {
+    switchy::unsync::select! {
         biased;
         () = turn_cancellation.cancelled() => Err(RuntimeError::Cancelled),
         () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
-        () = tokio::time::sleep(remaining) => Err(RuntimeError::Timeout { timeout }),
+        () = sleep(remaining) => Err(RuntimeError::Timeout { timeout }),
         plan = planner.plan_round(context) => plan,
     }
 }
@@ -3031,12 +3077,12 @@ async fn wait_for_provider_retry_delay(
 ) -> Result<()> {
     let remaining = remaining_turn_duration(started, timeout)?;
     let scope_cancellation = scope.control().cancellation();
-    tokio::select! {
+    switchy::unsync::select! {
         biased;
         () = turn_cancellation.cancelled() => Err(RuntimeError::Cancelled),
         () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
-        () = tokio::time::sleep(remaining) => Err(RuntimeError::Timeout { timeout }),
-        () = tokio::time::sleep(delay) => Ok(()),
+        () = sleep(remaining) => Err(RuntimeError::Timeout { timeout }),
+        () = sleep(delay) => Ok(()),
     }
 }
 
@@ -3046,7 +3092,7 @@ fn duration_millis(duration: Duration) -> u64 {
 
 fn remaining_turn_duration(started: Instant, timeout: Duration) -> Result<Duration> {
     timeout
-        .checked_sub(started.elapsed())
+        .checked_sub(instant_now().saturating_duration_since(started))
         .ok_or(RuntimeError::Timeout { timeout })
 }
 
@@ -3060,7 +3106,7 @@ fn completed_agent_response(
         text: response.text,
         stop_reason: response.stop_reason,
         usage,
-        latency_ms: duration_millis(started.elapsed()),
+        latency_ms: duration_millis(instant_now().saturating_duration_since(started)),
         termination_reason: AgentLoopTerminationReason::ProviderStop,
         events,
     }
@@ -3076,7 +3122,7 @@ fn stopped_agent_response(
         text: response.text,
         stop_reason: response.stop_reason,
         usage,
-        latency_ms: duration_millis(started.elapsed()),
+        latency_ms: duration_millis(instant_now().saturating_duration_since(started)),
         termination_reason: AgentLoopTerminationReason::StopCondition,
         events,
     }
@@ -3381,7 +3427,7 @@ where
     );
     let cancellation = scope.control().cancellation();
     let (queued_cancellations, running_cancellations) = loop {
-        tokio::select! {
+        switchy::unsync::select! {
             biased;
             () = cancellation.cancelled() => {
                 let running = observation.active();
@@ -3852,8 +3898,19 @@ fn model_image_metadata(metadata: bcode_tool::ImageMetadata) -> bcode_model::Ima
     }
 }
 
-fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
-    let session_id = SessionId::new();
+fn model_turn_request(
+    request: &AgentTurnRequest,
+    identity_source: Option<&dyn ProviderRequestIdentitySource>,
+) -> Result<ModelTurnRequest> {
+    let identity = if let Some(source) = identity_source {
+        source.next_identity()?
+    } else {
+        let session_id = SessionId::new();
+        ProviderRequestIdentity {
+            session_id,
+            turn_id: format!("sdk-turn-{session_id}"),
+        }
+    };
     let mut messages = request.messages.clone();
     if request.append_prompt {
         messages.push(ModelMessage {
@@ -3863,9 +3920,9 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
             }],
         });
     }
-    ModelTurnRequest {
-        session_id,
-        turn_id: format!("sdk-turn-{session_id}"),
+    Ok(ModelTurnRequest {
+        session_id: identity.session_id,
+        turn_id: identity.turn_id,
         model_id: request.model_id.clone(),
         provider_context: request.provider_context.clone(),
         system_prompt: request.system_prompt.clone(),
@@ -3884,7 +3941,7 @@ fn model_turn_request(request: &AgentTurnRequest) -> ModelTurnRequest {
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
         metadata: request.metadata.clone(),
-    }
+    })
 }
 
 fn model_tool_definition(definition: ToolDefinition) -> bcode_model::ToolDefinition {

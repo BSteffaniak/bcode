@@ -37,43 +37,49 @@ name              = "typed_workflow"
 required-features = ["testing"]
 
 [dependencies]
-bcode_agent_permissions                 = { workspace = true }
-bcode_agent_policy                      = { workspace = true }
-bcode_agent_profile                     = { workspace = true }
-bcode_agent_runtime                     = { workspace = true }
-bcode_build_info                        = { workspace = true }
-bcode_bundled_plugins                   = { workspace = true, optional = true }
-bcode_cli                               = { workspace = true, optional = true }
-bcode_client                            = { workspace = true, optional = true }
-bcode_config                            = { workspace = true, optional = true }
-bcode_eval                              = { workspace = true, optional = true }
-bcode_fake_provider_plugin              = { workspace = true, optional = true }
-bcode_mermaid_render                    = { workspace = true, optional = true }
-bcode_metrics                           = { workspace = true, optional = true }
-bcode_model                             = { workspace = true }
-bcode_model_catalog                     = { workspace = true }
-bcode_model_provider_runtime            = { workspace = true }
+bcode_agent_permissions = { workspace = true }
+bcode_agent_policy = { workspace = true }
+bcode_agent_profile = { workspace = true }
+bcode_agent_runtime = { workspace = true }
+bcode_build_info = { workspace = true }
+bcode_bundled_plugins = { workspace = true, optional = true }
+bcode_cli = { workspace = true, optional = true }
+bcode_client = { workspace = true, optional = true }
+bcode_config = { workspace = true, optional = true }
+bcode_eval = { workspace = true, optional = true }
+bcode_fake_provider_plugin = { workspace = true, optional = true }
+bcode_mermaid_render = { workspace = true, optional = true }
+bcode_metrics = { workspace = true, optional = true }
+bcode_model = { workspace = true }
+bcode_model_catalog = { workspace = true }
+bcode_model_provider_runtime = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
-bcode_plugin                            = { workspace = true, optional = true }
-bcode_plugin_sdk                        = { workspace = true }
-bcode_provider_auth                     = { workspace = true, optional = true }
-bcode_provider_auth_models              = { workspace = true }
-bcode_session_models                    = { workspace = true }
-bcode_tool                              = { workspace = true }
-bcode_workflow                          = { workspace = true }
-futures                                 = { workspace = true }
-jsonschema                              = { workspace = true }
-partial-json-fixer                      = { workspace = true }
-pin-project-lite                        = { workspace = true }
-schemars                                = { workspace = true }
-serde                                   = { workspace = true, features = ["derive"] }
-serde_json                              = { workspace = true }
-sha2                                    = { workspace = true }
-thiserror                               = { workspace = true }
-tokio                                   = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
-tracing                                 = { workspace = true }
-tracing-opentelemetry                   = { workspace = true, optional = true }
-tracing-subscriber                      = { workspace = true, optional = true }
+bcode_plugin = { workspace = true, optional = true }
+bcode_plugin_sdk = { workspace = true }
+bcode_provider_auth = { workspace = true, optional = true }
+bcode_provider_auth_models = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_tool = { workspace = true }
+bcode_workflow = { workspace = true }
+futures = { workspace = true }
+jsonschema = { workspace = true }
+partial-json-fixer = { workspace = true }
+pin-project-lite = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+switchy = { workspace = true, features = [
+    "async-macros",
+    "async-time",
+    "async-tokio",
+    "time-std",
+] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 bcode_build_info      = { workspace = true }
@@ -272,4 +278,7 @@ system-ocr-tesseract = [
     "bcode_bundled_plugins/system-ocr-tesseract",
 ]
 testing = ["bcode_agent_runtime/testing"]
-web-renderer = ["cli", "bcode_cli/web-renderer"]
+# Development-only backend selection for the bounded scripted-provider example.
+# This is not an admitted or certified deterministic SDK profile.
+simulation-example = ["testing", "switchy/simulator"]
+web-renderer       = ["cli", "bcode_cli/web-renderer"]

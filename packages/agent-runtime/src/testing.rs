@@ -5,17 +5,69 @@
 //! batches deliberately permit malformed provider output so applications can exercise validation
 //! and failure paths as well as successful responses.
 
-use crate::{ModelProviderInvoker, RuntimeError, RuntimeFuture};
+use crate::{
+    ModelProviderInvoker, ProviderRequestIdentity, ProviderRequestIdentitySource, RuntimeError,
+    RuntimeFuture,
+};
 use bcode_model::{
     AckResponse, CancelTurnRequest, FinishTurnRequest, ModelMessage, ModelParameters,
     ModelTurnRequest, PollTurnEventsRequest, PollTurnEventsResponse, ProviderError,
     ProviderErrorCategory, ProviderTurnEvent, StartTurnResponse, StopReason,
     StructuredOutputRequest, ToolDefinition,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Finite provider request identities consumed in allocation order.
+///
+/// Clones share consumption state. Construct a fresh source for each replay run.
+/// Exhaustion fails before provider startup and never falls back to random allocation.
+#[derive(Debug, Clone)]
+pub struct ScriptedRequestIdentities {
+    remaining: Arc<Mutex<VecDeque<ProviderRequestIdentity>>>,
+}
+
+impl ScriptedRequestIdentities {
+    /// Validate and create an identity script.
+    ///
+    /// # Errors
+    /// Returns an error for an empty turn ID or a duplicate session/turn pair.
+    pub fn new(
+        identities: impl IntoIterator<Item = ProviderRequestIdentity>,
+    ) -> crate::Result<Self> {
+        let mut seen = BTreeSet::new();
+        let mut remaining = VecDeque::new();
+        for identity in identities {
+            if identity.turn_id.is_empty()
+                || !seen.insert((identity.session_id, identity.turn_id.clone()))
+            {
+                return Err(RuntimeError::ProviderInvocation(
+                    "invalid scripted request identity".to_string(),
+                ));
+            }
+            remaining.push_back(identity);
+        }
+        Ok(Self {
+            remaining: Arc::new(Mutex::new(remaining)),
+        })
+    }
+}
+
+impl ProviderRequestIdentitySource for ScriptedRequestIdentities {
+    fn next_identity(&self) -> crate::Result<ProviderRequestIdentity> {
+        self.remaining
+            .lock()
+            .map_err(|_| {
+                RuntimeError::ProviderInvocation("request identity script poisoned".to_string())
+            })?
+            .pop_front()
+            .ok_or_else(|| {
+                RuntimeError::ProviderInvocation("request identity script exhausted".to_string())
+            })
+    }
+}
 
 /// One poll operation in a scripted provider turn.
 #[non_exhaustive]
@@ -25,8 +77,8 @@ pub enum ScriptedProviderAction {
     Events(Vec<ProviderTurnEvent>),
     /// Wait for the duration and return an empty event batch.
     ///
-    /// The delay uses Tokio's clock, so applications can use Tokio's optional paused-time test
-    /// support when it is enabled in their own test dependency configuration.
+    /// The delay uses the selected Switchy runtime clock. With the production Tokio backend,
+    /// applications can use Tokio's optional paused-time support in their test configuration.
     Delay(Duration),
     /// Fail the poll operation before returning provider events.
     PollError(ProviderError),
@@ -542,7 +594,7 @@ impl ModelProviderInvoker for ScriptedProvider {
             match action? {
                 ScriptedProviderAction::Events(events) => Ok(PollTurnEventsResponse { events }),
                 ScriptedProviderAction::Delay(delay) => {
-                    tokio::time::sleep(delay).await;
+                    switchy::unsync::time::sleep(delay).await;
                     Ok(PollTurnEventsResponse { events: Vec::new() })
                 }
                 ScriptedProviderAction::PollError(error) => Err(runtime_provider_error(error)),

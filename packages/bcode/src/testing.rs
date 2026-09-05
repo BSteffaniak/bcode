@@ -478,7 +478,7 @@ pub enum ScriptedToolOutcome {
     Response(ToolInvocationResponse),
     /// Fail the inline tool handler with this application message.
     Error(String),
-    /// Wait on Tokio's clock before returning another outcome.
+    /// Wait on the selected runtime's clock before returning another outcome.
     Delay {
         /// Delay duration.
         duration: Duration,
@@ -502,7 +502,7 @@ impl ScriptedToolOutcome {
         })
     }
 
-    /// Delay this outcome using Tokio's clock.
+    /// Delay this outcome using the selected runtime's clock.
     #[must_use]
     pub fn after(self, duration: Duration) -> Self {
         Self::Delay {
@@ -608,9 +608,9 @@ fn run_scripted_tool_outcome(
             Some(ScriptedToolOutcome::Response(response)) => Ok(response),
             Some(ScriptedToolOutcome::Error(message)) => Err(message),
             Some(ScriptedToolOutcome::Delay { duration, outcome }) => {
-                tokio::select! {
+                switchy::unsync::select! {
                     () = cancellation.cancelled() => Err("scripted tool cancelled".to_string()),
-                    () = tokio::time::sleep(duration) => {
+                    () = switchy::unsync::time::sleep(duration) => {
                         run_scripted_tool_outcome(Some(*outcome), cancellation).await
                     }
                 }

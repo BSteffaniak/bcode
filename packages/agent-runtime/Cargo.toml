@@ -11,15 +11,21 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_model          = { workspace = true }
+bcode_model = { workspace = true }
 bcode_session_models = { workspace = true }
-bcode_tool           = { workspace = true }
-futures              = { workspace = true }
-serde                = { workspace = true, features = ["derive"] }
-serde_json           = { workspace = true }
-thiserror            = { workspace = true }
-tokio                = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-tracing              = { workspace = true }
+bcode_tool = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+switchy = { workspace = true, features = [
+    "async-macros",
+    "async-time",
+    "async-tokio",
+    "time-std",
+] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 bcode_agent_profile = { workspace = true }

@@ -39,6 +39,127 @@ fn tool_provider() -> ScriptedProvider {
     ])
 }
 
+#[test]
+fn request_identity_scripts_reject_duplicates_and_empty_turn_ids() {
+    let identity = bcode::ProviderRequestIdentity {
+        session_id: "00000000-0000-4000-8000-000000000125"
+            .parse()
+            .expect("fixture ID"),
+        turn_id: "same".to_string(),
+    };
+    assert!(
+        bcode::testing::ScriptedRequestIdentities::new([identity.clone(), identity.clone()])
+            .is_err()
+    );
+    assert!(
+        bcode::testing::ScriptedRequestIdentities::new([bcode::ProviderRequestIdentity {
+            turn_id: String::new(),
+            ..identity
+        }])
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn explicit_request_identity_reaches_provider_and_exhaustion_prevents_start() {
+    let session_id: SessionId = "00000000-0000-4000-8000-000000000125"
+        .parse()
+        .expect("fixture ID");
+    let identities = bcode::testing::ScriptedRequestIdentities::new((0..2).map(|index| {
+        bcode::ProviderRequestIdentity {
+            session_id,
+            turn_id: format!("fixture-{index}"),
+        }
+    }))
+    .expect("valid identities");
+    let runtime =
+        bcode::AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities));
+    let mut provider = ScriptedProvider::new([
+        ScriptedProviderTurn::complete_text("one"),
+        ScriptedProviderTurn::complete_text("two"),
+    ]);
+    let probe = provider.probe();
+    let agent = bcode::AgentBuilder::from_context(session_id, std::env::temp_dir())
+        .runtime(runtime)
+        .build();
+    agent
+        .run(&mut provider, "one")
+        .await
+        .expect("first request");
+    agent
+        .run(&mut provider, "two")
+        .await
+        .expect("second request");
+    let error = agent
+        .run(&mut provider, "three")
+        .await
+        .expect_err("exhaustion");
+    assert!(
+        matches!(error, BcodeError::Runtime(RuntimeError::ProviderInvocation(message)) if message == "request identity script exhausted")
+    );
+    let requests = probe.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].request.session_id, session_id);
+    assert_eq!(requests[1].request.session_id, session_id);
+    assert_eq!(requests[0].request.turn_id, "fixture-0");
+    assert_eq!(requests[1].request.turn_id, "fixture-1");
+}
+
+#[tokio::test]
+async fn explicit_builder_context_reaches_tool_authorization() {
+    let session_id: SessionId = "00000000-0000-4000-8000-000000000123"
+        .parse()
+        .expect("fixture ID");
+    let cwd = std::env::temp_dir().join("bcode-explicit-context-fixture");
+    let permissions = ScriptedPermissionPolicy::new([PermissionDecision::Allow]);
+    let probe = permissions.clone();
+    let tool = ScriptedTool::new([ScriptedToolOutcome::text("explicit context")]);
+    let agent = tool
+        .register(
+            bcode::AgentBuilder::from_context(session_id, cwd),
+            tool_definition(),
+        )
+        .custom_permission_policy(permissions)
+        .build();
+    let response = agent
+        .run(&mut tool_provider(), "use tool")
+        .await
+        .expect("tool loop");
+    assert_eq!(response.text, "after tool");
+    assert_eq!(probe.requests()[0].context.session_id, session_id);
+}
+
+#[tokio::test]
+async fn explicit_builder_context_denial_prevents_tool_execution() {
+    let session_id: SessionId = "00000000-0000-4000-8000-000000000124"
+        .parse()
+        .expect("fixture ID");
+    let permissions =
+        ScriptedPermissionPolicy::new([PermissionDecision::Deny("fixture denial".to_string())]);
+    let permission_probe = permissions.clone();
+    let tool = ScriptedTool::new([ScriptedToolOutcome::text("must not execute")]);
+    let tool_probe = tool.probe();
+    let agent = tool
+        .register(
+            bcode::AgentBuilder::from_context(session_id, std::env::temp_dir()),
+            tool_definition(),
+        )
+        .custom_permission_policy(permissions)
+        .build();
+    let result = agent.run(&mut tool_provider(), "denied tool").await;
+    assert_eq!(tool_probe.invocation_count(), 0);
+    let requests = permission_probe.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].context.session_id, session_id);
+    let response = result.expect("denial remains visible to the provider for continuation");
+    assert_eq!(response.text, "after tool");
+    assert!(response.steps.iter().any(|step| matches!(
+        step,
+        GenerationStep::ToolResult { result, .. }
+            if result.is_error && result.output == "tool execution denied: fixture denial"
+    )));
+}
+
 #[tokio::test]
 async fn scripted_tools_and_permissions_capture_canonical_requests() {
     let tool = ScriptedTool::new([ScriptedToolOutcome::text("tool output")]);

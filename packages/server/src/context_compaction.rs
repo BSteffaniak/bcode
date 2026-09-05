@@ -160,6 +160,7 @@ pub async fn compact_session_context_with_limit(
 ) -> Result<CompactionCompletion, CompactionError> {
     let config = state.session_config(session_id).await;
     let compaction = effective_compaction_config(&config, selection);
+    // Keep the large compaction state machine off each caller's future stack.
     Box::pin(compact_session_context_with_policy(
         state,
         session_id,

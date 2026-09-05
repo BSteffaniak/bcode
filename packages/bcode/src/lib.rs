@@ -41,7 +41,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::Instrument as _;
 
@@ -61,10 +61,11 @@ pub use bcode_agent_runtime::{
     InProcessModelProvider, InProcessModelProviderAdapter, InProcessProviderContext,
     InProcessProviderEmitError, InProcessProviderEventSink, InProcessProviderFuture,
     InProcessProviderOutcome, ModelProviderInvoker, PermissionDecision, PermissionPolicy,
-    ProviderRoundPlan, ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool,
-    RuntimeError, RuntimeFuture, RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog,
-    ToolExecutionOutput, ToolResultPolicy, ToolResultTransform, ToolRoundObserver, ToolRoundState,
-    ToolSource, UnifiedToolCatalog, in_process_provider_error,
+    ProviderRequestIdentity, ProviderRequestIdentitySource, ProviderRoundPlan,
+    ProviderRoundPlanContext, ProviderRoundPlanner, RegisteredTool, RuntimeError, RuntimeFuture,
+    RuntimePermissionContext, RuntimePermissionRequest, ToolCatalog, ToolExecutionOutput,
+    ToolResultPolicy, ToolResultTransform, ToolRoundObserver, ToolRoundState, ToolSource,
+    UnifiedToolCatalog, in_process_provider_error,
 };
 pub use bcode_agent_runtime::{
     ArtifactCommitGuard, HostTurnEventSink, InvocationArtifactSink, InvocationCapabilities,
@@ -276,7 +277,7 @@ fn provider_retry_delay(failure: Option<&RuntimeError>) -> Option<Duration> {
     let hint = error.retry.as_deref()?;
     let relative = hint.retry_after_ms.map(Duration::from_millis);
     let absolute = hint.retry_at_unix.map(|retry_at| {
-        let now = SystemTime::now()
+        let now = switchy::time::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         Duration::from_secs(retry_at.saturating_sub(now))
@@ -2380,7 +2381,7 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             .lock()
             .map_err(|error| BcodeError::Cache(error.to_string()))?;
         loop {
-            let now = Instant::now();
+            let now = switchy::time::instant_now();
             if let Some(entry) = state.entries.get(&key) {
                 if entry.expires_at > now {
                     return Ok(Some(entry.response.clone()));
@@ -2417,7 +2418,7 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             key.clone(),
             InMemoryCacheEntry {
                 response: response.clone(),
-                expires_at: Instant::now() + self.ttl,
+                expires_at: switchy::time::instant_now() + self.ttl,
                 sequence,
             },
         );
@@ -2537,7 +2538,7 @@ async fn response_cache_get(
     cache: Arc<dyn ModelResponseCache>,
     request: AgentTurnRequest,
 ) -> Result<Option<GenerateTextResponse>> {
-    tokio::task::spawn_blocking(move || cache.get(&request))
+    switchy::unsync::task::spawn_blocking(move || cache.get(&request))
         .await
         .map_err(|error| BcodeError::Cache(format!("cache lookup task failed: {error}")))?
 }
@@ -2547,13 +2548,13 @@ async fn response_cache_put(
     request: AgentTurnRequest,
     response: GenerateTextResponse,
 ) -> Result<()> {
-    tokio::task::spawn_blocking(move || cache.put(&request, &response))
+    switchy::unsync::task::spawn_blocking(move || cache.put(&request, &response))
         .await
         .map_err(|error| BcodeError::Cache(format!("cache storage task failed: {error}")))?
 }
 
 async fn response_cache_abort(cache: Arc<dyn ModelResponseCache>, request: AgentTurnRequest) {
-    let _ = tokio::task::spawn_blocking(move || cache.abort(&request)).await;
+    let _ = switchy::unsync::task::spawn_blocking(move || cache.abort(&request)).await;
 }
 
 /// Typed application-owned model rate-limit decision.
@@ -8274,12 +8275,29 @@ impl fmt::Debug for AgentBuilder {
 
 impl Default for AgentBuilder {
     fn default() -> Self {
+        Self::with_initial_context(SessionId::default(), std::env::current_dir().ok())
+    }
+}
+
+impl AgentBuilder {
+    /// Create a builder with explicit session identity and working directory.
+    ///
+    /// Unlike [`Agent::builder`], this constructor does not generate a session ID or read
+    /// the process working directory. Supply an absolute directory to avoid resolving a
+    /// relative directory against the process working directory during tool execution.
+    /// This controls these initialization inputs only; it does not make execution deterministic.
+    #[must_use]
+    pub fn from_context(session_id: SessionId, cwd: PathBuf) -> Self {
+        Self::with_initial_context(session_id, Some(cwd))
+    }
+
+    fn with_initial_context(session_id: SessionId, cwd: Option<PathBuf>) -> Self {
         Self {
             runtime: AgentRuntime::new(),
             name: None,
             profile_id: bcode_agent_policy::BUILD_AGENT.to_string(),
-            session_id: SessionId::default(),
-            cwd: std::env::current_dir().ok(),
+            session_id,
+            cwd,
             provider_plugin_id: None,
             model_id: None,
             selection_provenance: Box::default(),

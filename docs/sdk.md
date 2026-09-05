@@ -28,7 +28,7 @@ async fn generate(provider: &mut impl ModelProviderInvoker) -> bcode::Result<Str
 }
 ```
 
-`Agent::builder()` provides a reusable configured agent when an application needs tools, policy, hooks, sessions, or repeated calls. `InProcessModelProviderAdapter` is the shortest provider implementation path: applications implement one asynchronous turn while Bcode handles provider turn IDs, polling, terminal lifecycle, cancellation races, and cleanup.
+`Agent::builder()` provides a reusable configured agent when an application needs tools, policy, hooks, sessions, or repeated calls. `AgentBuilder::from_context(session_id, cwd)` accepts explicit initialization inputs without generating a session ID or reading the process working directory; use an absolute directory to avoid later relative-path resolution. This is not a deterministic-execution guarantee. `InProcessModelProviderAdapter` is the shortest provider implementation path: applications implement one asynchronous turn while Bcode handles provider turn IDs, polling, terminal lifecycle, cancellation races, and cleanup.
 
 Executable examples:
 
@@ -37,6 +37,17 @@ Executable examples:
 * [`top_level_helpers`](../packages/bcode/examples/top_level_helpers.rs)
 
 ## Streaming and structured output
+
+Applications that own provider request correlation IDs can configure
+`AgentRuntime::with_provider_request_identity_source(Arc<dyn ProviderRequestIdentitySource>)`
+and pass that runtime to `AgentBuilder::runtime`. The source supplies a `ProviderRequestIdentity`
+for each request before provider startup; allocation errors prevent that startup. Runtime clones
+share the source. Callers must provide distinct request identities and control request ordering
+for reproducibility. These correlation IDs do not select canonical session storage. Without a
+source, the runtime retains its random per-request identity behavior. With the `testing`
+feature, `testing::ScriptedRequestIdentities` supplies a finite validated sequence, rejects
+empty turn IDs and duplicate session/turn pairs, and fails on exhaustion. Its clones share
+consumption; construct a fresh source for each run.
 
 `stream_text_builder` and agent streaming methods expose standard `futures::Stream` implementations while retaining normalized runtime and plugin-invocation events.
 
@@ -120,6 +131,31 @@ bcode = { git = "https://github.com/BSteffaniak/bcode", rev = "<commit>", defaul
 ```
 
 See [Deterministic SDK provider tests](sdk-testing.md) and the executable [`scripted_provider`](../packages/bcode/examples/scripted_provider.rs) example.
+
+## Development simulator smoke run
+
+With the currently required local upstream patches, the same example can drive
+Switchy's simulator explicitly. It checks a successful response, cancellation after
+a provider text delta, and a real agent deadline. Both streaming failures must have
+one coherent terminal, exhausted delivery, and exactly one provider cancellation
+and finish call. Allowed and denied tool-call scenarios also exercise the real
+permission dispatch and provider continuation: denial must invoke no tool, while
+allowance must invoke it once with the expected arguments and return its result.
+
+```sh
+SIMULATOR_SEED=0 SIMULATOR_EPOCH_OFFSET=1700000000000 SIMULATOR_STEP_MULTIPLIER=1 \
+  cargo run --offline -p bcode --no-default-features --features simulation-example --example scripted_provider
+```
+
+`simulation-example` selects the experimental backend; it is not a certified SDK
+profile. Each process polls at most 10,000 tasks and advances time by the configured
+step multiplier after each unfinished poll. Budget exhaustion is a harness error,
+not an application timeout. A large multiplier can legitimately trigger the real
+agent deadline. Use a fresh process and an external watchdog: a single blocking
+poll is not preemptible. Runtime-wide bounded draining is not yet exposed upstream,
+so this smoke run does not establish task cleanup, run isolation, host-effect
+confinement, or replay certification. Production execution remains
+`cargo run -p bcode --features testing --example scripted_provider`.
 
 ## Provider contract
 
