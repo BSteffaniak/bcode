@@ -1705,11 +1705,13 @@ impl AgentRuntime {
         O: ToolRoundObserver + ?Sized,
         R: ProviderRoundPlanner + ?Sized,
     {
-        let scope = self.begin_turn_scope(
+        let mut active_turn = ActiveRuntimeTurn::new(
+            self.turns.clone(),
             format!("agent-turn:{}", context.session_id),
             events,
             capabilities,
         );
+        let scope = active_turn.scope().clone();
         let turn_span = tracing::info_span!(
             target: "bcode::sdk",
             "bcode.agent_turn",
@@ -1736,14 +1738,9 @@ impl AgentRuntime {
             .instrument(turn_span)
             .await;
         match result {
-            Ok(response) if self.complete_turn_scope(&scope) => Ok(response),
+            Ok(response) if active_turn.complete() => Ok(response),
             Ok(_) => Err(RuntimeError::Cancelled),
-            Err(error) => {
-                let _ = self.cancel_turn_scope(&scope);
-                let _ = scope.control().mark_cancelled();
-                let _ = self.turns.release_terminal_turn(&scope);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -2269,7 +2266,14 @@ impl AgentRuntime {
                     return Ok(response);
                 }
             }
-            sleep_after_empty_poll(should_sleep, self.poll_interval).await;
+            if should_sleep {
+                let scope_cancellation = scope.control().cancellation();
+                switchy::unsync::select! {
+                    () = request.cancellation.cancelled() => {},
+                    () = scope_cancellation.cancelled() => {},
+                    () = sleep(self.poll_interval.min(request.timeout.saturating_sub(start.elapsed()))) => {},
+                }
+            }
         }
     }
 
@@ -2321,12 +2325,6 @@ enum EventDisposition {
         stop_reason: StopReason,
     },
     Cancelled(AgentRuntimeEvent),
-}
-
-async fn sleep_after_empty_poll(should_sleep: bool, poll_interval: Duration) {
-    if should_sleep {
-        sleep(poll_interval).await;
-    }
 }
 
 async fn ensure_scope_active<P>(
@@ -7911,6 +7909,32 @@ mod tests {
             bcode_model::CapabilityExecution::ToolFreeProviderRound;
         request.cancellation = cancellation;
         request
+    }
+
+    #[test]
+    fn stale_runtime_turn_guard_drop_preserves_new_owner() {
+        let runtime = AgentRuntime::new();
+        let stale = super::ActiveRuntimeTurn::new(
+            runtime.turns.clone(),
+            "stale",
+            Arc::new(AcceptingEventSink),
+            InvocationCapabilities::default(),
+        );
+        let mut current = super::ActiveRuntimeTurn::new(
+            runtime.turns.clone(),
+            "current",
+            Arc::new(AcceptingEventSink),
+            InvocationCapabilities::default(),
+        );
+        let generation = runtime.active_turn_generation();
+        assert!(generation.is_some());
+        drop(stale);
+        assert_eq!(runtime.active_turn_generation(), generation);
+        assert!(
+            current.complete(),
+            "stale drop must not cancel current scope"
+        );
+        assert_eq!(runtime.active_turn_generation(), None);
     }
 
     #[tokio::test]

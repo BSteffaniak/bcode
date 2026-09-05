@@ -38,7 +38,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err("simulation harness step budget exhausted (not a product timeout)".into())
 }
 
+struct InProcessEcho;
+
+impl bcode::InProcessModelProvider for InProcessEcho {
+    fn run_turn(
+        &self,
+        _request: bcode::ModelTurnRequest,
+        context: bcode::InProcessProviderContext,
+    ) -> bcode::InProcessProviderFuture<'_> {
+        Box::pin(async move {
+            switchy::unsync::time::sleep(Duration::from_millis(1)).await;
+            context
+                .events()
+                .emit(ProviderTurnEvent::TextDelta {
+                    text: "in-process answer".into(),
+                })
+                .expect("active in-process turn accepts text");
+            Ok(bcode::InProcessProviderOutcome::EndTurn)
+        })
+    }
+}
+
 async fn run() -> bcode::Result<()> {
+    let mut in_process = bcode::InProcessModelProviderAdapter::new(InProcessEcho);
+    let agent = bcode::Agent::builder().build();
+    for prompt in ["in-process smoke", "in-process reuse"] {
+        let response = agent
+            .generate_text_with_provider(&mut in_process, prompt)
+            .await?;
+        assert_eq!(response.text, "in-process answer");
+        assert_eq!(
+            response.runtime.stop_reason,
+            Some(bcode::StopReason::EndTurn)
+        );
+    }
     let provider = ScriptedProvider::new([ScriptedProviderTurn::new()
         .events([
             ProviderTurnEvent::TurnStarted,
@@ -110,6 +143,7 @@ async fn run() -> bcode::Result<()> {
     run_rate_limit_scenarios().await?;
     run_retry_scenarios().await?;
     run_response_cache_failure().await?;
+    run_response_cache_cancellation().await?;
     run_terminal_scenarios().await?;
     run_tool_scenarios(false).await?;
     run_tool_scenarios(true).await?;
@@ -231,7 +265,23 @@ async fn run_response_cache_scenario() -> bcode::Result<()> {
         ScriptedProviderTurn::complete_text("after expiry"),
     ]);
     let probe = provider.probe();
-    for _ in 0..2 {
+    for populated in [false, true] {
+        let cancellation = bcode::CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = agent
+            .generate_text_with_provider_and_cancellation(&mut provider, "cached", cancellation)
+            .await;
+        assert!(
+            matches!(
+                cancelled,
+                Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+            ),
+            "pre-cancelled request must not succeed"
+        );
+        assert_eq!(probe.requests().len(), usize::from(populated));
+        probe
+            .assert_finish_count(usize::from(populated))
+            .expect("cancelled request starts no provider");
         let response = agent
             .generate_text_with_provider(&mut provider, "cached")
             .await?;
@@ -284,7 +334,129 @@ async fn run_response_cache_scenario() -> bcode::Result<()> {
     Ok(())
 }
 
+async fn run_response_cache_cancellation() -> bcode::Result<()> {
+    for mode in [
+        CacheTermination::Cancel,
+        CacheTermination::Deadline,
+        CacheTermination::Drop,
+    ] {
+        run_response_cache_terminal_case(mode).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CacheTermination {
+    Cancel,
+    Deadline,
+    Drop,
+}
+
+async fn run_response_cache_terminal_case(mode: CacheTermination) -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000019"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new((0..2).map(|index| ProviderRequestIdentity {
+        session_id,
+        turn_id: format!("cache-cancel-{index}"),
+    }))?;
+    let timeout = if matches!(mode, CacheTermination::Deadline) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(120)
+    };
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .timeout(timeout)
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .response_cache(Arc::new(bcode::InMemoryModelResponseCache::new(
+            Duration::from_secs(60),
+            std::num::NonZeroUsize::new(2).expect("positive capacity"),
+        )))
+        .build();
+    let mut provider = ScriptedProvider::new([
+        ScriptedProviderTurn::new().pending(),
+        ScriptedProviderTurn::complete_text("after cancellation"),
+    ]);
+    let probe = provider.probe();
+    let cancellation = bcode::CancellationToken::new();
+    let generation_started = switchy::time::instant_now();
+    let mut generation = Box::pin(agent.generate_text_with_provider_and_cancellation(
+        &mut provider,
+        "recover",
+        cancellation.clone(),
+    ));
+    loop {
+        switchy::unsync::select! {
+            result = &mut generation => panic!("pending provider completed: {result:?}"),
+            () = switchy::unsync::task::yield_now() => {
+                if !probe.requests().is_empty() { break; }
+            }
+        }
+    }
+    if matches!(mode, CacheTermination::Drop) {
+        drop(generation);
+    } else if matches!(mode, CacheTermination::Deadline) {
+        assert!(matches!(generation.await,
+            Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Timeout { timeout: actual })) if actual == timeout
+        ));
+        assert!(
+            switchy::time::instant_now().duration_since(generation_started) >= timeout,
+            "product deadline must not fire early"
+        );
+    } else {
+        cancellation.cancel();
+        assert!(matches!(
+            generation.await,
+            Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+        ));
+    }
+    probe
+        .assert_finish_count(1)
+        .unwrap_or_else(|error| panic!("{mode:?}: cancelled provider not released: {error:?}"));
+    probe
+        .assert_cancellation_count(1)
+        .expect("provider cancelled once");
+    let started = switchy::time::instant_now();
+    for cached in [false, true] {
+        let response = agent
+            .generate_text_with_provider(&mut provider, "recover")
+            .await?;
+        assert_eq!(response.text, "after cancellation");
+        assert_recovery_cache_status(&response, cached);
+        assert_eq!(probe.requests().len(), 2, "recovery cached");
+    }
+    assert!(switchy::time::instant_now().duration_since(started) < Duration::from_secs(30));
+    probe
+        .assert_finish_count(2)
+        .expect("all providers released");
+    probe
+        .assert_cancellation_count(1)
+        .expect("recovery not cancelled");
+    Ok(())
+}
+
+fn assert_recovery_cache_status(response: &bcode::GenerateTextResponse, cached: bool) {
+    assert!(
+        matches!(
+            (&response.cache_status, cached),
+            (bcode::ModelResponseCacheStatus::Stored { .. }, false)
+                | (bcode::ModelResponseCacheStatus::Hit { .. }, true)
+        ),
+        "unexpected recovery cache provenance: {:?}",
+        response.cache_status
+    );
+}
+
 async fn run_response_cache_failure() -> bcode::Result<()> {
+    for started in [false, true] {
+        run_response_cache_failure_case(started).await?;
+    }
+    Ok(())
+}
+
+async fn run_response_cache_failure_case(started: bool) -> bcode::Result<()> {
     let session_id = "00000000-0000-4000-8000-000000000009"
         .parse()
         .expect("fixture ID");
@@ -313,15 +485,20 @@ async fn run_response_cache_failure() -> bcode::Result<()> {
         sources: Box::default(),
         retry: None,
     };
+    let failed_turn = if started {
+        ScriptedProviderTurn::new().poll_error(error)
+    } else {
+        ScriptedProviderTurn::start_error(error)
+    };
     let mut provider = ScriptedProvider::new([
-        ScriptedProviderTurn::start_error(error),
+        failed_turn,
         ScriptedProviderTurn::complete_text("recovered cache miss"),
     ]);
     let probe = provider.probe();
     let failure = agent
         .generate_text_with_provider(&mut provider, "recover")
         .await
-        .expect_err("scripted provider start must fail");
+        .expect_err("scripted provider must fail");
     assert!(
         matches!(
             failure,
@@ -332,22 +509,27 @@ async fn run_response_cache_failure() -> bcode::Result<()> {
     );
     assert_eq!(probe.requests().len(), 1);
     probe
-        .assert_finish_count(0)
-        .expect("failed start has no provider handle");
+        .assert_finish_count(usize::from(started))
+        .expect("only a started provider has a handle to release");
     // A leaked miss lease must not be allowed to expire and mask missing abort cleanup.
-    let started = switchy::time::instant_now();
-    for _ in 0..2 {
+    let recovery_started = switchy::time::instant_now();
+    for cached in [false, true] {
         let response = agent
             .generate_text_with_provider(&mut provider, "recover")
             .await?;
         assert_eq!(response.text, "recovered cache miss");
+        assert_recovery_cache_status(&response, cached);
         assert_eq!(probe.requests().len(), 2, "recovery is cached");
     }
-    assert!(switchy::time::instant_now().duration_since(started) < Duration::from_secs(30));
+    assert!(
+        switchy::time::instant_now().duration_since(recovery_started) < Duration::from_secs(30)
+    );
     probe
-        .assert_finish_count(1)
-        .expect("recovered provider released");
-    probe.assert_cancellation_count(0).expect("no cancellation");
+        .assert_finish_count(1 + usize::from(started))
+        .expect("failed and recovered providers released");
+    probe
+        .assert_cancellation_count(usize::from(started))
+        .expect("only failed started provider cancelled");
     Ok(())
 }
 

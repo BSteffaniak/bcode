@@ -2280,6 +2280,8 @@ pub trait ModelResponseCache: Send + Sync {
     ///
     /// Adapters implementing single-flight stampede control must wake followers so one can become
     /// the next leader. The compatibility default is a no-op.
+    /// This may run synchronously when a generation future is dropped; implementations must
+    /// perform bounded cleanup without waiting for other requests or panicking.
     fn abort(&self, _request: &AgentTurnRequest) {}
 
     /// Invalidate this exact request identity.
@@ -2381,6 +2383,9 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             .lock()
             .map_err(|error| BcodeError::Cache(error.to_string()))?;
         loop {
+            if request.cancellation.is_cancelled() {
+                return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+            }
             let now = switchy::time::instant_now();
             if let Some(entry) = state.entries.get(&key) {
                 if entry.expires_at > now {
@@ -2397,7 +2402,8 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             }
             let wait = lease_expires
                 .expect("checked in-flight lease")
-                .saturating_duration_since(now);
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(50));
             let (next_state, _) = self
                 .changed
                 .wait_timeout(state, wait)
@@ -2534,27 +2540,59 @@ const fn pricing_source_label(source: ModelPricingSource) -> &'static str {
     }
 }
 
+// The miss owner travels through blocking tasks as well as the caller's future.
+// Dropping either side must release the reservation, including an abandoned lookup result.
+struct ResponseCacheMiss {
+    cache: Arc<dyn ModelResponseCache>,
+    request: AgentTurnRequest,
+    completed: bool,
+}
+
+impl ResponseCacheMiss {
+    fn store(mut self, response: &GenerateTextResponse) -> Result<()> {
+        self.cache.put(&self.request, response)?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ResponseCacheMiss {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cache.abort(&self.request);
+        }
+    }
+}
+
 async fn response_cache_get(
     cache: Arc<dyn ModelResponseCache>,
     request: AgentTurnRequest,
-) -> Result<Option<GenerateTextResponse>> {
-    switchy::unsync::task::spawn_blocking(move || cache.get(&request))
-        .await
-        .map_err(|error| BcodeError::Cache(format!("cache lookup task failed: {error}")))?
+) -> Result<(Option<GenerateTextResponse>, Option<ResponseCacheMiss>)> {
+    let cancellation = request.cancellation.clone();
+    if cancellation.is_cancelled() {
+        return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+    }
+    let lookup = switchy::unsync::task::spawn_blocking(move || {
+        let response = cache.get(&request)?;
+        let miss = response.is_none().then(|| ResponseCacheMiss {
+            cache,
+            request,
+            completed: false,
+        });
+        Ok((response, miss))
+    });
+    switchy::unsync::select! {
+        biased;
+        () = cancellation.cancelled() => Err(BcodeError::Runtime(RuntimeError::Cancelled)),
+        result = lookup => result
+            .map_err(|error| BcodeError::Cache(format!("cache lookup task failed: {error}")))?,
+    }
 }
 
-async fn response_cache_put(
-    cache: Arc<dyn ModelResponseCache>,
-    request: AgentTurnRequest,
-    response: GenerateTextResponse,
-) -> Result<()> {
-    switchy::unsync::task::spawn_blocking(move || cache.put(&request, &response))
+async fn response_cache_put(miss: ResponseCacheMiss, response: GenerateTextResponse) -> Result<()> {
+    switchy::unsync::task::spawn_blocking(move || miss.store(&response))
         .await
         .map_err(|error| BcodeError::Cache(format!("cache storage task failed: {error}")))?
-}
-
-async fn response_cache_abort(cache: Arc<dyn ModelResponseCache>, request: AgentTurnRequest) {
-    let _ = switchy::unsync::task::spawn_blocking(move || cache.abort(&request)).await;
 }
 
 /// Typed application-owned model rate-limit decision.
@@ -7325,13 +7363,14 @@ impl Agent {
                 .as_ref()
                 .map(|_| ModelResponseCacheKey::from_request(&request))
                 .transpose()?;
-            let cached = if let Some(cache) = &cache {
-                let response = response_cache_get(Arc::clone(cache), request.clone()).await?;
+            let (cached, miss) = if let Some(cache) = &cache {
+                let (response, miss) =
+                    response_cache_get(Arc::clone(cache), request.clone()).await?;
                 record_cache_lookup(&request, response.is_some());
-                response
+                (response, miss)
             } else {
                 record_cache_bypass(&request);
-                None
+                (None, None)
             };
             let response = if let Some(mut response) = cached {
                 response.cache_status = ModelResponseCacheStatus::Hit {
@@ -7346,26 +7385,13 @@ impl Agent {
                         Arc::clone(&self.invocation_event_sink),
                     )
                     .await;
-                let runtime_response = match runtime_response {
-                    Ok(response) => response,
-                    Err(error) => {
-                        if let Some(cache) = cache {
-                            response_cache_abort(cache, request.clone()).await;
-                        }
-                        return Err(error);
-                    }
-                };
+                let runtime_response = runtime_response?;
                 let mut response = GenerateTextResponse::from(runtime_response);
-                if let Some(cache) = cache {
+                if let Some(miss) = miss {
                     response.cache_status = ModelResponseCacheStatus::Stored {
                         key: key.expect("cache key exists for cache storage"),
                     };
-                    if let Err(error) =
-                        response_cache_put(cache.clone(), request.clone(), response.clone()).await
-                    {
-                        response_cache_abort(cache, request.clone()).await;
-                        return Err(error);
-                    }
+                    response_cache_put(miss, response.clone()).await?;
                     record_cache_store(&request);
                 }
                 response

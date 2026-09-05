@@ -147,6 +147,20 @@ SIMULATOR_SEED=0 SIMULATOR_EPOCH_OFFSET=1700000000000 SIMULATOR_STEP_MULTIPLIER=
   cargo run --offline -p bcode --no-default-features --features simulation-example --example scripted_provider
 ```
 
+For separate locked backend builds and a fixed fresh-process campaign with an
+external watchdog, run:
+
+```sh
+python3 scripts/check-sdk-simulation-smoke.py --offline
+```
+
+This runs production once and simulator seeds `0,0,1,2,3,4,5,6,7,8,9` with a fixed
+epoch and 1 ms steps. It clears inherited `SIMULATOR_*` overrides, runs the exact
+executable reported by Cargo, and fails on build errors, scenario failures, or a
+60-second run watchdog (distinct from the simulated product deadline). Each build
+has a separate 600-second watchdog. It still requires the development upstream
+patches and does not produce a replay bundle or certify host confinement.
+
 `simulation-example` selects the experimental backend; it is not a certified SDK
 profile. Each process polls at most 10,000 tasks and advances time by the configured
 step multiplier after each unfinished poll. Budget exhaustion is a harness error,

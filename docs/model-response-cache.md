@@ -45,12 +45,52 @@ full invalidation, and never persists data.
 
 ## Stampede control and failure
 
-A miss adapter may reserve the key. Followers block on Tokio's blocking pool, not an async executor
-worker. `put` commits and wakes followers; `abort` releases a failed leader. The bundled in-memory
-adapter also expires single-flight leases (30 seconds by default, configurable), so an abandoned or
-dropped leader cannot strand followers forever. Provider/tool failures are never cached. Cache
-lookup/storage failures are typed terminal SDK errors rather than silent corruption.
+A miss adapter may reserve the key. Lookup and storage run through Switchy's blocking-task
+boundary (Tokio's blocking pool in the native build), not directly on the async executor worker.
+After a successful lookup returns a miss, an SDK-owned guard carries cleanup responsibility
+through generation and storage. Successful `put` disarms the guard; failure or future drop calls
+`abort` exactly once. An abandoned blocking lookup result also releases its late miss. `abort`
+can run synchronously during drop and must perform bounded cleanup without waiting for other
+requests or panicking. A lookup that fails before returning a miss owns its own partial cleanup.
+
+Already-observed request cancellation prevents lookup dispatch. Cancellation during lookup returns
+a typed cancellation result without waiting for the adapter. It does not interrupt synchronous
+adapter execution: the task may finish later, and its result owns any miss cleanup. These native
+regressions do not certify deterministic scheduling or complete runtime isolation. Storage already
+dispatched to a blocking task can likewise finish after its caller drops; drop does not roll back
+storage.
+
+The bundled in-memory adapter also expires single-flight leases (30 seconds by default,
+configurable). Provider/tool failures are never cached. Cache lookup/storage failures are typed
+terminal SDK errors rather than silent corruption.
+
+### Known borrowed-provider future-drop limitation
+
+Cache reservation cleanup is separate from provider-turn cleanup. Dropping a buffered SDK
+`generate_text_with_provider_and_cancellation` future while its borrowed provider is active does
+not currently invoke that provider's cancel/finish lifecycle. The SDK smoke regression observes
+zero finish calls where one is required on both native and simulator backends. Dropping an owned
+in-process provider adapter has separate cleanup and does not establish safety for this borrowed
+call path. The uncached `generate_text_with_provider` regression also fails: its runtime scope
+is released, but no provider finish is observed within the cleanup watchdog. Disabling the response
+cache therefore does not avoid this lifecycle defect.
+
+Until this is fixed, cancel through the supplied cancellation token and continue awaiting the
+buffered call's terminal result rather than dropping it to request cancellation. Explicit token
+cancellation and deadline cases pass the smoke scenario before its future-drop case fails. This
+is not a guarantee for arbitrary provider implementations or their independently spawned tasks.
+
+### Known reservation-fencing limitation
+
+The current `get`/`put`/`abort` contract identifies operations by request key, not by a unique miss
+reservation. Invalidation or lease replacement therefore does not fence an older leader: a late
+`put` can overwrite a newer response, and a late `abort` can release a newer reservation. The SDK
+cleanup guard prevents abandoned ownership from leaking but does not solve this identity defect.
+Do not treat invalidation as a barrier against in-flight completions or claim ownership-fenced
+stampede control. Reservation identity must be carried from lookup through completion and abort
+before that guarantee can be made.
 
 The compatibility `ModelResponseCache` interface remains application-owned. Implementations that do
-not reserve misses can keep `abort` as its no-op default, but distributed adapters must document and
-implement atomic miss reservation if they claim stampede control.
+not reserve misses can keep `abort` as its no-op default. Distributed adapters must define their
+atomic reservation and stale-owner behavior explicitly; the key-only interface alone supplies no
+such guarantee.

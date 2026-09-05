@@ -854,6 +854,177 @@ async fn explicit_safe_tool_cache_preserves_complete_steps_without_reexecution()
     )));
 }
 
+#[derive(Debug)]
+struct GatedLookupCache {
+    response: Option<GenerateTextResponse>,
+    entered: AtomicUsize,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    aborts: AtomicUsize,
+}
+
+impl ModelResponseCache for GatedLookupCache {
+    fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.release
+            .lock()
+            .expect("release lock")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test releases lookup");
+        Ok(self.response.clone())
+    }
+
+    fn put(
+        &self,
+        _request: &AgentTurnRequest,
+        _response: &GenerateTextResponse,
+    ) -> bcode::Result<()> {
+        panic!("abandoned lookup must not store")
+    }
+
+    fn abort(&self, _request: &AgentTurnRequest) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn abandoned_blocking_lookup_releases_late_miss() {
+    check_abandoned_lookup(false, false).await;
+}
+
+#[tokio::test]
+async fn cancelled_blocking_lookup_returns_before_adapter_and_releases_late_miss() {
+    check_abandoned_lookup(true, false).await;
+}
+
+#[tokio::test]
+async fn cancelled_blocking_lookup_discards_late_hit_without_abort() {
+    check_abandoned_lookup(true, true).await;
+}
+
+async fn check_abandoned_lookup(cancel: bool, hit: bool) {
+    let response = if hit {
+        Some(
+            Agent::builder()
+                .build()
+                .generate_text_with_provider(&mut CountingProvider::default(), "fixture response")
+                .await
+                .expect("fixture generation"),
+        )
+    } else {
+        None
+    };
+    let (release, receiver) = std::sync::mpsc::channel();
+    let cache = Arc::new(GatedLookupCache {
+        response,
+        entered: AtomicUsize::new(0),
+        release: Mutex::new(receiver),
+        aborts: AtomicUsize::new(0),
+    });
+    let agent = Agent::builder().response_cache(cache.clone()).build();
+    let mut provider = CountingProvider::default();
+    let cancellation = bcode::CancellationToken::new();
+    let mut generation = Box::pin(agent.generate_text_with_provider_and_cancellation(
+        &mut provider,
+        "abandoned lookup",
+        cancellation.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = &mut generation => panic!("lookup unexpectedly completed: {result:?}"),
+                () = tokio::task::yield_now() => {
+                    if cache.entered.load(Ordering::SeqCst) == 1 { break; }
+                }
+            }
+        }
+    })
+    .await
+    .expect("lookup starts");
+    if cancel {
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut generation)
+            .await
+            .expect("cancellation does not wait for adapter");
+        assert!(matches!(
+            result,
+            Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+        ));
+    }
+    drop(generation);
+    assert_eq!(provider.starts, 0);
+    assert_eq!(cache.aborts.load(Ordering::SeqCst), 0);
+    release.send(()).expect("release abandoned lookup");
+    drop(agent);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&cache) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late lookup result released");
+    assert_eq!(cache.aborts.load(Ordering::SeqCst), usize::from(!hit));
+    assert_eq!(provider.starts, 0);
+}
+
+#[derive(Debug)]
+struct StoreOutcomeCache {
+    fail: bool,
+    puts: AtomicUsize,
+    aborts: AtomicUsize,
+}
+
+impl ModelResponseCache for StoreOutcomeCache {
+    fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+        Ok(None)
+    }
+
+    fn put(
+        &self,
+        _request: &AgentTurnRequest,
+        _response: &GenerateTextResponse,
+    ) -> bcode::Result<()> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            Err(bcode::BcodeError::Cache("fixture storage failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn abort(&self, _request: &AgentTurnRequest) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn cache_storage_disarms_or_aborts_miss_exactly_once() {
+    for fail in [false, true] {
+        let cache = Arc::new(StoreOutcomeCache {
+            fail,
+            puts: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
+        });
+        let agent = Agent::builder().response_cache(cache.clone()).build();
+        let mut provider = CountingProvider::default();
+        let result = agent
+            .generate_text_with_provider(&mut provider, "store miss")
+            .await;
+        if fail {
+            assert!(
+                matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "fixture storage failure")
+            );
+        } else {
+            assert!(matches!(
+                result.expect("storage succeeds").cache_status,
+                ModelResponseCacheStatus::Stored { .. }
+            ));
+        }
+        assert_eq!(provider.starts, 1);
+        assert_eq!(cache.puts.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.aborts.load(Ordering::SeqCst), usize::from(fail));
+    }
+}
+
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
 struct AbortProbeCache {
@@ -883,7 +1054,129 @@ impl ModelResponseCache for AbortProbeCache {
 
 #[cfg(feature = "testing")]
 #[tokio::test]
-#[ignore = "known defect: buffered future drop does not abort cache reservation; requires reservation-owned cleanup"]
+async fn already_cancelled_generation_does_not_dispatch_cache_lookup() {
+    let cache = Arc::new(AbortProbeCache::default());
+    let agent = Agent::builder().response_cache(cache.clone()).build();
+    let mut provider = CountingProvider::default();
+    let cancellation = bcode::CancellationToken::new();
+    cancellation.cancel();
+    let result = agent
+        .generate_text_with_provider_and_cancellation(
+            &mut provider,
+            "already cancelled",
+            cancellation,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    drop(agent);
+    // Wait for any wrongly dispatched blocking task to relinquish its adapter reference,
+    // so a delayed get cannot make the zero-lookup assertion pass accidentally.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&cache) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cache references released");
+    assert_eq!(cache.lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(cache.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.starts, 0);
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn returned_provider_failure_aborts_cache_miss_once() {
+    use bcode::testing::{ScriptedProvider, ScriptedProviderTurn};
+
+    for started in [false, true] {
+        let cache = Arc::new(AbortProbeCache::default());
+        let agent = Agent::builder().response_cache(cache.clone()).build();
+        let failure = bcode::ProviderError {
+            code: "cache_abort_control".into(),
+            category: bcode::ProviderErrorCategory::ProviderInternal,
+            message: "fixture failure".into(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        };
+        let turn = if started {
+            ScriptedProviderTurn::new().poll_error(failure)
+        } else {
+            ScriptedProviderTurn::start_error(failure)
+        };
+        let mut provider = ScriptedProvider::new([turn]);
+        let probe = provider.probe();
+        let error = agent
+            .generate_text_with_provider(&mut provider, "failed miss")
+            .await
+            .expect_err("provider fails");
+        assert!(
+            matches!(error, bcode::BcodeError::Runtime(bcode::RuntimeError::Provider { code, .. }) if code == "cache_abort_control")
+        );
+        assert_eq!(cache.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.requests().len(), 1);
+        probe
+            .assert_finish_count(usize::from(started))
+            .expect("finish only a started provider");
+        probe
+            .assert_cancellation_count(usize::from(started))
+            .expect("cancel only a started provider");
+    }
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn cancelling_buffered_generation_releases_cache_and_provider() {
+    use bcode::testing::{ScriptedProvider, ScriptedProviderTurn};
+
+    let cache = Arc::new(AbortProbeCache::default());
+    let agent = Agent::builder().response_cache(cache.clone()).build();
+    let mut provider = ScriptedProvider::new([ScriptedProviderTurn::new().pending()]);
+    let probe = provider.probe();
+    let cancellation = bcode::CancellationToken::new();
+    let mut generation = Box::pin(agent.generate_text_with_provider_and_cancellation(
+        &mut provider,
+        "cancel miss",
+        cancellation.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = &mut generation => panic!("generation unexpectedly completed: {result:?}"),
+                () = tokio::task::yield_now() => {
+                    if !probe.requests().is_empty() { break; }
+                }
+            }
+        }
+    })
+    .await
+    .expect("provider starts after cache miss");
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), generation)
+        .await
+        .expect("cancellation completes");
+    assert!(matches!(
+        result,
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    assert_eq!(cache.lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.aborts.load(Ordering::SeqCst), 1);
+    probe.assert_finish_count(1).expect("provider released");
+    probe
+        .assert_cancellation_count(1)
+        .expect("provider cancelled once");
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
 async fn dropping_buffered_generation_after_cache_miss_releases_reservation() {
     use bcode::testing::{ScriptedProvider, ScriptedProviderTurn};
 
@@ -916,6 +1209,141 @@ async fn dropping_buffered_generation_after_cache_miss_releases_reservation() {
     .await
     .expect("dropping generation must release cache reservation");
     assert_eq!(cache.aborts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancelled_cache_follower_exits_within_bounded_wait() {
+    let cache = Arc::new(InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(2).expect("positive capacity"),
+    ));
+    let leader = AgentTurnRequest::new("model", "follower cancellation");
+    assert!(cache.get(&leader).expect("leader reservation").is_none());
+    let mut request = leader.clone();
+    request.cancellation = bcode::CancellationToken::new();
+    let cancellation = request.cancellation.clone();
+    let follower_cache = cache.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let follower = std::thread::spawn(move || {
+        sender
+            .send(follower_cache.get(&request))
+            .expect("receiver alive");
+    });
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    cancellation.cancel();
+    assert!(matches!(
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bounded cancellation"),
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    follower.join().expect("follower exits");
+    assert!(!leader.cancellation.is_cancelled());
+
+    let next_request = leader.clone();
+    let next_cache = cache.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let next = std::thread::spawn(move || {
+        sender
+            .send(next_cache.get(&next_request))
+            .expect("receiver alive");
+    });
+    assert!(
+        matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "cancelled follower must not release the leader reservation"
+    );
+    cache.abort(&leader);
+    assert!(
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("leader release wakes follower")
+            .expect("next lookup succeeds")
+            .is_none()
+    );
+    next.join().expect("next follower exits");
+    cache.abort(&leader);
+}
+
+#[tokio::test]
+#[ignore = "known defect: key-only cache completion is not fenced across invalidation"]
+async fn stale_cache_completion_cannot_overwrite_post_invalidation_response() {
+    let cache = InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(2).expect("positive capacity"),
+    );
+    let request = AgentTurnRequest::new("model", "same key");
+    let mut provider = CountingProvider::default();
+    let mut stale = Agent::builder()
+        .build()
+        .generate_text_with_provider(&mut provider, "fixture response")
+        .await
+        .expect("response fixture");
+    stale.text = "stale".into();
+    let mut fresh = stale.clone();
+    fresh.text = "fresh".into();
+
+    assert!(cache.get(&request).expect("old miss").is_none());
+    cache.invalidate_all().expect("invalidate old reservation");
+    assert!(cache.get(&request).expect("replacement miss").is_none());
+    cache.put(&request, &fresh).expect("replacement completes");
+    cache.put(&request, &stale).expect("old completion handled");
+    assert_eq!(
+        cache
+            .get(&request)
+            .expect("cached response")
+            .expect("hit")
+            .text,
+        "fresh"
+    );
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn dropping_uncached_buffered_generation_releases_provider() {
+    use bcode::testing::{ScriptedProvider, ScriptedProviderTurn};
+    let runtime = bcode::AgentRuntime::new();
+    let agent = Agent::builder().runtime(runtime.clone()).build();
+    let mut provider = ScriptedProvider::new([ScriptedProviderTurn::new().pending()]);
+    let probe = provider.probe();
+    let mut generation =
+        Box::pin(agent.generate_text_with_provider(&mut provider, "drop uncached"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = &mut generation => panic!("pending provider completed: {result:?}"),
+                () = tokio::task::yield_now() => {
+                    if !probe.requests().is_empty() { break; }
+                }
+            }
+        }
+    })
+    .await
+    .expect("provider starts");
+    assert!(runtime.active_turn_generation().is_some());
+    drop(generation);
+    assert!(
+        runtime.active_turn_generation().is_none(),
+        "dropped loop releases runtime scope"
+    );
+    let cleanup = tokio::time::timeout(Duration::from_secs(2), async {
+        while probe.assert_finish_count(1).is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    probe
+        .assert_finish_count(1)
+        .expect("dropped buffered provider released within cleanup watchdog");
+    cleanup.expect("cleanup completed before watchdog");
+    probe
+        .assert_cancellation_count(1)
+        .expect("dropped provider cancelled");
 }
 
 #[test]
