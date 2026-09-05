@@ -47022,6 +47022,39 @@ library = "test"
         );
     }
 
+    async fn assert_invalid_resolutions_preserve_pending_exchange(
+        state: &ServerState,
+        client_id: ClientId,
+        request: &ToolExchangeRequest,
+    ) {
+        for invalid in [
+            ToolExchangeResolution::TimedOut,
+            ToolExchangeResolution::NoCompatibleConsumer,
+            ToolExchangeResolution::ConsumerDetached,
+            ToolExchangeResolution::Failed {
+                code: "forged".to_owned(),
+                message: "must not terminalize".to_owned(),
+            },
+            ToolExchangeResolution::Responded {
+                payload: serde_json::json!("x".repeat(64 * 1024)),
+            },
+        ] {
+            assert!(matches!(
+                interaction_operations::resolve_tool_exchange(
+                    state,
+                    client_id,
+                    &request.exchange_id,
+                    invalid,
+                )
+                .await,
+                Err(interaction_operations::ResolveToolExchangeError::InvalidResolution)
+            ));
+            let pending = interaction_operations::list_pending_tool_exchanges(state).await;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(&pending[0].request, request);
+        }
+    }
+
     #[tokio::test]
     async fn interaction_operation_executes_complete_exchange_lifecycle_without_transport() {
         let state = Arc::new(test_server_state(SessionManager::default()));
@@ -47081,15 +47114,19 @@ library = "test"
         })
         .await
         .expect("exchange should become pending");
+        assert_invalid_resolutions_preserve_pending_exchange(&state, client_id, &request).await;
+        assert!(!operation.is_finished());
         assert!(
-            interaction_operations::complete_pending_tool_exchange(
+            interaction_operations::resolve_tool_exchange(
                 state.as_ref(),
+                client_id,
                 &request.exchange_id,
                 ToolExchangeResolution::Responded {
                     payload: serde_json::json!({"accepted": true}),
                 },
             )
             .await
+            .expect("compatible client response")
         );
         assert_eq!(
             operation.await.expect("join").expect("exchange operation"),
@@ -47113,6 +47150,46 @@ library = "test"
             ToolExchangeResolution::Failed { ref code, .. }
                 if code == "invocation_id_mismatch"
         ));
+    }
+
+    #[tokio::test]
+    async fn interaction_operation_rejects_host_outcomes_and_oversized_direct_resolutions() {
+        let state = test_server_state(SessionManager::default());
+        let client_id = ClientId::new();
+        for resolution in [
+            ToolExchangeResolution::TimedOut,
+            ToolExchangeResolution::NoCompatibleConsumer,
+            ToolExchangeResolution::ConsumerDetached,
+            ToolExchangeResolution::Failed {
+                code: "forged".to_owned(),
+                message: "host-only outcome".to_owned(),
+            },
+            ToolExchangeResolution::Responded {
+                payload: serde_json::json!("x".repeat(64 * 1024)),
+            },
+        ] {
+            assert!(matches!(
+                interaction_operations::resolve_tool_exchange(
+                    &state,
+                    client_id,
+                    "absent-exchange",
+                    resolution,
+                )
+                .await,
+                Err(interaction_operations::ResolveToolExchangeError::InvalidResolution)
+            ));
+        }
+        assert!(
+            !interaction_operations::resolve_tool_exchange(
+                &state,
+                client_id,
+                "absent-exchange",
+                ToolExchangeResolution::Cancelled,
+            )
+            .await
+            .expect("valid cancellation of absent exchange")
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -47866,6 +47943,89 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("IPC subscribed plugin event"),
             1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_discovery_operations_match_real_ipc_results() {
+        let root = tempfile::tempdir().expect("skills root");
+        let directory = root.path().join("discovery-skill");
+        std::fs::create_dir(&directory).expect("skill directory");
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\nid: discovery-skill\nname: Discovery Skill\ndescription: Discovery fixture\n---\nRead the repository instructions.",
+        )
+        .expect("skill source");
+        let registry = SkillRegistry::discover(
+            &[bcode_skill::SkillSourceRoot::new(
+                root.path(),
+                bcode_skill_models::SkillSourceKind::Configured,
+                "test:discovery",
+                1,
+            )],
+            SkillRegistryOptions::default(),
+        )
+        .expect("skill registry");
+        let mut state = test_server_state(SessionManager::default());
+        state.skills = Some(registry);
+        let state = Arc::new(state);
+        let direct_skills = session_operations::list_skills(&state);
+        assert_eq!(direct_skills.skills.len(), 1);
+        let skill_id = direct_skills.skills[0].id.clone();
+        let direct_skill =
+            session_operations::describe_skill(&state, &skill_id).expect("direct skill manifest");
+        let direct_agents = session_operations::list_agents(&state, ClientId::new()).await;
+        let direct_policy = session_operations::agent_policy_status(&state).await;
+        let missing_id = SkillId::new("missing-discovery-skill");
+        let direct_error =
+            session_operations::describe_skill(&state, &missing_id).expect_err("missing skill");
+
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        assert_eq!(
+            client.list_agents().await.expect("IPC agents"),
+            direct_agents
+        );
+        assert_eq!(
+            client
+                .agent_policy_status()
+                .await
+                .expect("IPC policy status"),
+            direct_policy
+        );
+        assert_eq!(
+            client.list_skills().await.expect("IPC skills"),
+            direct_skills
+        );
+        assert_eq!(
+            client.describe_skill(skill_id).await.expect("IPC manifest"),
+            direct_skill
+        );
+        let error = client
+            .describe_skill(missing_id)
+            .await
+            .expect_err("IPC missing skill");
+        assert!(
+            matches!(error, bcode_client::ClientError::Server { code, message }
+            if code == direct_error.code() && message == direct_error.message())
+        );
+        // A rejected inspection must not damage subsequent discovery.
+        assert_eq!(
+            client.list_skills().await.expect("IPC skills after error"),
+            direct_skills
         );
         server.abort();
     }
@@ -64269,7 +64429,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
 
-        let Err(error) = compact_session_context_with_limit(
+        let Err(error) = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &selection,
@@ -64277,7 +64437,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
             &TurnCancelState::default(),
             None,
-        )
+        ))
         .await
         else {
             panic!("strict provider-native failure must not fall back");
@@ -64962,7 +65122,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
 
-        compact_session_context_with_limit(
+        Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &selection,
@@ -64970,7 +65130,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
             &TurnCancelState::default(),
             None,
-        )
+        ))
         .await
         .unwrap_or_else(|error| panic!("local fallback failed: {error}"));
 
@@ -65037,7 +65197,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
 
-        compact_session_context_with_limit(
+        Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &selection,
@@ -65045,7 +65205,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
             &TurnCancelState::default(),
             None,
-        )
+        ))
         .await
         .unwrap_or_else(|error| panic!("local fallback failed: {error}"));
 
@@ -65118,7 +65278,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
 
-        compact_session_context_with_limit(
+        Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &selection,
@@ -65126,7 +65286,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
             &TurnCancelState::default(),
             None,
-        )
+        ))
         .await
         .unwrap_or_else(|error| panic!("provider-native compaction failed: {error}"));
 
@@ -65254,7 +65414,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .await
                     .expect("append assistant turn");
             }
-            compact_session_context_with_limit(
+            Box::pin(compact_session_context_with_limit(
                 &state,
                 session_id,
                 &selection,
@@ -65262,7 +65422,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 None,
                 &TurnCancelState::default(),
                 None,
-            )
+            ))
             .await
             .unwrap_or_else(|error| panic!("compaction round {round} failed: {error}"));
         }
@@ -65343,7 +65503,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut state = test_server_state(sessions);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         let cancel_state = TurnCancelState::default();
-        let Err(error) = compact_session_context_with_limit(
+        let Err(error) = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &SessionModelSelection::default(),
@@ -65354,7 +65514,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 minimum_reclaimable_tokens: u64::MAX,
                 previous_compacted_through_sequence: None,
             }),
-        )
+        ))
         .await
         else {
             panic!("ineffective compaction must be rejected before provider work");
@@ -65386,7 +65546,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let session_id = summary.id;
         let state = test_server_state(sessions);
 
-        let result = compact_session_context_with_limit(
+        let result = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &SessionModelSelection::default(),
@@ -65397,7 +65557,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 minimum_reclaimable_tokens: 1,
                 previous_compacted_through_sequence: None,
             }),
-        )
+        ))
         .await;
         assert!(matches!(result, Err(CompactionError::PlanUnavailable(_))));
 
@@ -66279,7 +66439,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_id: Some("fake-echo".to_owned()),
             ..SessionModelSelection::default()
         };
-        let first = compact_session_context_with_limit(
+        let first = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &selection,
@@ -66287,11 +66447,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
             &TurnCancelState::default(),
             None,
-        )
+        ))
         .await
         .expect("initial compaction");
 
-        let unchanged = compact_session_context_with_limit(
+        let unchanged = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &selection,
@@ -66302,7 +66462,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 minimum_reclaimable_tokens: 1,
                 previous_compacted_through_sequence: Some(first.compacted_through_sequence),
             }),
-        )
+        ))
         .await;
         assert!(matches!(
             unchanged,
@@ -66318,7 +66478,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await;
         }
-        let tiny = compact_session_context_with_limit(
+        let tiny = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &selection,
@@ -66329,7 +66489,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 minimum_reclaimable_tokens: 10_000,
                 previous_compacted_through_sequence: Some(first.compacted_through_sequence),
             }),
-        )
+        ))
         .await;
         assert!(matches!(
             tiny,
@@ -66365,7 +66525,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let cancel_state = TurnCancelState::default();
         cancel_state.cancel().await;
 
-        let Err(error) = compact_session_context_with_limit(
+        let Err(error) = Box::pin(compact_session_context_with_limit(
             &state,
             session_id,
             &SessionModelSelection::default(),
@@ -66373,7 +66533,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
             &cancel_state,
             None,
-        )
+        ))
         .await
         else {
             panic!("cancelled compaction must stop before provider work");

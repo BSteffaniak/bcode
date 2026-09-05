@@ -95,7 +95,8 @@ pub enum CliError {
     Sshenv(String),
     #[error("session history accepts only one of --after or --before")]
     InvalidSessionHistoryRange,
-    #[error("interrupted: {0}")]
+    /// I/O failure, including signal-listener setup failures (not a received signal).
+    #[error("I/O error: {0}")]
     Signal(#[from] std::io::Error),
     #[error("--new cannot be combined with a subcommand")]
     NewSessionWithCommand,
@@ -115,6 +116,10 @@ pub enum CliError {
     TurnRejected(bcode_session_models::TurnRejectionReason),
     #[error("turn was cancelled before start")]
     TurnCancelledBeforeStart,
+    #[error("session-search backfill was cancelled")]
+    SessionSearchBackfillCancelled,
+    #[error("session-search backfill did not complete")]
+    SessionSearchBackfillIncomplete,
     #[error("tool exchange resolution is malformed or unsupported")]
     InvalidExchangeResolution,
     #[error(transparent)]
@@ -140,16 +145,34 @@ impl CliError {
             | Self::InvalidSessionHistoryRange
             | Self::NewSessionWithCommand
             | Self::SessionRepairUsage(_)
+            | Self::InvalidExchangeResolution
             | Self::Json(_) => 2,
-            Self::Client(ClientError::Server { code, .. }) if code.contains("authorization") => 3,
-            Self::TurnRejected(_) => 3,
             Self::Client(ClientError::Server { code, .. })
-                if code.contains("cancel") || code == "invalid_exchange_resolution" =>
+                if code == "invalid_exchange_resolution" =>
+            {
+                2
+            }
+            Self::Client(ClientError::Server { code, .. })
+                if matches!(
+                    code.as_str(),
+                    "authorization_denied" | "workflow_operation_unauthorized"
+                ) =>
+            {
+                3
+            }
+            Self::TurnRejected(bcode_session_models::TurnRejectionReason::ExecutionPolicy) => 3,
+            Self::TurnRejected(bcode_session_models::TurnRejectionReason::SessionUnavailable) => 1,
+            Self::Client(ClientError::Server { code, .. })
+                if matches!(
+                    code.as_str(),
+                    "cancelled" | "workflow_computation_cancelled" | "worktree_create_cancelled"
+                ) =>
             {
                 4
             }
-            Self::TurnCancelledBeforeStart | Self::InvalidExchangeResolution => 4,
-            Self::Signal(_) => 130,
+            Self::TurnCancelledBeforeStart | Self::SessionSearchBackfillCancelled => 4,
+            Self::SessionSearchBackfillIncomplete => 1,
+            Self::Signal(_) => 1,
             Self::Client(_)
             | Self::DaemonLifecycle(_)
             | Self::DaemonStart(_)
@@ -1827,20 +1850,25 @@ fn read_json_with_limit(
     max_bytes: usize,
     description: &str,
 ) -> Result<serde_json::Value, CliError> {
-    let mut bytes = Vec::new();
     if path == Path::new("-") {
-        std::io::stdin()
-            .take((max_bytes + 1) as u64)
-            .read_to_end(&mut bytes)?;
+        read_json_from_reader(std::io::stdin().lock(), max_bytes, description)
     } else {
-        let metadata = fs::metadata(path)?;
-        if metadata.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
-            return Err(CliError::InvalidArguments(format!(
-                "{description} exceeds {max_bytes} bytes"
-            )));
-        }
-        bytes = fs::read(path)?;
+        read_json_from_reader(fs::File::open(path)?, max_bytes, description)
     }
+}
+
+fn read_json_from_reader(
+    reader: impl std::io::Read,
+    max_bytes: usize,
+    description: &str,
+) -> Result<serde_json::Value, CliError> {
+    // Read one sentinel byte beyond the limit to distinguish an exact-size input
+    // from an oversized one. Bound the read itself, not mutable file metadata.
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    reader.take(read_limit).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Err(CliError::InvalidArguments(format!(
             "{description} exceeds {max_bytes} bytes"
@@ -1850,12 +1878,32 @@ fn read_json_with_limit(
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    write_json_result(&mut std::io::stdout().lock(), value)
+}
+
+fn write_json_result<W: std::io::Write, T: Serialize>(
+    output: &mut W,
+    value: &T,
+) -> Result<(), CliError> {
+    let result = serde_json::to_string_pretty(value)?;
+    writeln!(output, "{result}")?;
+    output.flush()?;
     Ok(())
 }
 
 fn print_json_line<T: Serialize>(value: &T) -> Result<(), CliError> {
-    println!("{}", serde_json::to_string(value)?);
+    write_json_stream_record(&mut std::io::stdout().lock(), value)
+}
+
+fn write_json_stream_record<W: std::io::Write, T: Serialize>(
+    output: &mut W,
+    value: &T,
+) -> Result<(), CliError> {
+    // Serialize before writing so a serialization error cannot leave a partial record.
+    let record = serde_json::to_string(value)?;
+    writeln!(output, "{record}")?;
+    // Live consumers must receive each record without waiting for the buffer to fill.
+    output.flush()?;
     Ok(())
 }
 
@@ -1944,12 +1992,22 @@ async fn handle_worktree_command(command: WorktreeCommand) -> Result<(), CliErro
     Ok(())
 }
 
+fn filter_session_exchanges(
+    exchanges: &mut Vec<bcode_ipc::PendingToolExchangeSummary>,
+    session_id: Option<SessionId>,
+) {
+    if let Some(session_id) = session_id {
+        exchanges.retain(|exchange| exchange.session_id == session_id);
+    }
+}
+
 async fn handle_interaction_command(command: InteractionCommand) -> Result<(), CliError> {
     match command {
-        InteractionCommand::List { json } => {
+        InteractionCommand::List { session_id, json } => {
             ensure_server_running().await?;
             let client = BcodeClient::default_endpoint();
-            let exchanges = client.list_pending_tool_exchanges().await?;
+            let mut exchanges = client.list_pending_tool_exchanges().await?;
+            filter_session_exchanges(&mut exchanges, session_id);
             if json {
                 print_json(&exchanges)?;
             } else if exchanges.is_empty() {
@@ -2419,6 +2477,29 @@ async fn handle_session_io_command(
 
 async fn handle_permission_command(command: PermissionCommand) -> Result<(), CliError> {
     match command {
+        PermissionCommand::Status { json } => {
+            ensure_server_running().await?;
+            let status = BcodeClient::default_endpoint()
+                .agent_policy_status()
+                .await?;
+            if json {
+                print_json(&status)?;
+            } else {
+                println!("source: {}", status.source);
+                println!("using default policy: {}", status.using_default);
+                println!(
+                    "build enabled tools: {}",
+                    status.build_enabled_tools.join(", ")
+                );
+                println!(
+                    "plan enabled tools: {}",
+                    status.plan_enabled_tools.join(", ")
+                );
+                for diagnostic in status.diagnostics {
+                    eprintln!("{diagnostic}");
+                }
+            }
+        }
         PermissionCommand::List { session_id, json } => {
             list_permissions(session_id, json).await?;
         }
@@ -3474,6 +3555,22 @@ enum StateCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// List agent profiles available from the daemon for session selection.
+    Agents {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List available skills and discovery diagnostics from the daemon.
+    Skills {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect the daemon's manifest for one available skill.
+    DescribeSkill {
+        skill_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     Create {
         name: Option<String>,
         /// Print the created session summary as JSON.
@@ -3776,8 +3873,10 @@ enum SessionCommand {
         after_timestamp_ms: Option<u64>,
         #[arg(long)]
         before_timestamp_ms: Option<u64>,
+        /// Unsupported legacy option; complete backfill does not accept a catalog cursor.
         #[arg(long, value_parser = parse_session_search_backfill_cursor)]
         cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
+        /// Wall-clock budget per backfill slice, not a total operation timeout.
         #[arg(long, default_value_t = 30_000)]
         deadline_ms: u64,
         #[arg(long)]
@@ -3818,10 +3917,10 @@ enum SessionCommand {
         /// Select catalog sessions updated at or before this Unix timestamp in milliseconds.
         #[arg(long)]
         before_timestamp_ms: Option<u64>,
-        /// Continue a prior bounded catalog selection after `UPDATED_AT_MS:SESSION_ID`.
+        /// Unsupported legacy option; complete backfill does not accept a catalog cursor.
         #[arg(long, value_parser = parse_session_search_backfill_cursor)]
         cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
-        /// Bounded wall-clock deadline for this request.
+        /// Wall-clock budget per backfill slice, not a total operation timeout.
         #[arg(long, default_value_t = 30_000)]
         deadline_ms: u64,
         #[arg(long)]
@@ -3971,7 +4070,10 @@ enum SessionCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 enum SessionImportCommand {
-    Sources,
+    Sources {
+        #[arg(long)]
+        json: bool,
+    },
     Discover {
         #[arg(long)]
         source: Option<String>,
@@ -4517,6 +4619,11 @@ enum OpenAiLoginFlow {
 
 #[derive(Debug, Subcommand)]
 enum PermissionCommand {
+    /// Inspect the daemon's effective agent-policy summary and degradation diagnostics.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
     List {
         /// Restrict pending permissions to one canonical session.
         #[arg(long)]
@@ -4575,6 +4682,9 @@ enum PermissionCommand {
 enum InteractionCommand {
     /// List pending renderer-neutral tool exchanges.
     List {
+        /// Restrict pending exchanges to one canonical session.
+        #[arg(long)]
+        session_id: Option<SessionId>,
         /// Print the complete structured exchange envelopes as JSON.
         #[arg(long)]
         json: bool,
@@ -4754,6 +4864,51 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
 #[allow(clippy::too_many_lines)]
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
+        SessionCommand::Agents { json } => {
+            ensure_server_running().await?;
+            let agents = BcodeClient::default_endpoint().list_agents().await?;
+            if json {
+                print_json(&agents)?;
+            } else {
+                for agent in agents {
+                    println!("{}\t{}\t{}", agent.id, agent.name, agent.description);
+                }
+            }
+        }
+        SessionCommand::Skills { json } => {
+            ensure_server_running().await?;
+            let result = BcodeClient::default_endpoint().list_skills().await?;
+            if json {
+                print_json(&result)?;
+            } else {
+                for skill in result.skills {
+                    println!(
+                        "{}\t{}\t{}",
+                        skill.id,
+                        skill.name,
+                        skill.description.as_deref().unwrap_or_default()
+                    );
+                }
+                for diagnostic in result.diagnostics {
+                    eprintln!("{:?}: {}", diagnostic.severity, diagnostic.message);
+                }
+            }
+        }
+        SessionCommand::DescribeSkill { skill_id, json } => {
+            ensure_server_running().await?;
+            let skill = BcodeClient::default_endpoint()
+                .describe_skill(bcode_skill_models::SkillId::new(skill_id))
+                .await?;
+            if json {
+                print_json(&skill)?;
+            } else {
+                println!("{} ({})", skill.summary.name, skill.summary.id);
+                if let Some(description) = skill.summary.description {
+                    println!("{description}");
+                }
+                println!("{}", skill.instructions);
+            }
+        }
         SessionCommand::Create { name, json } => Box::pin(create_session(name, json)).await?,
         SessionCommand::List { json } => Box::pin(list_sessions(json)).await?,
         SessionCommand::Rename {
@@ -4989,8 +5144,7 @@ fn prune_relocation_staging_command(
         .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+        return print_json(&report);
     }
 
     if report.is_empty() {
@@ -5058,11 +5212,7 @@ fn list_state_locations(json: bool) -> Result<(), CliError> {
         .collect::<Vec<_>>();
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "locations": rows }))?
-        );
-        return Ok(());
+        return print_json(&serde_json::json!({ "locations": rows }));
     }
 
     println!("Configured state locations ({}):", rows.len());
@@ -5201,18 +5351,14 @@ fn print_relocation_plan(
     json: bool,
 ) -> Result<(), CliError> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source_sessions_root": source_root,
-                "destination_sessions_root": destination_root,
-                "relocatable": plan.relocatable,
-                "blocked": plan.blocked,
-                "total_bytes": plan.total_bytes(),
-                "pinned_artifact_sessions": plan.pinned_artifact_sessions(),
-            }))?
-        );
-        return Ok(());
+        return print_json(&serde_json::json!({
+            "source_sessions_root": source_root,
+            "destination_sessions_root": destination_root,
+            "relocatable": plan.relocatable,
+            "blocked": plan.blocked,
+            "total_bytes": plan.total_bytes(),
+            "pinned_artifact_sessions": plan.pinned_artifact_sessions(),
+        }));
     }
     println!("Relocation plan (dry run; nothing was copied or deleted):");
     println!("  source:      {}", source_root.display());
@@ -5262,8 +5408,7 @@ fn print_relocation_report(
     json: bool,
 ) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
+        return print_json(report);
     }
     println!("Relocated {} session(s).", report.relocated.len());
     for session_id in &report.relocated {
@@ -5539,8 +5684,7 @@ fn auth_security(
             status.device_seal_backend
         )));
     }
-    println!("{}", serde_json::to_string(&status)?);
-    Ok(())
+    print_json_line(&status)
 }
 
 fn handle_auth_usage_command(command: AuthUsageCommand) -> Result<(), CliError> {
@@ -6710,8 +6854,7 @@ fn print_auth_resets_report(
     json: bool,
 ) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
+        return print_json(report);
     }
 
     if report.profiles.len() == 1 {
@@ -6886,8 +7029,7 @@ fn print_auth_reset_consume_report(
     json: bool,
 ) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
+        return print_json(report);
     }
     if report.dry_run {
         println!("Dry run: no reset was consumed.");
@@ -6937,8 +7079,7 @@ fn print_auth_reset_consume_report(
 
 fn print_auth_usage_report(report: &AuthUsageReport, json: bool) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
+        return print_json(report);
     }
     println!("Auth usage: {}", report.pool);
     println!("Provider plugin: {}", report.provider_plugin_id);
@@ -6963,8 +7104,7 @@ fn print_auth_usage_report(report: &AuthUsageReport, json: bool) -> Result<(), C
 
 fn print_auth_prime_report(report: &AuthPrimeReport, json: bool) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
+        return print_json(report);
     }
     println!("Prime status: {}", report.pool);
     println!("Provider plugin: {}", report.provider_plugin_id);
@@ -9244,7 +9384,7 @@ async fn list_models(json: bool, provider: Option<String>) -> Result<(), CliErro
         .session_model_list(provider)
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&models)?);
+        print_json(&models)?;
     } else {
         print_model_list(&models.models);
     }
@@ -9259,7 +9399,7 @@ async fn model_status(session_id: Option<SessionId>, json: bool) -> Result<(), C
         client.default_model_status().await?
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        print_json(&status)?;
     } else {
         print_model_status(&status);
     }
@@ -9480,6 +9620,8 @@ fn verify_models(
         total_models: candidates.len(),
         results,
     };
+    // Provider work is complete; output failures must not skip plugin deactivation.
+    host.deactivate_all()?;
     let body = serde_json::to_string_pretty(&report)?;
     if let Some(output) = output {
         if let Some(parent) = output.parent() {
@@ -9488,9 +9630,8 @@ fn verify_models(
         fs::write(&output, body)?;
         println!("wrote {}", display_from_current_dir(&output));
     } else {
-        println!("{body}");
+        print_json(&report)?;
     }
-    host.deactivate_all()?;
     Ok(())
 }
 
@@ -9738,18 +9879,23 @@ async fn verify_model_caches(args: &VerifyCacheArgs) -> Result<(), CliError> {
         passed,
         results,
     };
+    // Provider work is complete; output failures must not skip plugin deactivation.
+    host.deactivate_all()?;
     let body = serde_json::to_string_pretty(&report)?;
     if let Some(output) = &args.output {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(output, &body)?;
-        println!("wrote {}", display_from_current_dir(output));
+        if args.json {
+            eprintln!("wrote {}", display_from_current_dir(output));
+        } else {
+            println!("wrote {}", display_from_current_dir(output));
+        }
     }
     if args.json {
-        println!("{body}");
+        print_json(&report)?;
     }
-    host.deactivate_all()?;
     if passed {
         Ok(())
     } else {
@@ -10205,7 +10351,7 @@ async fn server_metrics(json: bool, report: bool) -> Result<(), CliError> {
         } else {
             serde_json::to_value(&status.metrics)?
         };
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        print_json(&value)?;
     } else {
         print_metrics_summary(&status.metrics);
         println!(
@@ -10221,7 +10367,7 @@ async fn server_diagnose(json: bool) -> Result<(), CliError> {
     let status = client.verified_server_status().await?;
     let diagnosis = ServerDiagnosis::from_status(status)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+        print_json(&diagnosis)?;
     } else {
         print_server_diagnosis(&diagnosis);
     }
@@ -11472,7 +11618,7 @@ async fn create_session(name: Option<String>, json: bool) -> Result<(), CliError
     let client = BcodeClient::default_endpoint();
     let session = client.create_session(name).await?;
     if json {
-        println!("{}", serde_json::to_string(&session)?);
+        print_json_line(&session)?;
     } else {
         println!("{}", session.id);
     }
@@ -11483,7 +11629,7 @@ async fn list_sessions(json: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let sessions = client.list_sessions().await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        print_json(&sessions)?;
         return Ok(());
     }
     if sessions.is_empty() {
@@ -11505,7 +11651,7 @@ async fn rename_session(session_id: SessionId, name: String, json: bool) -> Resu
     let client = BcodeClient::default_endpoint();
     let session = client.rename_session(session_id, Some(name)).await?;
     if json {
-        println!("{}", serde_json::to_string(&session)?);
+        print_json_line(&session)?;
     } else {
         println!("renamed {} to {}", session.id, session.display_title());
     }
@@ -11521,7 +11667,7 @@ async fn delete_session(session_id: SessionId, yes: bool, json: bool) -> Result<
     let client = BcodeClient::default_endpoint();
     let session = client.delete_session(session_id).await?;
     if json {
-        println!("{}", serde_json::to_string(&session)?);
+        print_json_line(&session)?;
     } else {
         println!("deleted {} ({})", session.display_title(), session.id);
     }
@@ -11748,7 +11894,7 @@ async fn session_history(
         )
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&page)?);
+        print_json(&page)?;
         return Ok(());
     }
     for issue in &page.compatibility_issues {
@@ -11788,7 +11934,7 @@ async fn session_around(
         )
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&window)?);
+        print_json(&window)?;
         return Ok(());
     }
     for issue in &window.compatibility_issues {
@@ -11835,7 +11981,7 @@ async fn session_inspect(
         )
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&page)?);
+        print_json(&page)?;
         return Ok(());
     }
     for issue in &page.compatibility_issues {
@@ -12155,15 +12301,11 @@ async fn session_search(command: SessionSearchCliCommand) -> Result<(), CliError
         .session_search(request, policy, Vec::new(), command.hydrate)
         .await?;
     if command.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&session_search_json(
-                execution_class,
-                &response,
-                &hydrated_hits,
-            ))?
-        );
-        return Ok(());
+        return print_json(&session_search_json(
+            execution_class,
+            &response,
+            &hydrated_hits,
+        ));
     }
     for hit in &response.hits {
         println!(
@@ -12320,8 +12462,7 @@ fn print_session_bulk_migration_status(
     json: bool,
 ) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(status)?);
-        return Ok(());
+        return print_json(status);
     }
     println!(
         "{}: {:?} mode={:?} revision={} selected={} visited={} migrated={} blocked={} failed={}",
@@ -12355,8 +12496,7 @@ async fn session_search_status(json: bool) -> Result<(), CliError> {
         .session_search_providers()
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        return Ok(());
+        return print_json(&response);
     }
     for provider in response.providers {
         println!(
@@ -12421,7 +12561,7 @@ async fn session_search_maintenance(
         client.session_search_purge(provider, confirmation).await?
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        print_json(&response)?;
     } else {
         println!(
             "{} {} complete: state={:?}, index={}/{}, documents={}",
@@ -12486,13 +12626,14 @@ async fn handle_session_search_backfill_start_cli(command: SessionCommand) -> Re
         sessions,
         after_timestamp_ms,
         before_timestamp_ms,
-        cursor: _,
+        cursor,
         deadline_ms,
         json,
     } = command
     else {
         unreachable!("session search backfill start handler received another command")
     };
+    validate_complete_backfill_cursor(cursor.as_ref())?;
     let response = BcodeClient::default_endpoint()
         .session_search_complete_backfill_start(
             bcode_session_search::CompleteSessionSearchBackfillRequest {
@@ -12505,7 +12646,7 @@ async fn handle_session_search_backfill_start_cli(command: SessionCommand) -> Re
         )
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        print_json(&response)?;
     } else {
         println!(
             "started {} for {}",
@@ -12547,7 +12688,7 @@ fn print_session_search_backfill_operation(
     json: bool,
 ) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(status)?);
+        print_json_line(status)?;
     } else {
         println!(
             "{}: {:?} provider={} revision={}",
@@ -12652,16 +12793,15 @@ fn parse_session_search_backfill_cursor(
     })
 }
 
-fn complete_backfill_terminal_result(
+const fn complete_backfill_terminal_result(
     status: &bcode_session_search::SessionSearchBackfillOperationStatus,
 ) -> Result<(), CliError> {
-    if status.state == bcode_session_search::SessionSearchBackfillOperationState::Completed {
-        Ok(())
-    } else {
-        Err(CliError::InvalidArguments(format!(
-            "session-search backfill ended in {:?} state",
-            status.state
-        )))
+    match status.state {
+        bcode_session_search::SessionSearchBackfillOperationState::Completed => Ok(()),
+        bcode_session_search::SessionSearchBackfillOperationState::Cancelled => {
+            Err(CliError::SessionSearchBackfillCancelled)
+        }
+        _ => Err(CliError::SessionSearchBackfillIncomplete),
     }
 }
 
@@ -12722,15 +12862,27 @@ async fn session_search_backfill_wait_recovering(
     }
 }
 
+fn validate_complete_backfill_cursor(
+    cursor: Option<&bcode_session_search::SessionSearchBackfillCursor>,
+) -> Result<(), CliError> {
+    if cursor.is_some() {
+        return Err(CliError::InvalidArguments(
+            "--cursor is unsupported for complete backfill; use operation status/wait to observe an existing operation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn session_search_backfill(
     provider: Option<String>,
     sessions: Vec<SessionId>,
     after_timestamp_ms: Option<u64>,
     before_timestamp_ms: Option<u64>,
-    _cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
+    cursor: Option<bcode_session_search::SessionSearchBackfillCursor>,
     deadline_ms: u64,
     json: bool,
 ) -> Result<(), CliError> {
+    validate_complete_backfill_cursor(cursor.as_ref())?;
     let client = BcodeClient::default_endpoint();
     let daemon_instance_id = client.server_status().await?.daemon.instance_id;
     let started = client
@@ -12766,9 +12918,7 @@ async fn session_search_backfill(
                     json,
                     &mut last_printed_revision,
                 )?;
-                return Err(CliError::InvalidArguments(
-                    "session-search backfill cancelled".to_owned(),
-                ));
+                return complete_backfill_terminal_result(&status);
             }
         };
         revision = status.revision;
@@ -12786,13 +12936,11 @@ async fn session_search_backfill(
             )?;
             return complete_backfill_terminal_result(&status);
         }
-        if !json {
-            print_session_search_backfill_operation_if_changed(
-                &status,
-                false,
-                &mut last_printed_revision,
-            )?;
-        }
+        print_session_search_backfill_operation_if_changed(
+            &status,
+            json,
+            &mut last_printed_revision,
+        )?;
     }
 }
 
@@ -12813,8 +12961,7 @@ async fn session_search_explain(command: SessionSearchCliCommand) -> Result<(), 
         )
         .await?;
     if command.json {
-        println!("{}", serde_json::to_string_pretty(&plan)?);
-        return Ok(());
+        return print_json(&plan);
     }
     for provider in plan.providers {
         println!(
@@ -12857,7 +13004,7 @@ async fn session_export(
         match format {
             SessionExportFormat::Jsonl => {
                 for event in page.events {
-                    println!("{}", serde_json::to_string(&event)?);
+                    print_json_line(&event)?;
                 }
             }
         }
@@ -13152,7 +13299,7 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
     match collect_session_diagnosis(session_id, &root).await {
         Ok(diagnosis) => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+                print_json(&diagnosis)?;
             } else {
                 print_session_diagnosis(&diagnosis);
             }
@@ -13165,7 +13312,7 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
             let diagnosis =
                 collect_session_locked_diagnosis(session_id, &root, &error.to_string()).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+                print_json(&diagnosis)?;
             } else {
                 print_session_locked_diagnosis(&diagnosis);
             }
@@ -13394,7 +13541,7 @@ async fn retired_catalogs(apply: bool, json: bool) -> Result<(), CliError> {
     let reports =
         retired_catalogs::retired_catalog_reports(state_dir, &session_root, apply).await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&reports)?);
+        print_json(&reports)?;
     } else if reports.is_empty() {
         println!("No retired build-scoped session catalogs found");
     } else {
@@ -14099,7 +14246,7 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
     ensure_server_running().await?;
     let client = BcodeClient::default_endpoint();
     match command {
-        SessionImportCommand::Sources => {
+        SessionImportCommand::Sources { json } => {
             let response = client
                 .call_plugin_service(
                     SESSION_IMPORT_INTERFACE_ID.to_string(),
@@ -14108,8 +14255,12 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
                 )
                 .await?;
             let sources: ListImportSourcesResponse = serde_json::from_slice(&response.payload)?;
-            for source in sources.sources {
-                println!("{}\t{}", source.source_id, source.display_name);
+            if json {
+                print_json(&sources)?;
+            } else {
+                for source in sources.sources {
+                    println!("{}\t{}", source.source_id, source.display_name);
+                }
             }
         }
         SessionImportCommand::Discover {
@@ -14136,7 +14287,7 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
                     .retain(|session| session.source_id == source);
             }
             if json {
-                println!("{}", serde_json::to_string_pretty(&sessions)?);
+                print_json(&sessions)?;
             } else if sessions.sessions.is_empty() {
                 println!("no importable sessions");
             } else {
@@ -14669,17 +14820,7 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
                 },
             )
             .await?;
-        let terminal_failure = match &admission {
-            bcode_session_models::TurnAdmission::Rejected(reason) => {
-                Some(CliError::TurnRejected(reason.clone()))
-            }
-            bcode_session_models::TurnAdmission::CancelledBeforeStart(_) => {
-                Some(CliError::TurnCancelledBeforeStart)
-            }
-            bcode_session_models::TurnAdmission::Accepted(_)
-            | bcode_session_models::TurnAdmission::Existing(_)
-            | bcode_session_models::TurnAdmission::Deferred(_) => None,
-        };
+        let terminal_failure = turn_admission_failure(&admission);
         if json {
             print_json(&serde_json::json!({
                 "session_id": session_id,
@@ -14693,6 +14834,20 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn turn_admission_failure(admission: &bcode_session_models::TurnAdmission) -> Option<CliError> {
+    match admission {
+        bcode_session_models::TurnAdmission::Rejected(reason) => {
+            Some(CliError::TurnRejected(reason.clone()))
+        }
+        bcode_session_models::TurnAdmission::CancelledBeforeStart(_) => {
+            Some(CliError::TurnCancelledBeforeStart)
+        }
+        bcode_session_models::TurnAdmission::Accepted(_)
+        | bcode_session_models::TurnAdmission::Existing(_)
+        | bcode_session_models::TurnAdmission::Deferred(_) => None,
+    }
 }
 
 const fn provider_compaction_origin_label(
@@ -17236,6 +17391,31 @@ mod web_command_tests {
             ))
             .is_err()
         );
+        for (state, exit) in [
+            (
+                bcode_session_search::SessionSearchBackfillOperationState::Cancelled,
+                4,
+            ),
+            (
+                bcode_session_search::SessionSearchBackfillOperationState::Failed,
+                1,
+            ),
+            (
+                bcode_session_search::SessionSearchBackfillOperationState::NeedsAttention,
+                1,
+            ),
+            (
+                bcode_session_search::SessionSearchBackfillOperationState::Running,
+                1,
+            ),
+        ] {
+            assert_eq!(
+                complete_backfill_terminal_result(&status(state, None))
+                    .expect_err("not complete")
+                    .exit_code(),
+                exit
+            );
+        }
         let partial = bcode_session_search::CompleteSessionSearchBackfillResponse {
             provider_ids: vec!["provider".to_owned()],
             catalog_revision_started: 1,
@@ -19427,6 +19607,38 @@ mod session_configuration_cli_tests {
     use super::{Cli, CliError, Commands, SessionCommand, delete_session};
     use clap::Parser as _;
 
+    #[test]
+    fn session_discovery_commands_parse_without_a_session_id() {
+        let agents = Cli::try_parse_from(["bcode", "session", "agents", "--json"])
+            .expect("agent discovery parses");
+        assert!(matches!(
+            agents.command,
+            Some(Commands::Session {
+                command: SessionCommand::Agents { json: true }
+            })
+        ));
+        let skills = Cli::try_parse_from(["bcode", "session", "skills", "--json"])
+            .expect("skill discovery parses");
+        assert!(matches!(
+            skills.command,
+            Some(Commands::Session {
+                command: SessionCommand::Skills { json: true }
+            })
+        ));
+        let manifest = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "describe-skill",
+            "repo:review",
+            "--json",
+        ])
+        .expect("skill inspection parses");
+        assert!(matches!(manifest.command, Some(Commands::Session {
+            command: SessionCommand::DescribeSkill { skill_id, json: true }
+        }) if skill_id == "repo:review"));
+        assert!(Cli::try_parse_from(["bcode", "session", "describe-skill"]).is_err());
+    }
+
     #[tokio::test]
     async fn session_delete_requires_confirmation_before_connecting() {
         let error = delete_session(bcode_session_models::SessionId::new(), false, true)
@@ -19571,6 +19783,20 @@ mod permission_cli_tests {
     use std::str::FromStr as _;
 
     #[test]
+    fn permission_status_parses_human_and_machine_output() {
+        for json in [false, true] {
+            let mut arguments = vec!["bcode", "permission", "status"];
+            if json {
+                arguments.push("--json");
+            }
+            let parsed = Cli::try_parse_from(arguments).expect("policy status parses");
+            assert!(matches!(parsed.command, Some(Commands::Permission {
+                command: PermissionCommand::Status { json: actual }
+            }) if actual == json));
+        }
+    }
+
+    #[test]
     fn permission_commands_parse_scoped_json_remember_and_batch_paths() {
         let session_id = bcode_session_models::SessionId::new();
         let list = Cli::try_parse_from([
@@ -19689,6 +19915,39 @@ mod permission_cli_tests {
 }
 
 #[cfg(test)]
+mod turn_admission_cli_tests {
+    use bcode_session_models::{SessionId, TurnAdmission, TurnReceipt, TurnRejectionReason};
+
+    #[test]
+    fn admission_classification_preserves_receipts_and_distinguishes_all_outcomes() {
+        let receipt = TurnReceipt::from_accepted_event(SessionId::new(), 42);
+        for (admission, expected_exit) in [
+            (TurnAdmission::Accepted(receipt.clone()), None),
+            (TurnAdmission::Existing(receipt.clone()), None),
+            (TurnAdmission::Deferred(receipt.clone()), None),
+            (TurnAdmission::CancelledBeforeStart(receipt), Some(4)),
+            (
+                TurnAdmission::Rejected(TurnRejectionReason::ExecutionPolicy),
+                Some(3),
+            ),
+            (
+                TurnAdmission::Rejected(TurnRejectionReason::SessionUnavailable),
+                Some(1),
+            ),
+        ] {
+            let original = serde_json::to_value(&admission).expect("admission JSON");
+            assert_eq!(
+                super::turn_admission_failure(&admission)
+                    .as_ref()
+                    .map(super::CliError::exit_code),
+                expected_exit
+            );
+            assert_eq!(serde_json::to_value(&admission).unwrap(), original);
+        }
+    }
+}
+
+#[cfg(test)]
 mod exit_code_tests {
     use super::{CliError, ClientError};
 
@@ -19714,14 +19973,76 @@ mod exit_code_tests {
             .exit_code(),
             4
         );
+        for code in [
+            "ralph_run_cancel_failed",
+            "workflow_cancellation_prevents_control",
+            "future_cancel_state",
+            "authorization_service_failed",
+            "future_authorization_state",
+        ] {
+            assert_eq!(
+                CliError::Client(ClientError::Server {
+                    code: code.to_owned(),
+                    message: "operation failed".to_owned(),
+                })
+                .exit_code(),
+                1,
+                "{code}"
+            );
+        }
+        for code in [
+            "workflow_computation_cancelled",
+            "worktree_create_cancelled",
+        ] {
+            assert_eq!(
+                CliError::Client(ClientError::Server {
+                    code: code.to_owned(),
+                    message: "operation cancelled".to_owned(),
+                })
+                .exit_code(),
+                4,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            CliError::Client(ClientError::Server {
+                code: "workflow_operation_unauthorized".to_owned(),
+                message: "workflow operation is not authorized".to_owned(),
+            })
+            .exit_code(),
+            3
+        );
         assert_eq!(CliError::PluginCli("failed".to_owned()).exit_code(), 1);
         assert_eq!(
             CliError::TurnRejected(bcode_session_models::TurnRejectionReason::ExecutionPolicy)
                 .exit_code(),
             3
         );
+        assert_eq!(
+            CliError::TurnRejected(bcode_session_models::TurnRejectionReason::SessionUnavailable)
+                .exit_code(),
+            1
+        );
         assert_eq!(CliError::TurnCancelledBeforeStart.exit_code(), 4);
-        assert_eq!(CliError::InvalidExchangeResolution.exit_code(), 4);
+        assert_eq!(CliError::InvalidExchangeResolution.exit_code(), 2);
+        assert_eq!(
+            CliError::Client(ClientError::Server {
+                code: "invalid_exchange_resolution".to_owned(),
+                message: "tool exchange resolution is malformed or unsupported".to_owned(),
+            })
+            .exit_code(),
+            2
+        );
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let error = CliError::from(std::io::Error::from(kind));
+            assert_eq!(error.exit_code(), 1);
+            assert!(error.to_string().starts_with("I/O error:"));
+        }
     }
 }
 
@@ -19850,12 +20171,217 @@ mod model_cli_tests {
 }
 
 #[cfg(test)]
+mod json_stream_output_tests {
+    use super::{CliError, write_json_stream_record};
+
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        flushes: usize,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn canonical_event_export_is_one_lossless_json_line() {
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 42,
+            timestamp_ms: 123,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "first\nsecond\r\n\"quoted\" λ".to_owned(),
+            },
+        };
+        let mut output = Output::default();
+        write_json_stream_record(&mut output, &event).expect("event output");
+        let text = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert_eq!(output.flushes, 1);
+        let decoded: bcode_session_models::SessionEvent = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn finite_result_preserves_pretty_json_and_returns_output_failures() {
+        let value = serde_json::json!({ "result": [1, 2], "message": "hello\nworld" });
+        let mut output = Output::default();
+        super::write_json_result(&mut output, &value).expect("finite result");
+        assert_eq!(output.flushes, 1);
+        assert_eq!(
+            String::from_utf8(output.bytes).expect("UTF-8"),
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
+        );
+        for fail_write in [true, false] {
+            let mut output = Output {
+                fail_write,
+                fail_flush: !fail_write,
+                ..Output::default()
+            };
+            assert!(matches!(
+                super::write_json_result(&mut output, &value),
+                Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_records_are_compact_delimited_and_flushed_individually() {
+        let mut output = Output::default();
+        let value = serde_json::json!({ "text": "first\nsecond" });
+        for expected_flushes in 1..=2 {
+            write_json_stream_record(&mut output, &value).expect("record written");
+            assert_eq!(output.flushes, expected_flushes);
+        }
+        let text = String::from_utf8(output.bytes).expect("UTF-8 output");
+        assert!(text.ends_with('\n'));
+        assert_eq!(text.lines().count(), 2);
+        for line in text.lines() {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(line).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn stream_write_and_flush_failures_are_returned_without_panicking() {
+        for fail_write in [true, false] {
+            let mut output = Output {
+                fail_write,
+                fail_flush: !fail_write,
+                ..Output::default()
+            };
+            let error = write_json_stream_record(&mut output, &true).expect_err("broken pipe");
+            assert!(matches!(error, CliError::Signal(error)
+                if error.kind() == std::io::ErrorKind::BrokenPipe));
+        }
+    }
+
+    #[test]
+    fn stream_serialization_failure_writes_nothing() {
+        struct Invalid;
+        impl serde::Serialize for Invalid {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("test serialization failure"))
+            }
+        }
+        let mut output = Output::default();
+        let error = write_json_stream_record(&mut output, &Invalid).expect_err("invalid value");
+        assert!(matches!(error, CliError::Json(_)));
+        assert!(output.bytes.is_empty());
+        assert_eq!(output.flushes, 0);
+        let error =
+            super::write_json_result(&mut output, &Invalid).expect_err("invalid finite value");
+        assert!(matches!(error, CliError::Json(_)));
+        assert!(output.bytes.is_empty());
+        assert_eq!(output.flushes, 0);
+    }
+}
+
+#[cfg(test)]
 mod interaction_cli_tests {
     use super::{
         Cli, CliError, Commands, InteractionCommand, MAX_CLI_INTERACTION_JSON_BYTES,
-        read_bounded_interaction_json,
+        read_bounded_interaction_json, read_json_from_reader,
     };
     use clap::Parser as _;
+    use std::io::Read as _;
+
+    #[test]
+    fn interaction_json_reader_consumes_only_limit_plus_sentinel() {
+        let limit = 32;
+        let mut reader = std::io::repeat(b' ').take(1_000_000);
+        let error = read_json_from_reader(&mut reader, limit, "interaction JSON")
+            .expect_err("oversized stream must be rejected");
+        assert!(matches!(error, CliError::InvalidArguments(_)));
+        assert_eq!(reader.limit(), 1_000_000 - 33);
+    }
+
+    #[test]
+    fn interaction_json_reader_accepts_exact_limit_and_rejects_next_byte() {
+        let bytes = br#"{"answer":true}"#;
+        let parsed = read_json_from_reader(bytes.as_slice(), bytes.len(), "interaction JSON")
+            .expect("exact-size valid JSON");
+        assert_eq!(parsed, serde_json::json!({ "answer": true }));
+        let error = read_json_from_reader(bytes.as_slice(), bytes.len() - 1, "interaction JSON")
+            .expect_err("last byte crosses limit");
+        assert!(matches!(error, CliError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn interaction_json_reader_preserves_io_failure() {
+        struct FailedReader;
+        impl std::io::Read for FailedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("test read failure"))
+            }
+        }
+        let error = read_json_from_reader(FailedReader, 32, "interaction JSON")
+            .expect_err("read failure must not become a JSON result");
+        assert!(matches!(error, CliError::Signal(_)));
+    }
+
+    #[test]
+    fn interaction_list_session_scope_parses_and_preserves_exchange_metadata() {
+        let selected = bcode_session_models::SessionId::new();
+        let other = bcode_session_models::SessionId::new();
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "interaction",
+            "list",
+            "--session-id",
+            &selected.to_string(),
+            "--json",
+        ])
+        .expect("scoped interaction list");
+        assert!(matches!(parsed.command, Some(Commands::Interaction {
+            command: InteractionCommand::List { session_id: Some(id), json: true }
+        }) if id == selected));
+        let make_exchange = |session_id, exchange_id: &str| bcode_ipc::PendingToolExchangeSummary {
+            session_id,
+            request: bcode_session_models::ToolExchangeRequest {
+                invocation_id: "invocation".to_owned(),
+                exchange_id: exchange_id.to_owned(),
+                producer_id: "test.plugin".to_owned(),
+                schema: "test.exchange".to_owned(),
+                schema_version: 7,
+                payload: serde_json::json!({ "opaque": [1, 2] }),
+                response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+            },
+        };
+        let original = vec![
+            make_exchange(selected, "first"),
+            make_exchange(other, "other"),
+            make_exchange(selected, "last"),
+        ];
+        let mut exchanges = original.clone();
+        super::filter_session_exchanges(&mut exchanges, None);
+        assert_eq!(exchanges, original);
+        super::filter_session_exchanges(&mut exchanges, Some(selected));
+        assert_eq!(exchanges, vec![original[0].clone(), original[2].clone()]);
+        super::filter_session_exchanges(&mut exchanges, Some(other));
+        assert!(exchanges.is_empty());
+    }
 
     #[test]
     fn interaction_json_is_validated_before_daemon_work() {
@@ -19888,7 +20414,10 @@ mod interaction_cli_tests {
         assert!(matches!(
             list.command,
             Some(Commands::Interaction {
-                command: InteractionCommand::List { json: true }
+                command: InteractionCommand::List {
+                    session_id: None,
+                    json: true
+                }
             })
         ));
 

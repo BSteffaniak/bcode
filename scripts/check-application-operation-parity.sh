@@ -93,17 +93,13 @@ for phrase in required_phrases:
             f"application operation parity check failed: required coverage phrase missing: {phrase}"
         )
 
-classification_commands = [
-    "`Onboard`", "`ArtifactId`", "`Server`", "`Session`", "`Web`", "`Plugin`",
-    "`Theme`", "`Model`", "`Auth`", "`Login`", "`Permission`", "`Interaction`",
-    "`Worktree`", "`Workflow`", "`RuntimeWork`", "`Cancel`", "`Attach`", "`Tui`", "`Send`",
-]
+classification_commands = enum_variants("packages/cli/src/lib.rs", "Commands")
 classification_section = DOC.split("### Top-level CLI ownership classification", 1)
 if len(classification_section) != 2:
     raise SystemExit("application operation parity check failed: top-level CLI ownership classification is missing")
 classification_text = classification_section[1].split("## Maintenance rules", 1)[0]
 for command in classification_commands:
-    if f"| {command} |" not in classification_text:
+    if f"| `{command}` |" not in classification_text:
         raise SystemExit(
             f"application operation parity check failed: top-level ownership classification missing: {command}"
         )
@@ -175,6 +171,7 @@ required_interaction_operation_tests=(
   interaction_operation_executes_complete_exchange_lifecycle_without_transport
   interaction_operation_fails_closed_without_compatible_consumer
   interaction_operation_rejects_conflicting_duplicate_exchange_without_transport
+  interaction_operation_rejects_host_outcomes_and_oversized_direct_resolutions
   interaction_operation_rejects_incompatible_resolving_client
   interaction_operation_terminal_outcome_is_stable_against_stale_resolution
   interaction_operation_terminalizes_exchange_when_last_consumer_detaches
@@ -186,6 +183,7 @@ required_interaction_operation_tests=(
   plugin_service_operations_match_real_ipc_results
   runtime_work_list_and_history_match_real_ipc_results
   runtime_work_operations_cancel_parent_and_node_without_transport_writing
+  session_discovery_operations_match_real_ipc_results
   session_bounded_reads_match_real_ipc_results
   session_create_rename_and_delete_match_real_ipc_results
   session_operations_lifecycle_without_transport_writing
@@ -274,7 +272,9 @@ if rg -n '^async fn handle_(list_plugin_services|list_plugin_contributions|invok
 fi
 
 raw_ipc_callers="$(
-  rg -l 'bcode_ipc::Request|\bRequest::' packages --glob '*.rs' \
+  # IPC requests are enum variants. Do not confuse HTTP Request::builder() calls
+  # with Bcode request construction; fully qualified IPC references remain forbidden.
+  rg -l 'bcode_ipc::Request|\bRequest::[A-Z]' packages --glob '*.rs' \
     | grep -Ev '^packages/(client|server|ipc|daemon-lifecycle)/|(^|/)tests?(/|\.rs$)' \
     || true
 )"

@@ -652,20 +652,50 @@ pub async fn complete_pending_tool_exchange(
 
 const MAX_TOOL_EXCHANGE_RESOLUTION_BYTES: usize = 64 * 1024;
 
+struct ResolutionSizeBudget {
+    remaining: usize,
+}
+
+impl std::io::Write for ResolutionSizeBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.remaining = self.remaining.checked_sub(bytes.len()).ok_or_else(|| {
+            std::io::Error::other("tool exchange resolution exceeds encoded size limit")
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_resolution_size(value: &impl serde::Serialize) -> Result<(), ResolveToolExchangeError> {
+    serde_json::to_writer(
+        ResolutionSizeBudget {
+            remaining: MAX_TOOL_EXCHANGE_RESOLUTION_BYTES,
+        },
+        value,
+    )
+    .map_err(|_| ResolveToolExchangeError::InvalidResolution)
+}
+
 /// Decode one serialized client tool-exchange resolution without exposing serde failures.
 pub fn decode_tool_exchange_resolution(
     resolution_json: serde_json::Value,
 ) -> Result<ToolExchangeResolution, ResolveToolExchangeError> {
-    let encoded = serde_json::to_vec(&resolution_json)
-        .map_err(|_| ResolveToolExchangeError::InvalidResolution)?;
-    if encoded.len() > MAX_TOOL_EXCHANGE_RESOLUTION_BYTES {
-        return Err(ResolveToolExchangeError::InvalidResolution);
-    }
+    validate_resolution_size(&resolution_json)?;
     let resolution = serde_json::from_value(resolution_json)
         .map_err(|_| ResolveToolExchangeError::InvalidResolution)?;
+    validate_client_resolution(&resolution)?;
+    Ok(resolution)
+}
+
+fn validate_client_resolution(
+    resolution: &ToolExchangeResolution,
+) -> Result<(), ResolveToolExchangeError> {
     match resolution {
         ToolExchangeResolution::Responded { .. } | ToolExchangeResolution::Cancelled => {
-            Ok(resolution)
+            validate_resolution_size(resolution)
         }
         ToolExchangeResolution::TimedOut
         | ToolExchangeResolution::NoCompatibleConsumer
@@ -677,12 +707,18 @@ pub fn decode_tool_exchange_resolution(
 /// Resolve one pending exchange through canonical server-owned interaction state.
 ///
 /// Returns `Ok(false)` when the exchange is already terminal or otherwise no longer pending.
+///
+/// # Errors
+///
+/// Rejects host-owned outcomes, oversized encoded resolutions, and incompatible consumers.
+/// Validation precedes pending-state lookup so direct and IPC callers obey the same restrictions.
 pub async fn resolve_tool_exchange(
     state: &ServerState,
     client_id: ClientId,
     interaction_id: &str,
     resolution: ToolExchangeResolution,
 ) -> Result<bool, ResolveToolExchangeError> {
+    validate_client_resolution(&resolution)?;
     let pending = state
         .pending_tool_exchanges
         .lock()
@@ -696,4 +732,35 @@ pub async fn resolve_tool_exchange(
         return Err(ResolveToolExchangeError::IncompatibleConsumer);
     }
     Ok(complete_pending_tool_exchange(state, interaction_id, resolution).await)
+}
+
+#[cfg(test)]
+mod resolution_size_tests {
+    use super::{
+        MAX_TOOL_EXCHANGE_RESOLUTION_BYTES, ResolutionSizeBudget, validate_resolution_size,
+    };
+    use std::io::Write as _;
+
+    #[test]
+    fn encoded_resolution_size_accepts_exact_limit_and_rejects_next_byte() {
+        let exact = "a".repeat(MAX_TOOL_EXCHANGE_RESOLUTION_BYTES - 2);
+        assert!(validate_resolution_size(&exact).is_ok());
+        assert!(validate_resolution_size(&(exact + "a")).is_err());
+    }
+
+    #[test]
+    fn encoded_resolution_size_counts_json_escaping() {
+        let escaped = "\n".repeat(MAX_TOOL_EXCHANGE_RESOLUTION_BYTES / 2);
+        assert!(escaped.len() < MAX_TOOL_EXCHANGE_RESOLUTION_BYTES);
+        assert!(validate_resolution_size(&escaped).is_err());
+    }
+
+    #[test]
+    fn resolution_budget_rejects_overflow_without_consuming_budget() {
+        let mut budget = ResolutionSizeBudget { remaining: 3 };
+        budget.write_all(b"abc").expect("exact budget");
+        assert_eq!(budget.remaining, 0);
+        assert!(budget.write_all(b"d").is_err());
+        assert_eq!(budget.remaining, 0);
+    }
 }

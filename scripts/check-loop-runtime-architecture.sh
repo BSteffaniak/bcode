@@ -1198,10 +1198,12 @@ if ! grep -F 'TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA' packages/tool/src/contracts
   violations=1
 fi
 
-# Provider event diagnostic labels are not persisted legacy session result variants.
+# The provider stream trace projection names a current provider event, not a
+# historical session result. Exempt only that exact match arm; keep every other
+# legacy spelling forbidden, including session variants and serialized payloads.
 if rg -n '(^|[^A-Za-z])SessionEventKind::ToolCallFinished|"tool_call_finished"|\bsemantic_migration\b|MigrateSemanticResults' \
   packages/session packages/session-view packages/ipc packages/server packages/tui packages/hyperchad packages/cli packages/eval plugins/blims-plugin plugins/code-review-plugin \
-  --glob '*.rs' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*ProviderTurnEvent::ToolCallFinished \{ \.\. \} => "tool_call_finished",$' \
+  --glob '*.rs' | grep -Ev '^packages/server/src/lib\.rs:[0-9]+:[[:space:]]*ProviderTurnEvent::ToolCallFinished \{ \.\. \} => "tool_call_finished",[[:space:]]*$' \
   >/tmp/bcode-removed-session-result-compatibility.txt; then
   echo "Runtime architecture violation: removed legacy session result compatibility was reintroduced." >&2
   cat /tmp/bcode-removed-session-result-compatibility.txt >&2
