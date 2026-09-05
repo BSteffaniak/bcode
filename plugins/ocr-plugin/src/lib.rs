@@ -485,12 +485,16 @@ async fn extract_async(
 ) -> Result<ExtractResponse, OcrError> {
     validate_options(request.options.as_ref())?;
     let source = source(&request)?;
-    let engine = request.engine.unwrap_or_else(default_engine_name);
+    let engine = request
+        .engine
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default_engine_name);
     if !is_supported_engine(&engine) {
         return Err(OcrError::UnsupportedEngine(engine));
     }
     let language = request
         .language
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
     let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let max_bytes = request
@@ -562,7 +566,14 @@ fn source_response(source: &OcrSource) -> SourceResponse {
 }
 
 fn source(request: &ExtractRequest) -> Result<OcrSource, OcrError> {
-    match (&request.path, &request.url) {
+    // Tool callers may populate optional string fields with empty strings.
+    // Preserve nonempty paths verbatim, including meaningful whitespace.
+    let path = request
+        .path
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty());
+    let url = request.url.as_ref().filter(|url| !url.is_empty());
+    match (path, url) {
         (Some(path), None) => Ok(OcrSource::Path(path.clone())),
         (None, Some(url)) => Ok(OcrSource::Url(url.clone())),
         _ => Err(OcrError::InvalidSource),
@@ -806,8 +817,8 @@ fn extract_tool_definition() -> ToolDefinition {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Local path to an image or document to OCR." },
-                "url": { "type": "string", "description": "Optional URL to download and OCR." },
+                "path": { "type": "string", "description": "Local path to an image or document to OCR. Provide exactly one nonempty path or url; omit or leave the unused field empty." },
+                "url": { "type": "string", "description": "URL to download and OCR instead of a local path. Omit or leave empty when using path." },
                 "language": { "type": "string", "description": "OCR language code. Defaults to eng." },
                 "engine": { "type": "string", "description": "Optional OCR engine. Defaults to the plugin's configured engine." },
                 "options": { "type": "object", "description": "Advanced OCR engine options. Supported keys depend on the selected engine." },
@@ -1281,6 +1292,54 @@ mod tests {
         assert_eq!(decoded.sequence, 3);
         assert_eq!(decoded.stage, ToolInvocationLifecycleStage::Progress);
         assert_eq!(decoded.message.as_deref(), Some("extracting"));
+    }
+
+    #[test]
+    fn empty_optional_source_fields_survive_preparation_and_invocation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let image = workspace.path().join("image.png");
+        std::fs::write(&image, b"fixture").expect("fixture");
+        let canonical_image = image.canonicalize().expect("canonical image");
+        let definition = extract_tool_definition();
+        for (path, url, expected) in [
+            ("image.png", "", OcrSource::Path(canonical_image)),
+            (
+                "",
+                "https://example.com/image.png",
+                OcrSource::Url("https://example.com/image.png".to_owned()),
+            ),
+        ] {
+            let arguments = json!({
+                "path": path, "url": url, "engine": "", "language": "",
+                "options": {}, "max_bytes": 4096, "timeout_ms": 1000
+            });
+            let preparation = ocr_policy_preparation(
+                &preparation_request(
+                    &definition,
+                    arguments.clone(),
+                    workspace_context(workspace.path()),
+                ),
+                &definition,
+            )
+            .expect("prepare source with empty alternative");
+            let descriptor: OcrPreparationDescriptor =
+                serde_json::from_value(preparation.descriptor).expect("decode descriptor");
+            let mut request: ExtractRequest = serde_json::from_value(arguments).expect("request");
+            apply_ocr_preparation(&mut request, &descriptor).expect("apply preparation");
+            assert_eq!(source(&request).expect("source"), expected);
+        }
+    }
+
+    #[test]
+    fn empty_sources_are_not_inputs() {
+        for arguments in [
+            json!({"path": "", "url": ""}),
+            json!({"path": ""}),
+            json!({"url": ""}),
+        ] {
+            let request: ExtractRequest = serde_json::from_value(arguments).expect("request");
+            assert!(matches!(source(&request), Err(OcrError::InvalidSource)));
+        }
     }
 
     #[test]
