@@ -2407,7 +2407,12 @@ impl ModelResponseCache for InMemoryModelResponseCache {
                 let expires = now.checked_add(self.single_flight_timeout).ok_or_else(|| {
                     BcodeError::Cache("single-flight duration exceeds clock range".into())
                 })?;
-                state.in_flight.retain(|_, deadline| *deadline > now);
+                if lease_expires.is_some() {
+                    state.in_flight.remove(&key);
+                }
+                if state.in_flight.len() >= self.capacity.get() {
+                    state.in_flight.retain(|_, deadline| *deadline > now);
+                }
                 if state.in_flight.len() >= self.capacity.get() {
                     return Err(BcodeError::Cache("cache miss capacity exhausted".into()));
                 }
