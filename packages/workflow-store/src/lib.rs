@@ -19178,6 +19178,34 @@ mod tests {
              UPDATE workflow_store_contract SET schema_version = 15;",
             )
             .expect("schema 15");
+        let checksum: String = connection.query_row(
+            "SELECT checksum_sha256 FROM workflow_definitions WHERE definition_id = 'example' AND version = 1",
+            [], |row| row.get(0),
+        ).expect("checksum");
+        connection
+            .execute(
+                "UPDATE workflow_definitions SET checksum_sha256 = 'damaged'",
+                [],
+            )
+            .expect("damage fixture checksum");
+        drop(connection);
+        assert!(WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 45).is_err());
+        let connection = Connection::open(&path).expect("failed migration state");
+        assert_eq!(detected_store_schema(&connection), Some(15));
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM workflow_attempts WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal attempt");
+        assert_eq!(status, "succeeded");
+        connection
+            .execute(
+                "UPDATE workflow_definitions SET checksum_sha256 = ?1",
+                [checksum],
+            )
+            .expect("restore fixture checksum");
         drop(connection);
         WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 46).expect("migration");
         let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
