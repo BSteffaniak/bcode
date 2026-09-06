@@ -8480,15 +8480,28 @@ fn unconfigured_auth_provider_status_lines(
 fn print_unconfigured_auth_provider_status(
     provider: &bcode_plugin::RegisteredAuthProvider,
     profile_name: &str,
-) {
+) -> Result<(), CliError> {
+    let mut writer = std::io::stdout().lock();
     for line in unconfigured_auth_provider_status_lines(provider, profile_name) {
-        println!("{line}");
+        writeln!(writer, "{line}")?;
     }
+    writer.flush()?;
+    Ok(())
 }
 
 fn auth_provider_status(provider_id: &str, explicit_profile: Option<&str>) -> Result<(), CliError> {
     let mut host = load_cli_plugin_host()?;
-    let provider = registered_auth_provider(&host, provider_id)?;
+    let result = inspect_auth_provider_status(&host, provider_id, explicit_profile);
+    let cleanup = host.deactivate_all().map_err(CliError::from);
+    result.and(cleanup)
+}
+
+fn inspect_auth_provider_status(
+    host: &bcode_plugin::PluginHost,
+    provider_id: &str,
+    explicit_profile: Option<&str>,
+) -> Result<(), CliError> {
+    let provider = registered_auth_provider(host, provider_id)?;
     let config = bcode_config::load_config()?;
     let runtime = bcode_config::load_runtime_auth_subscriptions();
     let resolved = match lookup_registered_auth_profile_from(
@@ -8499,16 +8512,15 @@ fn auth_provider_status(provider_id: &str, explicit_profile: Option<&str>) -> Re
     )? {
         bcode_provider_auth::AuthProviderProfileLookup::Configured(resolved) => resolved,
         bcode_provider_auth::AuthProviderProfileLookup::Unconfigured { profile_name } => {
-            print_unconfigured_auth_provider_status(&provider, &profile_name);
-            host.deactivate_all()?;
-            return Ok(());
+            return print_unconfigured_auth_provider_status(&provider, &profile_name);
         }
     };
     let method = resolved_auth_method(&provider, &resolved)?;
-    println!("Provider: {}", provider.contribution.display_name);
-    println!("Plugin: {}", provider.plugin_id);
-    println!("Profile: {}", resolved.profile_name);
-    println!("Configured: true");
+    let mut writer = std::io::stdout().lock();
+    writeln!(writer, "Provider: {}", provider.contribution.display_name)?;
+    writeln!(writer, "Plugin: {}", provider.plugin_id)?;
+    writeln!(writer, "Profile: {}", resolved.profile_name)?;
+    writeln!(writer, "Configured: true")?;
     let status = bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
         &resolved,
         provider_id,
@@ -8518,17 +8530,22 @@ fn auth_provider_status(provider_id: &str, explicit_profile: Option<&str>) -> Re
     .map_err(|error| CliError::LoginProfile(error.to_string()))?
     .inspect()
     .map_err(|error| CliError::LoginProfile(error.to_string()))?;
-    println!(
+    writeln!(
+        writer,
         "Available: {}",
         status.profile_exists && !status.present_credentials.is_empty()
-    );
+    )?;
     for diagnostic in status.diagnostics {
-        println!("Diagnostic [{}]: {}", diagnostic.code, diagnostic.message);
+        writeln!(
+            writer,
+            "Diagnostic [{}]: {}",
+            diagnostic.code, diagnostic.message
+        )?;
         if let Some(remediation) = diagnostic.remediation {
-            println!("  remediation: {remediation}");
+            writeln!(writer, "  remediation: {remediation}")?;
         }
     }
-    host.deactivate_all()?;
+    writer.flush()?;
     Ok(())
 }
 
