@@ -1359,7 +1359,7 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn model_catalog_diagnostics(
         &self,
-    ) -> Result<bcode_ipc::ModelCatalogDiagnostics, ClientError> {
+    ) -> Result<bcode_model_catalog_models::ModelCatalogDiagnostics, ClientError> {
         match self.send_request(Request::ModelCatalogDiagnostics).await? {
             ResponsePayload::ModelCatalogDiagnostics { diagnostics } => Ok(diagnostics),
             _ => Err(ClientError::UnexpectedResponse),

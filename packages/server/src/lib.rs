@@ -48508,6 +48508,49 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn model_catalog_diagnostics_match_real_ipc_without_plugins() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        assert!(plugin_operations::list_services(&state).is_empty());
+        let direct: bcode_model_catalog_models::ModelCatalogDiagnostics =
+            server_operations::model_catalog_diagnostics(&state).await;
+        let socket_dir = tempfile::tempdir().expect("diagnostics socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("diagnostics listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let actual: bcode_model_catalog_models::ModelCatalogDiagnostics = client
+            .model_catalog_diagnostics()
+            .await
+            .expect("IPC diagnostics");
+        assert_eq!(actual, direct);
+        let expected = serde_json::json!({
+            "embedded_revision": direct.embedded_revision,
+            "remote_revision": direct.remote_revision,
+            "remote_enabled": direct.remote_enabled,
+            "cache_state": direct.cache_state,
+            "cache_age_seconds": direct.cache_age_seconds,
+            "refresh_in_progress": direct.refresh_in_progress,
+            "last_refresh_attempt_ms": direct.last_refresh_attempt_ms,
+            "last_refresh_success_ms": direct.last_refresh_success_ms,
+            "last_refresh_error": direct.last_refresh_error,
+        });
+        assert_eq!(
+            serde_json::to_value(&actual).expect("diagnostics JSON"),
+            expected
+        );
+        let decoded: bcode_ipc::ModelCatalogDiagnostics =
+            serde_json::from_value(expected).expect("compatible IPC diagnostics");
+        assert_eq!(decoded, actual);
+        shutdown.send(()).expect("stop diagnostics listener");
+        server.await.expect("diagnostics listener task");
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn plugin_service_operations_match_real_ipc_results() {
         const SUBSCRIBING_SHELL_MANIFEST: &str = r#"

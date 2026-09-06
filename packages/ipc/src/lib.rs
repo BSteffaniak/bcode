@@ -1385,19 +1385,8 @@ pub use bcode_session_models::PermissionBatchCorrelation;
 /// Compatibility export for session-owned pending permission observations.
 pub use bcode_session_models::PermissionSummary;
 
-/// Normalized model-catalog diagnostics exposed at the application boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelCatalogDiagnostics {
-    pub embedded_revision: String,
-    pub remote_revision: Option<String>,
-    pub remote_enabled: bool,
-    pub cache_state: String,
-    pub cache_age_seconds: Option<u64>,
-    pub refresh_in_progress: bool,
-    pub last_refresh_attempt_ms: Option<u64>,
-    pub last_refresh_success_ms: Option<u64>,
-    pub last_refresh_error: Option<String>,
-}
+/// Compatibility export for domain-owned model-catalog diagnostics.
+pub use bcode_model_catalog_models::ModelCatalogDiagnostics;
 
 /// Bounded generic session artifact byte range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

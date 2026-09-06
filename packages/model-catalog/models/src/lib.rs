@@ -11,6 +11,31 @@ pub use live::{LiveCatalogSnapshot, LiveModel, LiveModelMetadata};
 
 mod live;
 
+/// Normalized model-catalog diagnostics exposed at the application boundary.
+///
+/// This portable snapshot uses the enclosing application protocol's version semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogDiagnostics {
+    /// Revision bundled with the running application.
+    pub embedded_revision: String,
+    /// Revision provided by the remote catalog, when available.
+    pub remote_revision: Option<String>,
+    /// Whether remote catalog access is enabled.
+    pub remote_enabled: bool,
+    /// Normalized cache availability status.
+    pub cache_state: String,
+    /// Age of the cached catalog in seconds, when known.
+    pub cache_age_seconds: Option<u64>,
+    /// Whether a refresh is currently running.
+    pub refresh_in_progress: bool,
+    /// Most recent refresh attempt as Unix epoch milliseconds.
+    pub last_refresh_attempt_ms: Option<u64>,
+    /// Most recent successful refresh as Unix epoch milliseconds.
+    pub last_refresh_success_ms: Option<u64>,
+    /// Public, secret-safe failure message from the most recent refresh.
+    pub last_refresh_error: Option<String>,
+}
+
 /// Catalog schema version emitted by this crate.
 pub const SCHEMA_VERSION: &str = "3.0.0";
 

@@ -298,6 +298,42 @@ pub async fn publish_event(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn service_bridge_drains_queued_request_before_closure() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let (sender, requests) = tokio::sync::mpsc::unbounded_channel();
+        let (response, received) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(crate::ServerPluginBridgeCall {
+                request: bcode_plugin_sdk::ServiceBridgeRequest::Exchange(
+                    bcode_tool::ToolExchangeRequest {
+                        invocation_id: "test-invocation".to_owned(),
+                        exchange_id: "test-exchange".to_owned(),
+                        producer_id: "test".to_owned(),
+                        schema: "test.exchange".to_owned(),
+                        schema_version: 1,
+                        payload: serde_json::Value::Null,
+                        response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+                    },
+                ),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                response,
+            })
+            .expect("queue bridge request");
+        drop(sender);
+        let (complete, result) = tokio::sync::oneshot::channel::<u32>();
+        let driver = super::drive_service_bridge(&state, None, requests, result);
+        tokio::pin!(driver);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
+        assert_eq!(
+            received.try_recv().expect("queued request answered"),
+            Err("command invocation bridge supports nested application services only".to_owned())
+        );
+        complete.send(42).expect("complete invocation");
+        assert_eq!(driver.await.expect("invocation result"), 42);
+    }
+
+    #[tokio::test]
     async fn closed_service_bridge_yields_until_invocation_completes() {
         let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
         let (bridge, requests) = crate::server_plugin_bridge();

@@ -1,6 +1,7 @@
 //! Transport-neutral application operations for daemon status and lifecycle.
 
 use super::ServerState;
+use bcode_model_catalog_models::ModelCatalogDiagnostics;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -17,13 +18,13 @@ pub async fn status(
 }
 
 /// Return normalized model-catalog diagnostics without transport framing.
-pub async fn model_catalog_diagnostics(state: &ServerState) -> bcode_ipc::ModelCatalogDiagnostics {
+pub async fn model_catalog_diagnostics(state: &ServerState) -> ModelCatalogDiagnostics {
     let diagnostics = state.model_catalog.diagnostics().await;
     let epoch_ms = |time: Option<std::time::SystemTime>| {
         time.and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|value| u64::try_from(value.as_millis()).ok())
     };
-    bcode_ipc::ModelCatalogDiagnostics {
+    ModelCatalogDiagnostics {
         embedded_revision: diagnostics.embedded_revision,
         remote_revision: diagnostics.remote_revision,
         remote_enabled: diagnostics.remote_enabled,
