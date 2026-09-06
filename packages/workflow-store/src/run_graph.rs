@@ -133,7 +133,70 @@ pub fn migrate(transaction: &Transaction<'_>) -> Result<(), WorkflowStoreError> 
     Ok(())
 }
 
+pub fn initial_node(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
+    super::validate_id("run_id", run_id)?;
+    super::validate_id("node_id", node_id)?;
+    let revision = connection
+        .query_row(
+            "SELECT graph.revision FROM workflow_runs run
+         LEFT JOIN workflow_run_graphs graph ON graph.run_id = run.run_id WHERE run.run_id = ?1",
+            [run_id],
+            |row| row.get::<_, Option<u64>>(0),
+        )
+        .optional()?;
+    match revision {
+        None => return Ok(None),
+        Some(Some(1)) => {}
+        _ => {
+            return Err(WorkflowStoreError::InvalidData(
+                "initial graph lookup requires an intact initial graph revision".to_string(),
+            ));
+        }
+    }
+    let payload = connection
+        .query_row(
+            "SELECT CASE WHEN typeof(node_json) = 'text'
+                     AND length(CAST(node_json AS BLOB)) <= ?3 THEN node_json END
+         FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = ?2 AND revision = 1",
+            rusqlite::params![run_id, node_id, super::MAX_INLINE_JSON_BYTES],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let payload = payload.ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "workflow graph node payload is invalid or oversized".to_string(),
+        )
+    })?;
+    let node: NodeDefinition = serde_json::from_str(&payload)?;
+    if node.id != node_id {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow graph node identity mismatch".to_string(),
+        ));
+    }
+    Ok(Some(node))
+}
+
 impl WorkflowStore {
+    /// Read one exact node from the initial admitted run graph.
+    ///
+    /// # Errors
+    /// Returns an error for missing or unsupported graph state, inconsistent node identity,
+    /// invalid/oversized payloads, or database failures. A missing run or node returns `None`.
+    pub fn run_graph_node(
+        &self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
+        initial_node(&self.connection, run_id, node_id)
+    }
+
     /// Read a bounded page of initial edges without loading the full graph.
     ///
     /// # Errors
