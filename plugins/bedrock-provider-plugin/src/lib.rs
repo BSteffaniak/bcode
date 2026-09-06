@@ -104,14 +104,21 @@ impl BedrockTurnExecutor for AwsBedrockTurnExecutor {
         turn: TurnState,
         discovery: Arc<Mutex<DiscoveryCache>>,
     ) {
-        runtime.spawn(async move {
-            stream_bedrock_turn(&request, &turn, discovery).await;
-        });
+        let worker_turn = turn.clone();
+        if let Err(error) = runtime.try_spawn(async move {
+            stream_bedrock_turn(&request, &worker_turn, discovery).await;
+        }) {
+            push_runtime_error(&turn, &error.to_string());
+        }
     }
 }
 
 impl ConcurrentRustPlugin for BedrockProviderPlugin {
     fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        self.turns
+            .lock()
+            .map_err(|_| PluginError::failed("provider turn state is unavailable"))?
+            .cancel_all();
         if let Ok(runtime) = &self.runtime {
             runtime
                 .shutdown(Duration::from_secs(5))
@@ -7310,6 +7317,24 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_runtime_reports_turn_start_failure() {
+        let runtime = ProviderRuntime::new().unwrap();
+        runtime.shutdown(Duration::from_secs(5)).unwrap();
+        let turn = TurnState::default();
+        AwsBedrockTurnExecutor.start(
+            &runtime,
+            test_model_turn_request(),
+            turn.clone(),
+            Arc::default(),
+        );
+        assert!(
+            turn.drain()
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::Error { .. }))
+        );
+    }
 
     #[test]
     fn deactivation_stops_provider_runtime() {

@@ -23,6 +23,9 @@ fn finishing_all_turns_cancels_handles_without_reusing_identity() {
     let mut store = bcode_model_provider_runtime::TurnStore::default();
     let (first_id, first) = store.insert_started("provider");
     let (second_id, second) = store.insert_started("provider");
+    store.cancel_all();
+    assert!(first.is_cancelled());
+    assert!(!store.drain(&first_id).is_empty());
     store.finish_all();
     assert!(first.is_cancelled());
     assert!(second.is_cancelled());

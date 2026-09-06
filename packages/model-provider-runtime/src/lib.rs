@@ -614,14 +614,22 @@ impl TurnStore {
         }
     }
 
+    /// Request cancellation for every retained turn without releasing its store entry.
+    ///
+    /// Execution owners may use this before awaiting worker teardown. Entries remain available
+    /// for reconciliation if teardown times out.
+    pub fn cancel_all(&self) {
+        for turn in self.turns.values() {
+            turn.cancel();
+        }
+    }
+
     /// Cancel all retained turns and release their store entries without reusing turn IDs.
     ///
     /// External handles observe cancellation. This requests worker cancellation; it does not
     /// acknowledge worker termination, which remains the execution owner's responsibility.
     pub fn finish_all(&mut self) {
-        for turn in self.turns.values() {
-            turn.cancel();
-        }
+        self.cancel_all();
         self.turns.clear();
     }
 
@@ -1295,6 +1303,31 @@ impl ProviderRuntime {
         }
     }
 
+    /// Admit provider work, or reject it before polling when shutdown has begun.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderRuntimeError::ShuttingDown`] when shutdown has been requested.
+    pub fn try_spawn<F>(
+        &self,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ProviderRuntimeError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let admission = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admission.is_none() {
+            return Err(ProviderRuntimeError::ShuttingDown);
+        }
+        let task = self.handle.spawn(future);
+        drop(admission);
+        Ok(task)
+    }
+
     /// Spawn async provider work onto the shared runtime.
     ///
     /// The returned handle may be dropped when the caller does not need the task
@@ -1306,20 +1339,12 @@ impl ProviderRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let admission = self
-            .shutdown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if admission.is_none() {
-            drop(admission);
+        self.try_spawn(future).unwrap_or_else(|_| {
             // Preserve the join-handle API while never polling rejected user work.
             let task = self.handle.spawn(std::future::pending::<F::Output>());
             task.abort();
-            return task;
-        }
-        let task = self.handle.spawn(future);
-        drop(admission);
-        task
+            task
+        })
     }
 
     fn check_blocking_caller(&self) -> Result<(), ProviderRuntimeError> {

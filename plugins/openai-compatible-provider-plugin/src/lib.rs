@@ -275,6 +275,15 @@ impl TurnState {
 
 impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
     fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| PluginError::failed("provider state is unavailable"))?;
+            for turn in state.turns.values() {
+                turn.cancel();
+            }
+        }
         if let Ok(runtime) = &self.runtime {
             runtime
                 .shutdown(Duration::from_secs(5))
@@ -1448,11 +1457,7 @@ impl OpenAiCompatibleProviderPlugin {
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
         match &self.runtime {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    stream_chat_completion(&request, &turn).await;
-                });
-            }
+            Ok(runtime) => start_chat_completion(runtime, request, &turn),
             Err(error) => push_runtime_error(&turn, error),
         }
         json_response(&StartTurnResponse { provider_turn_id })
@@ -3025,6 +3030,15 @@ fn usage_window_refs(
                 })
         })
         .collect()
+}
+
+fn start_chat_completion(runtime: &ProviderRuntime, request: ModelTurnRequest, turn: &TurnState) {
+    let worker_turn = turn.clone();
+    if let Err(error) = runtime.try_spawn(async move {
+        stream_chat_completion(&request, &worker_turn).await;
+    }) {
+        push_runtime_error(turn, &error.to_string());
+    }
 }
 
 async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
@@ -9066,6 +9080,24 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_stream_admission_has_terminal_error() {
+        let runtime = ProviderRuntime::new().unwrap();
+        runtime.shutdown(Duration::from_secs(5)).unwrap();
+        let turn = TurnState::default();
+        start_chat_completion(&runtime, test_request(Vec::new()), &turn);
+        let events = turn.drain();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ProviderTurnEvent::Error { .. },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::Error
+                }
+            ]
+        ));
+    }
 
     #[test]
     fn deactivation_releases_retained_oauth_listener() {
