@@ -19040,7 +19040,12 @@ mod tests {
             )
             .expect("damage checksum");
         drop(connection);
-        assert!(WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 46).is_err());
+        assert!(
+            WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 46)
+                .expect_err("checksum mismatch")
+                .to_string()
+                .contains("workflow definition checksum mismatch during graph migration")
+        );
         let connection = Connection::open(&path).expect("failed migration state");
         assert_eq!(detected_store_schema(&connection), Some(15));
         let status: String = connection
@@ -19189,7 +19194,12 @@ mod tests {
             )
             .expect("damage fixture checksum");
         drop(connection);
-        assert!(WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 45).is_err());
+        assert!(
+            WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 45)
+                .expect_err("checksum mismatch")
+                .to_string()
+                .contains("workflow definition checksum mismatch during graph migration")
+        );
         let connection = Connection::open(&path).expect("failed migration state");
         assert_eq!(detected_store_schema(&connection), Some(15));
         let status: String = connection
