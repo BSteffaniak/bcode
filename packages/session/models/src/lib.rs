@@ -2089,6 +2089,42 @@ impl Display for WorkId {
     }
 }
 
+/// Grouped runtime-work lifecycle span from bounded history.
+///
+/// When the start is absent, the label is empty and parent/start time are unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWorkSpan {
+    /// Canonical work identity.
+    pub work_id: WorkId,
+    /// Parent identity, when observed.
+    pub parent_work_id: Option<WorkId>,
+    /// Label from the observed start, or empty when unavailable.
+    pub label: String,
+    /// Most recently observed status; not necessarily terminal.
+    pub status: Option<RuntimeWorkStatus>,
+    /// Observed start timestamp in Unix milliseconds.
+    pub started_at_ms: Option<u64>,
+    /// Observed finish timestamp in Unix milliseconds.
+    pub finished_at_ms: Option<u64>,
+    /// Whether a cancellation-request event was observed, not proof of completion.
+    pub cancelled: bool,
+    /// Most recently observed progress or finish message.
+    pub message: Option<String>,
+}
+
+impl RuntimeWorkSpan {
+    /// Return elapsed milliseconds when both timestamps are known.
+    ///
+    /// Reversed timestamps saturate to zero; missing timestamps remain unknown.
+    #[allow(
+        clippy::must_use_candidate,
+        reason = "Option is already must-use per repository API conventions"
+    )]
+    pub fn duration_ms(&self) -> Option<u64> {
+        Some(self.finished_at_ms?.saturating_sub(self.started_at_ms?))
+    }
+}
+
 /// Current runtime-work state exposed by application operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkSnapshot {

@@ -61324,6 +61324,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session");
         let state = Arc::new(test_server_state(sessions));
         let work_id = WorkId::new("runtime-ipc-work");
+        let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         register_runtime_work(
             state.as_ref(),
             session.id,
@@ -61331,7 +61332,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 work_id.clone(),
                 RuntimeWorkKind::PluginInvocation,
                 "runtime IPC work".to_owned(),
-                CancellationHandle::Test(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+                CancellationHandle::Test(Arc::clone(&cancellations)),
             ),
         )
         .await;
@@ -61399,8 +61400,59 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ..
             } if cancelled_work_id == work_id
         ));
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_bounded_runtime_history_span(&client, session.id, &work_id).await;
+        assert_runtime_completion_visible(&state, &client, &mut watcher, session.id, work_id).await;
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    async fn assert_runtime_completion_visible(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        watcher: &mut bcode_client::RuntimeWorkWatcher,
+        session_id: SessionId,
+        work_id: WorkId,
+    ) {
+        finish_registered_runtime_work(
+            state,
+            session_id,
+            work_id.clone(),
+            RuntimeWorkStatus::Cancelled,
+            Some("cancelled by owner".to_owned()),
+        )
+        .await;
+        let event = tokio::time::timeout(Duration::from_secs(1), watcher.next_event())
+            .await
+            .expect("terminal watch deadline")
+            .expect("terminal watch event");
+        assert!(matches!(event.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id: id, status: RuntimeWorkStatus::Cancelled, .. }
+                if id == work_id));
+        assert!(
+            client
+                .list_runtime_work(session_id)
+                .await
+                .expect("terminal active list")
+                .is_empty()
+        );
+        assert!(
+            !client
+                .cancel_runtime_work(session_id, work_id.clone())
+                .await
+                .expect("repeat cancellation")
+        );
+        let spans = client
+            .runtime_work_spans(session_id, 1)
+            .await
+            .expect("terminal bounded history");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].work_id, work_id);
+        assert_eq!(spans[0].status, Some(RuntimeWorkStatus::Cancelled));
+        assert_eq!(spans[0].message.as_deref(), Some("cancelled by owner"));
+        assert_eq!(spans[0].started_at_ms, None);
+        assert!(spans[0].finished_at_ms.is_some());
+        assert_eq!(spans[0].duration_ms(), None);
     }
 
     async fn assert_bounded_runtime_history_span(

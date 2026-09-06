@@ -1,7 +1,7 @@
-use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_plugin::PluginInvocationCancelHandle;
 use bcode_session::SessionOwnershipGuard;
+use bcode_session_models::RuntimeWorkSnapshot;
 use bcode_session_models::{RuntimeWorkKind, RuntimeWorkStatus, SessionId, WorkId};
 use std::collections::BTreeMap;
 use std::sync::Arc;

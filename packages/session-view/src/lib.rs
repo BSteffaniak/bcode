@@ -648,7 +648,10 @@ impl SessionView {
     }
 
     /// Replace active runtime work from an authoritative daemon snapshot.
-    pub fn set_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
+    pub fn set_runtime_work_snapshots(
+        &mut self,
+        snapshots: &[bcode_session_models::RuntimeWorkSnapshot],
+    ) {
         for snapshot in snapshots {
             if snapshot.status.is_terminal() {
                 self.terminal_runtime_work.insert(snapshot.work_id.clone());
@@ -12137,7 +12140,7 @@ mod tests {
         let session_id = SessionId::new();
         let work_id = bcode_session_models::WorkId::new("snapshot-work");
         let mut view = SessionView::new();
-        view.set_runtime_work_snapshots(&[bcode_ipc::RuntimeWorkSnapshot {
+        view.set_runtime_work_snapshots(&[bcode_session_models::RuntimeWorkSnapshot {
             work_id: work_id.clone(),
             kind: bcode_session_models::RuntimeWorkKind::PluginInvocation,
             label: "plugin call".to_owned(),
@@ -12154,7 +12157,7 @@ mod tests {
         assert_eq!(work.label, "plugin call");
         assert!(work.cancellable);
 
-        view.set_runtime_work_snapshots(&[bcode_ipc::RuntimeWorkSnapshot {
+        view.set_runtime_work_snapshots(&[bcode_session_models::RuntimeWorkSnapshot {
             work_id: work_id.clone(),
             kind: bcode_session_models::RuntimeWorkKind::PluginInvocation,
             label: "plugin call".to_owned(),

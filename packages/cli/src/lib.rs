@@ -14891,7 +14891,7 @@ fn write_runtime_work_list(
 
 fn write_runtime_work_history(
     output: &mut impl std::io::Write,
-    spans: &[bcode_client::RuntimeWorkSpan],
+    spans: &[bcode_session_models::RuntimeWorkSpan],
     json: bool,
 ) -> Result<(), CliError> {
     if json {

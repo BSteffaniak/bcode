@@ -22,12 +22,11 @@ use bcode_ipc::{
     decode_response, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionDerivationPromptPage,
-    SessionDerivationPromptQuery, SessionDerivationRequest, SessionDerivationSourceSnapshot,
-    SessionDerivationTerminalOutcome, SessionEvent, SessionEventKind, SessionHistoryAroundQuery,
-    SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow, SessionId,
-    SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery, SessionSummary,
-    WorkId,
+    ClientId, ProjectionWindowRequest, SessionDerivationPromptPage, SessionDerivationPromptQuery,
+    SessionDerivationRequest, SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome,
+    SessionEvent, SessionEventKind, SessionHistoryAroundQuery, SessionHistoryPage,
+    SessionHistoryQuery, SessionHistoryWindow, SessionId, SessionInputHistoryEntry,
+    SessionInspectionPage, SessionInspectionQuery, SessionSummary, WorkId,
 };
 use bcode_session_models::{PendingToolExchangeSummary, PermissionSummary};
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
@@ -71,39 +70,19 @@ mod artifact_range_tests {
     }
 }
 
-/// Grouped runtime-work lifecycle span.
-///
-/// Bounded history may omit the start event. Such spans retain observed events with
-/// an empty label and unknown parent/start time; no older history is fetched.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RuntimeWorkSpan {
-    pub work_id: WorkId,
-    pub parent_work_id: Option<WorkId>,
-    pub label: String,
-    pub status: Option<RuntimeWorkStatus>,
-    pub started_at_ms: Option<u64>,
-    pub finished_at_ms: Option<u64>,
-    pub cancelled: bool,
-    pub message: Option<String>,
-}
+/// Domain-owned history result retained here for source compatibility.
+pub use bcode_session_models::RuntimeWorkSpan;
 
-impl RuntimeWorkSpan {
-    const fn without_start(work_id: WorkId) -> Self {
-        Self {
-            work_id,
-            parent_work_id: None,
-            label: String::new(),
-            status: None,
-            started_at_ms: None,
-            finished_at_ms: None,
-            cancelled: false,
-            message: None,
-        }
-    }
-
-    #[must_use]
-    pub fn duration_ms(&self) -> Option<u64> {
-        Some(self.finished_at_ms?.saturating_sub(self.started_at_ms?))
+const fn runtime_work_span_without_start(work_id: WorkId) -> RuntimeWorkSpan {
+    RuntimeWorkSpan {
+        work_id,
+        parent_work_id: None,
+        label: String::new(),
+        status: None,
+        started_at_ms: None,
+        finished_at_ms: None,
+        cancelled: false,
+        message: None,
     }
 }
 
@@ -135,7 +114,7 @@ fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
             SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
                 spans
                     .entry(work_id.clone())
-                    .or_insert_with(|| RuntimeWorkSpan::without_start(work_id))
+                    .or_insert_with(|| runtime_work_span_without_start(work_id))
                     .cancelled = true;
             }
             SessionEventKind::RuntimeWorkProgress {
@@ -143,7 +122,7 @@ fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
             } => {
                 spans
                     .entry(work_id.clone())
-                    .or_insert_with(|| RuntimeWorkSpan::without_start(work_id))
+                    .or_insert_with(|| runtime_work_span_without_start(work_id))
                     .message = Some(message);
             }
             SessionEventKind::RuntimeWorkFinished {
@@ -154,7 +133,7 @@ fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
             } => {
                 let span = spans
                     .entry(work_id.clone())
-                    .or_insert_with(|| RuntimeWorkSpan::without_start(work_id));
+                    .or_insert_with(|| runtime_work_span_without_start(work_id));
                 span.status = Some(status);
                 span.finished_at_ms = finished_at_ms;
                 if message.is_some() {
@@ -170,6 +149,7 @@ fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
 #[cfg(test)]
 mod runtime_work_history_tests {
     use super::*;
+    use bcode_session_models::RuntimeWorkStatus;
 
     fn event(kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
@@ -180,6 +160,25 @@ mod runtime_work_history_tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn span_domain_contract_preserves_json_and_unknown_duration() {
+        let wire = serde_json::json!({
+            "work_id": "partial", "parent_work_id": null, "label": "",
+            "status": "cancelled", "started_at_ms": null, "finished_at_ms": 50,
+            "cancelled": false, "message": "finished λ",
+        });
+        let domain: bcode_session_models::RuntimeWorkSpan =
+            serde_json::from_value(wire.clone()).unwrap();
+        let compatible: RuntimeWorkSpan = domain;
+        assert_eq!(serde_json::to_value(&compatible).unwrap(), wire);
+        assert_eq!(compatible.duration_ms(), None);
+        let mut reversed = compatible;
+        reversed.started_at_ms = Some(60);
+        assert_eq!(reversed.duration_ms(), Some(0));
+        reversed.finished_at_ms = None;
+        assert_eq!(reversed.duration_ms(), None);
     }
 
     fn started(work_id: &WorkId, label: &str, started_at_ms: u64) -> SessionEventKind {

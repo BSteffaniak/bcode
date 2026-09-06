@@ -1,7 +1,7 @@
 //! Transport-neutral application operations for active runtime work.
 
 use super::{ClientId, ServerState, WorkId};
-use bcode_ipc::RuntimeWorkSnapshot;
+use bcode_session_models::RuntimeWorkSnapshot;
 use bcode_session_models::{SessionEvent, SessionId};
 
 /// Return bounded durable runtime-work history without transport framing.
