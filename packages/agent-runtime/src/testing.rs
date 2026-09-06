@@ -503,6 +503,7 @@ struct ScriptedProviderState {
 
 #[derive(Debug)]
 struct ActiveScriptedTurn {
+    cancellation_attempted: bool,
     actions: VecDeque<ScriptedProviderAction>,
     cancel_error: Option<ProviderError>,
     finish_error: Option<ProviderError>,
@@ -545,8 +546,8 @@ impl Drop for ScriptedTurnCleanup {
         let mut state = lock_state(&self.state);
         // Explicit finish already removes the active turn, including its scripted failure path.
         // Abandonment releases only this turn; it must not consume a recovery script.
-        if state.active.remove(&self.turn_id).is_some() {
-            if !state.cancellations.contains(&self.turn_id) {
+        if let Some(turn) = state.active.remove(&self.turn_id) {
+            if !turn.cancellation_attempted {
                 state.cancellations.push(self.turn_id.clone());
             }
             state.finishes.push(self.turn_id.clone());
@@ -592,6 +593,7 @@ impl ModelProviderInvoker for ScriptedProvider {
                     state.active.insert(
                         provider_turn_id.clone(),
                         ActiveScriptedTurn {
+                            cancellation_attempted: false,
                             actions: turn.actions,
                             cancel_error: turn.cancel_error,
                             finish_error: turn.finish_error,
@@ -647,8 +649,11 @@ impl ModelProviderInvoker for ScriptedProvider {
             state.cancellations.push(request.provider_turn_id.clone());
             state
                 .active
-                .get(&request.provider_turn_id)
-                .and_then(|turn| turn.cancel_error.clone())
+                .get_mut(&request.provider_turn_id)
+                .and_then(|turn| {
+                    turn.cancellation_attempted = true;
+                    turn.cancel_error.clone()
+                })
                 .map_or_else(
                     || Ok(AckResponse::default()),
                     |error| Err(runtime_provider_error(error)),
@@ -710,6 +715,34 @@ fn script_exhausted_error() -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_cancel_then_abandonment_records_no_duplicate_cancellation() {
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::new().pending()]);
+        let request = crate::model_turn_request(
+            &crate::AgentTurnRequest::new("model", "cancel then abandon"),
+            None,
+        )
+        .expect("model request");
+        let started = provider.start_turn(None, &request).await.expect("start");
+        let cleanup = provider.turn_cleanup_handle(None, &started.provider_turn_id);
+        provider
+            .cancel_turn(
+                None,
+                &CancelTurnRequest {
+                    provider_turn_id: started.provider_turn_id.clone(),
+                },
+            )
+            .await
+            .expect("explicit cancel");
+        // Capture history is observational, not the source of active lifecycle state.
+        lock_state(&provider.state).cancellations.clear();
+        drop(cleanup);
+        let state = lock_state(&provider.state);
+        assert!(state.active.is_empty());
+        assert!(state.cancellations.is_empty());
+        assert_eq!(state.finishes, [started.provider_turn_id]);
+    }
 
     #[tokio::test]
     async fn exhausted_turn_ids_preserve_active_turn_and_unused_script() {
