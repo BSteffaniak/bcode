@@ -77,7 +77,7 @@ async fn open_ralph_home_surface(
         serde_json::Value::Null,
         |message| serde_json::json!({ "flash_message": message }),
     );
-    let surface = crate::plugin_tui::open_plugin_tui_surface(
+    crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
         "bcode.ralph",
         "ralph-home",
@@ -93,8 +93,7 @@ async fn open_ralph_home_surface(
     .map_err(|error| TuiError::PluginService {
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
-    })?;
-    Ok(surface)
+    })
 }
 
 fn load_ralph_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {

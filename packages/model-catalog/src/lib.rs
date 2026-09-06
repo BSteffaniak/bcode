@@ -2254,7 +2254,7 @@ mod tests {
             );
         }
         let refresh = resolver
-            .prepare_refresh_if_stale_at(attempt + std::time::Duration::from_secs(60))
+            .prepare_refresh_if_stale_at(attempt + std::time::Duration::from_mins(1))
             .expect("retry interval elapsed");
         drop(refresh);
     }

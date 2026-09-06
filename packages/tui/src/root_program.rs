@@ -1499,10 +1499,9 @@ impl BcodeRuntimeModel {
             commands.push(bmux_tui_runtime::Command::start_if_idle(
                 bmux_tui_runtime::CommandKey::new("bcode.interactive_surface_open"),
                 async move {
-                    let runtime = super::plugin_tui::load_default_runtime_with_static_bundled(
+                    let result = match super::plugin_tui::load_default_runtime_with_static_bundled(
                         &super::static_bundled_plugins(),
-                    );
-                    let result = match runtime {
+                    ) {
                         Ok(runtime) => {
                             super::interactive_surface::InteractiveSurfaceState::open_request(
                                 &runtime, &request, &keymap,

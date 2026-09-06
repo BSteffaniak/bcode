@@ -303,7 +303,7 @@ async fn abandoned_async_shutdown_wait_can_be_resumed() {
         .unwrap();
     });
     start_receiver.await.unwrap();
-    let mut wait = Box::pin(runtime.shutdown_async(Duration::from_secs(60)));
+    let mut wait = Box::pin(runtime.shutdown_async(Duration::from_mins(1)));
     let pending = std::future::poll_fn(|context| {
         std::task::Poll::Ready(wait.as_mut().poll(context).is_pending())
     })

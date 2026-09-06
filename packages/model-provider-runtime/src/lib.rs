@@ -1338,7 +1338,8 @@ impl ProviderRuntime {
     /// * Returns [`ProviderRuntimeError::ShutdownFailed`] if teardown is not acknowledged.
     pub async fn shutdown_async(&self, timeout: Duration) -> Result<(), ProviderRuntimeError> {
         self.check_blocking_caller()?;
-        match *self.stopped_async.borrow() {
+        let status = *self.stopped_async.borrow();
+        match status {
             Some(true) => return Ok(()),
             Some(false) => return Err(ProviderRuntimeError::ShutdownFailed),
             None => {}

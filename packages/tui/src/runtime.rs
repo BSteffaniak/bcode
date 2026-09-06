@@ -74,26 +74,30 @@ pub async fn run_standalone_plugin_surface<W: Write>(
     plugin_id: impl Into<String>,
     surface: bcode_plugin_sdk::tui::BoxedPluginTuiSurface,
 ) -> Result<Option<serde_json::Value>, TuiError> {
-    let initialized = initialize_tui(
-        terminal.area(),
-        None,
-        &super::static_bundled_plugins(),
-        super::TuiLaunchOptions::default(),
-    );
-    let passive_client = initialized
-        .client
-        .clone()
-        .with_daemon_availability(DaemonAvailability::RequireRunning);
-    let loop_state = chat_loop::ChatLoopState::new(
-        &initialized.client,
-        &passive_client,
-        initialized.settings.metrics_enabled(),
-    );
-    let mut model =
-        root_program::BcodeRuntimeModel::new(initialized.chat, initialized.settings, loop_state);
     let plugin_id = plugin_id.into();
-    model.queue_standalone_plugin_surface(plugin_id.clone(), surface);
-    let (runtime, handle) = root_program::runtime(terminal, model);
+    let (runtime, handle) = {
+        let InitializedTui {
+            client,
+            settings,
+            chat,
+            ..
+        } = initialize_tui(
+            terminal.area(),
+            None,
+            &super::static_bundled_plugins(),
+            super::TuiLaunchOptions::default(),
+        );
+        let passive_client = client
+            .clone()
+            .with_daemon_availability(DaemonAvailability::RequireRunning);
+        let loop_state =
+            chat_loop::ChatLoopState::new(&client, &passive_client, settings.metrics_enabled());
+        drop(passive_client);
+        drop(client);
+        let mut model = root_program::BcodeRuntimeModel::new(chat, settings, loop_state);
+        model.queue_standalone_plugin_surface(plugin_id.clone(), surface);
+        root_program::runtime(terminal, model)
+    };
     let mut model = Box::pin(root_program::run(runtime, handle)).await?;
     let outcome = model
         .take_plugin_surface_result()
@@ -283,13 +287,19 @@ async fn run_root<W: Write>(
     );
     loop_state.declarative_streaming_policy = initialized.declarative_streaming_policy;
     loop_state.streaming_presentation_override = initialized.streaming_presentation_override;
-    let mut model =
-        root_program::BcodeRuntimeModel::new(initialized.chat, initialized.settings, loop_state);
-    if let StartupTuiAction::OpenRalphHome { repo_path } = startup_action {
-        let surface = super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;
-        model.queue_plugin_surface("bcode.ralph", surface);
-    }
-    let (runtime, handle) = root_program::runtime(terminal, model);
+    let (runtime, handle) = {
+        let mut model = root_program::BcodeRuntimeModel::new(
+            initialized.chat,
+            initialized.settings,
+            loop_state,
+        );
+        if let StartupTuiAction::OpenRalphHome { repo_path } = startup_action {
+            let surface =
+                super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;
+            model.queue_plugin_surface("bcode.ralph", surface);
+        }
+        root_program::runtime(terminal, model)
+    };
     let _model = Box::pin(root_program::run(runtime, handle)).await?;
     Ok(())
 }
