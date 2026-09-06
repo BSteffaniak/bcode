@@ -4397,7 +4397,9 @@ fn spawn_exclusive_plugin_executor(
     metrics: Arc<PluginExecutorMetrics>,
 ) {
     tokio::task::spawn_blocking(move || {
-        let mut active = true;
+        let plugin_id = plugin.manifest.id.clone();
+        let mut plugin = Some(plugin);
+        let mut stopping = false;
         while let Some(message) = receiver.blocking_recv() {
             match message {
                 PluginExecutorMessage::Service(mut invocation) => {
@@ -4407,7 +4409,7 @@ fn spawn_exclusive_plugin_executor(
                         "plugin.queue_wait.duration_ms",
                         queue_wait_ms,
                         plugin_runtime_metric_labels(
-                            &plugin.manifest.id,
+                            &plugin_id,
                             &invocation.interface_id,
                             &invocation.operation,
                             invocation.class,
@@ -4417,11 +4419,11 @@ fn spawn_exclusive_plugin_executor(
                     let (unused_response, _) = oneshot::channel();
                     let response_sender =
                         std::mem::replace(&mut invocation.response, unused_response);
-                    let response = if active {
-                        execute_plugin_service_invocation(&plugin, invocation, &metrics)
+                    let response = if let Some(plugin) = plugin.as_ref().filter(|_| !stopping) {
+                        execute_plugin_service_invocation(plugin, invocation, &metrics)
                     } else {
                         metrics.failed.fetch_add(1, Ordering::Relaxed);
-                        Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
+                        Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
                     };
                     let _ = response_sender.send(response);
                 }
@@ -4431,17 +4433,17 @@ fn spawn_exclusive_plugin_executor(
                     let started_at = Instant::now();
                     tracing::debug!(
                         target: "bcode_plugin::runtime",
-                        plugin_id = %plugin.manifest.id,
+                        plugin_id = %plugin_id,
                         invocation_id = invocation.id.get(),
                         class = ?invocation.class,
                         queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
                         topic = %invocation.topic,
                         "plugin event invocation started"
                     );
-                    let response = if active {
+                    let response = if let Some(plugin) = plugin.as_ref().filter(|_| !stopping) {
                         plugin.handle_event(invocation.topic, invocation.payload)
                     } else {
-                        Err(PluginLoadError::PluginNotLoaded(plugin.manifest.id.clone()))
+                        Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
                     };
                     metrics.running.fetch_sub(1, Ordering::Relaxed);
                     if response.is_ok() {
@@ -4451,7 +4453,7 @@ fn spawn_exclusive_plugin_executor(
                     }
                     tracing::debug!(
                         target: "bcode_plugin::runtime",
-                        plugin_id = %plugin.manifest.id,
+                        plugin_id = %plugin_id,
                         invocation_id = invocation.id.get(),
                         duration_ms = started_at.elapsed().as_millis(),
                         success = response.is_ok(),
@@ -4460,18 +4462,16 @@ fn spawn_exclusive_plugin_executor(
                     let _ = invocation.response.send(response);
                 }
                 PluginExecutorMessage::Deactivate(response) => {
-                    let result = if active {
-                        active = false;
-                        plugin.deactivate()
-                    } else {
-                        Ok(())
-                    };
+                    stopping = true;
+                    let result = plugin.as_ref().map_or(Ok(()), LoadedPlugin::deactivate);
+                    if result.is_ok() {
+                        drop(plugin.take());
+                    }
                     let _ = response.send(result);
-                    break;
                 }
             }
         }
-        if active {
+        if let Some(plugin) = plugin {
             let _ = plugin.deactivate();
         }
     });
@@ -7693,6 +7693,100 @@ library = "libexample_plugin.dylib"
     }
 
     #[test]
+    fn exclusive_deactivation_retries_failure_and_remembers_success() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+            i32::from(CALLS.fetch_add(1, Ordering::SeqCst) == 0)
+        }
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        tokio.block_on(async {
+            let mut vtable = test_large_vtable();
+            vtable.deactivate = deactivate;
+            let mut manifest = test_manifest("exclusive-cleanup-retry");
+            manifest.concurrency = PluginConcurrencyConfig::Exclusive;
+            let runtime = PluginRuntimeHost::from(PluginHost {
+                configs: BTreeMap::new(),
+                command_registry: bcode_command::CommandRegistry::new(),
+                auth_provider_registry: AuthProviderRegistry::new(),
+                loaded: vec![LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest,
+                    backend: LoadedPluginBackend::Static { vtable },
+                }],
+            });
+            for expected_cleanup_success in [false, true, true] {
+                assert_eq!(
+                    runtime.deactivate_all().await.is_ok(),
+                    expected_cleanup_success
+                );
+                let service = runtime
+                    .invoke_service(
+                        "exclusive-cleanup-retry",
+                        "test.service/v1",
+                        "test",
+                        Vec::new(),
+                    )
+                    .await;
+                assert!(matches!(service, Err(PluginLoadError::PluginNotLoaded(_))));
+                let event = runtime.executors["exclusive-cleanup-retry"]
+                    .handle_event("test.event".to_owned(), Vec::new())
+                    .await;
+                assert!(matches!(event, Err(PluginLoadError::PluginNotLoaded(_))));
+            }
+            drop(runtime);
+            assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn exclusive_deactivation_survives_abandoned_response() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        tokio.block_on(async {
+            let mut vtable = test_large_vtable();
+            vtable.deactivate = deactivate;
+            let (sender, receiver) = mpsc::channel(2);
+            spawn_exclusive_plugin_executor(
+                LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest("abandoned-cleanup"),
+                    backend: LoadedPluginBackend::Static { vtable },
+                },
+                receiver,
+                Arc::new(PluginExecutorMetrics::default()),
+            );
+            let (response, abandoned) = oneshot::channel();
+            drop(abandoned);
+            sender
+                .send(PluginExecutorMessage::Deactivate(response))
+                .await
+                .expect("queue abandoned cleanup");
+            let (response, completion) = oneshot::channel();
+            sender
+                .send(PluginExecutorMessage::Deactivate(response))
+                .await
+                .expect("queue cleanup acknowledgment");
+            completion
+                .await
+                .expect("executor responds")
+                .expect("cleanup succeeds");
+            drop(sender);
+        });
+        drop(tokio);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn concurrent_deactivation_runs_off_the_runtime_thread() {
         static RUNTIME_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
             std::sync::Mutex::new(None);
@@ -7779,7 +7873,6 @@ library = "libexample_plugin.dylib"
                     loaded,
                 });
                 let result = runtime.deactivate_all().await;
-                drop(runtime);
                 assert!(matches!(
                     result,
                     Err(PluginLoadError::LifecycleFailed {
@@ -7789,6 +7882,7 @@ library = "libexample_plugin.dylib"
                     }) if plugin_id == "z"
                 ));
                 assert_eq!(*CALLS.lock().expect("calls lock"), ["z", "m", "a"]);
+                drop(runtime);
             }
         });
     }

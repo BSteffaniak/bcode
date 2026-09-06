@@ -55586,6 +55586,43 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(DEACTIVATIONS.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedded_startup_bind_failure_deactivates_plugins() {
+        static DEACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+            DEACTIVATIONS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let mut vtable = bcode_prompt_profile_plugin::static_plugin();
+        vtable.deactivate = deactivate;
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
+            vtable,
+        );
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let result = run_embedded_with_services_and_shutdown(
+            bcode_ipc::IpcEndpoint::unix_socket(directory.path().to_path_buf()),
+            bcode_config::BcodeConfig::default(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from(["bcode.prompt-profile".to_owned()]),
+                    disabled: BTreeSet::new(),
+                },
+                &[plugin],
+            )
+            .expect("load plugin"),
+            bcode_model_catalog::ModelCatalogResolver::embedded(),
+            Vec::new(),
+            bcode_agent_runtime::CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Transport(_))));
+        assert_eq!(DEACTIVATIONS.load(Ordering::SeqCst), 1);
+        assert!(directory.path().is_dir());
+    }
+
     pub fn test_server_state_with_plugins(
         sessions: SessionManager,
         plugins: bcode_plugin::PluginRuntimeHost,
