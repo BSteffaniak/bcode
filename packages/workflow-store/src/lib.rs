@@ -19374,12 +19374,20 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT definition_json FROM workflow_definitions",
+                    "SELECT definition_json FROM workflow_definitions WHERE definition_id = 'example'",
                     [],
                     |row| row.get::<_, String>(0)
                 )
                 .expect("preserved payload"),
             payload
+        );
+        let preserved_valid: String = connection.query_row(
+            "SELECT definition_json FROM workflow_definitions WHERE definition_id = 'valid-earlier' AND version = 1",
+            [], |row| row.get(0),
+        ).expect("preserved earlier definition");
+        assert_eq!(
+            serde_json::from_str::<WorkflowDefinition>(&preserved_valid).expect("valid payload"),
+            definition("valid-earlier")
         );
         assert_eq!(
             connection
