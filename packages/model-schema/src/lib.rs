@@ -215,7 +215,35 @@ fn normalize_object(
     let keys = object.keys().cloned().collect::<Vec<_>>();
     for key in keys {
         if let Some(child) = object.get_mut(&key) {
-            normalize_value(child, dialect, &join_pointer(path, &key))?;
+            let child_path = join_pointer(path, &key);
+            match key.as_str() {
+                "properties" | "$defs" | "definitions" | "patternProperties"
+                | "dependentSchemas" => {
+                    if let Some(schemas) = child.as_object_mut() {
+                        for (name, schema) in schemas {
+                            normalize_value(schema, dialect, &join_pointer(&child_path, name))?;
+                        }
+                    }
+                }
+                "items"
+                | "additionalProperties"
+                | "additionalItems"
+                | "contains"
+                | "propertyNames"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "unevaluatedItems"
+                | "unevaluatedProperties"
+                | "allOf"
+                | "anyOf"
+                | "oneOf"
+                | "prefixItems" => {
+                    normalize_value(child, dialect, &child_path)?;
+                }
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -377,6 +405,25 @@ mod tests {
             accepted_min_items: BTreeSet::from([0, 1]),
             ..SchemaDialect::default()
         }
+    }
+
+    #[test]
+    fn property_names_and_literal_objects_are_not_schemas() {
+        let literal = serde_json::json!({"properties": {"type": "object"}});
+        let schema = serde_json::json!({
+            "type": "object", "properties": {
+                "properties": {"type": "array", "description": "attributes", "items": {"type": "string"}},
+                "type": {"type": "string"},
+                "example": {"type": "object", "const": literal}
+            }
+        });
+        let normalized = normalize(&schema, &restrictive_dialect()).unwrap();
+        assert_eq!(normalized["properties"].as_object().unwrap().len(), 3);
+        assert_eq!(
+            normalized["properties"]["properties"],
+            schema["properties"]["properties"]
+        );
+        assert_eq!(normalized["properties"]["example"]["const"], literal);
     }
 
     #[test]
