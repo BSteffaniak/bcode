@@ -3788,7 +3788,7 @@ pub async fn run_embedded_with_services_and_shutdown(
     shutdown: bcode_agent_runtime::CancellationToken,
 ) -> Result<(), ServerError> {
     let plugin_selection = plugins.selection().clone();
-    run_with_services(
+    Box::pin(run_with_services(
         endpoint,
         false,
         config,
@@ -3800,7 +3800,7 @@ pub async fn run_embedded_with_services_and_shutdown(
             default_plugin_ids,
             shutdown,
         },
-    )
+    ))
     .await
 }
 
