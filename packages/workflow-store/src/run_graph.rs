@@ -4,6 +4,7 @@ use super::{WorkflowStore, WorkflowStoreError};
 use bcode_workflow::{EdgeDefinition, NodeDefinition, WorkflowDefinition};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// An immutable executable node revision in a run-owned graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,8 +69,10 @@ pub fn materialize(
                 .to_string(),
         ));
     }
-    for id in definition.entries.iter().chain(&definition.exits) {
-        if !definition.nodes.contains_key(id) {
+    let entries: BTreeSet<_> = definition.entries.iter().collect();
+    let exits: BTreeSet<_> = definition.exits.iter().collect();
+    for id in entries.union(&exits) {
+        if !definition.nodes.contains_key(*id) {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow graph boundary references a missing node".to_string(),
             ));
@@ -100,8 +103,8 @@ pub fn materialize(
                 run_id,
                 id,
                 super::bounded_json("graph node", node)?,
-                definition.entries.contains(id),
-                definition.exits.contains(id),
+                entries.contains(id),
+                exits.contains(id),
             ],
         )?;
     }
@@ -126,14 +129,35 @@ pub fn migrate(transaction: &Transaction<'_>) -> Result<(), WorkflowStoreError> 
     initialize(transaction)?;
     // Explicit offline migration may scan all runs, but only retains one definition at a time.
     let mut statement = transaction.prepare(
-        "SELECT run.run_id, definition.definition_json FROM workflow_runs run
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id
+        "SELECT run.run_id,
+                CASE WHEN typeof(definition.definition_json) = 'text'
+                     AND length(CAST(definition.definition_json AS BLOB)) <= ?1
+                     THEN definition.definition_json END,
+                definition.checksum_sha256, definition.definition_id FROM workflow_runs run
+         LEFT JOIN workflow_definitions definition ON definition.definition_id = run.definition_id
              AND definition.version = run.definition_version ORDER BY run.run_id",
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query([super::MAX_INLINE_JSON_BYTES])?;
     while let Some(row) = rows.next()? {
         let run_id: String = row.get(0)?;
-        let definition: WorkflowDefinition = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        if row.get::<_, Option<String>>(3)?.is_none() {
+            return Err(WorkflowStoreError::InvalidData(
+                "foreign-key verification failed: workflow run definition is missing".to_string(),
+            ));
+        }
+        let payload = row.get::<_, Option<String>>(1)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow definition payload is invalid or oversized during graph migration"
+                    .to_string(),
+            )
+        })?;
+        let checksum: String = row.get(2)?;
+        if super::sha256_hex(payload.as_bytes()) != checksum {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow definition checksum mismatch during graph migration".to_string(),
+            ));
+        }
+        let definition: WorkflowDefinition = serde_json::from_str(&payload)?;
         definition.validate().map_err(|error| {
             WorkflowStoreError::InvalidData(format!(
                 "invalid workflow definition during graph migration: {error}"
@@ -171,7 +195,8 @@ pub fn initial_node(
     let payload = connection
         .query_row(
             "SELECT CASE WHEN typeof(node_json) = 'text'
-                     AND length(CAST(node_json AS BLOB)) <= ?3 THEN node_json END
+                     AND length(CAST(node_json AS BLOB)) <= ?3
+                     AND is_entry IN (0, 1) AND is_exit IN (0, 1) THEN node_json END
          FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = ?2 AND revision = 1",
             rusqlite::params![run_id, node_id, super::MAX_INLINE_JSON_BYTES],
             |row| row.get::<_, Option<String>>(0),
@@ -219,6 +244,40 @@ impl WorkflowStore {
         after_edge_id: Option<u64>,
         limit: usize,
     ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+        self.graph_edge_page(run_id, None, after_edge_id, limit)
+    }
+
+    /// Read a bounded page of initial edges targeting one node, ordered by edge identity.
+    ///
+    /// Missing runs or targets with no incoming edges return an empty page.
+    /// # Errors
+    /// Returns an error for invalid identities or cursors, unsupported graph revisions,
+    /// damaged edge relationships or payloads, or database failures.
+    pub fn run_graph_incoming_edges(
+        &self,
+        run_id: &str,
+        target_node_id: &str,
+        after_edge_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+        super::validate_id("target_node_id", target_node_id)?;
+        self.graph_edge_page(run_id, Some(target_node_id), after_edge_id, limit)
+    }
+
+    fn graph_edge_page(
+        &self,
+        run_id: &str,
+        target_node_id: Option<&str>,
+        after_edge_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+        let after_edge_id = after_edge_id
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                WorkflowStoreError::InvalidData("edge cursor exceeds storage range".to_string())
+            })?
+            .unwrap_or(-1);
         let Some(revision) = self.run_graph_revision(run_id)? else {
             return Ok(Vec::new());
         };
@@ -227,7 +286,12 @@ impl WorkflowStore {
                 "initial graph inspection does not support revised graphs".to_string(),
             ));
         }
-        let mut statement = self.connection.prepare(
+        let target_filter = if target_node_id.is_some() {
+            "AND edge.target_node_id = ?5"
+        } else {
+            "AND ?5 IS NULL"
+        };
+        let sql = format!(
             "SELECT edge.edge_id,
                     CASE WHEN typeof(edge.edge_json) = 'text'
                          AND length(CAST(edge.edge_json AS BLOB)) <= ?4
@@ -240,14 +304,16 @@ impl WorkflowStore {
              LEFT JOIN workflow_run_graph_nodes target ON target.run_id = edge.run_id
                  AND target.node_id = edge.target_node_id AND target.revision = 1
              WHERE edge.run_id = ?1 AND edge.revision = 1
-                 AND (?2 IS NULL OR edge.edge_id > ?2)
+                 AND edge.edge_id > ?2 {target_filter}
              ORDER BY edge.edge_id LIMIT ?3",
-        )?;
+        );
+        let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query(rusqlite::params![
             run_id,
             after_edge_id,
             limit.clamp(1, 100),
-            super::MAX_INLINE_JSON_BYTES
+            super::MAX_INLINE_JSON_BYTES,
+            target_node_id
         ])?;
         let mut edges = Vec::new();
         while let Some(row) = rows.next()? {
@@ -311,6 +377,9 @@ impl WorkflowStore {
         after_node_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RunGraphNode>, WorkflowStoreError> {
+        if let Some(id) = after_node_id {
+            super::validate_id("after_node_id", id)?;
+        }
         let Some(revision) = self.run_graph_revision(run_id)? else {
             return Ok(Vec::new());
         };
@@ -319,21 +388,18 @@ impl WorkflowStore {
                 "initial graph inspection does not support revised graphs".to_string(),
             ));
         }
-        if let Some(id) = after_node_id {
-            super::validate_id("after_node_id", id)?;
-        }
         let mut statement = self.connection.prepare(
             "SELECT node_id, revision,
                     CASE WHEN typeof(node_json) = 'text'
                          AND length(CAST(node_json AS BLOB)) <= ?5 THEN node_json END,
                     is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = ?1 AND revision <= ?2
-             AND (?3 IS NULL OR node_id > ?3) ORDER BY node_id LIMIT ?4",
+             AND node_id > ?3 ORDER BY node_id LIMIT ?4",
         )?;
         let mut rows = statement.query(rusqlite::params![
             run_id,
             revision,
-            after_node_id,
+            after_node_id.unwrap_or(""),
             limit.clamp(1, 100),
             super::MAX_INLINE_JSON_BYTES
         ])?;
