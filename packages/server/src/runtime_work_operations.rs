@@ -21,6 +21,9 @@ pub async fn history(
         .into_iter()
         .flat_map(|work| super::runtime_work_projection_to_events(session_id, work))
         .collect::<Vec<_>>();
+    // Projection rows are grouped by work, not by lifecycle event sequence.
+    // Sort before trimming so overlapping work retains the latest events in this window.
+    events.sort_by_key(|event| event.sequence);
     if events.len() > limit {
         events.drain(0..events.len() - limit);
     }

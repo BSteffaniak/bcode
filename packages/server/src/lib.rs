@@ -61314,6 +61314,108 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn runtime_work_history_orders_overlapping_lifecycles() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(None, PathBuf::from("."))
+            .await
+            .expect("session");
+        for name in ["older", "newer"] {
+            sessions
+                .append_runtime_work_started(
+                    session.id,
+                    SessionEventKind::RuntimeWorkStarted {
+                        work_id: WorkId::new(name),
+                        kind: RuntimeWorkKind::Tool,
+                        label: name.to_owned(),
+                        tool_call_id: None,
+                        plugin_id: None,
+                        service_interface: None,
+                        operation: None,
+                        parent_work_id: None,
+                        started_at_ms: None,
+                        cancellable: true,
+                    },
+                )
+                .await
+                .expect("start");
+        }
+        let finish = sessions
+            .append_runtime_work_finished(
+                session.id,
+                WorkId::new("older"),
+                RuntimeWorkStatus::Completed,
+                Some(10),
+                None,
+            )
+            .await
+            .expect("finish older work");
+        let state = test_server_state(sessions);
+        let history = runtime_work_operations::history(&state, session.id, 3)
+            .await
+            .expect("history");
+        assert_eq!(history.len(), 3);
+        assert!(
+            history
+                .windows(2)
+                .all(|pair| pair[0].sequence <= pair[1].sequence)
+        );
+        assert_eq!(history.last().expect("latest").sequence, finish.sequence);
+        let limited = runtime_work_operations::history(&state, session.id, 2)
+            .await
+            .expect("limited history");
+        assert_eq!(limited, history[1..]);
+    }
+
+    #[tokio::test]
+    async fn runtime_work_history_caps_large_persistent_windows() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(None, PathBuf::from("."))
+            .await
+            .expect("session");
+        let maximum = bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS;
+        for index in 0..maximum + 2 {
+            sessions
+                .append_runtime_work_started(
+                    session.id,
+                    SessionEventKind::RuntimeWorkStarted {
+                        work_id: WorkId::new(format!("bounded-{index}")),
+                        kind: RuntimeWorkKind::PluginInvocation,
+                        label: format!("work {index}"),
+                        tool_call_id: None,
+                        plugin_id: None,
+                        service_interface: None,
+                        operation: None,
+                        parent_work_id: None,
+                        started_at_ms: Some(u64::try_from(index).expect("timestamp")),
+                        cancellable: false,
+                    },
+                )
+                .await
+                .expect("persist start");
+        }
+        let state = test_server_state(sessions);
+        let history = runtime_work_operations::history(&state, session.id, usize::MAX)
+            .await
+            .expect("bounded history");
+        assert_eq!(history.len(), maximum);
+        for (index, event) in history.iter().enumerate() {
+            assert!(matches!(
+                &event.kind,
+                SessionEventKind::RuntimeWorkStarted { work_id, .. }
+                    if work_id == &WorkId::new(format!("bounded-{}", index + 2))
+            ));
+        }
+        let latest = runtime_work_operations::history(&state, session.id, 0)
+            .await
+            .expect("minimum history");
+        assert_eq!(latest.as_slice(), &history[maximum - 1..]);
+    }
+
+    #[tokio::test]
     async fn runtime_work_list_and_history_match_real_ipc_results() {
         let session_root = tempfile::tempdir().expect("session root");
         let sessions =
@@ -61452,6 +61554,31 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    async fn assert_cancelling_work_snapshot(
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+        work_id: &WorkId,
+    ) -> bcode_client::RuntimeWorkWatcher {
+        let mut watcher = client
+            .watch_runtime_work(session_id)
+            .await
+            .expect("late watcher");
+        let start = tokio::time::timeout(Duration::from_secs(1), watcher.next_event())
+            .await
+            .expect("late snapshot start deadline")
+            .expect("late snapshot start");
+        assert!(matches!(start.kind,
+            SessionEventKind::RuntimeWorkStarted { work_id: id, .. } if &id == work_id));
+        let status = tokio::time::timeout(Duration::from_secs(1), watcher.next_event())
+            .await
+            .expect("late snapshot status deadline")
+            .expect("late snapshot status");
+        assert!(matches!(status.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id: id, status: RuntimeWorkStatus::Cancelling, .. }
+                if &id == work_id));
+        watcher
+    }
+
     async fn assert_runtime_completion_visible(
         state: &ServerState,
         client: &bcode_client::BcodeClient,
@@ -61459,6 +61586,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         session_id: SessionId,
         work_id: WorkId,
     ) {
+        let mut late_watcher = assert_cancelling_work_snapshot(client, session_id, &work_id).await;
         finish_registered_runtime_work(
             state,
             session_id,
@@ -61471,6 +61599,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("terminal watch deadline")
             .expect("terminal watch event");
+        let late_event = tokio::time::timeout(Duration::from_secs(1), late_watcher.next_event())
+            .await
+            .expect("late watcher terminal deadline")
+            .expect("late watcher terminal event");
+        assert_eq!(late_event, event);
         assert!(matches!(event.kind,
             SessionEventKind::RuntimeWorkFinished { work_id: id, status: RuntimeWorkStatus::Cancelled, .. }
                 if id == work_id));

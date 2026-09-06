@@ -1584,9 +1584,15 @@ impl SessionDb {
                 "message",
                 "cancellable",
             ])
-            .where_eq(
+            .where_in(
                 "status",
-                runtime_work_status_name(RuntimeWorkStatus::Running),
+                [
+                    RuntimeWorkStatus::Queued,
+                    RuntimeWorkStatus::Running,
+                    RuntimeWorkStatus::Cancelling,
+                ]
+                .map(|status| DatabaseValue::String(runtime_work_status_name(status).to_owned()))
+                .to_vec(),
             )
             .sort("event_seq_start", SortDirection::Asc)
             .execute(&**self.db)
@@ -4573,8 +4579,12 @@ async fn project_event(
             ..
         } => {
             db.upsert("runtime_work")
+                .unique(&["work_id"])
                 .value("work_id", work_id.to_string())
                 .value("event_seq_start", seq_to_value(event.sequence))
+                .value("event_seq_end", DatabaseValue::Null)
+                .value("finished_at_ms", DatabaseValue::Null)
+                .value("message", DatabaseValue::Null)
                 .value("kind", runtime_work_kind_name(*kind))
                 .value("label", label.clone())
                 .value(
@@ -6621,6 +6631,124 @@ mod tests {
             .expect("tool result transcript item");
         assert_eq!(invocation.status, "complete");
         assert_eq!(invocation.event_seq_end, 1);
+    }
+
+    #[tokio::test]
+    async fn resumed_runtime_work_clears_suspended_completion_fields() {
+        let root = tempfile::tempdir().expect("session root");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, root.path())
+            .await
+            .expect("session database");
+        let start = SessionEventKind::RuntimeWorkStarted {
+            work_id: WorkId::new("resumable"),
+            kind: RuntimeWorkKind::Workflow,
+            label: "resumable work".to_owned(),
+            tool_call_id: None,
+            plugin_id: None,
+            service_interface: None,
+            operation: None,
+            parent_work_id: None,
+            started_at_ms: Some(10),
+            cancellable: true,
+        };
+        db.append_event(&event(session_id, 0, start.clone()))
+            .await
+            .expect("start");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: WorkId::new("resumable"),
+                status: RuntimeWorkStatus::Suspended,
+                finished_at_ms: Some(20),
+                message: Some("waiting for resume".to_owned()),
+            },
+        ))
+        .await
+        .expect("suspend");
+        assert!(db.active_runtime_work().await.expect("inactive").is_empty());
+        db.append_event(&event(session_id, 2, start))
+            .await
+            .expect("resume");
+        let active = db.active_runtime_work().await.expect("active resumed work");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, RuntimeWorkStatus::Running);
+        assert_eq!(active[0].event_seq_start, 2);
+        assert_eq!(active[0].event_seq_end, None);
+        assert_eq!(active[0].finished_at_ms, None);
+        assert_eq!(active[0].message, None);
+        assert_eq!(db.runtime_work_history(1).await.expect("history"), active);
+    }
+
+    #[tokio::test]
+    async fn runtime_work_lifecycles_remain_isolated_in_projection() {
+        let root = tempfile::tempdir().expect("session root");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, root.path())
+            .await
+            .expect("session database");
+        for (sequence, work_id) in [(0, "first"), (2, "second")] {
+            db.append_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: WorkId::new(work_id),
+                    kind: RuntimeWorkKind::Tool,
+                    label: work_id.to_owned(),
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(sequence),
+                    cancellable: true,
+                },
+            ))
+            .await
+            .expect("start work");
+            if sequence == 0 {
+                db.append_event(&event(
+                    session_id,
+                    1,
+                    SessionEventKind::RuntimeWorkFinished {
+                        work_id: WorkId::new("first"),
+                        status: RuntimeWorkStatus::Completed,
+                        finished_at_ms: Some(1),
+                        message: Some("first completed".to_owned()),
+                    },
+                ))
+                .await
+                .expect("complete first work");
+            }
+        }
+        let history = db.runtime_work_history(10).await.expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].work_id, WorkId::new("first"));
+        assert_eq!(history[0].status, RuntimeWorkStatus::Completed);
+        assert_eq!(history[0].event_seq_end, Some(1));
+        assert_eq!(history[0].message.as_deref(), Some("first completed"));
+        assert_eq!(history[1].work_id, WorkId::new("second"));
+        assert_eq!(history[1].status, RuntimeWorkStatus::Running);
+        assert_eq!(history[1].event_seq_end, None);
+        assert_eq!(history[1].message, None);
+        db.append_event(&event(
+            session_id,
+            3,
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id: WorkId::new("second"),
+                requested_at_ms: Some(3),
+                client_id: None,
+            },
+        ))
+        .await
+        .expect("cancel second work");
+        let after = db.runtime_work_history(10).await.expect("updated history");
+        assert_eq!(after[0], history[0]);
+        assert_eq!(after[1].status, RuntimeWorkStatus::Cancelling);
+        let active = db.active_runtime_work().await.expect("active work");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0], after[1]);
     }
 
     #[tokio::test]
