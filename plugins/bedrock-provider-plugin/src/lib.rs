@@ -76,10 +76,14 @@ struct PushTurnCleanup<'a> {
     store: &'a Mutex<TurnStore>,
     id: String,
     turn: TurnState,
+    transferred: bool,
 }
 
 impl Drop for PushTurnCleanup<'_> {
     fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
         self.turn.cancel();
         self.store
             .lock()
@@ -247,6 +251,12 @@ impl BedrockProviderPlugin {
             .lock()
             .expect("bedrock turn store lock should not be poisoned")
             .insert_started("bedrock-turn");
+        let mut cleanup = PushTurnCleanup {
+            store: &self.turns,
+            id: provider_turn_id.clone(),
+            turn: turn.clone(),
+            transferred: false,
+        };
         if positioned_output {
             turn.enable_positioned_output();
         }
@@ -262,7 +272,10 @@ impl BedrockProviderPlugin {
             }
             Err(error) => push_runtime_error(&turn, error),
         }
-        json_response(&StartTurnResponse { provider_turn_id })
+        let response = json_response(&StartTurnResponse { provider_turn_id });
+        cleanup.transferred = response.error.is_none();
+        drop(cleanup);
+        response
     }
 
     /// Serve one complete turn over a push event stream.
@@ -285,6 +298,7 @@ impl BedrockProviderPlugin {
             store: &self.turns,
             id: provider_turn_id,
             turn: turn.clone(),
+            transferred: false,
         };
         turn.enable_positioned_output();
         if let Ok(route) = resolve_bedrock_route(&request, &Settings::resolve(Some(&request))) {
@@ -1233,7 +1247,6 @@ async fn read_mantle_openai_stream(
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
         }
-        let cancel_notify = turn.cancel_notify();
         tokio::select! {
             chunk = response.chunk() => {
                 let Some(chunk) = chunk
@@ -1283,7 +1296,7 @@ async fn read_mantle_openai_stream(
                     }
                 }
             }
-            () = cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+            () = turn.cancelled() => return Ok(StreamOutcome::Cancelled),
         }
     }
 }
@@ -1930,7 +1943,6 @@ async fn read_mantle_anthropic_stream(
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
         }
-        let cancel_notify = turn.cancel_notify();
         tokio::select! {
             chunk = response.chunk() => {
                 if let Some(chunk) = chunk.map_err(|error| mantle_network_error("stream_failed", &error))? {
@@ -1956,7 +1968,7 @@ async fn read_mantle_anthropic_stream(
                     return Ok(accumulator.finish());
                 }
             }
-            () = cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+            () = turn.cancelled() => return Ok(StreamOutcome::Cancelled),
         }
     }
 }
@@ -2279,7 +2291,6 @@ async fn read_anthropic_messages_stream(
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
         }
-        let cancel_notify = turn.cancel_notify();
         tokio::select! {
             event = stream.recv() => {
                 let Some(event) = event.map_err(|error| bedrock_messages_stream_error(&error))? else {
@@ -2310,7 +2321,7 @@ async fn read_anthropic_messages_stream(
                     }
                 }
             }
-            () = cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+            () = turn.cancelled() => return Ok(StreamOutcome::Cancelled),
         }
     }
 }
@@ -2814,7 +2825,6 @@ async fn read_bedrock_stream(
         if turn.is_cancelled() {
             return Ok(StreamOutcome::Cancelled);
         }
-        let cancel_notify = turn.cancel_notify();
         tokio::select! {
             event = stream.recv() => {
                 let Some(event) = event.map_err(|error| bedrock_stream_error(&error))? else {
@@ -2833,7 +2843,7 @@ async fn read_bedrock_stream(
                     return Ok(outcome);
                 }
             }
-            () = cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+            () = turn.cancelled() => return Ok(StreamOutcome::Cancelled),
         }
     }
 }
@@ -7338,6 +7348,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transferred_turn_remains_owned_by_polling_caller() {
+        let store = Mutex::new(TurnStore::default());
+        let (id, turn) = store.lock().unwrap().insert_started("test");
+        drop(PushTurnCleanup {
+            store: &store,
+            id: id.clone(),
+            turn: turn.clone(),
+            transferred: true,
+        });
+        assert!(!turn.is_cancelled());
+        assert!(!store.lock().unwrap().drain(&id).is_empty());
+        store.lock().unwrap().finish(&id);
+        assert!(turn.is_cancelled());
+    }
+
+    #[test]
     fn push_turn_cleanup_releases_registry_on_unwind() {
         let store = Mutex::new(TurnStore::default());
         let (id, turn) = store.lock().unwrap().insert_started("test");
@@ -7346,6 +7372,7 @@ mod tests {
                 store: &store,
                 id: id.clone(),
                 turn: turn.clone(),
+                transferred: false,
             };
             panic!("failed invocation");
         }));

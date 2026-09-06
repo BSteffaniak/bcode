@@ -19,6 +19,55 @@ impl Drop for Released {
 }
 
 #[test]
+fn cancellation_wait_observes_prior_and_concurrent_requests() {
+    let runtime = ProviderRuntime::new().unwrap();
+    runtime
+        .block_on(async {
+            let turn = bcode_model_provider_runtime::TurnState::default();
+            turn.cancel();
+            tokio::time::timeout(Duration::from_secs(5), turn.cancelled())
+                .await
+                .unwrap();
+            let turn = bcode_model_provider_runtime::TurnState::default();
+            let wait = turn.cancelled();
+            tokio::pin!(wait);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    wait.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            turn.cancel();
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
+fn abandoning_turn_store_cancels_external_handles() {
+    let mut store = bcode_model_provider_runtime::TurnStore::default();
+    let (_, first) = store.insert_started("provider");
+    let (_, second) = store.insert_started("provider");
+    drop(store);
+    assert!(first.is_cancelled());
+    assert!(second.is_cancelled());
+}
+
+#[test]
+fn unwinding_turn_store_cancels_external_handles() {
+    let mut store = bcode_model_provider_runtime::TurnStore::default();
+    let (_, turn) = store.insert_started("provider");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _store = store;
+        panic!("abandoned provider owner");
+    }));
+    assert!(outcome.is_err());
+    assert!(turn.is_cancelled());
+}
+
+#[test]
 fn finishing_all_turns_cancels_handles_without_reusing_identity() {
     let mut store = bcode_model_provider_runtime::TurnStore::default();
     let (first_id, first) = store.insert_started("provider");
@@ -99,6 +148,30 @@ fn runtime_worker_rejects_self_wait_without_starting_shutdown() {
                 worker_runtime.shutdown(Duration::from_secs(5)),
                 Err(ProviderRuntimeError::RuntimeThreadWait)
             ));
+        })
+        .unwrap();
+    assert_eq!(runtime.block_on(async { 42 }).unwrap(), 42);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn blocking_worker_rejects_self_wait_without_closing_admission() {
+    let runtime = Arc::new(ProviderRuntime::new().unwrap());
+    let worker = Arc::clone(&runtime);
+    runtime
+        .block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                assert!(matches!(
+                    worker.shutdown(Duration::ZERO),
+                    Err(ProviderRuntimeError::RuntimeThreadWait)
+                ));
+                assert!(matches!(
+                    worker.block_on(async {}),
+                    Err(ProviderRuntimeError::RuntimeThreadWait)
+                ));
+            })
+            .await
+            .unwrap();
         })
         .unwrap();
     assert_eq!(runtime.block_on(async { 42 }).unwrap(), 42);

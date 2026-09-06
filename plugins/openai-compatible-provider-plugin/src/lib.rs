@@ -179,10 +179,14 @@ struct PushTurnCleanup<'a> {
     state: &'a Mutex<OpenAiCompatibleProviderState>,
     id: String,
     turn: TurnState,
+    transferred: bool,
 }
 
 impl Drop for PushTurnCleanup<'_> {
     fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
         self.turn.cancel();
         self.state
             .lock()
@@ -1476,11 +1480,20 @@ impl OpenAiCompatibleProviderPlugin {
         });
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
+        let mut cleanup = PushTurnCleanup {
+            state: &self.state,
+            id: provider_turn_id.clone(),
+            turn: turn.clone(),
+            transferred: false,
+        };
         match &self.runtime {
             Ok(runtime) => start_chat_completion(runtime, request, &turn),
             Err(error) => push_runtime_error(&turn, error),
         }
-        json_response(&StartTurnResponse { provider_turn_id })
+        let response = json_response(&StartTurnResponse { provider_turn_id });
+        cleanup.transferred = response.error.is_none();
+        drop(cleanup);
+        response
     }
 
     /// Serve one complete turn over a push event stream.
@@ -1516,6 +1529,7 @@ impl OpenAiCompatibleProviderPlugin {
             state: &self.state,
             id: provider_turn_id,
             turn: turn.clone(),
+            transferred: false,
         };
         let outcome = stream_turn_events(&turn, context);
         drop(cleanup);
@@ -9102,6 +9116,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transferred_turn_remains_registered() {
+        let state = Mutex::new(OpenAiCompatibleProviderState::default());
+        let turn = TurnState::default();
+        state
+            .lock()
+            .unwrap()
+            .turns
+            .insert("turn".to_owned(), turn.clone());
+        drop(PushTurnCleanup {
+            state: &state,
+            id: "turn".to_owned(),
+            turn: turn.clone(),
+            transferred: true,
+        });
+        assert!(!turn.is_cancelled());
+        assert!(state.lock().unwrap().turns.contains_key("turn"));
+    }
+
+    #[test]
     fn push_turn_cleanup_releases_registry_on_unwind() {
         let state = Mutex::new(OpenAiCompatibleProviderState::default());
         let turn = TurnState::default();
@@ -9115,6 +9148,7 @@ mod tests {
                 state: &state,
                 id: "turn".to_owned(),
                 turn: turn.clone(),
+                transferred: false,
             };
             panic!("failed invocation");
         }));

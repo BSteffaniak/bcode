@@ -574,7 +574,19 @@ impl TurnState {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// Wait for cancellation, including cancellation requested before this wait began.
+    pub async fn cancelled(&self) {
+        let notified = self.cancel_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+
     /// Notify fired when the host requests cancellation.
+    ///
+    /// Prefer [`Self::cancelled`] when waiting: raw notifications do not retain cancellation.
     #[must_use]
     pub fn cancel_notify(&self) -> Arc<Notify> {
         self.cancel_notify.clone()
@@ -582,16 +594,32 @@ impl TurnState {
 }
 
 /// In-memory active-turn store used by synchronous plugin entrypoints.
+///
+/// Dropping the store requests cancellation for retained turns. Execution owners must still
+/// await worker termination before releasing the resources those workers use.
 #[derive(Debug, Default)]
 pub struct TurnStore {
     next_turn: u64,
     turns: BTreeMap<String, TurnState>,
 }
 
+impl Drop for TurnStore {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
 impl TurnStore {
     /// Insert a new turn and return its provider turn id and state.
+    ///
+    /// # Panics
+    ///
+    /// Panics before modifying the store if the turn identity space is exhausted.
     pub fn insert_started(&mut self, id_prefix: &str) -> (String, TurnState) {
-        self.next_turn += 1;
+        self.next_turn = self
+            .next_turn
+            .checked_add(1)
+            .expect("provider turn identity exhausted");
         let provider_turn_id = format!("{id_prefix}-{}", self.next_turn);
         let turn = TurnState::default();
         turn.push(ProviderTurnEvent::TurnStarted);
@@ -1175,6 +1203,7 @@ pub struct ProviderRuntime {
     handle: tokio::runtime::Handle,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     thread: Option<thread::JoinHandle<()>>,
+    blocking_workers: Arc<Mutex<Vec<thread::ThreadId>>>,
     stopped: Arc<(Mutex<Option<bool>>, Condvar)>,
 }
 
@@ -1214,6 +1243,9 @@ impl ProviderRuntime {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let stopped = Arc::new((Mutex::new(None), Condvar::new()));
         let worker_stopped = Arc::clone(&stopped);
+        let blocking_workers = Arc::new(Mutex::new(Vec::new()));
+        let started_workers = Arc::clone(&blocking_workers);
+        let stopped_workers = Arc::clone(&blocking_workers);
         let thread = thread::Builder::new()
             .name("bcode-provider-runtime".to_string())
             .spawn(move || {
@@ -1224,6 +1256,18 @@ impl ProviderRuntime {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_io()
                     .enable_time()
+                    .on_thread_start(move || {
+                        started_workers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(thread::current().id());
+                    })
+                    .on_thread_stop(move || {
+                        stopped_workers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .retain(|id| *id != thread::current().id());
+                    })
                     .build()
                 {
                     Ok(runtime) => runtime,
@@ -1244,14 +1288,16 @@ impl ProviderRuntime {
                 exit.released = true;
             })
             .map_err(ProviderRuntimeError::ThreadSpawn)?;
-        let handle = ready_receiver
+        let startup = ready_receiver
             .recv()
-            .map_err(|_| ProviderRuntimeError::StartupDropped)?
-            .map_err(ProviderRuntimeError::RuntimeBuild)?;
+            .map_err(|_| ProviderRuntimeError::StartupDropped)
+            .and_then(|result| result.map_err(ProviderRuntimeError::RuntimeBuild));
+        let (handle, thread) = finish_runtime_startup(startup, thread)?;
         Ok(Self {
             handle,
             shutdown: Mutex::new(Some(shutdown_sender)),
             thread: Some(thread),
+            blocking_workers,
             stopped,
         })
     }
@@ -1281,8 +1327,8 @@ impl ProviderRuntime {
     ///
     /// # Errors
     ///
-    /// * Returns [`ProviderRuntimeError::RuntimeThreadWait`] on the runtime worker, without
-    ///   requesting shutdown.
+    /// * Returns [`ProviderRuntimeError::RuntimeThreadWait`] on the runtime worker or one of
+    ///   its blocking workers, without requesting shutdown.
     /// * Returns [`ProviderRuntimeError::ShutdownTimeout`] while work remains unaccounted for.
     /// * Returns [`ProviderRuntimeError::ShutdownFailed`] if the worker exits without acknowledging
     ///   resource release.
@@ -1360,6 +1406,11 @@ impl ProviderRuntime {
             .thread
             .as_ref()
             .is_some_and(|worker| worker.thread().id() == thread::current().id())
+            || self
+                .blocking_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&thread::current().id())
         {
             return Err(ProviderRuntimeError::RuntimeThreadWait);
         }
@@ -1373,8 +1424,9 @@ impl ProviderRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if called on the runtime worker, if shutdown has been requested,
-    /// or if the background runtime stops before the operation returns its result.
+    /// Returns an error if called on the runtime worker or one of its blocking workers,
+    /// if shutdown has been requested, or if the background runtime stops before the operation
+    /// returns its result.
     pub fn block_on<F>(&self, future: F) -> Result<F::Output, ProviderRuntimeError>
     where
         F: Future + Send + 'static,
@@ -1397,6 +1449,20 @@ impl ProviderRuntime {
         receiver
             .recv()
             .map_err(|_| ProviderRuntimeError::TaskDropped)
+    }
+}
+
+// Failed acquisition still owns the worker until all its thread-local teardown completes.
+fn finish_runtime_startup<T>(
+    startup: Result<T, ProviderRuntimeError>,
+    worker: thread::JoinHandle<()>,
+) -> Result<(T, thread::JoinHandle<()>), ProviderRuntimeError> {
+    match startup {
+        Ok(value) => Ok((value, worker)),
+        Err(error) => {
+            let _ = worker.join();
+            Err(error)
+        }
     }
 }
 
@@ -1640,6 +1706,48 @@ where
 mod output_position_tests {
     use super::*;
     use bcode_model::{ProviderOutputEvent, ToolCall};
+
+    #[test]
+    fn exhausted_turn_identity_preserves_existing_turns() {
+        let mut store = TurnStore::default();
+        let (id, turn) = store.insert_started("provider");
+        store.next_turn = u64::MAX;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.insert_started("provider");
+        }));
+        assert!(result.is_err());
+        assert_eq!(store.next_turn, u64::MAX);
+        assert_eq!(store.turns.len(), 1);
+        assert!(store.turns.contains_key(&id));
+        assert!(!turn.is_cancelled());
+        store.finish(&id);
+        assert!(turn.is_cancelled());
+    }
+
+    #[test]
+    fn failed_startup_joins_worker_before_returning_error() {
+        let released = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&released);
+        let worker = thread::spawn(move || {
+            observed.store(true, Ordering::Release);
+        });
+        let result =
+            finish_runtime_startup::<()>(Err(ProviderRuntimeError::StartupDropped), worker);
+        assert!(matches!(result, Err(ProviderRuntimeError::StartupDropped)));
+        assert!(released.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn startup_preserves_build_error_after_worker_panic() {
+        let worker = thread::spawn(|| panic!("startup teardown failed"));
+        let result = finish_runtime_startup::<()>(
+            Err(ProviderRuntimeError::RuntimeBuild(std::io::Error::other(
+                "build failed",
+            ))),
+            worker,
+        );
+        assert!(matches!(result, Err(ProviderRuntimeError::RuntimeBuild(_))));
+    }
 
     #[test]
     fn structured_candidate_extraction_accepts_one_safe_envelope_and_rejects_ambiguity() {
