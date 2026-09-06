@@ -68,6 +68,24 @@ fn shutdown_acknowledges_task_destruction_and_is_idempotent() {
 }
 
 #[test]
+fn worker_can_request_shutdown_without_waiting_on_itself() {
+    let runtime = Arc::new(ProviderRuntime::new().unwrap());
+    let worker = Arc::clone(&runtime);
+    let (sent, received) = mpsc::channel();
+    drop(runtime.spawn(async move {
+        worker.request_shutdown();
+        assert!(matches!(
+            worker.try_spawn(async {}),
+            Err(ProviderRuntimeError::ShuttingDown)
+        ));
+        sent.send(()).unwrap();
+    }));
+    received.recv_timeout(Duration::from_secs(5)).unwrap();
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+    runtime.request_shutdown();
+}
+
+#[test]
 fn runtime_worker_rejects_self_wait_without_starting_shutdown() {
     let runtime = Arc::new(ProviderRuntime::new().unwrap());
     let worker_runtime = Arc::clone(&runtime);

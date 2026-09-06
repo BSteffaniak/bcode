@@ -72,6 +72,22 @@ pub struct BedrockProviderPlugin {
     turn_executor: Arc<dyn BedrockTurnExecutor>,
 }
 
+struct PushTurnCleanup<'a> {
+    store: &'a Mutex<TurnStore>,
+    id: String,
+    turn: TurnState,
+}
+
+impl Drop for PushTurnCleanup<'_> {
+    fn drop(&mut self) {
+        self.turn.cancel();
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish(&self.id);
+    }
+}
+
 impl Default for BedrockProviderPlugin {
     fn default() -> Self {
         Self {
@@ -115,6 +131,9 @@ impl BedrockTurnExecutor for AwsBedrockTurnExecutor {
 
 impl ConcurrentRustPlugin for BedrockProviderPlugin {
     fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        if let Ok(runtime) = &self.runtime {
+            runtime.request_shutdown();
+        }
         self.turns
             .lock()
             .map_err(|_| PluginError::failed("provider turn state is unavailable"))?
@@ -262,6 +281,11 @@ impl BedrockProviderPlugin {
             .lock()
             .expect("bedrock turn store lock should not be poisoned")
             .insert_started("bedrock-turn");
+        let cleanup = PushTurnCleanup {
+            store: &self.turns,
+            id: provider_turn_id,
+            turn: turn.clone(),
+        };
         turn.enable_positioned_output();
         if let Ok(route) = resolve_bedrock_route(&request, &Settings::resolve(Some(&request))) {
             turn.push(ProviderTurnEvent::RequestProjection {
@@ -282,12 +306,7 @@ impl BedrockProviderPlugin {
 
         let outcome = stream_turn_events(&turn, context);
 
-        turn.cancel();
-        self.turns
-            .lock()
-            .expect("bedrock turn store lock should not be poisoned")
-            .finish(&provider_turn_id);
-
+        drop(cleanup);
         outcome
     }
 
@@ -7317,6 +7336,23 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_turn_cleanup_releases_registry_on_unwind() {
+        let store = Mutex::new(TurnStore::default());
+        let (id, turn) = store.lock().unwrap().insert_started("test");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = PushTurnCleanup {
+                store: &store,
+                id: id.clone(),
+                turn: turn.clone(),
+            };
+            panic!("failed invocation");
+        }));
+        assert!(outcome.is_err());
+        assert!(turn.is_cancelled());
+        assert!(store.lock().unwrap().drain(&id).is_empty());
+    }
 
     #[test]
     fn stopped_runtime_reports_turn_start_failure() {

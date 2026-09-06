@@ -175,6 +175,23 @@ struct OpenAiCompatibleProviderState {
     auth_flows: BTreeMap<String, OpenAiAuthFlowState>,
 }
 
+struct PushTurnCleanup<'a> {
+    state: &'a Mutex<OpenAiCompatibleProviderState>,
+    id: String,
+    turn: TurnState,
+}
+
+impl Drop for PushTurnCleanup<'_> {
+    fn drop(&mut self) {
+        self.turn.cancel();
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .turns
+            .remove(&self.id);
+    }
+}
+
 impl Default for OpenAiCompatibleProviderPlugin {
     fn default() -> Self {
         Self {
@@ -275,6 +292,9 @@ impl TurnState {
 
 impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
     fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        if let Ok(runtime) = &self.runtime {
+            runtime.request_shutdown();
+        }
         {
             let state = self
                 .state
@@ -1492,13 +1512,13 @@ impl OpenAiCompatibleProviderPlugin {
             );
         };
 
+        let cleanup = PushTurnCleanup {
+            state: &self.state,
+            id: provider_turn_id,
+            turn: turn.clone(),
+        };
         let outcome = stream_turn_events(&turn, context);
-
-        if let Ok(mut state) = self.state.lock() {
-            state.turns.remove(&provider_turn_id);
-        }
-        turn.cancel();
-
+        drop(cleanup);
         outcome
     }
 
@@ -9080,6 +9100,28 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_turn_cleanup_releases_registry_on_unwind() {
+        let state = Mutex::new(OpenAiCompatibleProviderState::default());
+        let turn = TurnState::default();
+        state
+            .lock()
+            .unwrap()
+            .turns
+            .insert("turn".to_owned(), turn.clone());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = PushTurnCleanup {
+                state: &state,
+                id: "turn".to_owned(),
+                turn: turn.clone(),
+            };
+            panic!("failed invocation");
+        }));
+        assert!(outcome.is_err());
+        assert!(turn.is_cancelled());
+        assert!(state.lock().unwrap().turns.is_empty());
+    }
 
     #[test]
     fn rejected_stream_admission_has_terminal_error() {

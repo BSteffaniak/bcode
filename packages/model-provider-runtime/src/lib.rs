@@ -1256,6 +1256,21 @@ impl ProviderRuntime {
         })
     }
 
+    /// Close work admission and request runtime shutdown without waiting for teardown.
+    ///
+    /// Idempotent and callable from runtime work. This does not acknowledge resource release;
+    /// synchronous lifecycle owners must subsequently call [`Self::shutdown`].
+    pub fn request_shutdown(&self) {
+        let signal = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(signal) = signal {
+            let _ = signal.send(());
+        }
+    }
+
     /// Request shutdown and wait at most `timeout` for runtime resources to be released.
     ///
     /// Call from synchronous lifecycle code, not from work running on this runtime. Once
@@ -1274,14 +1289,7 @@ impl ProviderRuntime {
     pub fn shutdown(&self, timeout: Duration) -> Result<(), ProviderRuntimeError> {
         self.check_blocking_caller()?;
         let started = Instant::now();
-        let signal = self
-            .shutdown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(signal) = signal {
-            let _ = signal.send(());
-        }
+        self.request_shutdown();
         let (state, _) = self
             .stopped
             .1
