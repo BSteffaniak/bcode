@@ -2577,9 +2577,17 @@ impl ResponseCacheMiss {
 impl Drop for ResponseCacheMiss {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.cache.abort(&self.request);
-            }));
+            }))
+            .is_err()
+            {
+                tracing::error!(
+                    target: "bcode::sdk",
+                    event = "bcode.cache_abort_failed",
+                    "cache abort callback panicked; reservation cleanup is unverified"
+                );
+            }
         }
     }
 }
