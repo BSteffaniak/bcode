@@ -19389,12 +19389,26 @@ mod tests {
             serde_json::from_str::<WorkflowDefinition>(&preserved_valid).expect("valid payload"),
             definition("valid-earlier")
         );
+        let mut statement = connection.prepare(
+            "SELECT run_id, definition_id, definition_version FROM workflow_runs ORDER BY run_id",
+        ).expect("run bindings");
+        let bindings = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })
+            .expect("binding rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("bindings");
         assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM workflow_runs", [], |row| row
-                    .get::<_, u64>(0))
-                .expect("preserved run"),
-            2
+            bindings,
+            vec![
+                ("run-0".to_string(), "valid-earlier".to_string(), 1),
+                ("run-1".to_string(), "example".to_string(), 1),
+            ]
         );
     }
 
