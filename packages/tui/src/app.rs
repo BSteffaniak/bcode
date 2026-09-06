@@ -3475,7 +3475,10 @@ impl BmuxApp {
         }
     }
 
-    pub fn apply_runtime_work_snapshots(&mut self, snapshots: &[bcode_ipc::RuntimeWorkSnapshot]) {
+    pub fn apply_runtime_work_snapshots(
+        &mut self,
+        snapshots: &[bcode_session_models::RuntimeWorkSnapshot],
+    ) {
         self.session_view.set_runtime_work_snapshots(snapshots);
         self.apply_shared_runtime_work_activity();
     }
@@ -6825,7 +6828,7 @@ mod tests {
     #[test]
     fn authoritative_runtime_work_snapshot_drives_tui_activity() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
-        app.apply_runtime_work_snapshots(&[bcode_ipc::RuntimeWorkSnapshot {
+        app.apply_runtime_work_snapshots(&[bcode_session_models::RuntimeWorkSnapshot {
             work_id: bcode_session_models::WorkId::new("tool-1"),
             kind: bcode_session_models::RuntimeWorkKind::Tool,
             label: "shell".to_owned(),

@@ -901,7 +901,7 @@ pub struct SessionStatusHydration {
     /// Active skills captured during bounded attach hydration.
     pub active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
     /// Runtime work snapshots, if available.
-    pub runtime_work: Option<Vec<bcode_ipc::RuntimeWorkSnapshot>>,
+    pub runtime_work: Option<Vec<bcode_session_models::RuntimeWorkSnapshot>>,
     /// Pending interactive requests, if available.
     pub interactions: Option<Vec<bcode_session_view_models::InteractionViewSummary>>,
     /// Active plugin-owned status contributions.

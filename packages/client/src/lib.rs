@@ -87,8 +87,22 @@ const fn runtime_work_span_without_start(work_id: WorkId) -> RuntimeWorkSpan {
 }
 
 fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
-    let mut spans = BTreeMap::new();
+    let mut spans = BTreeMap::<WorkId, RuntimeWorkSpan>::new();
     for event in events {
+        let (SessionEventKind::RuntimeWorkStarted { work_id, .. }
+        | SessionEventKind::RuntimeWorkCancelRequested { work_id, .. }
+        | SessionEventKind::RuntimeWorkProgress { work_id, .. }
+        | SessionEventKind::RuntimeWorkFinished { work_id, .. }) = &event.kind
+        else {
+            continue;
+        };
+        if spans
+            .get(work_id)
+            .and_then(|span| span.status)
+            .is_some_and(bcode_session_models::RuntimeWorkStatus::is_terminal)
+        {
+            continue;
+        }
         match event.kind {
             SessionEventKind::RuntimeWorkStarted {
                 work_id,
@@ -229,6 +243,49 @@ mod runtime_work_history_tests {
             }]
         );
         assert_eq!(spans[0].duration_ms(), Some(30));
+    }
+
+    #[test]
+    fn terminal_history_cannot_be_reopened_or_overwritten() {
+        let work_id = WorkId::new("terminal");
+        for status in [
+            RuntimeWorkStatus::Completed,
+            RuntimeWorkStatus::Failed,
+            RuntimeWorkStatus::TimedOut,
+            RuntimeWorkStatus::Cancelled,
+        ] {
+            let terminal = event(SessionEventKind::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status,
+                finished_at_ms: Some(40),
+                message: Some("authoritative".into()),
+            });
+            let expected = runtime_work_spans(vec![terminal.clone()]);
+            let events = vec![
+                terminal.clone(),
+                terminal,
+                event(started(&work_id, "stale start", 50)),
+                event(SessionEventKind::RuntimeWorkProgress {
+                    work_id: work_id.clone(),
+                    message: "stale progress".into(),
+                    progress_at_ms: None,
+                    completed_units: None,
+                    total_units: None,
+                }),
+                event(SessionEventKind::RuntimeWorkCancelRequested {
+                    work_id: work_id.clone(),
+                    requested_at_ms: None,
+                    client_id: None,
+                }),
+                event(SessionEventKind::RuntimeWorkFinished {
+                    work_id: work_id.clone(),
+                    status: RuntimeWorkStatus::Suspended,
+                    finished_at_ms: Some(90),
+                    message: Some("stale finish".into()),
+                }),
+            ];
+            assert_eq!(runtime_work_spans(events), expected);
+        }
     }
 
     #[test]
@@ -4326,7 +4383,12 @@ impl BcodeClient {
         }
     }
 
-    /// Return recent durable runtime-work lifecycle events for a session.
+    /// Return recent runtime-work lifecycle events reconstructed from the bounded read model.
+    ///
+    /// The daemon clamps `limit` to 1 through
+    /// [`bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS`]. Zero is not unlimited.
+    /// A small window can omit a work's start event; these events are not a complete
+    /// canonical event-log export.
     ///
     /// # Errors
     ///

@@ -3737,6 +3737,7 @@ enum RuntimeWorkCommand {
     },
     History {
         session_id: SessionId,
+        /// Event budget clamped by the daemon to 1–1000; zero is not unlimited.
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]

@@ -61402,9 +61402,54 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
         assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_bounded_runtime_history_span(&client, session.id, &work_id).await;
+        assert_runtime_history_limits(&state, &client, session.id).await;
         assert_runtime_completion_visible(&state, &client, &mut watcher, session.id, work_id).await;
         assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    async fn assert_runtime_history_limits(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+    ) {
+        for limit in [
+            0,
+            1,
+            bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS,
+            usize::MAX,
+        ] {
+            let direct = runtime_work_operations::history(state, session_id, limit)
+                .await
+                .expect("direct limited history");
+            let ipc = client
+                .runtime_work_history(session_id, limit)
+                .await
+                .expect("IPC limited history");
+            assert_eq!(ipc, direct);
+            assert!(
+                ipc.len() <= limit.clamp(1, bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS)
+            );
+        }
+        assert_eq!(
+            runtime_work_operations::history(state, session_id, 0)
+                .await
+                .expect("zero is bounded")
+                .len(),
+            1
+        );
+        assert_eq!(
+            runtime_work_operations::history(state, session_id, usize::MAX)
+                .await
+                .expect("oversized limit"),
+            runtime_work_operations::history(
+                state,
+                session_id,
+                bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS
+            )
+            .await
+            .expect("maximum limit")
+        );
     }
 
     async fn assert_runtime_completion_visible(
@@ -61453,6 +61498,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(spans[0].started_at_ms, None);
         assert!(spans[0].finished_at_ms.is_some());
         assert_eq!(spans[0].duration_ms(), None);
+        let complete = client
+            .runtime_work_spans(session_id, 2)
+            .await
+            .expect("complete bounded span");
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].work_id, work_id);
+        assert_eq!(complete[0].label, "runtime IPC work");
+        assert_eq!(complete[0].status, spans[0].status);
+        assert_eq!(complete[0].message, spans[0].message);
+        assert_eq!(complete[0].finished_at_ms, spans[0].finished_at_ms);
+        assert!(complete[0].started_at_ms.is_some());
+        assert!(complete[0].duration_ms().is_some());
     }
 
     async fn assert_bounded_runtime_history_span(

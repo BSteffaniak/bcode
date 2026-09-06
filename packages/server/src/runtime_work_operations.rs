@@ -5,11 +5,15 @@ use bcode_session_models::RuntimeWorkSnapshot;
 use bcode_session_models::{SessionEvent, SessionId};
 
 /// Return bounded durable runtime-work history without transport framing.
+///
+/// Limits are clamped to the session history read budget; zero requests one event,
+/// never an unlimited persistence query.
 pub async fn history(
     state: &ServerState,
     session_id: SessionId,
     limit: usize,
 ) -> Result<Vec<SessionEvent>, bcode_session::SessionError> {
+    let limit = limit.clamp(1, bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS);
     let mut events = state
         .sessions
         .runtime_work_history(session_id, limit)
@@ -17,7 +21,7 @@ pub async fn history(
         .into_iter()
         .flat_map(|work| super::runtime_work_projection_to_events(session_id, work))
         .collect::<Vec<_>>();
-    if limit > 0 && events.len() > limit {
+    if events.len() > limit {
         events.drain(0..events.len() - limit);
     }
     Ok(events)
