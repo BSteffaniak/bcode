@@ -19060,6 +19060,16 @@ mod tests {
             .persist_definition("example", 1, &original)
             .expect("distinct storage identity");
         store.create_run(&new_run()).expect("run");
+        let mut newer = definition("newer-display-name");
+        let mut newer_node = newer.nodes.remove("review").expect("review node");
+        newer_node.id = "replacement".to_string();
+        newer.nodes.insert(newer_node.id.clone(), newer_node);
+        newer.entries = vec!["replacement".to_string()];
+        newer.exits = vec!["replacement".to_string()];
+        newer.validate().expect("valid newer definition");
+        store
+            .persist_definition("example", 2, &newer)
+            .expect("newer version");
         let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
         let path = store.path().to_path_buf();
         drop(store);
