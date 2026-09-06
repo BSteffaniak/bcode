@@ -20280,6 +20280,11 @@ mod tests {
         store.connection.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';").expect("damage header");
         let before = store.connection.total_changes();
         assert!(store.run_graph_revision("run-1").is_err());
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", &node.id, None, 10)
+                .is_err()
+        );
         assert!(store.run_graph_node("run-1", &node.id).is_err());
         assert!(store.run_graph_nodes("run-1", None, 10).is_err());
         assert!(store.run_graph_edge("run-1", 0).is_err());
@@ -20365,6 +20370,11 @@ mod tests {
             } else {
                 assert!(store.run_graph_revision("run-1").is_err());
             }
+            assert!(
+                store
+                    .run_graph_outgoing_edges("run-1", &node.id, None, 10)
+                    .is_err()
+            );
             assert!(store.run_graph_node("run-1", &node.id).is_err());
             assert!(store.run_graph_nodes("run-1", None, 10).is_err());
             assert!(store.run_graph_edge("run-1", 0).is_err());
