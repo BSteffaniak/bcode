@@ -187,6 +187,9 @@ pub enum ServerError {
     /// The owned session-search ingestion worker failed to finish normally.
     #[error("session search ingestion failed during shutdown")]
     SessionSearchIngestionShutdown,
+    /// The owned workflow event forwarder failed to finish normally.
+    #[error("workflow event forwarding failed during shutdown")]
+    WorkflowEventForwarderShutdown,
     #[error("IPC transport error: {0}")]
     Transport(#[from] bcode_ipc::IpcTransportError),
     #[error("config error: {0}")]
@@ -367,6 +370,8 @@ pub struct ServerState {
     event_clients: Mutex<BTreeMap<ClientId, CatalogEventSubscription>>,
     workflow_event_clients: Mutex<BTreeMap<ClientId, ClientEventSink>>,
     workflow_event_forwarder_started: std::sync::atomic::AtomicBool,
+    workflow_event_forwarder: Mutex<Option<JoinHandle<()>>>,
+    workflow_event_forwarder_failed: std::sync::atomic::AtomicBool,
     catalog_events_started: std::sync::atomic::AtomicBool,
     idle_shutdown_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
@@ -1598,6 +1603,8 @@ impl ServerState {
             event_clients: Mutex::default(),
             workflow_event_clients: Mutex::default(),
             workflow_event_forwarder_started: std::sync::atomic::AtomicBool::new(false),
+            workflow_event_forwarder: Mutex::new(None),
+            workflow_event_forwarder_failed: std::sync::atomic::AtomicBool::new(false),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             idle_shutdown_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
@@ -2140,7 +2147,11 @@ impl ServerState {
         }
     }
 
-    fn start_workflow_event_forwarder(self: &Arc<Self>) {
+    async fn start_workflow_event_forwarder(self: &Arc<Self>) {
+        let mut task = self.workflow_event_forwarder.lock().await;
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            return;
+        }
         if self
             .workflow_event_forwarder_started
             .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -2148,17 +2159,24 @@ impl ServerState {
             return;
         }
         let mut shutdown = self.subscribe_shutdown();
+        let watermark = self
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest_global_event_sequence();
+        let Ok(mut after_sequence) = watermark else {
+            self.workflow_event_forwarder_failed
+                .store(true, Ordering::SeqCst);
+            tracing::warn!(
+                "workflow event publication unavailable: initial watermark query failed"
+            );
+            return;
+        };
         let state = Arc::clone(self);
-        tokio::spawn(async move {
+        *task = Some(tokio::spawn(async move {
             if state.shutdown_requested.load(Ordering::SeqCst) {
                 return;
             }
-            let mut after_sequence = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .latest_global_event_sequence()
-                .unwrap_or(0);
             let mut interval = tokio::time::interval(Duration::from_millis(50));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -2176,12 +2194,12 @@ impl ServerState {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .event_positions_after(after_sequence, 256);
-                    let positions = match page {
-                        Ok(positions) => positions,
-                        Err(error) => {
-                            tracing::warn!(%error, "workflow event publication query failed");
-                            break;
-                        }
+                    let Ok(positions) = page else {
+                        state
+                            .workflow_event_forwarder_failed
+                            .store(true, Ordering::SeqCst);
+                        tracing::warn!("workflow event publication unavailable: page query failed");
+                        return;
                     };
                     if positions.is_empty() {
                         break;
@@ -2206,9 +2224,29 @@ impl ServerState {
                     if page_len < 256 {
                         break;
                     }
+                    // Ready sends (including an empty subscriber set) need not yield.
+                    // Give shutdown and other server work a turn between bounded pages.
+                    tokio::task::yield_now().await;
                 }
             }
-        });
+        }));
+    }
+
+    async fn stop_workflow_event_forwarder(&self) -> Result<(), ServerError> {
+        let mut task = self.workflow_event_forwarder.lock().await;
+        if let Some(worker) = task.as_mut()
+            && worker.await.is_err()
+        {
+            self.workflow_event_forwarder_failed
+                .store(true, Ordering::SeqCst);
+        }
+        *task = None;
+        drop(task);
+        if self.workflow_event_forwarder_failed.load(Ordering::SeqCst) {
+            Err(ServerError::WorkflowEventForwarderShutdown)
+        } else {
+            Ok(())
+        }
     }
 
     fn start_catalog_event_forwarder(self: &Arc<Self>) {
@@ -2236,7 +2274,11 @@ impl ServerState {
                     }
                 }
                 let revision = *revisions.borrow_and_update();
-                broadcast_catalog_update(&state, revision).await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    () = broadcast_catalog_update(&state, revision) => {}
+                }
             }
         });
 
@@ -2294,6 +2336,10 @@ impl ServerState {
             }
         });
 
+        self.start_catalog_backfill();
+    }
+
+    fn start_catalog_backfill(self: &Arc<Self>) {
         let state = Arc::clone(self);
         tokio::spawn(async move {
             if state.shutdown_requested.load(Ordering::SeqCst) {
@@ -3924,7 +3970,7 @@ async fn run_constructed_server(
     let startup_started_at = state.startup_started_at;
     let stage_started_at = Instant::now();
     state.start_catalog_event_forwarder();
-    state.start_workflow_event_forwarder();
+    state.start_workflow_event_forwarder().await;
     state.start_session_search_ingestion().await;
     start_catalog_refresh(&state).await;
     interrupt_stale_ralph_runs_best_effort(&state);
@@ -4073,6 +4119,7 @@ async fn shutdown_constructed_server(
 ) -> Result<(), ServerError> {
     state.request_shutdown();
     let ingestion = state.stop_session_search_ingestion().await;
+    let workflow_forwarder = state.stop_workflow_event_forwarder().await;
     stop_catalog_refresh(&state).await;
     state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
@@ -4098,6 +4145,7 @@ async fn shutdown_constructed_server(
     }
     accept_result?;
     ingestion?;
+    workflow_forwarder?;
     deactivation?;
     record_removal?;
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
@@ -14538,14 +14586,16 @@ async fn broadcast_workflow_event(
     event: bcode_workflow_view_models::WorkflowLiveEvent,
 ) {
     let event = Event::Workflow(event);
-    let mut sends = futures::stream::FuturesUnordered::new();
-    for sink in state.workflow_event_sinks().await {
-        let event = event.clone();
-        sends.push(async move {
-            let client_id = sink.client_id();
-            (client_id, sink.send(event).await)
-        });
-    }
+    let sinks = state.workflow_event_sinks().await;
+    let mut sends = futures::stream::iter(sinks)
+        .map(|sink| {
+            let event = event.clone();
+            async move {
+                let client_id = sink.client_id();
+                (client_id, sink.send(event).await)
+            }
+        })
+        .buffer_unordered(32);
     let mut disconnected = Vec::new();
     while let Some((client_id, result)) = sends.next().await {
         if let Err(error) = result {
@@ -31427,52 +31477,29 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
 async fn broadcast_catalog_update(state: &ServerState, revision: u64) {
     let event = Event::SessionCatalogUpdated { revision };
     let mut disconnected_clients = Vec::new();
-    let mut send_tasks = JoinSet::new();
-    for sink in state.catalog_event_sinks().await {
-        let event = event.clone();
-        send_tasks.spawn(async move {
-            let client_id = sink.client_id();
-            (client_id, sink.send(event).await)
-        });
-        if send_tasks.len() >= CATALOG_EVENT_BROADCAST_BATCH_SIZE {
-            collect_catalog_send_result(
-                state,
-                revision,
-                &mut send_tasks,
-                &mut disconnected_clients,
-            )
-            .await;
+    let sinks = state.catalog_event_sinks().await;
+    let mut sends = futures::stream::iter(sinks)
+        .map(|sink| {
+            let event = event.clone();
+            async move {
+                let client_id = sink.client_id();
+                (client_id, sink.send(event).await)
+            }
+        })
+        .buffer_unordered(CATALOG_EVENT_BROADCAST_BATCH_SIZE);
+    while let Some((client_id, send_result)) = sends.next().await {
+        if let Err(error) = send_result {
+            disconnected_clients.push(client_id);
+            if !is_expected_disconnect(&error) {
+                tracing::warn!("failed to send catalog update event to {client_id}: {error}");
+            }
+        } else {
+            state.mark_catalog_event_sent(client_id, revision).await;
         }
-    }
-    while !send_tasks.is_empty() {
-        collect_catalog_send_result(state, revision, &mut send_tasks, &mut disconnected_clients)
-            .await;
     }
     state
         .unregister_catalog_event_clients(&disconnected_clients)
         .await;
-}
-
-async fn collect_catalog_send_result(
-    state: &ServerState,
-    revision: u64,
-    send_tasks: &mut JoinSet<(ClientId, Result<(), CodecError>)>,
-    disconnected_clients: &mut Vec<ClientId>,
-) {
-    let Some(result) = send_tasks.join_next().await else {
-        return;
-    };
-    let Ok((client_id, send_result)) = result else {
-        return;
-    };
-    if let Err(error) = send_result {
-        disconnected_clients.push(client_id);
-        if !is_expected_disconnect(&error) {
-            tracing::warn!("failed to send catalog update event to {client_id}: {error}");
-        }
-    } else {
-        state.mark_catalog_event_sent(client_id, revision).await;
-    }
 }
 
 fn is_expected_disconnect(error: &CodecError) -> bool {
@@ -69576,19 +69603,33 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut state = test_server_state(SessionManager::default());
         state.workflow_store = StdMutex::new(store);
         let state = Arc::new(state);
-        state.start_workflow_event_forwarder();
 
         let socket_dir = tempfile::tempdir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let server_state = Arc::clone(&state);
+        let mut shutdown = state.subscribe_shutdown();
         let server = tokio::spawn(async move {
+            let mut clients = JoinSet::new();
             loop {
-                let stream = listener.accept().await.expect("connection");
-                let state = Arc::clone(&server_state);
-                tokio::spawn(async move {
-                    handle_client(stream, state).await.expect("client handler");
-                });
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    result = clients.join_next(), if !clients.is_empty() => {
+                        result.expect("client result").expect("client task");
+                    }
+                    stream = listener.accept() => {
+                        let stream = stream.expect("connection");
+                        let state = Arc::clone(&server_state);
+                        clients.spawn(async move {
+                            handle_client(stream, state).await.expect("client handler");
+                        });
+                    }
+                }
+            }
+            drop(listener);
+            while let Some(result) = clients.join_next().await {
+                result.expect("client drains");
             }
         });
 
@@ -69598,6 +69639,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(state.workflow_event_clients.lock().await.len(), 2);
         drop(disconnected_watcher);
 
+        // The current-thread runtime cannot poll the forwarder before this synchronous
+        // commit. Its watermark must already be captured when startup returns.
+        state.start_workflow_event_forwarder().await;
         state
             .workflow_store
             .lock()
@@ -69655,7 +69699,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("disconnected subscriber cleanup");
         drop(connection);
-        server.abort();
+        state.request_shutdown();
+        state
+            .stop_workflow_event_forwarder()
+            .await
+            .expect("workflow forwarder drains");
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("listener and clients drain")
+            .expect("server task succeeds");
+        assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -69698,6 +69752,51 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.start_session_search_ingestion().await;
         assert!(state.session_search_ingestion.lock().await.is_none());
         assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_forwarder_shutdown_joins_worker_and_prevents_restart() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        state.start_workflow_event_forwarder().await;
+        assert!(state.workflow_event_forwarder.lock().await.is_some());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            shutdown_constructed_server(Arc::clone(&state), Ok(())),
+        )
+        .await
+        .expect("server shutdown completes")
+        .expect("forwarder stops normally");
+        assert!(state.workflow_event_forwarder.lock().await.is_none());
+        assert_eq!(Arc::strong_count(&state), 1);
+        state.start_workflow_event_forwarder().await;
+        assert!(state.workflow_event_forwarder.lock().await.is_none());
+        state
+            .stop_workflow_event_forwarder()
+            .await
+            .expect("already stopped");
+    }
+
+    #[tokio::test]
+    async fn workflow_forwarder_failure_survives_server_cleanup() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        *state.workflow_event_forwarder.lock().await = Some(tokio::spawn(async {
+            panic!("private workflow worker failure");
+        }));
+        let result = shutdown_constructed_server(Arc::clone(&state), Ok(())).await;
+        assert!(matches!(
+            result,
+            Err(ServerError::WorkflowEventForwarderShutdown)
+        ));
+        assert!(state.workflow_event_forwarder.lock().await.is_none());
+        assert!(state.shutdown_requested.load(Ordering::SeqCst));
+        assert!(matches!(
+            state.stop_workflow_event_forwarder().await,
+            Err(ServerError::WorkflowEventForwarderShutdown)
+        ));
+        assert_eq!(
+            ServerError::WorkflowEventForwarderShutdown.to_string(),
+            "workflow event forwarding failed during shutdown"
+        );
     }
 
     #[tokio::test]
@@ -69761,6 +69860,39 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn abandoned_workflow_forwarder_shutdown_retains_worker() {
+        let state = test_server_state(SessionManager::default());
+        let resource = Arc::new(());
+        let owned_resource = Arc::clone(&resource);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        *state.workflow_event_forwarder.lock().await = Some(tokio::spawn(async move {
+            let _resource = owned_resource;
+            let _ = released.await;
+        }));
+        state.request_shutdown();
+        let mut wait = Box::pin(state.stop_workflow_event_forwarder());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(wait.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(wait);
+        assert!(state.workflow_event_forwarder.lock().await.is_some());
+        assert_eq!(Arc::strong_count(&resource), 2);
+        release.send(()).expect("worker remains owned");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.stop_workflow_event_forwarder(),
+        )
+        .await
+        .expect("worker drains")
+        .expect("worker succeeds");
+        assert!(state.workflow_event_forwarder.lock().await.is_none());
+        drop(state);
+        assert_eq!(Arc::strong_count(&resource), 1);
+    }
+
+    #[tokio::test]
     async fn shutdown_before_first_poll_releases_background_state() {
         for shutdown_before_spawn in [false, true] {
             let state = Arc::new(test_server_state(SessionManager::default()));
@@ -69768,7 +69900,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             if shutdown_before_spawn {
                 state.request_shutdown();
             }
-            state.start_workflow_event_forwarder();
+            state.start_workflow_event_forwarder().await;
             state.start_catalog_event_forwarder();
             let ingestion = ServerState::spawn_session_search_ingestion_worker(Arc::clone(&state));
             state.start_idle_shutdown_watcher(Duration::from_secs(30));

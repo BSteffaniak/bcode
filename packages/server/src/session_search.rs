@@ -3762,6 +3762,7 @@ pub(crate) mod tests {
         let rebuilt = rebuild_provider(&state, FAST_PROVIDER_ID, "rebuild".to_owned())
             .await
             .expect("rebuild succeeds");
+        drop(state);
         assert_eq!(rebuilt.provider_id, FAST_PROVIDER_ID);
         assert_eq!(rebuilt.operation, OP_REBUILD);
     }
@@ -3793,6 +3794,7 @@ pub(crate) mod tests {
             .mark_committed(SessionId::new())
             .await;
         process_dirty_sessions(&state).await;
+        drop(state);
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
     }
 
@@ -3817,7 +3819,9 @@ pub(crate) mod tests {
                 .await
                 .expect("federated search");
 
-        assert!(started.elapsed() < Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        drop(state);
+        assert!(elapsed < Duration::from_millis(200));
         assert!(SLOW_SEARCH_STARTED.load(Ordering::SeqCst));
         wait_for_slow_provider_to_finish().await;
         assert!(SLOW_SEARCH_CANCELLED.load(Ordering::SeqCst));
@@ -3857,6 +3861,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("federated search");
+        drop(state);
 
         assert_eq!(response.hits.len(), 1);
         assert_eq!(response.hits[0].provider_id, FAST_PROVIDER_ID);
