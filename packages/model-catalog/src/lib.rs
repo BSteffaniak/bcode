@@ -216,26 +216,61 @@ impl ModelCatalogResolver {
 
     /// Spawn a background refresh when cached data is stale or the retry interval elapsed.
     pub fn refresh_if_stale(&self) {
-        let Some(gate) = self.reserve_stale_refresh() else {
-            return;
-        };
-        let resolver = self.clone();
-        tokio::spawn(async move {
-            resolver.refresh_reserved().await;
-            drop(gate);
-        });
+        if let Some(refresh) = self.prepare_refresh_if_stale() {
+            tokio::spawn(refresh);
+        }
     }
 
+    /// Reserve a coalesced refresh for caller-owned scheduling.
+    ///
+    /// Returns `None` when remote overlays are disabled, another refresh owns the
+    /// reservation, diagnostics are busy, or the retry interval has not elapsed.
+    /// This method does not spawn work. Dropping the returned future, even before
+    /// its first poll, releases the reservation. Polling still uses native HTTP,
+    /// filesystem cache access, and time; this is not a simulated transport.
+    // Option is already must-use; repository style forbids a redundant attribute.
+    #[allow(clippy::must_use_candidate)]
+    pub fn prepare_refresh_if_stale(
+        &self,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static + use<>> {
+        self.prepare_refresh_if_stale_at(std::time::SystemTime::now())
+    }
+
+    /// Reserve refresh work using a caller-supplied admission time.
+    ///
+    /// Uses the same retry policy as [`Self::prepare_refresh_if_stale`]. A time
+    /// earlier than the previous attempt does not bypass the retry interval.
+    /// Only admission time is controlled; execution timestamps and I/O remain native.
+    #[allow(clippy::must_use_candidate)] // Option is already must-use.
+    pub fn prepare_refresh_if_stale_at(
+        &self,
+        now: std::time::SystemTime,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static + use<>> {
+        let gate = self.reserve_stale_refresh_at(now)?;
+        let resolver = self.clone();
+        Some(async move {
+            resolver.refresh_reserved().await;
+            drop(gate);
+        })
+    }
+
+    #[cfg(test)]
     fn reserve_stale_refresh(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.reserve_stale_refresh_at(std::time::SystemTime::now())
+    }
+
+    fn reserve_stale_refresh_at(
+        &self,
+        now: std::time::SystemTime,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         if self.options.disabled {
             return None;
         }
         let gate = self.refresh_gate.clone().try_lock_owned().ok()?;
         let diagnostics = self.diagnostics.try_read().ok()?;
         let recently_attempted = diagnostics.last_refresh_attempt.is_some_and(|attempt| {
-            attempt
-                .elapsed()
-                .is_ok_and(|elapsed| elapsed < std::time::Duration::from_mins(1))
+            now.duration_since(attempt)
+                .map_or(true, |elapsed| elapsed < std::time::Duration::from_mins(1))
         });
         drop(diagnostics);
         if recently_attempted {
@@ -2202,6 +2237,46 @@ mod tests {
     use super::*;
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn refresh_admission_uses_supplied_time_and_rejects_clock_regression() {
+        let mut resolver = ModelCatalogResolver::embedded();
+        resolver.options.disabled = false;
+        let attempt = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        resolver.diagnostics.write().await.last_refresh_attempt = Some(attempt);
+        for seconds in [99, 100, 159] {
+            assert!(
+                resolver
+                    .prepare_refresh_if_stale_at(
+                        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+                    )
+                    .is_none()
+            );
+        }
+        let refresh = resolver
+            .prepare_refresh_if_stale_at(attempt + std::time::Duration::from_secs(60))
+            .expect("retry interval elapsed");
+        drop(refresh);
+    }
+
+    #[tokio::test]
+    async fn unpolled_owned_refresh_releases_reservation_on_drop() {
+        let mut resolver = ModelCatalogResolver::embedded();
+        assert!(resolver.prepare_refresh_if_stale().is_none());
+        resolver.options.disabled = false;
+        let refresh = resolver.prepare_refresh_if_stale().expect("owned refresh");
+        assert!(resolver.prepare_refresh_if_stale().is_none());
+        assert!(resolver.diagnostics().await.refresh_in_progress);
+        assert!(resolver.diagnostics().await.last_refresh_attempt.is_none());
+        drop(refresh);
+        assert!(!resolver.diagnostics().await.refresh_in_progress);
+        let replacement = resolver
+            .prepare_refresh_if_stale()
+            .expect("new reservation");
+        drop(resolver);
+        // The work owns its inputs rather than borrowing the originating handle.
+        drop(replacement);
+    }
 
     #[tokio::test]
     async fn background_refresh_reservation_coalesces_before_polling() {

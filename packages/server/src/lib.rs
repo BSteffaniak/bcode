@@ -320,6 +320,7 @@ pub struct ServerState {
     invariant_full_fallback: Arc<Mutex<BTreeSet<SessionId>>>,
     invariant_guidance_generation: Arc<Mutex<BTreeMap<SessionId, u64>>>,
     invariant_background_tasks: Mutex<BTreeMap<SessionId, JoinHandle<()>>>,
+    catalog_refresh_tasks: Mutex<JoinSet<()>>,
     skills: Option<SkillRegistry>,
     skill_prompt_options: SkillPromptCatalogOptions,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
@@ -1545,6 +1546,7 @@ impl ServerState {
             invariant_full_fallback: Arc::new(Mutex::new(BTreeSet::new())),
             invariant_guidance_generation: Arc::new(Mutex::new(BTreeMap::new())),
             invariant_background_tasks: Mutex::new(BTreeMap::new()),
+            catalog_refresh_tasks: Mutex::new(JoinSet::new()),
             skills: init.skills,
             skill_prompt_options: init.skill_prompt_options,
             active_skills: Mutex::default(),
@@ -3812,7 +3814,7 @@ async fn run_constructed_server(
     state.start_catalog_event_forwarder();
     state.start_workflow_event_forwarder();
     state.start_session_search_ingestion();
-    state.model_catalog.spawn_refresh();
+    start_catalog_refresh(&state).await;
     interrupt_stale_ralph_runs_best_effort(&state);
     let workflow_recovery_started_at = Instant::now();
     restore_workflow_runtime_work(&state).await;
@@ -3917,11 +3919,45 @@ async fn run_constructed_server(
     shutdown_constructed_server(state, accept_result).await
 }
 
+async fn start_catalog_refresh(state: &ServerState) {
+    let mut tasks = state.catalog_refresh_tasks.lock().await;
+    while let Some(result) = tasks.try_join_next() {
+        if let Err(error) = result {
+            tracing::warn!(%error, "catalog refresh task failed");
+        }
+    }
+    if !state.shutdown_requested.load(Ordering::SeqCst)
+        && let Some(refresh) = state.model_catalog.prepare_refresh_if_stale()
+    {
+        let mut shutdown = state.subscribe_shutdown();
+        tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => {}
+                () = refresh => {}
+            }
+        });
+    }
+}
+
+async fn stop_catalog_refresh(state: &ServerState) {
+    let mut tasks = state.catalog_refresh_tasks.lock().await;
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            tracing::warn!(%error, "catalog refresh task failed during shutdown");
+        }
+    }
+}
+
 async fn shutdown_constructed_server(
     state: Arc<ServerState>,
     accept_result: Result<(), ServerError>,
 ) -> Result<(), ServerError> {
     state.request_shutdown();
+    stop_catalog_refresh(&state).await;
     state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
     let deactivation = state.plugins.deactivate_all().await;
@@ -13386,7 +13422,7 @@ async fn resolved_provider_models_view(
 ) -> Result<ModelList, String> {
     let selected_model_id = request.selected_model_id.clone();
     let models = provider_models(state, provider_plugin_id, request).await?;
-    state.model_catalog.refresh_if_stale();
+    start_catalog_refresh(state).await;
     Ok(state
         .model_catalog
         .resolve_view(models, selected_model_id.as_deref(), None, view)
@@ -69542,6 +69578,88 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("server cleanup");
         assert!(state.clients.lock().await.is_empty());
         drop(connection);
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_shutdown_cancels_pending_http() {
+        let directory = tempfile::tempdir().expect("catalog cache");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP listener");
+        let mut options = bcode_model_catalog::RemoteCatalogOptions::disabled();
+        options.disabled = false;
+        options.base_url = format!("http://{}", listener.local_addr().expect("HTTP address"));
+        options.cache_dir = directory.path().to_path_buf();
+        options.timeout = Duration::from_secs(60);
+        let mut state = test_server_state(SessionManager::default());
+        state.model_catalog =
+            bcode_model_catalog::ModelCatalogResolver::new(options).expect("catalog resolver");
+        start_catalog_refresh(&state).await;
+        let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("refresh connects")
+            .expect("HTTP connection");
+        assert!(state.model_catalog.diagnostics().await.refresh_in_progress);
+        state.request_shutdown();
+        let mut tasks = state.catalog_refresh_tasks.lock().await;
+        tokio::time::timeout(Duration::from_secs(2), tasks.join_next())
+            .await
+            .expect("shutdown interrupts HTTP wait")
+            .expect("retained task")
+            .expect("cooperative shutdown");
+        drop(tasks);
+        let diagnostics = state.model_catalog.diagnostics().await;
+        assert!(!diagnostics.refresh_in_progress);
+        assert!(diagnostics.last_refresh_attempt.is_some());
+        assert!(diagnostics.last_refresh_success.is_none());
+        assert!(diagnostics.last_refresh_error.is_none());
+        drop(connection);
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_observes_shutdown_before_first_poll() {
+        let directory = tempfile::tempdir().expect("catalog cache");
+        let mut options = bcode_model_catalog::RemoteCatalogOptions::disabled();
+        options.disabled = false;
+        options.cache_dir = directory.path().to_path_buf();
+        let mut state = test_server_state(SessionManager::default());
+        state.model_catalog =
+            bcode_model_catalog::ModelCatalogResolver::new(options).expect("catalog resolver");
+        start_catalog_refresh(&state).await;
+        assert_eq!(state.catalog_refresh_tasks.lock().await.len(), 1);
+        state.request_shutdown();
+        // Join without aborting: the retained shutdown notification must cancel
+        // the reserved refresh before it can perform its first network request.
+        let mut tasks = state.catalog_refresh_tasks.lock().await;
+        tokio::time::timeout(Duration::from_secs(2), tasks.join_next())
+            .await
+            .expect("refresh observes shutdown")
+            .expect("retained task")
+            .expect("task exits normally");
+        drop(tasks);
+        let diagnostics = state.model_catalog.diagnostics().await;
+        assert!(!diagnostics.refresh_in_progress);
+        assert!(diagnostics.last_refresh_attempt.is_none());
+    }
+
+    #[tokio::test]
+    async fn constructed_server_cleanup_joins_catalog_work() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        state.catalog_refresh_tasks.lock().await.spawn(async move {
+            let _sender = sender;
+            std::future::pending::<()>().await;
+        });
+        shutdown_constructed_server(Arc::clone(&state), Ok(()))
+            .await
+            .expect("server cleanup");
+        assert!(
+            receiver.await.is_err(),
+            "task captures released before return"
+        );
+        assert!(state.catalog_refresh_tasks.lock().await.is_empty());
+        start_catalog_refresh(&state).await;
+        assert!(state.catalog_refresh_tasks.lock().await.is_empty());
     }
 
     #[tokio::test]

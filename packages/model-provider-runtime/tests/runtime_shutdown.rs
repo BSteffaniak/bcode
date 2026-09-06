@@ -18,6 +18,66 @@ impl Drop for Released {
     }
 }
 
+#[tokio::test]
+async fn abandoned_execute_cancels_submitted_request() {
+    let runtime = ProviderRuntime::new().unwrap();
+    assert_eq!(runtime.execute(async { 42 }).await.unwrap(), 42);
+    let (started, receiver) = tokio::sync::oneshot::channel();
+    let (released, release_receiver) = tokio::sync::oneshot::channel::<()>();
+    let mut request = Box::pin(runtime.execute(async move {
+        let _released = released;
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+    }));
+    tokio::select! {
+        result = &mut request => panic!("request unexpectedly completed: {result:?}"),
+        result = receiver => result.unwrap(),
+    }
+    drop(request);
+    tokio::time::timeout(Duration::from_secs(5), release_receiver)
+        .await
+        .expect("request cancellation releases captures")
+        .expect_err("sender dropped by cancelled task");
+    runtime.shutdown_wait().await.unwrap();
+    assert!(matches!(
+        runtime.execute(async {}).await,
+        Err(ProviderRuntimeError::ShuttingDown)
+    ));
+}
+
+#[test]
+fn shutdown_wait_does_not_require_timer_driver() {
+    let host = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let runtime = ProviderRuntime::new().unwrap();
+    host.block_on(runtime.shutdown_wait()).unwrap();
+    host.block_on(runtime.shutdown_async(Duration::ZERO))
+        .unwrap();
+    runtime.shutdown(Duration::ZERO).unwrap();
+}
+
+#[tokio::test]
+async fn async_shutdown_acknowledges_task_release_and_is_repeatable() {
+    let runtime = ProviderRuntime::new().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let released = Released(sender);
+    let task = runtime.spawn(async move {
+        let _released = released;
+        std::future::pending::<()>().await;
+    });
+    runtime
+        .shutdown_async(Duration::from_secs(5))
+        .await
+        .unwrap();
+    receiver.try_recv().expect("task captures released");
+    assert!(task.await.unwrap_err().is_cancelled());
+    runtime
+        .shutdown_async(Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
 #[test]
 fn cancellation_wait_observes_prior_and_concurrent_requests() {
     let runtime = ProviderRuntime::new().unwrap();
@@ -171,6 +231,10 @@ fn runtime_worker_rejects_self_wait_without_starting_shutdown() {
                 Err(ProviderRuntimeError::RuntimeThreadWait)
             ));
             assert!(matches!(
+                worker_runtime.shutdown_async(Duration::from_secs(5)).await,
+                Err(ProviderRuntimeError::RuntimeThreadWait)
+            ));
+            assert!(matches!(
                 worker_runtime.shutdown(Duration::from_secs(5)),
                 Err(ProviderRuntimeError::RuntimeThreadWait)
             ));
@@ -222,6 +286,71 @@ fn concurrent_shutdown_callers_observe_the_same_release() {
     for worker in workers {
         worker.join().unwrap().unwrap();
     }
+    runtime.shutdown(Duration::ZERO).unwrap();
+}
+
+#[tokio::test]
+async fn abandoned_async_shutdown_wait_can_be_resumed() {
+    let runtime = ProviderRuntime::new().unwrap();
+    let (release, receiver) = mpsc::channel();
+    let (started, start_receiver) = tokio::sync::oneshot::channel();
+    let task = runtime.spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = receiver.recv();
+        })
+        .await
+        .unwrap();
+    });
+    start_receiver.await.unwrap();
+    let mut wait = Box::pin(runtime.shutdown_async(Duration::from_secs(60)));
+    let pending = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(wait.as_mut().poll(context).is_pending())
+    })
+    .await;
+    drop(wait);
+    let admission_closed = matches!(
+        runtime.try_spawn(async {}),
+        Err(ProviderRuntimeError::ShuttingDown)
+    );
+    release.send(()).unwrap();
+    assert!(pending);
+    assert!(admission_closed);
+    runtime
+        .shutdown_async(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(task.is_finished());
+}
+
+#[tokio::test]
+async fn async_shutdown_timeout_retains_ownership_until_blocking_work_releases() {
+    let runtime = ProviderRuntime::new().unwrap();
+    let (release, receiver) = mpsc::channel();
+    let (started, start_receiver) = tokio::sync::oneshot::channel();
+    let task = runtime.spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = receiver.recv();
+        })
+        .await
+        .unwrap();
+    });
+    start_receiver.await.unwrap();
+    let result = runtime.shutdown_async(Duration::from_millis(10)).await;
+    let admission_closed = matches!(
+        runtime.try_spawn(async {}),
+        Err(ProviderRuntimeError::ShuttingDown)
+    );
+    // Release before assertions so failures cannot block runtime destruction.
+    release.send(()).unwrap();
+    assert!(matches!(result, Err(ProviderRuntimeError::ShutdownTimeout)));
+    assert!(admission_closed);
+    runtime
+        .shutdown_async(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(task.is_finished());
     runtime.shutdown(Duration::ZERO).unwrap();
 }
 
