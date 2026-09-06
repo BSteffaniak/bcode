@@ -4607,6 +4607,18 @@ async fn project_event(
                     runtime_work_status_name(RuntimeWorkStatus::Cancelling),
                 )
                 .where_eq("work_id", work_id.to_string())
+                .where_in(
+                    "status",
+                    [
+                        RuntimeWorkStatus::Queued,
+                        RuntimeWorkStatus::Running,
+                        RuntimeWorkStatus::Cancelling,
+                    ]
+                    .map(|status| {
+                        DatabaseValue::String(runtime_work_status_name(status).to_owned())
+                    })
+                    .to_vec(),
+                )
                 .execute(db)
                 .await?;
         }
@@ -4622,6 +4634,19 @@ async fn project_event(
                 .value("finished_at_ms", finished_at_ms.map(seq_to_value))
                 .value("message", message.clone())
                 .where_eq("work_id", work_id.to_string())
+                .where_in(
+                    "status",
+                    [
+                        RuntimeWorkStatus::Queued,
+                        RuntimeWorkStatus::Running,
+                        RuntimeWorkStatus::Cancelling,
+                        RuntimeWorkStatus::Suspended,
+                    ]
+                    .map(|status| {
+                        DatabaseValue::String(runtime_work_status_name(status).to_owned())
+                    })
+                    .to_vec(),
+                )
                 .execute(db)
                 .await?;
         }
@@ -4631,6 +4656,18 @@ async fn project_event(
             db.update("runtime_work")
                 .value("message", message.clone())
                 .where_eq("work_id", work_id.to_string())
+                .where_in(
+                    "status",
+                    [
+                        RuntimeWorkStatus::Queued,
+                        RuntimeWorkStatus::Running,
+                        RuntimeWorkStatus::Cancelling,
+                    ]
+                    .map(|status| {
+                        DatabaseValue::String(runtime_work_status_name(status).to_owned())
+                    })
+                    .to_vec(),
+                )
                 .execute(db)
                 .await?;
         }
@@ -6749,6 +6786,75 @@ mod tests {
         let active = db.active_runtime_work().await.expect("active work");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0], after[1]);
+        assert_late_runtime_updates(&db, session_id, &after, &active).await;
+    }
+
+    async fn assert_late_runtime_updates(
+        db: &SessionDb,
+        session_id: SessionId,
+        after: &[RuntimeWorkProjection],
+        active: &[RuntimeWorkProjection],
+    ) {
+        db.append_event(&event(
+            session_id,
+            4,
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id: WorkId::new("first"),
+                requested_at_ms: Some(4),
+                client_id: None,
+            },
+        ))
+        .await
+        .expect("persist stale cancellation");
+        db.append_event(&event(
+            session_id,
+            5,
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: WorkId::new("first"),
+                status: RuntimeWorkStatus::Failed,
+                finished_at_ms: Some(5),
+                message: Some("stale conflicting finish".to_owned()),
+            },
+        ))
+        .await
+        .expect("persist conflicting finish");
+        db.append_event(&event(
+            session_id,
+            6,
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: WorkId::new("first"),
+                message: "stale progress".to_owned(),
+                progress_at_ms: Some(6),
+                completed_units: None,
+                total_units: None,
+            },
+        ))
+        .await
+        .expect("persist stale progress");
+        assert_eq!(
+            db.runtime_work_history(10).await.expect("stable history"),
+            after
+        );
+        assert_eq!(
+            db.active_runtime_work().await.expect("stable active work"),
+            active
+        );
+        db.append_event(&event(
+            session_id,
+            7,
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: WorkId::new("second"),
+                message: "cleaning up".to_owned(),
+                progress_at_ms: Some(7),
+                completed_units: None,
+                total_units: None,
+            },
+        ))
+        .await
+        .expect("active progress");
+        let updated = db.runtime_work_history(10).await.expect("progress history");
+        assert_eq!(updated[0], after[0]);
+        assert_eq!(updated[1].message.as_deref(), Some("cleaning up"));
     }
 
     #[tokio::test]
