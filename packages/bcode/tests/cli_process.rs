@@ -844,12 +844,25 @@ fn plugin_check_rejects_future_abi_before_native_loading() {
     }
 }
 
-#[test]
-#[ignore = "requires BCODE_METRICS_PLUGIN_TEST_LIBRARY pointing to a built metrics plugin"]
-fn plugin_service_errors_return_failure_with_response_envelope() {
+fn metrics_plugin_fixture(root: &std::path::Path) {
     let library = std::env::var_os("BCODE_METRICS_PLUGIN_TEST_LIBRARY")
         .expect("set BCODE_METRICS_PLUGIN_TEST_LIBRARY to the built metrics plugin");
     let library = std::fs::canonicalize(library).expect("built metrics plugin library");
+    let plugin_root = root.join("test-plugins");
+    std::fs::create_dir(&plugin_root).unwrap();
+    std::fs::write(
+        root.join("bcode.toml"),
+        "[plugins]\nenabled = [\"bcode.metrics\"]\n",
+    )
+    .unwrap();
+    let manifest = include_str!("../../../plugins/metrics-plugin/bcode-plugin.toml");
+    std::fs::write(plugin_root.join("bcode-plugin.toml"), manifest).unwrap();
+    std::fs::copy(library, plugin_root.join("libbcode_metrics_plugin.dylib")).unwrap();
+}
+
+#[test]
+#[ignore = "requires BCODE_METRICS_PLUGIN_TEST_LIBRARY pointing to a built metrics plugin"]
+fn plugin_service_errors_return_failure_with_response_envelope() {
     for invoke in [false, true] {
         for json in [false, true] {
             let mut args = vec!["plugin"];
@@ -867,18 +880,7 @@ fn plugin_service_errors_return_failure_with_response_envelope() {
             if json {
                 args.push("--json");
             }
-            let output = run_cli_with_fixture(&args, false, Stdio::piped(), |root| {
-                let plugin_root = root.join("test-plugins");
-                std::fs::create_dir(&plugin_root).unwrap();
-                std::fs::write(
-                    root.join("bcode.toml"),
-                    "[plugins]\nenabled = [\"bcode.metrics\"]\n",
-                )
-                .unwrap();
-                let manifest = include_str!("../../../plugins/metrics-plugin/bcode-plugin.toml");
-                std::fs::write(plugin_root.join("bcode-plugin.toml"), manifest).unwrap();
-                std::fs::copy(&library, plugin_root.join("libbcode_metrics_plugin.dylib")).unwrap();
-            });
+            let output = run_cli_with_fixture(&args, false, Stdio::piped(), metrics_plugin_fixture);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert_eq!(output.status.code(), Some(1), "{stderr}");
             assert!(stderr.contains("unsupported_operation"), "{stderr}");
@@ -895,6 +897,78 @@ fn plugin_service_errors_return_failure_with_response_envelope() {
                 );
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "requires BCODE_METRICS_PLUGIN_TEST_LIBRARY pointing to a built metrics plugin"]
+fn plugin_service_success_preserves_payload_and_zero_exit() {
+    for invoke in [false, true] {
+        for json in [false, true] {
+            let mut args = vec!["plugin"];
+            if invoke {
+                args.extend(["invoke", "bcode.metrics"]);
+            } else {
+                args.push("call");
+            }
+            args.extend([
+                "bcode.command/v1",
+                "invoke",
+                "--root",
+                "test-plugins",
+                r#"{"command_id":"metrics.open_dashboard"}"#,
+            ]);
+            if json {
+                args.push("--json");
+            }
+            let output = run_cli_with_fixture(&args, false, Stdio::piped(), metrics_plugin_fixture);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            let payload = if json {
+                let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(envelope["error"].is_null());
+                serde_json::from_value::<Vec<u8>>(envelope["payload"].clone()).unwrap()
+            } else {
+                output.stdout
+            };
+            let response: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(response["success"], true);
+            assert_eq!(response["message"], "Opening metrics dashboard");
+            assert_eq!(response["effects"].as_array().unwrap().len(), 1);
+
+            let (reader, writer) = std::io::pipe().expect("output pipe");
+            drop(reader);
+            let output =
+                run_cli_with_fixture(&args, false, Stdio::from(writer), metrics_plugin_fixture);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            assert!(stderr.starts_with("error: I/O error:"), "{stderr}");
+            assert!(!stderr.contains("panicked"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn plugin_service_help_discloses_failure_and_retry_semantics() {
+    for operation in ["invoke", "call"] {
+        let output = run_cli(&["plugin", operation, "--help"]);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("service error is printed in the response envelope"),
+            "{text}"
+        );
+        assert!(text.contains("exits with status 1"), "{text}");
+        assert!(
+            text.contains("does not imply rollback or that retrying is safe"),
+            "{text}"
+        );
     }
 }
 
@@ -959,6 +1033,84 @@ fn plugin_publish_receipt_handles_closed_stdout_without_panicking() {
         assert!(stderr.starts_with("error: I/O error:"), "{stderr}");
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
+}
+
+#[test]
+fn invalid_prompt_sources_fail_before_daemon_access_without_disclosure() {
+    for stdin in [false, true] {
+        for (bytes, diagnostic) in [
+            (Vec::new(), "prompt input must not be empty"),
+            (
+                b"private-prompt-marker\xff".to_vec(),
+                "prompt input must be valid UTF-8",
+            ),
+            (
+                vec![b'x'; 1024 * 1024 + 1],
+                "prompt input exceeds 1048576 bytes",
+            ),
+        ] {
+            let mut args = vec!["send", "00000000-0000-0000-0000-000000000001", "--json"];
+            let input = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(input.path(), &bytes).unwrap();
+            let output = if stdin {
+                args.push("--stdin");
+                run_cli_with_stdio(
+                    &args,
+                    true,
+                    Stdio::piped(),
+                    Stdio::from(input.reopen().unwrap()),
+                    |_| {},
+                )
+            } else {
+                args.extend(["--file", "prompt.txt"]);
+                run_cli_with_fixture(&args, true, Stdio::piped(), |root| {
+                    std::fs::write(root.join("prompt.txt"), &bytes).unwrap();
+                })
+            };
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{stderr}");
+            assert!(output.stdout.is_empty());
+            assert!(stderr.contains(diagnostic), "{stderr}");
+            assert!(!stderr.contains("private-prompt-marker"), "{stderr}");
+            assert!(!stderr.contains("panicked"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn follow_up_rejects_ignored_turn_admission_options() {
+    for extra in [
+        vec!["--producer", "test.producer"],
+        vec!["--idempotency-key", "retry-key"],
+        vec!["--background"],
+    ] {
+        let mut args = vec![
+            "send",
+            "00000000-0000-0000-0000-000000000001",
+            "hello",
+            "--follow-up",
+            "--json",
+        ];
+        args.extend(extra);
+        let output = run_cli_with_state(&args, true);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("cannot be used with"), "{stderr}");
+    }
+    // The default producer must not conflict unless supplied explicitly.
+    let output = run_cli_with_state(
+        &[
+            "send",
+            "00000000-0000-0000-0000-000000000001",
+            "hello",
+            "--follow-up",
+            "--json",
+        ],
+        true,
+    );
+    assert_eq!(output.status.code(), Some(1), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
 }
 
 #[test]

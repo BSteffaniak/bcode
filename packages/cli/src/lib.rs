@@ -2921,7 +2921,8 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["message", "file"])]
         stdin: bool,
         /// Queue explicitly as a follow-up instead of default steering semantics.
-        #[arg(long)]
+        /// Incompatible with turn-admission producer, idempotency, and priority options.
+        #[arg(long, conflicts_with_all = ["producer", "idempotency_key", "background"])]
         follow_up: bool,
         /// Stable producer namespace for durable turn admission.
         #[arg(long, default_value = "bcode.cli")]
@@ -4825,6 +4826,10 @@ enum PluginCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Invoke a service on a specific plugin.
+    ///
+    /// A service error is printed in the response envelope and exits with status 1.
+    /// Failure does not imply rollback or that retrying is safe.
     Invoke {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
@@ -4839,6 +4844,10 @@ enum PluginCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Call the loaded plugin that provides a service interface.
+    ///
+    /// A service error is printed in the response envelope and exits with status 1.
+    /// Failure does not imply rollback or that retrying is safe.
     Call {
         #[arg(long = "root")]
         root: Vec<std::path::PathBuf>,
@@ -14828,21 +14837,17 @@ impl PromptInput {
         let text = if let Some(message) = self.message {
             message
         } else {
-            let mut bytes = Vec::new();
-            if self.stdin {
-                std::io::stdin()
-                    .take((MAX_CLI_PROMPT_BYTES + 1) as u64)
-                    .read_to_end(&mut bytes)?;
+            let bytes = if self.stdin {
+                read_prompt_bytes(std::io::stdin())?
             } else if let Some(path) = self.file {
                 let metadata = fs::metadata(&path)?;
                 if metadata.len() > MAX_CLI_PROMPT_BYTES as u64 {
                     return Err(prompt_too_large_error());
                 }
-                bytes = fs::read(path)?;
-            }
-            if bytes.len() > MAX_CLI_PROMPT_BYTES {
-                return Err(prompt_too_large_error());
-            }
+                read_prompt_bytes(fs::File::open(path)?)?
+            } else {
+                unreachable!("prompt source count was validated")
+            };
             String::from_utf8(bytes).map_err(|_| {
                 CliError::InvalidArguments("prompt input must be valid UTF-8".to_owned())
             })?
@@ -14859,8 +14864,85 @@ impl PromptInput {
     }
 }
 
+fn read_prompt_bytes(reader: impl std::io::Read) -> Result<Vec<u8>, CliError> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_CLI_PROMPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CLI_PROMPT_BYTES {
+        return Err(prompt_too_large_error());
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod prompt_input_tests {
+    use super::{CliError, MAX_CLI_PROMPT_BYTES, PromptInput};
+
+    #[test]
+    fn prompt_reader_stops_without_waiting_for_eof() {
+        struct Endless {
+            consumed: usize,
+        }
+        impl std::io::Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(self.consumed + buffer.len() <= MAX_CLI_PROMPT_BYTES + 1);
+                buffer.fill(b'x');
+                self.consumed += buffer.len();
+                Ok(buffer.len())
+            }
+        }
+        let mut reader = Endless { consumed: 0 };
+        assert!(
+            matches!(super::read_prompt_bytes(&mut reader), Err(CliError::InvalidArguments(message)) if message.contains("exceeds"))
+        );
+        assert_eq!(reader.consumed, MAX_CLI_PROMPT_BYTES + 1);
+    }
+
+    #[test]
+    fn prompt_file_enforces_size_and_utf8_without_changing_content() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let read = || {
+            PromptInput {
+                message: None,
+                file: Some(file.path().to_path_buf()),
+                stdin: false,
+            }
+            .read()
+        };
+        for text in ["hello\n", "  keep whitespace  ", "unicode: 🦀"] {
+            std::fs::write(file.path(), text).unwrap();
+            assert_eq!(read().unwrap(), text);
+        }
+        let exact = "x".repeat(MAX_CLI_PROMPT_BYTES);
+        std::fs::write(file.path(), &exact).unwrap();
+        assert_eq!(read().unwrap(), exact);
+        std::fs::write(file.path(), vec![b'x'; MAX_CLI_PROMPT_BYTES + 1]).unwrap();
+        assert!(
+            matches!(read(), Err(CliError::InvalidArguments(message)) if message.contains("exceeds"))
+        );
+        std::fs::write(file.path(), [0xff]).unwrap();
+        assert!(
+            matches!(read(), Err(CliError::InvalidArguments(message)) if message.contains("UTF-8"))
+        );
+        std::fs::write(file.path(), []).unwrap();
+        assert!(
+            matches!(read(), Err(CliError::InvalidArguments(message)) if message.contains("empty"))
+        );
+    }
+}
+
 fn prompt_too_large_error() -> CliError {
     CliError::InvalidArguments(format!("prompt input exceeds {MAX_CLI_PROMPT_BYTES} bytes"))
+}
+
+fn write_follow_up_disposition(
+    output: &mut impl std::io::Write,
+    disposition: &impl std::fmt::Debug,
+) -> Result<(), CliError> {
+    writeln!(output, "{disposition:?}")?;
+    output.flush()?;
+    Ok(())
 }
 
 async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(), CliError> {
@@ -14892,7 +14974,7 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
                 "disposition": acceptance.disposition,
             }))?;
         } else {
-            println!("{:?}", acceptance.disposition);
+            write_follow_up_disposition(&mut std::io::stdout().lock(), &acceptance.disposition)?;
         }
     } else {
         let admission = client
@@ -20642,6 +20724,25 @@ mod json_stream_output_tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn follow_up_receipt_propagates_output_failures() {
+        let mut output = Output::default();
+        super::write_follow_up_disposition(&mut output, &"queued").unwrap();
+        assert_eq!(output.bytes, b"\"queued\"\n");
+        assert_eq!(output.flushes, 1);
+        for fail_write in [false, true] {
+            let mut output = Output {
+                fail_write,
+                fail_flush: !fail_write,
+                ..Output::default()
+            };
+            assert!(matches!(
+                super::write_follow_up_disposition(&mut output, &"queued"),
+                Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+            ));
         }
     }
 
