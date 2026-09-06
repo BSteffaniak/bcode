@@ -6357,19 +6357,7 @@ impl WorkflowStore {
         enforce_attempt_limits(&transaction, &prepared)?;
         let dispatch_identity = prepared.dispatch_identity();
         let checksum = sha256_hex(intent_json.as_bytes());
-        let changed = transaction.execute(
-            "UPDATE workflow_activations SET status = 'running' \
-             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
-            (run_id, node_id, activation_id),
-        )? + transaction.execute(
-            "UPDATE workflow_fan_out_members SET status = 'running' \
-             WHERE run_id = ?1 AND member_node_id = ?2 AND member_activation_id = ?3 \
-               AND status = 'pending'",
-            (run_id, node_id, activation_id),
-        )?;
-        if changed != 1 {
-            return Ok(None);
-        }
+        mark_pending_activation_running(&transaction, run_id, node_id, activation_id)?;
         transaction.execute(
             "INSERT INTO workflow_attempts \
              (run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, status, \
@@ -11847,6 +11835,53 @@ fn validate_observed_output(
     Ok(())
 }
 
+fn mark_pending_activation_running(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<(), WorkflowStoreError> {
+    let member_status: Option<String> = transaction
+        .query_row(
+            "SELECT status FROM workflow_fan_out_members
+         WHERE run_id = ?1 AND member_node_id = ?2 AND member_activation_id = ?3",
+            (run_id, node_id, activation_id),
+            |row| row.get(0),
+        )
+        .optional()?;
+    if member_status
+        .as_deref()
+        .is_some_and(|status| status != "pending")
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "fan-out member state disagrees with pending activation".to_string(),
+        ));
+    }
+    let changed = transaction.execute(
+        "UPDATE workflow_activations SET status = 'running'
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
+        (run_id, node_id, activation_id),
+    )?;
+    if changed != 1 {
+        return Err(WorkflowStoreError::InvalidData(
+            "pending workflow activation is missing or inconsistent".to_string(),
+        ));
+    }
+    if member_status.is_some() {
+        let changed = transaction.execute(
+            "UPDATE workflow_fan_out_members SET status = 'running'
+             WHERE run_id = ?1 AND member_node_id = ?2 AND member_activation_id = ?3 AND status = 'pending'",
+            (run_id, node_id, activation_id),
+        )?;
+        if changed != 1 {
+            return Err(WorkflowStoreError::InvalidData(
+                "pending fan-out member is missing or inconsistent".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn pending_activation_by_identity(
     connection: &Connection,
     run_id: &str,
@@ -11856,11 +11891,9 @@ fn pending_activation_by_identity(
     let row = connection
         .query_row(
             "SELECT activation.dependency_generation, activation.input_json, \
-             activation.created_at_ms, definition.definition_json \
+             activation.created_at_ms \
              FROM workflow_activations activation \
              JOIN workflow_runs run ON run.run_id = activation.run_id \
-             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-               AND definition.version = run.definition_version \
              WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
                AND activation.activation_id = ?3 AND activation.status = 'pending' \
                AND NOT EXISTS(SELECT 1 FROM workflow_fan_out_members member \
@@ -11873,32 +11906,28 @@ fn pending_activation_by_identity(
                     row.get::<_, u64>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, u64>(2)?,
-                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?;
-    row.map(
-        |(dependency_generation, input_json, created_at_ms, definition_json)| {
-            let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-            let node = definition.node(node_id).cloned().ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "workflow activation references missing node: {node_id}"
-                ))
-            })?;
-            Ok(PendingActivation {
-                run_id: run_id.to_string(),
-                node_id: node_id.to_string(),
-                activation_id: activation_id.to_string(),
-                dependency_generation,
-                input: input_json
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()?,
-                node,
-                created_at_ms,
-            })
-        },
-    )
+    row.map(|(dependency_generation, input_json, created_at_ms)| {
+        let node = run_graph::initial_node(connection, run_id, node_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow activation references missing run-graph node: {node_id}"
+            ))
+        })?;
+        Ok(PendingActivation {
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            activation_id: activation_id.to_string(),
+            dependency_generation,
+            input: input_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?,
+            node,
+            created_at_ms,
+        })
+    })
     .transpose()
 }
 
@@ -13775,21 +13804,14 @@ fn validate_output_against_node_schema(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
 ) -> Result<(), WorkflowStoreError> {
-    let definition_json: String = transaction.query_row(
-        "SELECT definition.definition_json FROM workflow_runs run \
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-           AND definition.version = run.definition_version \
-         WHERE run.run_id = ?1",
-        [&output.run_id],
-        |row| row.get(0),
+    let node = run_graph::initial_node(transaction, &output.run_id, &output.node_id)?.ok_or_else(
+        || {
+            WorkflowStoreError::InvalidData(format!(
+                "validated output references missing run-graph node: {}",
+                output.node_id
+            ))
+        },
     )?;
-    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-    let node = definition.node(&output.node_id).ok_or_else(|| {
-        WorkflowStoreError::InvalidData(format!(
-            "validated output references missing node: {}",
-            output.node_id
-        ))
-    })?;
     if output.schema_id != node.output.type_name {
         return Err(WorkflowStoreError::InvalidData(format!(
             "validated output schema identity mismatch for node {}: expected {}, received {}",
@@ -17748,6 +17770,71 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_preparation_is_atomic_and_not_repeated_after_reopen() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("fan-out", 1, &fan_out_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "fan-out".to_string();
+        run.input = Some(serde_json::json!([3, 1, 2]));
+        store.create_run(&run).expect("run");
+        store
+            .settle_pending_control_nodes("run-1", 10, 20)
+            .expect("materialize");
+        let member = store
+            .pending_activations_for_run("run-1", 1)
+            .expect("pending")
+            .remove(0);
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                &member.node_id,
+                &member.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "test"}),
+                30,
+            )
+            .expect("prepare")
+            .expect("admitted");
+        assert_eq!(prepared.activation, member);
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            store
+                .prepare_pending_activation(
+                    "run-1",
+                    &member.node_id,
+                    &member.activation_id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"operation": "test"}),
+                    31,
+                )
+                .expect("duplicate")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempts WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .expect("attempts"),
+            1
+        );
+        assert!(
+            store
+                .pending_activations_for_run("run-1", 10)
+                .expect("remaining")
+                .iter()
+                .all(|pending| pending.activation_id != member.activation_id)
+        );
+    }
+
+    #[test]
     fn durable_fan_out_materialization_is_bounded_ordered_and_restart_safe() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -18640,7 +18727,7 @@ mod tests {
 
     #[test]
     fn pending_standard_work_requires_exact_run_graph_node_without_repair() {
-        let (_temp, store) = initialized_store();
+        let (_temp, mut store) = initialized_store();
         let pending = store.pending_activations(10).expect("pending");
         let activation = pending.first().expect("activation");
         assert_eq!(
@@ -18671,6 +18758,79 @@ mod tests {
                 .contains("missing run-graph node")
         );
         assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .prepare_pending_activation(
+                    &activation.run_id,
+                    &activation.node_id,
+                    &activation.activation_id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({}),
+                    30,
+                )
+                .expect_err("admission must not fall back")
+                .to_string()
+                .contains("missing run-graph node")
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempts WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .expect("attempt count"),
+            0
+        );
+    }
+
+    #[test]
+    fn output_validation_requires_run_graph_node_before_persistence() {
+        let (_temp, mut store) = initialized_store();
+        let activation = store.pending_activations(1).expect("pending").remove(0);
+        let output = ValidatedOutput {
+            output_id: "missing-graph-output".to_string(),
+            run_id: activation.run_id.clone(),
+            node_id: activation.node_id.clone(),
+            activation_id: activation.activation_id.clone(),
+            schema_id: activation.node.output.type_name.clone(),
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        store
+            .connection
+            .execute(
+                "DELETE FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = ?2",
+                rusqlite::params![activation.run_id, activation.node_id],
+            )
+            .expect("damage");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .persist_validated_output(&output)
+                .expect_err("missing graph")
+                .to_string()
+                .contains("missing run-graph node")
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_outputs WHERE output_id = ?1",
+                    [&output.output_id],
+                    |row| row.get::<_, u64>(0)
+                )
+                .expect("outputs"),
+            0
+        );
+        assert_eq!(store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = ?1 AND activation_id = ?2",
+            rusqlite::params![activation.run_id, activation.activation_id], |row| row.get::<_, String>(0)
+        ).expect("status"), "pending");
     }
 
     #[test]
