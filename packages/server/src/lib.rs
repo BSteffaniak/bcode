@@ -6163,7 +6163,7 @@ async fn handle_agent_permission_plugin_request(
                 Ok(path) => Response::Ok(ResponsePayload::PermissionRuleAdded {
                     config_path: path.display().to_string(),
                 }),
-                Err(message) => Response::Err(ErrorResponse::new("config_error", message)),
+                Err(error) => Response::Err(ErrorResponse::new("config_error", error.message())),
             };
             send_response(writer, request_id, response).await
         }
@@ -47064,6 +47064,45 @@ library = "test"
             direct_around
         );
         server.abort();
+    }
+
+    #[test]
+    fn permission_rule_errors_do_not_expose_configuration_details() {
+        use interaction_operations::PermissionRuleError;
+        let secret = "PRIVATE_PERMISSION_SENTINEL";
+        for (error, expected) in [
+            (
+                bcode_config::ConfigError::UnknownPermissionCategory(secret.to_owned()),
+                PermissionRuleError::UnknownCategory,
+            ),
+            (
+                bcode_config::ConfigError::UnknownPermissionAction(secret.to_owned()),
+                PermissionRuleError::UnknownAction,
+            ),
+            (
+                bcode_config::ConfigError::Composition {
+                    message: secret.to_owned(),
+                },
+                PermissionRuleError::StateUnavailable,
+            ),
+            (
+                bcode_config::ConfigError::Io {
+                    path: PathBuf::from(secret),
+                    source: std::io::Error::other(secret),
+                },
+                PermissionRuleError::StateUnavailable,
+            ),
+        ] {
+            let normalized = PermissionRuleError::from(error);
+            assert_eq!(normalized, expected);
+            assert!(!normalized.message().contains(secret));
+            let response = ErrorResponse::new("config_error", normalized.message());
+            assert!(!serde_json::to_string(&response).unwrap().contains(secret));
+        }
+        assert_eq!(
+            interaction_operations::add_permission_rule("build", "read", "*".to_owned(), secret),
+            Err(PermissionRuleError::UnknownAction)
+        );
     }
 
     #[tokio::test]

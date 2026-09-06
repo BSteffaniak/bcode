@@ -20793,6 +20793,52 @@ mod json_stream_output_tests {
     }
 
     #[test]
+    fn populated_permission_lists_preserve_metadata_order_and_output_errors() {
+        let session_id = bcode_session_models::SessionId::new();
+        let permissions = ["second", "first"].map(|id| bcode_session_models::PermissionSummary {
+            permission_id: id.to_owned(),
+            session_id,
+            tool_call_id: format!("call-{id}"),
+            tool_name: "filesystem.read".to_owned(),
+            arguments_json: "{\"path\":\"雪\"}".to_owned(),
+            batch: Some(bcode_session_models::PermissionBatchCorrelation {
+                batch_id: "batch".to_owned(),
+                call_index: usize::from(id == "first"),
+                call_count: 2,
+            }),
+            agent_id: "build".to_owned(),
+            policy_source: Some("plugin.policy".to_owned()),
+            policy_reason: Some("approval required".to_owned()),
+            can_remember_policy: true,
+        });
+        for json in [false, true] {
+            let mut output = Output::default();
+            super::write_permission_list(&mut output, &permissions, json).unwrap();
+            assert_eq!(output.flushes, 1);
+            if json {
+                let decoded: Vec<bcode_session_models::PermissionSummary> =
+                    serde_json::from_slice(&output.bytes).unwrap();
+                assert_eq!(decoded, permissions);
+            } else {
+                let expected = format!(
+                    "second\t{session_id}\tcall-second\tfilesystem.read\tbuild\t{{\"path\":\"雪\"}}\nfirst\t{session_id}\tcall-first\tfilesystem.read\tbuild\t{{\"path\":\"雪\"}}\n"
+                );
+                assert_eq!(output.bytes, expected.as_bytes());
+            }
+            for fail_write in [false, true] {
+                let mut output = Output {
+                    fail_write,
+                    fail_flush: !fail_write,
+                    ..Output::default()
+                };
+                assert!(
+                    matches!(super::write_permission_list(&mut output, &permissions, json), Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn empty_permission_lists_flush_and_preserve_formats() {
         for json in [false, true] {
             let mut output = Output::default();

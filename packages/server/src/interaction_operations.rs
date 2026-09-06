@@ -161,19 +161,57 @@ impl Drop for PendingPermissionBatchRegistration {
     }
 }
 
+/// Normalized permission-rule update failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionRuleError {
+    /// The configuration owner rejected the category.
+    UnknownCategory,
+    /// The configuration owner rejected the action.
+    UnknownAction,
+    /// Permission state could not be read or updated.
+    StateUnavailable,
+}
+
+impl PermissionRuleError {
+    /// Secret-safe diagnostic suitable for application clients.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::UnknownCategory => {
+                "unknown permission category; expected command, read, write, edit, or web"
+            }
+            Self::UnknownAction => "unknown permission action; expected allow, ask, or deny",
+            Self::StateUnavailable => "permission state could not be read or updated",
+        }
+    }
+}
+
+impl From<bcode_config::ConfigError> for PermissionRuleError {
+    fn from(error: bcode_config::ConfigError) -> Self {
+        match error {
+            bcode_config::ConfigError::UnknownPermissionCategory(_) => Self::UnknownCategory,
+            bcode_config::ConfigError::UnknownPermissionAction(_) => Self::UnknownAction,
+            bcode_config::ConfigError::Io { .. }
+            | bcode_config::ConfigError::Composition { .. }
+            | bcode_config::ConfigError::RemovedShorthandToolId { .. }
+            | bcode_config::ConfigError::RemovedPermissionCategory { .. } => Self::StateUnavailable,
+        }
+    }
+}
+
 /// Persist one normalized agent permission rule through the configuration owner.
 ///
 /// # Errors
 ///
-/// Returns a normalized message when the rule fields or configuration write are invalid.
+/// Returns a normalized failure when the rule fields or permission state update are invalid.
 pub fn add_permission_rule(
     agent_id: &str,
     category: &str,
     pattern: String,
     action: &str,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, PermissionRuleError> {
     bcode_config::upsert_agent_permission_rule(agent_id, category, pattern, action)
-        .map_err(|error| error.to_string())
+        .map_err(PermissionRuleError::from)
 }
 
 /// Register one pending permission while preserving its optional batch-decision latch.
