@@ -1451,6 +1451,87 @@ impl ModelResponseCache for StoreOutcomeCache {
 }
 
 #[tokio::test]
+async fn no_store_bypasses_tool_cache_policy() {
+    struct NoStoreCache;
+    impl ModelResponseCache for NoStoreCache {
+        fn privacy(&self, _request: &AgentTurnRequest) -> ModelResponseCachePrivacy {
+            ModelResponseCachePrivacy::NoStore
+        }
+        fn allow_tool_responses(&self) -> bool {
+            panic!("tool cache policy must not run");
+        }
+        fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+            panic!("lookup must not run");
+        }
+        fn put(
+            &self,
+            _request: &AgentTurnRequest,
+            _response: &GenerateTextResponse,
+        ) -> bcode::Result<()> {
+            panic!("storage must not run");
+        }
+    }
+    let agent = Agent::builder()
+        .response_cache(Arc::new(NoStoreCache))
+        .inline_tool(tool_definition(), |_| {
+            panic!("provider does not call tools")
+        })
+        .build();
+    let mut provider = CountingProvider::default();
+    let response = agent
+        .generate_text_with_provider(&mut provider, "private request")
+        .await
+        .expect("cache bypass");
+    drop(agent);
+    assert!(matches!(
+        response.cache_status,
+        ModelResponseCacheStatus::Bypassed
+    ));
+    assert_eq!(provider.starts, 1);
+}
+
+#[tokio::test]
+async fn cache_policy_panic_prevents_lookup_and_provider_execution() {
+    struct PanickingPolicyCache {
+        panic_on_privacy: bool,
+    }
+    impl ModelResponseCache for PanickingPolicyCache {
+        fn privacy(&self, _request: &AgentTurnRequest) -> ModelResponseCachePrivacy {
+            assert!(!self.panic_on_privacy, "private policy details");
+            ModelResponseCachePrivacy::Private
+        }
+        fn allow_tool_responses(&self) -> bool {
+            panic!("private tool policy details");
+        }
+        fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+            panic!("lookup must not run");
+        }
+        fn put(
+            &self,
+            _request: &AgentTurnRequest,
+            _response: &GenerateTextResponse,
+        ) -> bcode::Result<()> {
+            panic!("storage must not run");
+        }
+    }
+    for panic_on_privacy in [true, false] {
+        let agent = Agent::builder()
+            .response_cache(Arc::new(PanickingPolicyCache { panic_on_privacy }))
+            .inline_tool(tool_definition(), |_| panic!("tool must not run"))
+            .build();
+        let mut provider = CountingProvider::default();
+        let result = agent
+            .generate_text_with_provider(&mut provider, "policy failure")
+            .await;
+        drop(agent);
+        assert!(
+            matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "cache policy callback failed")
+        );
+        assert_eq!(provider.starts, 0);
+    }
+}
+
+#[tokio::test]
 async fn cache_abort_panic_preserves_storage_failure() {
     struct PanickingAbortCache {
         aborts: AtomicUsize,
@@ -1746,6 +1827,38 @@ fn cache_miss_capacity_is_bounded_and_released() {
     cache.abort(&first);
     assert!(cache.get(&second).expect("released slot").is_none());
     cache.abort(&second);
+}
+
+#[tokio::test]
+async fn cache_capacity_rejection_precedes_provider_and_preserves_reservation() {
+    let cache = Arc::new(InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(1).expect("capacity"),
+    ));
+    let leader = AgentTurnRequest::new("model", "occupied slot");
+    assert!(cache.get(&leader).expect("reserve slot").is_none());
+    let agent = Agent::builder().response_cache(cache.clone()).build();
+    let mut provider = CountingProvider::default();
+    for _ in 0..2 {
+        let result = agent
+            .generate_text_with_provider(&mut provider, "new miss")
+            .await;
+        assert!(
+            matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "cache miss capacity exhausted")
+        );
+        assert_eq!(provider.starts, 0);
+    }
+    cache.abort(&leader);
+    let response = agent
+        .generate_text_with_provider(&mut provider, "new miss")
+        .await
+        .expect("released capacity");
+    drop(agent);
+    assert!(matches!(
+        response.cache_status,
+        ModelResponseCacheStatus::Stored { .. }
+    ));
+    assert_eq!(provider.starts, 1);
 }
 
 #[test]
