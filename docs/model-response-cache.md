@@ -60,6 +60,32 @@ regressions do not certify deterministic scheduling or complete runtime isolatio
 dispatched to a blocking task can likewise finish after its caller drops; drop does not roll back
 storage.
 
+Before dispatching storage, the SDK rejects already-observed cancellation. While storage is
+running, cancellation returns promptly without waiting for the adapter; the blocking task retains
+responsibility for its eventual commit or abort. Cancellation does not undo an already-committed
+write and can win the result race even when storage completes concurrently.
+
+Before invoking `put`, the SDK checks cancellation again and aborts the miss instead of calling
+storage when cancellation is already observed. The in-memory adapter also checks cancellation
+while holding its state lock. Neither check makes cancellation and commit atomic: cancellation
+can occur after the check, and an executing custom adapter cannot be interrupted or rolled back
+by the SDK. A cancellation check is not a substitute for reservation-owner fencing.
+
+Lookup/storage task join failures return fixed SDK cache diagnostics without including the join
+error or panic payload. The SDK catches unwinding lookup/write panics at the callback boundary;
+lookup adapters still own any partial cleanup before returning a miss. After a caught storage
+panic, the miss guard calls `abort` once outside that panic's unwind. This does not sanitize
+custom adapters' returned errors or process-global panic-hook output, nor does it make a panicking
+`abort` safe. Applications must keep those boundaries secret-safe and keep abort callbacks
+non-panicking.
+
+Native channel-gated regressions cover cancellation and future drop after a storage callback has
+entered, followed by success, returned error, or panic. Late success remains stored without an
+abort; error/panic aborts once, and task-owned references are released. These tests do not establish
+simulated blocking-operation scheduling, rollback, or stale-owner fencing. The cross-backend smoke
+suite exercises lookup/storage panic handling and storage-panic recovery, but still fails its
+mandatory active-provider future-drop regression; it is not an overall certification.
+
 The bundled in-memory adapter also expires single-flight leases (30 seconds by default,
 configurable). Provider/tool failures are never cached. Cache lookup/storage failures are typed
 terminal SDK errors rather than silent corruption.

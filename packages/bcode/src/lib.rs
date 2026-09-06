@@ -2321,6 +2321,9 @@ struct InMemoryCacheEntry {
 
 impl InMemoryModelResponseCache {
     /// Create a bounded cache. Both expiration and capacity are mandatory.
+    ///
+    /// A TTL that cannot be added to the selected clock returns [`BcodeError::Cache`] when
+    /// storing a response; construction does not validate the clock range.
     #[must_use]
     pub fn new(ttl: Duration, capacity: std::num::NonZeroUsize) -> Self {
         Self {
@@ -2336,6 +2339,8 @@ impl InMemoryModelResponseCache {
     /// Configure how long followers wait before replacing an abandoned miss leader.
     ///
     /// Zero is accepted and disables coalescing rather than permitting an unbounded wait.
+    /// A duration exceeding the selected clock's range returns [`BcodeError::Cache`] when
+    /// acquiring a miss reservation.
     #[must_use]
     pub const fn with_single_flight_timeout(mut self, timeout: Duration) -> Self {
         self.single_flight_timeout = timeout;
@@ -2395,9 +2400,10 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             }
             let lease_expires = state.in_flight.get(&key).copied();
             if lease_expires.is_none_or(|expires| expires <= now) {
-                state
-                    .in_flight
-                    .insert(key, now + self.single_flight_timeout);
+                let expires = now.checked_add(self.single_flight_timeout).ok_or_else(|| {
+                    BcodeError::Cache("single-flight duration exceeds clock range".into())
+                })?;
+                state.in_flight.insert(key, expires);
                 return Ok(None);
             }
             let wait = lease_expires
@@ -2418,13 +2424,19 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             .state
             .lock()
             .map_err(|error| BcodeError::Cache(error.to_string()))?;
+        if request.cancellation.is_cancelled() {
+            return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+        }
+        let expires_at = switchy::time::instant_now()
+            .checked_add(self.ttl)
+            .ok_or_else(|| BcodeError::Cache("cache TTL exceeds clock range".into()))?;
         state.next_sequence = state.next_sequence.saturating_add(1);
         let sequence = state.next_sequence;
         state.entries.insert(
             key.clone(),
             InMemoryCacheEntry {
                 response: response.clone(),
-                expires_at: switchy::time::instant_now() + self.ttl,
+                expires_at,
                 sequence,
             },
         );
@@ -2550,7 +2562,13 @@ struct ResponseCacheMiss {
 
 impl ResponseCacheMiss {
     fn store(mut self, response: &GenerateTextResponse) -> Result<()> {
-        self.cache.put(&self.request, response)?;
+        if self.request.cancellation.is_cancelled() {
+            return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.cache.put(&self.request, response)
+        }))
+        .map_err(|_| BcodeError::Cache("cache storage task failed".into()))??;
         self.completed = true;
         Ok(())
     }
@@ -2573,7 +2591,13 @@ async fn response_cache_get(
         return Err(BcodeError::Runtime(RuntimeError::Cancelled));
     }
     let lookup = switchy::unsync::task::spawn_blocking(move || {
-        let response = cache.get(&request)?;
+        // The request may have been cancelled while this task waited for a worker.
+        if request.cancellation.is_cancelled() {
+            return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+        }
+        let response =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.get(&request)))
+                .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))??;
         let miss = response.is_none().then(|| ResponseCacheMiss {
             cache,
             request,
@@ -2585,14 +2609,22 @@ async fn response_cache_get(
         biased;
         () = cancellation.cancelled() => Err(BcodeError::Runtime(RuntimeError::Cancelled)),
         result = lookup => result
-            .map_err(|error| BcodeError::Cache(format!("cache lookup task failed: {error}")))?,
+            .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))?,
     }
 }
 
 async fn response_cache_put(miss: ResponseCacheMiss, response: GenerateTextResponse) -> Result<()> {
-    switchy::unsync::task::spawn_blocking(move || miss.store(&response))
-        .await
-        .map_err(|error| BcodeError::Cache(format!("cache storage task failed: {error}")))?
+    let cancellation = miss.request.cancellation.clone();
+    if cancellation.is_cancelled() {
+        return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+    }
+    let storage = switchy::unsync::task::spawn_blocking(move || miss.store(&response));
+    switchy::unsync::select! {
+        biased;
+        () = cancellation.cancelled() => Err(BcodeError::Runtime(RuntimeError::Cancelled)),
+        result = storage => result
+            .map_err(|_| BcodeError::Cache("cache storage task failed".into()))?,
+    }
 }
 
 /// Typed application-owned model rate-limit decision.
@@ -7016,6 +7048,13 @@ impl Agent {
 
     /// Generate text using a caller-supplied provider invoker.
     ///
+    /// # Cancellation safety
+    ///
+    /// Dropping this future while the provider is active does not currently run the provider's
+    /// cancel/finish lifecycle, even when response caching is disabled. For cancellation, use
+    /// [`Self::generate_text_with_provider_and_cancellation`], cancel its token, and continue
+    /// awaiting its terminal result instead of dropping the future.
+    ///
     /// # Errors
     ///
     /// Returns an error when provider invocation fails, the runtime is cancelled, or the provider
@@ -7033,6 +7072,8 @@ impl Agent {
     }
 
     /// Generate text using a caller-supplied provider invoker and prior conversation messages.
+    ///
+    /// This has the same future-drop limitation as [`Self::generate_text_with_provider`].
     ///
     /// # Errors
     ///
@@ -7052,6 +7093,13 @@ impl Agent {
     }
 
     /// Generate text using a caller-supplied provider invoker and cancellation token.
+    ///
+    /// # Cancellation safety
+    ///
+    /// Cancel the supplied token and continue awaiting the terminal result to run provider
+    /// cleanup. Dropping this future while the provider is active does not currently invoke
+    /// its cancel/finish lifecycle. Cache reservation cleanup is separate and does not establish
+    /// provider cleanup. Independently spawned provider work remains the provider's responsibility.
     ///
     /// # Errors
     ///

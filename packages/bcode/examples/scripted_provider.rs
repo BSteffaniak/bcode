@@ -59,7 +59,164 @@ impl bcode::InProcessModelProvider for InProcessEcho {
     }
 }
 
+struct PendingInProcess {
+    started: bcode::CancellationToken,
+    released: bcode::CancellationToken,
+    context: Arc<std::sync::Mutex<Option<bcode::InProcessProviderContext>>>,
+}
+
+struct WorkerRelease(bcode::CancellationToken);
+
+impl Drop for WorkerRelease {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl bcode::InProcessModelProvider for PendingInProcess {
+    fn run_turn(
+        &self,
+        _request: bcode::ModelTurnRequest,
+        context: bcode::InProcessProviderContext,
+    ) -> bcode::InProcessProviderFuture<'_> {
+        Box::pin(async move {
+            if self.started.is_cancelled() {
+                assert!(
+                    !context.cancellation().is_cancelled(),
+                    "fresh turn is active"
+                );
+                let old_context = self
+                    .context
+                    .lock()
+                    .expect("context lock")
+                    .clone()
+                    .expect("previous worker context");
+                assert_eq!(
+                    old_context.events().emit(ProviderTurnEvent::TextDelta {
+                        text: "stale during replacement".into(),
+                    }),
+                    Err(bcode::InProcessProviderEmitError::TurnFinished),
+                    "old context must not inject into an active replacement"
+                );
+                context
+                    .events()
+                    .emit(ProviderTurnEvent::TextDelta {
+                        text: "recovered worker".into(),
+                    })
+                    .expect("fresh turn accepts output");
+                return Ok(bcode::InProcessProviderOutcome::EndTurn);
+            }
+            let _release = WorkerRelease(self.released.clone());
+            *self.context.lock().expect("context lock") = Some(context);
+            self.started.cancel();
+            std::future::pending().await
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InProcessCleanup {
+    AdapterDrop,
+    Cancel,
+    Deadline,
+}
+
+async fn run_in_process_cleanup(mode: InProcessCleanup) -> bcode::Result<()> {
+    let started = bcode::CancellationToken::new();
+    let released = bcode::CancellationToken::new();
+    let context = Arc::new(std::sync::Mutex::new(None));
+    let mut provider = bcode::InProcessModelProviderAdapter::new(PendingInProcess {
+        started: started.clone(),
+        released: released.clone(),
+        context: context.clone(),
+    });
+    let timeout = Duration::from_secs(3);
+    let agent = bcode::Agent::builder().timeout(timeout).build();
+    let cancellation = bcode::CancellationToken::new();
+    let generation_started = switchy::time::instant_now();
+    let mut generation = Box::pin(agent.generate_text_with_provider_and_cancellation(
+        &mut provider,
+        "worker cleanup",
+        cancellation.clone(),
+    ));
+    switchy::unsync::select! {
+        result = &mut generation => panic!("pending provider completed: {result:?}"),
+        () = started.cancelled() => {},
+        () = switchy::unsync::time::sleep(Duration::from_secs(2)) => panic!("worker did not start"),
+    }
+    if matches!(mode, InProcessCleanup::Cancel) {
+        cancellation.cancel();
+        switchy::unsync::select! {
+            result = &mut generation => assert!(matches!(result,
+                Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled)))),
+            () = switchy::unsync::time::sleep(Duration::from_secs(2)) => panic!("SDK cancellation did not complete"),
+        }
+    }
+    if matches!(mode, InProcessCleanup::Deadline) {
+        switchy::unsync::select! {
+            result = &mut generation => assert!(matches!(result,
+                Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Timeout { timeout: actual })) if actual == timeout)),
+            () = switchy::unsync::time::sleep(Duration::from_secs(5)) => panic!("SDK deadline did not complete"),
+        }
+        assert!(
+            switchy::time::instant_now().duration_since(generation_started) >= timeout,
+            "in-process SDK deadline fired early"
+        );
+    }
+    drop(generation);
+    // Returned terminal outcomes must release the worker without adapter destruction.
+    let provider = (!matches!(mode, InProcessCleanup::AdapterDrop)).then_some(provider);
+    switchy::unsync::select! {
+        () = released.cancelled() => {},
+        () = switchy::unsync::time::sleep(Duration::from_secs(2)) => panic!("cleanup did not release worker future ({mode:?})"),
+    }
+    let context = context
+        .lock()
+        .expect("context lock")
+        .clone()
+        .expect("worker context");
+    assert!(
+        context.cancellation().is_cancelled(),
+        "{mode:?}: cancellation visible"
+    );
+    assert_eq!(
+        context.events().emit(ProviderTurnEvent::TextDelta {
+            text: "late output".into(),
+        }),
+        Err(bcode::InProcessProviderEmitError::TurnFinished),
+        "{mode:?}: terminal worker rejects late output"
+    );
+    if let Some(mut provider) = provider {
+        let response = agent
+            .generate_text_with_provider(&mut provider, "recover worker")
+            .await?;
+        assert_eq!(response.text, "recovered worker");
+        assert_eq!(
+            response.runtime.stop_reason,
+            Some(bcode::StopReason::EndTurn)
+        );
+        assert_eq!(
+            context.events().emit(ProviderTurnEvent::TextDelta {
+                text: "stale after reuse".into(),
+            }),
+            Err(bcode::InProcessProviderEmitError::TurnFinished),
+            "old context stays terminal after adapter reuse"
+        );
+    }
+    Ok(())
+}
+
 async fn run() -> bcode::Result<()> {
+    run_cache_lookup_panic().await?;
+    run_cache_storage_panic().await?;
+    run_cache_clock_errors().await?;
+    for mode in [
+        InProcessCleanup::AdapterDrop,
+        InProcessCleanup::Cancel,
+        InProcessCleanup::Deadline,
+    ] {
+        run_in_process_cleanup(mode).await?;
+    }
     let mut in_process = bcode::InProcessModelProviderAdapter::new(InProcessEcho);
     let agent = bcode::Agent::builder().build();
     for prompt in ["in-process smoke", "in-process reuse"] {
@@ -165,6 +322,253 @@ async fn run() -> bcode::Result<()> {
     run_provider_error(ProviderFailure::Start, false).await?;
     run_pre_cancelled().await?;
     run_sibling_cancellation().await?;
+    // Keep the known abandonment regression mandatory, but run it last so it
+    // cannot mask tool, permission, backpressure, and provider-error coverage.
+    run_response_cache_terminal_case(CacheTermination::Drop).await?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct PanickingStorageCache {
+    aborts: std::sync::atomic::AtomicUsize,
+    puts: std::sync::atomic::AtomicUsize,
+    response: std::sync::Mutex<Option<bcode::GenerateTextResponse>>,
+}
+
+impl bcode::ModelResponseCache for PanickingStorageCache {
+    fn get(
+        &self,
+        _request: &bcode::AgentTurnRequest,
+    ) -> bcode::Result<Option<bcode::GenerateTextResponse>> {
+        Ok(self.response.lock().expect("fixture cache lock").clone())
+    }
+
+    fn put(
+        &self,
+        _request: &bcode::AgentTurnRequest,
+        response: &bcode::GenerateTextResponse,
+    ) -> bcode::Result<()> {
+        if self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            panic!("fixture storage panic payload");
+        }
+        *self.response.lock().expect("fixture cache lock") = Some(response.clone());
+        Ok(())
+    }
+
+    fn abort(&self, _request: &bcode::AgentTurnRequest) {
+        self.aborts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn run_cache_storage_panic() -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000021"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([
+        ProviderRequestIdentity {
+            session_id,
+            turn_id: "cache-storage-panic".into(),
+        },
+        ProviderRequestIdentity {
+            session_id,
+            turn_id: "cache-storage-recovery".into(),
+        },
+    ])?;
+    let cache = Arc::new(PanickingStorageCache::default());
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .response_cache(cache.clone())
+        .build();
+    let mut provider = ScriptedProvider::new([
+        ScriptedProviderTurn::complete_text("completed before storage"),
+        ScriptedProviderTurn::complete_text("recovered after storage panic"),
+    ]);
+    let probe = provider.probe();
+    let result = agent
+        .generate_text_with_provider(&mut provider, "storage panic")
+        .await;
+    assert!(
+        matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "cache storage task failed")
+    );
+    assert_eq!(probe.requests().len(), 1);
+    probe
+        .assert_finish_count(1)
+        .expect("provider finished before cache storage");
+    probe
+        .assert_cancellation_count(0)
+        .expect("completed provider not cancelled");
+    assert_eq!(cache.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for cached in [false, true] {
+        let response = agent
+            .generate_text_with_provider(&mut provider, "storage panic")
+            .await?;
+        assert_eq!(response.text, "recovered after storage panic");
+        assert_recovery_cache_status(&response, cached);
+    }
+    assert_eq!(probe.requests().len(), 2);
+    probe
+        .assert_finish_count(2)
+        .expect("both providers finished");
+    probe
+        .assert_cancellation_count(0)
+        .expect("recovery not cancelled");
+    assert_eq!(cache.puts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(cache.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    Ok(())
+}
+
+async fn run_cache_clock_errors() -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000022"
+        .parse()
+        .expect("fixture ID");
+    for lease_overflow in [false, true] {
+        let identities =
+            ScriptedRequestIdentities::new((0..2).map(|attempt| ProviderRequestIdentity {
+                session_id,
+                turn_id: format!("cache-overflow-{lease_overflow}-{attempt}"),
+            }))?;
+        let cache = Arc::new(
+            bcode::InMemoryModelResponseCache::new(
+                if lease_overflow {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::MAX
+                },
+                std::num::NonZeroUsize::new(1).expect("positive capacity"),
+            )
+            .with_single_flight_timeout(if lease_overflow {
+                Duration::MAX
+            } else {
+                Duration::from_secs(30)
+            }),
+        );
+        let agent = AgentBuilder::from_context(session_id, "/".into())
+            .runtime(
+                AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)),
+            )
+            .provider_plugin("test-provider")
+            .model("test-model")
+            .response_cache(cache.clone())
+            .build();
+        let mut provider = ScriptedProvider::new([
+            ScriptedProviderTurn::complete_text("overflow fixture"),
+            ScriptedProviderTurn::complete_text("overflow fixture"),
+        ]);
+        let probe = provider.probe();
+        for attempt in 1..=2 {
+            let result = agent
+                .generate_text_with_provider(&mut provider, "overflow")
+                .await;
+            assert!(matches!(result, Err(bcode::BcodeError::Cache(_))));
+            let expected = if lease_overflow { 0 } else { attempt };
+            assert_eq!(probe.requests().len(), expected);
+            probe
+                .assert_finish_count(expected)
+                .expect("provider finished before storage error");
+            probe
+                .assert_cancellation_count(0)
+                .expect("completed provider not cancelled");
+        }
+        cache.invalidate_all()?;
+    }
+    Ok(())
+}
+
+struct PanickingLookupCache;
+
+impl bcode::ModelResponseCache for PanickingLookupCache {
+    fn get(
+        &self,
+        _request: &bcode::AgentTurnRequest,
+    ) -> bcode::Result<Option<bcode::GenerateTextResponse>> {
+        panic!("fixture lookup panic payload");
+    }
+
+    fn put(
+        &self,
+        _request: &bcode::AgentTurnRequest,
+        _response: &bcode::GenerateTextResponse,
+    ) -> bcode::Result<()> {
+        panic!("failed lookup must not reach storage");
+    }
+}
+
+async fn run_cache_lookup_panic() -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000020"
+        .parse()
+        .expect("fixture ID");
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .provider_plugin("test-provider")
+        .model("test-model")
+        .response_cache(Arc::new(PanickingLookupCache))
+        .build();
+    let mut provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("must not run")]);
+    let probe = provider.probe();
+    let result = agent
+        .generate_text_with_provider(&mut provider, "lookup panic")
+        .await;
+    assert!(
+        matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "cache lookup task failed")
+    );
+    assert!(
+        probe.requests().is_empty(),
+        "failed lookup must not dispatch provider"
+    );
+    probe
+        .assert_finish_count(0)
+        .expect("no provider cleanup without start");
+    Ok(())
+}
+
+fn assert_cancelled_cache_write(response: &bcode::GenerateTextResponse) -> bcode::Result<()> {
+    use bcode::ModelResponseCache;
+
+    let cache = bcode::InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        std::num::NonZeroUsize::new(1).expect("positive capacity"),
+    );
+    let request = bcode::AgentTurnRequest::new("test-model", "cancelled cache write");
+    request.cancellation.cancel();
+    assert!(matches!(
+        cache.put(&request, response),
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    let fresh = bcode::AgentTurnRequest::new("test-model", "cancelled cache write");
+    assert!(
+        cache.get(&fresh)?.is_none(),
+        "cancelled write must not populate cache"
+    );
+    cache.abort(&fresh);
+    for lease_overflow in [false, true] {
+        let cache = bcode::InMemoryModelResponseCache::new(
+            if lease_overflow {
+                Duration::from_secs(60)
+            } else {
+                Duration::MAX
+            },
+            std::num::NonZeroUsize::new(1).expect("positive capacity"),
+        )
+        .with_single_flight_timeout(if lease_overflow {
+            Duration::MAX
+        } else {
+            Duration::from_secs(30)
+        });
+        let result = if lease_overflow {
+            cache.get(&fresh).map(|_| ())
+        } else {
+            assert!(cache.get(&fresh)?.is_none());
+            cache.put(&fresh, response)
+        };
+        assert!(
+            matches!(result, Err(bcode::BcodeError::Cache(_))),
+            "unrepresentable cache duration must fail"
+        );
+        cache.abort(&fresh);
+        cache.invalidate_all()?;
+    }
     Ok(())
 }
 
@@ -286,6 +690,7 @@ async fn run_response_cache_scenario() -> bcode::Result<()> {
             .generate_text_with_provider(&mut provider, "cached")
             .await?;
         assert_eq!(response.text, "before expiry");
+        assert_cancelled_cache_write(&response)?;
         assert_eq!(probe.requests().len(), 1, "hit must not dispatch provider");
         probe
             .assert_finish_count(1)
@@ -335,11 +740,7 @@ async fn run_response_cache_scenario() -> bcode::Result<()> {
 }
 
 async fn run_response_cache_cancellation() -> bcode::Result<()> {
-    for mode in [
-        CacheTermination::Cancel,
-        CacheTermination::Deadline,
-        CacheTermination::Drop,
-    ] {
+    for mode in [CacheTermination::Cancel, CacheTermination::Deadline] {
         run_response_cache_terminal_case(mode).await?;
     }
     Ok(())
@@ -367,7 +768,11 @@ async fn run_response_cache_terminal_case(mode: CacheTermination) -> bcode::Resu
     };
     let agent = AgentBuilder::from_context(session_id, "/".into())
         .timeout(timeout)
-        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .runtime(
+            AgentRuntime::new()
+                .with_poll_interval(Duration::from_mins(1))
+                .with_provider_request_identity_source(Arc::new(identities)),
+        )
         .provider_plugin("test-provider")
         .model("test-model")
         .response_cache(Arc::new(bcode::InMemoryModelResponseCache::new(
@@ -395,6 +800,7 @@ async fn run_response_cache_terminal_case(mode: CacheTermination) -> bcode::Resu
             }
         }
     }
+    let termination_started = switchy::time::instant_now();
     if matches!(mode, CacheTermination::Drop) {
         drop(generation);
     } else if matches!(mode, CacheTermination::Deadline) {
@@ -412,6 +818,10 @@ async fn run_response_cache_terminal_case(mode: CacheTermination) -> bcode::Resu
             Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
         ));
     }
+    assert!(
+        switchy::time::instant_now().duration_since(termination_started) < Duration::from_secs(30),
+        "{mode:?}: termination must interrupt the one-minute poll interval"
+    );
     probe
         .assert_finish_count(1)
         .unwrap_or_else(|error| panic!("{mode:?}: cancelled provider not released: {error:?}"));

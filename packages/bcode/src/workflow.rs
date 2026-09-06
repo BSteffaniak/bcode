@@ -1,7 +1,7 @@
 //! Typed workflow adapters for the high-level Bcode SDK.
 //!
 //! The host-neutral composition types live in [`bcode_workflow`]. This module adds an ergonomic
-//! [`AgentStep`] that executes structured agent turns using a caller-supplied provider factory.
+//! [`AgentStep`](crate::workflow::AgentStep) that executes structured agent turns using a caller-supplied provider factory.
 
 use crate::{
     Agent, AgentBuilder, BcodeError, CancellationToken, ModelProviderInvoker,

@@ -19,9 +19,14 @@ use std::time::Duration;
 struct MemoryCache {
     response: Mutex<Option<GenerateTextResponse>>,
     puts: Mutex<u32>,
+    aborts: AtomicUsize,
 }
 
 impl ModelResponseCache for MemoryCache {
+    fn abort(&self, _request: &AgentTurnRequest) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
         Ok(self
             .response
@@ -99,6 +104,99 @@ impl ModelProviderInvoker for CountingProvider {
     ) -> RuntimeFuture<'a, AckResponse> {
         Box::pin(async { Ok(AckResponse::default()) })
     }
+}
+
+struct CancelOnFinishProvider {
+    inner: CountingProvider,
+    cancellation: bcode::CancellationToken,
+}
+
+impl ModelProviderInvoker for CancelOnFinishProvider {
+    fn start_turn<'a>(
+        &'a mut self,
+        plugin: Option<&'a str>,
+        request: &'a ModelTurnRequest,
+    ) -> RuntimeFuture<'a, StartTurnResponse> {
+        self.inner.start_turn(plugin, request)
+    }
+
+    fn poll_turn_events<'a>(
+        &'a mut self,
+        plugin: Option<&'a str>,
+        request: &'a PollTurnEventsRequest,
+    ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
+        self.inner.poll_turn_events(plugin, request)
+    }
+
+    fn cancel_turn<'a>(
+        &'a mut self,
+        plugin: Option<&'a str>,
+        request: &'a CancelTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        self.inner.cancel_turn(plugin, request)
+    }
+
+    fn finish_turn<'a>(
+        &'a mut self,
+        plugin: Option<&'a str>,
+        request: &'a FinishTurnRequest,
+    ) -> RuntimeFuture<'a, AckResponse> {
+        self.cancellation.cancel();
+        self.inner.finish_turn(plugin, request)
+    }
+}
+
+#[tokio::test]
+async fn cancellation_before_cache_commit_skips_custom_put() {
+    let cancellation = bcode::CancellationToken::new();
+    let cache = Arc::new(MemoryCache::default());
+    let agent = Agent::builder().response_cache(cache.clone()).build();
+    let mut provider = CancelOnFinishProvider {
+        inner: CountingProvider::default(),
+        cancellation: cancellation.clone(),
+    };
+    let result = agent
+        .generate_text_with_provider_and_cancellation(
+            &mut provider,
+            "cancel before put",
+            cancellation,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    assert_eq!(provider.inner.starts, 1);
+    assert_eq!(*cache.puts.lock().expect("put count"), 0);
+    assert!(cache.response.lock().expect("response").is_none());
+    assert_eq!(cache.aborts.load(Ordering::SeqCst), 1);
+    let mut recovery = CountingProvider::default();
+    for _ in 0..2 {
+        let response = agent
+            .generate_text_with_provider(&mut recovery, "cancel before put")
+            .await
+            .expect("fresh request recovers");
+        assert_eq!(response.text, "cached response");
+    }
+    assert_eq!(recovery.starts, 1, "recovery response is cached");
+    assert_eq!(*cache.puts.lock().expect("put count"), 1);
+    assert_eq!(cache.aborts.load(Ordering::SeqCst), 1, "no extra abort");
+}
+
+#[tokio::test]
+async fn cache_lookup_panic_returns_normalized_error() {
+    let agent = Agent::builder()
+        .response_cache(Arc::new(PanicCache))
+        .build();
+    let mut provider = CountingProvider::default();
+    let result = agent
+        .generate_text_with_provider(&mut provider, "panic lookup")
+        .await;
+    assert!(matches!(
+        result,
+        Err(bcode::BcodeError::Cache(message)) if message == "cache lookup task failed"
+    ));
+    assert_eq!(provider.starts, 0);
 }
 
 struct PanicCache;
@@ -311,6 +409,135 @@ async fn in_memory_cache_expires_invalidates_and_evicts_by_capacity() {
     cache.invalidate_all().expect("invalidate all");
     run("first").await;
     assert_eq!(starts.load(Ordering::SeqCst), 6);
+}
+
+#[tokio::test]
+async fn unrepresentable_cache_durations_do_not_poison_state() {
+    let request = AgentTurnRequest::new("model", "clock overflow");
+    let lease_cache = InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(1).expect("positive capacity"),
+    )
+    .with_single_flight_timeout(Duration::MAX);
+    assert!(matches!(
+        lease_cache.get(&request),
+        Err(bcode::BcodeError::Cache(_))
+    ));
+    lease_cache
+        .invalidate_all()
+        .expect("lease error leaves lock usable");
+
+    let ttl_cache = InMemoryModelResponseCache::new(
+        Duration::MAX,
+        NonZeroUsize::new(1).expect("positive capacity"),
+    );
+    let response = Agent::builder()
+        .build()
+        .generate_text_with_provider(&mut CountingProvider::default(), "fixture")
+        .await
+        .expect("fixture response");
+    let cancelled = AgentTurnRequest::new("model", "cancelled overflow");
+    cancelled.cancellation.cancel();
+    assert!(matches!(
+        lease_cache.get(&cancelled),
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    assert!(matches!(
+        ttl_cache.put(&cancelled, &response),
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    assert!(ttl_cache.get(&request).expect("miss").is_none());
+    assert!(matches!(
+        ttl_cache.put(&request, &response),
+        Err(bcode::BcodeError::Cache(_))
+    ));
+    ttl_cache.abort(&request);
+    assert!(
+        ttl_cache
+            .get(&request)
+            .expect("failed write stored nothing")
+            .is_none()
+    );
+    ttl_cache.abort(&request);
+    ttl_cache
+        .invalidate_all()
+        .expect("TTL error leaves lock usable");
+}
+
+#[tokio::test]
+async fn sdk_propagates_cache_clock_errors_without_stuck_reservations() {
+    for lease_overflow in [false, true] {
+        let cache = Arc::new(
+            InMemoryModelResponseCache::new(
+                if lease_overflow {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::MAX
+                },
+                NonZeroUsize::new(1).expect("positive capacity"),
+            )
+            .with_single_flight_timeout(if lease_overflow {
+                Duration::MAX
+            } else {
+                Duration::from_secs(30)
+            }),
+        );
+        let agent = Agent::builder().response_cache(cache.clone()).build();
+        let mut provider = CountingProvider::default();
+        for attempt in 1..=2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                agent.generate_text_with_provider(&mut provider, "overflow retry"),
+            )
+            .await
+            .expect("cache error must not leave the next request waiting for a lease");
+            assert!(matches!(result, Err(bcode::BcodeError::Cache(_))));
+            assert_eq!(provider.starts, if lease_overflow { 0 } else { attempt });
+        }
+        cache
+            .invalidate_all()
+            .expect("SDK error leaves cache usable");
+    }
+}
+
+#[tokio::test]
+async fn cancelled_cache_write_preserves_existing_response() {
+    let cache = InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(1).expect("nonzero capacity"),
+    );
+    let response = Agent::builder()
+        .build()
+        .generate_text_with_provider(&mut CountingProvider::default(), "fixture")
+        .await
+        .expect("fixture response");
+    let request = AgentTurnRequest::new("", "cached");
+    cache.put(&request, &response).expect("initial write");
+    let mut stale_response = response.clone();
+    stale_response.text = "cancelled output".into();
+    request.cancellation.cancel();
+    assert!(matches!(
+        cache.put(&request, &stale_response),
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    let cancelled_miss = AgentTurnRequest::new("", "cancelled miss");
+    cancelled_miss.cancellation.cancel();
+    assert!(matches!(
+        cache.put(&cancelled_miss, &stale_response),
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    let fresh_request = AgentTurnRequest::new("", "cached");
+    assert_eq!(
+        cache
+            .get(&fresh_request)
+            .expect("lookup")
+            .expect("cancelled insertion must not evict existing response")
+            .text,
+        response.text
+    );
+    let fresh_miss = AgentTurnRequest::new("", "cancelled miss");
+    assert!(cache.get(&fresh_miss).expect("miss lookup").is_none());
+    cache.abort(&fresh_miss);
 }
 
 #[derive(Debug)]
@@ -940,20 +1167,23 @@ async fn check_abandoned_lookup(cancel: bool, hit: bool) {
     })
     .await
     .expect("lookup starts");
-    if cancel {
+    let cancelled_result = if cancel {
         cancellation.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(2), &mut generation)
-            .await
-            .expect("cancellation does not wait for adapter");
+        Some(tokio::time::timeout(Duration::from_secs(2), &mut generation).await)
+    } else {
+        None
+    };
+    drop(generation);
+    let aborts_before_release = cache.aborts.load(Ordering::SeqCst);
+    release.send(()).expect("release abandoned lookup");
+    if let Some(result) = cancelled_result {
         assert!(matches!(
-            result,
+            result.expect("cancellation does not wait for adapter"),
             Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
         ));
     }
-    drop(generation);
     assert_eq!(provider.starts, 0);
-    assert_eq!(cache.aborts.load(Ordering::SeqCst), 0);
-    release.send(()).expect("release abandoned lookup");
+    assert_eq!(aborts_before_release, 0);
     drop(agent);
     tokio::time::timeout(Duration::from_secs(2), async {
         while Arc::strong_count(&cache) != 1 {
@@ -966,9 +1196,230 @@ async fn check_abandoned_lookup(cancel: bool, hit: bool) {
     assert_eq!(provider.starts, 0);
 }
 
+#[test]
+fn cancellation_while_lookup_is_queued_skips_adapter() {
+    check_queued_lookup(true);
+}
+
+#[test]
+fn abandoned_uncancelled_queued_lookup_releases_late_miss() {
+    check_queued_lookup(false);
+}
+
+fn check_queued_lookup(cancel: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            entered.send(()).expect("notify worker entry");
+            wait.recv_timeout(Duration::from_secs(5))
+                .expect("release worker");
+        });
+        ready.await.expect("worker occupied");
+        let (adapter_release, receiver) = std::sync::mpsc::channel();
+        // Pre-release the adapter so an unexpected invocation cannot hang the test.
+        adapter_release.send(()).expect("release adapter");
+        let cache = Arc::new(GatedLookupCache {
+            response: None,
+            entered: AtomicUsize::new(0),
+            release: Mutex::new(receiver),
+            aborts: AtomicUsize::new(0),
+        });
+        let agent = Agent::builder().response_cache(cache.clone()).build();
+        let mut provider = CountingProvider::default();
+        let cancellation = bcode::CancellationToken::new();
+        let mut generation = Box::pin(agent.generate_text_with_provider_and_cancellation(
+            &mut provider,
+            "queued lookup",
+            cancellation.clone(),
+        ));
+        let pending = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(generation.as_mut().poll(context).is_pending())
+        })
+        .await;
+        let result = if cancel {
+            cancellation.cancel();
+            Some(tokio::time::timeout(Duration::from_secs(2), &mut generation).await)
+        } else {
+            None
+        };
+        drop(generation);
+        release.send(()).expect("release worker before assertions");
+        worker.await.expect("worker exits");
+        drop(agent);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&cache) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued lookup releases references");
+        assert!(pending);
+        if let Some(result) = result {
+            assert!(matches!(
+                result.expect("prompt cancellation"),
+                Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+            ));
+        }
+        assert_eq!(cache.entered.load(Ordering::SeqCst), usize::from(!cancel));
+        assert_eq!(cache.aborts.load(Ordering::SeqCst), usize::from(!cancel));
+        assert_eq!(provider.starts, 0);
+    });
+}
+
+struct BlockingStoreCache {
+    response: Mutex<Option<GenerateTextResponse>>,
+    outcome: StoreOutcome,
+    entered: AtomicUsize,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    aborts: AtomicUsize,
+}
+
+impl ModelResponseCache for BlockingStoreCache {
+    fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+        Ok(self.response.lock().expect("response lock").clone())
+    }
+
+    fn put(
+        &self,
+        _request: &AgentTurnRequest,
+        response: &GenerateTextResponse,
+    ) -> bcode::Result<()> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.release
+            .lock()
+            .expect("release lock")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release storage");
+        match self.outcome {
+            StoreOutcome::Success => {
+                *self.response.lock().expect("response lock") = Some(response.clone());
+                Ok(())
+            }
+            StoreOutcome::Error => Err(bcode::BcodeError::Cache("late storage failure".into())),
+            StoreOutcome::Panic => panic!("late storage panic"),
+        }
+    }
+
+    fn abort(&self, _request: &AgentTurnRequest) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_storage_returns_before_adapter_finishes() {
+    for outcome in [
+        StoreOutcome::Success,
+        StoreOutcome::Error,
+        StoreOutcome::Panic,
+    ] {
+        assert_storage_cleanup(outcome, true).await;
+    }
+}
+
+#[tokio::test]
+async fn dropping_generation_during_storage_preserves_task_cleanup() {
+    for outcome in [
+        StoreOutcome::Success,
+        StoreOutcome::Error,
+        StoreOutcome::Panic,
+    ] {
+        assert_storage_cleanup(outcome, false).await;
+    }
+}
+
+async fn assert_storage_cleanup(outcome: StoreOutcome, cancel: bool) {
+    let (release, receiver) = std::sync::mpsc::channel();
+    let cache = Arc::new(BlockingStoreCache {
+        response: Mutex::new(None),
+        outcome,
+        entered: AtomicUsize::new(0),
+        release: Mutex::new(receiver),
+        aborts: AtomicUsize::new(0),
+    });
+    let agent = Agent::builder().response_cache(cache.clone()).build();
+    let mut provider = CountingProvider::default();
+    let cancellation = bcode::CancellationToken::new();
+    let mut generation = Box::pin(agent.generate_text_with_provider_and_cancellation(
+        &mut provider,
+        "blocked storage",
+        cancellation.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = &mut generation => panic!("unexpected completion: {result:?}"),
+                () = tokio::task::yield_now() => {
+                    if cache.entered.load(Ordering::SeqCst) == 1 { break; }
+                }
+            }
+        }
+    })
+    .await
+    .expect("storage starts");
+    if cancel {
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut generation).await;
+        let aborts_before_release = cache.aborts.load(Ordering::SeqCst);
+        release
+            .send(())
+            .expect("release storage even if cancellation failed");
+        assert_eq!(
+            aborts_before_release, 0,
+            "cancellation must not abort a still-running write"
+        );
+        assert!(matches!(
+            result.expect("cancellation must not await storage"),
+            Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+        ));
+        drop(generation);
+    } else {
+        drop(generation);
+        let aborts_before_release = cache.aborts.load(Ordering::SeqCst);
+        release.send(()).expect("release abandoned storage");
+        assert_eq!(
+            aborts_before_release, 0,
+            "running write retains miss ownership"
+        );
+    }
+    drop(agent);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&cache) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("storage task released");
+    let stored = cache
+        .get(&AgentTurnRequest::new("", "blocked storage"))
+        .expect("inspect late write");
+    assert_eq!(
+        stored.as_ref().map(|response| response.text.as_str()),
+        matches!(outcome, StoreOutcome::Success).then_some("cached response")
+    );
+    assert_eq!(
+        cache.aborts.load(Ordering::SeqCst),
+        usize::from(!matches!(outcome, StoreOutcome::Success))
+    );
+    assert_eq!(provider.starts, 1);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StoreOutcome {
+    Success,
+    Error,
+    Panic,
+}
+
 #[derive(Debug)]
 struct StoreOutcomeCache {
-    fail: bool,
+    outcome: StoreOutcome,
+    aborts_during_unwind: AtomicUsize,
     puts: AtomicUsize,
     aborts: AtomicUsize,
 }
@@ -984,23 +1435,31 @@ impl ModelResponseCache for StoreOutcomeCache {
         _response: &GenerateTextResponse,
     ) -> bcode::Result<()> {
         self.puts.fetch_add(1, Ordering::SeqCst);
-        if self.fail {
-            Err(bcode::BcodeError::Cache("fixture storage failure".into()))
-        } else {
-            Ok(())
+        match self.outcome {
+            StoreOutcome::Success => Ok(()),
+            StoreOutcome::Error => Err(bcode::BcodeError::Cache("fixture storage failure".into())),
+            StoreOutcome::Panic => panic!("fixture cache panic"),
         }
     }
 
     fn abort(&self, _request: &AgentTurnRequest) {
         self.aborts.fetch_add(1, Ordering::SeqCst);
+        if std::thread::panicking() {
+            self.aborts_during_unwind.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
 #[tokio::test]
 async fn cache_storage_disarms_or_aborts_miss_exactly_once() {
-    for fail in [false, true] {
+    for outcome in [
+        StoreOutcome::Success,
+        StoreOutcome::Error,
+        StoreOutcome::Panic,
+    ] {
         let cache = Arc::new(StoreOutcomeCache {
-            fail,
+            outcome,
+            aborts_during_unwind: AtomicUsize::new(0),
             puts: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
         });
@@ -1009,19 +1468,25 @@ async fn cache_storage_disarms_or_aborts_miss_exactly_once() {
         let result = agent
             .generate_text_with_provider(&mut provider, "store miss")
             .await;
-        if fail {
-            assert!(
-                matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "fixture storage failure")
-            );
-        } else {
-            assert!(matches!(
+        match outcome {
+            StoreOutcome::Success => assert!(matches!(
                 result.expect("storage succeeds").cache_status,
                 ModelResponseCacheStatus::Stored { .. }
-            ));
+            )),
+            StoreOutcome::Error => assert!(
+                matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "fixture storage failure")
+            ),
+            StoreOutcome::Panic => assert!(
+                matches!(result, Err(bcode::BcodeError::Cache(message)) if message == "cache storage task failed")
+            ),
         }
         assert_eq!(provider.starts, 1);
         assert_eq!(cache.puts.load(Ordering::SeqCst), 1);
-        assert_eq!(cache.aborts.load(Ordering::SeqCst), usize::from(fail));
+        assert_eq!(cache.aborts_during_unwind.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cache.aborts.load(Ordering::SeqCst),
+            usize::from(!matches!(outcome, StoreOutcome::Success))
+        );
     }
 }
 
@@ -1270,9 +1735,98 @@ fn cancelled_cache_follower_exits_within_bounded_wait() {
     cache.abort(&leader);
 }
 
+#[test]
+#[ignore = "known defect: key-only cache abort is not fenced across invalidation"]
+fn stale_cache_abort_cannot_release_replacement_reservation() {
+    assert_replacement_reservation_retained(true, true);
+}
+
+#[test]
+#[ignore = "known defect: key-only cache abort is not fenced across exact invalidation"]
+fn stale_cache_abort_cannot_release_exact_invalidation_replacement() {
+    assert_replacement_reservation_retained(true, false);
+}
+
+#[test]
+fn replacement_cache_reservation_retains_follower_until_cancellation() {
+    for invalidate_all in [false, true] {
+        assert_replacement_reservation_retained(false, invalidate_all);
+    }
+}
+
+fn assert_replacement_reservation_retained(abort_stale: bool, invalidate_all: bool) {
+    let cache = Arc::new(InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(2).expect("positive capacity"),
+    ));
+    let request = AgentTurnRequest::new("model", "abort ownership");
+    assert!(cache.get(&request).expect("old miss").is_none());
+    if invalidate_all {
+        cache.invalidate_all().expect("invalidate old reservation");
+    } else {
+        cache
+            .invalidate(&request)
+            .expect("invalidate exact reservation");
+    }
+    assert!(cache.get(&request).expect("replacement miss").is_none());
+    if abort_stale {
+        // The abandoned old operation must not release its replacement.
+        cache.abort(&request);
+    }
+
+    let mut follower_request = request.clone();
+    follower_request.cancellation = bcode::CancellationToken::new();
+    let cancellation = follower_request.cancellation.clone();
+    let follower_cache = cache.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let follower = std::thread::spawn(move || {
+        let _ = sender.send(follower_cache.get(&follower_request));
+    });
+    let remained_reserved = matches!(
+        receiver.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    // Clean up the follower before asserting, including on the known failure path.
+    cancellation.cancel();
+    let cancelled_result = remained_reserved.then(|| {
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled follower exits within cleanup watchdog")
+    });
+    follower.join().expect("follower exits");
+    cache.abort(&request);
+    assert!(
+        remained_reserved,
+        "stale abort released the replacement reservation"
+    );
+    assert!(matches!(
+        cancelled_result,
+        Some(Err(bcode::BcodeError::Runtime(
+            bcode::RuntimeError::Cancelled
+        )))
+    ));
+}
+
 #[tokio::test]
 #[ignore = "known defect: key-only cache completion is not fenced across invalidation"]
 async fn stale_cache_completion_cannot_overwrite_post_invalidation_response() {
+    assert_replacement_completion_retained(true, true).await;
+}
+
+#[tokio::test]
+#[ignore = "known defect: key-only cache completion is not fenced across exact invalidation"]
+async fn stale_cache_completion_cannot_overwrite_post_exact_invalidation_response() {
+    assert_replacement_completion_retained(false, true).await;
+}
+
+#[tokio::test]
+async fn replacement_cache_completion_survives_invalidation_without_stale_write() {
+    for invalidate_all in [false, true] {
+        assert_replacement_completion_retained(invalidate_all, false).await;
+    }
+}
+
+async fn assert_replacement_completion_retained(invalidate_all: bool, write_stale: bool) {
     let cache = InMemoryModelResponseCache::new(
         Duration::from_secs(60),
         NonZeroUsize::new(2).expect("positive capacity"),
@@ -1289,10 +1843,18 @@ async fn stale_cache_completion_cannot_overwrite_post_invalidation_response() {
     fresh.text = "fresh".into();
 
     assert!(cache.get(&request).expect("old miss").is_none());
-    cache.invalidate_all().expect("invalidate old reservation");
+    if invalidate_all {
+        cache.invalidate_all().expect("invalidate old reservation");
+    } else {
+        cache
+            .invalidate(&request)
+            .expect("invalidate exact reservation");
+    }
     assert!(cache.get(&request).expect("replacement miss").is_none());
     cache.put(&request, &fresh).expect("replacement completes");
-    cache.put(&request, &stale).expect("old completion handled");
+    if write_stale {
+        cache.put(&request, &stale).expect("old completion handled");
+    }
     assert_eq!(
         cache
             .get(&request)

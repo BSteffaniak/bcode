@@ -139,9 +139,18 @@ where
         }
     }
 
-    fn turn_id(&self) -> String {
-        let sequence = self.next_turn.fetch_add(1, Ordering::Relaxed) + 1;
-        format!("in-process-turn-{sequence}")
+    fn turn_id(&self) -> Result<String, crate::RuntimeError> {
+        let sequence = self
+            .next_turn
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| {
+                crate::RuntimeError::ProviderInvocation(
+                    "in-process provider turn ID space exhausted".into(),
+                )
+            })?;
+        Ok(format!("in-process-turn-{}", sequence + 1))
     }
 }
 
@@ -155,7 +164,7 @@ where
         request: &'a ModelTurnRequest,
     ) -> RuntimeFuture<'a, StartTurnResponse> {
         Box::pin(async move {
-            let provider_turn_id = self.turn_id();
+            let provider_turn_id = self.turn_id()?;
             let state = Arc::new(InProcessTurnState::new());
             state.push(ProviderTurnEvent::TurnStarted);
             self.turns
@@ -432,6 +441,45 @@ mod tests {
                 Ok(InProcessProviderOutcome::EndTurn)
             })
         }
+    }
+
+    #[tokio::test]
+    async fn exhausted_turn_ids_fail_before_registering_work() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        provider.next_turn.store(u64::MAX - 1, Ordering::Relaxed);
+        let started = provider
+            .start_turn(None, &model_request("last-valid"))
+            .await
+            .expect("last available ID starts a turn");
+        assert_eq!(
+            started.provider_turn_id,
+            format!("in-process-turn-{}", u64::MAX)
+        );
+        let state =
+            provider.turns.lock().expect("turn registry")[&started.provider_turn_id].clone();
+        for _ in 0..2 {
+            let error = provider
+                .start_turn(None, &model_request("exhausted"))
+                .await
+                .expect_err("ID exhaustion must reject start");
+            assert!(matches!(error, RuntimeError::ProviderInvocation(message)
+                if message == "in-process provider turn ID space exhausted"));
+            let turns = provider.turns.lock().expect("turn registry");
+            assert_eq!(turns.len(), 1);
+            assert!(Arc::ptr_eq(&turns[&started.provider_turn_id], &state));
+            drop(turns);
+            assert_eq!(provider.next_turn.load(Ordering::Relaxed), u64::MAX);
+        }
+        provider
+            .finish_turn(
+                None,
+                &FinishTurnRequest {
+                    provider_turn_id: started.provider_turn_id,
+                },
+            )
+            .await
+            .expect("last valid turn remains releasable");
+        assert!(provider.turns.lock().expect("turn registry").is_empty());
     }
 
     #[tokio::test]
@@ -907,6 +955,79 @@ mod tests {
         assert!(matches!(error, RuntimeError::Cancelled));
         assert!(provider.turns.lock().expect("turns").is_empty());
         assert!(runtime.active_turn_generation().is_none());
+    }
+
+    #[tokio::test]
+    async fn scope_cancellation_interrupts_long_poll_wait() {
+        struct Sink;
+        impl crate::TurnEventSink for Sink {
+            fn emit(&self, _event: crate::ScopedTurnEvent) -> bool {
+                true
+            }
+        }
+        let mut provider = InProcessModelProviderAdapter::new(BlockingProvider);
+        let turns = provider.turns.clone();
+        let mut request = AgentTurnRequest::new("model", "scope cancellation");
+        request.timeout = Duration::from_mins(2);
+        let runtime = AgentRuntime::new().with_poll_interval(Duration::from_mins(1));
+        let scope = runtime.begin_turn_scope(
+            "scoped wait",
+            Arc::new(Sink),
+            crate::InvocationCapabilities::default(),
+        );
+        let mut generation =
+            Box::pin(runtime.run_text_turn_in_scope(&mut provider, &request, &scope));
+        std::future::poll_fn(|context| {
+            assert!(generation.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(turns.lock().expect("turns").len(), 1);
+        assert!(runtime.cancel_turn_scope(&scope));
+        let error = tokio::time::timeout(Duration::from_secs(2), generation)
+            .await
+            .expect("scope cancellation interrupts poll wait")
+            .expect_err("cancelled scope");
+        assert!(matches!(error, RuntimeError::Cancelled));
+        assert!(!request.cancellation.is_cancelled());
+        assert!(turns.lock().expect("turns").is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseded_long_poll_releases_provider_without_releasing_new_scope() {
+        struct Sink;
+        impl crate::TurnEventSink for Sink {
+            fn emit(&self, _event: crate::ScopedTurnEvent) -> bool {
+                true
+            }
+        }
+        let mut provider = InProcessModelProviderAdapter::new(BlockingProvider);
+        let turns = provider.turns.clone();
+        let mut request = AgentTurnRequest::new("model", "superseded");
+        request.timeout = Duration::from_mins(2);
+        let runtime = AgentRuntime::new().with_poll_interval(Duration::from_mins(1));
+        let mut generation = Box::pin(runtime.run_text_turn(&mut provider, request));
+        std::future::poll_fn(|context| {
+            assert!(generation.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(turns.lock().expect("turns").len(), 1);
+        let replacement = runtime.begin_turn_scope(
+            "replacement",
+            Arc::new(Sink),
+            crate::InvocationCapabilities::default(),
+        );
+        let active = runtime.active_turn_generation();
+        let error = tokio::time::timeout(Duration::from_secs(2), generation)
+            .await
+            .expect("superseding scope interrupts poll wait")
+            .expect_err("superseded turn");
+        assert!(matches!(error, RuntimeError::Cancelled));
+        assert!(turns.lock().expect("turns").is_empty());
+        assert!(replacement.accepts_work());
+        assert_eq!(runtime.active_turn_generation(), active);
+        assert!(runtime.cancel_turn_scope(&replacement));
     }
 
     #[tokio::test]
