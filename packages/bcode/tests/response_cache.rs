@@ -1451,6 +1451,55 @@ impl ModelResponseCache for StoreOutcomeCache {
 }
 
 #[tokio::test]
+async fn cache_abort_panic_preserves_storage_failure() {
+    struct PanickingAbortCache {
+        aborts: AtomicUsize,
+        panic_on_put: bool,
+    }
+
+    impl ModelResponseCache for PanickingAbortCache {
+        fn get(&self, _request: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+            Ok(None)
+        }
+
+        fn put(
+            &self,
+            _request: &AgentTurnRequest,
+            _response: &GenerateTextResponse,
+        ) -> bcode::Result<()> {
+            assert!(!self.panic_on_put, "storage panic");
+            Err(bcode::BcodeError::Cache("original storage failure".into()))
+        }
+
+        fn abort(&self, _request: &AgentTurnRequest) {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            panic!("cache cleanup failure");
+        }
+    }
+
+    for panic_on_put in [false, true] {
+        let cache = Arc::new(PanickingAbortCache {
+            aborts: AtomicUsize::new(0),
+            panic_on_put,
+        });
+        let agent = Agent::builder().response_cache(cache.clone()).build();
+        let mut provider = CountingProvider::default();
+        let result = agent
+            .generate_text_with_provider(&mut provider, "store miss")
+            .await;
+        drop(agent);
+        let expected = if panic_on_put {
+            "cache storage task failed"
+        } else {
+            "original storage failure"
+        };
+        assert!(matches!(result, Err(bcode::BcodeError::Cache(message)) if message == expected));
+        assert_eq!(cache.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.starts, 1);
+    }
+}
+
+#[tokio::test]
 async fn cache_storage_disarms_or_aborts_miss_exactly_once() {
     for outcome in [
         StoreOutcome::Success,

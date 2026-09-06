@@ -2577,7 +2577,9 @@ impl ResponseCacheMiss {
 impl Drop for ResponseCacheMiss {
     fn drop(&mut self) {
         if !self.completed {
-            self.cache.abort(&self.request);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.cache.abort(&self.request);
+            }));
         }
     }
 }

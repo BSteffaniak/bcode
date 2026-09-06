@@ -4684,6 +4684,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("checkpoint recovery");
+        drop(state);
         assert_eq!(recovered.providers[0].completed_sessions, 1);
         assert_eq!(
             APPLY_BATCH_CALLS.load(Ordering::SeqCst),
@@ -4779,6 +4780,7 @@ pub(crate) mod tests {
             .await
             .expect("canonical tail")
             .expect("tail exists");
+        drop(state);
         let checkpoint = STATEFUL_CHECKPOINTS
             .lock()
             .expect("stateful checkpoints")
@@ -4851,7 +4853,12 @@ pub(crate) mod tests {
             .lock()
             .expect("stateful apply release") = true;
         STATEFUL_APPLY_RELEASE.1.notify_all();
-        let _ = interrupted.await;
+        assert!(
+            interrupted
+                .await
+                .expect_err("coordinator is aborted")
+                .is_cancelled()
+        );
 
         let sessions = first_state.sessions.clone();
         drop(first_state);
@@ -4867,6 +4874,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("new invocation after operation loss");
+        drop(restarted);
 
         assert_eq!(response.providers[0].completed_sessions, 1);
         assert_eq!(response.providers[0].failed_sessions, 0);
