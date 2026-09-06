@@ -19052,6 +19052,46 @@ mod tests {
     }
 
     #[test]
+    fn graph_migration_preserves_definition_with_distinct_storage_identity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let original = definition("display-name");
+        store
+            .persist_definition("example", 1, &original)
+            .expect("distinct storage identity");
+        store.create_run(&new_run()).expect("run");
+        let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
+        let path = store.path().to_path_buf();
+        drop(store);
+        let connection = Connection::open(&path).expect("fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE workflow_run_graph_edges;
+             DROP TABLE workflow_run_graph_nodes;
+             DROP TABLE workflow_run_graphs;
+             UPDATE workflow_store_contract SET schema_version = 15;",
+            )
+            .expect("schema 15");
+        drop(connection);
+        WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 48).expect("migration");
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .run_graph_nodes("run-1", None, 100)
+                .expect("preserved graph"),
+            nodes
+        );
+        let payload: String = store.connection.query_row(
+            "SELECT definition_json FROM workflow_definitions WHERE definition_id = 'example' AND version = 1",
+            [], |row| row.get(0),
+        ).expect("preserved definition");
+        assert_eq!(
+            serde_json::from_str::<WorkflowDefinition>(&payload).expect("definition"),
+            original
+        );
+    }
+
+    #[test]
     fn graph_migration_preserves_completed_execution_state() {
         let (temp, mut store) = initialized_store();
         let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
@@ -19770,6 +19810,272 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn exact_node_reads_surface_invalid_row_revisions_without_repair() {
+        let (temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("fixture constraints");
+        for revision in [-1, 0] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_run_graph_nodes SET revision = ?1 WHERE run_id = 'run-1'",
+                    [revision],
+                )
+                .expect("corrupt revision");
+            let before = store.connection.total_changes();
+            assert!(store.run_graph_node("run-1", &node.id).is_err());
+            assert!(store.run_graph_nodes("run-1", None, 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
+                 SELECT run_id, node_id, 1, node_json, is_entry, is_exit
+                 FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND revision = ?1",
+                [revision],
+            ).expect("coexisting valid revision");
+            let before = store.connection.total_changes();
+            assert!(store.run_graph_node("run-1", &node.id).is_err());
+            assert!(store.run_graph_nodes("run-1", None, 1).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+            store
+                .connection
+                .execute(
+                    "DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND revision = 1",
+                    [],
+                )
+                .expect("remove valid fixture row");
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT revision FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("preserved revision"),
+                revision
+            );
+        }
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen damaged graph");
+        let before = reopened.connection.total_changes();
+        assert!(reopened.run_graph_node("run-1", &node.id).is_err());
+        assert!(reopened.run_graph_nodes("run-1", None, 1).is_err());
+        assert_eq!(reopened.connection.total_changes(), before);
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT revision FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("persisted damage"),
+            0
+        );
+    }
+
+    #[test]
+    fn edge_reads_surface_invalid_row_revisions_without_repair() {
+        let (temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        let edge = bcode_workflow::EdgeDefinition {
+            from: node.id.clone(),
+            to: node.id.clone(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("fixture constraints");
+        for revision in [-1, 0] {
+            store
+                .connection
+                .execute(
+                    "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1'",
+                    [],
+                )
+                .expect("reset fixture");
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, ?1, ?2, ?2, ?3)",
+                rusqlite::params![revision, node.id, serde_json::to_string(&edge).expect("payload")],
+            ).expect("corrupt revision");
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json)
+                 SELECT run_id, edge_id, 1, source_node_id, target_node_id, edge_json
+                 FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND revision = ?1",
+                [revision],
+            ).expect("coexisting valid edge revision");
+            let before = store.connection.total_changes();
+            assert!(store.run_graph_edge("run-1", 0).is_err());
+            assert!(store.run_graph_edges("run-1", None, 1).is_err());
+            assert!(
+                store
+                    .run_graph_incoming_edges("run-1", &node.id, None, 1)
+                    .is_err()
+            );
+            assert!(store.run_graph_edges("run-1", None, 10).is_err());
+            assert!(
+                store
+                    .run_graph_incoming_edges("run-1", &node.id, None, 10)
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen damaged edges");
+        let before = reopened.connection.total_changes();
+        assert!(reopened.run_graph_edge("run-1", 0).is_err());
+        assert!(reopened.run_graph_edges("run-1", None, 1).is_err());
+        assert!(
+            reopened
+                .run_graph_incoming_edges("run-1", &node.id, None, 1)
+                .is_err()
+        );
+        assert_eq!(reopened.connection.total_changes(), before);
+        let mut statement = reopened.connection.prepare(
+            "SELECT revision FROM workflow_run_graph_edges WHERE run_id = 'run-1' ORDER BY revision",
+        ).expect("persisted edge revisions");
+        let revisions = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("revisions");
+        assert_eq!(revisions, vec![0, 1]);
+    }
+
+    #[test]
+    fn graph_readers_reject_missing_header_without_reconstruction() {
+        let (temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        store.connection.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';").expect("damage header");
+        let before = store.connection.total_changes();
+        assert!(store.run_graph_revision("run-1").is_err());
+        assert!(store.run_graph_node("run-1", &node.id).is_err());
+        assert!(store.run_graph_nodes("run-1", None, 10).is_err());
+        assert!(store.run_graph_edge("run-1", 0).is_err());
+        assert!(store.run_graph_edges("run-1", None, 10).is_err());
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", &node.id, None, 10)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM workflow_run_graphs", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("headers"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .expect("surviving nodes"),
+            1
+        );
+        drop(store);
+        let reopened =
+            WorkflowStore::open_in_state_dir(temp.path()).expect("reopen missing header");
+        let before = reopened.connection.total_changes();
+        assert!(reopened.run_graph_revision("run-1").is_err());
+        assert!(reopened.run_graph_node("run-1", &node.id).is_err());
+        assert!(reopened.run_graph_nodes("run-1", None, 1).is_err());
+        assert!(reopened.run_graph_edge("run-1", 0).is_err());
+        assert!(reopened.run_graph_edges("run-1", None, 1).is_err());
+        assert!(
+            reopened
+                .run_graph_incoming_edges("run-1", &node.id, None, 1)
+                .is_err()
+        );
+        assert_eq!(reopened.connection.total_changes(), before);
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("SELECT COUNT(*) FROM workflow_run_graphs", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("header remains absent"),
+            0
+        );
+    }
+
+    #[test]
+    fn graph_readers_preserve_corrupt_and_unsupported_revisions() {
+        let (_temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("fixture constraints");
+        for revision in [-1_i64, 0, 2] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_run_graphs SET revision = ?1 WHERE run_id = 'run-1'",
+                    [revision],
+                )
+                .expect("fixture revision");
+            let before = store.connection.total_changes();
+            if revision > 0 {
+                assert_eq!(
+                    store
+                        .run_graph_revision("run-1")
+                        .expect("revision inspection"),
+                    Some(2)
+                );
+            } else {
+                assert!(store.run_graph_revision("run-1").is_err());
+            }
+            assert!(store.run_graph_node("run-1", &node.id).is_err());
+            assert!(store.run_graph_nodes("run-1", None, 10).is_err());
+            assert!(store.run_graph_edge("run-1", 0).is_err());
+            assert!(store.run_graph_edges("run-1", None, 10).is_err());
+            assert!(
+                store
+                    .run_graph_incoming_edges("run-1", &node.id, None, 10)
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT revision FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .expect("preserved revision"),
+                revision
+            );
+        }
     }
 
     #[test]

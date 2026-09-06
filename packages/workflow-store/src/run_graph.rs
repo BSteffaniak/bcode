@@ -214,8 +214,10 @@ pub fn initial_node(
         .query_row(
             "SELECT CASE WHEN typeof(node_json) = 'text'
                      AND length(CAST(node_json AS BLOB)) <= ?3
+                     AND revision = 1
                      AND is_entry IN (0, 1) AND is_exit IN (0, 1) THEN node_json END
-         FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = ?2 AND revision = 1",
+         FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = ?2 AND revision <= 1
+         ORDER BY revision LIMIT 1",
             rusqlite::params![run_id, node_id, super::MAX_INLINE_JSON_BYTES],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -344,15 +346,15 @@ impl WorkflowStore {
                     CASE WHEN source.is_entry IN (0, 1) AND source.is_exit IN (0, 1)
                          THEN source.node_id END,
                     CASE WHEN target.is_entry IN (0, 1) AND target.is_exit IN (0, 1)
-                         THEN target.node_id END
+                         THEN target.node_id END, edge.revision
              FROM workflow_run_graph_edges edge
              LEFT JOIN workflow_run_graph_nodes source ON source.run_id = edge.run_id
                  AND source.node_id = edge.source_node_id AND source.revision = 1
              LEFT JOIN workflow_run_graph_nodes target ON target.run_id = edge.run_id
                  AND target.node_id = edge.target_node_id AND target.revision = 1
-             WHERE edge.run_id = ?1 AND edge.revision = 1
+             WHERE edge.run_id = ?1 AND edge.revision <= 1
                  AND edge.edge_id {cursor_operator} ?2 {target_filter} {identity_filter}
-             ORDER BY edge.edge_id LIMIT ?3",
+             ORDER BY edge.edge_id, edge.revision LIMIT ?3",
         );
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query(rusqlite::params![
@@ -365,6 +367,11 @@ impl WorkflowStore {
         ])?;
         let mut edges = Vec::new();
         while let Some(row) = rows.next()? {
+            if row.get::<_, i64>(6)? != 1 {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow graph edge revision is invalid".to_string(),
+                ));
+            }
             let json = row.get::<_, Option<String>>(1)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(
                     "workflow graph edge payload is invalid or oversized".to_string(),
@@ -428,7 +435,7 @@ impl WorkflowStore {
                          AND length(CAST(node_json AS BLOB)) <= ?5 THEN node_json END,
                     is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = ?1 AND revision <= ?2
-             AND node_id {cursor_operator} ?3 ORDER BY node_id LIMIT ?4",
+             AND node_id {cursor_operator} ?3 ORDER BY node_id, revision LIMIT ?4",
         );
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query(rusqlite::params![
