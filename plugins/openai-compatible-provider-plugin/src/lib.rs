@@ -3114,12 +3114,16 @@ async fn stream_chat_completion_with_failover(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
+    if turn.is_cancelled() {
+        return Ok(StreamOutcome::Cancelled);
+    }
     if request.provider_context.auth_candidates.is_empty() {
         return stream_chat_completion_inner(request, turn).await;
     }
     if request.provider_context.auth_profile.is_some() {
         let outcome = stream_chat_completion_inner(request, turn).await;
         return match outcome {
+            Ok(StreamOutcome::Cancelled) => Ok(StreamOutcome::Cancelled),
             Ok(outcome) => {
                 record_selected_auth_profile_success(request);
                 refresh_priming_auth_profile_usage(request).await;
@@ -3292,6 +3296,9 @@ async fn try_auth_candidates_once(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<CandidateAttemptOutcome, ProviderError> {
+    if turn.is_cancelled() {
+        return Ok(CandidateAttemptOutcome::Finished(StreamOutcome::Cancelled));
+    }
     let (available_candidates, cooldown_candidates, skipped_profiles) =
         partition_auth_candidates(request);
     let selections =
@@ -3299,6 +3306,9 @@ async fn try_auth_candidates_once(
 
     let mut attempt_state = CandidateAttemptState::default();
     for selection in selections {
+        if turn.is_cancelled() {
+            return Ok(CandidateAttemptOutcome::Finished(StreamOutcome::Cancelled));
+        }
         warn_if_probing_cooldown_candidate(
             turn,
             selection.candidate,
@@ -3364,6 +3374,7 @@ async fn try_auth_candidate(
             .auth_pool_selection_reason = Some("priming".to_string());
     }
     match stream_chat_completion_inner(&candidate_request, turn).await {
+        Ok(StreamOutcome::Cancelled) => Ok(CandidateTryOutcome::Finished(StreamOutcome::Cancelled)),
         Ok(outcome) => {
             record_auth_candidate_success(request, candidate, selection.reason);
             if selection.reason == CandidateSelectionReason::Priming {
@@ -9186,12 +9197,76 @@ mod tests {
             .insert("BCODE_OPENAI_API_KEY".into(), "test-key".into());
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            stream_chat_completion_inner(&request, &turn),
+            stream_chat_completion(&request, &turn),
         )
         .await;
         let _ = release.send(());
         server.join().unwrap();
-        assert!(matches!(result, Ok(Ok(StreamOutcome::Cancelled))));
+        result.expect("cancelled turn must finish while headers are withheld");
+        let events = turn.drain();
+        assert!(matches!(
+            events.last(),
+            Some(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Cancelled
+            })
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::Cancelled))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::Error { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_empty_pool_is_not_reported_as_exhausted() {
+        let request = test_request(Vec::new());
+        let turn = TurnState::default();
+        turn.cancel();
+        assert!(matches!(
+            try_auth_candidates_once(&request, &turn).await,
+            Ok(CandidateAttemptOutcome::Finished(StreamOutcome::Cancelled))
+        ));
+        assert!(matches!(
+            stream_chat_completion_with_failover(&request, &turn).await,
+            Ok(StreamOutcome::Cancelled)
+        ));
+        assert!(turn.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_auth_candidate_returns_cancelled_without_output() {
+        let request = test_request(Vec::new());
+        let turn = TurnState::default();
+        turn.cancel();
+        let candidate = ProviderAuthCandidate::default();
+        let result = try_auth_candidate(
+            &request,
+            &turn,
+            CandidateSelection {
+                candidate: &candidate,
+                reason: CandidateSelectionReason::Priming,
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Ok(CandidateTryOutcome::Finished(StreamOutcome::Cancelled))
+        ));
+        assert!(turn.drain().is_empty());
     }
 
     #[tokio::test]
