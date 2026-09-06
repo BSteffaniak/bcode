@@ -642,6 +642,13 @@ impl AuthFlowResponse {
         }
         for effect in &self.effects {
             effect.validate()?;
+            if self.status != AuthFlowStatus::Pending
+                && matches!(effect, AuthFlowEffect::Prompt { .. })
+            {
+                return Err(AuthContractError::InvalidFlowShape(
+                    "terminal responses cannot request input",
+                ));
+            }
         }
         validate_count("diagnostics", self.diagnostics.len(), MAX_AUTH_FLOW_EFFECTS)?;
         for diagnostic in &self.diagnostics {
@@ -1199,6 +1206,38 @@ mod tests {
             diagnostics: Vec::new(),
         };
         response.validate().expect("valid terminal success");
+    }
+
+    #[test]
+    fn terminal_responses_reject_prompts_but_allow_messages() {
+        for status in [
+            AuthFlowStatus::Succeeded,
+            AuthFlowStatus::Failed,
+            AuthFlowStatus::Cancelled,
+        ] {
+            let mut response = AuthFlowResponse {
+                schema_version: AUTH_FLOW_SCHEMA_VERSION,
+                status,
+                state: None,
+                effects: vec![AuthFlowEffect::Prompt {
+                    prompt_id: "code".to_owned(),
+                    message: "Enter code".to_owned(),
+                    choices: Vec::new(),
+                }],
+                credentials: BTreeMap::new(),
+                diagnostics: Vec::new(),
+            };
+            assert!(matches!(
+                response.validate(),
+                Err(AuthContractError::InvalidFlowShape(
+                    "terminal responses cannot request input"
+                ))
+            ));
+            response.effects = vec![AuthFlowEffect::Message {
+                message: "Flow ended".to_owned(),
+            }];
+            response.validate().unwrap();
+        }
     }
 
     #[test]
