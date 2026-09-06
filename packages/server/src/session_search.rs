@@ -3179,6 +3179,7 @@ pub(crate) mod tests {
                             | SearchContentKind::Compaction
                     )
                 }));
+                APPLY_BATCH_CALLS.fetch_add(1, Ordering::SeqCst);
                 let duplicate = if matches!(provider.behavior, TestProviderBehavior::Stateful) {
                     let mut checkpoints =
                         STATEFUL_CHECKPOINTS.lock().expect("stateful checkpoints");
@@ -3223,7 +3224,6 @@ pub(crate) mod tests {
                 } else {
                     false
                 };
-                APPLY_BATCH_CALLS.fetch_add(1, Ordering::SeqCst);
                 service_response(&ApplySearchRecordsResponse {
                     batch_id: request.batch_id,
                     outcome: if duplicate {

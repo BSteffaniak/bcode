@@ -614,8 +614,11 @@ mod tests {
             host.registry().workflow_templates().is_empty(),
             "disabled workflow plugin must contribute no templates"
         );
+        let commands =
+            host.registered_command_contributions(&bcode_command::CommandSurface::Palette);
+        drop(host);
         assert!(
-            host.registered_command_contributions(&bcode_command::CommandSurface::Palette)
+            commands
                 .iter()
                 .all(|command| !command.id.starts_with("workflow"))
         );

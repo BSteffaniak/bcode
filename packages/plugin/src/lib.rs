@@ -2294,6 +2294,17 @@ impl PluginInvocationCancelHandle {
     }
 }
 
+#[derive(Debug)]
+struct CancelAbandonedInvocation(Option<PluginInvocationCancelHandle>);
+
+impl Drop for CancelAbandonedInvocation {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.0 {
+            cancel.cancel();
+        }
+    }
+}
+
 /// Plugin executor status snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginExecutorStatus {
@@ -2539,6 +2550,7 @@ struct PluginInvocation {
     bridge: Option<PluginInvocationBridge>,
     response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
     event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    _resource_permit: Option<Arc<PluginResourcePermit>>,
 }
 
 #[derive(Debug)]
@@ -2568,14 +2580,27 @@ pub enum StreamingServiceInvocationEvent {
 }
 
 /// Running streaming plugin service invocation.
+///
+/// Dropping before receiving the final response requests nonblocking cancellation. This
+/// does not acknowledge termination; the executor retains ownership of running work.
 #[derive(Debug)]
 pub struct StreamingServiceInvocation {
     response: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
     pending_response: Option<Result<ServiceResponse, PluginLoadError>>,
     response_taken: bool,
+    completed: bool,
     events: mpsc::UnboundedReceiver<Vec<u8>>,
     pub cancel: PluginInvocationCancelHandle,
     resource_permit: Option<Arc<PluginResourcePermit>>,
+}
+
+impl Drop for StreamingServiceInvocation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancel.cancel();
+        }
+        drop(self.resource_permit.take());
+    }
 }
 
 impl StreamingServiceInvocation {
@@ -2585,8 +2610,12 @@ impl StreamingServiceInvocation {
     ///
     /// # Errors
     ///
-    /// Returns an error when the response channel closes before a plugin response is produced.
+    /// Returns an error when the response channel closes before a plugin response is produced,
+    /// or when the final response has already been delivered.
     pub async fn next_event(&mut self) -> Result<StreamingServiceInvocationEvent, PluginLoadError> {
+        if self.completed {
+            return Err(Self::closed_response_error());
+        }
         loop {
             match self.events.try_recv() {
                 Ok(payload) => {
@@ -2598,6 +2627,7 @@ impl StreamingServiceInvocation {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
             }
             if let Some(response) = self.pending_response.take() {
+                self.completed = true;
                 return Ok(StreamingServiceInvocationEvent::Response(response));
             }
             tokio::select! {
@@ -2627,14 +2657,19 @@ impl StreamingServiceInvocation {
         &mut self,
     ) -> Result<StreamingServiceInvocationEvent, PluginLoadError> {
         if let Some(response) = self.pending_response.take() {
+            self.completed = true;
             return Ok(StreamingServiceInvocationEvent::Response(response));
         }
         if self.response_taken {
             return Err(Self::closed_response_error());
         }
+        let response = (&mut self.response).await;
         self.response_taken = true;
-        match (&mut self.response).await {
-            Ok(response) => Ok(StreamingServiceInvocationEvent::Response(response)),
+        match response {
+            Ok(response) => {
+                self.completed = true;
+                Ok(StreamingServiceInvocationEvent::Response(response))
+            }
             Err(_error) => Err(Self::closed_response_error()),
         }
     }
@@ -2650,6 +2685,9 @@ impl StreamingServiceInvocation {
     /// Try to receive a queued invocation event without blocking.
     #[must_use]
     pub fn try_recv_event(&mut self) -> Option<Vec<u8>> {
+        if self.completed {
+            return None;
+        }
         self.events.try_recv().ok()
     }
 }
@@ -2719,6 +2757,7 @@ impl PluginExecutorHandle {
         event_sender: mpsc::UnboundedSender<Vec<u8>>,
         response_receiver: oneshot::Receiver<Result<ServiceResponse, PluginLoadError>>,
         event_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+        resource_permit: Arc<PluginResourcePermit>,
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
@@ -2744,15 +2783,10 @@ impl PluginExecutorHandle {
                     bridge: bridge.clone(),
                     response,
                     event_sender: Some(event_sender),
+                    _resource_permit: Some(resource_permit.clone()),
                 };
-                self.metrics.enqueue(class);
-                sender
-                    .send(PluginExecutorMessage::Service(invocation))
-                    .await
-                    .map_err(|_| {
-                        self.metrics.dequeue(class);
-                        PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
-                    })?;
+                self.enqueue_exclusive(sender, class, PluginExecutorMessage::Service(invocation))
+                    .await?;
             }
             PluginExecutorKind::Concurrent(plugin, semaphore) => {
                 let permit = match semaphore {
@@ -2776,6 +2810,7 @@ impl PluginExecutorHandle {
                     bridge,
                     response: unused_response,
                     event_sender: Some(event_sender),
+                    _resource_permit: Some(resource_permit.clone()),
                 };
                 let plugin = Arc::clone(plugin);
                 let metrics = Arc::clone(&self.metrics);
@@ -2794,9 +2829,10 @@ impl PluginExecutorHandle {
             response: response_receiver,
             pending_response: None,
             response_taken: false,
+            completed: false,
             events: event_receiver,
             cancel,
-            resource_permit: None,
+            resource_permit: Some(resource_permit),
         })
     }
     #[allow(clippy::too_many_arguments)]
@@ -2809,93 +2845,111 @@ impl PluginExecutorHandle {
         scope: PluginInvocationScope,
         event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
         bridge: Option<PluginInvocationBridge>,
+        resource_permit: Arc<PluginResourcePermit>,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let invocation_id = next_plugin_invocation_id();
-        let invocation = PluginInvocation {
+        let cancellation = PluginInvocationCancelHandle {
             id: invocation_id,
-            class,
-            enqueued_at: Instant::now(),
-            scope,
-            interface_id,
-            operation,
-            payload,
-            cancellation: PluginInvocationCancelHandle {
-                id: invocation_id,
-                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
-            },
-            bridge,
-            response: oneshot::channel().0,
-            event_sender,
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
         };
-        match &self.executor {
-            PluginExecutorKind::Exclusive(sender) => {
-                tracing::debug!(
-                    target: "bcode_plugin::runtime",
-                    plugin_id = %self.manifest.id,
-                    class = ?invocation.class,
-                    scope = ?invocation.scope,
-                    interface_id = %invocation.interface_id,
-                    operation = %invocation.operation,
-                    serialization_reason = plugin_serialization_reason(self.concurrency),
-                    "plugin service invocation serialized by host"
-                );
-                let (response, receiver) = oneshot::channel();
-                let invocation = PluginInvocation {
-                    response,
-                    ..invocation
-                };
-                self.metrics.enqueue(class);
-                sender
-                    .send(PluginExecutorMessage::Service(invocation))
-                    .await
-                    .map_err(|_| {
-                        self.metrics.dequeue(class);
-                        PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
-                    })?;
-                receiver
+        let mut abandonment = Box::new(CancelAbandonedInvocation(Some(cancellation.clone())));
+        let result = {
+            let (response, receiver) = oneshot::channel();
+            let invocation = PluginInvocation {
+                id: invocation_id,
+                class,
+                enqueued_at: Instant::now(),
+                scope,
+                interface_id,
+                operation,
+                payload,
+                cancellation,
+                bridge,
+                response,
+                event_sender,
+                _resource_permit: Some(resource_permit),
+            };
+            match &self.executor {
+                PluginExecutorKind::Exclusive(sender) => {
+                    tracing::debug!(
+                        target: "bcode_plugin::runtime",
+                        plugin_id = %self.manifest.id,
+                        class = ?invocation.class,
+                        scope = ?invocation.scope,
+                        interface_id = %invocation.interface_id,
+                        operation = %invocation.operation,
+                        serialization_reason = plugin_serialization_reason(self.concurrency),
+                        "plugin service invocation serialized by host"
+                    );
+                    self.enqueue_exclusive(
+                        sender,
+                        class,
+                        PluginExecutorMessage::Service(invocation),
+                    )
+                    .await?;
+                    receiver
+                        .await
+                        .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+                }
+                PluginExecutorKind::Concurrent(plugin, semaphore) => {
+                    let permit = match semaphore {
+                        Some(semaphore) => {
+                            Some(semaphore.clone().acquire_owned().await.map_err(|_| {
+                                PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
+                            })?)
+                        }
+                        None => None,
+                    };
+                    let plugin = Arc::clone(plugin);
+                    let metrics = Arc::clone(&self.metrics);
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        execute_plugin_service_invocation(&plugin, invocation, &metrics)
+                    })
                     .await
                     .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+                }
             }
-            PluginExecutorKind::Concurrent(plugin, semaphore) => {
-                let permit = match semaphore {
-                    Some(semaphore) => {
-                        Some(semaphore.clone().acquire_owned().await.map_err(|_| {
-                            PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
-                        })?)
-                    }
-                    None => None,
-                };
-                let plugin = Arc::clone(plugin);
-                let metrics = Arc::clone(&self.metrics);
-                tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    execute_plugin_service_invocation(&plugin, invocation, &metrics)
-                })
+        };
+        abandonment.0 = None;
+        result
+    }
+
+    async fn enqueue_exclusive(
+        &self,
+        sender: &mpsc::Sender<PluginExecutorMessage>,
+        class: PluginInvocationClass,
+        message: PluginExecutorMessage,
+    ) -> Result<(), PluginLoadError> {
+        {
+            let permit = sender
+                .reserve()
                 .await
-                .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
-            }
+                .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+            // Once counted, transfer ownership without a cancellation point.
+            self.metrics.enqueue(class);
+            permit.send(message);
         }
+        Ok(())
     }
 
     async fn handle_event(&self, topic: String, payload: Vec<u8>) -> Result<(), PluginLoadError> {
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
                 let (response, receiver) = oneshot::channel();
-                self.metrics.enqueue(PluginInvocationClass::EventDelivery);
-                sender
-                    .send(PluginExecutorMessage::Event(PluginEventInvocation {
+                self.enqueue_exclusive(
+                    sender,
+                    PluginInvocationClass::EventDelivery,
+                    PluginExecutorMessage::Event(PluginEventInvocation {
                         id: next_plugin_invocation_id(),
                         class: PluginInvocationClass::EventDelivery,
                         enqueued_at: Instant::now(),
                         topic,
                         payload,
                         response,
-                    }))
-                    .await
-                    .map_err(|_| {
-                        self.metrics.dequeue(PluginInvocationClass::EventDelivery);
-                        PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
-                    })?;
+                    }),
+                )
+                .await?;
                 receiver
                     .await
                     .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
@@ -2941,7 +2995,12 @@ impl PluginExecutorHandle {
                     .await
                     .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
             }
-            PluginExecutorKind::Concurrent(plugin, _) => plugin.deactivate(),
+            PluginExecutorKind::Concurrent(plugin, _) => {
+                let plugin = Arc::clone(plugin);
+                tokio::task::spawn_blocking(move || plugin.deactivate())
+                    .await
+                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+            }
         }
     }
 }
@@ -3373,6 +3432,31 @@ impl PluginRuntimeHost {
             })
     }
 
+    /// Load explicitly discovered plugins and start their normal runtime executors.
+    ///
+    /// No default filesystem roots are discovered. Selection, static-registration precedence,
+    /// configuration, activation, and runtime construction are shared with native startup.
+    /// Plugin loading and executors retain their native effects; this is not a simulated runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when selection, loading, activation, or presentation validation fails.
+    pub fn load_discovered_with_static_bundled_and_config(
+        selection: &PluginSelection,
+        discovered_plugins: Vec<RegisteredPlugin>,
+        static_plugins: &[StaticBundledPlugin],
+        configs: BTreeMap<String, ResolvedPluginConfig>,
+    ) -> Result<Self, PluginLoadError> {
+        PluginHost::load_discovered_with_static_bundled_and_config(
+            selection,
+            discovered_plugins,
+            static_plugins,
+            configs,
+        )
+        .map(Self::from)
+        .map(|runtime| runtime.with_selection(selection.clone()))
+    }
+
     /// Return a clone with the resolved selection inventory attached.
     #[must_use]
     pub fn with_selection(mut self, selection: PluginSelection) -> Self {
@@ -3647,7 +3731,7 @@ impl PluginRuntimeHost {
             .service_policy(plugin_id, &interface_id)
             .and_then(|policy| policy.class)
             .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
-        let resource_permit = self.resources.acquire(&scope).await?;
+        let resource_permit = Arc::new(self.resources.acquire(&scope).await?);
         let metric_labels =
             plugin_runtime_metric_labels(plugin_id, &interface_id, &operation, class, &scope);
         self.metrics.record_histogram_with_labels(
@@ -3667,9 +3751,19 @@ impl PluginRuntimeHost {
             "plugin resource slot acquired"
         );
         let span = self.metrics.span("plugin.invocation").labels(metric_labels);
-        let result = executor
-            .invoke_service_scoped(interface_id, operation, payload, class, scope, None, bridge)
-            .await;
+        let result = Box::pin(executor.invoke_service_scoped(
+            interface_id,
+            operation,
+            payload,
+            class,
+            scope,
+            None,
+            bridge,
+            resource_permit.clone(),
+        ))
+        .await;
+        drop(resource_permit);
+        drop(executor);
         span.finish_result(&result);
         result
     }
@@ -3790,12 +3884,11 @@ impl PluginRuntimeHost {
                 event_sender,
                 response_receiver,
                 event_receiver,
+                Arc::new(resource_permit),
             )
             .await;
         start_span.finish_result(&result);
-        let mut invocation = result?;
-        invocation.resource_permit = Some(Arc::new(resource_permit));
-        Ok(invocation)
+        result
     }
 
     /// Invoke a service operation by service interface ID.
@@ -4067,14 +4160,17 @@ impl PluginRuntimeHost {
     ///
     /// # Errors
     ///
-    /// Returns the first deactivation error.
+    /// Returns the first deactivation error after attempting every loaded executor.
     pub async fn deactivate_all(&self) -> Result<(), PluginLoadError> {
+        let mut first_error = None;
         for plugin_id in self.registry.manifests.keys().rev() {
-            if let Some(executor) = self.executors.get(plugin_id) {
-                executor.deactivate().await?;
+            if let Some(executor) = self.executors.get(plugin_id)
+                && let Err(error) = executor.deactivate().await
+            {
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -4555,14 +4651,37 @@ impl PluginHost {
         static_plugins: &[StaticBundledPlugin],
         configs: BTreeMap<String, ResolvedPluginConfig>,
     ) -> Result<Self, PluginLoadError> {
+        Self::load_discovered_with_static_bundled_and_config(
+            selection,
+            discover_plugins()?,
+            static_plugins,
+            configs,
+        )
+    }
+
+    /// Select, load, and activate explicitly discovered plugins and static registrations.
+    ///
+    /// Does not discover plugins from ambient filesystem roots. Static registrations take
+    /// precedence over discovered plugins with the same ID, exactly as in native startup.
+    /// Loading and plugin activation still perform their normal native effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when manifest selection, loading, activation, or presentation validation
+    /// fails.
+    pub fn load_discovered_with_static_bundled_and_config(
+        selection: &PluginSelection,
+        discovered_plugins: Vec<RegisteredPlugin>,
+        static_plugins: &[StaticBundledPlugin],
+        configs: BTreeMap<String, ResolvedPluginConfig>,
+    ) -> Result<Self, PluginLoadError> {
         let discovery_started_at = Instant::now();
-        tracing::debug!(target: "bcode_plugin::startup", "discovering plugins");
         let static_plugins = filter_selected_static_plugins(static_plugins, selection)?;
         let static_ids = static_plugins
             .iter()
             .map(|plugin| plugin.0.id.clone())
             .collect::<BTreeSet<_>>();
-        let plugins = filter_selected_plugins(discover_plugins()?, selection)
+        let plugins = filter_selected_plugins(discovered_plugins, selection)
             .into_iter()
             .filter(|plugin| !static_ids.contains(&plugin.manifest.id))
             .collect::<Vec<_>>();
@@ -4902,19 +5021,31 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Returns the first deactivation error.
+    /// Returns the first deactivation error after attempting every plugin. Failed plugins
+    /// remain loaded for retry; successfully deactivated plugins are removed.
     pub fn deactivate_all(&mut self) -> Result<(), PluginLoadError> {
-        for plugin in self.loaded.iter().rev() {
-            plugin.deactivate()?;
+        let mut failed = Vec::new();
+        let mut first_error = None;
+        while let Some(plugin) = self.loaded.pop() {
+            if let Err(error) = plugin.deactivate() {
+                first_error.get_or_insert(error);
+                failed.push(plugin);
+            }
         }
-        self.loaded.clear();
-        Ok(())
+        failed.reverse();
+        self.loaded = failed;
+        first_error.map_or(Ok(()), Err)
     }
 }
 
 impl Drop for PluginHost {
     fn drop(&mut self) {
-        let _ = self.deactivate_all();
+        if self.deactivate_all().is_err() {
+            tracing::warn!(
+                remaining_plugins = self.loaded.len(),
+                "plugin host dropped with incomplete deactivation"
+            );
+        }
     }
 }
 
@@ -6545,6 +6676,7 @@ library = "libexample_plugin.dylib"
             )
             .await
             .expect_err("wait operation should time out");
+        drop(runtime);
         assert!(matches!(
             error,
             PluginLoadError::ServiceInvocationTimeout {
@@ -6584,12 +6716,253 @@ library = "libexample_plugin.dylib"
             )
             .await
             .expect_err("wait operation should observe caller cancellation");
+        drop(runtime);
         cancel_task.await.expect("cancellation task");
         assert!(matches!(
             error,
             PluginServiceCallError::Service { code, .. } if code == "cancelled"
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn abandoned_stream_keeps_resource_slot_until_executor_releases_work() {
+        let resources = PluginResourceLimiter::new(1, 1);
+        let scope = PluginInvocationScope::Global;
+        let permit = Arc::new(resources.acquire(&scope).await.expect("resource slot"));
+        let (sender, mut receiver) = mpsc::channel(1);
+        let handle = PluginExecutorHandle::new(
+            test_manifest("owned-permit"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let (response, response_receiver) = oneshot::channel();
+        let (events, event_receiver) = mpsc::unbounded_channel();
+        let invocation = handle
+            .start_service_with_events_scoped(
+                "test".into(),
+                "run".into(),
+                Vec::new(),
+                PluginInvocationClass::Service,
+                scope,
+                PluginInvocationId(1),
+                PluginInvocationCancelHandle {
+                    id: PluginInvocationId(1),
+                    cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                },
+                None,
+                response,
+                events,
+                response_receiver,
+                event_receiver,
+                permit,
+            )
+            .await
+            .expect("queued invocation");
+        drop(invocation);
+        assert_eq!(resources.global.available_permits(), 0);
+        let work = receiver.recv().await.expect("executor owns queued work");
+        assert_eq!(resources.global.available_permits(), 0);
+        drop(work);
+        assert_eq!(resources.global.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_exclusive_queue_wait_does_not_leave_phantom_work() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let metrics = Arc::new(PluginExecutorMetrics::default());
+        let handle = PluginExecutorHandle::new(
+            test_manifest("queue-test"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender.clone()),
+            metrics.clone(),
+        );
+        let (response, _) = oneshot::channel();
+        sender
+            .send(PluginExecutorMessage::Deactivate(response))
+            .await
+            .expect("fill queue");
+        {
+            let (response, _) = oneshot::channel();
+            let mut enqueue = Box::pin(handle.enqueue_exclusive(
+                &sender,
+                PluginInvocationClass::Service,
+                PluginExecutorMessage::Deactivate(response),
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(enqueue.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+        receiver.recv().await.expect("original message");
+        assert!(receiver.try_recv().is_err());
+        let (response, _) = oneshot::channel();
+        handle
+            .enqueue_exclusive(
+                &sender,
+                PluginInvocationClass::Service,
+                PluginExecutorMessage::Deactivate(response),
+            )
+            .await
+            .expect("enqueue after cancellation");
+        drop(handle);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 1);
+        receiver.recv().await.expect("committed message");
+        metrics.dequeue(PluginInvocationClass::Service);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_service_future_cancels_running_plugin() {
+        let bundled = [StaticBundledPlugin::new(
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            bcode_hello_plugin::static_plugin(),
+        )];
+        let runtime = PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
+            &PluginSelection::all_enabled(),
+            Vec::new(),
+            &bundled,
+            BTreeMap::new(),
+        )
+        .expect("static runtime");
+        let mut invocation = Box::pin(runtime.invoke_service(
+            "example.hello",
+            "example-hello/v1",
+            "wait-cancelled",
+            Vec::new(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(invocation.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                if runtime
+                    .executor_statuses()
+                    .iter()
+                    .any(|status| status.running > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("plugin starts before abandonment");
+        drop(invocation);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .executor_statuses()
+                    .iter()
+                    .all(|status| status.running == 0 && status.queued == 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abandonment cancels before plugin's five-second timeout");
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn abandoned_streaming_invocation_requests_cancellation() {
+        let bundled = [StaticBundledPlugin::new(
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            bcode_hello_plugin::static_plugin(),
+        )];
+        let runtime = PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
+            &PluginSelection::all_enabled(),
+            Vec::new(),
+            &bundled,
+            BTreeMap::new(),
+        )
+        .expect("static runtime");
+        let invocation = runtime
+            .invoke_service_with_events(
+                "example.hello",
+                "example-hello/v1",
+                "wait-cancelled",
+                Vec::new(),
+            )
+            .await
+            .expect("start pending service");
+        let cancellation = invocation.cancel.clone();
+        assert!(!cancellation.is_cancelled());
+        drop(invocation);
+        assert!(cancellation.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime
+                    .executor_statuses()
+                    .iter()
+                    .all(|status| status.running == 0 && status.queued == 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("executor releases abandoned work");
+    }
+
+    #[test]
+    fn explicit_runtime_discovery_retains_selection_inventory() {
+        let mut selection = PluginSelection::all_enabled();
+        selection.disabled.insert("example.hello".to_owned());
+        let bundled = [StaticBundledPlugin::new(
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            bcode_hello_plugin::static_plugin(),
+        )];
+        let runtime = PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
+            &selection,
+            Vec::new(),
+            &bundled,
+            BTreeMap::new(),
+        )
+        .expect("disabled runtime composition");
+        assert_eq!(runtime.selection(), &selection);
+        assert!(runtime.registry().manifests().is_empty());
+        drop(runtime);
+    }
+
+    #[test]
+    fn explicit_discovery_preserves_static_precedence_and_disablement() {
+        let manifest_text = include_str!("../../../examples/hello-plugin/bcode-plugin.toml");
+        let discovered = RegisteredPlugin {
+            manifest_path: PathBuf::from("/nonexistent/bcode-explicit-discovery/bcode-plugin.toml"),
+            manifest: toml::from_str(manifest_text).expect("hello manifest"),
+        };
+        let bundled = [StaticBundledPlugin::new(
+            manifest_text,
+            bcode_hello_plugin::static_plugin(),
+        )];
+        let mut selection = PluginSelection::all_enabled();
+        let host = PluginHost::load_discovered_with_static_bundled_and_config(
+            &selection,
+            vec![discovered.clone()],
+            &bundled,
+            BTreeMap::new(),
+        )
+        .expect("static registration must override nonexistent dynamic library");
+        assert!(host.auth_provider_registry().get("example-hello").is_some());
+
+        selection.disabled.insert("example.hello".to_owned());
+        let host = PluginHost::load_discovered_with_static_bundled_and_config(
+            &selection,
+            vec![discovered],
+            &bundled,
+            BTreeMap::new(),
+        )
+        .expect("disabled registrations must not load");
+        assert!(host.auth_provider_registry().is_empty());
     }
 
     #[test]
@@ -6995,6 +7368,7 @@ library = "libexample_plugin.dylib"
                 response,
                 pending_response: None,
                 response_taken: false,
+                completed: false,
                 events,
                 cancel: PluginInvocationCancelHandle {
                     id: PluginInvocationId(1),
@@ -7003,6 +7377,7 @@ library = "libexample_plugin.dylib"
                 resource_permit: None,
             };
 
+            let cancellation = invocation.cancel.clone();
             assert!(matches!(
                 invocation.next_event().await.expect("first item"),
                 StreamingServiceInvocationEvent::Event(payload)
@@ -7014,7 +7389,87 @@ library = "libexample_plugin.dylib"
                     if response.payload_text().ok() == Some("complete")
             ));
             drop(invocation);
+            assert!(!cancellation.is_cancelled());
         });
+    }
+
+    #[tokio::test]
+    async fn streaming_final_response_rejects_late_events_and_repolls() {
+        let (response_tx, response) = oneshot::channel();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let mut invocation = StreamingServiceInvocation {
+            response,
+            pending_response: None,
+            response_taken: false,
+            completed: false,
+            events,
+            cancel: PluginInvocationCancelHandle {
+                id: PluginInvocationId(1),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            },
+            resource_permit: None,
+        };
+        response_tx
+            .send(Ok(ServiceResponse::text("done")))
+            .expect("response");
+        assert!(matches!(
+            invocation.next_event().await.expect("final response"),
+            StreamingServiceInvocationEvent::Response(Ok(_))
+        ));
+        events_tx.send(b"late".to_vec()).expect("retained sender");
+        assert!(invocation.try_recv_event().is_none());
+        for _ in 0..2 {
+            let mut next = Box::pin(invocation.next_event());
+            std::future::poll_fn(|cx| {
+                assert!(matches!(
+                    std::future::Future::poll(next.as_mut(), cx),
+                    std::task::Poll::Ready(Err(_))
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(invocation);
+    }
+
+    #[tokio::test]
+    async fn cancelled_final_response_wait_can_resume() {
+        let (response_tx, response) = oneshot::channel();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        drop(events_tx);
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let mut invocation = StreamingServiceInvocation {
+            response,
+            pending_response: None,
+            response_taken: false,
+            completed: false,
+            events,
+            cancel: PluginInvocationCancelHandle {
+                id: PluginInvocationId(1),
+                cancellation,
+            },
+            resource_permit: None,
+        };
+        let cancel = invocation.cancel.clone();
+        {
+            let mut next = Box::pin(invocation.next_event());
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(!cancel.is_cancelled());
+        response_tx
+            .send(Ok(ServiceResponse::text("resumed")))
+            .expect("live receiver");
+        assert!(matches!(
+            invocation.next_event().await.expect("resume cancelled poll"),
+            StreamingServiceInvocationEvent::Response(Ok(response))
+                if response.payload_text().ok() == Some("resumed")
+        ));
+        drop(invocation);
+        assert!(!cancel.is_cancelled());
     }
 
     #[test]
@@ -7035,6 +7490,7 @@ library = "libexample_plugin.dylib"
                 response,
                 pending_response: None,
                 response_taken: false,
+                completed: false,
                 events,
                 cancel: PluginInvocationCancelHandle {
                     id: PluginInvocationId(1),
@@ -7077,27 +7533,26 @@ library = "libexample_plugin.dylib"
             .expect("runtime builds");
 
         tokio.block_on(async {
-            let StreamingServiceInvocation {
-                response,
-                pending_response: _,
-                response_taken: _,
-                mut events,
-                cancel: _,
-                resource_permit,
-            } = runtime
+            let mut invocation = runtime
                 .invoke_service_with_events("events", "events", "run", Vec::new())
                 .await
                 .expect("service should start");
-            let event = events.recv().await.expect("event should emit");
-            let response = response
+            let event = invocation.events.recv().await.expect("event should emit");
+            let response = (&mut invocation.response)
                 .await
                 .expect("response sender should stay alive")
                 .expect("service should invoke");
+            invocation.completed = true;
 
             assert_eq!(event, b"event".to_vec());
-            let thread_event = events.recv().await.expect("thread event should emit");
+            let thread_event = invocation
+                .events
+                .recv()
+                .await
+                .expect("thread event should emit");
             assert_eq!(thread_event, b"thread-event".to_vec());
-            drop(resource_permit);
+            drop(invocation.resource_permit.take());
+            drop(invocation);
             assert_eq!(response.payload, b"ok");
         });
     }
@@ -7192,6 +7647,150 @@ library = "libexample_plugin.dylib"
         ));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn synchronous_deactivation_retries_only_failed_plugins() {
+        static FAILED_CALLS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        static SUCCESS_CALLS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        fn retry(_: *const std::ffi::c_void) -> i32 {
+            i32::from(FAILED_CALLS.fetch_add(1, Ordering::SeqCst) == 0)
+        }
+        fn success(_: *const std::ffi::c_void) -> i32 {
+            SUCCESS_CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let mut loaded = Vec::new();
+        for (id, deactivate) in [
+            ("success", success as fn(*const std::ffi::c_void) -> i32),
+            ("retry", retry),
+        ] {
+            let mut vtable = test_large_vtable();
+            vtable.deactivate = deactivate;
+            loaded.push(LoadedPlugin {
+                config: ResolvedPluginConfig::default(),
+                manifest: test_manifest(id),
+                backend: LoadedPluginBackend::Static { vtable },
+            });
+        }
+        let mut host = PluginHost {
+            configs: BTreeMap::new(),
+            command_registry: bcode_command::CommandRegistry::new(),
+            auth_provider_registry: AuthProviderRegistry::new(),
+            loaded,
+        };
+        assert!(host.deactivate_all().is_err());
+        assert_eq!(host.loaded.len(), 1);
+        assert_eq!(host.loaded[0].manifest.id, "retry");
+        assert_eq!(SUCCESS_CALLS.load(Ordering::SeqCst), 1);
+        host.deactivate_all().expect("retry succeeds");
+        assert!(host.loaded.is_empty());
+        drop(host);
+        assert_eq!(FAILED_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(SUCCESS_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_deactivation_runs_off_the_runtime_thread() {
+        static RUNTIME_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
+            std::sync::Mutex::new(None);
+
+        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+            i32::from(
+                *RUNTIME_THREAD.lock().expect("thread lock") == Some(std::thread::current().id()),
+            )
+        }
+
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        tokio.block_on(async {
+            *RUNTIME_THREAD.lock().expect("thread lock") = Some(std::thread::current().id());
+            let mut vtable = test_large_vtable();
+            vtable.deactivate = deactivate;
+            let mut manifest = test_manifest("deactivation-thread");
+            manifest.concurrency = PluginConcurrencyConfig::Concurrent;
+            let runtime = PluginRuntimeHost::from(PluginHost {
+                configs: BTreeMap::new(),
+                command_registry: bcode_command::CommandRegistry::new(),
+                auth_provider_registry: AuthProviderRegistry::new(),
+                loaded: vec![LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest,
+                    backend: LoadedPluginBackend::Static { vtable },
+                }],
+            });
+            let result = runtime.deactivate_all().await;
+            drop(runtime);
+            result.expect("deactivation must run outside the async runtime thread");
+        });
+    }
+
+    #[test]
+    fn runtime_deactivation_attempts_every_plugin_after_errors() {
+        static CALLS: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+
+        fn first(_: *const std::ffi::c_void) -> i32 {
+            CALLS.lock().expect("calls lock").push("z");
+            17
+        }
+        fn second(_: *const std::ffi::c_void) -> i32 {
+            CALLS.lock().expect("calls lock").push("m");
+            23
+        }
+        fn last(_: *const std::ffi::c_void) -> i32 {
+            CALLS.lock().expect("calls lock").push("a");
+            0
+        }
+
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        tokio.block_on(async {
+            for concurrency in [
+                PluginConcurrencyConfig::Concurrent,
+                PluginConcurrencyConfig::Exclusive,
+            ] {
+                CALLS.lock().expect("calls lock").clear();
+                let mut loaded = Vec::new();
+                for (id, deactivate) in [
+                    ("a", last as fn(*const std::ffi::c_void) -> i32),
+                    ("m", second),
+                    ("z", first),
+                ] {
+                    let mut vtable = test_large_vtable();
+                    vtable.deactivate = deactivate;
+                    let mut manifest = test_manifest(id);
+                    manifest.concurrency = concurrency.clone();
+                    loaded.push(LoadedPlugin {
+                        config: ResolvedPluginConfig::default(),
+                        manifest,
+                        backend: LoadedPluginBackend::Static { vtable },
+                    });
+                }
+                let runtime = PluginRuntimeHost::from(PluginHost {
+                    configs: BTreeMap::new(),
+                    command_registry: bcode_command::CommandRegistry::new(),
+                    auth_provider_registry: AuthProviderRegistry::new(),
+                    loaded,
+                });
+                let result = runtime.deactivate_all().await;
+                drop(runtime);
+                assert!(matches!(
+                    result,
+                    Err(PluginLoadError::LifecycleFailed {
+                        plugin_id,
+                        hook: "deactivate",
+                        code: 17,
+                    }) if plugin_id == "z"
+                ));
+                assert_eq!(*CALLS.lock().expect("calls lock"), ["z", "m", "a"]);
+            }
+        });
     }
 
     #[test]
@@ -7459,6 +8058,7 @@ library = "libexample_plugin.dylib"
                     .into_iter()
                     .any(|status| status.plugin_id == "slow" && status.running == 1)
             );
+            drop(runtime);
             let first_slow = first_slow_task
                 .await
                 .expect("first slow task joins")
@@ -7596,6 +8196,7 @@ library = "libexample_plugin.dylib"
                 )
                 .await
                 .expect("fast shell invocation should complete");
+            drop(runtime);
             assert!(fast_start.elapsed() < Duration::from_millis(100));
             assert_eq!(fast.payload, b"fast");
 
@@ -7732,6 +8333,7 @@ library = "libexample_plugin.dylib"
                 )
                 .await
                 .expect("fast model invocation should complete");
+            drop(runtime);
             assert!(fast_start.elapsed() < Duration::from_millis(100));
             assert_eq!(fast.payload, b"fast");
 

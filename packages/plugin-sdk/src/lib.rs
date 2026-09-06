@@ -220,8 +220,16 @@ impl ServiceCancellation {
 
     /// Request cancellation and wake threads blocked on this state.
     pub fn cancel(&self) {
+        // Serialize the predicate update with the waiter's check-and-sleep transition.
+        // Otherwise notification can be lost after its check but before it starts waiting.
+        let guard = self
+            .state
+            .mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.state.cancelled.store(true, Ordering::SeqCst);
         self.state.wakeup.notify_all();
+        drop(guard);
     }
 
     /// Return whether host cancellation has been requested.
@@ -2761,6 +2769,34 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    #[test]
+    fn cancellation_racing_with_wait_registration_wakes_all_waiters() {
+        for _ in 0..64 {
+            let cancellation = ServiceCancellation::default();
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            std::thread::scope(|scope| {
+                let mut waiters = Vec::new();
+                for _ in 0..4 {
+                    let cancellation = cancellation.clone();
+                    let barrier = barrier.clone();
+                    waiters.push(scope.spawn(move || {
+                        barrier.wait();
+                        let started = std::time::Instant::now();
+                        assert!(cancellation.wait_cancelled(std::time::Duration::from_secs(5)));
+                        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                    }));
+                }
+                barrier.wait();
+                cancellation.cancel();
+                cancellation.cancel();
+                for waiter in waiters {
+                    waiter.join().expect("waiter wakes promptly");
+                }
+            });
+            assert!(cancellation.wait_cancelled(std::time::Duration::ZERO));
+        }
+    }
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct ExamplePayload {

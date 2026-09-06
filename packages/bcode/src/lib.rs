@@ -4724,7 +4724,24 @@ impl Bcode {
     /// Start building an agent attached to this SDK handle.
     #[must_use]
     pub fn agent(&self) -> AgentBuilder {
-        let builder = AgentBuilder::default().runtime(self.runtime.clone());
+        self.configure_agent(AgentBuilder::default())
+    }
+
+    /// Start building an agent with explicit session identity and working directory.
+    ///
+    /// Inherits the same runtime, provider registry, and plugin configuration as [`Self::agent`],
+    /// without generating a session ID or reading the process working directory. Supply an
+    /// absolute directory to avoid later relative-path resolution against the process directory.
+    /// These explicit inputs alone do not make execution deterministic.
+    #[must_use]
+    pub fn agent_from_context(&self, session_id: SessionId, cwd: PathBuf) -> AgentBuilder {
+        self.configure_agent(AgentBuilder::from_context(session_id, cwd))
+    }
+
+    fn configure_agent(&self, builder: AgentBuilder) -> AgentBuilder {
+        let builder = builder
+            .runtime(self.runtime.clone())
+            .provider_context(self.provider_context.clone());
         #[cfg(feature = "embedded-plugins")]
         let builder = if let Some(provider) = self.provider.clone() {
             builder.provider_invoker(provider)
@@ -4751,7 +4768,6 @@ impl Bcode {
                 }
             };
             builder
-                .provider_context(self.provider_context.clone())
                 .selection_report(report)
                 .structured_output_support(structured_output_support)
                 .structured_output_execution(structured_output_execution)
@@ -5005,7 +5021,30 @@ impl Bcode {
     /// Returns an error when no embedded runtime is configured or tool discovery fails.
     #[cfg(feature = "embedded-plugins")]
     pub async fn agent_with_discovered_tools(&self) -> Result<AgentBuilder> {
-        let mut builder = self.agent();
+        self.register_discovered_tools(self.agent()).await
+    }
+
+    /// Build an agent with explicit context and manifest-discovered embedded plugin tools.
+    ///
+    /// Uses the same configuration and discovery as [`Self::agent_with_discovered_tools`],
+    /// without generating a session ID or reading the process working directory.
+    /// See [`Self::agent_from_context`] for the limits of explicit initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded runtime is configured or tool discovery fails.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn agent_with_discovered_tools_from_context(
+        &self,
+        session_id: SessionId,
+        cwd: PathBuf,
+    ) -> Result<AgentBuilder> {
+        self.register_discovered_tools(self.agent_from_context(session_id, cwd))
+            .await
+    }
+
+    #[cfg(feature = "embedded-plugins")]
+    async fn register_discovered_tools(&self, mut builder: AgentBuilder) -> Result<AgentBuilder> {
         for tool in self.discover_tools().await? {
             builder = builder.plugin_tool(tool.definition, tool.plugin_id);
         }
@@ -5181,6 +5220,17 @@ impl BcodeBuilder {
     #[must_use]
     pub fn provider_registry(mut self, provider_registry: ProviderRegistry) -> Self {
         self.provider_registry = provider_registry;
+        self
+    }
+
+    /// Configure already-resolved provider request context inherited by this handle's agents.
+    ///
+    /// This performs no authentication or configuration lookup. Callers own resolution through
+    /// the provider-auth domain. Later configuration-loading methods may replace this context;
+    /// individual agent builders can override it.
+    #[must_use]
+    pub fn provider_context(mut self, context: ProviderRequestContext) -> Self {
+        self.provider_context = context;
         self
     }
 
@@ -7200,9 +7250,9 @@ impl Agent {
                 },
                 |factory| Ok(factory()),
             )?;
-        let agent = Agent {
-            timeout,
+        let agent = Self {
             metadata,
+            timeout,
             ..self.clone()
         };
         agent

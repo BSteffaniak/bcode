@@ -19,15 +19,13 @@ fn plugin_runtime() -> bcode_plugin::PluginRuntimeHost {
         include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
         bcode_question_plugin::static_plugin(),
     )];
-    let selected = bcode_plugin::filter_selected_static_plugins(
-        &bundled,
+    bcode_plugin::PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
         &bcode_plugin::PluginSelection::all_enabled(),
+        Vec::new(),
+        &bundled,
+        std::collections::BTreeMap::new(),
     )
-    .expect("question plugin manifest should parse");
-    bcode_plugin::PluginRuntimeHost::from(
-        bcode_plugin::PluginHost::load_static_plugins(&selected)
-            .expect("question plugin should load statically"),
-    )
+    .expect("question plugin should load from explicit registrations")
 }
 
 fn agent(policy: HeadlessExchangePolicy) -> Agent {
@@ -96,6 +94,52 @@ async fn discovered_tools_register_without_redeclaring_plugin_metadata() {
             .output
             .contains("headless_exchange_rejected")
     );
+}
+
+#[tokio::test]
+async fn explicit_context_discovery_requires_plugin_runtime() {
+    let sdk = Bcode::builder().build();
+    let session_id = "00000000-0000-4000-8000-000000000127"
+        .parse()
+        .expect("fixture session ID");
+    let error = sdk
+        .agent_with_discovered_tools_from_context(session_id, std::env::temp_dir())
+        .await
+        .expect_err("discovery cannot silently omit an unavailable runtime");
+    assert!(matches!(error, bcode::BcodeError::MissingPluginRuntime));
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn explicit_context_discovery_preserves_authorization_and_plugin_routing() {
+    let sdk = Bcode::builder().plugin_runtime(plugin_runtime()).build();
+    let session_id = "00000000-0000-4000-8000-000000000128"
+        .parse()
+        .expect("fixture session ID");
+    let permissions =
+        bcode::testing::ScriptedPermissionPolicy::new([bcode::PermissionDecision::Allow]);
+    let probe = permissions.clone();
+    let agent = sdk
+        .agent_with_discovered_tools_from_context(session_id, std::env::temp_dir())
+        .await
+        .expect("real plugin discovery")
+        .custom_permission_policy(permissions)
+        .headless_exchange_policy(HeadlessExchangePolicy::Reject)
+        .build();
+    let output = agent
+        .execute_tool_call(&question_call("explicit-discovered", true))
+        .await
+        .expect("real plugin invocation");
+    assert!(output.model_result.is_error);
+    assert!(
+        output
+            .model_result
+            .output
+            .contains("headless_exchange_rejected")
+    );
+    let requests = probe.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].context.session_id, session_id);
 }
 
 #[tokio::test]

@@ -110,8 +110,9 @@ async fn explicit_request_identity_reaches_provider_and_exhaustion_prevents_star
         ScriptedProviderTurn::complete_text("two"),
     ]);
     let probe = provider.probe();
-    let agent = bcode::AgentBuilder::from_context(session_id, std::env::temp_dir())
-        .runtime(runtime)
+    let sdk = bcode::Bcode::builder().runtime(runtime).build();
+    let agent = sdk
+        .agent_from_context(session_id, std::env::temp_dir())
         .build();
     agent
         .run(&mut provider, "one")
@@ -137,6 +138,50 @@ async fn explicit_request_identity_reaches_provider_and_exhaustion_prevents_star
 }
 
 #[tokio::test]
+async fn sdk_explicit_provider_context_is_inherited_without_model_defaults() {
+    let context = bcode::ProviderRequestContext {
+        model_profile: Some("explicit-profile".to_owned()),
+        ..Default::default()
+    };
+    let sdk = bcode::Bcode::builder()
+        .provider_context(context.clone())
+        .build();
+    assert_eq!(sdk.provider_context(), &context);
+    let session_id = "00000000-0000-4000-8000-000000000129"
+        .parse()
+        .expect("fixture ID");
+    for builder in [
+        sdk.agent(),
+        sdk.agent_from_context(session_id, std::env::temp_dir()),
+    ] {
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("ok")]);
+        let probe = provider.probe();
+        builder
+            .build()
+            .run(&mut provider, "context")
+            .await
+            .expect("real turn");
+        assert_eq!(probe.requests()[0].request.provider_context, context);
+    }
+    let override_context = bcode::ProviderRequestContext {
+        model_profile: Some("agent-override".to_owned()),
+        ..Default::default()
+    };
+    let mut provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("ok")]);
+    let probe = provider.probe();
+    sdk.agent_from_context(session_id, std::env::temp_dir())
+        .provider_context(override_context.clone())
+        .build()
+        .run(&mut provider, "override")
+        .await
+        .expect("overridden turn");
+    assert_eq!(
+        probe.requests()[0].request.provider_context,
+        override_context
+    );
+}
+
+#[tokio::test]
 async fn explicit_builder_context_reaches_tool_authorization() {
     let session_id: SessionId = "00000000-0000-4000-8000-000000000123"
         .parse()
@@ -145,11 +190,9 @@ async fn explicit_builder_context_reaches_tool_authorization() {
     let permissions = ScriptedPermissionPolicy::new([PermissionDecision::Allow]);
     let probe = permissions.clone();
     let tool = ScriptedTool::new([ScriptedToolOutcome::text("explicit context")]);
+    let sdk = bcode::Bcode::builder().build();
     let agent = tool
-        .register(
-            bcode::AgentBuilder::from_context(session_id, cwd),
-            tool_definition(),
-        )
+        .register(sdk.agent_from_context(session_id, cwd), tool_definition())
         .custom_permission_policy(permissions)
         .build();
     let response = agent

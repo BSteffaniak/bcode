@@ -368,6 +368,7 @@ pub struct ServerState {
     startup_started_at: Instant,
     first_hello_recorded: std::sync::atomic::AtomicBool,
     metrics: MetricsRegistry,
+    shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -1595,6 +1596,7 @@ impl ServerState {
             startup_started_at: init.startup_started_at.unwrap_or_else(Instant::now),
             first_hello_recorded: std::sync::atomic::AtomicBool::new(false),
             metrics: init.metrics,
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown,
         }
     }
@@ -1753,16 +1755,24 @@ impl ServerState {
     async fn abort_client_forwarders(&self, client_id: ClientId) {
         let handles = self.client_forwarders.lock().await.remove(&client_id);
         if let Some(handles) = handles {
-            for handle in handles {
+            for handle in &handles {
                 handle.abort();
+            }
+            for handle in handles {
+                if let Err(error) = handle.await
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, "client forwarder failed during cleanup");
+                }
             }
         }
     }
 
     async fn close_client(&self, client_id: ClientId) -> Result<(), ServerError> {
         self.abort_client_forwarders(client_id).await;
-        self.detach_client_session(client_id).await?;
+        let detach_result = self.detach_client_session(client_id).await;
         self.unregister_client(client_id).await;
+        detach_result?;
         Ok(())
     }
 
@@ -1819,7 +1829,7 @@ impl ServerState {
                 .await
                 .unwrap_or_else(|_| PathBuf::from("."))
         };
-        let skills = build_skill_registry(&config, &self.plugins, &workspace);
+        let skills = build_skill_registry(&config, &workspace);
         self.session_configs.lock().await.insert(session_id, config);
         self.session_skills.lock().await.insert(session_id, skills);
     }
@@ -2105,7 +2115,7 @@ impl ServerState {
                 .unwrap_or(0);
             let mut interval = tokio::time::interval(Duration::from_millis(50));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut shutdown = state.shutdown.subscribe();
+            let mut shutdown = state.subscribe_shutdown();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
@@ -2313,10 +2323,22 @@ impl ServerState {
     }
 
     fn subscribe_shutdown(&self) -> broadcast::Receiver<()> {
-        self.shutdown.subscribe()
+        // Subscribe first so a concurrent request is either queued here or observed below.
+        let receiver = self.shutdown.subscribe();
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            // Do not rebroadcast to existing subscribers just to notify a late subscriber.
+            let (sender, receiver) = broadcast::channel(1);
+            let _ = sender.send(());
+            receiver
+        } else {
+            receiver
+        }
     }
 
     fn request_shutdown(&self) {
+        if self.shutdown_requested.swap(true, Ordering::SeqCst) {
+            return;
+        }
         clear_all_live_state(self);
         let _ = self.shutdown.send(());
     }
@@ -3416,6 +3438,25 @@ pub async fn run_embedded_with_static_bundled(
     run_with_static_bundled_inner(endpoint, static_plugins, false).await
 }
 
+/// Run an embedded server with caller-resolved configuration and static plugins.
+///
+/// Unlike [`run_embedded_with_static_bundled`], this does not load configuration
+/// from the process environment or configuration files. State locations, plugin
+/// discovery, IPC, and task execution still use the native server infrastructure.
+/// No daemon lifecycle record is published; the caller owns endpoint isolation.
+///
+/// # Errors
+///
+/// Returns an error when plugin loading, server initialization, binding, or
+/// client handling fails.
+pub async fn run_embedded_with_config(
+    endpoint: IpcEndpoint,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    config: bcode_config::BcodeConfig,
+) -> Result<(), ServerError> {
+    run_with_config(endpoint, static_plugins, false, config, Instant::now()).await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_with_static_bundled_inner(
     endpoint: IpcEndpoint,
@@ -3423,7 +3464,7 @@ async fn run_with_static_bundled_inner(
     publish_daemon_record: bool,
 ) -> Result<(), ServerError> {
     let startup_started_at = Instant::now();
-    let mut stage_started_at = startup_started_at;
+    let stage_started_at = startup_started_at;
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let config = bcode_config::load_config()?;
     tracing::debug!(
@@ -3432,7 +3473,25 @@ async fn run_with_static_bundled_inner(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "config loaded"
     );
-    stage_started_at = Instant::now();
+    run_with_config(
+        endpoint,
+        static_plugins,
+        publish_daemon_record,
+        config,
+        startup_started_at,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_with_config(
+    endpoint: IpcEndpoint,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    publish_daemon_record: bool,
+    config: bcode_config::BcodeConfig,
+    startup_started_at: Instant,
+) -> Result<(), ServerError> {
+    let mut stage_started_at = Instant::now();
     let default_plugin_ids = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
     let plugin_selection =
         bcode_config::plugin_selection_with_default_plugin_ids(&config, &default_plugin_ids);
@@ -3442,6 +3501,9 @@ async fn run_with_static_bundled_inner(
         disabled = ?plugin_selection.disabled,
         "plugin selection resolved"
     );
+    let model_catalog = bcode_model_catalog::ModelCatalogResolver::new(
+        bcode_model_catalog::RemoteCatalogOptions::default(),
+    )?;
     tracing::debug!(target: "bcode_server::startup", "loading plugins");
     let plugin_configs = resolve_plugin_configs(&config, static_plugins);
     let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
@@ -3456,44 +3518,57 @@ async fn run_with_static_bundled_inner(
         "plugins loaded"
     );
     stage_started_at = Instant::now();
-    let legacy_recovery = session_migration_adapter::recover_historical_session_storage(
-        &bcode_config::default_state_dir(),
-    )?;
-    if !legacy_recovery.relocated.is_empty() {
-        tracing::info!(
+    let startup_resources = (|| {
+        let legacy_recovery = session_migration_adapter::recover_historical_session_storage(
+            &bcode_config::default_state_dir(),
+        )?;
+        if !legacy_recovery.relocated.is_empty() {
+            tracing::info!(
+                target: "bcode_server::startup",
+                recovered_sessions = legacy_recovery.relocated.len(),
+                session_ids = ?legacy_recovery.relocated,
+                "restored sessions to canonical storage root"
+            );
+        }
+        if !legacy_recovery.blocked_by_owner.is_empty() {
+            tracing::warn!(
+                target: "bcode_server::startup",
+                session_ids = ?legacy_recovery.blocked_by_owner,
+                "historical session relocation blocked by live owners"
+            );
+        }
+        if !legacy_recovery.destination_conflicts.is_empty() {
+            tracing::warn!(
+                target: "bcode_server::startup",
+                session_ids = ?legacy_recovery.destination_conflicts,
+                "historical and canonical session directories conflict; no data was moved"
+            );
+        }
+        tracing::debug!(
             target: "bcode_server::startup",
-            recovered_sessions = legacy_recovery.relocated.len(),
-            session_ids = ?legacy_recovery.relocated,
-            "restored sessions to canonical storage root"
+            elapsed_ms = stage_started_at.elapsed().as_millis(),
+            total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+            "historical session recovery complete"
         );
-    }
-    if !legacy_recovery.blocked_by_owner.is_empty() {
-        tracing::warn!(
-            target: "bcode_server::startup",
-            session_ids = ?legacy_recovery.blocked_by_owner,
-            "historical session relocation blocked by live owners"
-        );
-    }
-    if !legacy_recovery.destination_conflicts.is_empty() {
-        tracing::warn!(
-            target: "bcode_server::startup",
-            session_ids = ?legacy_recovery.destination_conflicts,
-            "historical and canonical session directories conflict; no data was moved"
-        );
-    }
-    tracing::debug!(
-        target: "bcode_server::startup",
-        elapsed_ms = stage_started_at.elapsed().as_millis(),
-        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
-        "historical session recovery complete"
-    );
-    stage_started_at = Instant::now();
-    tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
-    let listener = LocalIpcListener::bind(&endpoint)?;
-    let daemon_record = if publish_daemon_record {
-        Some(register_daemon(&endpoint)?)
-    } else {
-        None
+        stage_started_at = Instant::now();
+        tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
+        let listener = LocalIpcListener::bind(&endpoint)?;
+        let daemon_record = if publish_daemon_record {
+            Some(register_daemon(&endpoint)?)
+        } else {
+            None
+        };
+        Ok::<_, ServerError>((listener, daemon_record))
+    })();
+    let (plugins, listener, daemon_record) = match startup_resources {
+        Ok((listener, daemon_record)) => (plugins, listener, daemon_record),
+        Err(error) => {
+            if let Err(cleanup_error) = plugins.deactivate_all().await {
+                tracing::warn!(error = %cleanup_error, "plugin cleanup failed after server startup failure");
+            }
+            drop(plugins);
+            return Err(error);
+        }
     };
     let daemon_status = daemon_record.as_ref().map_or_else(
         || DaemonStatus {
@@ -3562,7 +3637,6 @@ async fn run_with_static_bundled_inner(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "lazy session services ready"
     );
-    stage_started_at = Instant::now();
     let resolved_model = config.resolved_model_selection();
     tracing::debug!(
         target: "bcode_server::startup",
@@ -3573,7 +3647,6 @@ async fn run_with_static_bundled_inner(
     let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
     let skills = build_skill_registry(
         &config,
-        &plugins,
         &std::env::current_dir()
             .and_then(fs::canonicalize)
             .unwrap_or_else(|_| PathBuf::from(".")),
@@ -3589,9 +3662,7 @@ async fn run_with_static_bundled_inner(
         sessions,
         plugins,
         ServerStateInit {
-            model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::new(
-                bcode_model_catalog::RemoteCatalogOptions::default(),
-            )?),
+            model_catalog: Some(model_catalog),
             startup_plugin_selection: plugin_selection,
             default_plugin_ids,
             selected_provider_plugin_id: resolved_model.provider_plugin_id,
@@ -3630,6 +3701,30 @@ async fn run_with_static_bundled_inner(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server state constructed"
     );
+    run_constructed_server(
+        state,
+        listener,
+        &config.daemon,
+        config.session_search.enabled,
+        &configured_agent_ids,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_constructed_server(
+    state: Arc<ServerState>,
+    listener: LocalIpcListener,
+    daemon: &bcode_config::DaemonConfig,
+    session_search_enabled: bool,
+    configured_agent_ids: &[String],
+) -> Result<(), ServerError> {
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        drop(listener);
+        return shutdown_constructed_server(state, Ok(())).await;
+    }
+    let startup_started_at = state.startup_started_at;
+    let stage_started_at = Instant::now();
     state.start_catalog_event_forwarder();
     state.start_workflow_event_forwarder();
     state.start_session_search_ingestion();
@@ -3637,27 +3732,29 @@ async fn run_with_static_bundled_inner(
     interrupt_stale_ralph_runs_best_effort(&state);
     let workflow_recovery_started_at = Instant::now();
     restore_workflow_runtime_work(&state).await;
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        drop(listener);
+        return shutdown_constructed_server(state, Ok(())).await;
+    }
     settle_restored_quiescent_workflow_runtime_work(&state).await;
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        drop(listener);
+        return shutdown_constructed_server(state, Ok(())).await;
+    }
     tracing::debug!(
         target: "bcode_server::startup",
         elapsed_ms = workflow_recovery_started_at.elapsed().as_millis(),
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "workflow runtime recovery complete"
     );
-    if config.daemon.idle_shutdown {
-        state.start_idle_shutdown_watcher(Duration::from_secs(
-            config.daemon.idle_shutdown_after_secs,
-        ));
+    if daemon.idle_shutdown {
+        state.start_idle_shutdown_watcher(Duration::from_secs(daemon.idle_shutdown_after_secs));
     }
-    warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
+    warn_on_unregistered_agent_ids(&state, configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
-    state.metrics.record_histogram(
-        "server.startup.ready_ms",
-        u64::try_from(startup_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-    );
     state.metrics.set_gauge(
         "server.startup.session_search_enabled",
-        i64::from(config.session_search.enabled),
+        i64::from(session_search_enabled),
     );
     let search_providers = session_search::list_providers(&state).await.providers;
     state.metrics.set_gauge(
@@ -3686,29 +3783,64 @@ async fn run_with_static_bundled_inner(
         )
         .unwrap_or(i64::MAX),
     );
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        drop(listener);
+        return shutdown_constructed_server(state, Ok(())).await;
+    }
+    state.metrics.record_histogram(
+        "server.startup.ready_ms",
+        u64::try_from(startup_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
     tracing::info!(
         target: "bcode_server::startup",
         elapsed_ms = stage_started_at.elapsed().as_millis(),
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server ready; accepting clients"
     );
-    loop {
+    let mut clients = JoinSet::new();
+    let accept_result = loop {
         tokio::select! {
+            biased;
+            _ = shutdown.recv() => break Ok(()),
+            completed = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "client connection task failed");
+                }
+            }
             stream = listener.accept() => {
-                let stream = stream?;
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, state).await {
+                let stream = match stream {
+                    Ok(stream) => stream,
+                    Err(error) => break Err(ServerError::from(error)),
+                };
+                let client = handle_client(stream, Arc::clone(&state));
+                clients.spawn(async move {
+                    if let Err(error) = client.await {
                         tracing::warn!("client connection failed: {error}");
                     }
                 });
             }
-            _ = shutdown.recv() => break,
+        }
+    };
+    drop(listener);
+    state.request_shutdown();
+    // Let admitted requests and registered-client cleanup finish before deactivating
+    // the plugins they may still be using. Cancellation is not completion.
+    while let Some(completed) = clients.join_next().await {
+        if let Err(error) = completed {
+            tracing::warn!(%error, "client connection task failed during shutdown");
         }
     }
+    shutdown_constructed_server(state, accept_result).await
+}
+
+async fn shutdown_constructed_server(
+    state: Arc<ServerState>,
+    accept_result: Result<(), ServerError>,
+) -> Result<(), ServerError> {
+    state.request_shutdown();
     state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
-    state.plugins.deactivate_all().await?;
+    let deactivation = state.plugins.deactivate_all().await;
     let metrics_status = state.metrics.shutdown_persistence();
     if metrics_status.dropped_events > 0 || metrics_status.writer_failed {
         tracing::warn!(
@@ -3718,9 +3850,19 @@ async fn run_with_static_bundled_inner(
             "metrics persistence stopped with degraded telemetry"
         );
     }
-    if let Some(path) = &state.daemon_record_path {
-        bcode_daemon_lifecycle::remove_record_if_instance(path, &state.daemon_status.instance_id)?;
+    let record_removal = state.daemon_record_path.as_ref().map_or(Ok(()), |path| {
+        bcode_daemon_lifecycle::remove_record_if_instance(path, &state.daemon_status.instance_id)
+    });
+    drop(state);
+    if let Err(error) = &deactivation {
+        tracing::warn!(%error, "plugin deactivation failed during server shutdown");
     }
+    if let Err(error) = &record_removal {
+        tracing::warn!(%error, "daemon record removal failed during server shutdown");
+    }
+    accept_result?;
+    deactivation?;
+    record_removal?;
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
     Ok(())
 }
@@ -3937,15 +4079,31 @@ fn request_error_response(error: &ServerError) -> ErrorResponse {
     ErrorResponse::new(code, message)
 }
 
-async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Result<(), ServerError> {
-    let client_id = ClientId::new();
-    state.register_client(client_id).await;
+fn handle_client(
+    stream: LocalIpcStream,
+    state: Arc<ServerState>,
+) -> impl std::future::Future<Output = Result<(), ServerError>> + Send {
+    // Subscribe before scheduling so shutdown cannot be lost before the first poll.
+    let mut shutdown = state.subscribe_shutdown();
+    async move {
+        if state.shutdown_requested.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let client_id = ClientId::new();
+        state.register_client(client_id).await;
 
-    let result = handle_registered_client(stream, &state, client_id).await;
-    let cleanup_result = state.close_client(client_id).await;
-    match (result, cleanup_result) {
-        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+        let result = handle_registered_client(stream, &state, client_id, &mut shutdown).await;
+        let cleanup_result = state.close_client(client_id).await;
+        if result.is_err()
+            && let Err(error) = &cleanup_result
+        {
+            let diagnostic = request_error_response(error);
+            tracing::warn!(code = %diagnostic.code, "client cleanup also failed after request failure");
+        }
+        match (result, cleanup_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 }
 
@@ -3953,6 +4111,7 @@ async fn handle_registered_client(
     stream: LocalIpcStream,
     state: &Arc<ServerState>,
     client_id: ClientId,
+    shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<(), ServerError> {
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(ResponseWriter {
@@ -3962,7 +4121,12 @@ async fn handle_registered_client(
     let mut attached_session: Option<SessionId> = None;
 
     loop {
-        let envelope = match recv_envelope(&mut reader).await {
+        let received = tokio::select! {
+            biased;
+            _ = shutdown.recv() => break,
+            envelope = recv_envelope(&mut reader) => envelope,
+        };
+        let envelope = match received {
             Ok(envelope) => envelope,
             Err(CodecError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
@@ -14182,13 +14346,21 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         }
         let settled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .settle_pending_control_nodes(run_id, 1_000, now_ms)?;
-        let owner = WorkflowActivationOwner { state };
         let dispatched = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .dispatch_pending_activations_for_run(&owner, run_id, 1_000, now_ms)
+            .dispatch_pending_activations_for_run(
+                &WorkflowActivationOwner { state },
+                run_id,
+                1_000,
+                now_ms,
+            )
             .await?;
-        let observer = WorkflowTurnReceiptObserver { state };
         let reconciled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .reconcile_receipt_backed_attempts_for_run_async(&observer, run_id, 1_000, now_ms)
+            .reconcile_receipt_backed_attempts_for_run_async(
+                &WorkflowTurnReceiptObserver { state },
+                run_id,
+                1_000,
+                now_ms,
+            )
             .await?;
         if !reconciled.sibling_cancellations.is_empty() {
             propagate_fail_fast_sibling_cancellation(
@@ -15437,20 +15609,22 @@ async fn run_model_turn(
         completion.message.clone(),
     )
     .await;
-    let background_guidance = if completion.outcome == ModelTurnOutcome::Completed {
-        prepare_background_invariant_guidance_work(
-            state,
-            session_id,
-            trigger_event.sequence,
-            completion.output.as_deref(),
-        )
-        .await
-    } else {
-        None
-    };
-    service_runtime_priority_commands(state, session_id, command_context).await;
-    if let Some(work) = background_guidance {
-        launch_background_invariant_guidance(state, session_id, work).await;
+    {
+        let background_guidance = if completion.outcome == ModelTurnOutcome::Completed {
+            prepare_background_invariant_guidance_work(
+                state,
+                session_id,
+                trigger_event.sequence,
+                completion.output.as_deref(),
+            )
+            .await
+        } else {
+            None
+        };
+        service_runtime_priority_commands(state, session_id, command_context).await;
+        if let Some(work) = background_guidance {
+            launch_background_invariant_guidance(state, session_id, work).await;
+        }
     }
     turn_span.finish_with_outcome(&model_turn_outcome_metric_label(completion.outcome));
     completion
@@ -23577,12 +23751,13 @@ async fn prepare_registered_server_tool(
         ),
         host_context,
     );
-    let invoker = ServerToolInvoker::new(state, session_id, &working_directory, cancel_state);
-    let preparation = invoker
-        .prepare_tool(&tool, &request, &scope)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(preparation)
+    {
+        let invoker = ServerToolInvoker::new(state, session_id, &working_directory, cancel_state);
+        invoker
+            .prepare_tool(&tool, &request, &scope)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 async fn prepare_server_tool_with_cancel(
@@ -29889,7 +30064,6 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             .path()
             .to_path_buf();
         let owner = WorkflowActivationOwner { state };
-        let observer = WorkflowTurnReceiptObserver { state };
         let mut store = match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
             Ok(store) => store,
             Err(error) => {
@@ -29916,7 +30090,7 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
         }
         let reconciliation = store
             .reconcile_receipt_backed_attempts_for_run_async(
-                &observer,
+                &WorkflowTurnReceiptObserver { state },
                 &run_id,
                 1_000,
                 current_unix_millis(),
@@ -31971,7 +32145,6 @@ const fn response_payload_kind(response: &Response) -> &'static str {
 
 fn build_skill_registry(
     config: &bcode_config::BcodeConfig,
-    _plugins: &bcode_plugin::PluginRuntimeHost,
     canonical_workspace: &Path,
 ) -> Option<SkillRegistry> {
     if !config.skills.enabled {
@@ -33489,10 +33662,24 @@ mod tests {
             bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested
         );
         let cancellation_started = Instant::now();
-        let terminal = client
-            .session_search_backfill_wait(started.operation_id.clone(), cancelling.revision, 5_000)
-            .await
-            .expect("wait through IPC");
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut status = cancelling;
+            while status.state
+                == bcode_session_search::SessionSearchBackfillOperationState::CancellationRequested
+            {
+                status = client
+                    .session_search_backfill_wait(
+                        started.operation_id.clone(),
+                        status.revision,
+                        5_000,
+                    )
+                    .await
+                    .expect("wait through IPC");
+            }
+            status
+        })
+        .await
+        .expect("cancellation must reach a terminal state promptly");
         assert_eq!(
             terminal.state,
             bcode_session_search::SessionSearchBackfillOperationState::Cancelled
@@ -69236,5 +69423,181 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("disconnected subscriber cleanup");
         drop(connection);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn constructed_server_shutdown_drains_idle_clients() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("drain.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            run_constructed_server(
+                server_state,
+                listener,
+                &bcode_config::DaemonConfig::default(),
+                false,
+                &[],
+            )
+            .await
+        });
+        let connection = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.clients.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client registered");
+        state.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server shutdown")
+            .expect("server task")
+            .expect("server cleanup");
+        assert!(state.clients.lock().await.is_empty());
+        drop(connection);
+    }
+
+    #[tokio::test]
+    async fn constructed_server_cleanup_requests_shutdown_on_normal_exit() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let mut shutdown = state.subscribe_shutdown();
+        shutdown_constructed_server(Arc::clone(&state), Ok(()))
+            .await
+            .expect("server cleanup");
+        shutdown.try_recv().expect("cleanup notifies subscribers");
+        assert!(state.shutdown_requested.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn constructed_server_shutdown_before_start_does_not_launch_forwarders() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("stopped.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        state.request_shutdown();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_constructed_server(
+                Arc::clone(&state),
+                listener,
+                &bcode_config::DaemonConfig::default(),
+                false,
+                &[],
+            ),
+        )
+        .await
+        .expect("pre-start shutdown")
+        .expect("server cleanup");
+        assert!(!state.catalog_events_started.load(Ordering::SeqCst));
+        assert!(
+            !state
+                .workflow_event_forwarder_started
+                .load(Ordering::SeqCst)
+        );
+        assert!(!state.idle_shutdown_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn client_forwarder_cleanup_waits_for_task_resource_release() {
+        let state = test_server_state(SessionManager::default());
+        let client_id = ClientId::new();
+        let resource = Arc::new(());
+        let owned_resource = Arc::clone(&resource);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let forwarder = tokio::spawn(async move {
+            let _resource = owned_resource;
+            started.send(()).expect("ready receiver");
+            std::future::pending::<()>().await;
+        });
+        ready.await.expect("forwarder started");
+        state.register_client_forwarder(client_id, forwarder).await;
+        state.abort_client_forwarders(client_id).await;
+        assert_eq!(Arc::strong_count(&resource), 1);
+        assert!(
+            !state
+                .client_forwarders
+                .lock()
+                .await
+                .contains_key(&client_id)
+        );
+        state.abort_client_forwarders(client_id).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_subscription_retains_request_without_rebroadcasting() {
+        let state = test_server_state(SessionManager::default());
+        let mut early = state.subscribe_shutdown();
+        state.request_shutdown();
+        early.try_recv().expect("early subscriber notified");
+        let mut late = state.subscribe_shutdown();
+        late.try_recv().expect("late subscriber notified");
+        state.request_shutdown();
+        assert!(matches!(
+            early.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_observes_shutdown_before_first_poll() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("early.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let peer = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let stream = listener.accept().await.expect("accept");
+        let handler = handle_client(stream, Arc::clone(&state));
+        state.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .expect("shutdown must survive delayed polling")
+            .expect("client cleanup");
+        assert!(state.clients.lock().await.is_empty());
+        drop(peer);
+
+        // A connection accepted after the broadcast must also observe retained shutdown.
+        let late_peer = LocalIpcStream::connect(&endpoint)
+            .await
+            .expect("late connect");
+        let late_stream = listener.accept().await.expect("late accept");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_client(late_stream, Arc::clone(&state)),
+        )
+        .await
+        .expect("late handler must not wait for another broadcast")
+        .expect("late handler");
+        assert!(state.clients.lock().await.is_empty());
+        drop(late_peer);
+    }
+
+    #[tokio::test]
+    async fn idle_client_shutdown_closes_handler_and_unregisters_client() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("shutdown.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let peer = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let stream = listener.accept().await.expect("accept");
+        let server_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move { handle_client(stream, server_state).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.clients.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client registration");
+        state.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .expect("idle handler must observe shutdown with peer still open")
+            .expect("handler task")
+            .expect("client cleanup");
+        assert!(state.clients.lock().await.is_empty());
+        drop(peer);
     }
 }
