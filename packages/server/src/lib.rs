@@ -193,6 +193,9 @@ pub enum ServerError {
     /// An owned catalog worker failed to finish normally.
     #[error("catalog worker failed during shutdown")]
     CatalogWorkerShutdown,
+    /// The owned idle shutdown watcher failed to finish normally.
+    #[error("idle shutdown watcher failed during shutdown")]
+    IdleWatcherShutdown,
     #[error("IPC transport error: {0}")]
     Transport(#[from] bcode_ipc::IpcTransportError),
     #[error("config error: {0}")]
@@ -379,6 +382,8 @@ pub struct ServerState {
     catalog_workers: Mutex<Vec<JoinHandle<()>>>,
     catalog_workers_failed: std::sync::atomic::AtomicBool,
     idle_shutdown_started: std::sync::atomic::AtomicBool,
+    idle_shutdown_worker: Mutex<Option<JoinHandle<()>>>,
+    idle_shutdown_failed: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
     startup_started_at: Instant,
@@ -1614,6 +1619,8 @@ impl ServerState {
             catalog_workers: Mutex::new(Vec::new()),
             catalog_workers_failed: std::sync::atomic::AtomicBool::new(false),
             idle_shutdown_started: std::sync::atomic::AtomicBool::new(false),
+            idle_shutdown_worker: Mutex::new(None),
+            idle_shutdown_failed: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
             startup_started_at: init.startup_started_at.unwrap_or_else(Instant::now),
@@ -2309,10 +2316,11 @@ impl ServerState {
                 match mutation {
                     Ok(mutation) => {
                         let session_id = mutation.session_id;
-                        state
-                            .session_catalog
-                            .upsert_native_session(mutation.summary)
-                            .await;
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => break,
+                            () = state.session_catalog.upsert_native_session(mutation.summary) => {}
+                        }
                         if state.session_search_enabled
                             && state
                                 .plugins
@@ -2330,7 +2338,11 @@ impl ServerState {
                             skipped,
                             "session mutation subscriber lagged; refreshing native catalog"
                         );
-                        state.session_catalog.refresh_native_now(&state).await;
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => break,
+                            () = state.session_catalog.refresh_native_now(&state) => {}
+                        }
                         if state.session_search_enabled
                             && state
                                 .plugins
@@ -2358,6 +2370,7 @@ impl ServerState {
             }
             workers.pop();
         }
+        drop(workers);
         if self.catalog_workers_failed.load(Ordering::SeqCst) {
             Err(ServerError::CatalogWorkerShutdown)
         } else {
@@ -2398,7 +2411,8 @@ impl ServerState {
         })
     }
 
-    fn start_idle_shutdown_watcher(self: &Arc<Self>, idle_after: Duration) {
+    async fn start_idle_shutdown_watcher(self: &Arc<Self>, idle_after: Duration) {
+        let mut worker = self.idle_shutdown_worker.lock().await;
         if idle_after.is_zero()
             || self.shutdown_requested.load(Ordering::SeqCst)
             || self
@@ -2409,7 +2423,7 @@ impl ServerState {
         }
         let mut shutdown = self.subscribe_shutdown();
         let state = Arc::clone(self);
-        tokio::spawn(async move {
+        *worker = Some(tokio::spawn(async move {
             if state.shutdown_requested.load(Ordering::SeqCst) {
                 return;
             }
@@ -2451,7 +2465,23 @@ impl ServerState {
                     break;
                 }
             }
-        });
+        }));
+    }
+
+    async fn stop_idle_shutdown_watcher(&self) -> Result<(), ServerError> {
+        let mut worker = self.idle_shutdown_worker.lock().await;
+        if let Some(task) = worker.as_mut() {
+            if task.await.is_err() {
+                self.idle_shutdown_failed.store(true, Ordering::SeqCst);
+            }
+            *worker = None;
+        }
+        drop(worker);
+        if self.idle_shutdown_failed.load(Ordering::SeqCst) {
+            Err(ServerError::IdleWatcherShutdown)
+        } else {
+            Ok(())
+        }
     }
 
     async fn workflow_event_sinks(&self) -> Vec<ClientEventSink> {
@@ -4034,7 +4064,9 @@ async fn run_constructed_server(
         "workflow runtime recovery complete"
     );
     if daemon.idle_shutdown {
-        state.start_idle_shutdown_watcher(Duration::from_secs(daemon.idle_shutdown_after_secs));
+        state
+            .start_idle_shutdown_watcher(Duration::from_secs(daemon.idle_shutdown_after_secs))
+            .await;
     }
     warn_on_unregistered_agent_ids(&state, configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
@@ -4163,6 +4195,7 @@ async fn shutdown_constructed_server(
     let ingestion = state.stop_session_search_ingestion().await;
     let workflow_forwarder = state.stop_workflow_event_forwarder().await;
     let catalog_workers = state.stop_catalog_workers().await;
+    let idle_watcher = state.stop_idle_shutdown_watcher().await;
     stop_catalog_refresh(&state).await;
     state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
@@ -4190,6 +4223,7 @@ async fn shutdown_constructed_server(
     ingestion?;
     workflow_forwarder?;
     catalog_workers?;
+    idle_watcher?;
     deactivation?;
     record_removal?;
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
@@ -36897,7 +36931,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn idle_shutdown_watcher_stops_daemon_with_zero_clients() {
         let state = Arc::new(test_server_state(SessionManager::default()));
         let mut shutdown = state.subscribe_shutdown();
-        state.start_idle_shutdown_watcher(Duration::from_millis(10));
+        state
+            .start_idle_shutdown_watcher(Duration::from_millis(10))
+            .await;
 
         tokio::time::timeout(Duration::from_millis(100), shutdown.recv())
             .await
@@ -36914,7 +36950,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session");
         let state = Arc::new(test_server_state(sessions));
         let mut shutdown = state.subscribe_shutdown();
-        state.start_idle_shutdown_watcher(Duration::from_millis(20));
+        state
+            .start_idle_shutdown_watcher(Duration::from_millis(20))
+            .await;
 
         tokio::time::sleep(Duration::from_millis(15)).await;
         register_runtime_work(
@@ -69976,11 +70014,104 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("already stopped");
     }
 
+    #[tokio::test]
+    async fn abandoned_idle_watcher_shutdown_retains_worker() {
+        let state = test_server_state(SessionManager::default());
+        let resource = Arc::new(());
+        let owned_resource = Arc::clone(&resource);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        *state.idle_shutdown_worker.lock().await = Some(tokio::spawn(async move {
+            let _resource = owned_resource;
+            let _ = released.await;
+        }));
+        state.request_shutdown();
+        let mut wait = Box::pin(state.stop_idle_shutdown_watcher());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(wait.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(wait);
+        assert!(state.idle_shutdown_worker.lock().await.is_some());
+        assert_eq!(Arc::strong_count(&resource), 2);
+        release.send(()).expect("worker remains owned");
+        tokio::time::timeout(Duration::from_secs(2), state.stop_idle_shutdown_watcher())
+            .await
+            .expect("worker drains")
+            .expect("worker succeeds");
+        assert!(state.idle_shutdown_worker.lock().await.is_none());
+        drop(state);
+        assert_eq!(Arc::strong_count(&resource), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_failure_is_reported_after_cleanup() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        *state.idle_shutdown_worker.lock().await = Some(tokio::spawn(async {
+            panic!("injected idle watcher failure");
+        }));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            shutdown_constructed_server(Arc::clone(&state), Ok(())),
+        )
+        .await
+        .expect("shutdown completes despite watcher failure");
+        assert!(matches!(result, Err(ServerError::IdleWatcherShutdown)));
+        assert!(state.idle_shutdown_worker.lock().await.is_none());
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert!(matches!(
+            state.stop_idle_shutdown_watcher().await,
+            Err(ServerError::IdleWatcherShutdown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_shutdown_joins_and_prevents_restart() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        state
+            .start_idle_shutdown_watcher(Duration::from_secs(30))
+            .await;
+        let id = state
+            .idle_shutdown_worker
+            .lock()
+            .await
+            .as_ref()
+            .expect("worker")
+            .id();
+        state
+            .start_idle_shutdown_watcher(Duration::from_secs(30))
+            .await;
+        assert_eq!(
+            state
+                .idle_shutdown_worker
+                .lock()
+                .await
+                .as_ref()
+                .expect("same worker")
+                .id(),
+            id
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            shutdown_constructed_server(Arc::clone(&state), Ok(())),
+        )
+        .await
+        .expect("shutdown completes")
+        .expect("watcher joins");
+        state
+            .start_idle_shutdown_watcher(Duration::from_secs(30))
+            .await;
+        assert!(state.idle_shutdown_worker.lock().await.is_none());
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn idle_watcher_after_shutdown_spawns_no_worker() {
         let state = Arc::new(test_server_state(SessionManager::default()));
         state.request_shutdown();
-        state.start_idle_shutdown_watcher(Duration::from_secs(30));
+        state
+            .start_idle_shutdown_watcher(Duration::from_secs(30))
+            .await;
         assert!(!state.idle_shutdown_started.load(Ordering::SeqCst));
         assert_eq!(Arc::strong_count(&state), 1);
     }
@@ -70063,7 +70194,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             state.start_workflow_event_forwarder().await;
             state.start_catalog_event_forwarder().await;
             let ingestion = ServerState::spawn_session_search_ingestion_worker(Arc::clone(&state));
-            state.start_idle_shutdown_watcher(Duration::from_secs(30));
+            state
+                .start_idle_shutdown_watcher(Duration::from_secs(30))
+                .await;
             // On the current-thread runtime neither spawned task has polled yet.
             state.request_shutdown();
             drop(state);

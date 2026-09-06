@@ -4185,6 +4185,7 @@ pub(crate) mod tests {
                 hit.outcome == SearchHitHydrationOutcome::Hydrated && hit.event.is_some()
             }));
         }
+        drop(state);
         durations.sort_unstable();
         let p50_us = durations[RUNS / 2];
         let p95_us = durations[(RUNS * 95 / 100).min(RUNS - 1)];
@@ -4394,6 +4395,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("complete backfill");
+        drop(state);
 
         assert_eq!(
             response.provider_ids,
@@ -4464,6 +4466,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("complete multi-page backfill");
+        drop(state);
 
         let provider = &response.providers[0];
         assert_eq!(provider.catalog_pages, 3);
@@ -4514,6 +4517,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("complete backfill returns aggregate failure");
+        drop(state);
 
         assert_eq!(
             response.provider_ids,
@@ -4593,6 +4597,7 @@ pub(crate) mod tests {
         let second = complete_backfill(&state, request, &cancellation, None)
             .await
             .expect("second complete backfill");
+        drop(state);
         assert_eq!(second.providers[0].completed_sessions, 1);
         assert_eq!(
             APPLY_BATCH_CALLS.load(Ordering::SeqCst),
@@ -4663,7 +4668,12 @@ pub(crate) mod tests {
             .lock()
             .expect("stateful apply release") = true;
         STATEFUL_APPLY_RELEASE.1.notify_all();
-        let _ = first.await;
+        assert!(
+            first
+                .await
+                .expect_err("coordinator is aborted")
+                .is_cancelled()
+        );
         APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
 
         let recovered = complete_backfill(
