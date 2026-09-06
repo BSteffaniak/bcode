@@ -2340,15 +2340,25 @@ impl ServerState {
     }
 
     fn start_catalog_backfill(self: &Arc<Self>) {
+        let mut shutdown = self.subscribe_shutdown();
         let state = Arc::clone(self);
         tokio::spawn(async move {
             if state.shutdown_requested.load(Ordering::SeqCst) {
                 return;
             }
-            match state.sessions.backfill_catalog().await {
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.recv() => return,
+                result = state.sessions.backfill_catalog() => result,
+            };
+            match result {
                 Ok(summaries) => {
                     for summary in summaries {
-                        state.session_catalog.upsert_native_session(summary).await;
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => return,
+                            () = state.session_catalog.upsert_native_session(summary) => {}
+                        }
                     }
                 }
                 Err(error) => {
