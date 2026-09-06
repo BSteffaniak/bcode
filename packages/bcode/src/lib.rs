@@ -2322,6 +2322,10 @@ struct InMemoryCacheEntry {
 impl InMemoryModelResponseCache {
     /// Create a bounded cache. Both expiration and capacity are mandatory.
     ///
+    /// Capacity independently bounds stored responses and active miss reservations. A lookup
+    /// requiring a new reservation fails with [`BcodeError::Cache`] when all reservation slots
+    /// are occupied; expired reservations are reclaimed on admission.
+    ///
     /// A TTL that cannot be added to the selected clock returns [`BcodeError::Cache`] when
     /// storing a response; construction does not validate the clock range.
     #[must_use]
@@ -2403,6 +2407,10 @@ impl ModelResponseCache for InMemoryModelResponseCache {
                 let expires = now.checked_add(self.single_flight_timeout).ok_or_else(|| {
                     BcodeError::Cache("single-flight duration exceeds clock range".into())
                 })?;
+                state.in_flight.retain(|_, deadline| *deadline > now);
+                if state.in_flight.len() >= self.capacity.get() {
+                    return Err(BcodeError::Cache("cache miss capacity exhausted".into()));
+                }
                 state.in_flight.insert(key, expires);
                 return Ok(None);
             }
@@ -2576,18 +2584,17 @@ impl ResponseCacheMiss {
 
 impl Drop for ResponseCacheMiss {
     fn drop(&mut self) {
-        if !self.completed {
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !self.completed
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.cache.abort(&self.request);
             }))
             .is_err()
-            {
-                tracing::error!(
-                    target: "bcode::sdk",
-                    event = "bcode.cache_abort_failed",
-                    "cache abort callback panicked; reservation cleanup is unverified"
-                );
-            }
+        {
+            tracing::error!(
+                target: "bcode::sdk",
+                event = "bcode.cache_abort_failed",
+                "cache abort callback panicked; reservation cleanup is unverified"
+            );
         }
     }
 }

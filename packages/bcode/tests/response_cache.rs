@@ -1723,6 +1723,47 @@ async fn dropping_buffered_generation_after_cache_miss_releases_reservation() {
     .await
     .expect("dropping generation must release cache reservation");
     assert_eq!(cache.aborts.load(Ordering::SeqCst), 1);
+    probe
+        .assert_finish_count(1)
+        .expect("provider released on drop");
+    probe
+        .assert_cancellation_count(1)
+        .expect("provider cancelled once on drop");
+}
+
+#[test]
+fn cache_miss_capacity_is_bounded_and_released() {
+    let cache = bcode::InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        std::num::NonZeroUsize::new(1).expect("capacity"),
+    );
+    let first = AgentTurnRequest::new("model", "first");
+    let second = AgentTurnRequest::new("model", "second");
+    assert!(cache.get(&first).expect("first reservation").is_none());
+    assert!(
+        matches!(cache.get(&second), Err(bcode::BcodeError::Cache(message)) if message == "cache miss capacity exhausted")
+    );
+    cache.abort(&first);
+    assert!(cache.get(&second).expect("released slot").is_none());
+    cache.abort(&second);
+}
+
+#[test]
+fn expired_cache_misses_do_not_exhaust_capacity() {
+    let cache = bcode::InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        std::num::NonZeroUsize::new(1).expect("capacity"),
+    )
+    .with_single_flight_timeout(Duration::ZERO);
+    for index in 0..10 {
+        let request = AgentTurnRequest::new("model", format!("request {index}"));
+        assert!(
+            cache
+                .get(&request)
+                .expect("expired slot reclaimed")
+                .is_none()
+        );
+    }
 }
 
 #[test]
