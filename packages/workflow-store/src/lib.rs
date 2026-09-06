@@ -19351,6 +19351,10 @@ mod tests {
              UPDATE workflow_store_contract SET schema_version = 15 WHERE contract_id = 1;",
             )
             .expect("historical fixture");
+        let expected_checksum: String = connection.query_row(
+            "SELECT checksum_sha256 FROM workflow_definitions WHERE definition_id = 'example' AND version = 1",
+            [], |row| row.get(0),
+        ).expect("fixture checksum before migration");
         drop(connection);
         assert!(
             WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 43)
@@ -19381,6 +19385,11 @@ mod tests {
                 .expect("preserved payload"),
             payload
         );
+        let preserved_checksum: String = connection.query_row(
+            "SELECT checksum_sha256 FROM workflow_definitions WHERE definition_id = 'example' AND version = 1",
+            [], |row| row.get(0),
+        ).expect("preserved checksum");
+        assert_eq!(preserved_checksum, expected_checksum);
         let preserved_valid: String = connection.query_row(
             "SELECT definition_json FROM workflow_definitions WHERE definition_id = 'valid-earlier' AND version = 1",
             [], |row| row.get(0),
@@ -19389,6 +19398,10 @@ mod tests {
             serde_json::from_str::<WorkflowDefinition>(&preserved_valid).expect("valid payload"),
             definition("valid-earlier")
         );
+        assert_rollback_run_bindings(&connection);
+    }
+
+    fn assert_rollback_run_bindings(connection: &Connection) {
         let mut statement = connection.prepare(
             "SELECT run_id, definition_id, definition_version FROM workflow_runs ORDER BY run_id",
         ).expect("run bindings");
