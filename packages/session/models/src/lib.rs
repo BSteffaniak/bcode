@@ -37,6 +37,55 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
+/// Maximum byte count accepted by a single session artifact range read.
+pub const MAX_SESSION_ARTIFACT_RANGE_BYTES: u32 = 1024 * 1024;
+
+/// Bounded session artifact byte range, versioned by the enclosing application protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionArtifactRange {
+    /// Artifact identity within the session.
+    pub artifact_id: String,
+    /// Canonical artifact reference key.
+    pub reference_key: String,
+    /// Declared media type, when available.
+    pub content_type: Option<String>,
+    /// Starting byte offset of this range.
+    pub offset: u64,
+    /// Current artifact length.
+    pub total_bytes: u64,
+    /// Length declared by the artifact reference.
+    pub reference_bytes: Option<u64>,
+    /// Revision of the artifact reference.
+    pub reference_revision: u64,
+    /// Whether the artifact reference is finalized.
+    pub finalized: bool,
+    /// Event sequence finalizing the reference.
+    pub finalized_event_seq: Option<u64>,
+    /// Reported artifact availability.
+    pub availability: Option<String>,
+    /// Whether the producer reports the artifact complete.
+    pub complete: Option<bool>,
+    /// Declared SHA-256 checksum, when available.
+    pub checksum_sha256: Option<String>,
+    /// Bytes in the requested bounded range.
+    pub bytes: Vec<u8>,
+}
+
+impl SessionArtifactRange {
+    /// Return the offset immediately after this response.
+    #[must_use]
+    pub fn next_offset(&self) -> u64 {
+        self.offset
+            .saturating_add(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Return whether this response reaches the current artifact EOF.
+    #[must_use]
+    pub fn is_eof(&self) -> bool {
+        self.next_offset() >= self.total_bytes
+    }
+}
+
 /// Scope for durable composer draft persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -40,7 +40,33 @@ const DEFAULT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LONG_POLL_TRANSPORT_GRACE: Duration = Duration::from_secs(5);
 
-pub use bcode_ipc::SessionArtifactRange;
+pub use bcode_session_models::SessionArtifactRange;
+
+fn validate_artifact_range_response(
+    range: &SessionArtifactRange,
+    artifact_id: &str,
+    reference_key: &str,
+    offset: u64,
+    length: u32,
+) -> Result<(), ClientError> {
+    if range.artifact_id != artifact_id
+        || range.reference_key != reference_key
+        || range.offset != offset
+        || range.bytes.len() as u64 > u64::from(length)
+        || range.bytes.len() as u64
+            > u64::from(bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES)
+        || (length > 0 && range.bytes.is_empty() && offset < range.total_bytes)
+        || (!range.bytes.is_empty()
+            && offset
+                .checked_add(range.bytes.len() as u64)
+                .is_none_or(|end| end > range.total_bytes))
+    {
+        return Err(ClientError::Protocol(
+            "artifact range response does not match the requested range".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod artifact_range_tests {
@@ -63,6 +89,39 @@ mod artifact_range_tests {
             checksum_sha256: Some("abc".to_owned()),
             bytes: b"89".to_vec(),
         };
+        super::validate_artifact_range_response(&range, "artifact", "recording", 8, 2)
+            .expect("valid range");
+        for (id, key, offset, length) in [
+            ("other", "recording", 8, 2),
+            ("artifact", "other", 8, 2),
+            ("artifact", "recording", 7, 2),
+            ("artifact", "recording", 8, 1),
+        ] {
+            assert!(
+                super::validate_artifact_range_response(&range, id, key, offset, length).is_err()
+            );
+        }
+        let mut invalid = range.clone();
+        invalid.total_bytes = 9;
+        assert!(
+            super::validate_artifact_range_response(&invalid, "artifact", "recording", 8, 2)
+                .is_err()
+        );
+        invalid.offset = u64::MAX;
+        invalid.total_bytes = u64::MAX;
+        assert!(
+            super::validate_artifact_range_response(&invalid, "artifact", "recording", u64::MAX, 2)
+                .is_err()
+        );
+        invalid.bytes.clear();
+        invalid.offset = 8;
+        assert!(
+            super::validate_artifact_range_response(&invalid, "artifact", "recording", 8, 2)
+                .is_err()
+        );
+        invalid.offset = u64::MAX;
+        super::validate_artifact_range_response(&invalid, "artifact", "recording", u64::MAX, 2)
+            .expect("empty EOF range");
         assert_eq!(range.next_offset(), 10);
         assert!(range.is_eof());
         assert_eq!(range.finalized_event_seq, Some(42));
@@ -2125,6 +2184,9 @@ impl BcodeClient {
 
     /// Read a bounded generic artifact range from canonical session metadata.
     ///
+    /// `length` must be between 1 and
+    /// [`bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES`] inclusive.
+    ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached, rejects the reference/range, or returns
@@ -2140,14 +2202,23 @@ impl BcodeClient {
         match self
             .send_request(Request::ReadSessionArtifact {
                 session_id,
-                artifact_id,
-                reference_key,
+                artifact_id: artifact_id.clone(),
+                reference_key: reference_key.clone(),
                 offset,
                 length,
             })
             .await?
         {
-            ResponsePayload::SessionArtifactRange { range } => Ok(range),
+            ResponsePayload::SessionArtifactRange { range } => {
+                validate_artifact_range_response(
+                    &range,
+                    &artifact_id,
+                    &reference_key,
+                    offset,
+                    length,
+                )?;
+                Ok(range)
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

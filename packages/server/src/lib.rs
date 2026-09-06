@@ -9888,7 +9888,7 @@ async fn handle_invocation_input(
     }
 }
 
-const MAX_ARTIFACT_RANGE_BYTES: u32 = 1024 * 1024;
+use bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES as MAX_ARTIFACT_RANGE_BYTES;
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_read_session_artifact(
@@ -10075,7 +10075,7 @@ async fn read_active_artifact_range(
     offset: u64,
     length: u32,
     active: ActiveArtifactReference,
-) -> Result<bcode_ipc::SessionArtifactRange, String> {
+) -> Result<bcode_session_models::SessionArtifactRange, String> {
     if active.abandoned {
         return Err(
             "active artifact is incomplete because its producer stopped before finalization"
@@ -10096,7 +10096,7 @@ async fn read_active_artifact_range(
     })
     .await
     .map_err(|error| format!("active artifact range reader task failed: {error}"))??;
-    Ok(bcode_ipc::SessionArtifactRange {
+    Ok(bcode_session_models::SessionArtifactRange {
         artifact_id: artifact_id.to_owned(),
         reference_key: reference_key.to_owned(),
         content_type: active.content_type,
@@ -10124,7 +10124,7 @@ async fn read_session_artifact_range(
     reference_key: &str,
     offset: u64,
     length: u32,
-) -> Result<bcode_ipc::SessionArtifactRange, String> {
+) -> Result<bcode_session_models::SessionArtifactRange, String> {
     if length == 0 || length > MAX_ARTIFACT_RANGE_BYTES {
         return Err(format!(
             "artifact range length must be between 1 and {MAX_ARTIFACT_RANGE_BYTES} bytes"
@@ -10202,7 +10202,7 @@ async fn read_session_artifact_range(
     })
     .await
     .map_err(|error| format!("artifact range reader task failed: {error}"))??;
-    let response = bcode_ipc::SessionArtifactRange {
+    let response = bcode_session_models::SessionArtifactRange {
         artifact_id: artifact_id.to_owned(),
         reference_key: reference_key.to_owned(),
         content_type: reference.content_type,
@@ -48505,6 +48505,47 @@ library = "test"
         let public = plugin_operations::normalize_error(&private);
         assert_eq!(public.code, "plugin_error");
         assert!(!public.message.contains("secret-provider-detail"));
+    }
+
+    #[tokio::test]
+    async fn artifact_invalid_lengths_match_real_ipc_errors() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = tempfile::tempdir().expect("artifact socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("artifact listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let session_id = SessionId::new();
+        for length in [0, MAX_ARTIFACT_RANGE_BYTES + 1, u32::MAX] {
+            let direct = artifact_operations::read_range(
+                &state, session_id, "missing", "missing", 0, length,
+            )
+            .await
+            .expect_err("invalid direct range");
+            let error = client
+                .session_artifact_range(
+                    session_id,
+                    "missing".to_owned(),
+                    "missing".to_owned(),
+                    0,
+                    length,
+                )
+                .await
+                .expect_err("invalid IPC range");
+            let bcode_client::ClientError::Server { code, message } = error else {
+                panic!("expected server rejection, got {error}");
+            };
+            assert_eq!(code, direct.code());
+            assert_eq!(message, direct.message());
+            assert_eq!(code, "invalid_artifact_range_length");
+        }
+        shutdown.send(()).expect("stop artifact listener");
+        server.await.expect("artifact listener task");
     }
 
     #[tokio::test]

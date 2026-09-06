@@ -77,6 +77,19 @@ impl Display for Error {
     }
 }
 
+impl Error {
+    /// Secret-safe description suitable for application diagnostics.
+    #[must_use]
+    pub const fn public_message(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "catalog storage operation failed",
+            Self::Toml(_) | Self::Json(_) => "catalog document could not be decoded",
+            Self::RemoteCatalog(_) => "remote catalog request failed",
+            Self::Validation(_) => "catalog document failed validation",
+        }
+    }
+}
+
 impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
@@ -117,6 +130,36 @@ pub struct ModelCatalogDiagnostics {
     pub last_refresh_error: Option<String>,
     /// Whether a refresh is currently running.
     pub refresh_in_progress: bool,
+}
+
+impl ModelCatalogDiagnostics {
+    /// Convert runtime diagnostics into the portable application snapshot.
+    #[must_use]
+    pub fn into_public(self) -> bcode_model_catalog_models::ModelCatalogDiagnostics {
+        let epoch_ms = |time: Option<std::time::SystemTime>| {
+            time.and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|value| u64::try_from(value.as_millis()).ok())
+        };
+        let cache_state = match self.cache_state {
+            remote::CatalogCacheState::Disabled => "disabled",
+            remote::CatalogCacheState::Missing => "missing",
+            remote::CatalogCacheState::Fresh => "fresh",
+            remote::CatalogCacheState::Stale => "stale",
+            remote::CatalogCacheState::Expired => "expired",
+            remote::CatalogCacheState::Corrupt => "corrupt",
+        };
+        bcode_model_catalog_models::ModelCatalogDiagnostics {
+            embedded_revision: self.embedded_revision,
+            remote_revision: self.remote_revision,
+            remote_enabled: self.remote_enabled,
+            cache_state: cache_state.to_owned(),
+            cache_age_seconds: self.cache_age.map(|age| age.as_secs()),
+            refresh_in_progress: self.refresh_in_progress,
+            last_refresh_attempt_ms: epoch_ms(self.last_refresh_attempt),
+            last_refresh_success_ms: epoch_ms(self.last_refresh_success),
+            last_refresh_error: self.last_refresh_error,
+        }
+    }
 }
 
 /// Model list projection requested by a consumer.
@@ -309,7 +352,7 @@ impl ModelCatalogResolver {
                 diagnostics.last_refresh_success = Some(std::time::SystemTime::now());
                 diagnostics.last_refresh_error = None;
             }
-            Err(error) => diagnostics.last_refresh_error = Some(error.to_string()),
+            Err(error) => diagnostics.last_refresh_error = Some(error.public_message().to_owned()),
         }
     }
 
@@ -2234,6 +2277,116 @@ pub fn default_source_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn public_diagnostics_normalize_cache_states_and_timestamps() {
+        use super::remote::CatalogCacheState;
+        let states = [
+            (CatalogCacheState::Disabled, "disabled"),
+            (CatalogCacheState::Missing, "missing"),
+            (CatalogCacheState::Fresh, "fresh"),
+            (CatalogCacheState::Stale, "stale"),
+            (CatalogCacheState::Expired, "expired"),
+            (CatalogCacheState::Corrupt, "corrupt"),
+        ];
+        for (cache_state, expected) in states {
+            let diagnostics = super::ModelCatalogDiagnostics {
+                embedded_revision: "embedded".to_owned(),
+                remote_revision: None,
+                remote_enabled: true,
+                cache_state,
+                cache_age: Some(std::time::Duration::from_millis(1500)),
+                last_refresh_attempt: Some(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(1234),
+                ),
+                last_refresh_success: Some(
+                    std::time::UNIX_EPOCH - std::time::Duration::from_secs(1),
+                ),
+                last_refresh_error: None,
+                refresh_in_progress: false,
+            }
+            .into_public();
+            assert_eq!(diagnostics.cache_state, expected);
+            assert_eq!(diagnostics.cache_age_seconds, Some(1));
+            assert_eq!(diagnostics.last_refresh_attempt_ms, Some(1234));
+            assert_eq!(diagnostics.last_refresh_success_ms, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_preserves_catalog_and_normalizes_diagnostics() {
+        let cache = tempfile::tempdir().expect("isolated catalog cache");
+        let resolver = super::ModelCatalogResolver::new(super::RemoteCatalogOptions {
+            base_url: "unsupported://user:private-password@example.invalid/private-token"
+                .to_owned(),
+            cache_dir: cache.path().to_path_buf(),
+            timeout: std::time::Duration::from_secs(1),
+            fresh_for: std::time::Duration::from_mins(1),
+            max_stale: std::time::Duration::from_mins(1),
+            disabled: false,
+        })
+        .expect("embedded resolver");
+        let before = resolver.catalog.read().await.clone();
+        resolver.refresh_now().await;
+        let diagnostics = resolver.diagnostics().await;
+        assert_eq!(
+            diagnostics.last_refresh_error.as_deref(),
+            Some("remote catalog request failed")
+        );
+        assert!(!diagnostics.refresh_in_progress);
+        assert!(diagnostics.last_refresh_attempt.is_some());
+        assert!(diagnostics.last_refresh_success.is_none());
+        assert!(diagnostics.remote_revision.is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            &before,
+            &*resolver.catalog.read().await
+        ));
+        assert_eq!(
+            std::fs::read_dir(cache.path())
+                .expect("cache directory")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn public_catalog_errors_exclude_private_details() {
+        let secret = "https://user:password@example.invalid/catalog?token=private";
+        let cases = [
+            (
+                super::Error::Io(std::io::Error::other(secret)),
+                "catalog storage operation failed",
+            ),
+            (
+                super::Error::RemoteCatalog(secret.to_owned()),
+                "remote catalog request failed",
+            ),
+            (
+                super::Error::Validation(secret.to_owned()),
+                "catalog document failed validation",
+            ),
+            (
+                super::Error::Json(
+                    serde_json::from_str::<bool>(&format!("\"{secret}\""))
+                        .expect_err("invalid boolean"),
+                ),
+                "catalog document could not be decoded",
+            ),
+            (
+                super::Error::Toml(
+                    toml::from_str::<std::collections::BTreeMap<String, bool>>(&format!(
+                        "value = '{secret}'"
+                    ))
+                    .expect_err("invalid boolean"),
+                ),
+                "catalog document could not be decoded",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.public_message(), expected);
+            assert!(!error.public_message().contains(secret));
+        }
+    }
+
     use super::*;
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
     use std::collections::BTreeSet;

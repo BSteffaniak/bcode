@@ -19,22 +19,7 @@ pub async fn status(
 
 /// Return normalized model-catalog diagnostics without transport framing.
 pub async fn model_catalog_diagnostics(state: &ServerState) -> ModelCatalogDiagnostics {
-    let diagnostics = state.model_catalog.diagnostics().await;
-    let epoch_ms = |time: Option<std::time::SystemTime>| {
-        time.and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|value| u64::try_from(value.as_millis()).ok())
-    };
-    ModelCatalogDiagnostics {
-        embedded_revision: diagnostics.embedded_revision,
-        remote_revision: diagnostics.remote_revision,
-        remote_enabled: diagnostics.remote_enabled,
-        cache_state: format!("{:?}", diagnostics.cache_state).to_lowercase(),
-        cache_age_seconds: diagnostics.cache_age.map(|age| age.as_secs()),
-        refresh_in_progress: diagnostics.refresh_in_progress,
-        last_refresh_attempt_ms: epoch_ms(diagnostics.last_refresh_attempt),
-        last_refresh_success_ms: epoch_ms(diagnostics.last_refresh_success),
-        last_refresh_error: diagnostics.last_refresh_error,
-    }
+    state.model_catalog.diagnostics().await.into_public()
 }
 
 #[derive(Debug, thiserror::Error)]

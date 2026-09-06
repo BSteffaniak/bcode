@@ -1388,38 +1388,8 @@ pub use bcode_session_models::PermissionSummary;
 /// Compatibility export for domain-owned model-catalog diagnostics.
 pub use bcode_model_catalog_models::ModelCatalogDiagnostics;
 
-/// Bounded generic session artifact byte range.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionArtifactRange {
-    pub artifact_id: String,
-    pub reference_key: String,
-    pub content_type: Option<String>,
-    pub offset: u64,
-    pub total_bytes: u64,
-    pub reference_bytes: Option<u64>,
-    pub reference_revision: u64,
-    pub finalized: bool,
-    pub finalized_event_seq: Option<u64>,
-    pub availability: Option<String>,
-    pub complete: Option<bool>,
-    pub checksum_sha256: Option<String>,
-    pub bytes: Vec<u8>,
-}
-
-impl SessionArtifactRange {
-    /// Return the offset immediately after this response.
-    #[must_use]
-    pub fn next_offset(&self) -> u64 {
-        self.offset
-            .saturating_add(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
-    }
-
-    /// Return whether this response reaches the current artifact EOF.
-    #[must_use]
-    pub fn is_eof(&self) -> bool {
-        self.next_offset() >= self.total_bytes
-    }
-}
+/// Compatibility export for the session-owned artifact range response.
+pub use bcode_session_models::SessionArtifactRange;
 
 /// Pending renderer-neutral invocation exchange.
 pub use bcode_session_models::PendingToolExchangeSummary;
