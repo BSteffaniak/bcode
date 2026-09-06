@@ -62,6 +62,12 @@ pub fn materialize(
     run_id: &str,
     definition: &WorkflowDefinition,
 ) -> Result<(), WorkflowStoreError> {
+    if definition.schema_version != bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION {
+        return Err(WorkflowStoreError::InvalidData(
+            "unsupported workflow definition schema version during graph materialization"
+                .to_string(),
+        ));
+    }
     for id in definition.entries.iter().chain(&definition.exits) {
         if !definition.nodes.contains_key(id) {
             return Err(WorkflowStoreError::InvalidData(
@@ -128,6 +134,11 @@ pub fn migrate(transaction: &Transaction<'_>) -> Result<(), WorkflowStoreError> 
     while let Some(row) = rows.next()? {
         let run_id: String = row.get(0)?;
         let definition: WorkflowDefinition = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        definition.validate().map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "invalid workflow definition during graph migration: {error}"
+            ))
+        })?;
         materialize(transaction, &run_id, &definition)?;
     }
     Ok(())

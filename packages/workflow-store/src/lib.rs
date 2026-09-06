@@ -11536,11 +11536,16 @@ fn settle_fan_out_member_failure(
             "fan-out member is not running or already settled".to_string(),
         ));
     }
-    transaction.execute(
+    let changed = transaction.execute(
         "UPDATE workflow_activations SET status = 'failed' WHERE run_id = ?1 \
          AND node_id = ?2 AND activation_id = ?3 AND status = 'running'",
         (&request.run_id, &request.node_id, &request.activation_id),
     )?;
+    if changed != 1 {
+        return Err(WorkflowStoreError::InvalidData(
+            "fan-out member activation is not running".to_string(),
+        ));
+    }
     let mut sibling_cancellations = Vec::new();
     if configuration.failure_policy == bcode_workflow::ParallelFailurePolicy::FailFast {
         let mut statement = transaction.prepare(
@@ -11706,11 +11711,16 @@ fn settle_fan_out_member_success(
             "fan-out member is not running or already settled".to_string(),
         ));
     }
-    transaction.execute(
+    let changed = transaction.execute(
         "UPDATE workflow_activations SET status = 'completed' WHERE run_id = ?1 \
          AND node_id = ?2 AND activation_id = ?3 AND status = 'running'",
         (&request.run_id, &request.node_id, &request.activation_id),
     )?;
+    if changed != 1 {
+        return Err(WorkflowStoreError::InvalidData(
+            "fan-out member activation is not running".to_string(),
+        ));
+    }
     append_event(
         transaction,
         &request.run_id,
@@ -17939,6 +17949,11 @@ mod tests {
             } else {
                 AttemptObservation::Succeeded { output }
             };
+            verify_fan_out_activation_damage_rejects_observation(
+                &mut store,
+                &prepared.dispatch_identity,
+                &observation,
+            );
             let summary = store
                 .apply_attempt_observation(&prepared.dispatch_identity, observation, 40)
                 .expect("observe outcome");
@@ -17951,6 +17966,59 @@ mod tests {
         drop(store);
         let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen terminal");
         verify_fan_out_terminal_result(&store, fail_first);
+    }
+
+    fn verify_fan_out_activation_damage_rejects_observation(
+        store: &mut WorkflowStore,
+        identity: &str,
+        observation: &AttemptObservation,
+    ) {
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'cancelled' WHERE activation_id = \
+             (SELECT activation_id FROM workflow_attempts WHERE dispatch_identity = ?1)",
+                [identity],
+            )
+            .expect("damage activation");
+        assert!(
+            store
+                .apply_attempt_observation(identity, observation.clone(), 39)
+                .expect_err("inconsistent activation")
+                .to_string()
+                .contains("activation is not running")
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_fan_out_members WHERE member_activation_id = \
+             (SELECT activation_id FROM workflow_attempts WHERE dispatch_identity = ?1)",
+                    [identity],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("member rollback"),
+            "running"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+                    [identity],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("attempt unchanged"),
+            "admitted"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'running' WHERE activation_id = \
+             (SELECT activation_id FROM workflow_attempts WHERE dispatch_identity = ?1)",
+                [identity],
+            )
+            .expect("restore fixture");
     }
 
     fn verify_fan_out_terminal_result(store: &WorkflowStore, failed: bool) {
@@ -18845,6 +18913,79 @@ mod tests {
         assert_eq!(
             reopened.execution_authority("run-1").expect("authority"),
             None
+        );
+    }
+
+    #[test]
+    fn graph_migration_preserves_unsupported_definition_versions() {
+        let mut invalid = definition("example");
+        invalid.schema_version = bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION + 1;
+        verify_graph_migration_preserves_invalid_definition(&invalid);
+    }
+
+    #[test]
+    fn graph_migration_preserves_malformed_current_definitions() {
+        let mut invalid = definition("example");
+        invalid.entries.clear();
+        assert!(invalid.validate().is_err());
+        verify_graph_migration_preserves_invalid_definition(&invalid);
+    }
+
+    fn verify_graph_migration_preserves_invalid_definition(invalid: &WorkflowDefinition) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let path = store.path().to_path_buf();
+        drop(store);
+        let connection = Connection::open(&path).expect("fixture");
+        let payload = serde_json::to_string(invalid).expect("invalid payload");
+        connection
+            .execute(
+                "UPDATE workflow_definitions SET definition_json = ?1",
+                [&payload],
+            )
+            .expect("future definition");
+        connection
+            .execute_batch(
+                "DROP TABLE workflow_run_graph_edges;
+             DROP TABLE workflow_run_graph_nodes;
+             DROP TABLE workflow_run_graphs;
+             UPDATE workflow_store_contract SET schema_version = 15 WHERE contract_id = 1;",
+            )
+            .expect("historical fixture");
+        drop(connection);
+        assert!(
+            WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 43)
+                .expect_err("unsupported definition")
+                .to_string()
+                .contains("invalid workflow definition during graph migration")
+        );
+        let connection = Connection::open(&path).expect("preserved source");
+        assert_eq!(detected_store_schema(&connection), Some(15));
+        assert!(
+            connection
+                .prepare("SELECT run_id FROM workflow_run_graphs")
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT definition_json FROM workflow_definitions",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("preserved payload"),
+            payload
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM workflow_runs", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("preserved run"),
+            1
         );
     }
 
