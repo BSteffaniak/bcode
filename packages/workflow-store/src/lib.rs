@@ -1595,7 +1595,8 @@ impl WorkflowStore {
     /// Explicitly migrate supported historical workflow schemas, preserving canonical state.
     ///
     /// Acquires exclusive store ownership and verifies a backup before adding authority columns
-    /// where needed and materializing initial run graphs. Integrity is checked before commit.
+    /// where needed, materializing initial run graphs for schemas 14/15, and adding the
+    /// source-edge index for schema 16. Integrity is checked before commit.
     /// Normal reads never invoke this operation.
     ///
     /// # Errors
@@ -1611,7 +1612,8 @@ impl WorkflowStore {
     /// Compatibility entry point for explicit migration from schemas 14–16 to the current schema.
     ///
     /// Prefer [`Self::migrate_to_current_in_state_dir`]. Existing state is preserved; initial
-    /// run-owned graphs are materialized and schema-14 authority columns are added when needed.
+    /// run-owned graphs are materialized for schemas 14/15 and schema-14 authority columns
+    /// are added when needed. Schema 16 receives only the source-edge index, without graph rebuild.
     ///
     /// # Errors
     /// Returns an error when ownership is unavailable, the source schema is unsupported, backup or
@@ -19886,6 +19888,109 @@ mod tests {
     }
 
     #[test]
+    fn schema_16_index_migration_rolls_back_on_orphaned_graph() {
+        let (temp, store) = initialized_store();
+        let original_nodes = store
+            .run_graph_nodes("run-1", None, 100)
+            .expect("original nodes");
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX workflow_run_graph_edges_source;
+             UPDATE workflow_store_contract SET schema_version = 16 WHERE contract_id = 1;
+             PRAGMA foreign_keys = OFF;
+             DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
+            )
+            .expect("orphan graph fixture");
+        drop(store);
+        let error = WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 78)
+            .expect_err("orphaned graph must reject migration");
+        assert!(matches!(error, WorkflowStoreError::InvalidData(message)
+            if message == "workflow migration foreign-key verification failed; canonical relationships are inconsistent"));
+        let database_path = workflow_database_path(temp.path());
+        let backup_path = database_path
+            .parent()
+            .expect("store directory")
+            .join(MIGRATION_BACKUP_DIRECTORY)
+            .join("workflow-78.db");
+        let backup =
+            Connection::open_with_flags(&backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("failed migration retains backup");
+        assert_eq!(detected_store_schema(&backup), Some(16));
+        let backup_nodes: u64 = backup
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("backed up orphan");
+        assert_eq!(backup_nodes, 1);
+        let backup_headers: u64 = backup
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("backup preserves absent header");
+        assert_eq!(backup_headers, 0);
+        drop(backup);
+        let failed_backup_bytes = std::fs::read(&backup_path).expect("retain backup bytes");
+        let connection =
+            Connection::open(workflow_database_path(temp.path())).expect("inspect fixture");
+        assert_eq!(detected_store_schema(&connection), Some(16));
+        let indexes: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'workflow_run_graph_edges_source'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index rollback");
+        assert_eq!(indexes, 0);
+        let nodes: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphan preserved");
+        assert_eq!(nodes, 1);
+        let headers: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("no reconstruction");
+        assert_eq!(headers, 0);
+        connection
+            .execute(
+                "INSERT INTO workflow_run_graphs (run_id, revision) VALUES ('run-1', 1)",
+                [],
+            )
+            .expect("explicit fixture restoration");
+        drop(connection);
+        let receipt = WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 79)
+            .expect("retry after restoration");
+        assert_eq!(
+            std::fs::read(&backup_path).expect("failed backup after retry"),
+            failed_backup_bytes
+        );
+        assert_ne!(receipt.backup_path, backup_path);
+        assert_eq!(receipt.previous_schema_version, 16);
+        assert_eq!(receipt.new_schema_version, WORKFLOW_STORE_SCHEMA_VERSION);
+        let reopened =
+            WorkflowStore::open_in_state_dir(temp.path()).expect("reopen migrated store");
+        let nodes = reopened.run_graph_nodes("run-1", None, 100).expect("nodes");
+        assert_eq!(nodes, original_nodes);
+        assert!(
+            reopened
+                .run_graph_outgoing_edges("run-1", &original_nodes[0].node.id, None, 1)
+                .expect("source index available")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn schema_16_migration_adds_source_index_without_rebuilding_graph() {
         let (temp, store) = initialized_store();
         let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
@@ -19917,6 +20022,16 @@ mod tests {
             .expect("explicit migration");
         assert_eq!(receipt.previous_schema_version, 16);
         assert_eq!(receipt.new_schema_version, WORKFLOW_STORE_SCHEMA_VERSION);
+        assert_eq!(receipt.migrated_at_ms, 71);
+        let backup_bytes = std::fs::read(&receipt.backup_path).expect("receipt backup");
+        assert_eq!(receipt.backup_sha256, sha256_hex(&backup_bytes));
+        let backup = Connection::open_with_flags(
+            &receipt.backup_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("inspect pre-migration backup");
+        assert_eq!(detected_store_schema(&backup), Some(16));
+        drop(backup);
         let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
         assert_eq!(
             store.run_graph_nodes("run-1", None, 100).expect("nodes"),
@@ -19944,7 +20059,25 @@ mod tests {
     #[test]
     fn endpoint_index_damage_is_isolated_by_direction() {
         for source in [true, false] {
-            let (_temp, store) = initialized_store();
+            let (temp, store) = initialized_store();
+            let node = store
+                .run_graph_nodes("run-1", None, 1)
+                .expect("node")
+                .remove(0)
+                .node;
+            let edge = bcode_workflow::EdgeDefinition {
+                from: node.id.clone(),
+                to: node.id.clone(),
+                kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
+            };
+            store
+                .connection
+                .execute(
+                    "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 42, 1, ?1, ?1, ?2)",
+                    rusqlite::params![node.id, serde_json::to_string(&edge).expect("serialize")],
+                )
+                .expect("persist edge");
             store
                 .connection
                 .execute_batch(if source {
@@ -19954,20 +20087,33 @@ mod tests {
                 })
                 .expect("damage one index");
             let before = store.connection.total_changes();
-            let outgoing = store.run_graph_outgoing_edges("run-1", "review", None, 1);
-            let incoming = store.run_graph_incoming_edges("run-1", "review", None, 1);
+            let outgoing = store.run_graph_outgoing_edges("run-1", &node.id, None, 1);
+            let incoming = store.run_graph_incoming_edges("run-1", &node.id, None, 1);
             let (damaged, intact) = if source {
                 (outgoing, incoming)
             } else {
                 (incoming, outgoing)
             };
             assert!(damaged.is_err());
-            assert!(
-                intact
-                    .expect("other direction remains available")
-                    .is_empty()
-            );
+            let intact = intact.expect("other direction remains available");
+            assert_eq!(intact.len(), 1);
+            assert_eq!(intact[0].edge_id, 42);
+            assert_eq!(intact[0].edge, edge);
             assert_eq!(store.connection.total_changes(), before);
+            drop(store);
+            let reopened =
+                WorkflowStore::open_in_state_dir(temp.path()).expect("reopen without repair");
+            let before = reopened.connection.total_changes();
+            let outgoing = reopened.run_graph_outgoing_edges("run-1", &node.id, None, 1);
+            let incoming = reopened.run_graph_incoming_edges("run-1", &node.id, None, 1);
+            let (damaged, available) = if source {
+                (outgoing, incoming)
+            } else {
+                (incoming, outgoing)
+            };
+            assert!(damaged.is_err());
+            assert_eq!(available.expect("intact direction after reopen"), intact);
+            assert_eq!(reopened.connection.total_changes(), before);
         }
     }
 
