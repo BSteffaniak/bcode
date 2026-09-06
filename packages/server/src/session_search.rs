@@ -4051,6 +4051,7 @@ pub(crate) mod tests {
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
         assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -4093,6 +4094,7 @@ pub(crate) mod tests {
             .collect();
 
         let hydrated = hydrate_hits(&state, hits).await;
+        drop(state);
 
         assert_eq!(
             hydrated

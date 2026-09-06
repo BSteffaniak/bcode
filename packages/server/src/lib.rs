@@ -190,6 +190,9 @@ pub enum ServerError {
     /// The owned workflow event forwarder failed to finish normally.
     #[error("workflow event forwarding failed during shutdown")]
     WorkflowEventForwarderShutdown,
+    /// An owned catalog worker failed to finish normally.
+    #[error("catalog worker failed during shutdown")]
+    CatalogWorkerShutdown,
     #[error("IPC transport error: {0}")]
     Transport(#[from] bcode_ipc::IpcTransportError),
     #[error("config error: {0}")]
@@ -373,6 +376,8 @@ pub struct ServerState {
     workflow_event_forwarder: Mutex<Option<JoinHandle<()>>>,
     workflow_event_forwarder_failed: std::sync::atomic::AtomicBool,
     catalog_events_started: std::sync::atomic::AtomicBool,
+    catalog_workers: Mutex<Vec<JoinHandle<()>>>,
+    catalog_workers_failed: std::sync::atomic::AtomicBool,
     idle_shutdown_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
@@ -1606,6 +1611,8 @@ impl ServerState {
             workflow_event_forwarder: Mutex::new(None),
             workflow_event_forwarder_failed: std::sync::atomic::AtomicBool::new(false),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
+            catalog_workers: Mutex::new(Vec::new()),
+            catalog_workers_failed: std::sync::atomic::AtomicBool::new(false),
             idle_shutdown_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
@@ -2249,7 +2256,11 @@ impl ServerState {
         }
     }
 
-    fn start_catalog_event_forwarder(self: &Arc<Self>) {
+    async fn start_catalog_event_forwarder(self: &Arc<Self>) {
+        let mut workers = self.catalog_workers.lock().await;
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            return;
+        }
         if self
             .catalog_events_started
             .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -2259,7 +2270,7 @@ impl ServerState {
         let mut shutdown = self.subscribe_shutdown();
         let mut revisions = self.session_catalog.subscribe();
         let state = Arc::clone(self);
-        tokio::spawn(async move {
+        workers.push(tokio::spawn(async move {
             loop {
                 if state.shutdown_requested.load(Ordering::SeqCst) {
                     break;
@@ -2280,12 +2291,12 @@ impl ServerState {
                     () = broadcast_catalog_update(&state, revision) => {}
                 }
             }
-        });
+        }));
 
         let mut shutdown = self.subscribe_shutdown();
         let mut mutations = self.sessions.subscribe_mutations();
         let state = Arc::clone(self);
-        tokio::spawn(async move {
+        workers.push(tokio::spawn(async move {
             loop {
                 if state.shutdown_requested.load(Ordering::SeqCst) {
                     break;
@@ -2334,9 +2345,24 @@ impl ServerState {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
+        }));
 
-        self.start_catalog_backfill();
+        workers.push(self.start_catalog_backfill());
+    }
+
+    async fn stop_catalog_workers(&self) -> Result<(), ServerError> {
+        let mut workers = self.catalog_workers.lock().await;
+        while let Some(worker) = workers.last_mut() {
+            if worker.await.is_err() {
+                self.catalog_workers_failed.store(true, Ordering::SeqCst);
+            }
+            workers.pop();
+        }
+        if self.catalog_workers_failed.load(Ordering::SeqCst) {
+            Err(ServerError::CatalogWorkerShutdown)
+        } else {
+            Ok(())
+        }
     }
 
     fn start_catalog_backfill(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -2374,6 +2400,7 @@ impl ServerState {
 
     fn start_idle_shutdown_watcher(self: &Arc<Self>, idle_after: Duration) {
         if idle_after.is_zero()
+            || self.shutdown_requested.load(Ordering::SeqCst)
             || self
                 .idle_shutdown_started
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -2395,7 +2422,12 @@ impl ServerState {
                     _ = shutdown.recv() => break,
                     () = tokio::time::sleep(check_interval) => {}
                 }
-                if let Some(blocker) = state.idle_shutdown_blocker().await {
+                let blocker = tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    blocker = state.idle_shutdown_blocker() => blocker,
+                };
+                if let Some(blocker) = blocker {
                     if idle_since.take().is_some() {
                         tracing::info!(target: "bcode_server::idle_shutdown", blocker, "daemon no longer idle; idle shutdown timer reset");
                     }
@@ -3979,7 +4011,7 @@ async fn run_constructed_server(
     }
     let startup_started_at = state.startup_started_at;
     let stage_started_at = Instant::now();
-    state.start_catalog_event_forwarder();
+    state.start_catalog_event_forwarder().await;
     state.start_workflow_event_forwarder().await;
     state.start_session_search_ingestion().await;
     start_catalog_refresh(&state).await;
@@ -4130,6 +4162,7 @@ async fn shutdown_constructed_server(
     state.request_shutdown();
     let ingestion = state.stop_session_search_ingestion().await;
     let workflow_forwarder = state.stop_workflow_event_forwarder().await;
+    let catalog_workers = state.stop_catalog_workers().await;
     stop_catalog_refresh(&state).await;
     state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
@@ -4156,6 +4189,7 @@ async fn shutdown_constructed_server(
     accept_result?;
     ingestion?;
     workflow_forwarder?;
+    catalog_workers?;
     deactivation?;
     record_removal?;
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
@@ -69765,6 +69799,55 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn catalog_worker_failure_drains_remaining_workers_and_stays_failed() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        state.start_catalog_event_forwarder().await;
+        state.catalog_workers.lock().await.push(tokio::spawn(async {
+            panic!("injected catalog worker failure");
+        }));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            shutdown_constructed_server(Arc::clone(&state), Ok(())),
+        )
+        .await
+        .expect("shutdown drains despite worker failure");
+        assert!(matches!(result, Err(ServerError::CatalogWorkerShutdown)));
+        assert!(state.catalog_workers.lock().await.is_empty());
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert!(matches!(
+            state.stop_catalog_workers().await,
+            Err(ServerError::CatalogWorkerShutdown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_workers_shutdown_drains_and_prevents_restart() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        state.start_catalog_event_forwarder().await;
+        state.start_catalog_event_forwarder().await;
+        assert_eq!(state.catalog_workers.lock().await.len(), 3);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            shutdown_constructed_server(Arc::clone(&state), Ok(())),
+        )
+        .await
+        .expect("shutdown completes")
+        .expect("catalog workers stop normally");
+        state.start_catalog_event_forwarder().await;
+        assert!(state.catalog_workers.lock().await.is_empty());
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalog_startup_after_shutdown_spawns_no_workers() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        state.request_shutdown();
+        state.start_catalog_event_forwarder().await;
+        assert!(!state.catalog_events_started.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[tokio::test]
     async fn catalog_backfill_after_shutdown_releases_worker_state() {
         let state = Arc::new(test_server_state(SessionManager::default()));
         state.request_shutdown();
@@ -69893,6 +69976,49 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("already stopped");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_watcher_after_shutdown_spawns_no_worker() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        state.request_shutdown();
+        state.start_idle_shutdown_watcher(Duration::from_secs(30));
+        assert!(!state.idle_shutdown_started.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoned_catalog_shutdown_retains_workers() {
+        let state = test_server_state(SessionManager::default());
+        let resource = Arc::new(());
+        let owned_resource = Arc::clone(&resource);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        state
+            .catalog_workers
+            .lock()
+            .await
+            .push(tokio::spawn(async move {
+                let _resource = owned_resource;
+                let _ = released.await;
+            }));
+        state.request_shutdown();
+        let mut wait = Box::pin(state.stop_catalog_workers());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(wait.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(wait);
+        assert_eq!(state.catalog_workers.lock().await.len(), 1);
+        assert_eq!(Arc::strong_count(&resource), 2);
+        release.send(()).expect("worker remains owned");
+        tokio::time::timeout(Duration::from_secs(2), state.stop_catalog_workers())
+            .await
+            .expect("worker drains")
+            .expect("worker succeeds");
+        assert!(state.catalog_workers.lock().await.is_empty());
+        drop(state);
+        assert_eq!(Arc::strong_count(&resource), 1);
+    }
+
     #[tokio::test]
     async fn abandoned_workflow_forwarder_shutdown_retains_worker() {
         let state = test_server_state(SessionManager::default());
@@ -69935,7 +70061,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 state.request_shutdown();
             }
             state.start_workflow_event_forwarder().await;
-            state.start_catalog_event_forwarder();
+            state.start_catalog_event_forwarder().await;
             let ingestion = ServerState::spawn_session_search_ingestion_worker(Arc::clone(&state));
             state.start_idle_shutdown_watcher(Duration::from_secs(30));
             // On the current-thread runtime neither spawned task has polled yet.
