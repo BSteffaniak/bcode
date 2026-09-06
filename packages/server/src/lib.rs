@@ -62109,6 +62109,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("IPC runtime history"),
             direct_history
         );
+        assert_runtime_cancellation_is_scoped(
+            &state,
+            &client,
+            session.id,
+            &work_id,
+            &cancellations,
+        )
+        .await;
         let mut watcher = client
             .watch_runtime_work(session.id)
             .await
@@ -62141,11 +62149,89 @@ event_symbol = "bcode_plugin_handle_event_v1"
             } if cancelled_work_id == work_id
         ));
         assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_pending_runtime_cancellation_idempotent(&state, &client, session.id, &work_id).await;
         assert_bounded_runtime_history_span(&client, session.id, &work_id).await;
         assert_runtime_history_limits(&state, &client, session.id).await;
         assert_runtime_completion_visible(&state, &client, &mut watcher, session.id, work_id).await;
         assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    async fn assert_pending_runtime_cancellation_idempotent(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+        work_id: &WorkId,
+    ) {
+        let history = client
+            .runtime_work_history(session_id, 10)
+            .await
+            .expect("history before repeated cancellation");
+        let active = client
+            .list_runtime_work(session_id)
+            .await
+            .expect("active cancelling work");
+        assert_eq!(active.len(), 1);
+        assert!(!runtime_work_operations::cancel(state, session_id, work_id.clone(), None).await);
+        assert!(
+            !client
+                .cancel_runtime_work(session_id, work_id.clone())
+                .await
+                .expect("repeated IPC cancellation")
+        );
+        assert_eq!(
+            client
+                .runtime_work_history(session_id, 10)
+                .await
+                .expect("history after repeated cancellation"),
+            history
+        );
+        assert_eq!(
+            client
+                .list_runtime_work(session_id)
+                .await
+                .expect("unchanged cancelling work"),
+            active
+        );
+    }
+
+    async fn assert_runtime_cancellation_is_scoped(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+        work_id: &WorkId,
+        cancellations: &std::sync::atomic::AtomicUsize,
+    ) {
+        let before = runtime_work_operations::list(state, session_id).await;
+        let history = runtime_work_operations::history(state, session_id, 10)
+            .await
+            .expect("history before rejected cancellation");
+        for (target_session, target_work) in [
+            (SessionId::new(), work_id.clone()),
+            (session_id, WorkId::new("unknown-runtime-work")),
+        ] {
+            assert!(
+                !runtime_work_operations::cancel(state, target_session, target_work.clone(), None)
+                    .await
+            );
+            assert!(
+                !client
+                    .cancel_runtime_work(target_session, target_work)
+                    .await
+                    .expect("rejected IPC cancellation")
+            );
+        }
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime_work_operations::list(state, session_id).await,
+            before
+        );
+        assert_eq!(
+            runtime_work_operations::history(state, session_id, 10)
+                .await
+                .expect("history after rejected cancellation"),
+            history
+        );
     }
 
     async fn assert_runtime_history_limits(
@@ -62281,6 +62367,47 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(complete[0].finished_at_ms, spans[0].finished_at_ms);
         assert!(complete[0].started_at_ms.is_some());
         assert!(complete[0].duration_ms().is_some());
+        assert_runtime_terminal_outcome_stable(state, client, session_id, work_id).await;
+    }
+
+    async fn assert_runtime_terminal_outcome_stable(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+        work_id: WorkId,
+    ) {
+        let terminal_history = client
+            .runtime_work_history(session_id, 10)
+            .await
+            .expect("terminal history before stale completion");
+        finish_registered_runtime_work(
+            state,
+            session_id,
+            work_id,
+            RuntimeWorkStatus::Completed,
+            Some("stale completion must not replace cancellation".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            client
+                .runtime_work_history(session_id, 10)
+                .await
+                .expect("terminal history after stale completion"),
+            terminal_history
+        );
+        assert_eq!(
+            runtime_work_operations::history(state, session_id, 10)
+                .await
+                .expect("direct stable terminal history"),
+            terminal_history
+        );
+        assert!(
+            client
+                .list_runtime_work(session_id)
+                .await
+                .expect("stable terminal list")
+                .is_empty()
+        );
     }
 
     async fn assert_bounded_runtime_history_span(
