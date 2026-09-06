@@ -4419,12 +4419,13 @@ fn spawn_exclusive_plugin_executor(
                     let (unused_response, _) = oneshot::channel();
                     let response_sender =
                         std::mem::replace(&mut invocation.response, unused_response);
-                    let response = if let Some(plugin) = plugin.as_ref().filter(|_| !stopping) {
-                        execute_plugin_service_invocation(plugin, invocation, &metrics)
-                    } else {
-                        metrics.failed.fetch_add(1, Ordering::Relaxed);
-                        Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
-                    };
+                    let response = plugin.as_ref().filter(|_| !stopping).map_or_else(
+                        || {
+                            metrics.failed.fetch_add(1, Ordering::Relaxed);
+                            Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
+                        },
+                        |plugin| execute_plugin_service_invocation(plugin, invocation, &metrics),
+                    );
                     let _ = response_sender.send(response);
                 }
                 PluginExecutorMessage::Event(invocation) => {
