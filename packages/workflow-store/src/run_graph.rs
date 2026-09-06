@@ -6,6 +6,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+#[derive(Clone, Copy)]
+enum EdgeEndpoint<'a> {
+    Source(&'a str),
+    Target(&'a str),
+}
+
 /// An immutable executable node revision in a run-owned graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunGraphNode {
@@ -54,6 +60,14 @@ pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
         );
         CREATE INDEX workflow_run_graph_edges_target
             ON workflow_run_graph_edges(run_id, target_node_id, edge_id);",
+    )?;
+    initialize_source_index(connection)
+}
+
+pub fn initialize_source_index(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    connection.execute_batch(
+        "CREATE INDEX workflow_run_graph_edges_source
+            ON workflow_run_graph_edges(run_id, source_node_id, edge_id);",
     )?;
     Ok(())
 }
@@ -300,13 +314,42 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
         super::validate_id("target_node_id", target_node_id)?;
-        self.graph_edge_page(run_id, Some(target_node_id), after_edge_id, None, limit)
+        self.graph_edge_page(
+            run_id,
+            Some(EdgeEndpoint::Target(target_node_id)),
+            after_edge_id,
+            None,
+            limit,
+        )
+    }
+
+    /// Read a bounded page of initial edges leaving a node, ordered by edge identity.
+    ///
+    /// Missing runs or sources with no outgoing edges return an empty page.
+    /// # Errors
+    /// Returns an error for invalid identities or cursors, unsupported graph revisions,
+    /// damaged edge relationships or payloads, or database failures.
+    pub fn run_graph_outgoing_edges(
+        &self,
+        run_id: &str,
+        source_node_id: &str,
+        after_edge_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+        super::validate_id("source_node_id", source_node_id)?;
+        self.graph_edge_page(
+            run_id,
+            Some(EdgeEndpoint::Source(source_node_id)),
+            after_edge_id,
+            None,
+            limit,
+        )
     }
 
     fn graph_edge_page(
         &self,
         run_id: &str,
-        target_node_id: Option<&str>,
+        endpoint: Option<EdgeEndpoint<'_>>,
         after_edge_id: Option<u64>,
         exact_edge_id: Option<i64>,
         limit: usize,
@@ -332,10 +375,10 @@ impl WorkflowStore {
         } else {
             "AND ?6 IS NULL"
         };
-        let target_filter = if target_node_id.is_some() {
-            "AND edge.target_node_id = ?5"
-        } else {
-            "AND ?5 IS NULL"
+        let (target_filter, endpoint_id) = match endpoint {
+            Some(EdgeEndpoint::Source(id)) => ("AND edge.source_node_id = ?5", Some(id)),
+            Some(EdgeEndpoint::Target(id)) => ("AND edge.target_node_id = ?5", Some(id)),
+            None => ("AND ?5 IS NULL", None),
         };
         let sql = format!(
             "SELECT edge.edge_id,
@@ -362,7 +405,7 @@ impl WorkflowStore {
             after_edge_id,
             limit.clamp(1, 100),
             super::MAX_INLINE_JSON_BYTES,
-            target_node_id,
+            endpoint_id,
             exact_edge_id
         ])?;
         let mut edges = Vec::new();

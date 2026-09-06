@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 16;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 17;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1608,7 +1608,7 @@ impl WorkflowStore {
         Self::migrate_schema_14_to_current_in_state_dir(state_dir, migrated_at_ms)
     }
 
-    /// Compatibility entry point for explicit migration from schema 14 or 15 to the current schema.
+    /// Compatibility entry point for explicit migration from schemas 14–16 to the current schema.
     ///
     /// Prefer [`Self::migrate_to_current_in_state_dir`]. Existing state is preserved; initial
     /// run-owned graphs are materialized and schema-14 authority columns are added when needed.
@@ -1648,9 +1648,9 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14 | 15) {
+        if !matches!(previous_schema_version, 14..=16) {
             return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow store migration supports schemas 14 and 15, found {previous_schema_version}"
+                "workflow store migration supports schemas 14, 15, and 16, found {previous_schema_version}"
             )));
         }
         source.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
@@ -1679,7 +1679,11 @@ impl WorkflowStore {
                  ALTER TABLE workflow_runs ADD COLUMN coordinator_fencing_token TEXT;",
             )?;
         }
-        run_graph::migrate(&transaction)?;
+        if previous_schema_version < 16 {
+            run_graph::migrate(&transaction)?;
+        } else {
+            run_graph::initialize_source_index(&transaction)?;
+        }
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
             [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -19882,6 +19886,141 @@ mod tests {
     }
 
     #[test]
+    fn schema_16_migration_adds_source_index_without_rebuilding_graph() {
+        let (temp, store) = initialized_store();
+        let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX workflow_run_graph_edges_source;
+             UPDATE workflow_store_contract SET schema_version = 16 WHERE contract_id = 1;",
+            )
+            .expect("schema 16 fixture");
+        drop(store);
+        assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
+        let receipt = WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 71)
+            .expect("explicit migration");
+        assert_eq!(receipt.previous_schema_version, 16);
+        assert_eq!(receipt.new_schema_version, WORKFLOW_STORE_SCHEMA_VERSION);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store.run_graph_nodes("run-1", None, 100).expect("nodes"),
+            nodes
+        );
+        let index_count: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'workflow_run_graph_edges_source'",
+            [], |row| row.get(0),
+        ).expect("source index");
+        assert_eq!(index_count, 1);
+    }
+
+    #[test]
+    fn outgoing_edge_pages_filter_sources_and_preserve_storage() {
+        let (_temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        let edge = bcode_workflow::EdgeDefinition {
+            from: node.id.clone(),
+            to: node.id.clone(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        let json = serde_json::to_string(&edge).expect("serialize");
+        for id in 0..205 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, ?2, ?2, ?3)",
+                    rusqlite::params![id, node.id, json],
+                )
+                .expect("edge");
+        }
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 205, 1, 'unrelated', ?1, 'invalid')",
+            [&node.id],
+        ).expect("unrelated source damage");
+        let before = store.connection.total_changes();
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store
+                .run_graph_outgoing_edges("run-1", &node.id, cursor, usize::MAX)
+                .expect("page");
+            assert!(page.len() <= 100);
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|edge| edge.edge_id);
+            for item in page {
+                assert_eq!(item.edge, edge);
+                ids.push(item.edge_id);
+            }
+        }
+        assert_eq!(ids, (0..205).collect::<Vec<u64>>());
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", "unrelated", None, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", "", None, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_graph_outgoing_edges("missing", &node.id, Some(u64::MAX), 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_graph_outgoing_edges("missing", &node.id, None, 1)
+                .expect("missing run")
+                .is_empty()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn incoming_edge_pages_validate_inputs_even_for_missing_runs() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        for run_id in ["run-1", "missing"] {
+            assert!(
+                store
+                    .run_graph_incoming_edges(run_id, "", None, 10)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .run_graph_incoming_edges(run_id, "review", Some(u64::MAX), 10)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .run_graph_incoming_edges(run_id, "missing", None, usize::MAX)
+                    .expect("absent target")
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .run_graph_incoming_edges(run_id, "review", Some(i64::MAX as u64), 10)
+                    .expect("valid final cursor")
+                    .is_empty()
+            );
+        }
+        assert!(
+            store
+                .run_graph_incoming_edges("", "review", None, 10)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
     fn incoming_edge_pages_are_bounded_and_isolate_unrelated_damage() {
         let (_temp, store) = initialized_store();
         let node = store
@@ -19923,12 +20062,48 @@ mod tests {
             }
         }
         assert_eq!(ids, (0..205).collect::<Vec<u64>>());
+        let first = store
+            .run_graph_incoming_edges("run-1", &node.id, None, 0)
+            .expect("zero limit clamps to one");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].edge_id, 0);
+        let second = store
+            .run_graph_incoming_edges("run-1", &node.id, Some(0), 0)
+            .expect("exclusive cursor");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].edge_id, 1);
         assert!(
             store
                 .run_graph_incoming_edges("run-1", "unrelated", None, 10)
                 .is_err()
         );
         assert_eq!(store.connection.total_changes(), before);
+        store.connection.execute(
+            "UPDATE workflow_run_graph_edges SET edge_json = 'invalid' WHERE run_id = 'run-1' AND edge_id = 0",
+            [],
+        ).expect("damage first edge");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", &node.id, None, 1)
+                .is_err()
+        );
+        let page = store
+            .run_graph_incoming_edges("run-1", &node.id, Some(0), 1)
+            .expect("earlier damage lies outside page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].edge_id, 1);
+        assert_eq!(page[0].edge, edge);
+        assert_eq!(store.connection.total_changes(), before);
+        store.connection.execute(
+            "UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE run_id = 'run-1' AND edge_id = 0",
+            [&json],
+        ).expect("restore edge before testing missing endpoints");
+        let restored = store
+            .run_graph_incoming_edges("run-1", &node.id, None, 10)
+            .expect("valid edges before endpoint damage");
+        assert_eq!(restored.len(), 10);
+        assert_eq!(restored[0].edge, edge);
         store
             .connection
             .execute(
@@ -19937,11 +20112,14 @@ mod tests {
             )
             .expect("damage source");
         let before = store.connection.total_changes();
-        assert!(
-            store
-                .run_graph_incoming_edges("run-1", &node.id, None, 10)
-                .is_err()
-        );
+        let error = store
+            .run_graph_incoming_edges("run-1", &node.id, None, 10)
+            .expect_err("missing endpoints must fail");
+        assert!(matches!(
+            error,
+            WorkflowStoreError::InvalidData(message)
+                if message == "workflow graph edge relationships are inconsistent"
+        ));
         assert_eq!(store.connection.total_changes(), before);
     }
 
