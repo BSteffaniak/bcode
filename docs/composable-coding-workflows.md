@@ -11,6 +11,34 @@ The workflow store remains the canonical authority for definitions, runs, activa
 outputs, decisions, waits, receipts, resources, and terminal state. Source and package formats lower
 to canonical definitions; they do not define another scheduler or store.
 
+## Approved architecture direction and current gaps
+
+The workflow execution invariants in [`../INVARIANTS.md`](../INVARIANTS.md) require dynamically
+revisable execution graphs, policy-controlled recursive composition, and caller-owned collaboration
+strategy. Authored definitions are reusable starting plans, not immutable constraints on live
+execution topology. Authorized graph changes must preserve execution history and explicitly reconcile
+affected active work. Workspace isolation, roles, decomposition, and integration procedures are
+choices available to callers rather than mandatory runtime strategies.
+
+The implementation described below does not yet satisfy that direction. In particular, exact static
+`WorkflowCall` admission, `reject_recursive_child_target`, and hardcoded
+`MAX_WORKFLOW_RUN_DEPTH` / `MAX_WORKFLOW_RUN_DESCENDANTS` retain restrictions that must be replaced
+as part of the workflow redesign. These are known architectural gaps, not exceptions to the new
+invariants or evidence of dynamic-graph support. Recursive procedure reuse must be distinguished
+from invalid ownership cycles. Bounded reads must remain possible without imposing a universal
+workflow lifetime, graph-size, or recursion ceiling.
+
+Existing child-admission tests and the child-composition architecture guard characterize the current
+implementation. They must evolve alongside replacement admission, persistence, recovery, and
+configurable-policy semantics; simply deleting the checks would not implement the approved design.
+This documentation change does not enable new runtime capabilities or alter stored state.
+
+Compatibility is defined at independently evolving boundaries, not by requiring a version on every
+nested type or operation. Existing formats and versions remain in force until explicitly evolved;
+consolidating compatibility boundaries must preserve existing state and reject unsupported
+representations without guessing. Execution ownership, authorization, cancellation, and stable
+historical outcomes remain required independently of plan mutability.
+
 ## Generic shell and prompt composition
 
 A shell step is the generic deterministic external-operation boundary. Its owner receives exact typed

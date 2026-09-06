@@ -34,7 +34,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 
 * **Domain behavior belongs in plugins when practical.** Permission, provider, tool, command, integration, and plugin-contributed UI behavior should be plugin-owned rather than hardcoded in the host.
 * **Plugin hosts provide plumbing rather than product behavior.** Hosts and runtimes own discovery, loading, routing, lifecycle, isolation, and contract enforcement without absorbing plugin-specific behavior.
-* **Plugin interfaces are versioned and typed.** Cross-boundary plugin requests, responses, manifests, and contributed schemas are versioned, typed, and serializable.
+* **Plugin interfaces are typed and compatibility-defined.** Cross-boundary plugin requests, responses, manifests, and contributed schemas are typed and serializable, with explicit compatibility semantics at independently evolving interface boundaries; separate versions are not required on every nested type or operation.
 * **Bundled plugins remain disableable.** Bundled plugins may be enabled by default, but disabling one must not break unrelated Bcode capabilities.
 * **Renderers do not take ownership of plugin behavior.** A renderer may adapt a plugin-owned schema but must not become the owner of the plugin's workflow or business rules.
 
@@ -49,6 +49,12 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Canonical history is never silently merged.** Duplicate or historical session roots must not be merged automatically. When more than one state location claims the same session ID, the conflict is surfaced and no location is opened as authoritative until an explicit maintenance operation resolves it.
 * **Aggregated session discovery does not confer authority.** Session discovery may span multiple state locations, but a session's mutations, ownership, and repair apply only to the location that owns its canonical storage.
 * **Released session ownership is completely released.** When a session's runtime ownership is released, its lease, database connection, and derived handles are relinquished together; a released session must not retain process-level locks that block a later verified owner.
+
+## Workflow execution
+
+* **Workflow plans remain dynamically revisable.** Authorized callers may construct and revise workflow execution graphs during execution, including adding, replacing, removing, and reconnecting planned work. Authored definitions must not impose immutable execution topology. Revisions preserve execution history and explicitly reconcile affected active work.
+* **Recursive composition is a supported execution capability.** Workflows may recursively compose and reuse procedures. Recursion depth, descendant count, and execution allowances are governed by explicit configurable policy rather than unconditional architectural ceilings. Recursive procedure reuse must not be confused with cyclic ownership or inconsistent execution state.
+* **Workflow execution does not prescribe collaboration strategy.** Planning, decomposition, roles, workspace selection, and integration strategy remain authorable and revisable by authorized callers. The runtime provides execution, coordination, and policy enforcement without mandating a particular multi-agent methodology.
 
 ## Runtime, tools, and permissions
 
@@ -87,10 +93,10 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Derived state is disposable.** Derived data is identifiable and its presence is not proof of canonical validity.
 * **Daemon processes are disposable.** Loss or replacement of a daemon must not by itself terminate a client session or authoritative nonterminal work. Clients reconnect through normal application boundaries to a matching daemon for the same artifact identity and state location; recovery restores bounded state and resumes or reconciles work only when safe and ownership-authorized, without repeating ambiguous side effects.
 * **Domain-local durable failures remain isolated.** Missing, incompatible, corrupt, or maintenance-required state owned by one optional domain must not prevent the daemon or unrelated capabilities from starting; the affected domain fails closed and reports degraded or maintenance-required status without mutating its durable state.
-* **Normal interactive paths are bounded.** Attach, refresh, rendering, catalog discovery, context construction, and routine history access have bounded work and memory behavior.
+* **Normal interactive paths are bounded.** Attach, refresh, rendering, catalog discovery, context construction, and routine history access have bounded work and memory behavior. Bounded access does not impose fixed architectural limits on workflow lifetime, total graph size, or recursive composition; large or ongoing execution remains accessible through incremental operations.
 * **Terminal outcomes are stable.** Once a turn, interaction, or persisted stream reaches its authoritative terminal state, stale live updates cannot reopen or overwrite it.
 * **Duplicate delivery is safe where promised.** Contracts that permit retries or duplicate delivery define idempotency and conflicting-duplicate behavior.
-* **Persisted and public schemas are versioned.** Persisted formats, plugin contracts, frontend contracts, and cross-process messages have explicit version semantics.
+* **Persisted and public contracts have explicit compatibility semantics.** Durable data and cross-boundary contracts define how compatibility is recognized, unsupported representations are handled, and existing state is preserved. Versioning belongs at independently evolving compatibility boundaries; every nested type or operation need not carry a separate version.
 * **Unknown future state is not guessed.** Unknown schema versions and unsupported variants are preserved, rejected, or surfaced according to contract rather than silently interpreted as known older forms.
 * **Migrations preserve canonical authority.** A migration may change representation but must not replace canonical authority with an index, renderer state, or transient process state.
 

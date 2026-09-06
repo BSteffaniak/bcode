@@ -513,6 +513,10 @@ if ! rg -q 'WorkflowDependencyManifestEntry' packages/workflow/src/lib.rs \
   violations=1
 fi
 
+# Current static-call implementation checks, not permanent architectural restrictions.
+# See docs/composable-coding-workflows.md, "Approved architecture direction and current gaps".
+# Replace recursion/descendant checks with dynamic admission and configurable-policy coverage
+# alongside the runtime redesign; removing these checks alone does not provide that capability.
 if ! rg -q 'NodeKind::WorkflowCall' packages/workflow/src/lib.rs \
   || ! rg -q 'WorkflowCallTarget' packages/workflow/src/lib.rs \
   || ! rg -q 'workflow call nodes must not retain resource leases' packages/workflow/src/lib.rs \
