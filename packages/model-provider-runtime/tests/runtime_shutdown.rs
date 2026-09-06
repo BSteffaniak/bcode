@@ -46,6 +46,32 @@ fn cancellation_wait_observes_prior_and_concurrent_requests() {
 }
 
 #[test]
+fn notification_without_cancellation_does_not_complete_wait() {
+    let runtime = ProviderRuntime::new().unwrap();
+    runtime
+        .block_on(async {
+            let turn = bcode_model_provider_runtime::TurnState::default();
+            let wait = turn.cancelled();
+            tokio::pin!(wait);
+            for _ in 0..3 {
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(
+                        wait.as_mut().poll(cx).is_pending()
+                    ))
+                    .await
+                );
+                turn.cancel_notify().notify_waiters();
+            }
+            assert!(!turn.is_cancelled());
+            turn.cancel();
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
 fn abandoning_turn_store_cancels_external_handles() {
     let mut store = bcode_model_provider_runtime::TurnStore::default();
     let (_, first) = store.insert_started("provider");

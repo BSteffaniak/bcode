@@ -670,6 +670,18 @@ async fn stream_bedrock_turn_inner(
     turn: &TurnState,
     discovery: Arc<Mutex<DiscoveryCache>>,
 ) -> Result<StreamOutcome, ProviderError> {
+    tokio::select! {
+        biased;
+        () = turn.cancelled() => Ok(StreamOutcome::Cancelled),
+        outcome = stream_bedrock_turn_attempt(request, turn, discovery) => outcome,
+    }
+}
+
+async fn stream_bedrock_turn_attempt(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+    discovery: Arc<Mutex<DiscoveryCache>>,
+) -> Result<StreamOutcome, ProviderError> {
     let settings = Settings::resolve(Some(request));
     let route = resolve_bedrock_route(request, &settings)?;
     let responses_surface = route == EffectiveBedrockRoute::OpenAiResponses;
@@ -1252,16 +1264,6 @@ async fn read_mantle_openai_stream(
                 let Some(chunk) = chunk
                     .map_err(|error| mantle_network_error("stream_failed", &error))?
                 else {
-                    // Log stream end for debugging
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/bcode-mantle-stream.log")
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(f, "[STREAM END] No completion event received. Buffer: {buffer}");
-                    }
-
                     // The stream ended without reporting a terminal event.
                     return Err(provider_error(
                         "bedrock_mantle_openai_stream_incomplete",
@@ -1270,16 +1272,6 @@ async fn read_mantle_openai_stream(
                     ));
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Log raw stream data for debugging
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/bcode-mantle-stream.log")
-                {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[CHUNK] {}", String::from_utf8_lossy(&chunk));
-                }
 
                 for line in bcode_openai_responses::drain_complete_stream_lines(&mut buffer) {
                     if let Some(outcome) =
@@ -7346,6 +7338,19 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_turn_skips_discovery_and_request_setup() {
+        let request = test_model_turn_request();
+        let turn = TurnState::default();
+        turn.cancel();
+        let discovery = Arc::new(Mutex::new(DiscoveryCache::default()));
+        assert!(matches!(
+            stream_bedrock_turn_inner(&request, &turn, discovery).await,
+            Ok(StreamOutcome::Cancelled)
+        ));
+        assert!(turn.drain().is_empty());
+    }
 
     #[test]
     fn transferred_turn_remains_owned_by_polling_caller() {

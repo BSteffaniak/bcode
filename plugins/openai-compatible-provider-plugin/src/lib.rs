@@ -289,6 +289,15 @@ impl TurnState {
         self.cancel_notify.notify_waiters();
     }
 
+    async fn cancelled(&self) {
+        let notified = self.cancel_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
@@ -3669,6 +3678,9 @@ fn parse_duration(value: &str) -> Option<Duration> {
 }
 
 async fn wait_for_retry_or_cancel(turn: &TurnState, wait_seconds: u64) -> bool {
+    if turn.is_cancelled() {
+        return true;
+    }
     if wait_seconds == 0 {
         return false;
     }
@@ -3676,7 +3688,7 @@ async fn wait_for_retry_or_cancel(turn: &TurnState, wait_seconds: u64) -> bool {
     tokio::pin!(sleep);
     tokio::select! {
         () = &mut sleep => false,
-        () = turn.cancel_notify.notified() => true,
+        () = turn.cancelled() => true,
     }
 }
 
@@ -4195,6 +4207,17 @@ fn validate_openai_tool_choice(request: &ModelTurnRequest) -> Result<(), Provide
 }
 
 async fn stream_chat_completion_inner(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> Result<StreamOutcome, ProviderError> {
+    tokio::select! {
+        biased;
+        () = turn.cancelled() => Ok(StreamOutcome::Cancelled),
+        outcome = stream_chat_completion_attempt(request, turn) => outcome,
+    }
+}
+
+async fn stream_chat_completion_attempt(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
@@ -4719,7 +4742,7 @@ async fn read_stream_events(
                     return Ok(outcome);
                 }
             }
-            () = turn.cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+            () = turn.cancelled() => return Ok(StreamOutcome::Cancelled),
         }
     }
 }
@@ -4775,7 +4798,7 @@ async fn read_responses_stream_events(
                     return Ok(outcome);
                 }
             }
-            () = turn.cancel_notify.notified() => return Ok(StreamOutcome::Cancelled),
+            () = turn.cancelled() => return Ok(StreamOutcome::Cancelled),
         }
     }
 }
@@ -9114,6 +9137,102 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_interrupts_pending_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let turn = TurnState::default();
+        let server_turn = turn.clone();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "request never arrived"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap(), 1);
+            server_turn.cancel();
+            // Do not send headers until the cancelled attempt has returned.
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+        let mut request = test_request(Vec::new());
+        request
+            .provider_context
+            .settings
+            .insert("base_url".into(), format!("http://{address}/v1"));
+        request
+            .provider_context
+            .settings
+            .insert("dialect".into(), "chat_completions".into());
+        request
+            .provider_context
+            .env
+            .insert("BCODE_OPENAI_API_KEY".into(), "test-key".into());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_chat_completion_inner(&request, &turn),
+        )
+        .await;
+        let _ = release.send(());
+        server.join().unwrap();
+        assert!(matches!(result, Ok(Ok(StreamOutcome::Cancelled))));
+    }
+
+    #[tokio::test]
+    async fn cancelled_attempt_skips_request_setup() {
+        let request = test_request(Vec::new());
+        let turn = TurnState::default();
+        turn.cancel();
+        assert!(matches!(
+            stream_chat_completion_inner(&request, &turn).await,
+            Ok(StreamOutcome::Cancelled)
+        ));
+        assert!(
+            turn.drain().is_empty(),
+            "cancelled setup must not emit auth metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_retains_requests_and_wakes_registered_waiters() {
+        let turn = TurnState::default();
+        turn.cancel();
+        tokio::time::timeout(Duration::from_secs(5), turn.cancelled())
+            .await
+            .unwrap();
+        assert!(wait_for_retry_or_cancel(&turn, 0).await);
+        assert!(wait_for_retry_or_cancel(&turn, 60).await);
+        let turn = TurnState::default();
+        assert!(!wait_for_retry_or_cancel(&turn, 0).await);
+        let wait = turn.cancelled();
+        tokio::pin!(wait);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(wait.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        turn.cancel();
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn transferred_turn_remains_registered() {

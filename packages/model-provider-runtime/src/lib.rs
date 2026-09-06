@@ -576,10 +576,13 @@ impl TurnState {
 
     /// Wait for cancellation, including cancellation requested before this wait began.
     pub async fn cancelled(&self) {
-        let notified = self.cancel_notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !self.is_cancelled() {
+        loop {
+            let notified = self.cancel_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
             notified.await;
         }
     }
