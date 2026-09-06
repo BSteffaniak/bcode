@@ -375,6 +375,11 @@ impl WorkflowStore {
         } else {
             "AND ?6 IS NULL"
         };
+        let endpoint_index = match endpoint {
+            Some(EdgeEndpoint::Source(_)) => "INDEXED BY workflow_run_graph_edges_source",
+            Some(EdgeEndpoint::Target(_)) => "INDEXED BY workflow_run_graph_edges_target",
+            None => "",
+        };
         let (target_filter, endpoint_id) = match endpoint {
             Some(EdgeEndpoint::Source(id)) => ("AND edge.source_node_id = ?5", Some(id)),
             Some(EdgeEndpoint::Target(id)) => ("AND edge.target_node_id = ?5", Some(id)),
@@ -390,7 +395,7 @@ impl WorkflowStore {
                          THEN source.node_id END,
                     CASE WHEN target.is_entry IN (0, 1) AND target.is_exit IN (0, 1)
                          THEN target.node_id END, edge.revision
-             FROM workflow_run_graph_edges edge
+             FROM workflow_run_graph_edges edge {endpoint_index}
              LEFT JOIN workflow_run_graph_nodes source ON source.run_id = edge.run_id
                  AND source.node_id = edge.source_node_id AND source.revision = 1
              LEFT JOIN workflow_run_graph_nodes target ON target.run_id = edge.run_id

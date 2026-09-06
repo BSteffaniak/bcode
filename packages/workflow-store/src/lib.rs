@@ -19942,6 +19942,71 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_index_damage_is_isolated_by_direction() {
+        for source in [true, false] {
+            let (_temp, store) = initialized_store();
+            store
+                .connection
+                .execute_batch(if source {
+                    "DROP INDEX workflow_run_graph_edges_source;"
+                } else {
+                    "DROP INDEX workflow_run_graph_edges_target;"
+                })
+                .expect("damage one index");
+            let before = store.connection.total_changes();
+            let outgoing = store.run_graph_outgoing_edges("run-1", "review", None, 1);
+            let incoming = store.run_graph_incoming_edges("run-1", "review", None, 1);
+            let (damaged, intact) = if source {
+                (outgoing, incoming)
+            } else {
+                (incoming, outgoing)
+            };
+            assert!(damaged.is_err());
+            assert!(
+                intact
+                    .expect("other direction remains available")
+                    .is_empty()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn endpoint_reads_reject_missing_indexes_without_repair() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX workflow_run_graph_edges_source;
+             DROP INDEX workflow_run_graph_edges_target;",
+            )
+            .expect("damage indexes");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", "review", None, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", "review", None, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_graph_edges("run-1", None, 1)
+                .expect("unfiltered read remains available")
+                .is_empty()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        let count: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('workflow_run_graph_edges_source', 'workflow_run_graph_edges_target')",
+            [], |row| row.get(0),
+        ).expect("indexes remain absent");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn outgoing_edge_pages_filter_sources_and_preserve_storage() {
         let (_temp, store) = initialized_store();
         let node = store
