@@ -64,12 +64,20 @@ impl PluginInteractionAdapterCapability {
     /// Return whether this adapter supports an exchange envelope.
     #[must_use]
     pub fn supports(&self, schema: &str, schema_version: u32) -> bool {
-        self.exchange_schema == schema
+        self.min_schema_version > 0
+            && !self.producer_id.trim().is_empty()
+            && !self.exchange_schema.trim().is_empty()
+            && !self.platform_id.trim().is_empty()
+            && !self.interaction_kind.trim().is_empty()
+            && self.exchange_schema == schema
             && (self.min_schema_version..=self.max_schema_version).contains(&schema_version)
     }
 }
 
 /// Select the highest-priority adapter for one platform and opaque exchange envelope.
+///
+/// Equal priorities prefer the lexicographically first controller kind. Conflicting
+/// capabilities at that winning rank fail closed; identical duplicates are harmless.
 #[must_use]
 pub fn select_interaction_adapter<'a>(
     adapters: &'a [PluginInteractionAdapterCapability],
@@ -78,18 +86,26 @@ pub fn select_interaction_adapter<'a>(
     schema_version: u32,
     platform_id: &str,
 ) -> Option<&'a PluginInteractionAdapterCapability> {
-    adapters
-        .iter()
-        .filter(|adapter| {
+    let matches = || {
+        adapters.iter().filter(|adapter| {
             adapter.producer_id == producer_id
                 && adapter.platform_id == platform_id
                 && adapter.supports(schema, schema_version)
         })
-        .max_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| right.interaction_kind.cmp(&left.interaction_kind))
-        })
+    };
+    let selected = matches().max_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.interaction_kind.cmp(&left.interaction_kind))
+    })?;
+    if matches().any(|candidate| {
+        candidate.priority == selected.priority
+            && candidate.interaction_kind == selected.interaction_kind
+            && candidate != selected
+    }) {
+        return None;
+    }
+    Some(selected)
 }
 
 /// Errors returned by plugin interaction registries.
@@ -195,9 +211,15 @@ impl PluginInteractionRegistry {
             .factories
             .get(kind)
             .ok_or_else(|| PluginInteractionRegistryError::UnsupportedKind(kind.to_owned()))?;
-        factory
+        let controller = factory
             .open(request)
-            .map_err(|error| PluginInteractionRegistryError::OpenFailed(error.to_string()))
+            .map_err(|error| PluginInteractionRegistryError::OpenFailed(error.to_string()))?;
+        if controller.kind() != kind {
+            return Err(PluginInteractionRegistryError::OpenFailed(
+                "controller kind does not match the registered factory".to_owned(),
+            ));
+        }
+        Ok(controller)
     }
 }
 
@@ -327,6 +349,41 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn registry_rejects_factory_controller_kind_mismatch() {
+        struct WrongController;
+        impl PluginInteractionController for WrongController {
+            fn kind(&self) -> &'static str {
+                "wrong"
+            }
+            fn snapshot_json(&self) -> Value {
+                Value::Null
+            }
+            fn handle_input(&mut self, _: InteractionInput) -> InteractionOutput {
+                panic!("mismatched controller must never receive input")
+            }
+        }
+        struct Factory;
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                "expected"
+            }
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                Ok(Box::new(WrongController))
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.register_factory(Box::new(Factory));
+        let result = registry.open("expected", Value::Null);
+        assert!(
+            matches!(result, Err(PluginInteractionRegistryError::OpenFailed(message))
+            if message == "controller kind does not match the registered factory")
+        );
+    }
+
     fn adapter(
         kind: &str,
         min_schema_version: u32,
@@ -362,6 +419,84 @@ mod tests {
             select_interaction_adapter(&adapters, "example.plugin", "example.request", 5, "tui")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn adapter_selection_rejects_conflicting_winning_capabilities() {
+        let first = adapter("controller", 1, 3, "web", 10);
+        let mut conflicting = first.clone();
+        conflicting.tui_surface_kind = Some("other".to_owned());
+        for adapters in [
+            vec![first.clone(), conflicting.clone()],
+            vec![conflicting, first.clone()],
+        ] {
+            assert!(
+                select_interaction_adapter(
+                    &adapters,
+                    "example.plugin",
+                    "example.request",
+                    2,
+                    "web"
+                )
+                .is_none()
+            );
+        }
+        let duplicates = [first.clone(), first];
+        assert!(
+            select_interaction_adapter(&duplicates, "example.plugin", "example.request", 2, "web")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn adapter_selection_rejects_empty_route_identifiers() {
+        for empty in ["", " \t\n"] {
+            for field in 0..4 {
+                let mut malformed = adapter("controller", 1, 1, "web", 100);
+                match field {
+                    0 => malformed.producer_id = empty.to_owned(),
+                    1 => malformed.exchange_schema = empty.to_owned(),
+                    2 => malformed.platform_id = empty.to_owned(),
+                    _ => malformed.interaction_kind = empty.to_owned(),
+                }
+                let adapters = [malformed];
+                let candidate = &adapters[0];
+                assert!(
+                    select_interaction_adapter(
+                        &adapters,
+                        &candidate.producer_id,
+                        &candidate.exchange_schema,
+                        1,
+                        &candidate.platform_id
+                    )
+                    .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adapter_selection_rejects_invalid_version_ranges() {
+        for (min, max) in [(0, 0), (0, 3), (3, 2)] {
+            let adapters = [adapter("invalid", min, max, "web", 100)];
+            for version in [0, 1, 2, 3, u32::MAX] {
+                assert!(
+                    select_interaction_adapter(
+                        &adapters,
+                        "example.plugin",
+                        "example.request",
+                        version,
+                        "web"
+                    )
+                    .is_none()
+                );
+            }
+        }
+        let valid = adapter("valid", 1, 3, "web", 10);
+        assert!(valid.supports("example.request", 1));
+        assert!(valid.supports("example.request", 3));
+        assert!(!valid.supports("example.request", 0));
+        assert!(!valid.supports("example.request", 4));
     }
 
     #[test]

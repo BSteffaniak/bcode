@@ -6479,6 +6479,73 @@ mod client_timeout_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn artifact_client_rejects_empty_before_eof_over_ipc() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bca-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("range.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon: matching_daemon_status(),
+            });
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(hello.request_id, &response).expect("hello envelope"),
+            )
+            .await
+            .expect("send hello");
+            let request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("range request");
+            let response =
+                bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionArtifactRange {
+                    range: super::SessionArtifactRange {
+                        artifact_id: "artifact".to_owned(),
+                        reference_key: "reference".to_owned(),
+                        content_type: None,
+                        offset: 0,
+                        total_bytes: 1,
+                        reference_bytes: Some(1),
+                        reference_revision: 1,
+                        finalized: true,
+                        finalized_event_seq: Some(1),
+                        availability: None,
+                        complete: Some(true),
+                        checksum_sha256: None,
+                        bytes: Vec::new(),
+                    },
+                });
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(request.request_id, &response)
+                    .expect("range envelope"),
+            )
+            .await
+            .expect("send range");
+        });
+        let client = BcodeClient::new(endpoint);
+        let error = client
+            .session_artifact_range(
+                SessionId::new(),
+                "artifact".to_owned(),
+                "reference".to_owned(),
+                0,
+                1,
+            )
+            .await
+            .expect_err("inconsistent range must fail");
+        assert!(matches!(error, ClientError::Protocol(_)));
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn preparation_recovers_retained_operation_after_transport_interruption() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcr-{}", SessionOpenOperationId::new()));
