@@ -11520,7 +11520,7 @@ fn settle_fan_out_member_failure(
         })?;
     let configuration: bcode_workflow::WorkflowFanOutConfiguration =
         serde_json::from_value(controller.configuration)?;
-    transaction.execute(
+    let changed = transaction.execute(
         "UPDATE workflow_fan_out_members SET status = 'failed', terminal_at_ms = ?4 \
          WHERE run_id = ?1 AND member_node_id = ?2 AND member_activation_id = ?3 \
            AND status = 'running'",
@@ -11531,6 +11531,11 @@ fn settle_fan_out_member_failure(
             settled_at_ms,
         ),
     )?;
+    if changed != 1 {
+        return Err(WorkflowStoreError::InvalidData(
+            "fan-out member is not running or already settled".to_string(),
+        ));
+    }
     transaction.execute(
         "UPDATE workflow_activations SET status = 'failed' WHERE run_id = ?1 \
          AND node_id = ?2 AND activation_id = ?3 AND status = 'running'",
@@ -11746,11 +11751,41 @@ fn settle_fan_out_member_success(
     }
     let incomplete: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 \
-         AND controller_activation_id = ?2 AND status != 'completed')",
+         AND controller_activation_id = ?2 AND status NOT IN ('completed', 'failed'))",
         (&request.run_id, &controller_activation_id),
         |row| row.get(0),
     )?;
     if incomplete {
+        return Ok(());
+    }
+    let failed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 \
+         AND controller_activation_id = ?2 AND status = 'failed')",
+        (&request.run_id, &controller_activation_id),
+        |row| row.get(0),
+    )?;
+    if failed {
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'failed' WHERE run_id = ?1 \
+             AND node_id = ?2 AND activation_id = ?3 AND status = 'running'",
+            (
+                &request.run_id,
+                &controller_node_id,
+                &controller_activation_id,
+            ),
+        )?;
+        transaction.execute(
+            "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+             WHERE run_id = ?1 AND status = 'running'",
+            (&request.run_id, settled_at_ms),
+        )?;
+        append_event(
+            transaction,
+            &request.run_id,
+            "fan_out_failed",
+            &serde_json::json!({"controller_activation_id": controller_activation_id}).to_string(),
+            settled_at_ms,
+        )?;
         return Ok(());
     }
     let mut statement = transaction.prepare(
@@ -17834,6 +17869,142 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_receipt_backed_success_aggregates_across_restarts() {
+        verify_fan_out_receipt_backed_completion(false);
+    }
+
+    #[test]
+    fn fan_out_receipt_backed_wait_all_failure_settles_across_restarts() {
+        verify_fan_out_receipt_backed_completion(true);
+    }
+
+    fn verify_fan_out_receipt_backed_completion(fail_first: bool) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("fan-out", 1, &fan_out_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "fan-out".to_string();
+        run.input = Some(serde_json::json!([3, 1, 2]));
+        store.create_run(&run).expect("run");
+        store
+            .settle_pending_control_nodes("run-1", 10, 20)
+            .expect("materialize");
+        for index in 0..3 {
+            let member = store
+                .pending_activations_for_run("run-1", 1)
+                .expect("pending")
+                .remove(0);
+            let prepared = store
+                .prepare_pending_activation(
+                    "run-1",
+                    &member.node_id,
+                    &member.activation_id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"operation": "test"}),
+                    30,
+                )
+                .expect("prepare")
+                .expect("admitted");
+            store
+                .persist_dispatch_receipt(&DispatchReceipt {
+                    run_id: member.run_id.clone(),
+                    node_id: member.node_id.clone(),
+                    activation_id: member.activation_id.clone(),
+                    attempt: prepared.attempt,
+                    dispatch_identity: prepared.dispatch_identity.clone(),
+                    receipt: serde_json::json!({"owner": "test"}),
+                    admitted_at_ms: 31,
+                })
+                .expect("receipt");
+            drop(store);
+            store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen receipt");
+            let output = ValidatedOutput {
+                output_id: format!("{}:output", member.activation_id),
+                run_id: member.run_id,
+                node_id: member.node_id,
+                activation_id: member.activation_id,
+                schema_id: member.node.output.type_name,
+                schema_version: 1,
+                value: member.input.expect("member input"),
+                artifact_reference: None,
+                created_at_ms: 40,
+            };
+            let failed = fail_first && index == 0;
+            let observation = if failed {
+                AttemptObservation::Failed {
+                    message: "member failed".to_string(),
+                }
+            } else {
+                AttemptObservation::Succeeded { output }
+            };
+            let summary = store
+                .apply_attempt_observation(&prepared.dispatch_identity, observation, 40)
+                .expect("observe outcome");
+            if failed {
+                assert_eq!(summary.failed, [prepared.dispatch_identity]);
+            } else {
+                assert_eq!(summary.succeeded, [prepared.dispatch_identity]);
+            }
+        }
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen terminal");
+        verify_fan_out_terminal_result(&store, fail_first);
+    }
+
+    fn verify_fan_out_terminal_result(store: &WorkflowStore, failed: bool) {
+        let output = store.canonical_terminal_output("run-1").expect("output");
+        if failed {
+            assert!(output.is_none());
+        } else {
+            assert_eq!(
+                output.expect("completed").value,
+                serde_json::json!({"version": 1, "members": [
+                    {"index": 0, "value": 3}, {"index": 1, "value": 1}, {"index": 2, "value": 2}
+                ]})
+            );
+        }
+        let status = if failed { "failed" } else { "completed" };
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_runs WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("run status"),
+            status
+        );
+        assert_eq!(store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'fan-out'", [],
+            |row| row.get::<_, String>(0)).expect("controller status"), status);
+        let attempts = store.attempt_history("run-1", None, 10).expect("attempts");
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|attempt| attempt.status == "failed")
+                .count(),
+            usize::from(failed)
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|attempt| attempt.status == "succeeded")
+                .count(),
+            3 - usize::from(failed)
+        );
+        assert!(
+            store
+                .pending_activations_for_run("run-1", 10)
+                .expect("pending")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn fan_out_failure_requires_run_graph_and_releases_wait_all_capacity() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -17893,9 +18064,24 @@ mod tests {
                 .expect("settle failure")
                 .is_empty()
         );
+        let after_settlement = transaction.total_changes();
+        assert!(
+            settle_fan_out_member_failure(&transaction, &request, "duplicate failure", 41)
+                .expect_err("already settled")
+                .to_string()
+                .contains("already settled")
+        );
+        assert_eq!(transaction.total_changes(), after_settlement);
         transaction.commit().expect("commit");
         drop(store);
         let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        verify_failed_member_and_finish(store, &request);
+    }
+
+    fn verify_failed_member_and_finish(
+        store: WorkflowStore,
+        request: &AttemptReconciliationRequest,
+    ) {
         assert_eq!(
             store
                 .pending_activations_for_run("run-1", 10)
@@ -17927,6 +18113,69 @@ mod tests {
                 )
                 .expect("run status"),
             "running"
+        );
+        finish_wait_all_members_and_verify_failure(store);
+    }
+
+    fn finish_wait_all_members_and_verify_failure(mut store: WorkflowStore) {
+        let members = store
+            .pending_activations_for_run("run-1", 10)
+            .expect("members");
+        for member in members {
+            store
+                .prepare_pending_activation(
+                    "run-1",
+                    &member.node_id,
+                    &member.activation_id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"operation": "test"}),
+                    50,
+                )
+                .expect("prepare")
+                .expect("admitted");
+            let request = AttemptReconciliationRequest {
+                run_id: member.run_id.clone(),
+                node_id: member.node_id.clone(),
+                activation_id: member.activation_id.clone(),
+                attempt: 1,
+                dispatch_identity: "test".to_string(),
+                side_effect: DispatchSideEffect::ReadOnly,
+                receipt: serde_json::json!({}),
+            };
+            let output = ValidatedOutput {
+                output_id: format!("{}:output", member.activation_id),
+                run_id: member.run_id,
+                node_id: member.node_id,
+                activation_id: member.activation_id,
+                schema_id: member.node.output.type_name,
+                schema_version: 1,
+                value: serde_json::json!(1),
+                artifact_reference: None,
+                created_at_ms: 60,
+            };
+            let transaction = store.connection.transaction().expect("transaction");
+            settle_fan_out_member_success(&transaction, &request, &output, 60).expect("success");
+            transaction.commit().expect("commit");
+        }
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_runs WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("run status"),
+            "failed"
+        );
+        assert_eq!(store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'fan-out'", [],
+            |row| row.get::<_, String>(0)).expect("controller status"), "failed");
+        assert!(
+            store
+                .canonical_terminal_output("run-1")
+                .expect("terminal output")
+                .is_none()
         );
     }
 
