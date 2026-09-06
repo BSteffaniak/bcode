@@ -2339,7 +2339,7 @@ impl ServerState {
         self.start_catalog_backfill();
     }
 
-    fn start_catalog_backfill(self: &Arc<Self>) {
+    fn start_catalog_backfill(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let mut shutdown = self.subscribe_shutdown();
         let state = Arc::clone(self);
         tokio::spawn(async move {
@@ -2369,7 +2369,7 @@ impl ServerState {
                     );
                 }
             }
-        });
+        })
     }
 
     fn start_idle_shutdown_watcher(self: &Arc<Self>, idle_after: Duration) {
@@ -69761,6 +69761,30 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("clean shutdown");
         state.start_session_search_ingestion().await;
         assert!(state.session_search_ingestion.lock().await.is_none());
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn catalog_backfill_after_shutdown_releases_worker_state() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        state.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), state.start_catalog_backfill())
+            .await
+            .expect("backfill exits after shutdown")
+            .expect("backfill does not panic");
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalog_backfill_shutdown_before_first_poll_releases_worker_state() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let worker = state.start_catalog_backfill();
+        // No await before shutdown: the current-thread runtime cannot poll the worker yet.
+        state.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("backfill exits before processing")
+            .expect("backfill does not panic");
         assert_eq!(Arc::strong_count(&state), 1);
     }
 
