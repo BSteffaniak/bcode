@@ -8604,6 +8604,9 @@ async fn run_auth_interactive_flow(
                         println!("Choices: {}", choices.join(", "));
                     }
                     let value = read_stdin_line()?;
+                    effect
+                        .validate_answer(&value)
+                        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
                     input = Some(bcode_provider_auth_models::AuthFlowInput {
                         prompt_id: prompt_id.clone(),
                         value,

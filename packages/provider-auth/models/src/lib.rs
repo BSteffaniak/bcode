@@ -643,6 +643,13 @@ impl AuthFlowResponse {
         for effect in &self.effects {
             effect.validate()?;
             if self.status != AuthFlowStatus::Pending
+                && matches!(effect, AuthFlowEffect::Wait { .. })
+            {
+                return Err(AuthContractError::InvalidFlowShape(
+                    "terminal responses cannot request continuation waits",
+                ));
+            }
+            if self.status != AuthFlowStatus::Pending
                 && matches!(effect, AuthFlowEffect::Prompt { .. })
             {
                 return Err(AuthContractError::InvalidFlowShape(
@@ -725,6 +732,28 @@ pub enum AuthFlowEffect {
 }
 
 impl AuthFlowEffect {
+    /// Validate an answer against this prompt's offered choices.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-prompt effects, invalid prompt definitions, oversized answers,
+    /// and answers outside a non-empty choice list. Errors never include the supplied answer.
+    pub fn validate_answer(&self, value: &str) -> Result<(), AuthContractError> {
+        self.validate()?;
+        let Self::Prompt { choices, .. } = self else {
+            return Err(AuthContractError::InvalidFlowShape(
+                "only prompts accept answers",
+            ));
+        };
+        validate_optional_text("input.value", value, MAX_AUTH_TEXT_BYTES)?;
+        if !choices.is_empty() && !choices.iter().any(|choice| choice == value) {
+            return Err(AuthContractError::InvalidFlowShape(
+                "authentication response must match one of the offered choices",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), AuthContractError> {
         match self {
             Self::OpenBrowser { url } => validate_url(url),
@@ -1206,6 +1235,95 @@ mod tests {
             diagnostics: Vec::new(),
         };
         response.validate().expect("valid terminal success");
+    }
+
+    #[test]
+    fn prompt_answers_obey_input_byte_bounds() {
+        let prompt = AuthFlowEffect::Prompt {
+            prompt_id: "answer".to_owned(),
+            message: "Enter answer".to_owned(),
+            choices: Vec::new(),
+        };
+        for value in [
+            String::new(),
+            "a".repeat(MAX_AUTH_TEXT_BYTES),
+            "é".repeat(MAX_AUTH_TEXT_BYTES / 2),
+        ] {
+            prompt.validate_answer(&value).unwrap();
+            AuthFlowInput {
+                prompt_id: "answer".to_owned(),
+                value,
+            }
+            .validate()
+            .unwrap();
+        }
+        for value in [
+            "a".repeat(MAX_AUTH_TEXT_BYTES + 1),
+            "é".repeat(MAX_AUTH_TEXT_BYTES / 2 + 1),
+        ] {
+            let error = prompt.validate_answer(&value).unwrap_err();
+            let input = AuthFlowInput {
+                prompt_id: "answer".to_owned(),
+                value,
+            };
+            assert_eq!(error, input.validate().unwrap_err());
+            assert!(!error.to_string().contains(&input.value));
+        }
+    }
+
+    #[test]
+    fn prompt_answer_validation_is_shared_and_secret_safe() {
+        let mut prompt = AuthFlowEffect::Prompt {
+            prompt_id: "confirm".to_owned(),
+            message: "Confirm".to_owned(),
+            choices: vec!["yes".to_owned(), "no".to_owned()],
+        };
+        prompt.validate_answer("yes").unwrap();
+        prompt.validate_answer("no").unwrap();
+        for answer in ["", "YES", "secret-unoffered-answer"] {
+            assert!(matches!(
+                prompt.validate_answer(answer),
+                Err(AuthContractError::InvalidFlowShape(
+                    "authentication response must match one of the offered choices"
+                ))
+            ));
+        }
+        if let AuthFlowEffect::Prompt { choices, .. } = &mut prompt {
+            choices.clear();
+        }
+        prompt.validate_answer("free text").unwrap();
+        assert!(
+            AuthFlowEffect::Wait { millis: 1 }
+                .validate_answer("yes")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn continuation_waits_require_pending_status() {
+        let mut response = AuthFlowResponse {
+            schema_version: AUTH_FLOW_SCHEMA_VERSION,
+            status: AuthFlowStatus::Pending,
+            state: Some("state".to_owned()),
+            effects: vec![AuthFlowEffect::Wait { millis: 1 }],
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        response.validate().unwrap();
+        response.state = None;
+        for status in [
+            AuthFlowStatus::Succeeded,
+            AuthFlowStatus::Failed,
+            AuthFlowStatus::Cancelled,
+        ] {
+            response.status = status;
+            assert!(matches!(
+                response.validate(),
+                Err(AuthContractError::InvalidFlowShape(
+                    "terminal responses cannot request continuation waits"
+                ))
+            ));
+        }
     }
 
     #[test]
