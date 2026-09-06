@@ -37,6 +37,89 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
+/// Scope for durable composer draft persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerDraftScope {
+    /// Draft belongs to a persisted session.
+    Session { session_id: SessionId },
+    /// Draft belongs to the unsaved draft session for the launch working directory.
+    DraftSession { launch_working_directory: PathBuf },
+}
+
+/// Placement behavior for submitted user prompts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptPlacement {
+    /// Insert the prompt at the next safe conversation boundary.
+    ///
+    /// When a model request is already streaming, the next safe boundary is a queued follow-up
+    /// turn after the active response finishes.
+    #[default]
+    Steering,
+    /// Queue the prompt to run as a follow-up turn after the active turn finishes.
+    FollowUp,
+}
+
+impl PromptPlacement {
+    /// Return whether this placement is the wire-compatible default.
+    #[must_use]
+    pub const fn is_steering(placement: &Self) -> bool {
+        matches!(placement, Self::Steering)
+    }
+}
+
+/// Disposition for an accepted user prompt or skill invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAcceptanceDisposition {
+    /// Accepted as a new turn that can start immediately.
+    #[default]
+    StartedTurn,
+    /// Accepted as steering for the active turn.
+    AppliedSteering,
+    /// Accepted as a follow-up requested for after the active turn.
+    QueuedFollowUp,
+    /// Accepted behind already queued session work.
+    QueuedTurn,
+}
+
+impl MessageAcceptanceDisposition {
+    /// Return whether the disposition is the wire-compatible default.
+    #[must_use]
+    pub const fn is_default(disposition: &Self) -> bool {
+        matches!(disposition, Self::StartedTurn)
+    }
+}
+
+/// Result returned after a user message or skill invocation is accepted.
+///
+/// This reports placement and queue state, not a durable turn receipt or completion.
+/// Callers requiring canonical admission identity should use [`TurnAdmission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageAcceptance {
+    /// Whether the accepted message was queued.
+    pub queued: bool,
+    /// Reported position in the queue, when available.
+    pub queue_position: Option<u32>,
+    /// Reported placement of the accepted message.
+    pub disposition: MessageAcceptanceDisposition,
+}
+
+impl MessageAcceptance {
+    /// Acceptance for compatibility responses that only report message delivery.
+    ///
+    /// The default disposition does not establish a durable turn identity or outcome.
+    #[must_use]
+    pub const fn sent() -> Self {
+        Self {
+            queued: false,
+            queue_position: None,
+            disposition: MessageAcceptanceDisposition::StartedTurn,
+        }
+    }
+}
+
 /// Pending renderer-neutral invocation exchange associated with a canonical session.
 ///
 /// This is an observation, not a reservation or durable resume token. The exchange may
@@ -3632,6 +3715,56 @@ pub enum SessionEventKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delivery_only_acceptance_preserves_compatibility_defaults() {
+        assert_eq!(
+            super::MessageAcceptance::sent(),
+            super::MessageAcceptance {
+                queued: false,
+                queue_position: None,
+                disposition: super::MessageAcceptanceDisposition::StartedTurn,
+            }
+        );
+    }
+    #[test]
+    fn prompt_submission_contracts_preserve_wire_values_and_reject_future_variants() {
+        use super::{MessageAcceptanceDisposition as Disposition, PromptPlacement};
+
+        for (placement, wire) in [
+            (PromptPlacement::Steering, "\"steering\""),
+            (PromptPlacement::FollowUp, "\"follow_up\""),
+        ] {
+            assert_eq!(serde_json::to_string(&placement).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<PromptPlacement>(wire).unwrap(),
+                placement
+            );
+            assert_eq!(
+                PromptPlacement::is_steering(&placement),
+                placement == PromptPlacement::default()
+            );
+        }
+        for (disposition, wire) in [
+            (Disposition::StartedTurn, "\"started_turn\""),
+            (Disposition::AppliedSteering, "\"applied_steering\""),
+            (Disposition::QueuedFollowUp, "\"queued_follow_up\""),
+            (Disposition::QueuedTurn, "\"queued_turn\""),
+        ] {
+            assert_eq!(serde_json::to_string(&disposition).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<Disposition>(wire).unwrap(),
+                disposition
+            );
+            assert_eq!(
+                Disposition::is_default(&disposition),
+                disposition == Disposition::default()
+            );
+        }
+        for unknown in ["\"future_variant\"", "null", "0", "{}"] {
+            assert!(serde_json::from_str::<PromptPlacement>(unknown).is_err());
+            assert!(serde_json::from_str::<Disposition>(unknown).is_err());
+        }
+    }
     use super::*;
 
     fn derivation_request() -> SessionDerivationRequest {

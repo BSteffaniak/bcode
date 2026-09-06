@@ -2,6 +2,59 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
+fn prompt_action_preserves_session_owned_placement_contract() {
+    for (placement, wire) in [
+        (bcode_session_models::PromptPlacement::Steering, "steering"),
+        (bcode_session_models::PromptPlacement::FollowUp, "follow_up"),
+    ] {
+        let action = SessionViewAction::SubmitMessage {
+            session_id: Some(SessionId::new()),
+            launch_working_directory: None,
+            text: "continue".to_owned(),
+            placement,
+            execution: Box::default(),
+        };
+        let mut encoded = serde_json::to_value(&action).expect("encode action");
+        assert_eq!(encoded["placement"], wire);
+        assert_eq!(
+            serde_json::from_value::<SessionViewAction>(encoded.clone()).unwrap(),
+            action
+        );
+        encoded["placement"] = serde_json::json!("future_placement");
+        assert!(serde_json::from_value::<SessionViewAction>(encoded).is_err());
+    }
+}
+
+#[test]
+fn acceptance_outcome_preserves_session_owned_disposition_contract() {
+    use bcode_session_models::MessageAcceptanceDisposition as Disposition;
+    for (disposition, wire) in [
+        (Disposition::StartedTurn, "started_turn"),
+        (Disposition::AppliedSteering, "applied_steering"),
+        (Disposition::QueuedFollowUp, "queued_follow_up"),
+        (Disposition::QueuedTurn, "queued_turn"),
+    ] {
+        let outcome = SessionViewActionOutcome::MessageAccepted {
+            session_id: SessionId::new(),
+            queued: matches!(
+                disposition,
+                Disposition::QueuedFollowUp | Disposition::QueuedTurn
+            ),
+            queue_position: None,
+            disposition,
+        };
+        let mut encoded = serde_json::to_value(&outcome).expect("encode outcome");
+        assert_eq!(encoded["disposition"], wire);
+        assert_eq!(
+            serde_json::from_value::<SessionViewActionOutcome>(encoded.clone()).unwrap(),
+            outcome
+        );
+        encoded["disposition"] = serde_json::json!("future_disposition");
+        assert!(serde_json::from_value::<SessionViewActionOutcome>(encoded).is_err());
+    }
+}
+
+#[test]
 fn skill_invocation_action_round_trips_execution_options() {
     let action = SessionViewAction::InvokeSkill {
         session_id: SessionId::new(),

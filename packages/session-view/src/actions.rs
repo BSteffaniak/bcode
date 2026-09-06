@@ -1,11 +1,9 @@
 //! Daemon-backed execution for renderer-neutral session actions.
 
-use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
-use bcode_ipc::{ComposerDraftScope, PromptPlacement};
-use bcode_session_models::SessionId;
+use bcode_client::{BcodeClient, ClientError};
+use bcode_session_models::{ComposerDraftScope, MessageAcceptance, SessionId};
 use bcode_session_view_models::{
-    ComposerDraftViewScope, MessageAcceptanceDispositionView, PromptPlacementView,
-    SessionViewAction, SessionViewActionOutcome,
+    ComposerDraftViewScope, PromptPlacementView, SessionViewAction, SessionViewActionOutcome,
 };
 use bcode_skill_models::SkillId;
 
@@ -276,7 +274,7 @@ async fn execute_submit_message(
             .id
     };
     let acceptance = client
-        .send_user_message_with_execution(session_id, text, prompt_placement(placement), execution)
+        .send_user_message_with_execution(session_id, text, placement, execution)
         .await?;
     Ok(message_accepted_outcome(session_id, acceptance))
 }
@@ -336,27 +334,7 @@ fn message_accepted_outcome(
         queue_position: acceptance
             .queue_position
             .and_then(|position| usize::try_from(position).ok()),
-        disposition: match acceptance.disposition {
-            bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
-                MessageAcceptanceDispositionView::AppliedSteering
-            }
-            bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp => {
-                MessageAcceptanceDispositionView::QueuedFollowUp
-            }
-            bcode_ipc::MessageAcceptanceDisposition::QueuedTurn => {
-                MessageAcceptanceDispositionView::QueuedTurn
-            }
-            bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
-                MessageAcceptanceDispositionView::StartedTurn
-            }
-        },
-    }
-}
-
-const fn prompt_placement(value: PromptPlacementView) -> PromptPlacement {
-    match value {
-        PromptPlacementView::Steering => PromptPlacement::Steering,
-        PromptPlacementView::FollowUp => PromptPlacement::FollowUp,
+        disposition: acceptance.disposition,
     }
 }
 
@@ -377,24 +355,53 @@ fn composer_draft_scope(value: ComposerDraftViewScope) -> ComposerDraftScope {
 mod tests {
     use super::*;
 
-    #[test]
-    fn prompt_placement_maps_to_ipc() {
-        assert_eq!(
-            prompt_placement(PromptPlacementView::Steering),
-            PromptPlacement::Steering
-        );
-        assert_eq!(
-            prompt_placement(PromptPlacementView::FollowUp),
-            PromptPlacement::FollowUp
-        );
-    }
+    use bcode_session_view_models::MessageAcceptanceDispositionView;
 
     #[test]
-    fn draft_scope_maps_to_ipc() {
+    fn draft_scope_preserves_domain_identity_and_distinct_wire_formats() {
         let session_id = SessionId::new();
-        assert_eq!(
-            composer_draft_scope(ComposerDraftViewScope::Session { session_id }),
-            ComposerDraftScope::Session { session_id }
+        for (view, domain, wire_name) in [
+            (
+                ComposerDraftViewScope::Session { session_id },
+                ComposerDraftScope::Session { session_id },
+                "session",
+            ),
+            (
+                ComposerDraftViewScope::DraftSession {
+                    launch_working_directory: "/workspace/project with spaces".into(),
+                },
+                ComposerDraftScope::DraftSession {
+                    launch_working_directory: "/workspace/project with spaces".into(),
+                },
+                "draft_session",
+            ),
+        ] {
+            assert_eq!(composer_draft_scope(view.clone()), domain);
+            let view_json = serde_json::to_value(&view).expect("view encoding");
+            let domain_json = serde_json::to_value(&domain).expect("domain encoding");
+            assert_eq!(view_json["type"], wire_name);
+            assert_eq!(domain_json.as_object().unwrap().len(), 1);
+            assert!(domain_json.get(wire_name).is_some());
+            assert_eq!(
+                serde_json::from_value::<ComposerDraftViewScope>(view_json).unwrap(),
+                view
+            );
+            assert_eq!(
+                serde_json::from_value::<ComposerDraftScope>(domain_json).unwrap(),
+                domain
+            );
+        }
+        assert!(
+            serde_json::from_value::<ComposerDraftViewScope>(serde_json::json!({
+                "type": "future_scope"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ComposerDraftScope>(serde_json::json!({
+                "future_scope": {}
+            }))
+            .is_err()
         );
     }
 
@@ -403,19 +410,19 @@ mod tests {
         let session_id = SessionId::new();
         for (ipc, view) in [
             (
-                bcode_ipc::MessageAcceptanceDisposition::AppliedSteering,
+                bcode_session_models::MessageAcceptanceDisposition::AppliedSteering,
                 MessageAcceptanceDispositionView::AppliedSteering,
             ),
             (
-                bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp,
+                bcode_session_models::MessageAcceptanceDisposition::QueuedFollowUp,
                 MessageAcceptanceDispositionView::QueuedFollowUp,
             ),
             (
-                bcode_ipc::MessageAcceptanceDisposition::QueuedTurn,
+                bcode_session_models::MessageAcceptanceDisposition::QueuedTurn,
                 MessageAcceptanceDispositionView::QueuedTurn,
             ),
             (
-                bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
+                bcode_session_models::MessageAcceptanceDisposition::StartedTurn,
                 MessageAcceptanceDispositionView::StartedTurn,
             ),
         ] {
@@ -425,8 +432,8 @@ mod tests {
                     MessageAcceptance {
                         queued: !matches!(
                             ipc,
-                            bcode_ipc::MessageAcceptanceDisposition::StartedTurn
-                                | bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
+                            bcode_session_models::MessageAcceptanceDisposition::StartedTurn
+                                | bcode_session_models::MessageAcceptanceDisposition::AppliedSteering
                         ),
                         queue_position: None,
                         disposition: ipc,
@@ -447,7 +454,7 @@ mod tests {
                 MessageAcceptance {
                     queued: true,
                     queue_position: Some(3),
-                    disposition: bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp,
+                    disposition: bcode_session_models::MessageAcceptanceDisposition::QueuedFollowUp,
                 },
             ),
             SessionViewActionOutcome::MessageAccepted {

@@ -6731,17 +6731,9 @@ async fn handle_set_composer_draft(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
-    scope: bcode_ipc::ComposerDraftScope,
+    scope: bcode_session_models::ComposerDraftScope,
     text: String,
 ) -> Result<(), ServerError> {
-    let scope = match scope {
-        bcode_ipc::ComposerDraftScope::Session { session_id } => {
-            session_operations::ComposerDraftScope::Session(session_id)
-        }
-        bcode_ipc::ComposerDraftScope::DraftSession {
-            launch_working_directory,
-        } => session_operations::ComposerDraftScope::DraftSession(launch_working_directory),
-    };
     session_operations::set_composer_draft(state, scope, text).await?;
     send_response(
         writer,
@@ -6755,16 +6747,8 @@ async fn handle_composer_draft(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
-    scope: bcode_ipc::ComposerDraftScope,
+    scope: bcode_session_models::ComposerDraftScope,
 ) -> Result<(), ServerError> {
-    let scope = match scope {
-        bcode_ipc::ComposerDraftScope::Session { session_id } => {
-            session_operations::ComposerDraftScope::Session(session_id)
-        }
-        bcode_ipc::ComposerDraftScope::DraftSession {
-            launch_working_directory,
-        } => session_operations::ComposerDraftScope::DraftSession(launch_working_directory),
-    };
     let draft = session_operations::composer_draft(state, scope).await?;
     send_response(
         writer,
@@ -46917,6 +46901,99 @@ library = "test"
             ipc.id
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn composer_draft_operations_match_real_ipc_results() {
+        use bcode_session_models::ComposerDraftScope;
+
+        struct AbortServerOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortServerOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(session_root.path()).expect("session manager");
+        let state = Arc::new(test_server_state(sessions));
+        let directory = tempfile::tempdir().expect("launch directory");
+        let session = session_operations::create(&state, None, directory.path().to_path_buf())
+            .await
+            .expect("session");
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let stream = accepted.expect("connection");
+                        let state = Arc::clone(&server_state);
+                        connections.spawn(async move { handle_client(stream, state).await });
+                    }
+                    result = connections.join_next(), if !connections.is_empty() => {
+                        result.expect("connection task").expect("join connection").expect("handle connection");
+                    }
+                }
+            }
+        });
+        let _cleanup = AbortServerOnDrop(server.abort_handle());
+        let client = bcode_client::BcodeClient::new(endpoint);
+        for scope in [
+            ComposerDraftScope::Session {
+                session_id: session.id,
+            },
+            ComposerDraftScope::DraftSession {
+                launch_working_directory: directory.path().to_path_buf(),
+            },
+        ] {
+            assert_eq!(
+                client
+                    .composer_draft(scope.clone())
+                    .await
+                    .expect("initial draft"),
+                None
+            );
+            session_operations::set_composer_draft(&state, scope.clone(), "direct\n雪".to_owned())
+                .await
+                .expect("direct write");
+            assert_eq!(
+                client
+                    .composer_draft(scope.clone())
+                    .await
+                    .expect("IPC read"),
+                Some("direct\n雪".to_owned())
+            );
+            client
+                .set_composer_draft(scope.clone(), "IPC\nupdated".to_owned())
+                .await
+                .expect("IPC write");
+            assert_eq!(
+                session_operations::composer_draft(&state, scope.clone())
+                    .await
+                    .expect("direct read"),
+                Some("IPC\nupdated".to_owned())
+            );
+            client
+                .set_composer_draft(scope.clone(), String::new())
+                .await
+                .expect("clear draft");
+            assert_eq!(
+                session_operations::composer_draft(&state, scope.clone())
+                    .await
+                    .expect("cleared direct"),
+                None
+            );
+            assert_eq!(
+                client.composer_draft(scope).await.expect("cleared IPC"),
+                None
+            );
+        }
+        server.abort();
+        assert!(server.await.expect_err("server aborted").is_cancelled());
     }
 
     #[tokio::test]

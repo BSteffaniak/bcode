@@ -616,23 +616,32 @@ impl From<ErrorResponse> for ClientError {
     }
 }
 
-/// Result returned after a user message or skill invocation is accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MessageAcceptance {
-    pub queued: bool,
-    pub queue_position: Option<u32>,
-    pub disposition: bcode_ipc::MessageAcceptanceDisposition,
-}
+/// Compatibility export for the session-owned message acceptance result.
+pub use bcode_session_models::MessageAcceptance;
 
-impl MessageAcceptance {
-    /// Acceptance for legacy servers that only report message delivery.
-    #[must_use]
-    pub const fn sent() -> Self {
-        Self {
-            queued: false,
-            queue_position: None,
-            disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
-        }
+const fn decode_message_acceptance(
+    response: &ResponsePayload,
+) -> Result<MessageAcceptance, ClientError> {
+    match response {
+        ResponsePayload::MessageAccepted {
+            queued,
+            queue_position,
+        } => Ok(MessageAcceptance {
+            queued: *queued,
+            queue_position: *queue_position,
+            disposition: bcode_session_models::MessageAcceptanceDisposition::StartedTurn,
+        }),
+        ResponsePayload::MessageAcceptedWithDisposition {
+            queued,
+            queue_position,
+            disposition,
+        } => Ok(MessageAcceptance {
+            queued: *queued,
+            queue_position: *queue_position,
+            disposition: *disposition,
+        }),
+        ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
+        _ => Err(ClientError::UnexpectedResponse),
     }
 }
 
@@ -1264,7 +1273,7 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn composer_draft(
         &self,
-        scope: bcode_ipc::ComposerDraftScope,
+        scope: bcode_session_models::ComposerDraftScope,
     ) -> Result<Option<String>, ClientError> {
         match self.send_request(Request::ComposerDraft { scope }).await? {
             ResponsePayload::ComposerDraft { draft } => Ok(draft),
@@ -1281,7 +1290,7 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn set_composer_draft(
         &self,
-        scope: bcode_ipc::ComposerDraftScope,
+        scope: bcode_session_models::ComposerDraftScope,
         text: String,
     ) -> Result<(), ClientError> {
         match self
@@ -2293,36 +2302,17 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
         text: String,
-        placement: bcode_ipc::PromptPlacement,
+        placement: bcode_session_models::PromptPlacement,
     ) -> Result<MessageAcceptance, ClientError> {
-        match self
-            .send_request(Request::SendUserMessageWithPlacement {
-                session_id,
-                text,
-                placement,
-            })
-            .await?
-        {
-            ResponsePayload::MessageAccepted {
-                queued,
-                queue_position,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
-            }),
-            ResponsePayload::MessageAcceptedWithDisposition {
-                queued,
-                queue_position,
-                disposition,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition,
-            }),
-            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+        decode_message_acceptance(
+            &self
+                .send_request(Request::SendUserMessageWithPlacement {
+                    session_id,
+                    text,
+                    placement,
+                })
+                .await?,
+        )
     }
 
     /// Send a user message with immutable execution options for its admitted turn.
@@ -2334,38 +2324,19 @@ impl BcodeClient {
         &self,
         session_id: SessionId,
         text: String,
-        placement: bcode_ipc::PromptPlacement,
+        placement: bcode_session_models::PromptPlacement,
         execution: bcode_session_models::TurnExecutionOptions,
     ) -> Result<MessageAcceptance, ClientError> {
-        match self
-            .send_request(Request::SendUserMessageWithExecution {
-                session_id,
-                text,
-                placement,
-                execution,
-            })
-            .await?
-        {
-            ResponsePayload::MessageAccepted {
-                queued,
-                queue_position,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
-            }),
-            ResponsePayload::MessageAcceptedWithDisposition {
-                queued,
-                queue_position,
-                disposition,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition,
-            }),
-            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+        decode_message_acceptance(
+            &self
+                .send_request(Request::SendUserMessageWithExecution {
+                    session_id,
+                    text,
+                    placement,
+                    execution,
+                })
+                .await?,
+        )
     }
 
     /// Set a session-specific model selection.
@@ -4333,27 +4304,7 @@ impl BcodeClient {
         &self,
         request: Request,
     ) -> Result<MessageAcceptance, ClientError> {
-        match self.send_request(request).await? {
-            ResponsePayload::MessageAccepted {
-                queued,
-                queue_position,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
-            }),
-            ResponsePayload::MessageAcceptedWithDisposition {
-                queued,
-                queue_position,
-                disposition,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition,
-            }),
-            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+        decode_message_acceptance(&self.send_request(request).await?)
     }
 
     /// Activate a skill for a session.
@@ -5554,36 +5505,17 @@ impl ClientConnection {
         &mut self,
         session_id: SessionId,
         text: String,
-        placement: bcode_ipc::PromptPlacement,
+        placement: bcode_session_models::PromptPlacement,
     ) -> Result<MessageAcceptance, ClientError> {
-        match self
-            .send_request(Request::SendUserMessageWithPlacement {
-                session_id,
-                text,
-                placement,
-            })
-            .await?
-        {
-            ResponsePayload::MessageAccepted {
-                queued,
-                queue_position,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
-            }),
-            ResponsePayload::MessageAcceptedWithDisposition {
-                queued,
-                queue_position,
-                disposition,
-            } => Ok(MessageAcceptance {
-                queued,
-                queue_position,
-                disposition,
-            }),
-            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+        decode_message_acceptance(
+            &self
+                .send_request(Request::SendUserMessageWithPlacement {
+                    session_id,
+                    text,
+                    placement,
+                })
+                .await?,
+        )
     }
 
     /// Receive the next server event.
@@ -5769,6 +5701,71 @@ const fn session_open_failure_code(
         }
         bcode_session_models::SessionOpenFailureKind::MigrationFailed => "session_migration_failed",
         bcode_session_models::SessionOpenFailureKind::NotFound => "session_not_found",
+    }
+}
+
+#[cfg(test)]
+mod message_acceptance_tests {
+    use super::*;
+    use bcode_session_models::MessageAcceptanceDisposition as Disposition;
+
+    #[test]
+    fn acceptance_decoder_preserves_all_reported_fields() {
+        for disposition in [
+            Disposition::StartedTurn,
+            Disposition::AppliedSteering,
+            Disposition::QueuedFollowUp,
+            Disposition::QueuedTurn,
+        ] {
+            for queued in [false, true] {
+                for queue_position in [None, Some(0), Some(u32::MAX)] {
+                    let result = decode_message_acceptance(
+                        &ResponsePayload::MessageAcceptedWithDisposition {
+                            queued,
+                            queue_position,
+                            disposition,
+                        },
+                    )
+                    .expect("acceptance");
+                    assert_eq!(
+                        result,
+                        MessageAcceptance {
+                            queued,
+                            queue_position,
+                            disposition
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn acceptance_decoder_preserves_compatibility_and_rejects_unrelated_responses() {
+        assert_eq!(
+            decode_message_acceptance(&ResponsePayload::MessageSent).unwrap(),
+            MessageAcceptance::sent()
+        );
+        for queued in [false, true] {
+            for queue_position in [None, Some(0), Some(u32::MAX)] {
+                assert_eq!(
+                    decode_message_acceptance(&ResponsePayload::MessageAccepted {
+                        queued,
+                        queue_position
+                    })
+                    .unwrap(),
+                    MessageAcceptance {
+                        queued,
+                        queue_position,
+                        disposition: Disposition::StartedTurn,
+                    }
+                );
+            }
+        }
+        assert!(matches!(
+            decode_message_acceptance(&ResponsePayload::ComposerDraftSet),
+            Err(ClientError::UnexpectedResponse)
+        ));
     }
 }
 

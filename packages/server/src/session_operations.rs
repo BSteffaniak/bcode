@@ -230,13 +230,7 @@ pub async fn release_ownership(
     super::explicit_session_ownership_release_outcome(state, session_id).await
 }
 
-/// Application-level scope for persisted composer drafts.
-pub enum ComposerDraftScope {
-    /// Draft associated with one canonical session.
-    Session(bcode_session_models::SessionId),
-    /// Draft associated with a not-yet-created session in one launch directory.
-    DraftSession(PathBuf),
-}
+use bcode_session_models::ComposerDraftScope;
 
 /// Persist a composer draft without transport framing.
 pub async fn set_composer_draft(
@@ -245,13 +239,15 @@ pub async fn set_composer_draft(
     text: String,
 ) -> Result<(), bcode_session::SessionError> {
     match scope {
-        ComposerDraftScope::Session(session_id) => {
+        ComposerDraftScope::Session { session_id } => {
             state
                 .sessions
                 .set_session_composer_draft(session_id, text)
                 .await?;
         }
-        ComposerDraftScope::DraftSession(launch_working_directory) => {
+        ComposerDraftScope::DraftSession {
+            launch_working_directory,
+        } => {
             state
                 .sessions
                 .set_draft_session_composer_draft(launch_working_directory, text)
@@ -267,10 +263,12 @@ pub async fn composer_draft(
     scope: ComposerDraftScope,
 ) -> Result<Option<String>, bcode_session::SessionError> {
     match scope {
-        ComposerDraftScope::Session(session_id) => {
+        ComposerDraftScope::Session { session_id } => {
             state.sessions.session_composer_draft(session_id).await
         }
-        ComposerDraftScope::DraftSession(launch_working_directory) => {
+        ComposerDraftScope::DraftSession {
+            launch_working_directory,
+        } => {
             state
                 .sessions
                 .draft_session_composer_draft(launch_working_directory)

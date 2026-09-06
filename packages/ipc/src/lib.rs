@@ -198,50 +198,7 @@ impl Default for ProtocolVersion {
     }
 }
 
-/// Placement behavior for submitted user prompts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptPlacement {
-    /// Insert the prompt at the next safe conversation boundary.
-    ///
-    /// When a model request is already streaming, the next safe boundary is a queued follow-up
-    /// turn after the active response finishes.
-    #[default]
-    Steering,
-    /// Queue the prompt to run as a follow-up turn after the active turn finishes.
-    FollowUp,
-}
-
-/// Server-side disposition for an accepted user prompt or skill invocation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageAcceptanceDisposition {
-    /// Accepted as a new turn that can start immediately.
-    #[default]
-    StartedTurn,
-    /// Accepted as steering for the active turn.
-    AppliedSteering,
-    /// Accepted as a follow-up requested for after the active turn.
-    QueuedFollowUp,
-    /// Accepted behind already queued session work.
-    QueuedTurn,
-}
-
-impl MessageAcceptanceDisposition {
-    /// Return whether the disposition is the wire-compatible default.
-    #[must_use]
-    pub const fn is_default(disposition: &Self) -> bool {
-        matches!(disposition, Self::StartedTurn)
-    }
-}
-
-impl PromptPlacement {
-    /// Return whether this placement is the wire-compatible default.
-    #[must_use]
-    pub const fn is_steering(placement: &Self) -> bool {
-        matches!(placement, Self::Steering)
-    }
-}
+pub use bcode_session_models::{MessageAcceptanceDisposition, PromptPlacement};
 
 /// Envelope discriminant for payload interpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,15 +235,8 @@ impl Envelope {
     }
 }
 
-/// Scope for durable composer draft persistence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComposerDraftScope {
-    /// Draft belongs to a persisted session.
-    Session { session_id: SessionId },
-    /// Draft belongs to the unsaved draft session for the launch working directory.
-    DraftSession { launch_working_directory: PathBuf },
-}
+/// Compatibility export for the session-owned composer draft scope.
+pub use bcode_session_models::ComposerDraftScope;
 
 /// Maximum per-session outcomes retained in one bulk migration operation response.
 pub const MAX_SESSION_BULK_MIGRATION_OUTCOMES: usize = 256;
@@ -5576,6 +5526,26 @@ mod tests {
         let encoded = encode_response(&response).expect("response should encode");
         let decoded = decode_response(&encoded).expect("response should decode");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn prompt_placement_domain_contract_preserves_ipc_encoding() {
+        let session_id = SessionId::new();
+        for placement in [
+            bcode_session_models::PromptPlacement::Steering,
+            bcode_session_models::PromptPlacement::FollowUp,
+        ] {
+            let request = Request::SendUserMessageWithPlacement {
+                session_id,
+                text: "continue".to_owned(),
+                placement,
+            };
+            let encoded = encode_request(&request).expect("encode request");
+            assert_eq!(decode_request(&encoded).expect("decode request"), request);
+            let mut future = serde_json::to_value(&request).expect("request JSON");
+            future["placement"] = serde_json::json!("future_placement");
+            assert!(serde_json::from_value::<Request>(future).is_err());
+        }
     }
 
     #[test]

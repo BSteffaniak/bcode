@@ -1763,16 +1763,8 @@ pub struct InteractionViewSummary {
     pub resolution: Option<bcode_session_models::ToolExchangeResolution>,
 }
 
-/// Prompt placement semantics for renderer-neutral prompt submission.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptPlacementView {
-    /// Insert the prompt at the next safe conversation boundary.
-    #[default]
-    Steering,
-    /// Queue the prompt as a follow-up turn after the active turn finishes.
-    FollowUp,
-}
+/// Compatibility name for session-owned prompt placement semantics.
+pub use bcode_session_models::PromptPlacement as PromptPlacementView;
 
 /// Composer draft scope for renderer-neutral draft updates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1784,19 +1776,8 @@ pub enum ComposerDraftViewScope {
     DraftSession { launch_working_directory: PathBuf },
 }
 
-/// Renderer-neutral message acceptance disposition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageAcceptanceDispositionView {
-    /// Message was applied to the active turn as steering.
-    AppliedSteering,
-    /// Message was queued as a follow-up.
-    QueuedFollowUp,
-    /// Message was queued as a future turn.
-    QueuedTurn,
-    /// Message started a new turn.
-    StartedTurn,
-}
+/// Compatibility name for the session-owned message acceptance disposition.
+pub use bcode_session_models::MessageAcceptanceDisposition as MessageAcceptanceDispositionView;
 
 /// Result of executing a renderer-neutral session action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

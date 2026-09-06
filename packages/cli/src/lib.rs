@@ -14962,7 +14962,7 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
             .send_user_message_with_execution(
                 session_id,
                 text,
-                bcode_ipc::PromptPlacement::FollowUp,
+                bcode_session_models::PromptPlacement::FollowUp,
                 launch_options.turn_execution_options(),
             )
             .await?;
