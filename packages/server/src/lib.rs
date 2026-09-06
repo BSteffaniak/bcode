@@ -3831,6 +3831,10 @@ async fn run_with_services(
         default_plugin_ids,
         shutdown: host_shutdown,
     } = services;
+    if host_shutdown.is_cancelled() {
+        plugins.deactivate_all().await?;
+        return Ok(());
+    }
     let mut stage_started_at = Instant::now();
     let startup_resources = (|| {
         let legacy_recovery = session_migration_adapter::recover_historical_session_storage(
@@ -55512,6 +55516,35 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|event| matches!(event, ProviderTurnEvent::TextDelta { .. }))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn precancelled_embedded_startup_skips_resource_acquisition() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().to_path_buf());
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::new(),
+                disabled: BTreeSet::new(),
+            },
+            &[],
+        )
+        .expect("empty plugin runtime");
+        let shutdown = bcode_agent_runtime::CancellationToken::new();
+        shutdown.cancel();
+        run_embedded_with_services_and_shutdown(
+            endpoint,
+            bcode_config::BcodeConfig::default(),
+            plugins,
+            bcode_model_catalog::ModelCatalogResolver::embedded(),
+            Vec::new(),
+            shutdown,
+        )
+        .await
+        .expect("cancelled startup does not bind a directory as a socket");
+        assert!(directory.path().is_dir());
     }
 
     pub fn test_server_state_with_plugins(
