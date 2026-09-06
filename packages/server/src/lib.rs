@@ -31441,21 +31441,21 @@ fn plugin_service_metric_labels(
 }
 
 fn plugin_service_response(
-    result: Result<bcode_plugin::ServiceResponse, plugin_operations::PublicPluginError>,
+    result: Result<
+        plugin_operations::PluginServiceOperationResult,
+        plugin_operations::PublicPluginError,
+    >,
 ) -> Response {
     match result {
-        Ok(response) => {
-            let response = plugin_operations::project_service_response(response);
-            Response::Ok(ResponsePayload::PluginServiceResult {
-                response: PluginServiceResponse {
-                    payload: response.payload,
-                    error: response.error.map(|error| PluginServiceError {
-                        code: error.code,
-                        message: error.message,
-                    }),
-                },
-            })
-        }
+        Ok(response) => Response::Ok(ResponsePayload::PluginServiceResult {
+            response: PluginServiceResponse {
+                payload: response.payload,
+                error: response.error.map(|error| PluginServiceError {
+                    code: error.code,
+                    message: error.message,
+                }),
+            },
+        }),
         Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
     }
 }
@@ -46860,7 +46860,7 @@ library = "test"
         }
     }
 
-    fn test_server_state(sessions: SessionManager) -> ServerState {
+    pub fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
 
@@ -48478,7 +48478,7 @@ library = "test"
         ))
         .await
         .expect("invoke shell service in process");
-        let projected = plugin_operations::project_service_response(response);
+        let projected = response;
         assert_eq!(
             projected.error.as_ref().map(|error| error.code.as_str()),
             Some("unsupported_operation")
@@ -48519,6 +48519,10 @@ version = "0.0.1"
 name = "Shell Tool"
 interface_id = "bcode.workflow-block/v1"
 
+[[services]]
+name = "Tool inventory"
+interface_id = "bcode.tool/v1"
+
 [[event_subscriptions]]
 topic = "example.subscribed"
 delivery = "barrier"
@@ -48539,17 +48543,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
         let direct_services = plugin_operations::list_services(state.as_ref());
         let direct_diagnostics = server_operations::model_catalog_diagnostics(state.as_ref()).await;
-        let direct = plugin_operations::project_service_response(
-            Box::pin(plugin_operations::invoke_service(
-                state.as_ref(),
-                "bcode.shell",
-                bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
-                "unsupported-operation".to_owned(),
-                Vec::new(),
-            ))
-            .await
-            .expect("direct plugin operation"),
-        );
+        let direct = Box::pin(plugin_operations::invoke_service(
+            state.as_ref(),
+            "bcode.shell",
+            bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+            "unsupported-operation".to_owned(),
+            Vec::new(),
+        ))
+        .await
+        .expect("direct plugin operation");
         assert_eq!(
             plugin_operations::publish_event(state.as_ref(), "example.unsubscribed", b"payload")
                 .await
@@ -48566,16 +48568,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
-        let server_state = Arc::clone(&state);
-        let server = tokio::spawn(async move {
-            loop {
-                let stream = listener.accept().await.expect("client connection");
-                let state = Arc::clone(&server_state);
-                tokio::spawn(async move {
-                    handle_client(stream, state).await.expect("handle client");
-                });
-            }
-        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
         let client = bcode_client::BcodeClient::new(endpoint);
         assert_eq!(
             client
@@ -48620,7 +48618,152 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("IPC subscribed plugin event"),
             1
         );
-        server.abort();
+        assert_successful_plugin_service_parity(&state, &client).await;
+        assert_interface_service_parity(&state, &client, &direct).await;
+        assert_missing_interface_service_parity(&state, &client).await;
+        assert_missing_plugin_service_parity(&state, &client).await;
+        shutdown.send(()).expect("stop plugin test listener");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("plugin test shutdown deadline")
+            .expect("plugin test shutdown");
+    }
+
+    async fn assert_successful_plugin_service_parity(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+    ) {
+        let interface = bcode_tool::TOOL_SERVICE_INTERFACE_ID;
+        let operation = bcode_tool::OP_LIST_TOOLS;
+        let payload = b"{}".to_vec();
+        let direct = plugin_operations::call_service(
+            state,
+            interface,
+            operation.to_owned(),
+            payload.clone(),
+        )
+        .await
+        .expect("direct tool inventory");
+        assert!(direct.error.is_none());
+        let tools: bcode_tool::ToolList =
+            serde_json::from_slice(&direct.payload).expect("typed tool inventory");
+        assert_eq!(tools.tools.len(), 1);
+        let explicit = Box::pin(plugin_operations::invoke_service(
+            state,
+            "bcode.shell",
+            interface,
+            operation.to_owned(),
+            payload.clone(),
+        ))
+        .await
+        .expect("direct explicit tool inventory");
+        assert_eq!(explicit, direct);
+        let explicit_ipc = client
+            .invoke_plugin_service(
+                "bcode.shell".to_owned(),
+                interface.to_owned(),
+                operation.to_owned(),
+                payload.clone(),
+            )
+            .await
+            .expect("IPC explicit tool inventory");
+        assert!(explicit_ipc.error.is_none());
+        assert_eq!(explicit_ipc.payload, direct.payload);
+        let ipc = client
+            .call_plugin_service(interface.to_owned(), operation.to_owned(), payload)
+            .await
+            .expect("IPC tool inventory");
+        assert!(ipc.error.is_none());
+        assert_eq!(ipc.payload, direct.payload);
+    }
+
+    async fn assert_missing_plugin_service_parity(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+    ) {
+        let plugin = "example.missing-plugin";
+        let interface = "example.private-interface.v1";
+        let direct = Box::pin(plugin_operations::invoke_service(
+            state,
+            plugin,
+            interface,
+            "inspect".to_owned(),
+            Vec::new(),
+        ))
+        .await
+        .expect_err("missing plugin must fail");
+        let error = client
+            .invoke_plugin_service(
+                plugin.to_owned(),
+                interface.to_owned(),
+                "inspect".to_owned(),
+                Vec::new(),
+            )
+            .await
+            .expect_err("missing IPC plugin must fail");
+        let bcode_client::ClientError::Server { code, message } = error else {
+            panic!("expected normalized server error, got {error:?}");
+        };
+        assert_eq!(code, direct.code);
+        assert_eq!(message, direct.message);
+        assert!(!message.contains(plugin));
+        assert!(!message.contains(interface));
+    }
+
+    async fn assert_missing_interface_service_parity(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+    ) {
+        let interface = "example.missing-interface.v1";
+        let direct =
+            plugin_operations::call_service(state, interface, "inspect".to_owned(), Vec::new())
+                .await
+                .expect_err("missing interface must fail");
+        let error = client
+            .call_plugin_service(interface.to_owned(), "inspect".to_owned(), Vec::new())
+            .await
+            .expect_err("missing IPC interface must fail");
+        let bcode_client::ClientError::Server { code, message } = error else {
+            panic!("expected normalized server error, got {error:?}");
+        };
+        assert_eq!(code, direct.code);
+        assert_eq!(message, direct.message);
+        assert!(!message.contains(interface));
+    }
+
+    async fn assert_interface_service_parity(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        explicit: &plugin_operations::PluginServiceOperationResult,
+    ) {
+        let interface = bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID;
+        let direct = plugin_operations::call_service(
+            state,
+            interface,
+            "unsupported-operation".to_owned(),
+            Vec::new(),
+        )
+        .await
+        .expect("direct interface service");
+        assert_eq!(&direct, explicit);
+        let ipc = client
+            .call_plugin_service(
+                interface.to_owned(),
+                "unsupported-operation".to_owned(),
+                Vec::new(),
+            )
+            .await
+            .expect("IPC interface service");
+        assert_eq!(ipc.payload, direct.payload);
+        assert_eq!(
+            ipc.error
+                .as_ref()
+                .map(|error| (&error.code, &error.message)),
+            direct
+                .error
+                .as_ref()
+                .map(|error| (&error.code, &error.message))
+        );
     }
 
     #[tokio::test]
@@ -62084,16 +62227,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
-        let server_state = Arc::clone(&state);
-        let server = tokio::spawn(async move {
-            loop {
-                let stream = listener.accept().await.expect("client connection");
-                let state = Arc::clone(&server_state);
-                tokio::spawn(async move {
-                    handle_client(stream, state).await.expect("handle client");
-                });
-            }
-        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
         let client = bcode_client::BcodeClient::new(endpoint);
         assert_eq!(
             client
@@ -62148,13 +62287,58 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ..
             } if cancelled_work_id == work_id
         ));
-        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        wait_for_runtime_cleanup(&cancellations).await;
         assert_pending_runtime_cancellation_idempotent(&state, &client, session.id, &work_id).await;
         assert_bounded_runtime_history_span(&client, session.id, &work_id).await;
         assert_runtime_history_limits(&state, &client, session.id).await;
         assert_runtime_completion_visible(&state, &client, &mut watcher, session.id, work_id).await;
         assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
-        server.abort();
+        shutdown.send(()).expect("stop test listener");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("test listener shutdown deadline")
+            .expect("test listener shutdown");
+    }
+
+    async fn serve_runtime_test_clients(
+        listener: LocalIpcListener,
+        state: Arc<ServerState>,
+        mut stopped: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let mut clients = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                result = clients.join_next(), if !clients.is_empty() => {
+                    result.expect("completed client task").expect("client task panicked");
+                }
+                stream = listener.accept() => {
+                    let stream = stream.expect("client connection");
+                    let state = Arc::clone(&state);
+                    clients.spawn(async move {
+                        handle_client(stream, state).await.expect("handle client");
+                    });
+                }
+            }
+        }
+        clients.abort_all();
+        while let Some(result) = clients.join_next().await {
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "client task panicked: {error}");
+            }
+        }
+    }
+
+    async fn wait_for_runtime_cleanup(cancellations: &std::sync::atomic::AtomicUsize) {
+        // Cancellation acknowledgement precedes independently scheduled cleanup.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancellations.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime cleanup deadline");
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     async fn assert_pending_runtime_cancellation_idempotent(

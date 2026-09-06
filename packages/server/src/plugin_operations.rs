@@ -167,7 +167,7 @@ pub fn enqueue_invocation_input(
     })
 }
 
-/// Portable normalized plugin service result projected at the transport boundary.
+/// Normalized plugin service result returned by application operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginServiceOperationResult {
     /// Opaque plugin-owned response payload.
@@ -187,7 +187,7 @@ pub struct PluginServiceOperationError {
 
 /// Convert one internal plugin response into the normalized operation result.
 #[must_use]
-pub fn project_service_response(
+fn project_service_response(
     response: bcode_plugin::ServiceResponse,
 ) -> PluginServiceOperationResult {
     PluginServiceOperationResult {
@@ -205,13 +205,13 @@ pub async fn invoke_service(
     interface_id: &str,
     operation: String,
     payload: Vec<u8>,
-) -> Result<bcode_plugin::ServiceResponse, PublicPluginError> {
+) -> Result<PluginServiceOperationResult, PublicPluginError> {
     let plugin_id = plugin_id.to_owned();
     let interface_id = interface_id.to_owned();
     let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
     let authorized_session_id =
         super::command_invocation_session(&interface_id, &operation, &payload);
-    let (bridge, mut bridge_requests) = super::server_plugin_bridge();
+    let (bridge, bridge_requests) = super::server_plugin_bridge();
     let invocation = state.plugins.invoke_service_with_bridge_scoped(
         &plugin_id,
         interface_id,
@@ -220,32 +220,40 @@ pub async fn invoke_service(
         bcode_plugin::PluginInvocationScope::Global,
         Some(bridge),
     );
-    Box::pin(
-        state
-            .metrics
-            .time_result_async("plugin.service", labels, async {
-                tokio::pin!(invocation);
-                loop {
-                    tokio::select! {
-                        result = &mut invocation => break result,
-                        bridge_call = bridge_requests.recv() => {
-                            let Some(bridge_call) = bridge_call else {
-                                continue;
-                            };
-                            let response = super::resolve_command_plugin_bridge_request(
-                                &state.sessions,
-                                authorized_session_id,
-                                bridge_call.request,
-                                &bridge_call.cancellation,
-                            ).await;
-                            let _sent = bridge_call.response.send(response);
-                        }
-                    }
-                }
-            }),
-    )
+    Box::pin(state.metrics.time_result_async(
+        "plugin.service",
+        labels,
+        drive_service_bridge(state, authorized_session_id, bridge_requests, invocation),
+    ))
     .await
+    .map(project_service_response)
     .map_err(|error| normalize_error(&error))
+}
+
+async fn drive_service_bridge<T>(
+    state: &ServerState,
+    authorized_session_id: Option<bcode_session_models::SessionId>,
+    mut bridge_requests: mpsc::UnboundedReceiver<super::ServerPluginBridgeCall>,
+    invocation: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(invocation);
+    loop {
+        tokio::select! {
+            result = &mut invocation => break result,
+            bridge_call = bridge_requests.recv() => {
+                let Some(bridge_call) = bridge_call else {
+                    return invocation.await;
+                };
+                let response = super::resolve_command_plugin_bridge_request(
+                    &state.sessions,
+                    authorized_session_id,
+                    bridge_call.request,
+                    &bridge_call.cancellation,
+                ).await;
+                let _sent = bridge_call.response.send(response);
+            }
+        }
+    }
 }
 
 /// Call the unique provider of one typed plugin service interface.
@@ -254,7 +262,7 @@ pub async fn call_service(
     interface_id: &str,
     operation: String,
     payload: Vec<u8>,
-) -> Result<bcode_plugin::ServiceResponse, PublicPluginError> {
+) -> Result<PluginServiceOperationResult, PublicPluginError> {
     let labels = plugin_service_metric_labels(None, interface_id, &operation);
     state
         .metrics
@@ -266,6 +274,7 @@ pub async fn call_service(
                 .invoke_service_by_interface(interface_id, operation, payload),
         )
         .await
+        .map(project_service_response)
         .map_err(|error| normalize_error(&error))
 }
 
@@ -284,4 +293,36 @@ pub async fn publish_event(
         )
         .await
         .map_err(|error| normalize_error(&error))
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn closed_service_bridge_yields_until_invocation_completes() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let (bridge, requests) = crate::server_plugin_bridge();
+        drop(bridge);
+        let (complete, result) = tokio::sync::oneshot::channel::<u32>();
+        let driver = super::drive_service_bridge(&state, None, requests, result);
+        tokio::pin!(driver);
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
+        complete.send(42).expect("invocation still awaited");
+        assert_eq!(driver.await.expect("invocation result"), 42);
+    }
+
+    #[tokio::test]
+    async fn closed_service_bridge_preserves_invocation_failure() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let (bridge, requests) = crate::server_plugin_bridge();
+        drop(bridge);
+        let (complete, result) = tokio::sync::oneshot::channel::<u32>();
+        let driver = super::drive_service_bridge(&state, None, requests, result);
+        tokio::pin!(driver);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
+        drop(complete);
+        assert!(driver.await.is_err());
+    }
 }
