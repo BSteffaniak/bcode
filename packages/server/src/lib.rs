@@ -75,9 +75,9 @@ use bcode_agent_runtime::{
 };
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
-    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionBatchCorrelation, PermissionSummary,
-    PluginServiceError, PluginServiceResponse, RalphApproveRequest, RalphCancelRequest,
-    RalphCancelResponse, RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
+    IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionBatchCorrelation, PluginServiceError,
+    PluginServiceResponse, RalphApproveRequest, RalphCancelRequest, RalphCancelResponse,
+    RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
     RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
     RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
     RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
@@ -105,7 +105,6 @@ use bcode_session::{
     AppendToolCallRequestedInput, CatalogLoadStatus, SessionError, SessionManager,
     lease::SessionLeaseOwnerContext,
 };
-use bcode_session_models::ExecutionSessionProvenance;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
     ProviderToolCallProgress, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
@@ -115,6 +114,7 @@ use bcode_session_models::{
     TurnExecutionOptions, TurnOrigin, TurnPriority, TurnStructuredOutputRequest, TurnToolPolicy,
     WorkId,
 };
+use bcode_session_models::{ExecutionSessionProvenance, PermissionSummary};
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
     anchor_skill_source_roots, evaluate_skill_tool_call, format_skill_catalog_for_prompt,
@@ -52775,6 +52775,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             notify: Arc::new(Notify::new()),
             skill_decision_key: None,
         };
+        let expected_summary = pending.summary.clone();
+        let decision = Arc::clone(&pending.decision);
         state
             .pending_permissions
             .lock()
@@ -52796,8 +52798,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
         });
         let client = bcode_client::BcodeClient::new(endpoint);
         let permissions = client.list_permissions().await.expect("list permissions");
-        assert_eq!(permissions.len(), 1);
-        assert_eq!(permissions[0].permission_id, "permission-ipc");
+        assert_eq!(permissions, vec![expected_summary]);
+        assert_eq!(
+            interaction_operations::list_permissions(&state).await,
+            permissions
+        );
+        assert_eq!(
+            client.list_permissions().await.expect("repeat inspection"),
+            permissions
+        );
+        assert_eq!(*decision.lock().await, None);
         assert!(
             client
                 .resolve_permission("permission-ipc".to_owned(), true)
@@ -52809,6 +52819,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .list_permissions()
                 .await
                 .expect("list resolved")
+                .is_empty()
+        );
+        assert_eq!(*decision.lock().await, Some(true));
+        assert!(
+            !client
+                .resolve_permission("permission-ipc".to_owned(), false)
+                .await
+                .expect("stale resolution")
+        );
+        assert_eq!(*decision.lock().await, Some(true));
+        assert!(
+            interaction_operations::list_permissions(&state)
+                .await
                 .is_empty()
         );
         let history = state

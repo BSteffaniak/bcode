@@ -548,7 +548,7 @@ if ! rg -U 'parallel_tool_calls:[\s\S]{0,180}request\.tool_call_policy\.parallel
   violations=1
 fi
 
-if ! rg -U 'pub struct PermissionSummary \{[\s\S]{0,400}pub tool_call_id: String,[\s\S]{0,400}pub batch: Option<PermissionBatchCorrelation>' packages/ipc/src/lib.rs >/dev/null; then
+if ! rg -U 'pub struct PermissionSummary \{[\s\S]{0,400}pub tool_call_id: String,[\s\S]{0,400}pub batch: Option<PermissionBatchCorrelation>' packages/session/models/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: permission summaries lost call/batch correlation." >&2
   violations=1
 fi

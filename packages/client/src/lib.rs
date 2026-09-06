@@ -8,12 +8,12 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcStream, PermissionSummary, PluginContributions, PluginServiceResponse,
-    PluginServiceSummary, RalphApproveRequest, RalphCancelRequest, RalphCancelResponse,
-    RalphLifecycleRequest, RalphListIterationsRequest, RalphListIterationsResponse,
-    RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse,
-    RalphRunRequest, RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse,
-    RalphStatusRequest, RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
+    LocalIpcStream, PluginContributions, PluginServiceResponse, PluginServiceSummary,
+    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest,
+    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
+    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
+    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
+    RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
     SessionBulkMigrationOperationStatus, SessionBulkMigrationStartRequest,
     SessionCatalogSourceStatus, SessionCatalogStatus, SessionCompatibilityInventoryRequest,
     SessionCompatibilityInventoryResponse, SessionImportWarning, WorktreeCreateOperationStatus,
@@ -21,7 +21,6 @@ use bcode_ipc::{
     WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory, decode_event,
     decode_response, default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
-use bcode_session_models::PendingToolExchangeSummary;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionDerivationPromptPage,
     SessionDerivationPromptQuery, SessionDerivationRequest, SessionDerivationSourceSnapshot,
@@ -30,6 +29,7 @@ use bcode_session_models::{
     SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery, SessionSummary,
     WorkId,
 };
+use bcode_session_models::{PendingToolExchangeSummary, PermissionSummary};
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;

@@ -12,7 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcode_client::{BcodeClient, ClientError, DaemonAvailability, SessionWatchEvent};
 use bcode_config::AuthMode;
-use bcode_ipc::{PermissionSummary, ServerStatus, default_endpoint};
+use bcode_ipc::{ServerStatus, default_endpoint};
 use bcode_model_provider_runtime::{
     BlockingModelProviderInvoker, SingleTurnRequest, SingleTurnStatus, run_single_turn_blocking,
 };
@@ -25,6 +25,7 @@ use bcode_session_import::{
 use bcode_session_migration::{
     SessionDiagnosisClassification, SessionDiagnosisCompatibility, classify_session_diagnosis,
 };
+use bcode_session_models::PermissionSummary;
 use bcode_session_models::{
     SessionEvent, SessionEventCompatibilityIssue, SessionEventCompatibilityKind, SessionEventKind,
     SessionHistoryAroundQuery, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryQuery,
@@ -14547,14 +14548,7 @@ async fn list_permissions(session_id: Option<SessionId>, json: bool) -> Result<(
     if let Some(session_id) = session_id {
         permissions.retain(|permission| permission.session_id == session_id);
     }
-    if json {
-        print_json(&permissions)?;
-    } else {
-        for permission in permissions {
-            print_permission(&permission);
-        }
-    }
-    Ok(())
+    write_permission_list(&mut std::io::stdout().lock(), &permissions, json)
 }
 
 async fn resolve_permission(
@@ -14577,21 +14571,21 @@ async fn resolve_permission_batch(
     let resolved_count = BcodeClient::default_endpoint()
         .resolve_permission_batch(batch_id, approved)
         .await?;
-    if json {
-        print_json(&serde_json::json!({ "resolved_count": resolved_count }))
-    } else {
-        println!("resolved: {resolved_count}");
-        Ok(())
-    }
+    write_permission_receipt(
+        &mut std::io::stdout().lock(),
+        &serde_json::json!({ "resolved_count": resolved_count }),
+        format_args!("resolved: {resolved_count}"),
+        json,
+    )
 }
 
 fn print_permission_resolution(resolved: bool, json: bool) -> Result<(), CliError> {
-    if json {
-        print_json(&serde_json::json!({ "resolved": resolved }))
-    } else {
-        println!("resolved: {resolved}");
-        Ok(())
-    }
+    write_permission_receipt(
+        &mut std::io::stdout().lock(),
+        &serde_json::json!({ "resolved": resolved }),
+        format_args!("resolved: {resolved}"),
+        json,
+    )
 }
 
 async fn add_permission_rule(
@@ -14609,24 +14603,51 @@ async fn add_permission_rule(
             action.to_string(),
         )
         .await?;
+    write_permission_receipt(
+        &mut std::io::stdout().lock(),
+        &serde_json::json!({ "config_path": config_path }),
+        format_args!("permission rule added: {config_path}"),
+        json,
+    )
+}
+
+fn write_permission_receipt<W: std::io::Write>(
+    output: &mut W,
+    value: &serde_json::Value,
+    text: std::fmt::Arguments<'_>,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        print_json(&serde_json::json!({ "config_path": config_path }))
+        write_json_result(output, value)
     } else {
-        println!("permission rule added: {config_path}");
+        writeln!(output, "{text}")?;
+        output.flush()?;
         Ok(())
     }
 }
 
-fn print_permission(permission: &PermissionSummary) {
-    println!(
-        "{}\t{}\t{}\t{}\t{}\t{}",
-        permission.permission_id,
-        permission.session_id,
-        permission.tool_call_id,
-        permission.tool_name,
-        permission.agent_id,
-        permission.arguments_json
-    );
+fn write_permission_list<W: std::io::Write>(
+    output: &mut W,
+    permissions: &[PermissionSummary],
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        return write_json_result(output, &permissions);
+    }
+    for permission in permissions {
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            permission.permission_id,
+            permission.session_id,
+            permission.tool_call_id,
+            permission.tool_name,
+            permission.agent_id,
+            permission.arguments_json
+        )?;
+    }
+    output.flush()?;
+    Ok(())
 }
 
 async fn watch_session(session_id: SessionId, limit: usize, json: bool) -> Result<(), CliError> {
@@ -20724,6 +20745,72 @@ mod json_stream_output_tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn permission_receipts_preserve_formats_and_report_output_failures() {
+        for (value, text) in [
+            (serde_json::json!({"resolved": true}), "resolved: true"),
+            (serde_json::json!({"resolved": false}), "resolved: false"),
+            (serde_json::json!({"resolved_count": 0}), "resolved: 0"),
+            (
+                serde_json::json!({"config_path": "/config"}),
+                "permission rule added: /config",
+            ),
+        ] {
+            for json in [false, true] {
+                let mut output = Output::default();
+                super::write_permission_receipt(&mut output, &value, format_args!("{text}"), json)
+                    .unwrap();
+                assert_eq!(output.flushes, 1);
+                if json {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&output.bytes).unwrap(),
+                        value
+                    );
+                } else {
+                    assert_eq!(output.bytes, format!("{text}\n").as_bytes());
+                }
+                for fail_write in [false, true] {
+                    let mut output = Output {
+                        fail_write,
+                        fail_flush: !fail_write,
+                        ..Output::default()
+                    };
+                    assert!(
+                        super::write_permission_receipt(
+                            &mut output,
+                            &value,
+                            format_args!("{text}"),
+                            json
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_permission_lists_flush_and_preserve_formats() {
+        for json in [false, true] {
+            let mut output = Output::default();
+            super::write_permission_list(&mut output, &[], json).unwrap();
+            assert_eq!(output.flushes, 1);
+            assert_eq!(
+                output.bytes,
+                if json {
+                    b"[]\n".as_slice()
+                } else {
+                    b"".as_slice()
+                }
+            );
+            let mut output = Output {
+                fail_flush: true,
+                ..Output::default()
+            };
+            assert!(super::write_permission_list(&mut output, &[], json).is_err());
         }
     }
 

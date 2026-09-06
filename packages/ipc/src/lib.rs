@@ -1382,25 +1382,8 @@ pub struct PluginServiceSummary {
 /// Correlation metadata for one permission checkpoint in a complete tool-call batch.
 pub use bcode_session_models::PermissionBatchCorrelation;
 
-/// Pending permission checkpoint summary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionSummary {
-    pub permission_id: String,
-    pub session_id: SessionId,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub arguments_json: String,
-    /// Complete-batch correlation for grouped permission consumers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub batch: Option<PermissionBatchCorrelation>,
-    pub agent_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_reason: Option<String>,
-    #[serde(default)]
-    pub can_remember_policy: bool,
-}
+/// Compatibility export for session-owned pending permission observations.
+pub use bcode_session_models::PermissionSummary;
 
 /// Normalized model-catalog diagnostics exposed at the application boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

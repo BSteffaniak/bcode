@@ -120,6 +120,38 @@ impl MessageAcceptance {
     }
 }
 
+/// Pending permission checkpoint observation, not an authorization decision.
+///
+/// The checkpoint may resolve after inspection. Tool arguments are untrusted input;
+/// authorization remains owned by the permission policy and resolution operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionSummary {
+    /// Identity of the pending checkpoint.
+    pub permission_id: String,
+    /// Canonical session requesting permission.
+    pub session_id: SessionId,
+    /// Tool invocation requesting permission.
+    pub tool_call_id: String,
+    /// Reported tool name.
+    pub tool_name: String,
+    /// Serialized tool arguments for inspection.
+    pub arguments_json: String,
+    /// Complete-batch correlation for grouped permission consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<PermissionBatchCorrelation>,
+    /// Agent profile associated with the request.
+    pub agent_id: String,
+    /// Policy source reported by the permission owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_source: Option<String>,
+    /// Policy explanation reported by the permission owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_reason: Option<String>,
+    /// Whether the permission owner supports remembering this decision.
+    #[serde(default)]
+    pub can_remember_policy: bool,
+}
+
 /// Pending renderer-neutral invocation exchange associated with a canonical session.
 ///
 /// This is an observation, not a reservation or durable resume token. The exchange may
@@ -3715,6 +3747,27 @@ pub enum SessionEventKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn permission_summary_preserves_optional_field_defaults() {
+        let session_id = super::SessionId::new();
+        let value = serde_json::json!({
+            "permission_id": "checkpoint",
+            "session_id": session_id,
+            "tool_call_id": "call",
+            "tool_name": "tool",
+            "arguments_json": "{\"path\":\"untrusted\"}",
+            "agent_id": "build"
+        });
+        let summary: super::PermissionSummary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(summary.session_id, session_id);
+        assert_eq!(summary.batch, None);
+        assert_eq!(summary.policy_source, None);
+        assert_eq!(summary.policy_reason, None);
+        assert!(!summary.can_remember_policy);
+        let mut expected = value;
+        expected["can_remember_policy"] = serde_json::json!(false);
+        assert_eq!(serde_json::to_value(&summary).unwrap(), expected);
+    }
     #[test]
     fn delivery_only_acceptance_preserves_compatibility_defaults() {
         assert_eq!(

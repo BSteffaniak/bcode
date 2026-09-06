@@ -228,7 +228,7 @@ pub async fn permission_batch_decision(state: &ServerState, batch_id: &str) -> O
 }
 
 /// Return current pending permission summaries without transport framing.
-pub async fn list_permissions(state: &ServerState) -> Vec<bcode_ipc::PermissionSummary> {
+pub async fn list_permissions(state: &ServerState) -> Vec<bcode_session_models::PermissionSummary> {
     let mut permissions = state
         .pending_permissions
         .lock()
