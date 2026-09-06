@@ -19070,7 +19070,15 @@ mod tests {
         store
             .persist_definition("example", 2, &newer)
             .expect("newer version");
+        let mut second_run = new_run();
+        second_run.run_id = "run-2".to_string();
+        second_run.definition_version = 2;
+        store.create_run(&second_run).expect("version 2 run");
+        let second_nodes = store
+            .run_graph_nodes("run-2", None, 100)
+            .expect("version 2 nodes");
         let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
+        assert_ne!(nodes, second_nodes);
         let path = store.path().to_path_buf();
         drop(store);
         let connection = Connection::open(&path).expect("fixture");
@@ -19090,6 +19098,12 @@ mod tests {
                 .run_graph_nodes("run-1", None, 100)
                 .expect("preserved graph"),
             nodes
+        );
+        assert_eq!(
+            store
+                .run_graph_nodes("run-2", None, 100)
+                .expect("preserved version 2 graph"),
+            second_nodes
         );
         let payload: String = store.connection.query_row(
             "SELECT definition_json FROM workflow_definitions WHERE definition_id = 'example' AND version = 1",
@@ -19303,20 +19317,28 @@ mod tests {
             .persist_definition("example", 1, &definition("example"))
             .expect("definition");
         store.create_run(&new_run()).expect("run");
+        store
+            .persist_definition("valid-earlier", 1, &definition("valid-earlier"))
+            .expect("valid definition");
+        let mut earlier = new_run();
+        earlier.run_id = "run-0".to_string();
+        earlier.definition_id = "valid-earlier".to_string();
+        store.create_run(&earlier).expect("earlier valid run");
         let path = store.path().to_path_buf();
         drop(store);
         let connection = Connection::open(&path).expect("fixture");
         let payload = serde_json::to_string(invalid).expect("invalid payload");
+
         connection
             .execute(
-                "UPDATE workflow_definitions SET definition_json = ?1",
+                "UPDATE workflow_definitions SET definition_json = ?1 WHERE definition_id = 'example'",
                 [&payload],
             )
             .expect("future definition");
         if !stale_checksum {
             connection
                 .execute(
-                    "UPDATE workflow_definitions SET checksum_sha256 = ?1",
+                    "UPDATE workflow_definitions SET checksum_sha256 = ?1 WHERE definition_id = 'example'",
                     [sha256_hex(payload.as_bytes())],
                 )
                 .expect("fixture checksum");
@@ -19364,7 +19386,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM workflow_runs", [], |row| row
                     .get::<_, u64>(0))
                 .expect("preserved run"),
-            1
+            2
         );
     }
 
