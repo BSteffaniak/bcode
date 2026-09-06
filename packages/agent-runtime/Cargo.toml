@@ -29,6 +29,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 bcode_agent_profile = { workspace = true }
+tracing-subscriber  = { workspace = true }
 
 [features]
 default          = []

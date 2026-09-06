@@ -154,10 +154,42 @@ where
     }
 }
 
+struct InProcessTurnCleanup {
+    turns: Arc<Mutex<BTreeMap<String, Arc<InProcessTurnState>>>>,
+    turn_id: String,
+}
+
+impl crate::ProviderTurnCleanup for InProcessTurnCleanup {}
+
+impl Drop for InProcessTurnCleanup {
+    fn drop(&mut self) {
+        let state = self
+            .turns
+            .lock()
+            .expect("in-process provider turn lock should not be poisoned")
+            .remove(&self.turn_id);
+        if let Some(state) = state {
+            state.finish_cancelled();
+            state.cancellation.cancel();
+        }
+    }
+}
+
 impl<P> ModelProviderInvoker for InProcessModelProviderAdapter<P>
 where
     P: InProcessModelProvider,
 {
+    fn turn_cleanup_handle(
+        &mut self,
+        _provider_plugin_id: Option<&str>,
+        provider_turn_id: &str,
+    ) -> Option<Box<dyn crate::ProviderTurnCleanup>> {
+        Some(Box::new(InProcessTurnCleanup {
+            turns: self.turns.clone(),
+            turn_id: provider_turn_id.to_owned(),
+        }))
+    }
+
     fn start_turn<'a>(
         &'a mut self,
         _provider_plugin_id: Option<&'a str>,
@@ -483,6 +515,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_provider_start_releases_runtime_scope() {
+        let runtime = AgentRuntime::new();
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        provider.next_turn.store(u64::MAX, Ordering::Relaxed);
+        for _ in 0..2 {
+            let error = runtime
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "exhausted"))
+                .await
+                .expect_err("exhausted provider rejects runtime turn");
+            assert!(matches!(error, RuntimeError::ProviderInvocation(message)
+                if message == "in-process provider turn ID space exhausted"));
+            assert!(runtime.active_turn_generation().is_none());
+            assert!(provider.turns.lock().expect("turn registry").is_empty());
+        }
+        let mut replacement = InProcessModelProviderAdapter::new(EchoProvider);
+        let response = runtime
+            .run_text_turn(&mut replacement, AgentTurnRequest::new("model", "recovery"))
+            .await
+            .expect("runtime remains usable after rejected start");
+        assert_eq!(response.text, "hello from custom provider");
+        assert!(runtime.active_turn_generation().is_none());
+        assert!(replacement.turns.lock().expect("turn registry").is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_provider_stream_emits_one_error_and_closes() {
+        let runtime = AgentRuntime::new();
+        let provider = InProcessModelProviderAdapter::new(EchoProvider);
+        provider.next_turn.store(u64::MAX, Ordering::Relaxed);
+        let turns = Arc::clone(&provider.turns);
+        let mut stream = runtime
+            .run_streaming_text_turn(provider, AgentTurnRequest::new("model", "exhausted stream"));
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream reports failure promptly")
+            .expect("terminal error");
+        assert!(matches!(item,
+            crate::AgentRuntimeStreamItem::Error(RuntimeError::ProviderInvocation(message))
+            if message == "in-process provider turn ID space exhausted"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("stream closes promptly")
+                .is_none()
+        );
+        assert!(runtime.active_turn_generation().is_none());
+        assert!(turns.lock().expect("turn registry").is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_scope_cancellation_disposition_releases_acquired_adapter_turn() {
+        let runtime = AgentRuntime::new();
+        let scope = runtime.begin_turn_scope(
+            "closed-adapter",
+            Arc::new(crate::RuntimeStreamEventSink::default()),
+            crate::InvocationCapabilities::default(),
+        );
+        let polled = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let mut adapter = InProcessModelProviderAdapter::new(ResourceProvider {
+            started: polled.clone(),
+            released: released.clone(),
+        });
+        let started = adapter
+            .start_turn(None, &model_request("acquired"))
+            .await
+            .expect("acquire provider turn");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider resource acquired before scope cancellation");
+        assert!(!released.load(Ordering::Acquire));
+        assert_eq!(adapter.turns.lock().expect("registry").len(), 1);
+        assert!(runtime.cancel_turn_scope(&scope));
+        let cancel = CancelTurnRequest {
+            provider_turn_id: started.provider_turn_id.clone(),
+        };
+        let finish = FinishTurnRequest {
+            provider_turn_id: started.provider_turn_id,
+        };
+        let mut events = Vec::new();
+        let result = crate::apply_provider_event_disposition(
+            &mut adapter,
+            &crate::ProviderEventContext {
+                provider_plugin_id: None,
+                cancel_request: &cancel,
+                finish_request: &finish,
+                scope: &scope,
+                start: crate::instant_now(),
+            },
+            crate::EventDisposition::Cancelled(crate::AgentRuntimeEvent::Cancelled),
+            &mut String::new(),
+            &mut None,
+            &mut events,
+        )
+        .await;
+        assert!(matches!(result, Err(RuntimeError::Cancelled)));
+        assert!(events.is_empty());
+        assert!(adapter.turns.lock().expect("registry").is_empty());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !released.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed-scope disposition releases the running provider resource");
+        assert!(scope.control().mark_cancelled());
+        assert!(runtime.turns.release_terminal_turn(&scope));
+    }
+
+    #[tokio::test]
     async fn adapter_runs_custom_provider_through_canonical_runtime() {
         let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
         let response = AgentRuntime::new()
@@ -693,6 +839,43 @@ mod tests {
         .await
         .expect("provider future resource released");
         assert!(adapter.turns.lock().expect("turns").is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoning_borrowed_generation_releases_running_provider_resource() {
+        let started = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let mut adapter = InProcessModelProviderAdapter::new(ResourceProvider {
+            started: started.clone(),
+            released: released.clone(),
+        });
+        let runtime = AgentRuntime::new();
+        let mut generation = Box::pin(
+            runtime.run_text_turn(&mut adapter, AgentTurnRequest::new("model", "abandon")),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut generation => panic!("pending provider completed: {result:?}"),
+                    () = tokio::task::yield_now() => {
+                        if started.load(Ordering::Acquire) { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("provider acquired resource");
+        assert!(!released.load(Ordering::Acquire));
+        drop(generation);
+        assert!(adapter.turns.lock().expect("registry").is_empty());
+        assert!(runtime.active_turn_generation().is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !released.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abandoned provider resource released while adapter remains alive");
     }
 
     #[tokio::test]

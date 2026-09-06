@@ -759,9 +759,34 @@ impl TurnEventSink for RuntimeStreamEventSink {
     }
 }
 
-/// Abstract provider invocation boundary used by the runtime.
+/// Provider-owned, nonblocking cleanup obligation released through Drop.
+///
+/// Implementations must be idempotent with explicit turn cancellation and finish.
+pub trait ProviderTurnCleanup: Send {}
+
+/// Invokes normalized provider turn operations.
 pub trait ModelProviderInvoker: Send {
+    /// Acquire an owned cleanup handle for a successfully started turn.
+    ///
+    /// The runtime drops this handle on every exit, including caller abandonment. Implementations
+    /// must make Drop nonblocking and idempotent with cancel/finish, and must not retain borrowed
+    /// provider state. Returning `None` means abandonment cleanup is unsupported. Dropping a handle
+    /// requests cleanup; it does not acknowledge termination of external work.
+    fn turn_cleanup_handle(
+        &mut self,
+        _provider_plugin_id: Option<&str>,
+        _provider_turn_id: &str,
+    ) -> Option<Box<dyn ProviderTurnCleanup>> {
+        None
+    }
+
     /// Start a model turn.
+    ///
+    /// The runtime may drop this future when cancellation or a deadline wins the start race.
+    /// Until a successful response supplies a provider turn ID, the runtime cannot address
+    /// that turn with `cancel_turn` or `finish_turn`. Implementations must account for partial
+    /// acquisition when their start future is dropped; dropping it is not an acknowledgment
+    /// that externally dispatched work stopped.
     fn start_turn<'a>(
         &'a mut self,
         provider_plugin_id: Option<&'a str>,
@@ -769,6 +794,11 @@ pub trait ModelProviderInvoker: Send {
     ) -> RuntimeFuture<'a, StartTurnResponse>;
 
     /// Poll model turn events.
+    ///
+    /// This future may be dropped when cancellation or a deadline wins the polling race.
+    /// Explicit runtime cancellation subsequently attempts cancellation and finish, but dropping
+    /// the entire caller future does not drive those asynchronous cleanup methods. Providers
+    /// may support abandonment separately through `turn_cleanup_handle`.
     fn poll_turn_events<'a>(
         &'a mut self,
         provider_plugin_id: Option<&'a str>,
@@ -794,6 +824,14 @@ impl<T> ModelProviderInvoker for Box<T>
 where
     T: ModelProviderInvoker + ?Sized,
 {
+    fn turn_cleanup_handle(
+        &mut self,
+        provider_plugin_id: Option<&str>,
+        provider_turn_id: &str,
+    ) -> Option<Box<dyn ProviderTurnCleanup>> {
+        (**self).turn_cleanup_handle(provider_plugin_id, provider_turn_id)
+    }
+
     fn start_turn<'a>(
         &'a mut self,
         provider_plugin_id: Option<&'a str>,
@@ -2188,6 +2226,8 @@ impl AgentRuntime {
         let start_response =
             start_provider_turn(provider, provider_plugin_id, &model_request, request, scope)
                 .await?;
+        let _provider_cleanup =
+            provider.turn_cleanup_handle(provider_plugin_id, &start_response.provider_turn_id);
         let poll_request = PollTurnEventsRequest {
             provider_turn_id: start_response.provider_turn_id.clone(),
         };
@@ -2426,13 +2466,23 @@ where
             }))
         }
         EventDisposition::Cancelled(event) => {
-            if !context.scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
-                return Err(RuntimeError::Cancelled);
+            // Event delivery may be rejected by a closed scope, but the acquired provider
+            // turn still requires a finish attempt.
+            if context.scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
+                events.push(event);
             }
-            events.push(event);
-            provider
+            if provider
                 .finish_turn(context.provider_plugin_id, context.finish_request)
-                .await?;
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "bcode::sdk",
+                    event = "bcode.provider_cleanup_failed",
+                    operation = "finish",
+                    "provider finish failed; resource release is not confirmed"
+                );
+            }
             Err(RuntimeError::Cancelled)
         }
     }
@@ -2668,12 +2718,31 @@ async fn cancel_and_finish<P>(
         provider_id = provider_plugin_id.unwrap_or(""),
         provider_turn_id = %cancel_request.provider_turn_id,
     );
-    let _ = provider
+    if provider
         .cancel_turn(provider_plugin_id, cancel_request)
-        .await;
-    let _ = provider
+        .await
+        .is_err()
+    {
+        // Custom provider errors may contain secrets; expose only the failed operation.
+        tracing::warn!(
+            target: "bcode::sdk",
+            event = "bcode.provider_cleanup_failed",
+            operation = "cancel",
+            "provider cancellation failed; attempting finish"
+        );
+    }
+    if provider
         .finish_turn(provider_plugin_id, finish_request)
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            target: "bcode::sdk",
+            event = "bcode.provider_cleanup_failed",
+            operation = "finish",
+            "provider finish failed; resource release is not confirmed"
+        );
+    }
 }
 
 fn finished_event(
@@ -7701,6 +7770,10 @@ mod tests {
         polling: AtomicBool,
         poll_count: AtomicUsize,
         cancelled: AtomicBool,
+        fail_cancel: AtomicBool,
+        fail_finish: AtomicBool,
+        cancel_count: AtomicUsize,
+        finish_count: AtomicUsize,
         finished: AtomicBool,
         dropped: AtomicBool,
         release_poll: Notify,
@@ -7709,6 +7782,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum LifecyclePollOutcome {
         Finish,
+        Cancelled,
         ProviderError,
         Flood,
         ToolCall,
@@ -7752,6 +7826,9 @@ mod tests {
                     self.lifecycle.release_poll.notified().await;
                 }
                 match self.outcome {
+                    LifecyclePollOutcome::Cancelled => Ok(PollTurnEventsResponse {
+                        events: vec![ProviderTurnEvent::Cancelled],
+                    }),
                     LifecyclePollOutcome::ProviderError => Ok(PollTurnEventsResponse {
                         events: vec![ProviderTurnEvent::Error {
                             error: ProviderError {
@@ -7815,7 +7892,16 @@ mod tests {
             _request: &'a CancelTurnRequest,
         ) -> RuntimeFuture<'a, AckResponse> {
             self.lifecycle.cancelled.store(true, Ordering::Release);
-            Box::pin(async { Ok(AckResponse::default()) })
+            self.lifecycle.cancel_count.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                if self.lifecycle.fail_cancel.load(Ordering::Acquire) {
+                    Err(RuntimeError::ProviderInvocation(
+                        "CANCEL_SECRET_SENTINEL".into(),
+                    ))
+                } else {
+                    Ok(AckResponse::default())
+                }
+            })
         }
 
         fn finish_turn<'a>(
@@ -7824,8 +7910,201 @@ mod tests {
             _request: &'a FinishTurnRequest,
         ) -> RuntimeFuture<'a, AckResponse> {
             self.lifecycle.finished.store(true, Ordering::Release);
-            Box::pin(async { Ok(AckResponse::default()) })
+            self.lifecycle.finish_count.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                if self.lifecycle.fail_finish.load(Ordering::Acquire) {
+                    Err(RuntimeError::ProviderInvocation(
+                        "FINISH_SECRET_SENTINEL".into(),
+                    ))
+                } else {
+                    Ok(AckResponse::default())
+                }
+            })
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_event_on_closed_scope_still_finishes_provider() {
+        let runtime = AgentRuntime::new();
+        let scope = runtime.begin_turn_scope(
+            "closed",
+            Arc::new(RuntimeStreamEventSink::default()),
+            InvocationCapabilities::default(),
+        );
+        assert!(runtime.cancel_turn_scope(&scope));
+        let mut provider = FakeProvider::new([]);
+        let cancel = CancelTurnRequest {
+            provider_turn_id: "turn-1".into(),
+        };
+        let finish = FinishTurnRequest {
+            provider_turn_id: "turn-1".into(),
+        };
+        let mut events = Vec::new();
+        let result = apply_provider_event_disposition(
+            &mut provider,
+            &ProviderEventContext {
+                provider_plugin_id: None,
+                cancel_request: &cancel,
+                finish_request: &finish,
+                scope: &scope,
+                start: instant_now(),
+            },
+            EventDisposition::Cancelled(AgentRuntimeEvent::Cancelled),
+            &mut String::new(),
+            &mut None,
+            &mut events,
+        )
+        .await;
+        assert!(matches!(result, Err(RuntimeError::Cancelled)));
+        assert!(events.is_empty(), "closed scope must reject event delivery");
+        assert!(provider.finished);
+        assert!(!provider.cancelled);
+        // This direct disposition test owns scope release (normally ActiveRuntimeTurn does).
+        assert!(scope.control().mark_cancelled());
+        assert!(runtime.turns.release_terminal_turn(&scope));
+        assert!(runtime.active_turn_generation().is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_cancellation_survives_finish_error() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle.fail_finish.store(true, Ordering::Release);
+        lifecycle.release_poll.notify_one();
+        let mut provider = LifecyclePollProvider {
+            lifecycle: Arc::clone(&lifecycle),
+            outcome: LifecyclePollOutcome::Cancelled,
+        };
+        let runtime = AgentRuntime::new();
+        let error = runtime
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "cancelled"))
+            .await
+            .expect_err("provider cancellation is terminal");
+        assert!(matches!(error, RuntimeError::Cancelled));
+        assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 0);
+        assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+        assert!(runtime.active_turn_generation().is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_cancellation_survives_finish_error() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle.fail_finish.store(true, Ordering::Release);
+        lifecycle.release_poll.notify_one();
+        let provider = LifecyclePollProvider {
+            lifecycle: Arc::clone(&lifecycle),
+            outcome: LifecyclePollOutcome::Cancelled,
+        };
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime
+            .run_streaming_text_turn(provider, AgentTurnRequest::new("model", "cancelled stream"));
+        let mut terminal_count = 0;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(item) = stream.next().await {
+                match item {
+                    AgentRuntimeStreamItem::Error(RuntimeError::Cancelled) => terminal_count += 1,
+                    AgentRuntimeStreamItem::Error(error) => panic!("unexpected error: {error}"),
+                    AgentRuntimeStreamItem::Finished(_) => {
+                        panic!("cancelled turn must not succeed")
+                    }
+                    AgentRuntimeStreamItem::Event(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("cancelled stream closes");
+        assert_eq!(terminal_count, 1);
+        assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 0);
+        assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+        assert!(runtime.active_turn_generation().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_error_still_finishes_after_poll_error() {
+        check_cleanup_errors(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn finish_error_preserves_original_provider_error() {
+        check_cleanup_errors(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn both_cleanup_errors_preserve_original_provider_error() {
+        check_cleanup_errors(true, true).await;
+    }
+
+    #[derive(Clone, Default)]
+    struct CleanupLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CleanupLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_diagnostics_omit_provider_error_text() {
+        for (fail_cancel, fail_finish) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            check_cleanup_diagnostics(fail_cancel, fail_finish).await;
+        }
+    }
+
+    async fn check_cleanup_diagnostics(fail_cancel: bool, fail_finish: bool) {
+        use tracing::instrument::WithSubscriber as _;
+
+        let capture = CleanupLog::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        check_cleanup_errors(fail_cancel, fail_finish)
+            .with_subscriber(subscriber)
+            .await;
+        let text = String::from_utf8(capture.0.lock().expect("capture lock").clone())
+            .expect("UTF-8 diagnostics");
+        assert_eq!(
+            text.matches("bcode.provider_cleanup_failed").count(),
+            usize::from(fail_cancel) + usize::from(fail_finish)
+        );
+        assert_eq!(text.contains("operation=\"cancel\""), fail_cancel);
+        assert_eq!(text.contains("operation=\"finish\""), fail_finish);
+        assert!(!text.contains("CANCEL_SECRET_SENTINEL"));
+        assert!(!text.contains("FINISH_SECRET_SENTINEL"));
+    }
+
+    async fn check_cleanup_errors(fail_cancel: bool, fail_finish: bool) {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle.fail_cancel.store(fail_cancel, Ordering::Release);
+        lifecycle.fail_finish.store(fail_finish, Ordering::Release);
+        lifecycle.release_poll.notify_one();
+        let mut provider = LifecyclePollProvider {
+            lifecycle: Arc::clone(&lifecycle),
+            outcome: LifecyclePollOutcome::ProviderError,
+        };
+        let runtime = AgentRuntime::new();
+        let error = runtime
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "cleanup"))
+            .await
+            .expect_err("poll error remains terminal");
+        assert!(matches!(error, RuntimeError::Provider { code, .. } if code == "lifecycle_error"));
+        assert!(lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
+        assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+        assert!(runtime.active_turn_generation().is_none());
     }
 
     async fn wait_for_flag(flag: &AtomicBool, message: &str) {

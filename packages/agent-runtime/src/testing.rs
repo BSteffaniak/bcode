@@ -533,14 +533,49 @@ impl ScriptedProvider {
     }
 }
 
+struct ScriptedTurnCleanup {
+    state: Arc<Mutex<ScriptedProviderState>>,
+    turn_id: String,
+}
+
+impl crate::ProviderTurnCleanup for ScriptedTurnCleanup {}
+
+impl Drop for ScriptedTurnCleanup {
+    fn drop(&mut self) {
+        let mut state = lock_state(&self.state);
+        // Explicit finish already removes the active turn, including its scripted failure path.
+        // Abandonment releases only this turn; it must not consume a recovery script.
+        if state.active.remove(&self.turn_id).is_some() {
+            if !state.cancellations.contains(&self.turn_id) {
+                state.cancellations.push(self.turn_id.clone());
+            }
+            state.finishes.push(self.turn_id.clone());
+        }
+    }
+}
+
 impl ModelProviderInvoker for ScriptedProvider {
+    fn turn_cleanup_handle(
+        &mut self,
+        _provider_plugin_id: Option<&str>,
+        provider_turn_id: &str,
+    ) -> Option<Box<dyn crate::ProviderTurnCleanup>> {
+        Some(Box::new(ScriptedTurnCleanup {
+            state: Arc::clone(&self.state),
+            turn_id: provider_turn_id.to_owned(),
+        }))
+    }
+
     fn start_turn<'a>(
         &'a mut self,
         provider_plugin_id: Option<&'a str>,
         request: &'a ModelTurnRequest,
     ) -> RuntimeFuture<'a, StartTurnResponse> {
-        let result = {
+        Box::pin(async move {
             let mut state = lock_state(&self.state);
+            let next_turn_id = state.next_turn_id.checked_add(1).ok_or_else(|| {
+                RuntimeError::ProviderInvocation("scripted provider turn ID space exhausted".into())
+            })?;
             let sequence = state.requests.len();
             state.requests.push(CapturedProviderRequest {
                 sequence,
@@ -552,7 +587,7 @@ impl ModelProviderInvoker for ScriptedProvider {
                 if let Some(error) = turn.start_error.take() {
                     Err(runtime_provider_error(error))
                 } else {
-                    state.next_turn_id = state.next_turn_id.saturating_add(1);
+                    state.next_turn_id = next_turn_id;
                     let provider_turn_id = format!("scripted-turn-{}", state.next_turn_id);
                     state.active.insert(
                         provider_turn_id.clone(),
@@ -569,8 +604,7 @@ impl ModelProviderInvoker for ScriptedProvider {
             };
             drop(state);
             result
-        };
-        Box::pin(async move { result })
+        })
     }
 
     fn poll_turn_events<'a>(
@@ -671,6 +705,78 @@ fn script_exhausted_error() -> RuntimeError {
         sources: Box::default(),
         retry: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exhausted_turn_ids_preserve_active_turn_and_unused_script() {
+        let mut provider = ScriptedProvider::new([
+            ScriptedProviderTurn::new().pending(),
+            ScriptedProviderTurn::complete_text("unused"),
+        ]);
+        lock_state(&provider.state).next_turn_id = u64::MAX - 1;
+        let request =
+            crate::model_turn_request(&crate::AgentTurnRequest::new("model", "exhaustion"), None)
+                .expect("model request");
+        let started = provider.start_turn(None, &request).await.expect("last ID");
+        assert_eq!(
+            started.provider_turn_id,
+            format!("scripted-turn-{}", u64::MAX)
+        );
+        let cleanup = provider.turn_cleanup_handle(None, &started.provider_turn_id);
+        for _ in 0..2 {
+            let error = provider
+                .start_turn(None, &request)
+                .await
+                .expect_err("ID exhaustion");
+            assert!(matches!(error, RuntimeError::ProviderInvocation(message)
+                if message == "scripted provider turn ID space exhausted"));
+            let state = lock_state(&provider.state);
+            assert_eq!(state.active.len(), 1);
+            assert!(state.active.contains_key(&started.provider_turn_id));
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.turns.len(), 1);
+        }
+        drop(cleanup);
+        let state = lock_state(&provider.state);
+        assert!(state.active.is_empty());
+        assert_eq!(state.cancellations, [started.provider_turn_id.clone()]);
+        assert_eq!(state.finishes, [started.provider_turn_id]);
+        assert_eq!(state.turns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_start_preserves_script_and_acquires_nothing() {
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("retained")]);
+        let request =
+            crate::model_turn_request(&crate::AgentTurnRequest::new("model", "unpolled"), None)
+                .expect("model request");
+        drop(provider.start_turn(None, &request));
+        {
+            let state = lock_state(&provider.state);
+            assert!(state.active.is_empty());
+            assert!(state.requests.is_empty());
+            assert!(state.cancellations.is_empty());
+            assert!(state.finishes.is_empty());
+            assert_eq!(state.turns.len(), 1);
+        }
+        let response = crate::AgentRuntime::new()
+            .run_text_turn(
+                &mut provider,
+                crate::AgentTurnRequest::new("model", "recovery"),
+            )
+            .await
+            .expect("unused script remains runnable");
+        assert_eq!(response.text, "retained");
+        let state = lock_state(&provider.state);
+        assert!(state.active.is_empty());
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.finishes.len(), 1);
+        assert!(state.cancellations.is_empty());
+    }
 }
 
 fn unknown_turn_error(provider_turn_id: &str) -> RuntimeError {
