@@ -4,6 +4,8 @@
 
 //! Portable JSON Schema normalization for model-provider output contracts.
 
+mod traversal;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -137,10 +139,14 @@ impl std::error::Error for SchemaPortabilityError {}
 /// # Errors
 ///
 /// Returns an error for rejected keywords, unsupported `minItems` values, external references,
-/// missing local reference targets, or recursive local references.
+/// missing local reference targets, recursive local references, unsupported source dialects,
+/// nested dialect declarations, or non-schema values in schema positions.
+/// Source dialects supported: draft-07, 2019-09 and 2020-12 (default when `$schema` is absent).
+/// Unknown extension keywords are preserved as opaque data; this is not a metaschema validator.
 pub fn normalize(schema: &Value, dialect: &SchemaDialect) -> Result<Value, SchemaPortabilityError> {
     let mut normalized = schema.clone();
-    normalize_value(&mut normalized, dialect, "")?;
+    let draft = traversal::Draft::from_schema(schema)?;
+    normalize_value(&mut normalized, dialect, "", draft)?;
     validate_references(&normalized, dialect)?;
     Ok(normalized)
 }
@@ -149,17 +155,33 @@ fn normalize_value(
     value: &mut Value,
     dialect: &SchemaDialect,
     path: &str,
+    draft: traversal::Draft,
 ) -> Result<(), SchemaPortabilityError> {
-    match value {
-        Value::Object(object) => normalize_object(object, dialect, path),
-        Value::Array(values) => {
-            for (index, child) in values.iter_mut().enumerate() {
-                normalize_value(child, dialect, &join_pointer(path, &index.to_string()))?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+    if value.get("$schema").is_some() && !path.is_empty() {
+        return Err(SchemaPortabilityError::new(
+            path,
+            "nested dialect declarations are unsupported",
+        ));
     }
+    if let Value::Object(object) = value {
+        normalize_object(object, dialect, path)?;
+    } else if !value.is_boolean() {
+        return Err(SchemaPortabilityError::new(
+            path,
+            "expected an object or boolean schema",
+        ));
+    }
+    for child_path in traversal::children(value, draft) {
+        normalize_value(
+            value
+                .pointer_mut(&child_path)
+                .expect("traversal pointer exists"),
+            dialect,
+            &format!("{path}{child_path}"),
+            draft,
+        )?;
+    }
+    Ok(())
 }
 
 fn normalize_object(
@@ -211,40 +233,6 @@ fn normalize_object(
             .map(|properties| properties.keys().cloned().map(Value::String).collect())
             .unwrap_or_default();
         object.insert("required".to_string(), Value::Array(required));
-    }
-    let keys = object.keys().cloned().collect::<Vec<_>>();
-    for key in keys {
-        if let Some(child) = object.get_mut(&key) {
-            let child_path = join_pointer(path, &key);
-            match key.as_str() {
-                "properties" | "$defs" | "definitions" | "patternProperties"
-                | "dependentSchemas" => {
-                    if let Some(schemas) = child.as_object_mut() {
-                        for (name, schema) in schemas {
-                            normalize_value(schema, dialect, &join_pointer(&child_path, name))?;
-                        }
-                    }
-                }
-                "items"
-                | "additionalProperties"
-                | "additionalItems"
-                | "contains"
-                | "propertyNames"
-                | "not"
-                | "if"
-                | "then"
-                | "else"
-                | "unevaluatedItems"
-                | "unevaluatedProperties"
-                | "allOf"
-                | "anyOf"
-                | "oneOf"
-                | "prefixItems" => {
-                    normalize_value(child, dialect, &child_path)?;
-                }
-                _ => {}
-            }
-        }
     }
     Ok(())
 }
@@ -334,53 +322,46 @@ fn walk_references(
     path: &str,
     stack: &mut Vec<String>,
 ) -> Result<(), SchemaPortabilityError> {
-    match value {
-        Value::Object(object) => {
-            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-                if reference.starts_with('#') {
-                    let target_pointer = reference.strip_prefix('#').unwrap_or_default();
-                    let target = root.pointer(target_pointer).ok_or_else(|| {
-                        SchemaPortabilityError::new(
-                            &join_pointer(path, "$ref"),
-                            format!("local reference `{reference}` does not exist"),
-                        )
-                    })?;
-                    if dialect.reject_recursive_references {
-                        if stack.iter().any(|seen| seen == reference) {
-                            return Err(SchemaPortabilityError::new(
-                                &join_pointer(path, "$ref"),
-                                format!("recursive reference `{reference}` is unsupported"),
-                            ));
-                        }
-                        stack.push(reference.to_string());
-                        walk_references(root, target, dialect, target_pointer, stack)?;
-                        stack.pop();
-                    }
-                } else if dialect.reject_external_references {
-                    return Err(SchemaPortabilityError::new(
+    if let Value::Object(object) = value {
+        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+            if reference.starts_with('#') {
+                let target_pointer = reference.strip_prefix('#').unwrap_or_default();
+                let target = root.pointer(target_pointer).ok_or_else(|| {
+                    SchemaPortabilityError::new(
                         &join_pointer(path, "$ref"),
-                        "external references are unsupported by this dialect",
-                    ));
+                        format!("local reference `{reference}` does not exist"),
+                    )
+                })?;
+                if dialect.reject_recursive_references {
+                    if stack.iter().any(|seen| seen == reference) {
+                        return Err(SchemaPortabilityError::new(
+                            &join_pointer(path, "$ref"),
+                            format!("recursive reference `{reference}` is unsupported"),
+                        ));
+                    }
+                    stack.push(reference.to_string());
+                    walk_references(root, target, dialect, target_pointer, stack)?;
+                    stack.pop();
                 }
-            }
-            for (key, child) in object {
-                if key != "$ref" {
-                    walk_references(root, child, dialect, &join_pointer(path, key), stack)?;
-                }
+            } else if dialect.reject_external_references {
+                return Err(SchemaPortabilityError::new(
+                    &join_pointer(path, "$ref"),
+                    "external references are unsupported by this dialect",
+                ));
             }
         }
-        Value::Array(values) => {
-            for (index, child) in values.iter().enumerate() {
-                walk_references(
-                    root,
-                    child,
-                    dialect,
-                    &join_pointer(path, &index.to_string()),
-                    stack,
-                )?;
-            }
+        let draft = traversal::Draft::from_schema(root)?;
+        for child_path in traversal::children(value, draft) {
+            walk_references(
+                root,
+                value
+                    .pointer(&child_path)
+                    .expect("traversal pointer exists"),
+                dialect,
+                &format!("{path}{child_path}"),
+                stack,
+            )?;
         }
-        _ => {}
     }
     Ok(())
 }
@@ -404,6 +385,101 @@ mod tests {
             ]),
             accepted_min_items: BTreeSet::from([0, 1]),
             ..SchemaDialect::default()
+        }
+    }
+
+    #[test]
+    fn literals_and_extensions_do_not_participate_in_reference_validation() {
+        for keyword in ["const", "enum", "default", "examples", "x-extension"] {
+            let schema = serde_json::json!({keyword: {"$ref":"https://example.invalid/schema", "properties":{"type":{"type":"object"}}}});
+            assert_eq!(
+                normalize(&schema, &SchemaDialect::default()).unwrap(),
+                schema
+            );
+        }
+        let schema = serde_json::json!({"properties":{"$ref":{"type":"string"},"a/b~c":{"$ref":"#/missing"}}});
+        assert_eq!(
+            normalize(&schema, &SchemaDialect::default())
+                .unwrap_err()
+                .path(),
+            "/properties/a~1b~0c/$ref"
+        );
+    }
+
+    #[test]
+    fn source_drafts_control_subschema_positions() {
+        let literal = serde_json::json!({"$ref":"https://example.invalid/schema"});
+        let seven = "http://json-schema.org/draft-07/schema#";
+        let nineteen = "https://json-schema.org/draft/2019-09/schema";
+        let twenty = "https://json-schema.org/draft/2020-12/schema";
+        for draft in [seven, nineteen, twenty] {
+            for (keyword, active) in [
+                ("definitions", draft != twenty),
+                ("dependencies", draft != twenty),
+                ("$defs", draft != seven),
+                ("dependentSchemas", draft != seven),
+            ] {
+                let schema = serde_json::json!({"$schema":draft, keyword:{"field":literal}});
+                assert_eq!(
+                    normalize(&schema, &SchemaDialect::default()).is_err(),
+                    active,
+                    "{draft} {keyword}"
+                );
+            }
+            let dependencies =
+                serde_json::json!({"$schema":draft,"dependencies":{"field":["properties","$ref"]}});
+            assert!(normalize(&dependencies, &SchemaDialect::default()).is_ok());
+            let tuple = serde_json::json!({"$schema":draft,"items":[true, {"type":"object"}]});
+            assert_eq!(
+                normalize(&tuple, &restrictive_dialect()).is_ok(),
+                draft != twenty
+            );
+            let content = serde_json::json!({"$schema":draft,"contentSchema":literal});
+            assert_eq!(
+                normalize(&content, &SchemaDialect::default()).is_err(),
+                draft != seven
+            );
+        }
+        assert!(
+            normalize(
+                &serde_json::json!({"$schema":"https://example.invalid/custom"}),
+                &SchemaDialect::default()
+            )
+            .is_err()
+        );
+        assert!(
+            normalize(
+                &serde_json::json!({"properties":{"x":{"$schema":seven}}}),
+                &SchemaDialect::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn all_applicator_shapes_share_normalization() {
+        for keyword in [
+            "items",
+            "contains",
+            "additionalProperties",
+            "propertyNames",
+            "not",
+            "if",
+            "then",
+            "else",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+            "contentSchema",
+        ] {
+            let schema = serde_json::json!({keyword:{"type":"object","properties":{"type":{"type":"string"}}}});
+            let normalized = normalize(&schema, &restrictive_dialect()).unwrap();
+            assert_eq!(normalized[keyword]["required"], serde_json::json!(["type"]));
+        }
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+            let schema = serde_json::json!({keyword:[true,{"type":"object"}]});
+            let normalized = normalize(&schema, &restrictive_dialect()).unwrap();
+            assert_eq!(normalized[keyword][0], true);
+            assert_eq!(normalized[keyword][1]["additionalProperties"], false);
         }
     }
 
