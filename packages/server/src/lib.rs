@@ -2132,6 +2132,7 @@ impl ServerState {
                 .store(true, Ordering::SeqCst);
         }
         *task = None;
+        drop(task);
         if self.session_search_ingestion_failed.load(Ordering::SeqCst) {
             Err(ServerError::SessionSearchIngestionShutdown)
         } else {
@@ -14537,23 +14538,19 @@ async fn broadcast_workflow_event(
     event: bcode_workflow_view_models::WorkflowLiveEvent,
 ) {
     let event = Event::Workflow(event);
-    let mut sends = JoinSet::new();
+    let mut sends = futures::stream::FuturesUnordered::new();
     for sink in state.workflow_event_sinks().await {
         let event = event.clone();
-        sends.spawn(async move {
+        sends.push(async move {
             let client_id = sink.client_id();
             (client_id, sink.send(event).await)
         });
     }
     let mut disconnected = Vec::new();
-    while let Some(result) = sends.join_next().await {
-        match result {
-            Ok((_client_id, Ok(()))) => {}
-            Ok((client_id, Err(error))) => {
-                tracing::debug!(%client_id, %error, "workflow event client disconnected");
-                disconnected.push(client_id);
-            }
-            Err(error) => tracing::warn!(%error, "workflow event send task failed"),
+    while let Some((client_id, result)) = sends.next().await {
+        if let Err(error) = result {
+            tracing::debug!(%client_id, %error, "workflow event client disconnected");
+            disconnected.push(client_id);
         }
     }
     state.unregister_workflow_event_clients(&disconnected).await;
