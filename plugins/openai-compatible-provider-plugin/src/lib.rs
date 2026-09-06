@@ -274,6 +274,14 @@ impl TurnState {
 }
 
 impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
+    fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        if let Ok(runtime) = &self.runtime {
+            runtime
+                .shutdown(Duration::from_secs(5))
+                .map_err(|error| PluginError::failed(error.to_string()))?;
+        }
+        Ok(())
+    }
     fn register_auth_providers_concurrent(
         &self,
         registrar: AuthRegistrar,
@@ -287,6 +295,9 @@ impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
 }
 
 impl RustPlugin for OpenAiCompatibleProviderPlugin {
+    fn deactivate(&mut self) -> Result<(), PluginError> {
+        self.deactivate_concurrent()
+    }
     fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
         register_auth_providers(registrar)
     }
@@ -9045,6 +9056,17 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deactivation_stops_provider_runtime() {
+        let mut plugin = OpenAiCompatibleProviderPlugin::default();
+        let runtime = plugin.runtime.as_ref().expect("runtime");
+        let task = runtime.spawn(std::future::pending::<()>());
+        plugin.deactivate_concurrent().expect("shutdown");
+        assert!(task.is_finished());
+        assert!(runtime.block_on(async {}).is_err());
+        plugin.deactivate().expect("idempotent shutdown");
+    }
 
     #[test]
     fn provider_api_pricing_preserves_provider_owned_revision() {

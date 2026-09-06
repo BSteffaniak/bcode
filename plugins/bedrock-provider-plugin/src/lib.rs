@@ -111,6 +111,14 @@ impl BedrockTurnExecutor for AwsBedrockTurnExecutor {
 }
 
 impl ConcurrentRustPlugin for BedrockProviderPlugin {
+    fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        if let Ok(runtime) = &self.runtime {
+            runtime
+                .shutdown(Duration::from_secs(5))
+                .map_err(|error| PluginError::failed(error.to_string()))?;
+        }
+        Ok(())
+    }
     fn activate_concurrent(&self) -> Result<(), PluginError> {
         self.activate_provider();
         Ok(())
@@ -122,6 +130,9 @@ impl ConcurrentRustPlugin for BedrockProviderPlugin {
 }
 
 impl RustPlugin for BedrockProviderPlugin {
+    fn deactivate(&mut self) -> Result<(), PluginError> {
+        self.deactivate_concurrent()
+    }
     fn activate(&mut self) -> Result<(), PluginError> {
         self.activate_provider();
         Ok(())
@@ -7295,6 +7306,17 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deactivation_stops_provider_runtime() {
+        let mut plugin = BedrockProviderPlugin::default();
+        let runtime = plugin.runtime.as_ref().expect("runtime");
+        let task = runtime.spawn(std::future::pending::<()>());
+        plugin.deactivate_concurrent().expect("shutdown");
+        assert!(task.is_finished());
+        assert!(runtime.block_on(async {}).is_err());
+        plugin.deactivate().expect("idempotent shutdown");
+    }
     use bcode_model_provider_runtime::{
         BlockingModelProviderInvoker, ProviderConformanceOptions, ProviderConformanceOutcome,
         run_provider_conformance_suite,

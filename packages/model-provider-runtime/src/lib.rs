@@ -18,7 +18,7 @@ use bcode_model::{
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot};
@@ -1154,8 +1154,25 @@ fn unix_timestamp() -> u64 {
 /// can spawn long-lived async work without creating a new runtime per operation.
 pub struct ProviderRuntime {
     handle: tokio::runtime::Handle,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
     thread: Option<thread::JoinHandle<()>>,
+    stopped: Arc<(Mutex<Option<bool>>, Condvar)>,
+}
+
+struct RuntimeExit {
+    stopped: Arc<(Mutex<Option<bool>>, Condvar)>,
+    released: bool,
+}
+
+impl Drop for RuntimeExit {
+    fn drop(&mut self) {
+        *self
+            .stopped
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.released);
+        self.stopped.1.notify_all();
+    }
 }
 
 impl std::fmt::Debug for ProviderRuntime {
@@ -1176,9 +1193,15 @@ impl ProviderRuntime {
     pub fn new() -> Result<Self, ProviderRuntimeError> {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let stopped = Arc::new((Mutex::new(None), Condvar::new()));
+        let worker_stopped = Arc::clone(&stopped);
         let thread = thread::Builder::new()
             .name("bcode-provider-runtime".to_string())
             .spawn(move || {
+                let mut exit = RuntimeExit {
+                    stopped: worker_stopped,
+                    released: false,
+                };
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_io()
                     .enable_time()
@@ -1197,6 +1220,9 @@ impl ProviderRuntime {
                 runtime.block_on(async {
                     let _ = shutdown_receiver.await;
                 });
+                // Acknowledge only after task destructors and blocking work have finished.
+                drop(runtime);
+                exit.released = true;
             })
             .map_err(ProviderRuntimeError::ThreadSpawn)?;
         let handle = ready_receiver
@@ -1205,22 +1231,81 @@ impl ProviderRuntime {
             .map_err(ProviderRuntimeError::RuntimeBuild)?;
         Ok(Self {
             handle,
-            shutdown: Some(shutdown_sender),
+            shutdown: Mutex::new(Some(shutdown_sender)),
             thread: Some(thread),
+            stopped,
         })
+    }
+
+    /// Request shutdown and wait at most `timeout` for runtime resources to be released.
+    ///
+    /// Call from synchronous lifecycle code, not from work running on this runtime. Once
+    /// requested, shutdown is permanent. A timeout retains ownership and a later call may
+    /// wait again. Success acknowledges task destruction and completion of blocking work.
+    /// Drop still joins the worker if shutdown has not completed, so plugin code cannot
+    /// outlive its library; a timeout is not permission to unload the plugin.
+    ///
+    /// # Errors
+    ///
+    /// * Returns [`ProviderRuntimeError::ShutdownTimeout`] while work remains unaccounted for.
+    /// * Returns [`ProviderRuntimeError::ShutdownFailed`] if the worker exits without acknowledging
+    ///   resource release.
+    pub fn shutdown(&self, timeout: Duration) -> Result<(), ProviderRuntimeError> {
+        let started = Instant::now();
+        let signal = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(signal) = signal {
+            let _ = signal.send(());
+        }
+        let (state, _) = self
+            .stopped
+            .1
+            .wait_timeout_while(
+                self.stopped
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                timeout.saturating_sub(started.elapsed()),
+                |state| state.is_none(),
+            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = *state;
+        drop(state);
+        match outcome {
+            Some(true) => Ok(()),
+            Some(false) => Err(ProviderRuntimeError::ShutdownFailed),
+            None => Err(ProviderRuntimeError::ShutdownTimeout),
+        }
     }
 
     /// Spawn async provider work onto the shared runtime.
     ///
     /// The returned handle may be dropped when the caller does not need the task
     /// result, such as provider turn streaming where completion is reported via
-    /// queued provider events.
+    /// queued provider events. After shutdown is requested, the supplied future is dropped
+    /// without polling and the returned handle is cancelled.
     pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.handle.spawn(future)
+        let admission = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admission.is_none() {
+            drop(admission);
+            // Preserve the join-handle API while never polling rejected user work.
+            let task = self.handle.spawn(std::future::pending::<F::Output>());
+            task.abort();
+            return task;
+        }
+        let task = self.handle.spawn(future);
+        drop(admission);
+        task
     }
 
     /// Run an async operation to completion from synchronous plugin code.
@@ -1230,18 +1315,26 @@ impl ProviderRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if the background runtime stops before the operation
-    /// returns its result.
+    /// Returns an error if shutdown has been requested or the background runtime stops
+    /// before the operation returns its result.
     pub fn block_on<F>(&self, future: F) -> Result<F::Output, ProviderRuntimeError>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        let admission = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admission.is_none() {
+            return Err(ProviderRuntimeError::ShuttingDown);
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         self.handle.spawn(async move {
             let output = future.await;
             let _ = sender.send(output);
         });
+        drop(admission);
         receiver
             .recv()
             .map_err(|_| ProviderRuntimeError::TaskDropped)
@@ -1250,7 +1343,12 @@ impl ProviderRuntime {
 
 impl Drop for ProviderRuntime {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
+        if let Some(shutdown) = self
+            .shutdown
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             let _ = shutdown.send(());
         }
         if let Some(thread) = self.thread.take() {
@@ -1270,6 +1368,12 @@ pub enum ProviderRuntimeError {
     StartupDropped,
     /// A scheduled operation did not return a result before the runtime stopped.
     TaskDropped,
+    /// Work was rejected because shutdown has already been requested.
+    ShuttingDown,
+    /// The shutdown deadline elapsed without confirmation of resource release.
+    ShutdownTimeout,
+    /// The worker exited without confirming resource release.
+    ShutdownFailed,
 }
 
 impl std::fmt::Display for ProviderRuntimeError {
@@ -1279,6 +1383,9 @@ impl std::fmt::Display for ProviderRuntimeError {
             Self::ThreadSpawn(error) => write!(formatter, "runtime thread spawn failed: {error}"),
             Self::StartupDropped => write!(formatter, "runtime thread exited during startup"),
             Self::TaskDropped => write!(formatter, "runtime task ended without returning a result"),
+            Self::ShuttingDown => write!(formatter, "runtime shutdown has been requested"),
+            Self::ShutdownTimeout => write!(formatter, "runtime shutdown deadline elapsed"),
+            Self::ShutdownFailed => write!(formatter, "runtime exited without confirming shutdown"),
         }
     }
 }
