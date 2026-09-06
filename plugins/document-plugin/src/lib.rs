@@ -46,6 +46,14 @@ impl Default for DocumentPlugin {
 }
 
 impl RustPlugin for DocumentPlugin {
+    fn deactivate(&mut self) -> Result<(), PluginError> {
+        if let Ok(runtime) = &self.runtime {
+            runtime
+                .shutdown(Duration::from_secs(5))
+                .map_err(|error| PluginError::failed(error.to_string()))?;
+        }
+        Ok(())
+    }
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             TOOL_SERVICE_INTERFACE_ID => self.invoke_tool_service(&context),
@@ -879,6 +887,20 @@ bcode_plugin_sdk::export_plugin!(DocumentPlugin, include_str!("../bcode-plugin.t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deactivation_releases_runtime_work() {
+        let mut plugin = DocumentPlugin::default();
+        let task = plugin
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .spawn(std::future::pending::<()>());
+        plugin.deactivate().expect("shutdown");
+        assert!(task.is_finished());
+        assert!(plugin.runtime.as_ref().unwrap().block_on(async {}).is_err());
+        plugin.deactivate().expect("idempotent shutdown");
+    }
 
     #[test]
     fn document_tools_emit_request_contributions() {

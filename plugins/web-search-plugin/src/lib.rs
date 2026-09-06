@@ -103,6 +103,14 @@ impl Default for WebSearchPlugin {
 }
 
 impl RustPlugin for WebSearchPlugin {
+    fn deactivate(&mut self) -> Result<(), PluginError> {
+        if let Ok(runtime) = &self.runtime {
+            runtime
+                .shutdown(Duration::from_secs(5))
+                .map_err(|error| PluginError::failed(error.to_string()))?;
+        }
+        Ok(())
+    }
     fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
         registrar
             .register(&exa_auth_provider_contribution())
@@ -2801,6 +2809,20 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deactivation_releases_runtime_work() {
+        let mut plugin = WebSearchPlugin::default();
+        let task = plugin
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .spawn(std::future::pending::<()>());
+        plugin.deactivate().expect("shutdown");
+        assert!(task.is_finished());
+        assert!(plugin.runtime.as_ref().unwrap().block_on(async {}).is_err());
+        plugin.deactivate().expect("idempotent shutdown");
+    }
     use std::sync::Mutex;
 
     static AUTH_REGISTRATIONS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());

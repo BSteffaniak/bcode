@@ -117,6 +117,10 @@ impl ConcurrentRustPlugin for BedrockProviderPlugin {
                 .shutdown(Duration::from_secs(5))
                 .map_err(|error| PluginError::failed(error.to_string()))?;
         }
+        self.turns
+            .lock()
+            .map_err(|_| PluginError::failed("provider turn state is unavailable"))?
+            .finish_all();
         Ok(())
     }
     fn activate_concurrent(&self) -> Result<(), PluginError> {
@@ -7312,7 +7316,10 @@ mod tests {
         let mut plugin = BedrockProviderPlugin::default();
         let runtime = plugin.runtime.as_ref().expect("runtime");
         let task = runtime.spawn(std::future::pending::<()>());
+        let (turn_id, turn) = plugin.turns.lock().unwrap().insert_started("test");
         plugin.deactivate_concurrent().expect("shutdown");
+        assert!(turn.is_cancelled());
+        assert!(plugin.turns.lock().unwrap().drain(&turn_id).is_empty());
         assert!(task.is_finished());
         assert!(runtime.block_on(async {}).is_err());
         plugin.deactivate().expect("idempotent shutdown");

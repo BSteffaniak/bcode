@@ -614,6 +614,17 @@ impl TurnStore {
         }
     }
 
+    /// Cancel all retained turns and release their store entries without reusing turn IDs.
+    ///
+    /// External handles observe cancellation. This requests worker cancellation; it does not
+    /// acknowledge worker termination, which remains the execution owner's responsibility.
+    pub fn finish_all(&mut self) {
+        for turn in self.turns.values() {
+            turn.cancel();
+        }
+        self.turns.clear();
+    }
+
     /// Cancel and remove a provider turn from the active store.
     pub fn finish(&mut self, provider_turn_id: &str) {
         if let Some(turn) = self.turns.remove(provider_turn_id) {
@@ -1247,10 +1258,13 @@ impl ProviderRuntime {
     ///
     /// # Errors
     ///
+    /// * Returns [`ProviderRuntimeError::RuntimeThreadWait`] on the runtime worker, without
+    ///   requesting shutdown.
     /// * Returns [`ProviderRuntimeError::ShutdownTimeout`] while work remains unaccounted for.
     /// * Returns [`ProviderRuntimeError::ShutdownFailed`] if the worker exits without acknowledging
     ///   resource release.
     pub fn shutdown(&self, timeout: Duration) -> Result<(), ProviderRuntimeError> {
+        self.check_blocking_caller()?;
         let started = Instant::now();
         let signal = self
             .shutdown
@@ -1308,6 +1322,17 @@ impl ProviderRuntime {
         task
     }
 
+    fn check_blocking_caller(&self) -> Result<(), ProviderRuntimeError> {
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|worker| worker.thread().id() == thread::current().id())
+        {
+            return Err(ProviderRuntimeError::RuntimeThreadWait);
+        }
+        Ok(())
+    }
+
     /// Run an async operation to completion from synchronous plugin code.
     ///
     /// This schedules the future on the background runtime and waits for its
@@ -1315,13 +1340,14 @@ impl ProviderRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if shutdown has been requested or the background runtime stops
-    /// before the operation returns its result.
+    /// Returns an error if called on the runtime worker, if shutdown has been requested,
+    /// or if the background runtime stops before the operation returns its result.
     pub fn block_on<F>(&self, future: F) -> Result<F::Output, ProviderRuntimeError>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.check_blocking_caller()?;
         let admission = self
             .shutdown
             .lock()
@@ -1368,6 +1394,8 @@ pub enum ProviderRuntimeError {
     StartupDropped,
     /// A scheduled operation did not return a result before the runtime stopped.
     TaskDropped,
+    /// A synchronous wait was requested from the runtime's own worker thread.
+    RuntimeThreadWait,
     /// Work was rejected because shutdown has already been requested.
     ShuttingDown,
     /// The shutdown deadline elapsed without confirmation of resource release.
@@ -1383,6 +1411,10 @@ impl std::fmt::Display for ProviderRuntimeError {
             Self::ThreadSpawn(error) => write!(formatter, "runtime thread spawn failed: {error}"),
             Self::StartupDropped => write!(formatter, "runtime thread exited during startup"),
             Self::TaskDropped => write!(formatter, "runtime task ended without returning a result"),
+            Self::RuntimeThreadWait => write!(
+                formatter,
+                "cannot synchronously wait on the provider runtime worker"
+            ),
             Self::ShuttingDown => write!(formatter, "runtime shutdown has been requested"),
             Self::ShutdownTimeout => write!(formatter, "runtime shutdown deadline elapsed"),
             Self::ShutdownFailed => write!(formatter, "runtime exited without confirming shutdown"),

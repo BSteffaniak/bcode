@@ -280,6 +280,16 @@ impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
                 .shutdown(Duration::from_secs(5))
                 .map_err(|error| PluginError::failed(error.to_string()))?;
         }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PluginError::failed("provider state is unavailable"))?;
+        for turn in state.turns.values() {
+            turn.cancel();
+        }
+        state.turns.clear();
+        state.auth_flows.clear();
+        drop(state);
         Ok(())
     }
     fn register_auth_providers_concurrent(
@@ -9056,6 +9066,38 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deactivation_releases_retained_oauth_listener() {
+        let plugin = OpenAiCompatibleProviderPlugin::default();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().unwrap();
+        let turn = TurnState::default();
+        {
+            let mut state = plugin.state.lock().unwrap();
+            state.turns.insert("turn".to_owned(), turn.clone());
+            state.auth_flows.insert(
+                "flow".to_owned(),
+                OpenAiAuthFlowState::Browser {
+                    profile: "test".to_owned(),
+                    oauth_state: "state".to_owned(),
+                    verifier: "verifier".to_owned(),
+                    redirect_uri: "http://localhost".to_owned(),
+                    listeners: vec![listener],
+                    polls: 0,
+                    prompt_shown: false,
+                },
+            );
+        }
+        plugin.deactivate_concurrent().expect("deactivation");
+        assert!(turn.is_cancelled());
+        let rebound = TcpListener::bind(address).expect("OAuth listener released");
+        drop(rebound);
+        let state = plugin.state.lock().unwrap();
+        assert!(state.turns.is_empty());
+        assert!(state.auth_flows.is_empty());
+        drop(state);
+    }
 
     #[test]
     fn deactivation_stops_provider_runtime() {

@@ -19,6 +19,24 @@ impl Drop for Released {
 }
 
 #[test]
+fn finishing_all_turns_cancels_handles_without_reusing_identity() {
+    let mut store = bcode_model_provider_runtime::TurnStore::default();
+    let (first_id, first) = store.insert_started("provider");
+    let (second_id, second) = store.insert_started("provider");
+    store.finish_all();
+    assert!(first.is_cancelled());
+    assert!(second.is_cancelled());
+    assert!(store.drain(&first_id).is_empty());
+    assert!(store.drain(&second_id).is_empty());
+    store.finish_all();
+    let (next_id, next) = store.insert_started("provider");
+    assert_ne!(first_id, next_id);
+    assert_ne!(second_id, next_id);
+    store.cancel(&first_id);
+    assert!(!next.is_cancelled());
+}
+
+#[test]
 fn shutdown_acknowledges_task_destruction_and_is_idempotent() {
     let runtime = ProviderRuntime::new().unwrap();
     let (released, receiver) = mpsc::channel();
@@ -44,6 +62,26 @@ fn shutdown_acknowledges_task_destruction_and_is_idempotent() {
     }));
     drop(runtime);
     assert!(!polled.load(Ordering::SeqCst));
+}
+
+#[test]
+fn runtime_worker_rejects_self_wait_without_starting_shutdown() {
+    let runtime = Arc::new(ProviderRuntime::new().unwrap());
+    let worker_runtime = Arc::clone(&runtime);
+    runtime
+        .block_on(async move {
+            assert!(matches!(
+                worker_runtime.block_on(async {}),
+                Err(ProviderRuntimeError::RuntimeThreadWait)
+            ));
+            assert!(matches!(
+                worker_runtime.shutdown(Duration::from_secs(5)),
+                Err(ProviderRuntimeError::RuntimeThreadWait)
+            ));
+        })
+        .unwrap();
+    assert_eq!(runtime.block_on(async { 42 }).unwrap(), 42);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
 }
 
 #[test]
