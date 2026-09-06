@@ -12,9 +12,17 @@ pub fn runtime_work_from_row(
         work_id: WorkId::new(required_string(row, "work_id")?),
         event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
         event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
-        kind: parse_runtime_work_kind(&required_string(row, "kind")?),
+        kind: parse_runtime_work_kind(&required_string(row, "kind")?).ok_or_else(|| {
+            crate::db::SessionDbError::InvalidRow {
+                column: "kind".to_owned(),
+            }
+        })?,
         label: required_string(row, "label")?,
-        status: parse_runtime_work_status(&required_string(row, "status")?),
+        status: parse_runtime_work_status(&required_string(row, "status")?).ok_or_else(|| {
+            crate::db::SessionDbError::InvalidRow {
+                column: "status".to_owned(),
+            }
+        })?,
         parent_work_id: optional_string(row, "parent_work_id").map(WorkId::new),
         started_at_ms: optional_i64(row, "started_at_ms").map(i64_to_u64),
         finished_at_ms: optional_i64(row, "finished_at_ms").map(i64_to_u64),

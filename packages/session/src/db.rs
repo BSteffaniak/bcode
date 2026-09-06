@@ -4578,6 +4578,24 @@ async fn project_event(
             cancellable,
             ..
         } => {
+            // A later start may resume suspended work, but cannot reopen a terminal ID.
+            let existing = db
+                .select("runtime_work")
+                .columns(&["status"])
+                .where_eq("work_id", work_id.to_string())
+                .execute_first(db)
+                .await?;
+            if let Some(row) = existing {
+                let status = crate::db_runtime_work::parse_runtime_work_status(&required_string(
+                    &row, "status",
+                )?)
+                .ok_or_else(|| SessionDbError::InvalidRow {
+                    column: "status".to_owned(),
+                })?;
+                if status.is_terminal() {
+                    return Ok(());
+                }
+            }
             db.upsert("runtime_work")
                 .unique(&["work_id"])
                 .value("work_id", work_id.to_string())
@@ -6720,6 +6738,17 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_work_lifecycles_remain_isolated_in_projection() {
+        for status in [
+            RuntimeWorkStatus::Completed,
+            RuntimeWorkStatus::Failed,
+            RuntimeWorkStatus::TimedOut,
+            RuntimeWorkStatus::Cancelled,
+        ] {
+            assert_runtime_terminal_isolation(status).await;
+        }
+    }
+
+    async fn assert_runtime_terminal_isolation(status: RuntimeWorkStatus) {
         let root = tempfile::tempdir().expect("session root");
         let session_id = SessionId::new();
         let db = SessionDb::open_turso_in_root(session_id, root.path())
@@ -6750,7 +6779,7 @@ mod tests {
                     1,
                     SessionEventKind::RuntimeWorkFinished {
                         work_id: WorkId::new("first"),
-                        status: RuntimeWorkStatus::Completed,
+                        status,
                         finished_at_ms: Some(1),
                         message: Some("first completed".to_owned()),
                     },
@@ -6762,7 +6791,7 @@ mod tests {
         let history = db.runtime_work_history(10).await.expect("history");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].work_id, WorkId::new("first"));
-        assert_eq!(history[0].status, RuntimeWorkStatus::Completed);
+        assert_eq!(history[0].status, status);
         assert_eq!(history[0].event_seq_end, Some(1));
         assert_eq!(history[0].message.as_deref(), Some("first completed"));
         assert_eq!(history[1].work_id, WorkId::new("second"));
@@ -6855,6 +6884,121 @@ mod tests {
         let updated = db.runtime_work_history(10).await.expect("progress history");
         assert_eq!(updated[0], after[0]);
         assert_eq!(updated[1].message.as_deref(), Some("cleaning up"));
+        assert_terminal_restart_ignored(db, session_id, &updated).await;
+    }
+
+    async fn assert_terminal_restart_ignored(
+        db: &SessionDb,
+        session_id: SessionId,
+        expected: &[RuntimeWorkProjection],
+    ) {
+        db.append_event(&event(
+            session_id,
+            8,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: WorkId::new("first"),
+                kind: RuntimeWorkKind::Tool,
+                label: "stale restart".to_owned(),
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(8),
+                cancellable: true,
+            },
+        ))
+        .await
+        .expect("persist stale restart");
+        assert_eq!(
+            db.runtime_work_history(10).await.expect("terminal history"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_work_history_rejects_unknown_projection_values_without_repair() {
+        let root = tempfile::tempdir().expect("session root");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, root.path())
+            .await
+            .expect("database");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: WorkId::new("unknown-projection"),
+                kind: RuntimeWorkKind::Tool,
+                label: "work".to_owned(),
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(0),
+                cancellable: true,
+            },
+        ))
+        .await
+        .expect("start");
+        for (column, valid) in [("kind", "tool"), ("status", "running")] {
+            db.database()
+                .update("runtime_work")
+                .value(column, "future_variant")
+                .where_eq("work_id", "unknown-projection")
+                .execute(db.database())
+                .await
+                .expect("damage test projection");
+            assert!(matches!(db.runtime_work_history(1).await,
+                Err(SessionDbError::InvalidRow { column: invalid }) if invalid == column));
+            if column == "status" {
+                let restart = event(
+                    session_id,
+                    1,
+                    SessionEventKind::RuntimeWorkStarted {
+                        work_id: WorkId::new("unknown-projection"),
+                        kind: RuntimeWorkKind::Tool,
+                        label: "restart".to_owned(),
+                        tool_call_id: None,
+                        plugin_id: None,
+                        service_interface: None,
+                        operation: None,
+                        parent_work_id: None,
+                        started_at_ms: Some(1),
+                        cancellable: true,
+                    },
+                );
+                assert!(matches!(db.append_event(&restart).await,
+                    Err(SessionDbError::InvalidRow { column }) if column == "status"));
+            }
+            let row = db
+                .database()
+                .select("runtime_work")
+                .columns(&[column])
+                .where_eq("work_id", "unknown-projection")
+                .execute_first(db.database())
+                .await
+                .expect("inspect projection")
+                .expect("row");
+            assert_eq!(
+                required_string(&row, column).expect("unchanged value"),
+                "future_variant"
+            );
+            db.database()
+                .update("runtime_work")
+                .value(column, valid)
+                .where_eq("work_id", "unknown-projection")
+                .execute(db.database())
+                .await
+                .expect("restore test fixture");
+        }
+        assert_eq!(
+            db.runtime_work_history(1)
+                .await
+                .expect("valid history")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

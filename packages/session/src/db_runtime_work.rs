@@ -14,16 +14,16 @@ pub const fn runtime_work_kind_name(kind: RuntimeWorkKind) -> &'static str {
     }
 }
 
-#[must_use]
-pub fn parse_runtime_work_kind(value: &str) -> RuntimeWorkKind {
-    match value {
+pub fn parse_runtime_work_kind(value: &str) -> Option<RuntimeWorkKind> {
+    Some(match value {
+        "tool" => RuntimeWorkKind::Tool,
         "plugin_invocation" => RuntimeWorkKind::PluginInvocation,
         "model_turn" => RuntimeWorkKind::ModelTurn,
         "event_delivery" => RuntimeWorkKind::EventDelivery,
         "workflow" => RuntimeWorkKind::Workflow,
         "workflow_node" => RuntimeWorkKind::WorkflowNode,
-        _ => RuntimeWorkKind::Tool,
-    }
+        _ => return None,
+    })
 }
 
 #[must_use]
@@ -40,9 +40,9 @@ pub const fn runtime_work_status_name(status: RuntimeWorkStatus) -> &'static str
     }
 }
 
-#[must_use]
-pub fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
-    match value {
+pub fn parse_runtime_work_status(value: &str) -> Option<RuntimeWorkStatus> {
+    Some(match value {
+        "running" => RuntimeWorkStatus::Running,
         "queued" => RuntimeWorkStatus::Queued,
         "cancelling" => RuntimeWorkStatus::Cancelling,
         "completed" => RuntimeWorkStatus::Completed,
@@ -50,8 +50,8 @@ pub fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
         "timed_out" => RuntimeWorkStatus::TimedOut,
         "cancelled" => RuntimeWorkStatus::Cancelled,
         "suspended" => RuntimeWorkStatus::Suspended,
-        _ => RuntimeWorkStatus::Running,
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -72,8 +72,25 @@ mod tests {
         ] {
             assert_eq!(
                 parse_runtime_work_status(runtime_work_status_name(status)),
-                status
+                Some(status)
             );
+        }
+        for kind in [
+            RuntimeWorkKind::Tool,
+            RuntimeWorkKind::PluginInvocation,
+            RuntimeWorkKind::ModelTurn,
+            RuntimeWorkKind::EventDelivery,
+            RuntimeWorkKind::Workflow,
+            RuntimeWorkKind::WorkflowNode,
+        ] {
+            assert_eq!(
+                parse_runtime_work_kind(runtime_work_kind_name(kind)),
+                Some(kind)
+            );
+        }
+        for value in ["", "future_variant", "RUNNING"] {
+            assert_eq!(parse_runtime_work_kind(value), None);
+            assert_eq!(parse_runtime_work_status(value), None);
         }
     }
 }
