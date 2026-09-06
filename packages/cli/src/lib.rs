@@ -103,6 +103,9 @@ pub enum CliError {
     NewSessionWithCommand,
     #[error("{0}")]
     LoginProfile(String),
+    /// Provider authentication ended with an explicit cancelled outcome.
+    #[error("Provider authentication flow was cancelled.")]
+    AuthFlowCancelled,
     #[error("bundled plugin install failed: {0}")]
     BundledPluginInstallFailed(String),
     #[error("plugin service error {code}: {message}")]
@@ -171,7 +174,9 @@ impl CliError {
             {
                 4
             }
-            Self::TurnCancelledBeforeStart | Self::SessionSearchBackfillCancelled => 4,
+            Self::TurnCancelledBeforeStart
+            | Self::SessionSearchBackfillCancelled
+            | Self::AuthFlowCancelled => 4,
             Self::SessionSearchBackfillIncomplete => 1,
             Self::Signal(_) => 1,
             Self::Client(_)
@@ -459,33 +464,87 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
+// Bound user-supplied theme documents before parsing, including growing files.
+const MAX_CLI_THEME_BYTES: usize = 1024 * 1024;
+
+fn theme_catalog_json(catalog: &bcode_tui::theme::definition::ThemeCatalog) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "themes": catalog.definitions().map(|definition| serde_json::json!({
+            "id": definition.id(),
+            "display_name": definition.display_name(),
+            "source": "bundled",
+            "dark": definition.has_dark_variant(),
+            "light": definition.has_light_variant(),
+        })).collect::<Vec<_>>()
+    })
+}
+
+const fn theme_variant_label(dark: bool, light: bool) -> &'static str {
+    match (dark, light) {
+        (true, true) => "dark,light",
+        (true, false) => "dark",
+        (false, true) => "light",
+        (false, false) => "-",
+    }
+}
+
+fn theme_copy_json(
+    builtin: &str,
+    path: &Path,
+    json: bool,
+) -> Result<Option<serde_json::Value>, CliError> {
+    // Validate path serialization before creating or replacing the destination.
+    if !json {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "schema_version": 1,
+        "builtin": builtin,
+        "path": serde_json::to_value(path)?,
+    })))
+}
+
 fn handle_theme_command(command: ThemeCommand) -> Result<(), CliError> {
+    write_theme_command(command, &mut std::io::stdout().lock())
+}
+
+fn write_theme_command(
+    command: ThemeCommand,
+    writer: &mut impl std::io::Write,
+) -> Result<(), CliError> {
     use bcode_tui::theme::definition::{ThemeCatalog, ThemeSelection, parse_theme_definition};
 
     match command {
-        ThemeCommand::List => {
+        ThemeCommand::List { json } => {
             let catalog =
                 ThemeCatalog::bundled().map_err(|error| CliError::Theme(error.to_string()))?;
+            if json {
+                return write_json_result(writer, &theme_catalog_json(&catalog));
+            }
             for definition in catalog.definitions() {
-                let variants = match (
+                let variants = theme_variant_label(
                     definition.has_dark_variant(),
                     definition.has_light_variant(),
-                ) {
-                    (true, true) => "dark,light",
-                    (true, false) => "dark",
-                    (false, true) => "light",
-                    (false, false) => "-",
-                };
-                println!(
+                );
+                writeln!(
+                    writer,
                     "{}\t{}\tbundled\t{}",
                     definition.id(),
                     definition.display_name(),
                     variants
-                );
+                )?;
             }
         }
-        ThemeCommand::Validate { path } => {
-            let source = std::fs::read_to_string(&path).map_err(CliError::ThemeIo)?;
+        ThemeCommand::Validate { path, json } => {
+            let bytes = read_bytes_with_limit(
+                std::fs::File::open(&path).map_err(CliError::ThemeIo)?,
+                MAX_CLI_THEME_BYTES,
+                "theme definition",
+            )?;
+            let source = String::from_utf8(bytes).map_err(|_| {
+                CliError::InvalidArguments("theme definition must be valid UTF-8".to_owned())
+            })?;
             let definition = parse_theme_definition(path.display().to_string(), &source)
                 .map_err(|error| CliError::Theme(error.to_string()))?;
             let id = definition.id().to_owned();
@@ -495,30 +554,58 @@ fn handle_theme_command(command: ThemeCommand) -> Result<(), CliError> {
             let resolved = catalog
                 .resolve(&ThemeSelection::new(&id))
                 .map_err(|error| CliError::Theme(error.to_string()))?;
-            println!("valid\t{id}\t{}", resolved.fingerprint);
+            if json {
+                return write_json_result(
+                    writer,
+                    &serde_json::json!({
+                        "schema_version": 1,
+                        "valid": true,
+                        "id": id,
+                        "fingerprint": resolved.fingerprint,
+                    }),
+                );
+            }
+            writeln!(writer, "valid\t{id}\t{}", resolved.fingerprint)?;
         }
         ThemeCommand::Copy {
             builtin,
             path,
             force,
+            json,
         } => {
+            let result = theme_copy_json(&builtin, &path, json)?;
             let source = ThemeCatalog::bundled_source(&builtin)
                 .ok_or_else(|| CliError::Theme(format!("unknown bundled theme {builtin:?}")))?;
-            if path.exists() && !force {
-                return Err(CliError::Theme(format!(
-                    "destination already exists: {} (use --force to replace)",
-                    path.display()
-                )));
-            }
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
                 std::fs::create_dir_all(parent).map_err(CliError::ThemeIo)?;
             }
-            std::fs::write(&path, source).map_err(CliError::ThemeIo)?;
-            println!("{}", path.display());
+            let mut destination = std::fs::OpenOptions::new();
+            destination.write(true);
+            if force {
+                destination.create(true).truncate(true);
+            } else {
+                destination.create_new(true);
+            }
+            let mut file = destination.open(&path).map_err(|error| {
+                if !force && error.kind() == std::io::ErrorKind::AlreadyExists {
+                    CliError::Theme(format!(
+                        "destination already exists: {} (use --force to replace)",
+                        path.display()
+                    ))
+                } else {
+                    CliError::ThemeIo(error)
+                }
+            })?;
+            std::io::Write::write_all(&mut file, source.as_bytes()).map_err(CliError::ThemeIo)?;
+            if let Some(result) = result {
+                return write_json_result(writer, &result);
+            }
+            writeln!(writer, "{}", path.display())?;
         }
     }
+    writer.flush()?;
     Ok(())
 }
 
@@ -3078,11 +3165,18 @@ impl Default for Commands {
 #[derive(Debug, Subcommand)]
 enum ThemeCommand {
     /// List bundled themes in stable id order.
-    List,
+    List {
+        /// Emit the bundled theme catalog as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate one theme file using the runtime parser and resolver.
     Validate {
         #[arg(value_name = "PATH")]
         path: PathBuf,
+        /// Emit the successful validation result as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Copy one bundled theme definition to an editable file.
     Copy {
@@ -3093,6 +3187,9 @@ enum ThemeCommand {
         /// Replace an existing destination file.
         #[arg(long)]
         force: bool,
+        /// Emit the completed copy result as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -8480,6 +8577,8 @@ async fn run_auth_interactive_flow(
         response
             .validate()
             .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+        // Failed/cancelled flows must not execute further interactive effects.
+        let terminal = auth_flow_terminal_result(response.status)?.is_some();
         let mut input = None;
         for effect in &response.effects {
             match effect {
@@ -8519,9 +8618,13 @@ async fn run_auth_interactive_flow(
             }
         }
         for diagnostic in &response.diagnostics {
-            println!("Diagnostic [{}]: {}", diagnostic.code, diagnostic.message);
+            write_auth_diagnostic(
+                &mut std::io::stderr().lock(),
+                &diagnostic.code,
+                &diagnostic.message,
+            )?;
         }
-        if auth_flow_terminal_result(response.status)?.is_some() {
+        if terminal {
             if !response.credentials.is_empty() {
                 bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
                     resolved,
@@ -8541,6 +8644,16 @@ async fn run_auth_interactive_flow(
     }
 }
 
+fn write_auth_diagnostic(
+    writer: &mut impl std::io::Write,
+    code: &str,
+    message: &str,
+) -> Result<(), CliError> {
+    writeln!(writer, "Diagnostic [{code}]: {message}")?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn auth_flow_terminal_result(
     status: bcode_provider_auth_models::AuthFlowStatus,
 ) -> Result<Option<()>, CliError> {
@@ -8550,15 +8663,33 @@ fn auth_flow_terminal_result(
         bcode_provider_auth_models::AuthFlowStatus::Failed => Err(CliError::LoginProfile(
             "Provider authentication flow failed.".to_owned(),
         )),
-        bcode_provider_auth_models::AuthFlowStatus::Cancelled => Err(CliError::LoginProfile(
-            "Provider authentication flow was cancelled.".to_owned(),
-        )),
+        bcode_provider_auth_models::AuthFlowStatus::Cancelled => Err(CliError::AuthFlowCancelled),
     }
 }
 
+const MAX_CLI_AUTH_INPUT_BYTES: usize = 64 * 1024;
+
 fn read_stdin_line() -> Result<String, CliError> {
-    let mut value = String::new();
-    std::io::stdin().read_line(&mut value)?;
+    read_auth_input_line(std::io::stdin().lock())
+}
+
+fn read_auth_input_line(reader: impl std::io::BufRead) -> Result<String, CliError> {
+    let mut limited = std::io::Read::take(reader, (MAX_CLI_AUTH_INPUT_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut bytes)?;
+    if bytes.is_empty() {
+        return Err(CliError::InvalidArguments(
+            "authentication input ended before a response".to_owned(),
+        ));
+    }
+    if bytes.len() > MAX_CLI_AUTH_INPUT_BYTES {
+        return Err(CliError::InvalidArguments(
+            "authentication response exceeds 65536 bytes".to_owned(),
+        ));
+    }
+    let value = String::from_utf8(bytes).map_err(|_| {
+        CliError::InvalidArguments("authentication response must be valid UTF-8".to_owned())
+    })?;
     Ok(value.trim().to_owned())
 }
 
@@ -17120,13 +17251,62 @@ auth_profile = "openai"
     }
 
     #[test]
-    fn failed_and_cancelled_flow_statuses_are_terminal_errors() {
-        assert!(
-            auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Failed).is_err()
+    fn auth_diagnostic_output_is_fallible() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut bytes = Vec::new();
+        write_auth_diagnostic(&mut bytes, "pending", "Waiting for approval").unwrap();
+        assert_eq!(bytes, b"Diagnostic [pending]: Waiting for approval\n");
+        assert!(write_auth_diagnostic(&mut Broken, "pending", "Waiting for approval").is_err());
+    }
+
+    #[test]
+    fn auth_input_is_bounded_and_preserves_following_lines() {
+        let mut input = std::io::Cursor::new(b" first \r\nsecond\n");
+        assert_eq!(read_auth_input_line(&mut input).unwrap(), "first");
+        assert_eq!(read_auth_input_line(&mut input).unwrap(), "second");
+        assert!(read_auth_input_line(&mut input).is_err());
+        assert_eq!(
+            read_auth_input_line(std::io::Cursor::new(b"\n")).unwrap(),
+            ""
         );
-        assert!(
+        assert!(read_auth_input_line(std::io::Cursor::new([0xff])).is_err());
+        let mut oversized = std::io::Cursor::new(vec![b'x'; MAX_CLI_AUTH_INPUT_BYTES + 20]);
+        assert!(read_auth_input_line(&mut oversized).is_err());
+        assert_eq!(oversized.position(), (MAX_CLI_AUTH_INPUT_BYTES + 1) as u64);
+        assert_eq!(
+            read_auth_input_line(std::io::Cursor::new(vec![b'x'; MAX_CLI_AUTH_INPUT_BYTES]))
+                .unwrap()
+                .len(),
+            MAX_CLI_AUTH_INPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn failed_and_cancelled_flow_statuses_are_terminal_errors() {
+        let failed = auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Failed)
+            .expect_err("failed flow");
+        assert_eq!(failed.exit_code(), 1);
+        let cancelled =
             auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Cancelled)
-                .is_err()
+                .expect_err("cancelled flow");
+        assert!(matches!(cancelled, CliError::AuthFlowCancelled));
+        assert_eq!(cancelled.exit_code(), 4);
+        assert_eq!(
+            cancelled.to_string(),
+            "Provider authentication flow was cancelled."
+        );
+        // Text resembling cancellation must not change generic failure semantics.
+        assert_eq!(
+            CliError::LoginProfile("cancelled".to_owned()).exit_code(),
+            1
         );
         assert_eq!(
             auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Pending)
@@ -17400,7 +17580,7 @@ mod theme_command_tests {
                 .expect("theme list parses")
                 .command,
             Some(Commands::Theme {
-                command: ThemeCommand::List
+                command: ThemeCommand::List { json: false }
             })
         ));
         assert!(matches!(
@@ -17428,6 +17608,273 @@ mod theme_command_tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn theme_copy_json_rejects_non_utf8_paths_before_mutation() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("not-created");
+        let path = parent.join(std::ffi::OsString::from_vec(vec![0xff]));
+        let mut output = Vec::new();
+        let copy = |output: &mut Vec<u8>| {
+            write_theme_command(
+                ThemeCommand::Copy {
+                    builtin: "terminal-native".to_owned(),
+                    path: path.clone(),
+                    force: true,
+                    json: true,
+                },
+                output,
+            )
+        };
+        assert!(matches!(copy(&mut output), Err(CliError::Json(_))));
+        assert!(!parent.exists());
+        assert!(output.is_empty());
+
+        // Linux filesystems permit existing non-UTF-8 names; macOS may reject
+        // creating them even though the preflight check above is portable Unix.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::write(&path, "original content").unwrap();
+            assert!(matches!(copy(&mut output), Err(CliError::Json(_))));
+            assert_eq!(std::fs::read(&path).unwrap(), b"original content");
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn theme_copy_json_reports_completed_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("copy.toml");
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "theme",
+            "copy",
+            "terminal-native",
+            path.to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap();
+        let Some(Commands::Theme { command }) = cli.command else {
+            panic!("theme command")
+        };
+        let mut output = Vec::new();
+        write_theme_command(command, &mut output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schema_version": 1, "builtin": "terminal-native", "path": path,
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            bcode_tui::theme::definition::ThemeCatalog::bundled_source("terminal-native").unwrap()
+        );
+        output.clear();
+        assert!(
+            write_theme_command(
+                ThemeCommand::Copy {
+                    builtin: "terminal-native".to_owned(),
+                    path,
+                    force: false,
+                    json: true,
+                },
+                &mut output
+            )
+            .is_err()
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn theme_output_propagates_flush_failures() {
+        #[derive(Default)]
+        struct FlushFailure {
+            bytes: Vec<u8>,
+        }
+        impl std::io::Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("theme.toml");
+        std::fs::write(
+            &path,
+            bcode_tui::theme::definition::ThemeCatalog::bundled_source("terminal-native").unwrap(),
+        )
+        .unwrap();
+        for json in [false, true] {
+            for command in [
+                ThemeCommand::List { json },
+                ThemeCommand::Validate {
+                    path: path.clone(),
+                    json,
+                },
+            ] {
+                let mut writer = FlushFailure::default();
+                assert!(write_theme_command(command, &mut writer).is_err());
+                assert!(!writer.bytes.is_empty());
+            }
+        }
+        let copied = root.path().join("copy.toml");
+        let mut writer = FlushFailure::default();
+        assert!(
+            write_theme_command(
+                ThemeCommand::Copy {
+                    builtin: "terminal-native".to_owned(),
+                    path: copied.clone(),
+                    force: false,
+                    json: false,
+                },
+                &mut writer
+            )
+            .is_err()
+        );
+        // Output failure does not roll back the already completed file copy.
+        assert_eq!(std::fs::read(copied).unwrap(), std::fs::read(path).unwrap());
+    }
+
+    #[test]
+    fn theme_command_writes_json_and_propagates_output_failure() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = Vec::new();
+        write_theme_command(ThemeCommand::List { json: true }, &mut output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let catalog = bcode_tui::theme::definition::ThemeCatalog::bundled().unwrap();
+        assert_eq!(value, theme_catalog_json(&catalog));
+        for json in [false, true] {
+            assert!(write_theme_command(ThemeCommand::List { json }, &mut Broken).is_err());
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("theme.toml");
+        std::fs::write(
+            &path,
+            bcode_tui::theme::definition::ThemeCatalog::bundled_source("terminal-native").unwrap(),
+        )
+        .unwrap();
+        output.clear();
+        write_theme_command(ThemeCommand::Validate { path, json: true }, &mut output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["id"], "terminal-native");
+        assert_eq!(
+            value["fingerprint"],
+            catalog
+                .resolve(&bcode_tui::theme::definition::ThemeSelection::new(
+                    "terminal-native"
+                ))
+                .unwrap()
+                .fingerprint
+        );
+    }
+
+    #[test]
+    fn theme_list_json_matches_runtime_catalog() {
+        assert!(matches!(
+            Cli::try_parse_from(["bcode", "theme", "list", "--json"])
+                .unwrap()
+                .command,
+            Some(Commands::Theme {
+                command: ThemeCommand::List { json: true }
+            })
+        ));
+        let catalog = bcode_tui::theme::definition::ThemeCatalog::bundled().unwrap();
+        let value = theme_catalog_json(&catalog);
+        assert_eq!(value["schema_version"], 1);
+        let rows = value["themes"].as_array().unwrap();
+        assert_eq!(rows.len(), catalog.definitions().count());
+        assert!(!rows.is_empty());
+        for (row, definition) in rows.iter().zip(catalog.definitions()) {
+            assert_eq!(row["id"], definition.id());
+            assert_eq!(row["display_name"], definition.display_name());
+            assert_eq!(row["dark"], definition.has_dark_variant());
+            assert_eq!(row["light"], definition.has_light_variant());
+            assert_eq!(row["source"], "bundled");
+        }
+    }
+
+    #[test]
+    fn theme_validate_rejects_oversized_and_non_utf8_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("theme.toml");
+        std::fs::write(&path, vec![b' '; MAX_CLI_THEME_BYTES + 1]).unwrap();
+        let validate = || {
+            handle_theme_command(ThemeCommand::Validate {
+                path: path.clone(),
+                json: true,
+            })
+        };
+        assert!(
+            matches!(validate(), Err(CliError::InvalidArguments(message))
+            if message == format!("theme definition exceeds {MAX_CLI_THEME_BYTES} bytes"))
+        );
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(
+            matches!(validate(), Err(CliError::InvalidArguments(message))
+            if message == "theme definition must be valid UTF-8")
+        );
+    }
+
+    #[test]
+    fn theme_copy_requires_force_to_replace_existing_content() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("theme.toml");
+        std::fs::write(&path, "user content").unwrap();
+        let copy = |force| {
+            handle_theme_command(ThemeCommand::Copy {
+                builtin: "terminal-native".to_owned(),
+                path: path.clone(),
+                force,
+                json: false,
+            })
+        };
+        assert!(copy(false).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user content");
+        copy(true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            bcode_tui::theme::definition::ThemeCatalog::bundled_source("terminal-native").unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn theme_copy_does_not_follow_dangling_symlink_without_force() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("missing.toml");
+        let path = root.path().join("theme.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(
+            handle_theme_command(ThemeCommand::Copy {
+                builtin: "terminal-native".to_owned(),
+                path: path.clone(),
+                force: false,
+                json: false,
+            })
+            .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_link(path).unwrap(), target);
+    }
+
     #[test]
     fn theme_validate_and_copy_use_runtime_definitions() {
         let root = tempfile::tempdir().expect("theme tempdir");
@@ -17436,12 +17883,16 @@ mod theme_command_tests {
             builtin: "terminal-native".to_owned(),
             path: copied.clone(),
             force: false,
+            json: false,
         })
         .expect("copy bundled theme");
-        handle_theme_command(ThemeCommand::Validate {
-            path: copied.clone(),
-        })
-        .expect("validate copied theme");
+        for json in [false, true] {
+            handle_theme_command(ThemeCommand::Validate {
+                path: copied.clone(),
+                json,
+            })
+            .expect("validate copied theme");
+        }
         assert_eq!(
             std::fs::read_to_string(copied).expect("copied theme"),
             bcode_tui::theme::definition::ThemeCatalog::bundled_source("terminal-native")

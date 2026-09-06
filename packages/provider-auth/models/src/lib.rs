@@ -629,6 +629,17 @@ impl AuthFlowResponse {
             validate_optional_text("state", state, MAX_AUTH_FLOW_STATE_BYTES)?;
         }
         validate_count("effects", self.effects.len(), MAX_AUTH_FLOW_EFFECTS)?;
+        if self
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, AuthFlowEffect::Prompt { .. }))
+            .count()
+            > 1
+        {
+            return Err(AuthContractError::InvalidFlowShape(
+                "responses cannot contain more than one prompt",
+            ));
+        }
         for effect in &self.effects {
             effect.validate()?;
         }
@@ -1188,6 +1199,38 @@ mod tests {
             diagnostics: Vec::new(),
         };
         response.validate().expect("valid terminal success");
+    }
+
+    #[test]
+    fn interactive_response_allows_only_one_prompt() {
+        let prompt = AuthFlowEffect::Prompt {
+            prompt_id: "code".to_owned(),
+            message: "Enter code".to_owned(),
+            choices: Vec::new(),
+        };
+        let mut response = AuthFlowResponse {
+            schema_version: AUTH_FLOW_SCHEMA_VERSION,
+            status: AuthFlowStatus::Pending,
+            state: Some("state".to_owned()),
+            effects: vec![prompt.clone()],
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        response.validate().unwrap();
+        response.effects.push(prompt);
+        assert!(matches!(
+            response.validate(),
+            Err(AuthContractError::InvalidFlowShape(_))
+        ));
+        response.effects[1] = AuthFlowEffect::Prompt {
+            prompt_id: "other".to_owned(),
+            message: "Other code".to_owned(),
+            choices: Vec::new(),
+        };
+        assert!(matches!(
+            response.validate(),
+            Err(AuthContractError::InvalidFlowShape(_))
+        ));
     }
 
     #[test]

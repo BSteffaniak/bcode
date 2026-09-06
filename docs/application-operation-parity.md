@@ -19,6 +19,8 @@ CLI, TUI, HyperChad, or SDK caller
 
 `CliError::exit_code` maps returned failures to process status: 1 for runtime/I/O failures, 2 for invalid arguments, JSON, or malformed/unsupported exchange resolutions, 3 for execution-policy turn rejection and recognized authorization denial, and 4 for recognized cancellation. Turn rejection because the session is unavailable is a runtime failure (1). Server-code classification uses exact codes, not substrings: `invalid_exchange_resolution` maps to 2; `authorization_denied` and `workflow_operation_unauthorized` map to 3; `cancelled`, `workflow_computation_cancelled`, and `worktree_create_cancelled` map to 4. Unknown server codes remain runtime failures (1). These statuses do not imply rollback or safe retries of committed operations.
 
+Provider authentication's typed `Cancelled` terminal outcome also maps to status 4; generic login failures remain status 1 regardless of their message text. Credential handling is unchanged.
+
 This describes returned-error classification, not complete command parity: signal handling, successful responses containing failed terminal outcomes, and end-to-end authorization/cancellation verification remain separate work.
 
 ## Local plugin CLI behavior and evidence
@@ -108,6 +110,10 @@ Evidence lives in `packages/bcode/tests/cli_process.rs` and the plugin-output wr
 | `workflow.package_local` | source package discovery and local file validation | Source-controlled workflow package owner | Bounded workspace scanning and explicit typed submission for daemon mutations. |
 
 ## Automation examples
+
+### Local theme artifacts
+
+`theme list --json`, `theme validate PATH --json`, and `theme copy BUILTIN PATH --json` emit finite JSON objects with `schema_version: 1`. List returns `themes` with `id`, `display_name`, `source`, `dark`, and `light`; successful validation returns `valid`, `id`, and `fingerprint`; successful copy returns `builtin` and `path`. Default human output remains available. Validation input is limited to 1 MiB. Copy requires `--force` to replace an existing destination; output failure does not roll back a completed copy. JSON copy rejects paths that cannot be serialized before filesystem mutation. These are local artifact operations, not interactive theme selection.
 
 These examples use only supported typed CLI/application paths. Machine-readable one-result commands emit JSON; live watch commands emit one JSON object per line.
 

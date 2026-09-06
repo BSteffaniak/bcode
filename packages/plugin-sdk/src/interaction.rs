@@ -201,7 +201,9 @@ impl PluginInteractionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns an error when no factory exists or the factory fails to open the controller.
+    /// Returns an error when no factory exists, initialization fails, or the returned
+    /// controller kind differs from the registered kind. Factory error details are
+    /// not exposed because they may contain sensitive request data.
     pub fn open(
         &self,
         kind: &str,
@@ -211,9 +213,11 @@ impl PluginInteractionRegistry {
             .factories
             .get(kind)
             .ok_or_else(|| PluginInteractionRegistryError::UnsupportedKind(kind.to_owned()))?;
-        let controller = factory
-            .open(request)
-            .map_err(|error| PluginInteractionRegistryError::OpenFailed(error.to_string()))?;
+        let controller = factory.open(request).map_err(|_| {
+            PluginInteractionRegistryError::OpenFailed(
+                "controller initialization failed".to_owned(),
+            )
+        })?;
         if controller.kind() != kind {
             return Err(PluginInteractionRegistryError::OpenFailed(
                 "controller kind does not match the registered factory".to_owned(),
@@ -348,6 +352,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_does_not_expose_factory_error_details() {
+        struct Factory;
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                "example"
+            }
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                Err(std::io::Error::other("secret-token-from-request").into())
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.register_factory(Box::new(Factory));
+        let Err(error) = registry.open("example", Value::Null) else {
+            panic!("initialization must fail");
+        };
+        assert_eq!(
+            error,
+            PluginInteractionRegistryError::OpenFailed(
+                "controller initialization failed".to_owned()
+            )
+        );
+        assert!(!error.to_string().contains("secret-token"));
+        assert!(!format!("{error:?}").contains("secret-token"));
+    }
 
     #[test]
     fn registry_rejects_factory_controller_kind_mismatch() {
