@@ -37,6 +37,19 @@ pub fn required_non_negative_u64(
     Ok(value.cast_unsigned())
 }
 
+pub fn optional_non_negative_u64(
+    row: &switchy::database::Row,
+    column: &str,
+) -> SessionDbResult<Option<u64>> {
+    match row.get(column) {
+        Some(switchy::database::DatabaseValue::Null) => Ok(None),
+        Some(_) => required_non_negative_u64(row, column).map(Some),
+        None => Err(SessionDbError::InvalidRow {
+            column: column.to_owned(),
+        }),
+    }
+}
+
 #[must_use]
 pub fn optional_i64(row: &switchy::database::Row, column: &str) -> Option<i64> {
     row.get(column).and_then(|value| value.as_i64())

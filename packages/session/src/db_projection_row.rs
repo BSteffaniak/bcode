@@ -10,8 +10,8 @@ pub fn runtime_work_from_row(
 ) -> SessionDbResult<RuntimeWorkProjection> {
     Ok(RuntimeWorkProjection {
         work_id: WorkId::new(required_string(row, "work_id")?),
-        event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
-        event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
+        event_seq_start: crate::db_row::required_non_negative_u64(row, "event_seq_start")?,
+        event_seq_end: crate::db_row::optional_non_negative_u64(row, "event_seq_end")?,
         kind: parse_runtime_work_kind(&required_string(row, "kind")?).ok_or_else(|| {
             crate::db::SessionDbError::InvalidRow {
                 column: "kind".to_owned(),
@@ -24,8 +24,8 @@ pub fn runtime_work_from_row(
             }
         })?,
         parent_work_id: optional_string(row, "parent_work_id").map(WorkId::new),
-        started_at_ms: optional_i64(row, "started_at_ms").map(i64_to_u64),
-        finished_at_ms: optional_i64(row, "finished_at_ms").map(i64_to_u64),
+        started_at_ms: crate::db_row::optional_non_negative_u64(row, "started_at_ms")?,
+        finished_at_ms: crate::db_row::optional_non_negative_u64(row, "finished_at_ms")?,
         message: optional_string(row, "message"),
         cancellable: optional_i64(row, "cancellable").is_some_and(|value| value != 0),
     })
@@ -91,4 +91,47 @@ pub fn input_history_entry_from_row(
         timestamp_ms: optional_i64(row, "created_at_ms").map_or(0, i64_to_u64),
         text: required_string(row, "text")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_work_optional_numbers_are_strict() {
+        use switchy::database::{DatabaseValue, Row};
+        for column in ["event_seq_end", "started_at_ms", "finished_at_ms"] {
+            for (value, expected) in [
+                (DatabaseValue::Null, None),
+                (0_i64.into(), Some(0)),
+                (42_i64.into(), Some(42)),
+            ] {
+                let row = Row {
+                    columns: vec![(column.to_owned(), value)],
+                };
+                assert_eq!(
+                    crate::db_row::optional_non_negative_u64(&row, column).expect("valid value"),
+                    expected
+                );
+            }
+            for value in [(-1_i64).into(), "invalid".into()] {
+                let row = Row {
+                    columns: vec![(column.to_owned(), value)],
+                };
+                assert!(crate::db_row::optional_non_negative_u64(&row, column).is_err());
+            }
+            assert!(
+                crate::db_row::optional_non_negative_u64(&Row { columns: vec![] }, column).is_err()
+            );
+        }
+    }
+    #[test]
+    fn runtime_work_rejects_negative_start_sequence() {
+        let row = switchy::database::Row {
+            columns: vec![
+                ("work_id".to_owned(), "work".into()),
+                ("event_seq_start".to_owned(), (-1_i64).into()),
+            ],
+        };
+        assert!(matches!(super::runtime_work_from_row(&row),
+            Err(crate::db::SessionDbError::InvalidRow { column }) if column == "event_seq_start"));
+    }
 }

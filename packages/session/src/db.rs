@@ -4581,11 +4581,15 @@ async fn project_event(
             // A later start may resume suspended work, but cannot reopen a terminal ID.
             let existing = db
                 .select("runtime_work")
-                .columns(&["status"])
+                .columns(&["status", "kind"])
                 .where_eq("work_id", work_id.to_string())
                 .execute_first(db)
                 .await?;
             if let Some(row) = existing {
+                crate::db_runtime_work::parse_runtime_work_kind(&required_string(&row, "kind")?)
+                    .ok_or_else(|| SessionDbError::InvalidRow {
+                        column: "kind".to_owned(),
+                    })?;
                 let status = crate::db_runtime_work::parse_runtime_work_status(&required_string(
                     &row, "status",
                 )?)
@@ -6951,26 +6955,30 @@ mod tests {
                 .expect("damage test projection");
             assert!(matches!(db.runtime_work_history(1).await,
                 Err(SessionDbError::InvalidRow { column: invalid }) if invalid == column));
-            if column == "status" {
-                let restart = event(
-                    session_id,
-                    1,
-                    SessionEventKind::RuntimeWorkStarted {
-                        work_id: WorkId::new("unknown-projection"),
-                        kind: RuntimeWorkKind::Tool,
-                        label: "restart".to_owned(),
-                        tool_call_id: None,
-                        plugin_id: None,
-                        service_interface: None,
-                        operation: None,
-                        parent_work_id: None,
-                        started_at_ms: Some(1),
-                        cancellable: true,
-                    },
-                );
-                assert!(matches!(db.append_event(&restart).await,
-                    Err(SessionDbError::InvalidRow { column }) if column == "status"));
-            }
+            let restart = event(
+                session_id,
+                1,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: WorkId::new("unknown-projection"),
+                    kind: RuntimeWorkKind::Tool,
+                    label: "restart".to_owned(),
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(1),
+                    cancellable: true,
+                },
+            );
+            assert!(matches!(db.append_event(&restart).await,
+                Err(SessionDbError::InvalidRow { column: invalid }) if invalid == column));
+            assert_eq!(
+                db.last_event_sequence()
+                    .await
+                    .expect("canonical tail after rejection"),
+                Some(0)
+            );
             let row = db
                 .database()
                 .select("runtime_work")
