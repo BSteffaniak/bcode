@@ -8333,6 +8333,20 @@ async fn enroll_registered_auth_provider(
     supplied: BTreeMap<String, String>,
     replace_owned: bool,
 ) -> Result<AuthProviderLoginResult, CliError> {
+    let mut host = load_cli_plugin_host()?;
+    let result =
+        enroll_auth_provider_with_host(&host, provider_id, options, supplied, replace_owned).await;
+    let cleanup = host.deactivate_all().map_err(CliError::from);
+    result.and_then(|result| cleanup.map(|()| result))
+}
+
+async fn enroll_auth_provider_with_host(
+    host: &bcode_plugin::PluginHost,
+    provider_id: &str,
+    options: AuthProviderLoginOptions<'_>,
+    supplied: BTreeMap<String, String>,
+    replace_owned: bool,
+) -> Result<AuthProviderLoginResult, CliError> {
     let AuthProviderLoginOptions {
         explicit_profile,
         explicit_vault,
@@ -8342,8 +8356,7 @@ async fn enroll_registered_auth_provider(
         requested_method,
         verify,
     } = options;
-    let mut host = load_cli_plugin_host()?;
-    let provider = registered_auth_provider(&host, provider_id)?;
+    let provider = registered_auth_provider(host, provider_id)?;
     let method = selected_auth_method(&provider, requested_method)?;
     let (mut resolved, persist_runtime) = resolve_or_prepare_auth_profile(
         &provider,
@@ -8377,7 +8390,7 @@ async fn enroll_registered_auth_provider(
                 replace_owned,
             )?;
             if verify {
-                run_auth_interactive_flow(&host, &provider, method, &resolved, true, false).await?;
+                run_auth_interactive_flow(host, &provider, method, &resolved, true, false).await?;
             }
         }
         bcode_provider_auth_models::AuthMethodContribution::Interactive { .. } => {
@@ -8387,7 +8400,7 @@ async fn enroll_registered_auth_provider(
                     method.method_id()
                 )));
             }
-            run_auth_interactive_flow(&host, &provider, method, &resolved, verify, false).await?;
+            run_auth_interactive_flow(host, &provider, method, &resolved, verify, false).await?;
         }
     }
     if let Some(pool) = pool {
@@ -8395,7 +8408,6 @@ async fn enroll_registered_auth_provider(
     } else if persist_runtime {
         persist_prepared_runtime_profile(&resolved)?;
     }
-    host.deactivate_all()?;
     Ok(AuthProviderLoginResult {
         resolved,
         persisted_runtime: pool.is_some() || persist_runtime,
