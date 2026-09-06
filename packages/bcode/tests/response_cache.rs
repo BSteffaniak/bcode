@@ -1520,6 +1520,19 @@ async fn cache_policy_panic_prevents_lookup_and_provider_execution() {
             .inline_tool(tool_definition(), |_| panic!("tool must not run"))
             .build();
         let mut provider = CountingProvider::default();
+        let cancellation = bcode::CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = agent
+            .generate_text_with_provider_and_cancellation(
+                &mut provider,
+                "cancelled policy",
+                cancellation,
+            )
+            .await;
+        assert!(matches!(
+            cancelled,
+            Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+        ));
         let result = agent
             .generate_text_with_provider(&mut provider, "policy failure")
             .await;

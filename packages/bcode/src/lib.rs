@@ -7470,6 +7470,9 @@ impl Agent {
                     cancellation,
                 )?,
             )?;
+            if request.cancellation.is_cancelled() {
+                return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+            }
             let cache = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.response_cache.as_ref().and_then(|cache| {
                     if cache.privacy(&request) == ModelResponseCachePrivacy::NoStore {
