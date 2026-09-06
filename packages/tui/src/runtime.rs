@@ -95,10 +95,12 @@ pub async fn run_standalone_plugin_surface<W: Write>(
     model.queue_standalone_plugin_surface(plugin_id.clone(), surface);
     let (runtime, handle) = root_program::runtime(terminal, model);
     let mut model = Box::pin(root_program::run(runtime, handle)).await?;
-    Ok(model
+    let outcome = model
         .take_plugin_surface_result()
         .filter(|(closed_plugin_id, _)| closed_plugin_id == &plugin_id)
-        .and_then(|(_, outcome)| outcome))
+        .and_then(|(_, outcome)| outcome);
+    drop(model);
+    Ok(outcome)
 }
 
 /// Attach to a session, run an optional startup action, and run the active chat loop with caller-provided static bundled plugins.

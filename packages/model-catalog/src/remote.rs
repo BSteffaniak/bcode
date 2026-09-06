@@ -36,6 +36,19 @@ pub struct RemoteCatalogOptions {
 }
 
 impl RemoteCatalogOptions {
+    /// Disable remote overlays without reading environment variables or resolving cache paths.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            base_url: DEFAULT_REMOTE_CATALOG_URL.to_owned(),
+            cache_dir: PathBuf::new(),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
+            fresh_for: Duration::from_secs(DEFAULT_FRESH_SECONDS),
+            max_stale: Duration::from_secs(DEFAULT_MAX_STALE_SECONDS),
+            disabled: true,
+        }
+    }
+
     /// Build options from environment variables and platform defaults.
     #[must_use]
     pub fn from_env() -> Self {

@@ -3454,7 +3454,14 @@ pub async fn run_embedded_with_config(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     config: bcode_config::BcodeConfig,
 ) -> Result<(), ServerError> {
-    run_with_config(endpoint, static_plugins, false, config, Instant::now()).await
+    Box::pin(run_with_config(
+        endpoint,
+        static_plugins,
+        false,
+        config,
+        Instant::now(),
+    ))
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3473,13 +3480,13 @@ async fn run_with_static_bundled_inner(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "config loaded"
     );
-    run_with_config(
+    Box::pin(run_with_config(
         endpoint,
         static_plugins,
         publish_daemon_record,
         config,
         startup_started_at,
-    )
+    ))
     .await
 }
 
@@ -3491,7 +3498,7 @@ async fn run_with_config(
     config: bcode_config::BcodeConfig,
     startup_started_at: Instant,
 ) -> Result<(), ServerError> {
-    let mut stage_started_at = Instant::now();
+    let stage_started_at = Instant::now();
     let default_plugin_ids = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
     let plugin_selection =
         bcode_config::plugin_selection_with_default_plugin_ids(&config, &default_plugin_ids);
@@ -3517,7 +3524,84 @@ async fn run_with_config(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "plugins loaded"
     );
-    stage_started_at = Instant::now();
+    run_with_services(
+        endpoint,
+        publish_daemon_record,
+        config,
+        startup_started_at,
+        ServerStartupServices {
+            plugins,
+            model_catalog,
+            plugin_selection,
+            default_plugin_ids,
+        },
+    )
+    .await
+}
+
+/// Run an embedded server with already-acquired plugin and model catalog services.
+///
+/// The plugin runtime's selection is authoritative. `default_plugin_ids` records
+/// the embedding host's bundled defaults for later configuration resolution.
+/// This transfers lifecycle responsibility for the supplied plugin runtime to
+/// the server, including deactivation on startup failure and normal shutdown.
+/// Callers must not share that runtime with independently running applications.
+/// Configuration loading, plugin discovery, and catalog construction are skipped;
+/// storage, IPC, signals, and task execution still use native infrastructure.
+/// The caller owns endpoint isolation. No daemon lifecycle record is published.
+///
+/// # Errors
+///
+/// Returns an error when server initialization, binding, or client handling fails.
+pub async fn run_embedded_with_services(
+    endpoint: IpcEndpoint,
+    config: bcode_config::BcodeConfig,
+    plugins: bcode_plugin::PluginRuntimeHost,
+    model_catalog: bcode_model_catalog::ModelCatalogResolver,
+    default_plugin_ids: Vec<String>,
+) -> Result<(), ServerError> {
+    let plugin_selection = plugins.selection().clone();
+    run_with_services(
+        endpoint,
+        false,
+        config,
+        Instant::now(),
+        ServerStartupServices {
+            plugins,
+            model_catalog,
+            plugin_selection,
+            default_plugin_ids,
+        },
+    )
+    .await
+}
+
+/// Acquired services shared by native bootstrap and server execution.
+///
+/// Keep acquisition outside execution so construction failures use the same
+/// plugin cleanup path regardless of how these services were acquired.
+struct ServerStartupServices {
+    plugins: bcode_plugin::PluginRuntimeHost,
+    model_catalog: bcode_model_catalog::ModelCatalogResolver,
+    plugin_selection: bcode_plugin::PluginSelection,
+    default_plugin_ids: Vec<String>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_with_services(
+    endpoint: IpcEndpoint,
+    publish_daemon_record: bool,
+    config: bcode_config::BcodeConfig,
+    startup_started_at: Instant,
+    services: ServerStartupServices,
+) -> Result<(), ServerError> {
+    let ServerStartupServices {
+        plugins,
+        model_catalog,
+        plugin_selection,
+        default_plugin_ids,
+    } = services;
+    let mut stage_started_at = Instant::now();
     let startup_resources = (|| {
         let legacy_recovery = session_migration_adapter::recover_historical_session_storage(
             &bcode_config::default_state_dir(),

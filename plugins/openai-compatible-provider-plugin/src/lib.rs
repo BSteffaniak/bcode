@@ -3126,7 +3126,7 @@ async fn stream_chat_completion_with_failover(
             Ok(StreamOutcome::Cancelled) => Ok(StreamOutcome::Cancelled),
             Ok(outcome) => {
                 record_selected_auth_profile_success(request);
-                refresh_priming_auth_profile_usage(request).await;
+                refresh_priming_auth_profile_usage(request, turn).await;
                 Ok(outcome)
             }
             Err(error) if is_subscription_quota_error(&error) => {
@@ -3220,7 +3220,10 @@ fn record_selected_auth_profile_success(request: &ModelTurnRequest) {
     }
 }
 
-async fn refresh_priming_auth_profile_usage(request: &ModelTurnRequest) {
+async fn refresh_priming_auth_profile_usage(request: &ModelTurnRequest, turn: &TurnState) {
+    if turn.is_cancelled() {
+        return;
+    }
     if request
         .provider_context
         .auth_pool_selection_reason
@@ -3242,7 +3245,12 @@ async fn refresh_priming_auth_profile_usage(request: &ModelTurnRequest) {
             .cloned()
             .collect(),
     };
-    let Ok(usage) = auth_usage_inner(usage_request).await else {
+    let usage_result = tokio::select! {
+        biased;
+        () = turn.cancelled() => return,
+        result = auth_usage_inner(usage_request) => result,
+    };
+    let Ok(usage) = usage_result else {
         return;
     };
     auth_pool_state::record_profile_usage_windows(
@@ -3378,7 +3386,7 @@ async fn try_auth_candidate(
         Ok(outcome) => {
             record_auth_candidate_success(request, candidate, selection.reason);
             if selection.reason == CandidateSelectionReason::Priming {
-                refresh_priming_auth_profile_usage(&candidate_request).await;
+                refresh_priming_auth_profile_usage(&candidate_request, turn).await;
             }
             Ok(CandidateTryOutcome::Finished(outcome))
         }
@@ -9229,6 +9237,22 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ProviderTurnEvent::Error { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_priming_usage_refresh_returns_without_output() {
+        let mut request = test_request(Vec::new());
+        request.provider_context.auth_pool_selection_reason = Some("priming".into());
+        request.provider_context.auth_profile = Some("cancelled-refresh".into());
+        let turn = TurnState::default();
+        turn.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            refresh_priming_auth_profile_usage(&request, &turn),
+        )
+        .await
+        .unwrap();
+        assert!(turn.drain().is_empty());
     }
 
     #[tokio::test]

@@ -206,11 +206,7 @@ impl ModelCatalogResolver {
     /// Panics if the compile-time embedded catalog is invalid.
     #[must_use]
     pub fn embedded() -> Self {
-        let options = RemoteCatalogOptions {
-            disabled: true,
-            ..RemoteCatalogOptions::default()
-        };
-        Self::new(options).expect("embedded model catalog must be valid")
+        Self::new(RemoteCatalogOptions::disabled()).expect("embedded model catalog must be valid")
     }
 
     /// Spawn a coalesced background refresh without delaying the caller.
@@ -242,7 +238,12 @@ impl ModelCatalogResolver {
     }
 
     /// Refresh remote data and atomically replace the active snapshot on success.
+    ///
+    /// Does nothing when remote overlays are disabled, including explicit refresh requests.
     pub async fn refresh_now(&self) {
+        if self.options.disabled {
+            return;
+        }
         let Ok(_gate) = self.refresh_gate.try_lock() else {
             return;
         };
@@ -2187,6 +2188,26 @@ mod tests {
     use super::*;
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn disabled_resolver_never_attempts_explicit_refresh() {
+        let mut options = RemoteCatalogOptions::disabled();
+        // An invalid URL makes accidental client construction fail without network I/O.
+        options.base_url = "://invalid".to_owned();
+        let resolver = ModelCatalogResolver::new(options).expect("disabled resolver");
+        let before = resolver.catalog_snapshot().await;
+        resolver.refresh_now().await;
+        let diagnostics = resolver.diagnostics().await;
+        assert!(!diagnostics.remote_enabled);
+        assert!(!diagnostics.refresh_in_progress);
+        assert!(diagnostics.last_refresh_attempt.is_none());
+        assert!(diagnostics.last_refresh_error.is_none());
+        assert!(diagnostics.last_refresh_success.is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            &before,
+            &resolver.catalog_snapshot().await
+        ));
+    }
 
     #[tokio::test]
     async fn resolver_identity_maps_region_prefixed_opus_five_to_stable_entry() {

@@ -40,12 +40,14 @@ pub async fn run_dashboard<W: Write>(
         code: "tui_surface_open_failed".to_string(),
         message: error.to_string(),
     })?;
-    let _outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
+    let outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
         terminal,
         METRICS_PLUGIN_ID,
         surface,
     ))
-    .await?;
+    .await;
+    drop(runtime);
+    outcome?;
     Ok(())
 }
 

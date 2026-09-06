@@ -57,8 +57,9 @@ pub async fn run_home<W: Write>(
         CODE_REVIEW_PLUGIN_ID,
         surface,
     ))
-    .await?;
-    Ok(parse_review_home_outcome(outcome))
+    .await;
+    drop(runtime);
+    Ok(parse_review_home_outcome(outcome?))
 }
 
 /// Run a full-screen local Git review from a durable workspace.
@@ -125,12 +126,14 @@ async fn run_with_workspace<W: Write>(
     )
     .await
     .map_err(|error| map_surface_open_error(&error))?;
-    let _outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
+    let outcome = Box::pin(crate::runtime::run_standalone_plugin_surface(
         terminal,
         CODE_REVIEW_PLUGIN_ID,
         surface,
     ))
-    .await?;
+    .await;
+    drop(runtime);
+    outcome?;
     Ok(None)
 }
 
