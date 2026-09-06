@@ -172,24 +172,38 @@ pub fn migrate(transaction: &Transaction<'_>) -> Result<(), WorkflowStoreError> 
     Ok(())
 }
 
+fn graph_revision(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<u64>, WorkflowStoreError> {
+    super::validate_id("run_id", run_id)?;
+    let row = connection
+        .query_row(
+            "SELECT graph.revision FROM workflow_runs run
+         LEFT JOIN workflow_run_graphs graph ON graph.run_id = run.run_id
+         WHERE run.run_id = ?1",
+            [run_id],
+            |row| row.get::<_, Option<u64>>(0),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some(Some(revision)) if revision > 0 => Ok(Some(revision)),
+        _ => Err(WorkflowStoreError::InvalidData(
+            "workflow run graph is missing or invalid".to_string(),
+        )),
+    }
+}
+
 pub fn initial_node(
     connection: &Connection,
     run_id: &str,
     node_id: &str,
 ) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
-    super::validate_id("run_id", run_id)?;
     super::validate_id("node_id", node_id)?;
-    let revision = connection
-        .query_row(
-            "SELECT graph.revision FROM workflow_runs run
-         LEFT JOIN workflow_run_graphs graph ON graph.run_id = run.run_id WHERE run.run_id = ?1",
-            [run_id],
-            |row| row.get::<_, Option<u64>>(0),
-        )
-        .optional()?;
-    match revision {
+    match graph_revision(connection, run_id)? {
         None => return Ok(None),
-        Some(Some(1)) => {}
+        Some(1) => {}
         _ => {
             return Err(WorkflowStoreError::InvalidData(
                 "initial graph lookup requires an intact initial graph revision".to_string(),
@@ -382,24 +396,7 @@ impl WorkflowStore {
     /// Returns an error for an invalid run identity, missing graph for an existing run,
     /// corrupt revision, or database failure.
     pub fn run_graph_revision(&self, run_id: &str) -> Result<Option<u64>, WorkflowStoreError> {
-        super::validate_id("run_id", run_id)?;
-        let row = self
-            .connection
-            .query_row(
-                "SELECT graph.revision FROM workflow_runs run
-             LEFT JOIN workflow_run_graphs graph ON graph.run_id = run.run_id
-             WHERE run.run_id = ?1",
-                [run_id],
-                |row| row.get::<_, Option<u64>>(0),
-            )
-            .optional()?;
-        match row {
-            None => Ok(None),
-            Some(Some(revision)) if revision > 0 => Ok(Some(revision)),
-            _ => Err(WorkflowStoreError::InvalidData(
-                "workflow run graph is missing or invalid".to_string(),
-            )),
-        }
+        graph_revision(&self.connection, run_id)
     }
 
     /// Read a bounded page of initial graph nodes ordered by stable node identity.
