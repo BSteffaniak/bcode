@@ -532,11 +532,96 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         WorkflowCommand::Package { command } => {
             handle_workflow_package_command(&client, command).await?;
         }
+        WorkflowCommand::Events {
+            run_id,
+            after_sequence,
+            limit,
+        } => {
+            print_json(
+                &client
+                    .workflow_event_history(run_id, after_sequence, limit)
+                    .await?,
+            )?;
+        }
+        WorkflowCommand::Attempts {
+            run_id,
+            after_prepared_at_ms,
+            after_dispatch_identity,
+            limit,
+        } => {
+            let cursor = match (after_prepared_at_ms, after_dispatch_identity) {
+                (Some(prepared_at_ms), Some(dispatch_identity)) => {
+                    Some(bcode_workflow_store::AttemptCursor {
+                        prepared_at_ms,
+                        dispatch_identity,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(CliError::InvalidArguments(
+                        "attempt cursor requires both timestamp and dispatch identity".to_string(),
+                    ));
+                }
+            };
+            print_json(
+                &client
+                    .workflow_attempt_history(run_id, cursor, limit)
+                    .await?,
+            )?;
+        }
+        WorkflowCommand::Definitions { limit } => {
+            print_json(&Box::pin(client.list_workflow_definitions(limit)).await?)?;
+        }
+        WorkflowCommand::DescribeDefinition {
+            definition_id,
+            version,
+        } => {
+            print_json(
+                &Box::pin(client.describe_workflow_definition(definition_id, version)).await?,
+            )?;
+        }
+        WorkflowCommand::Doctor { run_id, limit } => {
+            print_json(&Box::pin(client.doctor_workflow_run(run_id, limit)).await?)?;
+        }
+        WorkflowCommand::RunStatus { run_id } => {
+            print_json(&Box::pin(client.workflow_run_status(run_id)).await?)?;
+        }
+        WorkflowCommand::Runs { limit } => {
+            print_json(&Box::pin(client.list_workflow_runs(limit)).await?)?;
+        }
+        WorkflowCommand::CancelRun { run_id } => {
+            print_json(&Box::pin(client.cancel_workflow_run(run_id)).await?)?;
+        }
+        WorkflowCommand::PauseRun { run_id } => {
+            print_json(&Box::pin(client.pause_workflow_run(run_id)).await?)?;
+        }
+        WorkflowCommand::ResumeRun { run_id } => {
+            print_json(&Box::pin(client.resume_workflow_run(run_id)).await?)?;
+        }
+        WorkflowCommand::RetryNode {
+            run_id,
+            node_id,
+            activation_id,
+            failed_attempt,
+        } => {
+            print_json(
+                &Box::pin(client.retry_workflow_node(
+                    run_id,
+                    node_id,
+                    activation_id,
+                    failed_attempt,
+                ))
+                .await?,
+            )?;
+        }
+        WorkflowCommand::Waits { run_id, limit } => {
+            print_json(&Box::pin(client.list_workflow_waits(run_id, limit)).await?)?;
+        }
         WorkflowCommand::InspectRun { run_id, limit } => {
-            print_json(&client.inspect_workflow_run(run_id, limit).await?)?;
+            print_json(&Box::pin(client.inspect_workflow_run(run_id, limit)).await?)?;
         }
         WorkflowCommand::RunOutput { run_id, limit } => {
-            print_json(&client.workflow_run_outputs(run_id, limit).await?)?;
+            print_json(&Box::pin(client.workflow_run_outputs(run_id, limit)).await?)?;
         }
         WorkflowCommand::ProvideInput {
             run_id,
@@ -544,12 +629,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
             activation_id,
             value,
         } => {
-            let value = Path::new(&value);
-            let value = if value.is_file() {
-                read_bounded_json(value)?
-            } else {
-                serde_json::from_str(value.to_string_lossy().as_ref())?
-            };
+            let value = read_workflow_input_value(&value)?;
             print_json(
                 &client
                     .provide_workflow_input(run_id, node_id, activation_id, value)
@@ -573,6 +653,37 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
                     .resolve_workflow_approval(run_id, node_id, activation_id, approve)
                     .await?,
             )?;
+        }
+        WorkflowCommand::ResolveMutationApproval {
+            approval_id,
+            approve,
+            deny,
+        } => {
+            if approve == deny {
+                return Err(CliError::InvalidArguments(
+                    "exactly one of --approve or --deny is required".to_string(),
+                ));
+            }
+            let decision = if approve {
+                bcode_workflow_store::WorkflowMutationApprovalDecision::Approve
+            } else {
+                bcode_workflow_store::WorkflowMutationApprovalDecision::Deny
+            };
+            print_json(
+                &client
+                    .resolve_workflow_mutation_approval(approval_id, decision)
+                    .await?,
+            )?;
+        }
+        WorkflowCommand::MutationApprovals { run_id, limit } => {
+            let approvals = if let Some(run_id) = run_id {
+                client
+                    .list_workflow_mutation_approvals(run_id, limit)
+                    .await?
+            } else {
+                client.list_all_workflow_mutation_approvals(limit).await?
+            };
+            print_json(&approvals)?;
         }
         WorkflowCommand::CancelComputation { operation_id } => {
             print_json(&client.cancel_workflow_computation(operation_id).await?)?;
@@ -1500,9 +1611,20 @@ fn parse_package_expected_generations(
     Ok(parsed)
 }
 
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn read_workflow_package_manifest(
     path: &Path,
+) -> Result<bcode_workflow::WorkflowPackageManifest, CliError> {
+    read_workflow_package_manifest_with_budget(
+        path,
+        bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_workflow_package_manifest_with_budget(
+    path: &Path,
+    source_budget: usize,
 ) -> Result<bcode_workflow::WorkflowPackageManifest, CliError> {
     if path == Path::new("-") {
         return Err(CliError::InvalidArguments(
@@ -1514,12 +1636,14 @@ fn read_workflow_package_manifest(
     let package_root = manifest_path.parent().ok_or_else(|| {
         CliError::InvalidArguments("workflow package manifest has no parent directory".to_string())
     })?;
-    let manifest_source = fs::read_to_string(&manifest_path)?;
-    if manifest_source.len() > bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES {
-        return Err(CliError::InvalidArguments(
-            "workflow package manifest exceeds the package byte bound".to_string(),
-        ));
-    }
+    let manifest_bytes = read_bytes_with_limit(
+        fs::File::open(&manifest_path)?,
+        bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES,
+        "workflow package manifest",
+    )?;
+    let manifest_source = String::from_utf8(manifest_bytes).map_err(|_| {
+        CliError::InvalidArguments("workflow package manifest is not valid UTF-8".to_string())
+    })?;
     let file_name = manifest_path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
@@ -1530,18 +1654,17 @@ fn read_workflow_package_manifest(
         match bcode_workflow::WorkflowSourceFormat::from_file_name(file_name)
             .map_err(|error| CliError::InvalidArguments(error.to_string()))?
         {
-            bcode_workflow::WorkflowSourceFormat::Json => serde_json::from_str(&manifest_source)?,
+            bcode_workflow::WorkflowSourceFormat::Json => serde_json::from_str(&manifest_source)
+                .map_err(|_| {
+                    CliError::InvalidArguments("invalid workflow package JSON manifest".to_string())
+                })?,
             bcode_workflow::WorkflowSourceFormat::Yaml => yaml_serde::from_str(&manifest_source)
-                .map_err(|error| {
-                    CliError::InvalidArguments(format!(
-                        "invalid workflow package YAML manifest: {error}"
-                    ))
+                .map_err(|_| {
+                    CliError::InvalidArguments("invalid workflow package YAML manifest".to_string())
                 })?,
             bcode_workflow::WorkflowSourceFormat::Toml => toml::from_str(&manifest_source)
-                .map_err(|error| {
-                    CliError::InvalidArguments(format!(
-                        "invalid workflow package TOML manifest: {error}"
-                    ))
+                .map_err(|_| {
+                    CliError::InvalidArguments("invalid workflow package TOML manifest".to_string())
                 })?,
         };
     let mut manifest = bcode_workflow::WorkflowPackageManifest {
@@ -1594,15 +1717,15 @@ fn read_workflow_package_manifest(
                 member.source_name
             )));
         }
-        let source = fs::read_to_string(&member_path)?;
-        total_bytes = total_bytes.checked_add(source.len()).ok_or_else(|| {
-            CliError::InvalidArguments("workflow package byte count overflow".to_string())
+        let bytes = read_bytes_with_limit(
+            fs::File::open(&member_path)?,
+            source_budget - total_bytes,
+            "workflow package sources",
+        )?;
+        total_bytes += bytes.len();
+        let source = String::from_utf8(bytes).map_err(|_| {
+            CliError::InvalidArguments("workflow package source is not valid UTF-8".to_string())
         })?;
-        if total_bytes > bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES {
-            return Err(CliError::InvalidArguments(
-                "workflow package sources exceed the package byte bound".to_string(),
-            ));
-        }
         member.format = bcode_workflow::WorkflowSourceFormat::from_file_name(&member.source_name)
             .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
         member.source = source;
@@ -1643,6 +1766,7 @@ fn read_workflow_package_closure_in_root(
     let mut pending = vec![(entry_path.clone(), 1_usize)];
     let mut visited = std::collections::BTreeSet::new();
     let mut packages = Vec::new();
+    let mut source_budget = bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES;
     while let Some((manifest_path, depth)) = pending.pop() {
         if depth > bcode_workflow::MAX_WORKFLOW_PACKAGE_DEPTH {
             return Err(CliError::InvalidArguments(
@@ -1657,7 +1781,10 @@ fn read_workflow_package_closure_in_root(
                 "workflow package closure exceeds the package-count bound".to_string(),
             ));
         }
-        let manifest = read_workflow_package_manifest(&manifest_path)?;
+        let manifest = read_workflow_package_manifest_with_budget(&manifest_path, source_budget)?;
+        for member in &manifest.members {
+            source_budget -= member.source.len();
+        }
         let package_root = manifest_path.parent().ok_or_else(|| {
             CliError::InvalidArguments(
                 "workflow package manifest has no parent directory".to_string(),
@@ -1723,12 +1850,14 @@ fn read_workflow_source_file(
             "workflow source apply from stdin is not yet supported".to_string(),
         ));
     }
-    let source = fs::read_to_string(path)?;
-    if source.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
-        return Err(CliError::InvalidArguments(
-            "workflow source exceeds the byte bound".to_string(),
-        ));
-    }
+    let bytes = read_bytes_with_limit(
+        fs::File::open(path)?,
+        bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES,
+        "workflow source",
+    )?;
+    let source = String::from_utf8(bytes).map_err(|_| {
+        CliError::InvalidArguments("workflow source is not valid UTF-8".to_string())
+    })?;
     let source_format = match explicit_format {
         Some("json") => bcode_workflow::WorkflowSourceFormat::Json,
         Some("yaml" | "yml") => bcode_workflow::WorkflowSourceFormat::Yaml,
@@ -1764,30 +1893,12 @@ async fn read_workflow_source_lowering(
     path: &Path,
     explicit_format: Option<&str>,
 ) -> Result<LoadedWorkflowSource, CliError> {
-    let mut bytes = Vec::new();
-    if path == Path::new("-") {
-        std::io::stdin()
-            .take((bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
+    let max_bytes = bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES;
+    let bytes = if path == Path::new("-") {
+        read_bytes_with_limit(std::io::stdin().lock(), max_bytes, "workflow source")?
     } else {
-        let metadata = fs::metadata(path)?;
-        if metadata.len()
-            > u64::try_from(bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES)
-                .unwrap_or(u64::MAX)
-        {
-            return Err(CliError::InvalidArguments(format!(
-                "workflow source exceeds {} bytes",
-                bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES
-            )));
-        }
-        bytes = fs::read(path)?;
-    }
-    if bytes.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
-        return Err(CliError::InvalidArguments(format!(
-            "workflow source exceeds {} bytes",
-            bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES
-        )));
-    }
+        read_bytes_with_limit(fs::File::open(path)?, max_bytes, "workflow source")?
+    };
     let source = std::str::from_utf8(&bytes).map_err(|error| {
         CliError::InvalidArguments(format!("workflow source is not valid UTF-8: {error}"))
     })?;
@@ -1834,6 +1945,19 @@ async fn read_workflow_authoring_document(
 
 const MAX_CLI_INTERACTION_JSON_BYTES: usize = 256 * 1024;
 
+fn read_workflow_input_value(value: &str) -> Result<serde_json::Value, CliError> {
+    let path = Path::new(value);
+    if value == "-" || path.is_file() {
+        read_bounded_json(path)
+    } else {
+        read_json_from_reader(
+            value.as_bytes(),
+            bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES,
+            "workflow JSON",
+        )
+    }
+}
+
 fn read_bounded_json(path: &Path) -> Result<serde_json::Value, CliError> {
     read_json_with_limit(
         path,
@@ -1863,6 +1987,15 @@ fn read_json_from_reader(
     max_bytes: usize,
     description: &str,
 ) -> Result<serde_json::Value, CliError> {
+    let bytes = read_bytes_with_limit(reader, max_bytes, description)?;
+    serde_json::from_slice(&bytes).map_err(CliError::Json)
+}
+
+fn read_bytes_with_limit(
+    reader: impl std::io::Read,
+    max_bytes: usize,
+    description: &str,
+) -> Result<Vec<u8>, CliError> {
     // Read one sentinel byte beyond the limit to distinguish an exact-size input
     // from an oversized one. Bound the read itself, not mutable file metadata.
     let read_limit = u64::try_from(max_bytes)
@@ -1875,7 +2008,7 @@ fn read_json_from_reader(
             "{description} exceeds {max_bytes} bytes"
         )));
     }
-    serde_json::from_slice(&bytes).map_err(CliError::Json)
+    Ok(bytes)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
@@ -2523,19 +2656,15 @@ async fn handle_permission_command(command: PermissionCommand) -> Result<(), Cli
             if json {
                 print_json(&status)?;
             } else {
-                println!("source: {}", status.source);
-                println!("using default policy: {}", status.using_default);
-                println!(
-                    "build enabled tools: {}",
-                    status.build_enabled_tools.join(", ")
-                );
-                println!(
-                    "plan enabled tools: {}",
-                    status.plan_enabled_tools.join(", ")
-                );
-                for diagnostic in status.diagnostics {
-                    eprintln!("{diagnostic}");
-                }
+                write_permission_status(
+                    &mut std::io::stdout().lock(),
+                    &mut std::io::stderr().lock(),
+                    &status.source,
+                    status.using_default,
+                    &status.build_enabled_tools,
+                    &status.plan_enabled_tools,
+                    &status.diagnostics,
+                )?;
             }
         }
         PermissionCommand::List { session_id, json } => {
@@ -3005,6 +3134,91 @@ enum WorkflowCommand {
         #[arg(long, value_name = "JSON_FILE")]
         input: Option<PathBuf>,
     },
+    /// Return one bounded page of workflow events as JSON (not a live watch).
+    Events {
+        #[arg(long)]
+        run_id: String,
+        /// Return events after this sequence; omit for the first page.
+        #[arg(long)]
+        after_sequence: Option<u64>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Return one bounded page of workflow attempts as JSON.
+    Attempts {
+        #[arg(long)]
+        run_id: String,
+        /// Timestamp from the last attempt on the preceding page.
+        #[arg(long, requires = "after_dispatch_identity")]
+        after_prepared_at_ms: Option<u64>,
+        /// Dispatch identity from the same last attempt.
+        #[arg(long, requires = "after_prepared_at_ms")]
+        after_dispatch_identity: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// List bounded, checksum-verified registered definitions as JSON.
+    Definitions {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Inspect one exact registered definition version as JSON, or null when absent.
+    DescribeDefinition {
+        #[arg(long)]
+        definition_id: String,
+        #[arg(long)]
+        version: u32,
+    },
+    /// Inspect one workflow run for damage or ambiguous attempts without repairing it.
+    Doctor {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Return one durable run summary as JSON, or null when absent.
+    RunStatus {
+        #[arg(long)]
+        run_id: String,
+    },
+    /// List bounded workflow run summaries as JSON.
+    Runs {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Request durable run cancellation; print whether it was recorded as JSON.
+    CancelRun {
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Pause further scheduler admission; print the transition result as JSON.
+    PauseRun {
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Resume a paused workflow; print the transition result as JSON.
+    ResumeRun {
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Retry one exact failed node attempt and return the admission result as JSON.
+    RetryNode {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        activation_id: String,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        failed_attempt: u32,
+    },
+    /// List bounded durable input and approval waits as JSON.
+    Waits {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Return one bounded public run inspection including canonical output and descendants.
     InspectRun {
         #[arg(long)]
@@ -3027,6 +3241,7 @@ enum WorkflowCommand {
         node_id: String,
         #[arg(long)]
         activation_id: String,
+        /// Inline JSON, a JSON file, or `-` for stdin; capped at the workflow document byte limit.
         #[arg(long, value_name = "JSON_OR_FILE")]
         value: String,
     },
@@ -3038,10 +3253,27 @@ enum WorkflowCommand {
         node_id: String,
         #[arg(long)]
         activation_id: String,
-        #[arg(long, conflicts_with = "deny")]
+        #[arg(long, conflicts_with = "deny", required_unless_present = "deny")]
         approve: bool,
         #[arg(long, conflicts_with = "approve")]
         deny: bool,
+    },
+    /// Resolve one exact pending workflow mutation approval and return JSON.
+    ResolveMutationApproval {
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long, conflicts_with = "deny", required_unless_present = "deny")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve")]
+        deny: bool,
+    },
+    /// List bounded pending workflow mutation approvals as JSON.
+    MutationApprovals {
+        /// Restrict results to one workflow run; omit to list across runs.
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
     /// Cancel one exact in-flight validation or compilation operation.
     CancelComputation {
@@ -4272,27 +4504,44 @@ enum ModelCommand {
         #[arg(long)]
         json: bool,
     },
-    Capabilities,
+    Capabilities {
+        /// Print the complete normalized capability contract as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect normalized embedded/remote model-catalog state.
     Diagnostics {
         /// Print the complete diagnostics contract as JSON.
         #[arg(long)]
         json: bool,
     },
-    Validate,
+    Validate {
+        /// Print the normalized validation result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Ignore {
         model_id: String,
         #[arg(long)]
         provider: Option<String>,
+        /// Print the mutation receipt as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Unignore {
         model_id: String,
         #[arg(long)]
         provider: Option<String>,
+        /// Print the mutation receipt as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Ignored {
         #[arg(long)]
         provider: Option<String>,
+        /// Print provider-keyed ignore rules as JSON.
+        #[arg(long)]
+        json: bool,
     },
     Verify {
         /// Prompt sent to each model.
@@ -4325,6 +4574,9 @@ enum ModelCommand {
         model_id: String,
         #[arg(long)]
         provider: Option<String>,
+        /// Print the session operation result as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4919,6 +5171,32 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+fn write_skill_list(
+    output: &mut impl std::io::Write,
+    diagnostics: &mut impl std::io::Write,
+    result: &bcode_skill_models::SkillList,
+) -> Result<(), CliError> {
+    for skill in &result.skills {
+        writeln!(
+            output,
+            "{}\t{}\t{}",
+            skill.id,
+            skill.name,
+            skill.description.as_deref().unwrap_or_default()
+        )?;
+    }
+    output.flush()?;
+    for diagnostic in &result.diagnostics {
+        writeln!(
+            diagnostics,
+            "{:?}: {}",
+            diagnostic.severity, diagnostic.message
+        )?;
+    }
+    diagnostics.flush()?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
@@ -4928,9 +5206,15 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             if json {
                 print_json(&agents)?;
             } else {
+                let mut output = std::io::stdout().lock();
                 for agent in agents {
-                    println!("{}\t{}\t{}", agent.id, agent.name, agent.description);
+                    writeln!(
+                        output,
+                        "{}\t{}\t{}",
+                        agent.id, agent.name, agent.description
+                    )?;
                 }
+                output.flush()?;
             }
         }
         SessionCommand::Skills { json } => {
@@ -4939,17 +5223,11 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             if json {
                 print_json(&result)?;
             } else {
-                for skill in result.skills {
-                    println!(
-                        "{}\t{}\t{}",
-                        skill.id,
-                        skill.name,
-                        skill.description.as_deref().unwrap_or_default()
-                    );
-                }
-                for diagnostic in result.diagnostics {
-                    eprintln!("{:?}: {}", diagnostic.severity, diagnostic.message);
-                }
+                write_skill_list(
+                    &mut std::io::stdout().lock(),
+                    &mut std::io::stderr().lock(),
+                    &result,
+                )?;
             }
         }
         SessionCommand::DescribeSkill { skill_id, json } => {
@@ -4960,11 +5238,13 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             if json {
                 print_json(&skill)?;
             } else {
-                println!("{} ({})", skill.summary.name, skill.summary.id);
+                let mut output = std::io::stdout().lock();
+                writeln!(output, "{} ({})", skill.summary.name, skill.summary.id)?;
                 if let Some(description) = skill.summary.description {
-                    println!("{description}");
+                    writeln!(output, "{description}")?;
                 }
-                println!("{}", skill.instructions);
+                writeln!(output, "{}", skill.instructions)?;
+                output.flush()?;
             }
         }
         SessionCommand::Create { name, json } => Box::pin(create_session(name, json)).await?,
@@ -5499,42 +5779,77 @@ fn default_model_provider_id() -> Result<String, CliError> {
         })
 }
 
+fn list_ignored_models(provider: Option<&str>, json: bool) -> Result<(), CliError> {
+    let mut state = bcode_config::load_model_ignores_state()?;
+    state.retain(|provider_id, _| provider.is_none_or(|filter| filter == provider_id));
+    if json {
+        return print_json(&state);
+    }
+    let mut output = std::io::stdout().lock();
+    for (provider_id, rules) in state {
+        writeln!(output, "{provider_id}")?;
+        for model in rules.models {
+            writeln!(output, "  model {model}")?;
+        }
+        for pattern in rules.patterns {
+            writeln!(output, "  pattern {pattern}")?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
 async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
     match command {
-        ModelCommand::Ignore { model_id, provider } => {
-            let provider = provider.unwrap_or(default_model_provider_id()?);
+        ModelCommand::Ignore {
+            model_id,
+            provider,
+            json,
+        } => {
+            let provider = match provider {
+                Some(provider) => provider,
+                None => default_model_provider_id()?,
+            };
             let path = bcode_config::ignore_model_in_state(&provider, model_id.clone())?;
-            println!(
-                "Ignored model '{model_id}' for provider '{provider}' in {}",
-                display_from_current_dir(&path)
-            );
-        }
-        ModelCommand::Unignore { model_id, provider } => {
-            let provider = provider.unwrap_or(default_model_provider_id()?);
-            let path = bcode_config::unignore_model_in_state(&provider, &model_id)?;
-            println!(
-                "Removed state ignore for model '{model_id}' and provider '{provider}' in {}",
-                display_from_current_dir(&path)
-            );
-        }
-        ModelCommand::Ignored { provider } => {
-            let state = bcode_config::load_model_ignores_state()?;
-            for (provider_id, rules) in state {
-                if provider
-                    .as_deref()
-                    .is_some_and(|filter| filter != provider_id)
-                {
-                    continue;
-                }
-                println!("{provider_id}");
-                for model in rules.models {
-                    println!("  model {model}");
-                }
-                for pattern in rules.patterns {
-                    println!("  pattern {pattern}");
-                }
+            if json {
+                print_json(
+                    &serde_json::json!({"operation": "model_ignored", "provider": provider, "model_id": model_id, "state_path": path}),
+                )?;
+            } else {
+                let mut output = std::io::stdout().lock();
+                writeln!(
+                    output,
+                    "Ignored model '{model_id}' for provider '{provider}' in {}",
+                    display_from_current_dir(&path)
+                )?;
+                output.flush()?;
             }
         }
+        ModelCommand::Unignore {
+            model_id,
+            provider,
+            json,
+        } => {
+            let provider = match provider {
+                Some(provider) => provider,
+                None => default_model_provider_id()?,
+            };
+            let path = bcode_config::unignore_model_in_state(&provider, &model_id)?;
+            if json {
+                print_json(
+                    &serde_json::json!({"operation": "model_unignored", "provider": provider, "model_id": model_id, "state_path": path}),
+                )?;
+            } else {
+                let mut output = std::io::stdout().lock();
+                writeln!(
+                    output,
+                    "Removed state ignore for model '{model_id}' and provider '{provider}' in {}",
+                    display_from_current_dir(&path)
+                )?;
+                output.flush()?;
+            }
+        }
+        ModelCommand::Ignored { provider, json } => list_ignored_models(provider.as_deref(), json)?,
         ModelCommand::Verify {
             prompt,
             max_models,
@@ -5560,14 +5875,15 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                 ModelCommand::Status { session_id, json } => {
                     model_status(session_id, json).await?;
                 }
-                ModelCommand::Capabilities => model_capabilities().await?,
+                ModelCommand::Capabilities { json } => model_capabilities(json).await?,
                 ModelCommand::Diagnostics { json } => model_catalog_diagnostics(json).await?,
-                ModelCommand::Validate => model_validate_config().await?,
+                ModelCommand::Validate { json } => model_validate_config(json).await?,
                 ModelCommand::Set {
                     session_id,
                     provider,
                     model_id,
-                } => set_session_model(session_id, provider, model_id).await?,
+                    json,
+                } => set_session_model_selection(session_id, provider, model_id, json).await?,
                 ModelCommand::Verify { .. }
                 | ModelCommand::VerifyCache(_)
                 | ModelCommand::Ignore { .. }
@@ -9491,7 +9807,7 @@ async fn list_models(json: bool, provider: Option<String>) -> Result<(), CliErro
     if json {
         print_json(&models)?;
     } else {
-        print_model_list(&models.models);
+        write_model_list(&mut std::io::stdout().lock(), &models.models)?;
     }
     Ok(())
 }
@@ -9506,41 +9822,54 @@ async fn model_status(session_id: Option<SessionId>, json: bool) -> Result<(), C
     if json {
         print_json(&status)?;
     } else {
-        print_model_status(&status);
+        write_model_status(&mut std::io::stdout().lock(), &status)?;
     }
     Ok(())
 }
 
-fn print_model_status(status: &bcode_ipc::SessionModelStatus) {
-    println!(
+fn write_model_status(
+    output: &mut impl std::io::Write,
+    status: &bcode_ipc::SessionModelStatus,
+) -> Result<(), CliError> {
+    writeln!(
+        output,
         "provider\t{}",
         status.provider_plugin_id.as_deref().unwrap_or("<auto>")
-    );
-    println!(
+    )?;
+    writeln!(
+        output,
         "model\t{}",
         status.model_id.as_deref().unwrap_or("<default>")
-    );
-    println!(
+    )?;
+    writeln!(
+        output,
         "context_window\t{}",
         status
             .context_window
             .map_or_else(|| "<none>".to_string(), |value| value.to_string())
-    );
-    println!(
+    )?;
+    writeln!(
+        output,
         "max_output_tokens\t{}",
         status
             .max_output_tokens
             .map_or_else(|| "<none>".to_string(), |value| value.to_string())
-    );
-    println!(
+    )?;
+    writeln!(
+        output,
         "metadata_source\t{}",
         status
             .metadata_source
             .map_or_else(|| "<none>".to_string(), |source| format!("{source:?}"))
-    );
+    )?;
+    output.flush()?;
+    Ok(())
 }
 
-fn print_model_list(models: &[bcode_model::ModelInfo]) {
+fn write_model_list(
+    output: &mut impl std::io::Write,
+    models: &[bcode_model::ModelInfo],
+) -> Result<(), CliError> {
     let model_width = models
         .iter()
         .map(|model| model.model_id.len())
@@ -9553,10 +9882,11 @@ fn print_model_list(models: &[bcode_model::ModelInfo]) {
         .max()
         .unwrap_or("DISPLAY NAME".len())
         .max("DISPLAY NAME".len());
-    println!(
+    writeln!(
+        output,
         "{:<model_width$}  {:<display_name_width$}  {:>10}  {:>10}  {:<16}  DEFAULT",
         "MODEL", "DISPLAY NAME", "CTX", "MAX OUT", "METADATA"
-    );
+    )?;
     for model in models {
         let context = model
             .context_window
@@ -9568,28 +9898,20 @@ fn print_model_list(models: &[bcode_model::ModelInfo]) {
             .metadata_source
             .map_or_else(|| "-".to_string(), |source| format!("{source:?}"));
         if model.is_default {
-            println!(
+            writeln!(
+                output,
                 "{:<model_width$}  {:<display_name_width$}  {:>10}  {:>10}  {:<16}  yes",
                 model.model_id, model.display_name, context, max_output, metadata
-            );
+            )?;
         } else {
-            println!(
+            writeln!(
+                output,
                 "{:<model_width$}  {:<display_name_width$}  {:>10}  {:>10}  {:<16}",
                 model.model_id, model.display_name, context, max_output, metadata
-            );
+            )?;
         }
     }
-}
-
-async fn set_session_model(
-    session_id: SessionId,
-    provider_plugin_id: Option<String>,
-    model_id: String,
-) -> Result<(), CliError> {
-    BcodeClient::default_endpoint()
-        .set_session_model(session_id, provider_plugin_id, model_id)
-        .await?;
-    println!("session model set");
+    output.flush()?;
     Ok(())
 }
 
@@ -9600,28 +9922,47 @@ async fn model_catalog_diagnostics(json: bool) -> Result<(), CliError> {
     if json {
         print_json(&diagnostics)?;
     } else {
-        println!("embedded revision: {}", diagnostics.embedded_revision);
-        println!(
-            "remote revision: {}",
-            diagnostics.remote_revision.as_deref().unwrap_or("-")
-        );
-        println!("remote enabled: {}", diagnostics.remote_enabled);
-        println!("cache state: {}", diagnostics.cache_state);
-        println!(
-            "cache age seconds: {}",
-            diagnostics
-                .cache_age_seconds
-                .map_or_else(|| "-".to_owned(), |seconds| seconds.to_string())
-        );
-        println!("refresh in progress: {}", diagnostics.refresh_in_progress);
-        if let Some(error) = diagnostics.last_refresh_error {
-            println!("last refresh error: {error}");
-        }
+        write_model_catalog_diagnostics(&mut std::io::stdout().lock(), &diagnostics)?;
     }
     Ok(())
 }
 
-async fn model_capabilities() -> Result<(), CliError> {
+fn write_model_catalog_diagnostics(
+    output: &mut impl std::io::Write,
+    diagnostics: &bcode_ipc::ModelCatalogDiagnostics,
+) -> Result<(), CliError> {
+    writeln!(
+        output,
+        "embedded revision: {}",
+        diagnostics.embedded_revision
+    )?;
+    writeln!(
+        output,
+        "remote revision: {}",
+        diagnostics.remote_revision.as_deref().unwrap_or("-")
+    )?;
+    writeln!(output, "remote enabled: {}", diagnostics.remote_enabled)?;
+    writeln!(output, "cache state: {}", diagnostics.cache_state)?;
+    writeln!(
+        output,
+        "cache age seconds: {}",
+        diagnostics
+            .cache_age_seconds
+            .map_or_else(|| "-".to_owned(), |seconds| seconds.to_string())
+    )?;
+    writeln!(
+        output,
+        "refresh in progress: {}",
+        diagnostics.refresh_in_progress
+    )?;
+    if let Some(error) = &diagnostics.last_refresh_error {
+        writeln!(output, "last refresh error: {error}")?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+async fn model_capabilities(json: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let selection = config.resolved_model_selection();
     let request = bcode_model::ProviderCapabilitiesRequest {
@@ -9633,22 +9974,37 @@ async fn model_capabilities() -> Result<(), CliError> {
         serde_json::to_vec(&request)?,
     )
     .await?;
+    write_model_capabilities(&mut std::io::stdout().lock(), response, json)
+}
+
+fn write_model_capabilities(
+    output: &mut impl std::io::Write,
+    response: bcode_ipc::PluginServiceResponse,
+    json: bool,
+) -> Result<(), CliError> {
     if let Some(error) = response.error {
-        println!("ERROR\t{}\t{}", error.code, error.message);
-        return Ok(());
+        return Err(CliError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
     }
     let capabilities: bcode_model::ProviderCapabilities =
         serde_json::from_slice(&response.payload)?;
-    println!(
+    if json {
+        return write_json_result(output, &capabilities);
+    }
+    writeln!(
+        output,
         "{}\t{}",
         capabilities.provider_id, capabilities.display_name
-    );
+    )?;
     for capability in capabilities.capabilities {
-        println!("capability\t{capability:?}");
+        writeln!(output, "capability\t{capability:?}")?;
     }
     for (key, value) in capabilities.metadata {
-        println!("metadata\t{key}\t{value}");
+        writeln!(output, "metadata\t{key}\t{value}")?;
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -10177,20 +10533,49 @@ fn unix_timestamp_string() -> String {
         )
 }
 
-async fn model_validate_config() -> Result<(), CliError> {
+async fn model_validate_config(json: bool) -> Result<(), CliError> {
     let response = call_model_provider_service(bcode_model::OP_VALIDATE_CONFIG).await?;
+    write_model_validation(&mut std::io::stdout().lock(), response, json)
+}
+
+fn write_model_validation(
+    output: &mut impl std::io::Write,
+    response: bcode_ipc::PluginServiceResponse,
+    json: bool,
+) -> Result<(), CliError> {
     if let Some(error) = response.error {
-        println!("ERROR\t{}\t{}", error.code, error.message);
-        return Ok(());
+        return Err(CliError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
     }
     let validation: bcode_model::ValidateConfigResponse =
         serde_json::from_slice(&response.payload)?;
-    println!("valid\t{}", validation.valid);
-    if let Some(message) = validation.message {
-        println!("message\t{message}");
+    if json {
+        write_json_result(output, &validation)?;
+    } else {
+        writeln!(output, "valid\t{}", validation.valid)?;
+        if let Some(message) = &validation.message {
+            writeln!(output, "message\t{message}")?;
+        }
+        for failure in &validation.failures {
+            writeln!(
+                output,
+                "failure\t{}\t{:?}\t{}\t{:?}",
+                failure.provider_id, failure.source_kind, failure.source, failure.capability
+            )?;
+            writeln!(output, "remediation\t{}", failure.remediation)?;
+        }
+        for (key, value) in &validation.metadata {
+            writeln!(output, "metadata\t{key}\t{value}")?;
+        }
+        output.flush()?;
     }
-    for (key, value) in validation.metadata {
-        println!("metadata\t{key}\t{value}");
+    if !validation.valid {
+        return Err(CliError::PluginService {
+            code: "invalid_configuration".to_owned(),
+            message: "model provider configuration is invalid".to_owned(),
+        });
     }
     Ok(())
 }
@@ -14543,6 +14928,27 @@ fn print_cancellation_result(kind: &str, cancelled: bool, json: bool) -> Result<
     }
 }
 
+fn write_permission_status<W: std::io::Write, E: std::io::Write>(
+    output: &mut W,
+    diagnostics: &mut E,
+    source: &str,
+    using_default: bool,
+    build_tools: &[String],
+    plan_tools: &[String],
+    messages: &[String],
+) -> Result<(), CliError> {
+    writeln!(output, "source: {source}")?;
+    writeln!(output, "using default policy: {using_default}")?;
+    writeln!(output, "build enabled tools: {}", build_tools.join(", "))?;
+    writeln!(output, "plan enabled tools: {}", plan_tools.join(", "))?;
+    output.flush()?;
+    for message in messages {
+        writeln!(diagnostics, "{message}")?;
+    }
+    diagnostics.flush()?;
+    Ok(())
+}
+
 async fn list_permissions(session_id: Option<SessionId>, json: bool) -> Result<(), CliError> {
     let mut permissions = BcodeClient::default_endpoint().list_permissions().await?;
     if let Some(session_id) = session_id {
@@ -17332,6 +17738,123 @@ mod web_command_tests {
     }
 
     #[test]
+    fn workflow_run_controls_preserve_run_identity() {
+        for command in ["cancel-run", "pause-run", "resume-run", "run-status"] {
+            let cli = Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                command,
+                "--run-id",
+                "run/exact-identity",
+            ])
+            .expect("workflow control");
+            let Some(Commands::Workflow { command: parsed }) = cli.command else {
+                panic!("expected workflow command");
+            };
+            let (("cancel-run", WorkflowCommand::CancelRun { run_id })
+            | ("pause-run", WorkflowCommand::PauseRun { run_id })
+            | ("resume-run", WorkflowCommand::ResumeRun { run_id })
+            | ("run-status", WorkflowCommand::RunStatus { run_id })) = (command, parsed)
+            else {
+                panic!("incorrect workflow control variant");
+            };
+            assert_eq!(run_id, "run/exact-identity");
+        }
+    }
+
+    #[test]
+    fn workflow_run_and_wait_lists_preserve_limits() {
+        for limit in [None, Some("7")] {
+            let expected = if limit.is_some() { 7 } else { 100 };
+            for command in ["runs", "waits"] {
+                let mut arguments = vec!["bcode", "workflow", command];
+                if command == "waits" {
+                    arguments.extend(["--run-id", "run-1"]);
+                }
+                if let Some(limit) = limit {
+                    arguments.extend(["--limit", limit]);
+                }
+                let cli = Cli::try_parse_from(arguments).expect("bounded workflow list");
+                match cli.command {
+                    Some(Commands::Workflow {
+                        command: WorkflowCommand::Runs { limit },
+                    }) => {
+                        assert_eq!(command, "runs");
+                        assert_eq!(limit, expected);
+                    }
+                    Some(Commands::Workflow {
+                        command: WorkflowCommand::Waits { run_id, limit },
+                    }) => {
+                        assert_eq!(command, "waits");
+                        assert_eq!(run_id, "run-1");
+                        assert_eq!(limit, expected);
+                    }
+                    _ => panic!("incorrect workflow list variant"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_doctor_preserves_bounds_and_rejects_repair_flags() {
+        for limit in [None, Some("7")] {
+            let mut arguments = vec!["bcode", "workflow", "doctor", "--run-id", "run-1"];
+            if let Some(limit) = limit {
+                arguments.extend(["--limit", limit]);
+            }
+            let cli = Cli::try_parse_from(&arguments).expect("workflow doctor");
+            assert!(matches!(cli.command,
+                Some(Commands::Workflow { command: WorkflowCommand::Doctor { run_id, limit: bound } })
+                if run_id == "run-1" && bound == if limit.is_some() { 7 } else { 100 }
+            ));
+            arguments.push("--apply");
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_retry_node_requires_exact_attempt_identity() {
+        let arguments = [
+            "bcode",
+            "workflow",
+            "retry-node",
+            "--run-id",
+            "run-1",
+            "--node-id",
+            "node-2",
+            "--activation-id",
+            "activation-3",
+            "--failed-attempt",
+            "4",
+        ];
+        let cli = Cli::try_parse_from(arguments).expect("exact node retry");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Workflow {
+                command: WorkflowCommand::RetryNode {
+                    run_id, node_id, activation_id, failed_attempt
+                }
+            }) if run_id == "run-1" && node_id == "node-2"
+                && activation_id == "activation-3" && failed_attempt == 4
+        ));
+        for index in [3, 5, 7, 9] {
+            let incomplete: Vec<_> = arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(position, value)| {
+                    (!(index..index + 2).contains(&position)).then_some(*value)
+                })
+                .collect();
+            assert!(Cli::try_parse_from(incomplete).is_err());
+        }
+        for invalid in ["0", "-1", "4294967296", "latest"] {
+            let mut invalid_arguments = arguments;
+            invalid_arguments[10] = invalid;
+            assert!(Cli::try_parse_from(invalid_arguments).is_err());
+        }
+    }
+
+    #[test]
     fn workflow_run_output_command_parses_bounded_identity() {
         let cli = Cli::try_parse_from([
             "bcode",
@@ -18400,6 +18923,47 @@ mod workflow_source_tests {
     }
 
     #[test]
+    fn package_manifest_parse_errors_do_not_echo_contents() {
+        let temp = tempfile::tempdir().expect("fixture");
+        for (extension, source) in [
+            ("json", r#"{"version":"secret-marker-123"}"#),
+            ("yaml", "version: secret-marker-123\n"),
+            ("toml", "version = \"secret-marker-123\"\n"),
+        ] {
+            let path = temp.path().join(format!("package.{extension}"));
+            std::fs::write(&path, source).unwrap();
+            let error = read_workflow_package_manifest(&path).unwrap_err();
+            assert!(error.to_string().contains("invalid workflow package"));
+            assert!(!error.to_string().contains("secret-marker-123"));
+            assert!(!format!("{error:?}").contains("secret-marker-123"));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn package_file_reads_enforce_manifest_and_combined_source_bounds() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let manifest = temp.path().join("package.yaml");
+        let limit = bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES;
+        std::fs::write(&manifest, vec![b' '; limit + 1]).unwrap();
+        let error = read_workflow_package_manifest(&manifest).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workflow package manifest exceeds")
+        );
+        std::fs::write(&manifest, "version: 3\npackage_id: example/package\nexports:\n  main: first\nmembers:\n  - member_id: first\n    source_name: first.yaml\n  - member_id: second\n    source_name: second.yaml\n").unwrap();
+        std::fs::write(temp.path().join("first.yaml"), vec![b' '; limit]).unwrap();
+        std::fs::write(temp.path().join("second.yaml"), b"x").unwrap();
+        let error = read_workflow_package_manifest(&manifest).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workflow package sources exceeds 0 bytes")
+        );
+    }
+
+    #[test]
     fn primary_cli_confines_and_loads_package_member_sources() {
         let temp = tempfile::tempdir().expect("tempdir");
         let member = temp.path().join("member.workflow.yaml");
@@ -19165,6 +19729,34 @@ mod workflow_source_tests {
         );
     }
 
+    fn assert_transitive_package_byte_boundary(root: &std::path::Path, child: &std::path::Path) {
+        let child_source = std::fs::read(child.join("main.workflow.yaml")).expect("child source");
+        let remaining = bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES - child_source.len();
+        let manifest = root.join("package.workflow-package.yaml");
+        std::fs::write(root.join("main.workflow.yaml"), vec![b' '; remaining]).unwrap();
+        let exact = read_workflow_package_closure(&manifest).expect("exact transitive limit");
+        assert_eq!(
+            exact
+                .packages
+                .iter()
+                .flat_map(|package| &package.manifest.members)
+                .map(|member| member.source.len())
+                .sum::<usize>(),
+            bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES
+        );
+        std::fs::write(root.join("main.workflow.yaml"), vec![b' '; remaining + 1]).unwrap();
+        let error = read_workflow_package_closure(&manifest).expect_err("one byte beyond limit");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow package sources exceeds")
+        );
+        assert_eq!(
+            std::fs::read(child.join("main.workflow.yaml")).unwrap(),
+            child_source
+        );
+    }
+
     #[test]
     fn primary_cli_resolves_recursive_confined_package_manifests() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -19221,6 +19813,28 @@ mod workflow_source_tests {
                 .packages
                 .iter()
                 .any(|package| package.package_id == "child")
+        );
+
+        assert_transitive_package_byte_boundary(temp.path(), &child);
+
+        std::fs::write(
+            temp.path().join("main.workflow.yaml"),
+            vec![b' '; bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES],
+        )
+        .expect("root consumes closure budget");
+        let error =
+            read_workflow_package_closure(&temp.path().join("package.workflow-package.yaml"))
+                .expect_err("child must share the root source budget");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow package sources exceeds 0 bytes")
+        );
+        write_package(
+            temp.path(),
+            "root",
+            "example/root",
+            Some(("child", "child/package.workflow-package.yaml")),
         );
 
         let outside = tempfile::tempdir().expect("outside");
@@ -20399,6 +21013,319 @@ mod json_stream_output_tests {
     }
 
     #[test]
+    fn model_validation_exposes_provider_owned_remediation() {
+        let failure = bcode_model::ProviderFailureContext {
+            provider_id: "provider".to_owned(),
+            source_kind: bcode_model::ProviderFailureSourceKind::AuthProfile,
+            source: "work".to_owned(),
+            capability: bcode_model::ProviderFailureCapability::Authentication,
+            remediation: "Sign in to the work profile".to_owned(),
+        };
+        let validation = bcode_model::ValidateConfigResponse {
+            valid: false,
+            message: None,
+            failures: vec![failure.clone()],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        for json in [false, true] {
+            let mut output = Output::default();
+            let response = bcode_ipc::PluginServiceResponse {
+                payload: serde_json::to_vec(&validation).unwrap(),
+                error: None,
+            };
+            let error = super::write_model_validation(&mut output, response, json).unwrap_err();
+            assert_eq!(error.exit_code(), 1);
+            if json {
+                let parsed: bcode_model::ValidateConfigResponse =
+                    serde_json::from_slice(&output.bytes).unwrap();
+                assert_eq!(parsed.failures, vec![failure.clone()]);
+            } else {
+                assert_eq!(output.bytes, b"valid\tfalse\nfailure\tprovider\tAuthProfile\twork\tAuthentication\nremediation\tSign in to the work profile\n");
+            }
+            assert_eq!(output.flushes, 1);
+        }
+    }
+
+    #[test]
+    fn model_validation_preserves_results_but_rejects_invalid_configuration() {
+        for json in [false, true] {
+            for valid in [false, true] {
+                let response = || {
+                    bcode_ipc::PluginServiceResponse {
+                    payload: serde_json::to_vec(&serde_json::json!({"valid": valid, "message": "details", "metadata": {"key": "value"}})).unwrap(),
+                    error: None,
+                }
+                };
+                let mut output = Output::default();
+                let result = super::write_model_validation(&mut output, response(), json);
+                if valid {
+                    result.unwrap();
+                } else {
+                    assert!(
+                        matches!(result, Err(CliError::PluginService { code, .. }) if code == "invalid_configuration")
+                    );
+                }
+                if json {
+                    let value: bcode_model::ValidateConfigResponse =
+                        serde_json::from_slice(&output.bytes).unwrap();
+                    assert_eq!(value.valid, valid);
+                    assert_eq!(value.message.as_deref(), Some("details"));
+                } else {
+                    assert_eq!(
+                        output.bytes,
+                        format!("valid\t{valid}\nmessage\tdetails\nmetadata\tkey\tvalue\n")
+                            .as_bytes()
+                    );
+                }
+                assert_eq!(output.flushes, 1);
+                for fail_flush in [false, true] {
+                    let mut output = Output {
+                        fail_write: !fail_flush,
+                        fail_flush,
+                        ..Output::default()
+                    };
+                    assert!(
+                        matches!(super::write_model_validation(&mut output, response(), json),
+                        Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                    );
+                }
+            }
+            let mut output = Output::default();
+            let response = bcode_ipc::PluginServiceResponse {
+                payload: vec![],
+                error: Some(bcode_ipc::PluginServiceError {
+                    code: "unavailable".to_owned(),
+                    message: "unavailable".to_owned(),
+                }),
+            };
+            assert!(matches!(
+                super::write_model_validation(&mut output, response, json),
+                Err(CliError::PluginService { .. })
+            ));
+            assert!(output.bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn model_capabilities_separate_failures_and_support_machine_results() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "provider_id": "provider", "display_name": "Provider", "metadata": {"key": "value"}
+        }))
+        .unwrap();
+        for json in [false, true] {
+            let response = || bcode_ipc::PluginServiceResponse {
+                payload: payload.clone(),
+                error: None,
+            };
+            let mut output = Output::default();
+            super::write_model_capabilities(&mut output, response(), json).unwrap();
+            if json {
+                let parsed: bcode_model::ProviderCapabilities =
+                    serde_json::from_slice(&output.bytes).unwrap();
+                assert_eq!(parsed.provider_id, "provider");
+                assert_eq!(parsed.metadata.get("key").unwrap(), "value");
+            } else {
+                assert_eq!(output.bytes, b"provider\tProvider\nmetadata\tkey\tvalue\n");
+            }
+            assert_eq!(output.flushes, 1);
+            for fail_flush in [false, true] {
+                let mut output = Output {
+                    fail_write: !fail_flush,
+                    fail_flush,
+                    ..Output::default()
+                };
+                assert!(
+                    matches!(super::write_model_capabilities(&mut output, response(), json),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                );
+            }
+            let mut output = Output::default();
+            let failed = bcode_ipc::PluginServiceResponse {
+                payload: vec![],
+                error: Some(bcode_ipc::PluginServiceError {
+                    code: "unavailable".to_owned(),
+                    message: "provider unavailable".to_owned(),
+                }),
+            };
+            assert!(matches!(
+                super::write_model_capabilities(&mut output, failed, json),
+                Err(CliError::PluginService { .. })
+            ));
+            assert!(output.bytes.is_empty());
+            let malformed = bcode_ipc::PluginServiceResponse {
+                payload: b"not json".to_vec(),
+                error: None,
+            };
+            assert!(super::write_model_capabilities(&mut output, malformed, json).is_err());
+            assert!(output.bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_diagnostics_preserve_degraded_state_and_output_errors() {
+        for degraded in [false, true] {
+            let diagnostics = bcode_ipc::ModelCatalogDiagnostics {
+                embedded_revision: "embedded".to_owned(),
+                remote_revision: degraded.then(|| "remote".to_owned()),
+                remote_enabled: degraded,
+                cache_state: if degraded { "stale" } else { "disabled" }.to_owned(),
+                cache_age_seconds: degraded.then_some(123),
+                refresh_in_progress: false,
+                last_refresh_attempt_ms: None,
+                last_refresh_success_ms: None,
+                last_refresh_error: degraded.then(|| "refresh unavailable".to_owned()),
+            };
+            let mut output = Output::default();
+            super::write_model_catalog_diagnostics(&mut output, &diagnostics).unwrap();
+            let expected = if degraded {
+                "embedded revision: embedded\nremote revision: remote\nremote enabled: true\ncache state: stale\ncache age seconds: 123\nrefresh in progress: false\nlast refresh error: refresh unavailable\n"
+            } else {
+                "embedded revision: embedded\nremote revision: -\nremote enabled: false\ncache state: disabled\ncache age seconds: -\nrefresh in progress: false\n"
+            };
+            assert_eq!(output.bytes, expected.as_bytes());
+            assert_eq!(output.flushes, 1);
+            for fail_flush in [false, true] {
+                let mut output = Output {
+                    fail_write: !fail_flush,
+                    fail_flush,
+                    ..Output::default()
+                };
+                assert!(
+                    matches!(super::write_model_catalog_diagnostics(&mut output, &diagnostics),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_lists_preserve_rows_and_propagate_output_failures() {
+        let models: Vec<bcode_model::ModelInfo> = serde_json::from_value(serde_json::json!([
+            {"model_id": "first", "display_name": "First", "is_default": true,
+             "context_window": 32000, "max_output_tokens": 4096},
+            {"model_id": "second", "display_name": "Second"}
+        ]))
+        .unwrap();
+        for rows in [&[][..], models.as_slice()] {
+            let mut output = Output::default();
+            super::write_model_list(&mut output, rows).unwrap();
+            let text = String::from_utf8(output.bytes).unwrap();
+            let lines = text
+                .lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lines[0],
+                [
+                    "MODEL", "DISPLAY", "NAME", "CTX", "MAX", "OUT", "METADATA", "DEFAULT"
+                ]
+            );
+            assert_eq!(lines.len(), rows.len() + 1);
+            if !rows.is_empty() {
+                assert_eq!(lines[1], ["first", "First", "32000", "4096", "-", "yes"]);
+                assert_eq!(lines[2], ["second", "Second", "-", "-", "-"]);
+            }
+            assert_eq!(output.flushes, 1);
+            for fail_flush in [false, true] {
+                let mut output = Output {
+                    fail_write: !fail_flush,
+                    fail_flush,
+                    ..Output::default()
+                };
+                assert!(matches!(super::write_model_list(&mut output, rows),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe));
+            }
+        }
+    }
+
+    #[test]
+    fn model_status_preserves_values_and_propagates_output_failures() {
+        let empty: bcode_ipc::SessionModelStatus =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let populated: bcode_ipc::SessionModelStatus = serde_json::from_value(serde_json::json!({
+            "provider_plugin_id": "provider", "model_id": "model",
+            "context_window": 32000, "max_output_tokens": 4096
+        }))
+        .unwrap();
+        for (status, expected) in [
+            (
+                empty,
+                "provider\t<auto>\nmodel\t<default>\ncontext_window\t<none>\nmax_output_tokens\t<none>\nmetadata_source\t<none>\n",
+            ),
+            (
+                populated,
+                "provider\tprovider\nmodel\tmodel\ncontext_window\t32000\nmax_output_tokens\t4096\nmetadata_source\t<none>\n",
+            ),
+        ] {
+            let mut output = Output::default();
+            super::write_model_status(&mut output, &status).unwrap();
+            assert_eq!(output.bytes, expected.as_bytes());
+            assert_eq!(output.flushes, 1);
+            for fail_flush in [false, true] {
+                let mut output = Output {
+                    fail_write: !fail_flush,
+                    fail_flush,
+                    ..Output::default()
+                };
+                assert!(matches!(super::write_model_status(&mut output, &status),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe));
+            }
+        }
+    }
+
+    #[test]
+    fn skill_lists_separate_diagnostics_and_propagate_output_failures() {
+        let result = bcode_skill_models::SkillList {
+            skills: vec![bcode_skill_models::SkillSummary {
+                id: bcode_skill_models::SkillId::new("example"),
+                name: "Example".to_owned(),
+                description: Some("Instructions".to_owned()),
+                version: None,
+                source: bcode_skill_models::SkillSource {
+                    kind: bcode_skill_models::SkillSourceKind::Bundled,
+                    label: "bundled".to_owned(),
+                    path: None,
+                    precedence: 0,
+                },
+                activation: bcode_skill_models::SkillActivation::default(),
+                diagnostics: vec![],
+                disable_model_invocation: false,
+            }],
+            diagnostics: vec![bcode_skill_models::SkillDiagnostic {
+                severity: bcode_skill_models::SkillDiagnosticSeverity::Warning,
+                message: "another skill unavailable".to_owned(),
+                path: None,
+            }],
+        };
+        let mut output = Output::default();
+        let mut diagnostics = Output::default();
+        super::write_skill_list(&mut output, &mut diagnostics, &result).unwrap();
+        assert_eq!(output.bytes, b"example\tExample\tInstructions\n");
+        assert_eq!(diagnostics.bytes, b"Warning: another skill unavailable\n");
+        assert_eq!((output.flushes, diagnostics.flushes), (1, 1));
+        for fail_diagnostics in [false, true] {
+            for fail_flush in [false, true] {
+                let mut output = Output::default();
+                let mut diagnostics = Output::default();
+                let failing = if fail_diagnostics {
+                    &mut diagnostics
+                } else {
+                    &mut output
+                };
+                failing.fail_write = !fail_flush;
+                failing.fail_flush = fail_flush;
+                assert!(matches!(
+                    super::write_skill_list(&mut output, &mut diagnostics, &result),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+                ));
+                if !fail_diagnostics {
+                    assert!(diagnostics.bytes.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn worktree_lists_preserve_rows_and_return_output_errors() {
         let rows = [
             bcode_worktree_models::WorktreeInfo {
@@ -20749,6 +21676,43 @@ mod json_stream_output_tests {
     }
 
     #[test]
+    fn permission_status_separates_diagnostics_and_propagates_stream_errors() {
+        let build = vec!["filesystem.read".to_owned(), "shell.run".to_owned()];
+        let messages = vec!["policy degraded".to_owned()];
+        let mut output = Output::default();
+        let mut diagnostics = Output::default();
+        super::write_permission_status(
+            &mut output,
+            &mut diagnostics,
+            "fallback",
+            true,
+            &build,
+            &[],
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(output.bytes, b"source: fallback\nusing default policy: true\nbuild enabled tools: filesystem.read, shell.run\nplan enabled tools: \n");
+        assert_eq!(diagnostics.bytes, b"policy degraded\n");
+        assert_eq!((output.flushes, diagnostics.flushes), (1, 1));
+        for fail_stderr in [false, true] {
+            for fail_write in [false, true] {
+                let mut output = Output::default();
+                let mut diagnostics = Output::default();
+                let failed = if fail_stderr {
+                    &mut diagnostics
+                } else {
+                    &mut output
+                };
+                failed.fail_write = fail_write;
+                failed.fail_flush = !fail_write;
+                assert!(
+                    matches!(super::write_permission_status(&mut output, &mut diagnostics, "fallback", true, &build, &[], &messages), Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn permission_receipts_preserve_formats_and_report_output_failures() {
         for (value, text) in [
             (serde_json::json!({"resolved": true}), "resolved: true"),
@@ -20964,6 +21928,70 @@ mod interaction_cli_tests {
     };
     use clap::Parser as _;
     use std::io::Read as _;
+
+    #[test]
+    fn workflow_source_file_enforces_size_and_encoding() {
+        let root = tempfile::tempdir().expect("source fixture");
+        let path = root.path().join("source.yaml");
+        let limit = bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES;
+        let bytes = vec![b' '; limit];
+        std::fs::write(&path, &bytes).unwrap();
+        let source = super::read_workflow_source_file(&path, None).expect("exact limit");
+        assert_eq!(source.source.len(), limit);
+        assert_eq!(
+            source.source_format,
+            bcode_workflow::WorkflowSourceFormat::Yaml
+        );
+        std::fs::write(&path, vec![b' '; limit + 1]).unwrap();
+        let error = super::read_workflow_source_file(&path, None)
+            .err()
+            .expect("oversized file");
+        assert!(error.to_string().contains("workflow source exceeds"));
+        std::fs::write(&path, [0xff]).unwrap();
+        let error = super::read_workflow_source_file(&path, None)
+            .err()
+            .expect("invalid encoding");
+        assert!(error.to_string().contains("not valid UTF-8"));
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff]);
+    }
+
+    #[test]
+    fn workflow_input_value_accepts_inline_and_file_and_bounds_inline() {
+        let value = serde_json::json!({"answer": 42});
+        assert_eq!(
+            super::read_workflow_input_value(&value.to_string()).unwrap(),
+            value
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("input.json");
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(
+            super::read_workflow_input_value(path.to_str().unwrap()).unwrap(),
+            value
+        );
+        let oversized = " ".repeat(bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1);
+        let error = super::read_workflow_input_value(&oversized).unwrap_err();
+        assert!(error.to_string().contains("workflow JSON exceeds"));
+    }
+
+    #[test]
+    fn workflow_source_reader_enforces_limit_during_read() {
+        let bytes = b"name: example";
+        assert_eq!(
+            super::read_bytes_with_limit(bytes.as_slice(), bytes.len(), "workflow source")
+                .expect("exact limit"),
+            bytes
+        );
+        let mut reader = std::io::repeat(b'x').take(1_000_000);
+        let error = super::read_bytes_with_limit(&mut reader, 32, "workflow source")
+            .expect_err("oversized source");
+        assert_eq!(reader.limit(), 1_000_000 - 33);
+        assert!(
+            error
+                .to_string()
+                .contains("workflow source exceeds 32 bytes")
+        );
+    }
 
     #[test]
     fn interaction_json_reader_consumes_only_limit_plus_sentinel() {

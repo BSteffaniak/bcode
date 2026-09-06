@@ -184,6 +184,623 @@ fn conflicting_history_cursors_fail_before_daemon_access() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn model_ignore_mutations_preserve_unreadable_state_targets() {
+    for missing in [false, true] {
+        let fixture = tempfile::tempdir().expect("state target fixture");
+        let target = fixture.path().join("ignores.toml");
+        if !missing {
+            std::fs::write(&target, b"invalid [toml").unwrap();
+        }
+        for command in ["ignore", "unignore"] {
+            for json in [false, true] {
+                let mut arguments =
+                    vec!["model", command, "example", "--provider", "custom-provider"];
+                if json {
+                    arguments.push("--json");
+                }
+                let output = run_cli_with_fixture(&arguments, false, Stdio::piped(), |root| {
+                    let state = root.join("bcode-state");
+                    std::fs::create_dir_all(&state).unwrap();
+                    std::os::unix::fs::symlink(&target, state.join("model-ignores.toml")).unwrap();
+                });
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{arguments:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    output.stdout.is_empty(),
+                    "unexpected receipt: {arguments:?}"
+                );
+                if missing {
+                    assert!(!target.exists(), "must not create dangling symlink target");
+                } else {
+                    assert_eq!(std::fs::read(&target).unwrap(), b"invalid [toml");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn model_ignore_diagnostics_do_not_disclose_state_contents() {
+    for contents in [
+        "secret-token-123 = [",
+        "[providers.first]\nmodels = [\"secret-token-123\", 42]",
+    ] {
+        for command in ["ignored", "ignore", "unignore"] {
+            for json in [false, true] {
+                let mut arguments = vec!["model", command];
+                if command != "ignored" {
+                    arguments.extend(["example", "--provider", "custom-provider"]);
+                }
+                if json {
+                    arguments.push("--json");
+                }
+                let output = run_cli_with_fixture(&arguments, false, Stdio::piped(), |root| {
+                    let state = root.join("bcode-state");
+                    std::fs::create_dir_all(&state).unwrap();
+                    std::fs::write(state.join("model-ignores.toml"), contents).unwrap();
+                });
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
+                assert!(
+                    output.stdout.is_empty(),
+                    "unexpected receipt: {arguments:?}"
+                );
+                assert!(
+                    stderr.contains("invalid TOML or ignore-rule schema"),
+                    "{stderr}"
+                );
+                assert!(!stderr.contains("secret-token-123"), "{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn workflow_package_parse_failures_are_secret_safe_before_daemon_access() {
+    for (extension, source) in [
+        ("json", r#"{"version":"secret-marker-123"}"#),
+        ("yaml", "version: secret-marker-123\n"),
+        ("toml", "version = \"secret-marker-123\"\n"),
+    ] {
+        let fixture = tempfile::tempdir().expect("manifest fixture");
+        let manifest = fixture.path().join(format!("package.{extension}"));
+        std::fs::write(&manifest, source).unwrap();
+        for command in ["validate", "preview", "apply"] {
+            let output = run_cli_with_state(
+                &["workflow", "package", command, manifest.to_str().unwrap()],
+                true,
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{command}: {stderr}");
+            assert!(output.stdout.is_empty());
+            assert!(stderr.contains("invalid workflow package"), "{stderr}");
+            assert!(!stderr.contains("secret-marker-123"), "{stderr}");
+            assert_eq!(std::fs::read_to_string(&manifest).unwrap(), source);
+        }
+    }
+}
+
+#[test]
+fn workflow_input_stdin_rejects_invalid_and_oversized_payloads() {
+    use std::io::{Seek as _, Write as _};
+
+    for (contents, diagnostic) in [
+        (
+            b"{\"secret\":\"workflow-secret-marker\"} {}".to_vec(),
+            "trailing characters",
+        ),
+        (
+            vec![b' '; bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1],
+            "workflow JSON exceeds",
+        ),
+    ] {
+        let mut input = tempfile::tempfile().expect("stdin fixture");
+        input.write_all(&contents).unwrap();
+        input.rewind().unwrap();
+        let output = run_cli_with_stdio(
+            &[
+                "workflow",
+                "provide-input",
+                "--run-id",
+                "test-run",
+                "--node-id",
+                "test-node",
+                "--activation-id",
+                "test-activation",
+                "--value",
+                "-",
+            ],
+            true,
+            Stdio::piped(),
+            Stdio::from(input),
+            |_| {},
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert!(!stderr.contains("workflow-secret-marker"), "{stderr}");
+    }
+}
+
+#[test]
+fn workflow_input_stdin_accepts_valid_json_through_exact_limit() {
+    use std::io::{Seek as _, Write as _};
+
+    for length in [4, bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES] {
+        let mut bytes = b"null".to_vec();
+        bytes.resize(length, b' ');
+        let mut input = tempfile::tempfile().expect("stdin fixture");
+        input.write_all(&bytes).unwrap();
+        input.rewind().unwrap();
+        let output = run_cli_with_stdio(
+            &[
+                "workflow",
+                "provide-input",
+                "--run-id",
+                "test-run",
+                "--node-id",
+                "test-node",
+                "--activation-id",
+                "test-activation",
+                "--value",
+                "-",
+            ],
+            true,
+            Stdio::piped(),
+            Stdio::from(input),
+            |_| {},
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(!stderr.contains("workflow JSON exceeds"), "{stderr}");
+        assert!(!stderr.is_empty());
+    }
+}
+
+#[test]
+fn workflow_approval_requires_exactly_one_decision() {
+    let arguments = [
+        "workflow",
+        "resolve-approval",
+        "--run-id",
+        "test-run",
+        "--node-id",
+        "test-node",
+        "--activation-id",
+        "test-activation",
+    ];
+    assert_usage_error(&arguments, "required arguments were not provided");
+    let mut conflicting = arguments.to_vec();
+    conflicting.extend(["--approve", "--deny"]);
+    assert_usage_error(&conflicting, "cannot be used with");
+    for decision in ["--approve", "--deny"] {
+        let mut selected = arguments.to_vec();
+        selected.push(decision);
+        let output = run_cli_with_state(&selected, true);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn workflow_mutation_approval_listing_reaches_application_boundary() {
+    for run in [None, Some("test-run")] {
+        let mut arguments = vec!["workflow", "mutation-approvals", "--limit", "5"];
+        if let Some(run) = run {
+            arguments.extend(["--run-id", run]);
+        }
+        let output = run_cli_with_state(&arguments, true);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn workflow_mutation_approval_resolution_requires_explicit_decision() {
+    let arguments = [
+        "workflow",
+        "resolve-mutation-approval",
+        "--approval-id",
+        "test-approval",
+    ];
+    assert_usage_error(&arguments, "required arguments were not provided");
+    let mut conflicting = arguments.to_vec();
+    conflicting.extend(["--approve", "--deny"]);
+    assert_usage_error(&conflicting, "cannot be used with");
+    for decision in ["--approve", "--deny"] {
+        let mut selected = arguments.to_vec();
+        selected.push(decision);
+        let output = run_cli_with_state(&selected, true);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn workflow_events_accepts_page_cursor_and_rejects_invalid_sequence() {
+    let arguments = ["workflow", "events", "--run-id", "test-run", "--limit", "5"];
+    for cursor in [None, Some("0"), Some("18446744073709551615")] {
+        let mut page = arguments.to_vec();
+        if let Some(cursor) = cursor {
+            page.extend(["--after-sequence", cursor]);
+        }
+        let output = run_cli_with_state(&page, true);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
+    let mut invalid = arguments.to_vec();
+    invalid.extend(["--after-sequence", "18446744073709551616"]);
+    assert_usage_error(&invalid, "invalid value");
+}
+
+#[test]
+fn workflow_attempts_requires_complete_keyset_cursor() {
+    let arguments = [
+        "workflow", "attempts", "--run-id", "test-run", "--limit", "5",
+    ];
+    for partial in [
+        ["--after-prepared-at-ms", "10"],
+        ["--after-dispatch-identity", "dispatch"],
+    ] {
+        let mut page = arguments.to_vec();
+        page.extend(partial);
+        assert_usage_error(&page, "required arguments were not provided");
+    }
+    for cursor in [false, true] {
+        let mut page = arguments.to_vec();
+        if cursor {
+            page.extend([
+                "--after-prepared-at-ms",
+                "10",
+                "--after-dispatch-identity",
+                "dispatch",
+            ]);
+        }
+        let output = run_cli_with_state(&page, true);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn workflow_run_controls_require_identity_and_do_not_claim_success_on_failure() {
+    for command in ["cancel-run", "pause-run", "resume-run", "run-status"] {
+        assert_usage_error(
+            &["workflow", command],
+            "required arguments were not provided",
+        );
+        let output = run_cli_with_state(&["workflow", command, "--run-id", "run-1"], true);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "{command}");
+    }
+}
+
+#[test]
+fn workflow_definition_queries_require_exact_version_and_report_failure() {
+    assert_usage_error(
+        &[
+            "workflow",
+            "describe-definition",
+            "--definition-id",
+            "definition-1",
+        ],
+        "required arguments were not provided",
+    );
+    for arguments in [
+        vec!["workflow", "definitions", "--limit", "5"],
+        vec![
+            "workflow",
+            "describe-definition",
+            "--definition-id",
+            "definition-1",
+            "--version",
+            "3",
+        ],
+    ] {
+        let output = run_cli_with_state(&arguments, true);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn workflow_doctor_requires_identity_and_reports_daemon_failure() {
+    assert_usage_error(
+        &["workflow", "doctor"],
+        "required arguments were not provided",
+    );
+    let output = run_cli_with_state(
+        &["workflow", "doctor", "--run-id", "run-1", "--limit", "5"],
+        true,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn workflow_runs_does_not_emit_a_list_on_daemon_failure() {
+    let output = run_cli_with_state(&["workflow", "runs", "--limit", "5"], true);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn workflow_retry_zero_attempt_is_usage_error() {
+    let output = run_cli_with_state(
+        &[
+            "workflow",
+            "retry-node",
+            "--run-id",
+            "run",
+            "--node-id",
+            "node",
+            "--activation-id",
+            "activation",
+            "--failed-attempt",
+            "0",
+        ],
+        true,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+}
+
+#[test]
+fn workflow_retry_node_does_not_emit_success_on_daemon_failure() {
+    assert_usage_error(
+        &["workflow", "retry-node"],
+        "required arguments were not provided",
+    );
+    let output = run_cli_with_state(
+        &[
+            "workflow",
+            "retry-node",
+            "--run-id",
+            "test-run",
+            "--node-id",
+            "test-node",
+            "--activation-id",
+            "test-activation",
+            "--failed-attempt",
+            "1",
+        ],
+        true,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn workflow_waits_requires_run_and_reaches_application_boundary() {
+    assert_usage_error(
+        &["workflow", "waits"],
+        "required arguments were not provided",
+    );
+    let output = run_cli_with_state(
+        &["workflow", "waits", "--run-id", "test-run", "--limit", "5"],
+        true,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn ignored_models_json_filters_provider_rules() {
+    for provider in [None, Some("first"), Some("missing")] {
+        let mut arguments = vec!["model", "ignored", "--json"];
+        if let Some(provider) = provider {
+            arguments.extend(["--provider", provider]);
+        }
+        let output = run_cli_with_fixture(&arguments, false, Stdio::piped(), |root| {
+            let state = root.join("bcode-state");
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::write(state.join("model-ignores.toml"), "[providers.first]\nmodels = [\"one\"]\npatterns = [\"test-*\"]\n[providers.second]\nmodels = [\"two\"]\n").unwrap();
+        });
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().len(),
+            match provider {
+                None => 2,
+                Some("first") => 1,
+                _ => 0,
+            }
+        );
+        if provider != Some("missing") {
+            assert_eq!(value["first"]["models"], serde_json::json!(["one"]));
+            assert_eq!(value["first"]["patterns"], serde_json::json!(["test-*"]));
+        }
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn model_ignore_mutations_return_json_receipts() {
+    for (command, operation) in [("ignore", "model_ignored"), ("unignore", "model_unignored")] {
+        let arguments = [
+            "model",
+            command,
+            "example",
+            "--provider",
+            "custom-provider",
+            "--json",
+        ];
+        let output = run_cli(&arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["operation"], operation);
+        assert_eq!(receipt["provider"], "custom-provider");
+        assert_eq!(receipt["model_id"], "example");
+        assert!(
+            receipt["state_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("model-ignores.toml")
+        );
+        assert!(output.stderr.is_empty());
+        let failed = run_cli_with_state(&arguments, true);
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(failed.stdout.is_empty());
+    }
+}
+
+#[test]
+fn explicit_model_ignore_provider_does_not_require_a_configured_default() {
+    for command in ["ignore", "unignore"] {
+        let output = run_cli(&["model", command, "example", "--provider", "custom-provider"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{command}: {stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("example"), "{stdout}");
+        assert!(stdout.contains("custom-provider"), "{stdout}");
+        assert!(output.stderr.is_empty(), "{stderr}");
+    }
+}
+
+#[test]
+fn model_inspection_commands_report_daemon_failure_without_results() {
+    for command in ["list", "status", "diagnostics", "capabilities", "validate"] {
+        for json in [false, true] {
+            let mut arguments = vec!["model", command];
+            if json {
+                arguments.push("--json");
+            }
+            let output = run_cli_with_state(&arguments, true);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
+            assert!(output.stdout.is_empty(), "unexpected result: {arguments:?}");
+            assert!(stderr.starts_with("error:"), "{arguments:?}: {stderr}");
+            assert!(!stderr.contains("panicked"), "{arguments:?}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn model_set_alias_accepts_machine_output_and_reports_daemon_failure() {
+    for prefix in [vec!["model", "set"], vec!["session", "set-model"]] {
+        for json in [false, true] {
+            let mut arguments = prefix.clone();
+            arguments.extend([
+                "00000000-0000-0000-0000-000000000001",
+                "example",
+                "--provider",
+                "provider",
+            ]);
+            if json {
+                arguments.push("--json");
+            }
+            let output = run_cli_with_state(&arguments, true);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
+            assert!(
+                output.stdout.is_empty(),
+                "unexpected success receipt: {arguments:?}"
+            );
+            assert!(stderr.starts_with("error:"), "{stderr}");
+            assert!(!stderr.contains("panicked"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn permission_commands_report_daemon_failure_without_success_receipts() {
+    for arguments in [
+        vec!["permission", "status"],
+        vec!["permission", "list"],
+        vec!["permission", "approve", "pending"],
+        vec!["permission", "approve", "pending", "--remember"],
+        vec!["permission", "deny", "pending"],
+        vec!["permission", "resolve-batch", "batch", "--approve"],
+        vec!["permission", "resolve-batch", "batch", "--deny"],
+        vec![
+            "permission",
+            "add",
+            "--agent",
+            "build",
+            "--category",
+            "read",
+            "--pattern",
+            "*",
+            "--action",
+            "ask",
+        ],
+    ] {
+        for json in [false, true] {
+            let mut args = arguments.clone();
+            if json {
+                args.push("--json");
+            }
+            let output = run_cli_with_state(&args, true);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(
+                output.stdout.is_empty(),
+                "unexpected success receipt: {args:?}"
+            );
+            assert!(stderr.starts_with("error:"), "{args:?}: {stderr}");
+            assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        }
+    }
+}
+
 #[test]
 fn worktree_commands_report_daemon_failure_without_json() {
     for arguments in [

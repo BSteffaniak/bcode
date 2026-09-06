@@ -5991,17 +5991,26 @@ pub fn load_model_ignores_state() -> Result<BTreeMap<String, ModelIgnoreConfig>,
 pub fn load_model_ignores_state_from(
     path: &Path,
 ) -> Result<BTreeMap<String, ModelIgnoreConfig>, ConfigError> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     }
     let raw = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     let state =
-        toml::from_str::<ModelIgnoresState>(&raw).map_err(|source| ConfigError::Composition {
+        toml::from_str::<ModelIgnoresState>(&raw).map_err(|_| ConfigError::Composition {
             message: format!(
-                "failed to parse {}: {source}",
+                "failed to parse model ignore state {}: invalid TOML or ignore-rule schema",
                 display_from_current_dir(path)
             ),
         })?;
@@ -6069,11 +6078,7 @@ fn update_model_ignores_state(
     update: impl FnOnce(&mut BTreeMap<String, ModelIgnoreConfig>) -> Result<(), ConfigError>,
 ) -> Result<PathBuf, ConfigError> {
     let path = default_model_ignores_state_path();
-    let mut providers = if path.exists() {
-        load_model_ignores_state_from(&path)?
-    } else {
-        BTreeMap::new()
-    };
+    let mut providers = load_model_ignores_state_from(&path)?;
     update(&mut providers)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
@@ -6099,8 +6104,19 @@ fn model_ignores_state_to_toml(providers: &BTreeMap<String, ModelIgnoreConfig>) 
         "# Declarative [model.ignored] rules in bcode.toml are unioned with this file.\n\n",
     );
     for (provider, rules) in providers {
-        let escaped_provider = provider.replace('"', "\\\"");
-        let _ = writeln!(output, "[providers.\"{escaped_provider}\"]");
+        let mut provider_key = String::from("\"");
+        for character in provider.chars() {
+            match character {
+                '"' => provider_key.push_str("\\\""),
+                '\\' => provider_key.push_str("\\\\"),
+                character if character.is_control() => {
+                    let _ = write!(provider_key, "\\u{:04X}", u32::from(character));
+                }
+                character => provider_key.push(character),
+            }
+        }
+        provider_key.push('"');
+        let _ = writeln!(output, "[providers.{provider_key}]");
         write_model_ignore_string_set(&mut output, "models", &rules.models);
         write_string_slice(&mut output, "patterns", &rules.patterns);
         output.push('\n');
@@ -6119,7 +6135,7 @@ fn write_string_slice(output: &mut String, key: &str, values: &[String]) {
     }
     let escaped = values
         .iter()
-        .map(|value| format!("\"{}\"", value.replace('"', "\\\"")))
+        .map(|value| toml::Value::String(value.clone()).to_string())
         .collect::<Vec<_>>()
         .join(", ");
     let _ = writeln!(output, "{key} = [{escaped}]");
@@ -8181,6 +8197,78 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_ignore_parse_errors_do_not_echo_file_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ignores.toml");
+        for contents in [
+            "secret-token-123 = [",
+            "[providers.first]\nmodels = [\"secret-token-123\", 42]",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            let error = super::load_model_ignores_state_from(&path).unwrap_err();
+            assert!(!error.to_string().contains("secret-token-123"));
+            assert!(!format!("{error:?}").contains("secret-token-123"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid TOML or ignore-rule schema")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn model_ignore_state_only_defaults_when_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ignores.toml");
+        assert!(
+            super::load_model_ignores_state_from(&path)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&path, "invalid [toml").unwrap();
+        assert!(super::load_model_ignores_state_from(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid [toml");
+        assert!(super::load_model_ignores_state_from(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_ignore_state_rejects_dangling_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("missing.toml");
+        let link = root.path().join("ignores.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(super::load_model_ignores_state_from(&link).is_err());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_link(link).unwrap(), target);
+    }
+
+    #[test]
+    fn model_ignore_state_round_trips_toml_special_characters() {
+        for value in [
+            "plain",
+            "back\\slash",
+            "quoted\"name",
+            "new\nline",
+            "tab\tname",
+            "unicode-λ",
+            "control\u{0001}",
+        ] {
+            let providers = std::collections::BTreeMap::from([(
+                value.to_owned(),
+                super::ModelIgnoreConfig {
+                    models: std::collections::BTreeSet::from([value.to_owned()]),
+                    patterns: vec![format!("{value}*")],
+                },
+            )]);
+            let encoded = super::model_ignores_state_to_toml(&providers);
+            let decoded: super::ModelIgnoresState = toml::from_str(&encoded).expect("valid TOML");
+            assert_eq!(decoded.providers, providers);
+        }
+    }
+
     use super::{
         AuthConfig, AuthPoolConfig, BCODE_CONFIG_ENV, BcodeConfig, CompactionBackend,
         CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot, ConfigError,

@@ -52847,6 +52847,35 @@ event_symbol = "bcode_plugin_handle_event_v1"
             permissions
         );
         assert_eq!(*decision.lock().await, None);
+        let invalid_action = "PRIVATE_PERMISSION_ACTION_SENTINEL";
+        let error = client
+            .add_permission_rule(
+                "build".to_owned(),
+                "read".to_owned(),
+                "*".to_owned(),
+                invalid_action.to_owned(),
+            )
+            .await
+            .expect_err("invalid action must be rejected");
+        match error {
+            bcode_client::ClientError::Server { code, message } => {
+                assert_eq!(code, "config_error");
+                assert_eq!(
+                    message,
+                    interaction_operations::PermissionRuleError::UnknownAction.message()
+                );
+                assert!(!message.contains(invalid_action));
+            }
+            other => panic!("expected normalized server rejection, got {other:?}"),
+        }
+        assert_eq!(
+            client
+                .list_permissions()
+                .await
+                .expect("inspect after rejection"),
+            permissions
+        );
+        assert_eq!(*decision.lock().await, None);
         assert!(
             client
                 .resolve_permission("permission-ipc".to_owned(), true)
@@ -52878,6 +52907,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .session_history(session_id)
             .await
             .expect("permission history");
+        let resolutions = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::PermissionResolved {
+                    permission_id,
+                    approved,
+                } if permission_id == "permission-ipc" => Some(*approved),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resolutions,
+            vec![true],
+            "stale denial must not append another canonical resolution"
+        );
+        let requests = history.iter().filter(|event| matches!(
+            &event.kind,
+            SessionEventKind::PermissionRequested { permission_id, .. } if permission_id == "permission-ipc"
+        )).count();
+        assert_eq!(
+            requests, 1,
+            "inspection and invalid rule updates must not duplicate the request"
+        );
         let snapshot = bcode_session_view::build_session_view_snapshot(&history);
         assert!(snapshot.permissions.is_empty());
         assert!(snapshot.transcript.items.iter().any(|item| matches!(
@@ -59899,10 +59951,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         bcode_ipc::send_envelope(&mut stream, &resume)
             .await
             .expect("send resume");
-        let response = bcode_ipc::recv_envelope(&mut stream)
-            .await
-            .expect("resume response");
-        let response = bcode_ipc::decode_response(&response.payload).expect("decode response");
+        let response = receive_correlated_test_response(&mut stream, 1).await;
         assert!(matches!(
             response,
             Response::Err(ErrorResponse { code, message })
@@ -59910,16 +59959,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     && message.contains("completed to running")
         ));
 
-        let ping = bcode_ipc::request_envelope(2, &Request::Ping).expect("ping request");
-        bcode_ipc::send_envelope(&mut stream, &ping)
+        let status = bcode_ipc::request_envelope(
+            2,
+            &Request::WorkflowRunStatus {
+                run_id: "completed-control-run".to_string(),
+            },
+        )
+        .expect("status request");
+        bcode_ipc::send_envelope(&mut stream, &status)
             .await
-            .expect("send ping");
-        let response = bcode_ipc::recv_envelope(&mut stream)
-            .await
-            .expect("ping response");
+            .expect("send status");
         assert!(matches!(
-            bcode_ipc::decode_response(&response.payload).expect("decode ping"),
-            Response::Ok(ResponsePayload::Pong)
+            receive_correlated_test_response(&mut stream, 2).await,
+            Response::Ok(ResponsePayload::WorkflowRunStatus { run: Some(run) })
+                if run.run_id == "completed-control-run"
+                    && run.status == bcode_workflow_store::RunStatus::Completed
         ));
         drop(stream);
         server.await.expect("server task");
@@ -60921,25 +60975,134 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(conflict.to_string().contains("identity conflicts"));
     }
 
+    async fn receive_correlated_test_response(
+        stream: &mut LocalIpcStream,
+        request_id: u64,
+    ) -> Response {
+        let envelope =
+            tokio::time::timeout(Duration::from_secs(5), bcode_ipc::recv_envelope(stream))
+                .await
+                .expect("response deadline")
+                .expect("response");
+        assert_eq!(envelope.request_id, request_id);
+        bcode_ipc::decode_response(&envelope.payload).expect("decode response")
+    }
+
+    async fn send_correlated_test_request(
+        stream: &mut LocalIpcStream,
+        request_id: u64,
+        request: &Request,
+    ) -> Response {
+        let envelope = bcode_ipc::request_envelope(request_id, request).expect("request envelope");
+        bcode_ipc::send_envelope(stream, &envelope)
+            .await
+            .expect("send request");
+        receive_correlated_test_response(stream, request_id).await
+    }
+
+    #[tokio::test]
+    async fn workflow_definition_queries_preserve_exact_versions_over_ipc() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let fixture_state = Arc::clone(&state);
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("definitions.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server = tokio::spawn(async move {
+            handle_client(listener.accept().await.expect("client connection"), state)
+                .await
+                .expect("handle client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        assert!(matches!(
+            send_correlated_test_request(&mut stream, 1, &Request::ListWorkflowDefinitions { limit: 5 }).await,
+            Response::Ok(ResponsePayload::WorkflowDefinitionList { definitions }) if definitions.is_empty()
+        ));
+        for version in [1, 17] {
+            assert!(matches!(
+                send_correlated_test_request(
+                    &mut stream,
+                    u64::from(version) + 1,
+                    &Request::DescribeWorkflowDefinition {
+                        definition_id: "missing".to_string(),
+                        version
+                    }
+                )
+                .await,
+                Response::Ok(ResponsePayload::WorkflowDefinitionDescription { definition: None })
+            ));
+        }
+        let workflow = bcode_workflow::WorkflowBuilder::new(
+            "definition-query",
+            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow");
+        fixture_state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_definition("definition-query", 3, workflow.definition())
+            .expect("definition");
+        let response = send_correlated_test_request(
+            &mut stream,
+            20,
+            &Request::ListWorkflowDefinitions { limit: 1 },
+        )
+        .await;
+        let Response::Ok(ResponsePayload::WorkflowDefinitionList { definitions }) = response else {
+            panic!("expected definition list");
+        };
+        assert_eq!(definitions.len(), 1);
+        let expected = &definitions[0];
+        assert_eq!(expected.definition_id, "definition-query");
+        assert_eq!(expected.version, 3);
+        assert_eq!(
+            serde_json::from_str::<bcode_workflow::WorkflowDefinition>(&expected.definition_json)
+                .expect("definition JSON"),
+            *workflow.definition()
+        );
+        for version in [3, 4] {
+            let response = send_correlated_test_request(
+                &mut stream,
+                20 + u64::from(version),
+                &Request::DescribeWorkflowDefinition {
+                    definition_id: "definition-query".to_string(),
+                    version,
+                },
+            )
+            .await;
+            let Response::Ok(ResponsePayload::WorkflowDefinitionDescription { definition }) =
+                response
+            else {
+                panic!("expected definition description");
+            };
+            if version == 3 {
+                assert_eq!(definition.as_ref(), Some(expected));
+            } else {
+                assert!(definition.is_none());
+            }
+        }
+        drop(stream);
+        server.await.expect("server task");
+    }
+
     #[tokio::test]
     async fn workflow_read_api_handlers_use_bounded_canonical_store_queries() {
-        let sessions = SessionManager::default();
-        let state = test_server_state(sessions);
-        let definition = bcode_workflow::WorkflowBuilder::new(
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let workflow = bcode_workflow::WorkflowBuilder::new(
             "read-api",
             bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
         )
         .build()
-        .expect("workflow")
-        .definition()
-        .clone();
+        .expect("workflow");
         {
             let mut store = state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             store
-                .persist_definition("read-api", 1, &definition)
+                .persist_definition("read-api", 1, workflow.definition())
                 .expect("definition");
             store
                 .create_run(&bcode_workflow_store::NewWorkflowRun {
@@ -60965,21 +61128,66 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 })
                 .expect("run");
         }
-        let definitions = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .list_definitions(10)
-            .expect("definitions");
-        assert_eq!(definitions.len(), 1);
-        let runs = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .list_runs(10)
-            .expect("runs");
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].run_id, "run-read");
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("reads.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server = tokio::spawn(async move {
+            handle_client(listener.accept().await.expect("client connection"), state)
+                .await
+                .expect("handle client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        for (request, index) in [
+            Request::ListWorkflowRuns { limit: 1 },
+            Request::WorkflowRunStatus {
+                run_id: "run-read".to_string(),
+            },
+            Request::WorkflowRunStatus {
+                run_id: "absent".to_string(),
+            },
+            Request::ListWorkflowWaits {
+                run_id: "run-read".to_string(),
+                limit: 1,
+            },
+            Request::ListWorkflowRuns { limit: 0 },
+            Request::DoctorWorkflowRun {
+                run_id: "run-read".to_string(),
+                limit: 100,
+            },
+        ]
+        .into_iter()
+        .zip(0_u64..)
+        {
+            let response = send_correlated_test_request(&mut stream, index, &request).await;
+            match index {
+                0 => assert!(
+                    matches!(response, Response::Ok(ResponsePayload::WorkflowRunList { runs })
+                    if runs.len() == 1 && runs[0].run_id == "run-read")
+                ),
+                1 => assert!(
+                    matches!(response, Response::Ok(ResponsePayload::WorkflowRunStatus { run: Some(run) })
+                    if run.run_id == "run-read")
+                ),
+                2 => assert!(matches!(
+                    response,
+                    Response::Ok(ResponsePayload::WorkflowRunStatus { run: None })
+                )),
+                3 => assert!(
+                    matches!(response, Response::Ok(ResponsePayload::WorkflowWaitList { waits }) if waits.is_empty())
+                ),
+                4 => assert!(
+                    matches!(response, Response::Err(ErrorResponse { code, message })
+                    if code == "workflow_unavailable" && message == "workflow state is unavailable")
+                ),
+                5 => assert!(
+                    matches!(response, Response::Ok(ResponsePayload::WorkflowDoctorReport { report })
+                    if report.run_id == "run-read" && report.issues.is_empty() && !report.truncated)
+                ),
+                _ => unreachable!(),
+            }
+        }
+        drop(stream);
+        server.await.expect("server task");
     }
 
     #[tokio::test]
