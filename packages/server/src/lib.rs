@@ -184,6 +184,9 @@ pub const SESSION_EVENT_PLUGIN_TOPIC: &str = "bcode.session.event";
 /// Errors returned by the local server.
 #[derive(Debug, Error)]
 pub enum ServerError {
+    /// The owned session-search ingestion worker failed to finish normally.
+    #[error("session search ingestion failed during shutdown")]
+    SessionSearchIngestionShutdown,
     #[error("IPC transport error: {0}")]
     Transport(#[from] bcode_ipc::IpcTransportError),
     #[error("config error: {0}")]
@@ -295,6 +298,8 @@ pub struct ServerState {
     default_plugin_ids: Vec<String>,
     session_search_enabled: bool,
     session_search_dirty: session_search::SessionSearchDirtyQueue,
+    session_search_ingestion: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    session_search_ingestion_failed: std::sync::atomic::AtomicBool,
     session_search_work: session_search::SessionSearchWorkScheduler,
     session_search_backfills: Mutex<BTreeMap<String, SessionSearchBackfillOperation>>,
     session_bulk_migrations: Mutex<BTreeMap<String, SessionBulkMigrationOperation>>,
@@ -1519,6 +1524,8 @@ impl ServerState {
             default_plugin_ids: init.default_plugin_ids,
             session_search_enabled: init.session_search_enabled,
             session_search_dirty: session_search::SessionSearchDirtyQueue::default(),
+            session_search_ingestion: Mutex::new(None),
+            session_search_ingestion_failed: std::sync::atomic::AtomicBool::new(false),
             session_search_work: session_search::SessionSearchWorkScheduler::default(),
             session_search_backfills: Mutex::default(),
             session_bulk_migrations: Mutex::default(),
@@ -2084,20 +2091,52 @@ impl ServerState {
         }
     }
 
-    fn start_session_search_ingestion(self: &Arc<Self>) {
+    async fn start_session_search_ingestion(self: &Arc<Self>) {
         if !self.session_search_enabled {
             return;
         }
-        Self::spawn_session_search_ingestion_worker(Arc::clone(self));
+        let mut task = self.session_search_ingestion.lock().await;
+        if task.is_none() && !self.shutdown_requested.load(Ordering::SeqCst) {
+            *task = Some(Self::spawn_session_search_ingestion_worker(Arc::clone(
+                self,
+            )));
+        }
     }
 
-    fn spawn_session_search_ingestion_worker(state: Arc<Self>) {
+    fn spawn_session_search_ingestion_worker(state: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let mut shutdown = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
-                state.session_search_dirty.notified().await;
+                if state.shutdown_requested.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    () = state.session_search_dirty.notified() => {}
+                }
+                if state.shutdown_requested.load(Ordering::SeqCst) {
+                    break;
+                }
                 session_search::process_dirty_sessions(&state).await;
             }
-        });
+        })
+    }
+
+    async fn stop_session_search_ingestion(&self) -> Result<(), ServerError> {
+        let mut task = self.session_search_ingestion.lock().await;
+        if let Some(worker) = task.as_mut()
+            && worker.await.is_err()
+        {
+            self.session_search_ingestion_failed
+                .store(true, Ordering::SeqCst);
+        }
+        *task = None;
+        if self.session_search_ingestion_failed.load(Ordering::SeqCst) {
+            Err(ServerError::SessionSearchIngestionShutdown)
+        } else {
+            Ok(())
+        }
     }
 
     fn start_workflow_event_forwarder(self: &Arc<Self>) {
@@ -2128,6 +2167,9 @@ impl ServerState {
                     _ = interval.tick() => {}
                 }
                 loop {
+                    if state.shutdown_requested.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let page = state
                         .workflow_store
                         .lock()
@@ -2145,16 +2187,19 @@ impl ServerState {
                     }
                     let page_len = positions.len();
                     for (event_sequence, run_id, changed_at_ms) in positions {
-                        broadcast_workflow_event(
-                            &state,
-                            bcode_workflow_view_models::WorkflowLiveEvent {
-                                version: bcode_workflow_view_models::WORKFLOW_LIVE_EVENT_VERSION,
-                                run_id,
-                                event_sequence,
-                                changed_at_ms,
-                            },
-                        )
-                        .await;
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => return,
+                            () = broadcast_workflow_event(
+                                &state,
+                                bcode_workflow_view_models::WorkflowLiveEvent {
+                                    version: bcode_workflow_view_models::WORKFLOW_LIVE_EVENT_VERSION,
+                                    run_id,
+                                    event_sequence,
+                                    changed_at_ms,
+                                },
+                            ) => {}
+                        }
                         after_sequence = event_sequence;
                     }
                     if page_len < 256 {
@@ -3879,7 +3924,7 @@ async fn run_constructed_server(
     let stage_started_at = Instant::now();
     state.start_catalog_event_forwarder();
     state.start_workflow_event_forwarder();
-    state.start_session_search_ingestion();
+    state.start_session_search_ingestion().await;
     start_catalog_refresh(&state).await;
     interrupt_stale_ralph_runs_best_effort(&state);
     let workflow_recovery_started_at = Instant::now();
@@ -4026,6 +4071,7 @@ async fn shutdown_constructed_server(
     accept_result: Result<(), ServerError>,
 ) -> Result<(), ServerError> {
     state.request_shutdown();
+    let ingestion = state.stop_session_search_ingestion().await;
     stop_catalog_refresh(&state).await;
     state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
@@ -4050,6 +4096,7 @@ async fn shutdown_constructed_server(
         tracing::warn!(%error, "daemon record removal failed during server shutdown");
     }
     accept_result?;
+    ingestion?;
     deactivation?;
     record_removal?;
     tracing::debug!(target: "bcode_server::startup", "shutdown complete");
@@ -69615,6 +69662,108 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn ingestion_startup_is_single_owner_and_shutdown_fenced() {
+        let mut state = test_server_state(SessionManager::default());
+        state.session_search_enabled = false;
+        let mut state = Arc::new(state);
+        state.start_session_search_ingestion().await;
+        assert!(state.session_search_ingestion.lock().await.is_none());
+        Arc::get_mut(&mut state)
+            .expect("no worker started")
+            .session_search_enabled = true;
+        state.start_session_search_ingestion().await;
+        let worker_id = state
+            .session_search_ingestion
+            .lock()
+            .await
+            .as_ref()
+            .expect("worker")
+            .id();
+        state.start_session_search_ingestion().await;
+        assert_eq!(
+            state
+                .session_search_ingestion
+                .lock()
+                .await
+                .as_ref()
+                .expect("same worker")
+                .id(),
+            worker_id
+        );
+        state.request_shutdown();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.stop_session_search_ingestion(),
+        )
+        .await
+        .expect("ingestion drains")
+        .expect("clean shutdown");
+        state.start_session_search_ingestion().await;
+        assert!(state.session_search_ingestion.lock().await.is_none());
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn ingestion_worker_failure_is_reported_after_server_cleanup() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        *state.session_search_ingestion.lock().await = Some(tokio::spawn(async {
+            panic!("private worker failure");
+        }));
+        let result = shutdown_constructed_server(Arc::clone(&state), Ok(())).await;
+        assert!(matches!(
+            result,
+            Err(ServerError::SessionSearchIngestionShutdown)
+        ));
+        assert!(state.session_search_ingestion.lock().await.is_none());
+        assert!(state.shutdown_requested.load(Ordering::SeqCst));
+        assert!(matches!(
+            state.stop_session_search_ingestion().await,
+            Err(ServerError::SessionSearchIngestionShutdown)
+        ));
+        assert_eq!(
+            ServerError::SessionSearchIngestionShutdown.to_string(),
+            "session search ingestion failed during shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_ingestion_shutdown_wait_retains_worker_ownership() {
+        let state = test_server_state(SessionManager::default());
+        let resource = Arc::new(());
+        let owned_resource = Arc::clone(&resource);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let worker = tokio::spawn(async move {
+            let _resource = owned_resource;
+            let _ = released.await;
+        });
+        *state.session_search_ingestion.lock().await = Some(worker);
+        state.request_shutdown();
+        let mut wait = Box::pin(state.stop_session_search_ingestion());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(wait.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(wait);
+        assert!(state.session_search_ingestion.lock().await.is_some());
+        assert_eq!(Arc::strong_count(&resource), 2);
+        release.send(()).expect("worker still owns receiver");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.stop_session_search_ingestion(),
+        )
+        .await
+        .expect("worker drains")
+        .expect("worker succeeds");
+        assert!(state.session_search_ingestion.lock().await.is_none());
+        assert_eq!(Arc::strong_count(&resource), 1);
+        state
+            .stop_session_search_ingestion()
+            .await
+            .expect("already stopped");
+    }
+
+    #[tokio::test]
     async fn shutdown_before_first_poll_releases_background_state() {
         for shutdown_before_spawn in [false, true] {
             let state = Arc::new(test_server_state(SessionManager::default()));
@@ -69624,6 +69773,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             }
             state.start_workflow_event_forwarder();
             state.start_catalog_event_forwarder();
+            let ingestion = ServerState::spawn_session_search_ingestion_worker(Arc::clone(&state));
             state.start_idle_shutdown_watcher(Duration::from_secs(30));
             // On the current-thread runtime neither spawned task has polled yet.
             state.request_shutdown();
@@ -69635,6 +69785,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             })
             .await
             .expect("background tasks release state after shutdown");
+            ingestion.await.expect("ingestion exits cleanly");
         }
     }
 
