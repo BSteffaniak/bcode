@@ -438,7 +438,7 @@ pub struct WorkflowRunLimits {
     /// Absolute wall-clock deadline, when configured.
     pub deadline_at_ms: Option<u64>,
     /// Maximum total node attempts in the run.
-    pub node_execution_cap: u32,
+    pub node_execution_cap: u64,
     /// Maximum concurrently running nodes.
     pub concurrency_cap: u32,
     /// Maximum cycle/repeat activations.
@@ -4164,7 +4164,7 @@ impl WorkflowStore {
                         row.get::<_, Option<u64>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<u64>>(6)?,
-                        row.get::<_, u32>(7)?,
+                        row.get::<_, u64>(7)?,
                         row.get::<_, u32>(8)?,
                         row.get::<_, u32>(9)?,
                         row.get::<_, u32>(10)?,
@@ -4428,7 +4428,7 @@ impl WorkflowStore {
                 "workflow child execution limits exceed the inherited parent limits".to_string(),
             ));
         }
-        let root_execution_count: u32 = transaction.query_row(
+        let root_execution_count: u64 = transaction.query_row(
             "SELECT COALESCE(SUM(run_attempts.attempt_count), 0) FROM (\
                SELECT run.run_id, COUNT(attempt.dispatch_identity) AS attempt_count \
                FROM workflow_runs run \
@@ -11980,7 +11980,7 @@ fn enforce_attempt_limits(
         retry_cap,
         cancellation_requested,
         run_status,
-    ): (Option<u64>, u32, u32, u32, bool, String) = connection.query_row(
+    ): (Option<u64>, u64, u32, u32, bool, String) = connection.query_row(
         "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, retry_cap, \
          cancellation_requested_at_ms IS NOT NULL, status FROM workflow_runs WHERE run_id = ?1",
         [&attempt.run_id],
@@ -12015,7 +12015,7 @@ fn enforce_attempt_limits(
             "workflow retry cap exceeded".to_string(),
         ));
     }
-    let execution_count: u32 = connection.query_row(
+    let execution_count: u64 = connection.query_row(
         "SELECT COUNT(*) FROM workflow_attempts WHERE run_id = ?1",
         [&attempt.run_id],
         |row| row.get(0),
@@ -13573,10 +13573,15 @@ fn validate_binding(binding: &WorkflowRunBinding) -> Result<(), WorkflowStoreErr
 }
 
 fn validate_run_limits(limits: &WorkflowRunLimits) -> Result<(), WorkflowStoreError> {
+    if limits.node_execution_cap > i64::MAX as u64 {
+        return Err(WorkflowStoreError::InvalidData(
+            "node_execution_cap exceeds the supported storage integer range".to_string(),
+        ));
+    }
     for (label, value) in [
         ("node_execution_cap", limits.node_execution_cap),
-        ("concurrency_cap", limits.concurrency_cap),
-        ("cycle_cap", limits.cycle_cap),
+        ("concurrency_cap", u64::from(limits.concurrency_cap)),
+        ("cycle_cap", u64::from(limits.cycle_cap)),
     ] {
         if value == 0 {
             return Err(WorkflowStoreError::InvalidData(format!(
@@ -14070,10 +14075,11 @@ fn validate_workflow_preset(preset: &WorkflowPreset) -> Result<(), WorkflowStore
     if let Some(limits) = &preset.run_limits
         && (limits.maximum_duration_ms == Some(0)
             || limits.node_execution_cap == 0
+            || limits.node_execution_cap > i64::MAX as u64
             || limits.concurrency_cap == 0
             || limits.cycle_cap == 0
             || limits.retry_cap == 0
-            || limits.concurrency_cap > limits.node_execution_cap)
+            || u64::from(limits.concurrency_cap) > limits.node_execution_cap)
     {
         return Err(WorkflowStoreError::InvalidData(
             "workflow preset run limits are invalid".to_string(),
@@ -16680,6 +16686,69 @@ mod tests {
         assert!(store.event_positions_after(0, 0).is_err());
         assert!(store.list_runs(0).is_err());
         assert!(store.event_history("run-1", None, 1_001).is_err());
+    }
+
+    #[test]
+    fn durable_repeat_honors_requested_limits_above_old_defaults_after_reopen() {
+        for iterations in [200_u32, 1_001] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            let mut definition = repeat_definition();
+            definition
+                .nodes
+                .get_mut("repeat-control")
+                .unwrap()
+                .configuration["max_iterations"] = serde_json::json!(iterations);
+            store
+                .persist_definition("example", 1, &definition)
+                .expect("definition");
+            let mut run = new_run();
+            run.input = Some(serde_json::json!({"condition_met": false, "iteration": 1}));
+            run.limits.cycle_cap = iterations;
+            // Exercise a budget beyond u32 through persistence, reopen and idempotency.
+            run.limits.node_execution_cap = u64::from(u32::MAX) * 8;
+            store.create_run_idempotent(&run).expect("run");
+            drop(store);
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+            assert!(!store.create_run_idempotent(&run).expect("idempotent"));
+            assert_eq!(
+                store.run_limits(&run.run_id).expect("limits").unwrap(),
+                run.limits
+            );
+            for iteration in 1..=iterations {
+                let body = store
+                    .pending_activations(10)
+                    .expect("body")
+                    .pop()
+                    .expect("activation");
+                assert_eq!(body.dependency_generation, u64::from(iteration - 1));
+                store
+                    .persist_validated_output(&ValidatedOutput {
+                        output_id: format!("output-{iteration}"),
+                        run_id: run.run_id.clone(),
+                        node_id: "body".to_string(),
+                        activation_id: body.activation_id,
+                        schema_id: definition.nodes["body"].output.type_name.clone(),
+                        schema_version: 1,
+                        value: serde_json::json!({"condition_met": false, "iteration": iteration}),
+                        artifact_reference: None,
+                        created_at_ms: 20 + u64::from(iteration) * 2,
+                    })
+                    .expect("output");
+                let settled = store
+                    .settle_pending_control_nodes(&run.run_id, 10, 21 + u64::from(iteration) * 2)
+                    .expect("settle");
+                assert_eq!(settled.activated.len(), usize::from(iteration < iterations));
+            }
+            assert_eq!(
+                store
+                    .run_summary(&run.run_id)
+                    .expect("summary")
+                    .unwrap()
+                    .status,
+                RunStatus::Failed
+            );
+        }
     }
 
     #[test]

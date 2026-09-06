@@ -22,7 +22,7 @@ name         = "Amazon Bedrock Model Provider v1"
 type = "concurrent"
 
 [runtime]
-abi_version  = 3
+abi_version  = 4
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_bedrock_provider_plugin.dylib"
 type         = "native"

@@ -1041,8 +1041,7 @@ fn reference_template_run_limits(
         .ok_or_else(|| "reference template iteration_limit is required".to_string())?;
     limits.cycle_cap = u32::try_from(iteration_limit)
         .map_err(|_| "reference template iteration_limit exceeds u32".to_string())?;
-    limits.node_execution_cap = limits
-        .cycle_cap
+    limits.node_execution_cap = u64::from(limits.cycle_cap)
         .checked_mul(16)
         .ok_or_else(|| "reference template node execution limit overflow".to_string())?;
     Ok(limits)

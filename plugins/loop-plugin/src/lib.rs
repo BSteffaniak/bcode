@@ -50,7 +50,6 @@ const STOP_COMMAND: &str = "loop.stop";
 const RESUME_COMMAND: &str = "loop.resume";
 const SURFACE_KIND: &str = "loop.start";
 const DEFAULT_MAX_ITERATIONS: u64 = 20;
-const HARD_MAX_ITERATIONS: u64 = 1_000;
 const MAX_PROMPT_BYTES: usize = 262_144;
 
 #[derive(Default)]
@@ -711,7 +710,7 @@ impl LoopSurface {
         let input = LoopWorkflowInput::new(prompt, condition, max_iterations)?;
         let spec = loop_workflow_spec(&input)?;
         let initial = loop_workflow_initial_value(&input);
-        PluginWorkflowStartRequest::typed(
+        let mut request = PluginWorkflowStartRequest::typed(
             &spec,
             &initial,
             session_id,
@@ -724,7 +723,14 @@ impl LoopSurface {
             },
             Some(uuid::Uuid::new_v4().to_string()),
         )
-        .map_err(|error| format!("invalid durable loop request: {error}"))
+        .map_err(|error| format!("invalid durable loop request: {error}"))?;
+        request.limits.cycle_cap = input.max_iterations;
+        // Both agent nodes may consume every permitted attempt in every iteration.
+        // Control nodes do not dispatch attempts. Use a wide budget so the supported
+        // iteration range cannot overflow or introduce another hidden ceiling.
+        request.limits.node_execution_cap =
+            u64::from(input.max_iterations) * 2 * (u64::from(request.limits.retry_cap) + 1);
+        Ok(request)
     }
 
     fn begin_replace_cancel(&mut self, host: &dyn PluginTuiHost) {
@@ -1218,7 +1224,6 @@ impl ReferenceWorkflowState {
             || self.stop_condition.len() > MAX_PROMPT_BYTES
             || self.iteration == 0
             || self.iteration > self.iteration_limit
-            || self.iteration_limit > u32::try_from(HARD_MAX_ITERATIONS).unwrap_or(u32::MAX)
         {
             return Err("reference workflow state is invalid or unbounded".to_string());
         }
@@ -1251,12 +1256,14 @@ impl LoopWorkflowInput {
                 "loop prompts must not exceed {MAX_PROMPT_BYTES} bytes"
             ));
         }
-        let max_iterations = u32::try_from(max_iterations)
-            .map_err(|_| "maximum iterations exceed the workflow limit".to_string())?;
-        if !(1..=u32::try_from(HARD_MAX_ITERATIONS).unwrap_or(u32::MAX)).contains(&max_iterations) {
-            return Err(format!(
-                "maximum iterations must be 1..={HARD_MAX_ITERATIONS}"
-            ));
+        let max_iterations = u32::try_from(max_iterations).map_err(|_| {
+            format!(
+                "maximum iterations exceed the supported integer range (1..={})",
+                u32::MAX
+            )
+        })?;
+        if max_iterations == 0 {
+            return Err("maximum iterations must be greater than zero".to_string());
         }
         Ok(Self {
             implementation_prompt,
@@ -2211,6 +2218,34 @@ mod tests {
             bcode_ipc::decode_request(&encoded).expect("decode loop start request"),
             ipc_request
         );
+    }
+
+    #[test]
+    fn requested_iteration_count_controls_all_loop_budgets() {
+        for iterations in [200, 1_001, u32::MAX] {
+            let mut surface = LoopSurface::new(Some(SessionId::new()));
+            surface.prompt = text_state("implement");
+            surface.condition = text_state("done");
+            surface.limit = text_state(&iterations.to_string());
+            let request = surface
+                .build_start_request(surface.session_id.unwrap())
+                .expect("start request");
+            assert_eq!(request.input["max_iterations"], iterations);
+            assert_eq!(
+                request.definition.nodes["loop.repeat"].configuration["max_iterations"],
+                iterations
+            );
+            assert_eq!(request.limits.cycle_cap, iterations);
+            assert_eq!(request.limits.node_execution_cap, u64::from(iterations) * 8);
+            let encoded = serde_json::to_vec(&request).expect("encode");
+            assert_eq!(
+                serde_json::from_slice::<PluginWorkflowStartRequest>(&encoded).expect("decode"),
+                request
+            );
+        }
+        for iterations in [0, u64::from(u32::MAX) + 1] {
+            assert!(LoopWorkflowInput::new("implement".into(), "done".into(), iterations).is_err());
+        }
     }
 
     #[tokio::test]

@@ -28,6 +28,23 @@ remain authoritative.
 Use typed workflow composition for domain behavior and let the host own durable registration,
 execution, discovery, and lifecycle state.
 
+## Loop iteration budgets
+
+Plugin start requests carry renderer-neutral `WorkflowRunLimitPolicy` values; adapters must
+preserve these rather than replacing them with host defaults. `/loop` sets the cycle budget to
+the user's positive `max_iterations` and derives its node-attempt budget from both agent nodes
+and the permitted attempts per activation. There is no separate 100-cycle or 1,000-iteration
+ceiling. The iteration contract supports `1..=u32::MAX`; out-of-range input is rejected explicitly.
+Node-attempt budgets use 64-bit integers (within SQLite's signed integer range), so supporting
+the full iteration range does not overflow a smaller execution budget. Existing stored integer
+budgets retain their values and semantics; existing runs are not rewritten. Older clients that
+cannot represent a wider budget reject it rather than truncate it. Native plugin ABI version 4
+covers the changed workflow-start request layout and widened budget type; ABI-3 binaries are
+rejected. Rebuild native plugins with the matching SDK when updating the host.
+
+Stop conditions, explicit cancellation, retry limits, per-agent timeouts, and execution ownership
+checks still apply. These changes affect newly started loops, not budgets of already-running ones.
+
 ```rust
 let workflow = WorkflowBuilder::new(
     "review",

@@ -68,7 +68,7 @@ fn workflow_start_request(
             display_label: request.binding.display_label,
             single_active: request.binding.single_active,
         },
-        limits: bcode_workflow_store::WorkflowRunLimits::default(),
+        limits: workflow_run_limits(&request.limits),
     })
 }
 
@@ -1379,8 +1379,9 @@ pub fn subscribe_workflow_views(
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginWorkflowPackageExportStartRequest, SessionId, workflow_catalog_selection,
-        workflow_event_refreshes_selected_detail, workflow_package_export_start_request,
+        PluginWorkflowPackageExportStartRequest, PluginWorkflowStartRequest, SessionId,
+        workflow_catalog_selection, workflow_event_refreshes_selected_detail,
+        workflow_package_export_start_request, workflow_run_limits, workflow_start_request,
     };
 
     #[test]
@@ -1399,6 +1400,40 @@ mod tests {
     fn plugin_surface_host_source_uses_bmux_redraw_latch() {
         let source = include_str!("plugin_surface_host.rs");
         assert!(source.contains("InvalidationSignal"));
+    }
+
+    #[test]
+    fn plugin_surface_host_preserves_requested_workflow_limits() {
+        let session_id = SessionId::new();
+        let workflow = bcode_workflow::WorkflowBuilder::new(
+            "budget-test",
+            bcode_workflow::Step::task("body", |value: bool, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow");
+        let spec = bcode_workflow::WorkflowSpec::new("budget-test", &workflow).expect("spec");
+        let mut request = PluginWorkflowStartRequest::typed(
+            &spec,
+            &false,
+            session_id,
+            bcode_plugin_sdk::tui::PluginWorkflowBinding {
+                owner_plugin_id: "test".to_string(),
+                workflow_kind: "budget-test".to_string(),
+                scope_key: session_id.to_string(),
+                display_label: None,
+                single_active: true,
+            },
+            None,
+        )
+        .expect("request");
+        request.limits.cycle_cap = u32::MAX;
+        request.limits.node_execution_cap = u64::from(u32::MAX) * 8;
+        let expected = workflow_run_limits(&request.limits);
+        let adapted = workflow_start_request(request).expect("adapt");
+        assert_eq!(adapted.limits, expected);
+        let wire = bcode_ipc::Request::StartWorkflow(adapted);
+        let encoded = bcode_ipc::encode_request(&wire).expect("encode");
+        assert_eq!(bcode_ipc::decode_request(&encoded).expect("decode"), wire);
     }
 
     #[test]

@@ -8,7 +8,7 @@ interface_id = "bcode.prompt-profile/v1"
 name         = "Prompt Profiles"
 
 [runtime]
-abi_version  = 3
+abi_version  = 4
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_prompt_profile_plugin.dylib"
 type         = "native"

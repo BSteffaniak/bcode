@@ -18,7 +18,7 @@ section    = "plugin.bcode.tantivy-session-search"
 type = "concurrent"
 
 [runtime]
-abi_version  = 3
+abi_version  = 4
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_tantivy_session_search_plugin.dylib"
 type         = "native"

@@ -3001,7 +3001,7 @@ pub struct WorkflowRunLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_duration_ms: Option<u64>,
     /// Maximum total node attempts in a run.
-    pub node_execution_cap: u32,
+    pub node_execution_cap: u64,
     /// Maximum concurrently running nodes.
     pub concurrency_cap: u32,
     /// Maximum cycle/repeat activations.
@@ -3026,10 +3026,11 @@ impl WorkflowRunLimitPolicy {
     fn validate(&self) -> Result<(), WorkflowError> {
         if self.maximum_duration_ms == Some(0)
             || self.node_execution_cap == 0
+            || self.node_execution_cap > i64::MAX as u64
             || self.concurrency_cap == 0
             || self.cycle_cap == 0
             || self.retry_cap == 0
-            || self.concurrency_cap > self.node_execution_cap
+            || u64::from(self.concurrency_cap) > self.node_execution_cap
         {
             return Err(authoring_error(
                 "run_limits",
@@ -7971,7 +7972,7 @@ fn validate_structured_source_fan_out(
     ] {
         validate_runtime_value_schema(&format!("steps[{index}].fan_out.{suffix}"), schema)?;
     }
-    let members_fit_run = fan_out.max_members <= limits.node_execution_cap;
+    let members_fit_run = u64::from(fan_out.max_members) <= limits.node_execution_cap;
     let concurrency_fits_run = fan_out.max_concurrency <= limits.concurrency_cap;
     if fan_out.max_members == 0
         || !members_fit_run
@@ -9569,7 +9570,7 @@ fn apply_authoring_binding(
             })?;
             match field.as_str() {
                 "maximum_duration_ms" => run_limits.maximum_duration_ms = Some(value),
-                "node_execution_cap" => run_limits.node_execution_cap = bounded_u32(field, value)?,
+                "node_execution_cap" => run_limits.node_execution_cap = value,
                 "concurrency_cap" => run_limits.concurrency_cap = bounded_u32(field, value)?,
                 "cycle_cap" => run_limits.cycle_cap = bounded_u32(field, value)?,
                 "retry_cap" => run_limits.retry_cap = bounded_u32(field, value)?,

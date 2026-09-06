@@ -30,7 +30,7 @@ title       = "Workflow Status"
 type = "exclusive"
 
 [runtime]
-abi_version  = 3
+abi_version  = 4
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_workflow_plugin.dylib"
 type         = "native"

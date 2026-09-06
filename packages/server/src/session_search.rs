@@ -2774,7 +2774,7 @@ pub(crate) mod tests {
         "[runtime]\n",
         "type = \"native\"\n",
         "library = \"libsession_search_integration_provider.dylib\"\n",
-        "abi_version = 3\n",
+        "abi_version = 4\n",
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const SLOW_PROVIDER_MANIFEST: &str = concat!(
@@ -2789,7 +2789,7 @@ pub(crate) mod tests {
         "[runtime]\n",
         "type = \"native\"\n",
         "library = \"libsession_search_integration_provider.dylib\"\n",
-        "abi_version = 3\n",
+        "abi_version = 4\n",
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const MALFORMED_PROVIDER_MANIFEST: &str = concat!(
@@ -2804,7 +2804,7 @@ pub(crate) mod tests {
         "[runtime]\n",
         "type = \"native\"\n",
         "library = \"libsession_search_integration_provider.dylib\"\n",
-        "abi_version = 3\n",
+        "abi_version = 4\n",
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const FAST_SEQUENCE: u64 = 11;
@@ -2829,7 +2829,7 @@ pub(crate) mod tests {
         "[runtime]\n",
         "type = \"native\"\n",
         "library = \"libsession_search_future_provider.dylib\"\n",
-        "abi_version = 3\n",
+        "abi_version = 4\n",
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const FUTURE_CAPABILITY_PROVIDER_MANIFEST: &str = concat!(
@@ -2844,7 +2844,7 @@ pub(crate) mod tests {
         "[runtime]\n",
         "type = \"native\"\n",
         "library = \"libsession_search_future_capability_provider.dylib\"\n",
-        "abi_version = 3\n",
+        "abi_version = 4\n",
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const CRASH_PROVIDER_MANIFEST: &str = concat!(
@@ -2859,7 +2859,7 @@ pub(crate) mod tests {
         "[runtime]\n",
         "type = \"native\"\n",
         "library = \"libsession_search_crash_provider.dylib\"\n",
-        "abi_version = 3\n",
+        "abi_version = 4\n",
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
 
@@ -2875,7 +2875,7 @@ pub(crate) mod tests {
         "[runtime]\n",
         "type = \"native\"\n",
         "library = \"libsession_search_unavailable_provider.dylib\"\n",
-        "abi_version = 3\n",
+        "abi_version = 4\n",
         "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
 

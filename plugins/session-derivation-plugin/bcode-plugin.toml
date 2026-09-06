@@ -16,7 +16,7 @@ kind        = "session-derivation.fork-select"
 title       = "Fork Session"
 
 [runtime]
-abi_version  = 3
+abi_version  = 4
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_session_derivation_plugin.dylib"
 type         = "native"

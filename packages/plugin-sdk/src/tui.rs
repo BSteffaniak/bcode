@@ -468,6 +468,9 @@ pub struct PluginWorkflowStartRequest {
     pub parent_session_id: SessionId,
     pub input: serde_json::Value,
     pub binding: PluginWorkflowBinding,
+    /// Plugin-owned execution budgets, preserved by frontend adapters.
+    #[serde(default)]
+    pub limits: bcode_workflow::WorkflowRunLimitPolicy,
 }
 
 impl PluginWorkflowStartRequest {
@@ -493,6 +496,7 @@ impl PluginWorkflowStartRequest {
             parent_session_id,
             input: spec.serialize_input(input)?,
             binding,
+            limits: bcode_workflow::WorkflowRunLimitPolicy::default(),
         })
     }
 }
