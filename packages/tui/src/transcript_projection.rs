@@ -99,73 +99,82 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);
     let transcript_dirty_items = app.drain_transcript_dirty_items();
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
-    let input = TranscriptLayoutInput::from_app(app, width);
-    let fingerprint = input.fingerprint();
-    let structural_fingerprint = input.structural_fingerprint();
-    if transcript_layout.is_current(&fingerprint) {
-        transcript_layout
-            .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
-        *app.transcript_layout_mut() = transcript_layout;
-        return;
-    }
-    if !transcript_dirty_items.is_empty()
-        && transcript_layout.structure_is_current(&structural_fingerprint)
     {
-        transcript_layout.sync_transcript_entries(
+        let input = TranscriptLayoutInput::from_app(app, width);
+        let fingerprint = input.fingerprint();
+        let structural_fingerprint = input.structural_fingerprint();
+        if transcript_layout.is_current(&fingerprint) {
+            transcript_layout
+                .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            *app.transcript_layout_mut() = transcript_layout;
+            return;
+        }
+        if !transcript_dirty_items.is_empty()
+            && transcript_layout.structure_is_current(&structural_fingerprint)
+        {
+            transcript_layout.sync_transcript_entries(
+                fingerprint,
+                &transcript_dirty_items,
+                |index| transcript_item_signature(&input.transcript[index], &input),
+                |index| transcript_item_rows(app, &input.transcript[index], &input),
+            );
+            *app.transcript_layout_mut() = transcript_layout;
+            return;
+        }
+        let mut dirty_visuals =
+            input
+                .plugin_host
+                .map_or_else(std::collections::BTreeSet::new, |host| {
+                    host.drain_dirty_visuals_bounded(
+                        MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC
+                            .saturating_sub(elapsed_dirty_visuals.len()),
+                    )
+                });
+        dirty_visuals.extend(elapsed_dirty_visuals);
+        if !dirty_visuals.is_empty()
+            && transcript_layout.structure_is_current(&structural_fingerprint)
+        {
+            transcript_layout.sync_visuals(
+                fingerprint,
+                &dirty_visuals,
+                |index| transcript_item_signature(&input.transcript[index], &input),
+                |index| transcript_item_rows(app, &input.transcript[index], &input),
+            );
+            *app.transcript_layout_mut() = transcript_layout;
+            return;
+        }
+        transcript_layout.sync(TranscriptLayoutSpec {
+            width,
             fingerprint,
-            &transcript_dirty_items,
-            |index| transcript_item_signature(&input.transcript[index], &input),
-            |index| transcript_item_rows(app, &input.transcript[index], &input),
-        );
-        *app.transcript_layout_mut() = transcript_layout;
-        return;
+            structural_fingerprint,
+            transcript_len: input.transcript.len(),
+            pending_len: input.pending.len(),
+            transcript_signature: |index| {
+                transcript_item_signature(&input.transcript[index], &input)
+            },
+            transcript_rows: |index| transcript_item_rows(app, &input.transcript[index], &input),
+            transcript_invocation_id: |index: usize| {
+                input.transcript[index]
+                    .visual_invocation_id()
+                    .map(ToOwned::to_owned)
+            },
+            pending_signature: |index| {
+                render::pending_submission_signature(&input.pending[index], width)
+            },
+            pending_rows: |index| {
+                render::pending_submission_rows(&input.pending[index], width).into()
+            },
+            history_banner_signature: || {
+                render::history_banner_text(input.has_older_history, input.loading_older_history)
+                    .map(|text| TranscriptLayoutSignature::new(format!("history:{width}:{text}")))
+            },
+            history_banner_rows: || {
+                render::history_banner_rows(input.has_older_history, input.loading_older_history)
+                    .into()
+            },
+            reset: || false,
+        });
     }
-    let mut dirty_visuals =
-        input
-            .plugin_host
-            .map_or_else(std::collections::BTreeSet::new, |host| {
-                host.drain_dirty_visuals_bounded(
-                    MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC.saturating_sub(elapsed_dirty_visuals.len()),
-                )
-            });
-    dirty_visuals.extend(elapsed_dirty_visuals);
-    if !dirty_visuals.is_empty() && transcript_layout.structure_is_current(&structural_fingerprint)
-    {
-        transcript_layout.sync_visuals(
-            fingerprint,
-            &dirty_visuals,
-            |index| transcript_item_signature(&input.transcript[index], &input),
-            |index| transcript_item_rows(app, &input.transcript[index], &input),
-        );
-        *app.transcript_layout_mut() = transcript_layout;
-        return;
-    }
-    transcript_layout.sync(TranscriptLayoutSpec {
-        width,
-        fingerprint,
-        structural_fingerprint,
-        transcript_len: input.transcript.len(),
-        pending_len: input.pending.len(),
-        transcript_signature: |index| transcript_item_signature(&input.transcript[index], &input),
-        transcript_rows: |index| transcript_item_rows(app, &input.transcript[index], &input),
-        transcript_invocation_id: |index: usize| {
-            input.transcript[index]
-                .visual_invocation_id()
-                .map(ToOwned::to_owned)
-        },
-        pending_signature: |index| {
-            render::pending_submission_signature(&input.pending[index], width)
-        },
-        pending_rows: |index| render::pending_submission_rows(&input.pending[index], width).into(),
-        history_banner_signature: || {
-            render::history_banner_text(input.has_older_history, input.loading_older_history)
-                .map(|text| TranscriptLayoutSignature::new(format!("history:{width}:{text}")))
-        },
-        history_banner_rows: || {
-            render::history_banner_rows(input.has_older_history, input.loading_older_history).into()
-        },
-        reset: || false,
-    });
     *app.transcript_layout_mut() = transcript_layout;
 }
 

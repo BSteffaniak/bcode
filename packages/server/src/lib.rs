@@ -2107,8 +2107,12 @@ impl ServerState {
         {
             return;
         }
+        let mut shutdown = self.subscribe_shutdown();
         let state = Arc::clone(self);
         tokio::spawn(async move {
+            if state.shutdown_requested.load(Ordering::SeqCst) {
+                return;
+            }
             let mut after_sequence = state
                 .workflow_store
                 .lock()
@@ -2117,11 +2121,11 @@ impl ServerState {
                 .unwrap_or(0);
             let mut interval = tokio::time::interval(Duration::from_millis(50));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut shutdown = state.subscribe_shutdown();
             loop {
                 tokio::select! {
-                    _ = interval.tick() => {}
+                    biased;
                     _ = shutdown.recv() => break,
+                    _ = interval.tick() => {}
                 }
                 loop {
                     let page = state
@@ -2168,23 +2172,42 @@ impl ServerState {
         {
             return;
         }
+        let mut shutdown = self.subscribe_shutdown();
+        let mut revisions = self.session_catalog.subscribe();
         let state = Arc::clone(self);
         tokio::spawn(async move {
-            let mut revisions = state.session_catalog.subscribe();
             loop {
-                if revisions.changed().await.is_err() {
+                if state.shutdown_requested.load(Ordering::SeqCst) {
                     break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    result = revisions.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                    }
                 }
                 let revision = *revisions.borrow_and_update();
                 broadcast_catalog_update(&state, revision).await;
             }
         });
 
+        let mut shutdown = self.subscribe_shutdown();
+        let mut mutations = self.sessions.subscribe_mutations();
         let state = Arc::clone(self);
         tokio::spawn(async move {
-            let mut mutations = state.sessions.subscribe_mutations();
             loop {
-                match mutations.recv().await {
+                if state.shutdown_requested.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mutation = tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    mutation = mutations.recv() => mutation,
+                };
+                match mutation {
                     Ok(mutation) => {
                         let session_id = mutation.session_id;
                         state
@@ -2227,6 +2250,9 @@ impl ServerState {
 
         let state = Arc::clone(self);
         tokio::spawn(async move {
+            if state.shutdown_requested.load(Ordering::SeqCst) {
+                return;
+            }
             match state.sessions.backfill_catalog().await {
                 Ok(summaries) => {
                     for summary in summaries {
@@ -2252,16 +2278,20 @@ impl ServerState {
         {
             return;
         }
+        let mut shutdown = self.subscribe_shutdown();
         let state = Arc::clone(self);
         tokio::spawn(async move {
+            if state.shutdown_requested.load(Ordering::SeqCst) {
+                return;
+            }
             let mut idle_since: Option<Instant> = None;
             let mut last_blocker: Option<String> = None;
             let check_interval = idle_after.min(Duration::from_secs(30));
-            let mut shutdown = state.subscribe_shutdown();
             loop {
                 tokio::select! {
-                    () = tokio::time::sleep(check_interval) => {}
+                    biased;
                     _ = shutdown.recv() => break,
+                    () = tokio::time::sleep(check_interval) => {}
                 }
                 if let Some(blocker) = state.idle_shutdown_blocker().await {
                     if idle_since.take().is_some() {
@@ -3536,6 +3566,7 @@ async fn run_with_config(
             model_catalog,
             plugin_selection,
             default_plugin_ids,
+            shutdown: bcode_agent_runtime::CancellationToken::new(),
         },
     )
     .await
@@ -3562,6 +3593,36 @@ pub async fn run_embedded_with_services(
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     default_plugin_ids: Vec<String>,
 ) -> Result<(), ServerError> {
+    Box::pin(run_embedded_with_services_and_shutdown(
+        endpoint,
+        config,
+        plugins,
+        model_catalog,
+        default_plugin_ids,
+        bcode_agent_runtime::CancellationToken::new(),
+    ))
+    .await
+}
+
+/// Run an embedded server with a caller-owned graceful shutdown signal.
+///
+/// Uses the same services and cleanup as [`run_embedded_with_services`]. Cancellation
+/// is observed at startup checkpoints and while accepting clients; it does not
+/// interrupt acquisition, an in-flight recovery operation, or admitted requests. Keep polling this future
+/// until it returns to allow cleanup to finish. Dropping it is not graceful shutdown.
+/// Storage, IPC, clocks, and scheduling remain native.
+///
+/// # Errors
+///
+/// Returns initialization, client handling, or shutdown failures.
+pub async fn run_embedded_with_services_and_shutdown(
+    endpoint: IpcEndpoint,
+    config: bcode_config::BcodeConfig,
+    plugins: bcode_plugin::PluginRuntimeHost,
+    model_catalog: bcode_model_catalog::ModelCatalogResolver,
+    default_plugin_ids: Vec<String>,
+    shutdown: bcode_agent_runtime::CancellationToken,
+) -> Result<(), ServerError> {
     let plugin_selection = plugins.selection().clone();
     run_with_services(
         endpoint,
@@ -3573,6 +3634,7 @@ pub async fn run_embedded_with_services(
             model_catalog,
             plugin_selection,
             default_plugin_ids,
+            shutdown,
         },
     )
     .await
@@ -3587,6 +3649,7 @@ struct ServerStartupServices {
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
+    shutdown: bcode_agent_runtime::CancellationToken,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3602,6 +3665,7 @@ async fn run_with_services(
         model_catalog,
         plugin_selection,
         default_plugin_ids,
+        shutdown: host_shutdown,
     } = services;
     let mut stage_started_at = Instant::now();
     let startup_resources = (|| {
@@ -3793,6 +3857,7 @@ async fn run_with_services(
         &config.daemon,
         config.session_search.enabled,
         &configured_agent_ids,
+        host_shutdown,
     )
     .await
 }
@@ -3804,8 +3869,9 @@ async fn run_constructed_server(
     daemon: &bcode_config::DaemonConfig,
     session_search_enabled: bool,
     configured_agent_ids: &[String],
+    host_shutdown: bcode_agent_runtime::CancellationToken,
 ) -> Result<(), ServerError> {
-    if state.shutdown_requested.load(Ordering::SeqCst) {
+    if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
     }
@@ -3818,12 +3884,12 @@ async fn run_constructed_server(
     interrupt_stale_ralph_runs_best_effort(&state);
     let workflow_recovery_started_at = Instant::now();
     restore_workflow_runtime_work(&state).await;
-    if state.shutdown_requested.load(Ordering::SeqCst) {
+    if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
     }
     settle_restored_quiescent_workflow_runtime_work(&state).await;
-    if state.shutdown_requested.load(Ordering::SeqCst) {
+    if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
     }
@@ -3869,7 +3935,7 @@ async fn run_constructed_server(
         )
         .unwrap_or(i64::MAX),
     );
-    if state.shutdown_requested.load(Ordering::SeqCst) {
+    if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
     }
@@ -3887,6 +3953,7 @@ async fn run_constructed_server(
     let accept_result = loop {
         tokio::select! {
             biased;
+            () = host_shutdown.cancelled() => break Ok(()),
             _ = shutdown.recv() => break Ok(()),
             completed = clients.join_next(), if !clients.is_empty() => {
                 if let Some(Err(error)) = completed {
@@ -3926,10 +3993,12 @@ async fn start_catalog_refresh(state: &ServerState) {
             tracing::warn!(%error, "catalog refresh task failed");
         }
     }
+    // Subscribe before checking the latch so shutdown cannot fall between the
+    // admission check and subscription, leaving refresh work waiting on a lost signal.
+    let mut shutdown = state.subscribe_shutdown();
     if !state.shutdown_requested.load(Ordering::SeqCst)
         && let Some(refresh) = state.model_catalog.prepare_refresh_if_stale()
     {
-        let mut shutdown = state.subscribe_shutdown();
         tasks.spawn(async move {
             tokio::select! {
                 biased;
@@ -69546,38 +69615,74 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    async fn constructed_server_shutdown_drains_idle_clients() {
-        let state = Arc::new(test_server_state(SessionManager::default()));
-        let socket_dir = tempfile::tempdir().expect("socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("drain.sock"));
-        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
-        let server_state = Arc::clone(&state);
-        let server = tokio::spawn(async move {
-            run_constructed_server(
-                server_state,
-                listener,
-                &bcode_config::DaemonConfig::default(),
-                false,
-                &[],
-            )
-            .await
-        });
-        let connection = LocalIpcStream::connect(&endpoint).await.expect("connect");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while state.clients.lock().await.is_empty() {
-                tokio::task::yield_now().await;
+    async fn shutdown_before_first_poll_releases_background_state() {
+        for shutdown_before_spawn in [false, true] {
+            let state = Arc::new(test_server_state(SessionManager::default()));
+            let weak = Arc::downgrade(&state);
+            if shutdown_before_spawn {
+                state.request_shutdown();
             }
-        })
-        .await
-        .expect("client registered");
-        state.request_shutdown();
-        tokio::time::timeout(Duration::from_secs(5), server)
+            state.start_workflow_event_forwarder();
+            state.start_catalog_event_forwarder();
+            state.start_idle_shutdown_watcher(Duration::from_secs(30));
+            // On the current-thread runtime neither spawned task has polled yet.
+            state.request_shutdown();
+            drop(state);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.strong_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .expect("server shutdown")
-            .expect("server task")
-            .expect("server cleanup");
-        assert!(state.clients.lock().await.is_empty());
-        drop(connection);
+            .expect("background tasks release state after shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn constructed_server_shutdown_drains_idle_clients() {
+        for cancel_from_host in [false, true] {
+            let state = Arc::new(test_server_state(SessionManager::default()));
+            let socket_dir = tempfile::tempdir().expect("socket directory");
+            let endpoint =
+                bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("drain.sock"));
+            let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+            let server_state = Arc::clone(&state);
+            let host_shutdown = bcode_agent_runtime::CancellationToken::new();
+            let shutdown_signal = host_shutdown.clone();
+            let server = tokio::spawn(async move {
+                run_constructed_server(
+                    server_state,
+                    listener,
+                    &bcode_config::DaemonConfig::default(),
+                    false,
+                    &[],
+                    host_shutdown,
+                )
+                .await
+            });
+            let connection = LocalIpcStream::connect(&endpoint).await.expect("connect");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.clients.lock().await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("client registered");
+            if cancel_from_host {
+                shutdown_signal.cancel();
+            } else {
+                state.request_shutdown();
+            }
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("server shutdown")
+                .expect("server task")
+                .expect("server cleanup");
+            assert!(state.clients.lock().await.is_empty());
+            assert!(state.shutdown_requested.load(Ordering::SeqCst));
+            assert!(LocalIpcStream::connect(&endpoint).await.is_err());
+            drop(connection);
+        }
     }
 
     #[tokio::test]
@@ -69675,31 +69780,42 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn constructed_server_shutdown_before_start_does_not_launch_forwarders() {
-        let state = Arc::new(test_server_state(SessionManager::default()));
-        let socket_dir = tempfile::tempdir().expect("socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("stopped.sock"));
-        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
-        state.request_shutdown();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            run_constructed_server(
-                Arc::clone(&state),
-                listener,
-                &bcode_config::DaemonConfig::default(),
-                false,
-                &[],
-            ),
-        )
-        .await
-        .expect("pre-start shutdown")
-        .expect("server cleanup");
-        assert!(!state.catalog_events_started.load(Ordering::SeqCst));
-        assert!(
-            !state
-                .workflow_event_forwarder_started
-                .load(Ordering::SeqCst)
-        );
-        assert!(!state.idle_shutdown_started.load(Ordering::SeqCst));
+        for cancel_from_host in [false, true] {
+            let state = Arc::new(test_server_state(SessionManager::default()));
+            let socket_dir = tempfile::tempdir().expect("socket directory");
+            let endpoint =
+                bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("stopped.sock"));
+            let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+            let host_shutdown = bcode_agent_runtime::CancellationToken::new();
+            if cancel_from_host {
+                host_shutdown.cancel();
+            } else {
+                state.request_shutdown();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                run_constructed_server(
+                    Arc::clone(&state),
+                    listener,
+                    &bcode_config::DaemonConfig::default(),
+                    false,
+                    &[],
+                    host_shutdown,
+                ),
+            )
+            .await
+            .expect("pre-start shutdown")
+            .expect("server cleanup");
+            assert!(!state.catalog_events_started.load(Ordering::SeqCst));
+            assert!(
+                !state
+                    .workflow_event_forwarder_started
+                    .load(Ordering::SeqCst)
+            );
+            assert!(!state.idle_shutdown_started.load(Ordering::SeqCst));
+            assert!(state.shutdown_requested.load(Ordering::SeqCst));
+            assert!(LocalIpcStream::connect(&endpoint).await.is_err());
+        }
     }
 
     #[tokio::test]
