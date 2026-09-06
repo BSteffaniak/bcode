@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use thiserror::Error;
 
+mod run_graph;
+pub use run_graph::{RunGraphEdge, RunGraphNode};
+
 const DATABASE_FILE: &str = "workflow.db";
 const LOCK_FILE: &str = "workflow.lock";
 const ARTIFACT_DIRECTORY: &str = "artifacts";
@@ -35,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 16;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1589,17 +1592,29 @@ impl WorkflowStore {
         })
     }
 
-    /// Explicitly migrate the immediately preceding workflow schema without discarding canonical
-    /// workflow state.
+    /// Explicitly migrate supported historical workflow schemas, preserving canonical state.
     ///
-    /// This offline operation acquires exclusive workflow-store ownership, creates and verifies a
-    /// `SQLite` backup, adds the version-15 execution-authority columns, advances the contract, and
-    /// records a bounded receipt. Existing rows remain byte-for-byte represented except for the
-    /// new nullable authority fields and schema contract version.
+    /// Acquires exclusive store ownership and verifies a backup before adding authority columns
+    /// where needed and materializing initial run graphs. Integrity is checked before commit.
+    /// Normal reads never invoke this operation.
     ///
     /// # Errors
+    /// Returns an error for unavailable ownership, unsupported source schemas, inconsistent
+    /// canonical state, backup failure, or database failure.
+    pub fn migrate_to_current_in_state_dir(
+        state_dir: &Path,
+        migrated_at_ms: u64,
+    ) -> Result<WorkflowStoreMigrationReceipt, WorkflowStoreError> {
+        Self::migrate_schema_14_to_current_in_state_dir(state_dir, migrated_at_ms)
+    }
+
+    /// Compatibility entry point for explicit migration from schema 14 or 15 to the current schema.
     ///
-    /// Returns an error when ownership is unavailable, the source schema is not 14, backup or
+    /// Prefer [`Self::migrate_to_current_in_state_dir`]. Existing state is preserved; initial
+    /// run-owned graphs are materialized and schema-14 authority columns are added when needed.
+    ///
+    /// # Errors
+    /// Returns an error when ownership is unavailable, the source schema is unsupported, backup or
     /// integrity verification fails, or migration cannot commit atomically.
     pub fn migrate_schema_14_to_current_in_state_dir(
         state_dir: &Path,
@@ -1633,9 +1648,9 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if previous_schema_version != 14 {
+        if !matches!(previous_schema_version, 14 | 15) {
             return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow store migration supports only schema 14, found {previous_schema_version}"
+                "workflow store migration supports schemas 14 and 15, found {previous_schema_version}"
             )));
         }
         source.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
@@ -1656,22 +1671,22 @@ impl WorkflowStore {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        transaction.execute_batch(
-            "ALTER TABLE workflow_runs ADD COLUMN target_artifact_id TEXT;\
-             ALTER TABLE workflow_runs ADD COLUMN coordinator_daemon_instance_id TEXT;\
-             ALTER TABLE workflow_runs ADD COLUMN coordinator_generation INTEGER;\
-             ALTER TABLE workflow_runs ADD COLUMN coordinator_fencing_token TEXT;\
-             UPDATE workflow_store_contract SET schema_version = 15 WHERE contract_id = 1 AND schema_version = 14;",
-        )?;
-        transaction.commit()?;
-        verify_store_schema(&connection)?;
-        let integrity =
-            connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
-        if integrity != "ok" {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow migration integrity verification failed: {integrity}"
-            )));
+        if previous_schema_version == 14 {
+            transaction.execute_batch(
+                "ALTER TABLE workflow_runs ADD COLUMN target_artifact_id TEXT;\
+                 ALTER TABLE workflow_runs ADD COLUMN coordinator_daemon_instance_id TEXT;\
+                 ALTER TABLE workflow_runs ADD COLUMN coordinator_generation INTEGER;\
+                 ALTER TABLE workflow_runs ADD COLUMN coordinator_fencing_token TEXT;",
+            )?;
         }
+        run_graph::migrate(&transaction)?;
+        transaction.execute(
+            "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
+            [WORKFLOW_STORE_SCHEMA_VERSION],
+        )?;
+        verify_store_schema(&transaction)?;
+        verify_migration_integrity(&transaction)?;
+        transaction.commit()?;
         drop(connection);
         let receipt = WorkflowStoreMigrationReceipt {
             version: WORKFLOW_STORE_MIGRATION_RECEIPT_VERSION,
@@ -13169,6 +13184,7 @@ fn create_run_in_transaction(
             run.created_at_ms,
         ],
     )?;
+    run_graph::materialize(transaction, &run.run_id, &definition)?;
     append_event(
         transaction,
         &run.run_id,
@@ -14132,6 +14148,25 @@ fn decode_workflow_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowP
     })
 }
 
+/// Verify migrated canonical state before committing schema changes.
+fn verify_migration_integrity(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    let integrity =
+        connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+    if integrity != "ok" {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow migration integrity verification failed: {integrity}"
+        )));
+    }
+    let foreign_key_violation = connection.prepare("PRAGMA foreign_key_check")?.exists([])?;
+    if foreign_key_violation {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow migration foreign-key verification failed; canonical relationships are inconsistent"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
     let transaction = connection.transaction()?;
@@ -14451,6 +14486,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
          CREATE INDEX IF NOT EXISTS idx_workflow_authoring_events_identity \
              ON workflow_authoring_events(workflow_id, event_seq);",
     )?;
+    run_graph::initialize(&transaction)?;
     transaction.execute(
         "INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, ?1)",
         [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -18206,7 +18242,10 @@ mod tests {
         let connection = Connection::open(&path).expect("schema 15");
         connection
             .execute_batch(
-                "ALTER TABLE workflow_runs DROP COLUMN target_artifact_id;\
+                "DROP TABLE workflow_run_graph_edges;\
+                 DROP TABLE workflow_run_graph_nodes;\
+                 DROP TABLE workflow_run_graphs;\
+                 ALTER TABLE workflow_runs DROP COLUMN target_artifact_id;\
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_daemon_instance_id;\
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_generation;\
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_fencing_token;\
@@ -18226,6 +18265,313 @@ mod tests {
         assert_eq!(
             reopened.execution_authority("run-1").expect("authority"),
             None
+        );
+    }
+
+    #[test]
+    fn schema_migration_rolls_back_when_canonical_relationships_are_damaged() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let path = store.path().to_path_buf();
+        drop(store);
+        let connection = Connection::open(&path).expect("fixture");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;\
+                 DROP TABLE workflow_run_graph_edges;\
+                 DROP TABLE workflow_run_graph_nodes;\
+                 DROP TABLE workflow_run_graphs;\
+                 DELETE FROM workflow_definitions;\
+                 ALTER TABLE workflow_runs DROP COLUMN target_artifact_id;\
+                 ALTER TABLE workflow_runs DROP COLUMN coordinator_daemon_instance_id;\
+                 ALTER TABLE workflow_runs DROP COLUMN coordinator_generation;\
+                 ALTER TABLE workflow_runs DROP COLUMN coordinator_fencing_token;\
+                 UPDATE workflow_store_contract SET schema_version = 14 WHERE contract_id = 1;",
+            )
+            .expect("damaged historical fixture");
+        drop(connection);
+
+        let error = WorkflowStore::migrate_schema_14_to_current_in_state_dir(temp.path(), 31)
+            .expect_err("damaged relationships must not be committed");
+        assert!(
+            error
+                .to_string()
+                .contains("foreign-key verification failed")
+        );
+        let connection = Connection::open(&path).expect("preserved source");
+        assert_eq!(detected_store_schema(&connection), Some(14));
+        assert!(
+            connection
+                .prepare("SELECT target_artifact_id FROM workflow_runs")
+                .is_err(),
+            "schema additions must roll back with the contract version"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM workflow_runs", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .expect("preserved runs"),
+            1
+        );
+        let root = path.parent().expect("workflow root");
+        assert!(
+            root.join(MIGRATION_BACKUP_DIRECTORY)
+                .join("workflow-31.db")
+                .is_file()
+        );
+        assert!(!root.join(MIGRATION_RECEIPT_FILE).exists());
+        assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
+        assert_eq!(detected_store_schema(&connection), Some(14));
+    }
+
+    #[test]
+    fn initial_run_graph_is_atomic_paged_and_preserved_by_migration() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let plan = definition("example");
+        store
+            .persist_definition("example", 1, &plan)
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        assert_eq!(
+            store.run_graph_revision("run-1").expect("revision"),
+            Some(1)
+        );
+        let mut after = None;
+        let mut actual = Vec::new();
+        loop {
+            let page = store
+                .run_graph_nodes("run-1", after.as_deref(), 1)
+                .expect("page");
+            let Some(node) = page.first() else { break };
+            assert_eq!(node.revision, 1);
+            assert_eq!(node.entry, plan.entries.contains(&node.node.id));
+            assert_eq!(node.exit, plan.exits.contains(&node.node.id));
+            after = Some(node.node.id.clone());
+            actual.push(node.node.clone());
+        }
+        assert_eq!(actual, plan.nodes.values().cloned().collect::<Vec<_>>());
+        let initial_edges = store.run_graph_edges("run-1", None, 100).expect("edges");
+        assert_eq!(
+            initial_edges
+                .iter()
+                .map(|row| row.edge.clone())
+                .collect::<Vec<_>>(),
+            plan.edges
+        );
+        for pair in initial_edges.windows(2) {
+            let page = store
+                .run_graph_edges("run-1", Some(pair[0].edge_id), 1)
+                .expect("edge page");
+            assert_eq!(page, vec![pair[1].clone()]);
+        }
+        let before = store.run_summary("run-1").expect("summary");
+        let path = store.path().to_path_buf();
+        drop(store);
+        let connection = Connection::open(&path).expect("historical fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE workflow_run_graph_edges;
+             DROP TABLE workflow_run_graph_nodes;
+             DROP TABLE workflow_run_graphs;
+             UPDATE workflow_store_contract SET schema_version = 15;",
+            )
+            .expect("schema 15");
+        drop(connection);
+        assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
+        let receipt =
+            WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 42).expect("migration");
+        assert_eq!(receipt.previous_schema_version, 15);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(store.run_summary("run-1").expect("summary"), before);
+        assert_eq!(
+            store
+                .run_graph_nodes("run-1", None, 100)
+                .expect("nodes")
+                .into_iter()
+                .map(|node| node.node)
+                .collect::<Vec<_>>(),
+            actual
+        );
+        assert_eq!(store.run_graph_revision("missing").expect("missing"), None);
+        store
+            .connection
+            .execute(
+                "DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("damage nodes");
+        store
+            .connection
+            .execute(
+                "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("damage edges");
+        store
+            .connection
+            .execute("DELETE FROM workflow_run_graphs WHERE run_id = 'run-1'", [])
+            .expect("damage graph");
+        assert!(store.run_graph_revision("run-1").is_err());
+    }
+
+    #[test]
+    fn graph_materialization_rejects_dangling_edges_atomically() {
+        let (_temp, mut store) = initialized_store();
+        let mut plan = definition("broken");
+        plan.edges.push(bcode_workflow::EdgeDefinition {
+            from: plan.nodes.keys().next().expect("node").clone(),
+            to: "missing".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        });
+        let before: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM workflow_run_graphs", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        let transaction = store.connection.transaction().expect("transaction");
+        assert!(run_graph::materialize(&transaction, "run-1", &plan).is_err());
+        transaction.rollback().expect("rollback");
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM workflow_run_graphs", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("count"),
+            before
+        );
+    }
+
+    #[test]
+    fn graph_inspection_rejects_oversized_payloads_and_invalid_flags_without_mutation() {
+        let (_temp, store) = initialized_store();
+        let original: String = store
+            .connection
+            .query_row(
+                "SELECT node_json FROM workflow_run_graph_nodes WHERE run_id = 'run-1' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("node");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'run-1'",
+                ["x".repeat(MAX_INLINE_JSON_BYTES + 1)],
+            )
+            .expect("oversized fixture");
+        let before = store.connection.total_changes();
+        let error = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect_err("oversized");
+        assert!(
+            error
+                .to_string()
+                .contains("payload is invalid or oversized")
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'run-1'",
+                [&original],
+            )
+            .expect("restore payload");
+        store
+            .connection
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+             UPDATE workflow_run_graph_nodes SET is_entry = 2 WHERE run_id = 'run-1';",
+            )
+            .expect("invalid flag");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_nodes("run-1", None, 1)
+                .expect_err("invalid flag")
+                .to_string()
+                .contains("boundary flags")
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn initial_edge_pages_preserve_duplicate_edges_and_detect_damage() {
+        let (_temp, mut store) = initialized_store();
+        let mut plan = definition("example");
+        let node_id = plan.nodes.keys().next().expect("node").clone();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: node_id.clone(),
+            to: node_id,
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        plan.edges = vec![edge.clone(), edge.clone(), edge.clone()];
+        // Exercise storage independently of scheduler cycle admission.
+        let transaction = store.connection.transaction().expect("transaction");
+        transaction
+            .execute(
+                "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("edges");
+        transaction
+            .execute(
+                "DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("nodes");
+        transaction
+            .execute("DELETE FROM workflow_run_graphs WHERE run_id = 'run-1'", [])
+            .expect("graph");
+        run_graph::materialize(&transaction, "run-1", &plan).expect("materialize");
+        transaction.commit().expect("commit");
+        let first = store.run_graph_edges("run-1", None, 2).expect("first page");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].edge, edge);
+        assert_eq!(first[0].edge_id, 0);
+        assert_eq!(first[1].edge_id, 1);
+        let second = store
+            .run_graph_edges("run-1", Some(1), 2)
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].edge_id, 2);
+        assert!(
+            store
+                .run_graph_edges("run-1", Some(2), 2)
+                .expect("end")
+                .is_empty()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_edges SET target_node_id = 'missing' WHERE edge_id = 2",
+                [],
+            )
+            .expect("damage endpoint");
+        let before = store.connection.total_changes();
+        assert!(store.run_graph_edges("run-1", Some(1), 2).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE edge_id = 0",
+                ["x".repeat(MAX_INLINE_JSON_BYTES + 1)],
+            )
+            .expect("oversized edge");
+        assert!(
+            store
+                .run_graph_edges("run-1", None, 1)
+                .expect_err("oversized")
+                .to_string()
+                .contains("payload is invalid or oversized")
         );
     }
 

@@ -11,9 +11,9 @@ fi
 if rg -n 'fn migrate\(' packages/workflow-store/src/lib.rs >/tmp/bcode-workflow-store-migrations 2>/dev/null \
   || rg -n 'ALTER TABLE workflow_|UPDATE workflow_store_contract SET schema_version' \
     packages/workflow-store/src/lib.rs \
-    | rg -v 'migrate_schema_14_to_current_in_state_dir|target_artifact_id|coordinator_daemon_instance_id|coordinator_generation|coordinator_fencing_token|schema_version = 15|schema_version = 14' \
+    | rg -v 'migrate_schema_14_to_current_in_state_dir|target_artifact_id|coordinator_daemon_instance_id|coordinator_generation|coordinator_fencing_token|schema_version = 15|schema_version = 14|schema_version = \?1' \
     >/tmp/bcode-workflow-store-unapproved-migrations 2>/dev/null; then
-  echo "Workflow store compatibility violation: only the approved explicit schema-14 authority migration may remain." >&2
+  echo "Workflow store compatibility violation: only approved explicit authority and run-graph preservation migrations may remain." >&2
   cat /tmp/bcode-workflow-store-migrations /tmp/bcode-workflow-store-unapproved-migrations 2>/dev/null >&2
   violations=1
 fi
@@ -95,7 +95,7 @@ if ! rg -q 'pub struct WorkflowStructuredSourceConcisePrompt' packages/workflow/
   violations=1
 fi
 
-if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 15' packages/workflow-store/src/lib.rs \
+if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 16' packages/workflow-store/src/lib.rs \
   || ! rg -q 'UnsupportedStore' packages/workflow-store/src/lib.rs \
   || ! rg -q 'reset_incompatible_store_in_state_dir' packages/workflow-store/src/lib.rs \
   || ! rg -q 'WorkflowStoreResetReceipt' packages/workflow-store/src/lib.rs \

@@ -700,7 +700,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         }
         WorkflowCommand::MigrateStore => {
             print_json(
-                &bcode_workflow_store::WorkflowStore::migrate_schema_14_to_current_in_state_dir(
+                &bcode_workflow_store::WorkflowStore::migrate_to_current_in_state_dir(
                     &bcode_config::default_state_dir(),
                     current_unix_time_ms()?,
                 )?,

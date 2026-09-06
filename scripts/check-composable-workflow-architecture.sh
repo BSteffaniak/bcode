@@ -123,7 +123,7 @@ if rg -n 'fn migrate\(' packages/workflow-store/src/lib.rs \
   >/tmp/bcode-workflow-store-compatibility.txt 2>/dev/null \
   || rg -n 'ALTER TABLE workflow_|UPDATE workflow_store_contract SET schema_version' \
     packages/workflow-store/src/lib.rs \
-    | rg -v 'target_artifact_id|coordinator_daemon_instance_id|coordinator_generation|coordinator_fencing_token|schema_version = 15|schema_version = 14' \
+    | rg -v 'target_artifact_id|coordinator_daemon_instance_id|coordinator_generation|coordinator_fencing_token|schema_version = 15|schema_version = 14|schema_version = \?1' \
     >/tmp/bcode-workflow-store-unapproved-compatibility.txt 2>/dev/null; then
   echo "Composable workflow compatibility violation: unapproved store migration paths remain." >&2
   cat /tmp/bcode-workflow-store-compatibility.txt /tmp/bcode-workflow-store-unapproved-compatibility.txt 2>/dev/null >&2
