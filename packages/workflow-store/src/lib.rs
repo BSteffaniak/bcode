@@ -19487,6 +19487,63 @@ mod tests {
     }
 
     #[test]
+    fn node_pages_reject_unusable_stored_cursor_ids_without_repair() {
+        let (_temp, store) = initialized_store();
+        let template = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        for id in [String::new(), " ".to_string(), "x".repeat(MAX_ID_BYTES + 1)] {
+            let mut node = template.clone();
+            node.id.clone_from(&id);
+            store.connection.execute(
+                "UPDATE workflow_run_graph_nodes SET node_id = ?1, node_json = ?2 WHERE run_id = 'run-1'",
+                rusqlite::params![id, serde_json::to_string(&node).expect("payload")],
+            ).expect("damage stored identity");
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .run_graph_nodes("run-1", None, 10)
+                    .expect_err("unusable cursor")
+                    .to_string()
+                    .contains("node_id must contain")
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn graph_materialization_rejects_unreadable_node_ids_before_writes() {
+        let (_temp, mut store) = initialized_store();
+        for id in [String::new(), " ".to_string(), "x".repeat(MAX_ID_BYTES + 1)] {
+            let mut plan = definition("example");
+            let mut node = plan.nodes.values().next().expect("node").clone();
+            node.id.clone_from(&id);
+            plan.nodes.clear();
+            plan.nodes.insert(id.clone(), node);
+            plan.entries = vec![id.clone()];
+            plan.exits = vec![id];
+            let transaction = store.connection.transaction().expect("transaction");
+            let before = transaction.total_changes();
+            assert!(
+                run_graph::materialize(&transaction, "run-1", &plan)
+                    .expect_err("invalid id")
+                    .to_string()
+                    .contains("node_id must contain")
+            );
+            assert_eq!(transaction.total_changes(), before);
+        }
+        assert_eq!(
+            store
+                .run_graph_nodes("run-1", None, 10)
+                .expect("preserved graph")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn graph_materialization_rejects_dangling_edges_atomically() {
         let (_temp, mut store) = initialized_store();
         let mut plan = definition("broken");
@@ -19716,6 +19773,205 @@ mod tests {
     }
 
     #[test]
+    fn edge_first_pages_surface_negative_identities_without_repair() {
+        let (_temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        let edge = bcode_workflow::EdgeDefinition {
+            from: node.id.clone(),
+            to: node.id.clone(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("fixture constraints");
+        for id in [i64::MIN, -1] {
+            store
+                .connection
+                .execute(
+                    "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1'",
+                    [],
+                )
+                .expect("reset fixture");
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, 1, ?2, ?2, ?3)",
+                rusqlite::params![id, node.id, serde_json::to_string(&edge).expect("payload")],
+            ).expect("corrupt edge identity");
+            let before = store.connection.total_changes();
+            assert!(store.run_graph_edges("run-1", None, 10).is_err());
+            assert!(
+                store
+                    .run_graph_incoming_edges("run-1", &node.id, None, 10)
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn edge_reads_reject_unusable_endpoint_identities() {
+        let (_temp, store) = initialized_store();
+        let template = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        for id in [String::new(), " ".to_string(), "x".repeat(MAX_ID_BYTES + 1)] {
+            let mut node = template.clone();
+            node.id.clone_from(&id);
+            store.connection.execute(
+                "UPDATE workflow_run_graph_nodes SET node_id = ?1, node_json = ?2 WHERE run_id = 'run-1'",
+                rusqlite::params![id, serde_json::to_string(&node).expect("node payload")],
+            ).expect("corrupt node identity");
+            let edge = bcode_workflow::EdgeDefinition {
+                from: id.clone(),
+                to: id.clone(),
+                kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
+            };
+            store.connection.execute(
+                "INSERT OR REPLACE INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, ?1, ?1, ?2)",
+                rusqlite::params![id, serde_json::to_string(&edge).expect("edge payload")],
+            ).expect("corrupt edge identity");
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .run_graph_edge("run-1", 0)
+                    .expect_err("unusable endpoint")
+                    .to_string()
+                    .contains("source_node_id must contain")
+            );
+            assert!(store.run_graph_edges("run-1", None, 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn edge_reads_reject_corrupt_endpoint_boundary_flags() {
+        let (_temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        let mut target = node.clone();
+        target.id = "target".to_string();
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', ?1, 1, ?2, 0, 1)",
+            rusqlite::params![target.id, serde_json::to_string(&target).expect("target payload")],
+        ).expect("target");
+        let edge = bcode_workflow::EdgeDefinition {
+            from: node.id.clone(),
+            to: target.id.clone(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, ?1, ?2, ?3)",
+            rusqlite::params![node.id, target.id, serde_json::to_string(&edge).expect("serialize")],
+        ).expect("edge");
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("fixture constraints");
+        for endpoint in [&node.id, &target.id] {
+            for flag in ["is_entry", "is_exit"] {
+                assert!(
+                    store
+                        .run_graph_edge("run-1", 0)
+                        .expect("intact endpoints")
+                        .is_some()
+                );
+                store.connection.execute(
+                    &format!("UPDATE workflow_run_graph_nodes SET {flag} = 2 WHERE run_id = 'run-1' AND node_id = ?1"),
+                    [endpoint],
+                ).expect("damage one flag");
+                let before = store.connection.total_changes();
+                assert!(store.run_graph_edge("run-1", 0).is_err());
+                assert!(store.run_graph_edges("run-1", None, 10).is_err());
+                assert!(
+                    store
+                        .run_graph_incoming_edges("run-1", &target.id, None, 10)
+                        .is_err()
+                );
+                assert_eq!(store.connection.total_changes(), before);
+                store.connection.execute(
+                    &format!("UPDATE workflow_run_graph_nodes SET {flag} = 0 WHERE run_id = 'run-1' AND node_id = ?1"),
+                    [endpoint],
+                ).expect("restore fixture flag");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_edge_lookup_isolates_damage_without_repair() {
+        let (_temp, store) = initialized_store();
+        let node = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("node")
+            .remove(0)
+            .node;
+        let edge = bcode_workflow::EdgeDefinition {
+            from: node.id.clone(),
+            to: node.id.clone(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 10, 1, ?1, ?1, ?2)",
+            rusqlite::params![node.id, serde_json::to_string(&edge).expect("serialize")],
+        ).expect("edge");
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'missing', 'missing', 'invalid')", [],
+        ).expect("unrelated corruption");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .run_graph_edge("run-1", 10)
+                .expect("exact edge")
+                .expect("present")
+                .edge,
+            edge
+        );
+        assert!(store.run_graph_edge("run-1", 5).expect("gap").is_none());
+        assert!(store.run_graph_edge("run-1", 0).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_edges SET source_node_id = 'missing' WHERE edge_id = 10",
+                [],
+            )
+            .expect("damage requested relationship");
+        let before = store.connection.total_changes();
+        assert!(store.run_graph_edge("run-1", 10).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn exact_edge_lookup_handles_absence_and_overflow() {
+        let (_temp, store) = initialized_store();
+        assert!(
+            store
+                .run_graph_edge("run-1", 99)
+                .expect("missing edge")
+                .is_none()
+        );
+        assert!(
+            store
+                .run_graph_edge("missing", 0)
+                .expect("missing run")
+                .is_none()
+        );
+        assert!(store.run_graph_edge("run-1", u64::MAX).is_err());
+    }
+
+    #[test]
     fn initial_edge_pages_preserve_duplicate_edges_and_detect_damage() {
         let (_temp, mut store) = initialized_store();
         let mut plan = definition("example");
@@ -19758,6 +20014,14 @@ mod tests {
         assert_eq!(first[0].edge, edge);
         assert_eq!(first[0].edge_id, 0);
         assert_eq!(first[1].edge_id, 1);
+        assert_eq!(
+            store.run_graph_edge("run-1", 0).expect("exact first"),
+            Some(first[0].clone())
+        );
+        assert_eq!(
+            store.run_graph_edge("run-1", 1).expect("exact duplicate"),
+            Some(first[1].clone())
+        );
         assert_eq!(
             store
                 .run_graph_incoming_edges("run-1", &edge.to, None, 2)
