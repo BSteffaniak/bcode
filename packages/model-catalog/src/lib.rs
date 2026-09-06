@@ -216,25 +216,32 @@ impl ModelCatalogResolver {
 
     /// Spawn a background refresh when cached data is stale or the retry interval elapsed.
     pub fn refresh_if_stale(&self) {
-        if self.options.disabled {
-            return;
-        }
-        let Ok(diagnostics) = self.diagnostics.try_read() else {
+        let Some(gate) = self.reserve_stale_refresh() else {
             return;
         };
+        let resolver = self.clone();
+        tokio::spawn(async move {
+            resolver.refresh_reserved().await;
+            drop(gate);
+        });
+    }
+
+    fn reserve_stale_refresh(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.options.disabled {
+            return None;
+        }
+        let gate = self.refresh_gate.clone().try_lock_owned().ok()?;
+        let diagnostics = self.diagnostics.try_read().ok()?;
         let recently_attempted = diagnostics.last_refresh_attempt.is_some_and(|attempt| {
             attempt
                 .elapsed()
                 .is_ok_and(|elapsed| elapsed < std::time::Duration::from_mins(1))
         });
-        if diagnostics.refresh_in_progress || recently_attempted {
-            return;
-        }
         drop(diagnostics);
-        let resolver = self.clone();
-        tokio::spawn(async move {
-            resolver.refresh_now().await;
-        });
+        if recently_attempted {
+            return None;
+        }
+        Some(gate)
     }
 
     /// Refresh remote data and atomically replace the active snapshot on success.
@@ -244,17 +251,20 @@ impl ModelCatalogResolver {
         if self.options.disabled {
             return;
         }
-        let Ok(_gate) = self.refresh_gate.try_lock() else {
+        let Ok(gate) = self.refresh_gate.try_lock() else {
             return;
         };
+        self.refresh_reserved().await;
+        drop(gate);
+    }
+
+    async fn refresh_reserved(&self) {
         {
             let mut diagnostics = self.diagnostics.write().await;
-            diagnostics.refresh_in_progress = true;
             diagnostics.last_refresh_attempt = Some(std::time::SystemTime::now());
         }
         let result = self.fetch_refreshed_catalog().await;
         let mut diagnostics = self.diagnostics.write().await;
-        diagnostics.refresh_in_progress = false;
         match result {
             Ok((catalog, revision)) => {
                 *self.catalog.write().await = std::sync::Arc::new(catalog);
@@ -287,7 +297,11 @@ impl ModelCatalogResolver {
 
     /// Return current resolver diagnostics.
     pub async fn diagnostics(&self) -> ModelCatalogDiagnostics {
-        self.diagnostics.read().await.clone()
+        let mut diagnostics = self.diagnostics.read().await.clone();
+        // The gate is released on completion, cancellation, and panic. A stored
+        // flag cannot track those paths without asynchronous cleanup in Drop.
+        diagnostics.refresh_in_progress = self.refresh_gate.try_lock().is_err();
+        diagnostics
     }
 
     /// Return the resolver's current catalog snapshot.
@@ -2188,6 +2202,49 @@ mod tests {
     use super::*;
     use bcode_model::{ModelCacheInfo, ModelCapability, ModelVisibility};
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn background_refresh_reservation_coalesces_before_polling() {
+        let mut resolver = ModelCatalogResolver::embedded();
+        resolver.options.disabled = false;
+        let reservation = resolver.reserve_stale_refresh().expect("first reservation");
+        assert!(resolver.reserve_stale_refresh().is_none());
+        assert!(resolver.diagnostics().await.refresh_in_progress);
+        // Explicit refresh must defer to queued background work too.
+        resolver.refresh_now().await;
+        assert!(resolver.diagnostics().await.last_refresh_attempt.is_none());
+        drop(reservation);
+        let replacement = resolver
+            .reserve_stale_refresh()
+            .expect("released reservation");
+        drop(replacement);
+        assert!(!resolver.diagnostics().await.refresh_in_progress);
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_releases_execution_authority() {
+        let mut options = RemoteCatalogOptions::disabled();
+        options.disabled = false;
+        let mut resolver = ModelCatalogResolver::embedded();
+        resolver.options = options;
+        // Hold diagnostics so refresh suspends after acquiring its execution gate,
+        // before constructing a network client or touching the cache.
+        let diagnostics = resolver.diagnostics.write().await;
+        let mut refresh = Box::pin(resolver.refresh_now());
+        std::future::poll_fn(|context| {
+            assert!(refresh.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(resolver.refresh_gate.try_lock().is_err());
+        drop(refresh);
+        drop(diagnostics);
+        assert!(!resolver.diagnostics().await.refresh_in_progress);
+        let next_owner = resolver.refresh_gate.try_lock().expect("released gate");
+        assert!(resolver.diagnostics().await.refresh_in_progress);
+        drop(next_owner);
+        assert!(!resolver.diagnostics().await.refresh_in_progress);
+    }
 
     #[tokio::test]
     async fn disabled_resolver_never_attempts_explicit_refresh() {
