@@ -8421,7 +8421,18 @@ async fn auth_provider_logout(
     revoke: bool,
 ) -> Result<(), CliError> {
     let mut host = load_cli_plugin_host()?;
-    let provider = registered_auth_provider(&host, provider_id)?;
+    let result = logout_auth_provider(&host, provider_id, explicit_profile, revoke).await;
+    let cleanup = host.deactivate_all().map_err(CliError::from);
+    result.and(cleanup)
+}
+
+async fn logout_auth_provider(
+    host: &bcode_plugin::PluginHost,
+    provider_id: &str,
+    explicit_profile: Option<&str>,
+    revoke: bool,
+) -> Result<(), CliError> {
+    let provider = registered_auth_provider(host, provider_id)?;
     let resolved = resolve_registered_auth_profile(&provider, explicit_profile)?;
     let method = resolved_auth_method(&provider, &resolved)?;
     if revoke {
@@ -8440,7 +8451,7 @@ async fn auth_provider_logout(
                 "Provider '{provider_id}' does not support remote revocation."
             )));
         }
-        run_auth_interactive_flow(&host, &provider, method, &resolved, false, true).await?;
+        run_auth_interactive_flow(host, &provider, method, &resolved, false, true).await?;
     }
     bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
         &resolved,
@@ -8451,8 +8462,12 @@ async fn auth_provider_logout(
     .map_err(|error| CliError::LoginProfile(error.to_string()))?
     .delete()
     .map_err(|error| CliError::LoginProfile(error.to_string()))?;
-    println!("Local authentication removed for provider '{provider_id}'.");
-    host.deactivate_all()?;
+    let mut writer = std::io::stdout().lock();
+    writeln!(
+        writer,
+        "Local authentication removed for provider '{provider_id}'."
+    )?;
+    writer.flush()?;
     Ok(())
 }
 
