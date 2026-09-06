@@ -11512,19 +11512,14 @@ fn settle_fan_out_member_failure(
         fan_out_member_controller(transaction, request)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData("fan-out member controller is missing".to_string())
         })?;
-    let definition_json: String = transaction.query_row(
-        "SELECT definition.definition_json FROM workflow_runs run \
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-           AND definition.version = run.definition_version WHERE run.run_id = ?1",
-        [&request.run_id],
-        |row| row.get(0),
-    )?;
-    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-    let controller = definition.node(&controller_node_id).ok_or_else(|| {
-        WorkflowStoreError::InvalidData("fan-out controller node is missing".to_string())
-    })?;
+    let controller = run_graph::initial_node(transaction, &request.run_id, &controller_node_id)?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "fan-out controller run-graph node is missing".to_string(),
+            )
+        })?;
     let configuration: bcode_workflow::WorkflowFanOutConfiguration =
-        serde_json::from_value(controller.configuration.clone())?;
+        serde_json::from_value(controller.configuration)?;
     transaction.execute(
         "UPDATE workflow_fan_out_members SET status = 'failed', terminal_at_ms = ?4 \
          WHERE run_id = ?1 AND member_node_id = ?2 AND member_activation_id = ?3 \
@@ -17835,6 +17830,103 @@ mod tests {
                 .expect("remaining")
                 .iter()
                 .all(|pending| pending.activation_id != member.activation_id)
+        );
+    }
+
+    #[test]
+    fn fan_out_failure_requires_run_graph_and_releases_wait_all_capacity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("fan-out", 1, &fan_out_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "fan-out".to_string();
+        run.input = Some(serde_json::json!([3, 1, 2]));
+        store.create_run(&run).expect("run");
+        store
+            .settle_pending_control_nodes("run-1", 10, 20)
+            .expect("materialize");
+        let member = store
+            .pending_activations_for_run("run-1", 1)
+            .expect("pending")
+            .remove(0);
+        store
+            .prepare_pending_activation(
+                "run-1",
+                &member.node_id,
+                &member.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "test"}),
+                30,
+            )
+            .expect("prepare")
+            .expect("admitted");
+        let request = AttemptReconciliationRequest {
+            run_id: member.run_id,
+            node_id: member.node_id,
+            activation_id: member.activation_id,
+            attempt: 1,
+            dispatch_identity: "test".to_string(),
+            side_effect: DispatchSideEffect::ReadOnly,
+            receipt: serde_json::json!({}),
+        };
+        let transaction = store.connection.transaction().expect("transaction");
+        transaction
+            .execute(
+                "DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("damage graph");
+        let before = transaction.total_changes();
+        assert!(
+            settle_fan_out_member_failure(&transaction, &request, "failure", 40)
+                .expect_err("missing graph")
+                .to_string()
+                .contains("run-graph node is missing")
+        );
+        assert_eq!(transaction.total_changes(), before);
+        transaction.rollback().expect("restore fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        assert!(
+            settle_fan_out_member_failure(&transaction, &request, "failure", 40)
+                .expect("settle failure")
+                .is_empty()
+        );
+        transaction.commit().expect("commit");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .pending_activations_for_run("run-1", 10)
+                .expect("next wave")
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_fan_out_members WHERE member_activation_id = ?1",
+                    [&request.activation_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("member status"),
+            "failed"
+        );
+        assert_eq!(store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = ?1 AND activation_id = ?2",
+            (&request.run_id, &request.activation_id), |row| row.get::<_, String>(0)).expect("activation status"), "failed");
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_runs WHERE run_id = ?1",
+                    [&request.run_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("run status"),
+            "running"
         );
     }
 
