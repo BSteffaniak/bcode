@@ -2089,6 +2089,24 @@ impl Display for WorkId {
     }
 }
 
+/// Current runtime-work state exposed by application operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWorkSnapshot {
+    /// Canonical runtime-work identity.
+    pub work_id: WorkId,
+    /// Domain category of the work.
+    pub kind: RuntimeWorkKind,
+    /// User-visible work label.
+    pub label: String,
+    /// Associated tool invocation, when present.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// Current status; cancellation admission is not terminal completion.
+    pub status: RuntimeWorkStatus,
+    /// Whether cancellation may currently be requested.
+    pub cancellable: bool,
+}
+
 /// Durable runtime work category.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

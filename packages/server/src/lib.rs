@@ -61399,7 +61399,46 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ..
             } if cancelled_work_id == work_id
         ));
+        assert_bounded_runtime_history_span(&client, session.id, &work_id).await;
         server.abort();
+    }
+
+    async fn assert_bounded_runtime_history_span(
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+        work_id: &WorkId,
+    ) {
+        let events = client
+            .runtime_work_history(session_id, 1)
+            .await
+            .expect("bounded IPC history");
+        assert_eq!(events.len(), 1);
+        let SessionEventKind::RuntimeWorkFinished {
+            work_id: id,
+            status,
+            finished_at_ms,
+            ..
+        } = &events[0].kind
+        else {
+            panic!(
+                "expected bounded projection status event: {:?}",
+                events[0].kind
+            );
+        };
+        assert_eq!(id, work_id);
+        assert_eq!(*status, RuntimeWorkStatus::Cancelling);
+        assert!(!status.is_terminal());
+        let spans = client
+            .runtime_work_spans(session_id, 1)
+            .await
+            .expect("bounded IPC spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&spans[0].work_id, work_id);
+        assert!(spans[0].label.is_empty());
+        assert_eq!(spans[0].started_at_ms, None);
+        assert_eq!(spans[0].finished_at_ms, *finished_at_ms);
+        assert_eq!(spans[0].status, Some(RuntimeWorkStatus::Cancelling));
+        assert_eq!(spans[0].duration_ms(), None);
     }
 
     #[tokio::test]

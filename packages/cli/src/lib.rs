@@ -14831,16 +14831,7 @@ async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), 
     match command {
         RuntimeWorkCommand::List { session_id, json } => {
             let work = client.list_runtime_work(session_id).await?;
-            if json {
-                print_json(&work)?;
-            } else {
-                for work in work {
-                    println!(
-                        "{} {:?} {:?} {} cancellable={}",
-                        work.work_id, work.kind, work.status, work.label, work.cancellable
-                    );
-                }
-            }
+            write_runtime_work_list(&mut std::io::stdout().lock(), &work, json)?;
         }
         RuntimeWorkCommand::Cancel {
             session_id,
@@ -14858,26 +14849,7 @@ async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), 
             json,
         } => {
             let spans = client.runtime_work_spans(session_id, limit).await?;
-            if json {
-                print_json(&spans)?;
-            } else {
-                for span in spans {
-                    println!(
-                        "{} status={:?} cancelled={} duration_ms={:?} parent={} label={}{}",
-                        span.work_id,
-                        span.status,
-                        span.cancelled,
-                        span.duration_ms(),
-                        span.parent_work_id
-                            .as_ref()
-                            .map_or_else(|| "-".to_string(), ToString::to_string),
-                        span.label,
-                        span.message
-                            .as_ref()
-                            .map_or_else(String::new, |message| format!(" message={message}"))
-                    );
-                }
-            }
+            write_runtime_work_history(&mut std::io::stdout().lock(), &spans, json)?;
         }
         RuntimeWorkCommand::Watch { session_id, json } => {
             let mut watcher = client.watch_runtime_work(session_id).await?;
@@ -14898,6 +14870,54 @@ async fn handle_runtime_work_command(command: RuntimeWorkCommand) -> Result<(), 
     Ok(())
 }
 
+fn write_runtime_work_list(
+    output: &mut impl std::io::Write,
+    work: &[bcode_session_models::RuntimeWorkSnapshot],
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        return write_json_result(output, &work);
+    }
+    for work in work {
+        writeln!(
+            output,
+            "{} {:?} {:?} {} cancellable={}",
+            work.work_id, work.kind, work.status, work.label, work.cancellable
+        )?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn write_runtime_work_history(
+    output: &mut impl std::io::Write,
+    spans: &[bcode_client::RuntimeWorkSpan],
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        return write_json_result(output, &spans);
+    }
+    for span in spans {
+        writeln!(
+            output,
+            "{} status={:?} cancelled={} duration_ms={:?} parent={} label={}{}",
+            span.work_id,
+            span.status,
+            span.cancelled,
+            span.duration_ms(),
+            span.parent_work_id
+                .as_ref()
+                .map_or_else(|| "-".to_string(), ToString::to_string),
+            span.label,
+            span.message
+                .as_ref()
+                .map_or_else(String::new, |message| format!(" message={message}"))
+        )?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 async fn cancel_session_turn(
     session_id: SessionId,
     clear_queue: bool,
@@ -14910,20 +14930,30 @@ async fn cancel_session_turn(
 }
 
 fn print_cancellation_result(kind: &str, cancelled: bool, json: bool) -> Result<(), CliError> {
+    write_cancellation_result(&mut std::io::stdout().lock(), kind, cancelled, json)
+}
+
+fn write_cancellation_result(
+    output: &mut impl std::io::Write,
+    kind: &str,
+    cancelled: bool,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        print_json(&serde_json::json!({
-            "kind": kind,
-            "cancellation_requested": cancelled,
-        }))
+        write_json_result(
+            output,
+            &serde_json::json!({
+                "kind": kind,
+                "cancellation_requested": cancelled,
+            }),
+        )
     } else {
-        println!(
-            "{}",
-            if cancelled {
-                format!("{kind} cancellation requested")
-            } else {
-                format!("no active {kind}")
-            }
-        );
+        if cancelled {
+            writeln!(output, "{kind} cancellation requested")?;
+        } else {
+            writeln!(output, "no active {kind}")?;
+        }
+        output.flush()?;
         Ok(())
     }
 }
@@ -15424,18 +15454,28 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
                 },
             )
             .await?;
-        let terminal_failure = turn_admission_failure(&admission);
-        if json {
-            print_json(&serde_json::json!({
-                "session_id": session_id,
-                "admission": admission,
-            }))?;
-        } else {
-            println!("{admission:?}");
-        }
-        if let Some(error) = terminal_failure {
-            return Err(error);
-        }
+        write_turn_admission(&mut std::io::stdout().lock(), session_id, &admission, json)?;
+    }
+    Ok(())
+}
+
+fn write_turn_admission(
+    output: &mut impl std::io::Write,
+    session_id: SessionId,
+    admission: &bcode_session_models::TurnAdmission,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        write_json_result(
+            output,
+            &serde_json::json!({ "session_id": session_id, "admission": admission }),
+        )?;
+    } else {
+        writeln!(output, "{admission:?}")?;
+        output.flush()?;
+    }
+    if let Some(error) = turn_admission_failure(admission) {
+        return Err(error);
     }
     Ok(())
 }
@@ -21840,6 +21880,191 @@ mod json_stream_output_tests {
                 super::write_follow_up_disposition(&mut output, &"queued"),
                 Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
             ));
+        }
+    }
+
+    #[test]
+    fn runtime_work_outputs_preserve_partial_spans_and_failures() {
+        use bcode_session_models::{
+            RuntimeWorkKind, RuntimeWorkSnapshot, RuntimeWorkStatus, WorkId,
+        };
+        let work = vec![RuntimeWorkSnapshot {
+            work_id: WorkId::new("w"),
+            kind: RuntimeWorkKind::Tool,
+            label: "inspect λ".into(),
+            tool_call_id: Some("call".into()),
+            status: RuntimeWorkStatus::Cancelling,
+            cancellable: true,
+        }];
+        let spans = vec![bcode_client::RuntimeWorkSpan {
+            work_id: WorkId::new("w"),
+            parent_work_id: None,
+            label: String::new(),
+            status: Some(RuntimeWorkStatus::Failed),
+            started_at_ms: None,
+            finished_at_ms: Some(40),
+            cancelled: false,
+            message: Some("failed λ".into()),
+        }];
+        for history in [false, true] {
+            for empty in [false, true] {
+                for json in [false, true] {
+                    let write = |output: &mut Output| {
+                        if history {
+                            super::write_runtime_work_history(
+                                output,
+                                if empty { &[] } else { &spans },
+                                json,
+                            )
+                        } else {
+                            super::write_runtime_work_list(
+                                output,
+                                if empty { &[] } else { &work },
+                                json,
+                            )
+                        }
+                    };
+                    let mut output = Output::default();
+                    write(&mut output).unwrap();
+                    assert_eq!(output.flushes, 1);
+                    if json {
+                        let expected = if empty {
+                            serde_json::json!([])
+                        } else if history {
+                            serde_json::to_value(&spans).unwrap()
+                        } else {
+                            serde_json::to_value(&work).unwrap()
+                        };
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&output.bytes).unwrap(),
+                            expected
+                        );
+                    } else {
+                        let expected = if empty {
+                            ""
+                        } else if history {
+                            "w status=Some(Failed) cancelled=false duration_ms=None parent=- label= message=failed λ\n"
+                        } else {
+                            "w Tool Cancelling inspect λ cancellable=true\n"
+                        };
+                        assert_eq!(output.bytes, expected.as_bytes());
+                    }
+                    for fail_write in [false, true] {
+                        if fail_write && empty && !json {
+                            continue;
+                        }
+                        let mut output = Output {
+                            fail_write,
+                            fail_flush: !fail_write,
+                            ..Output::default()
+                        };
+                        let error = write(&mut output).unwrap_err();
+                        assert_eq!(error.exit_code(), 1);
+                        assert!(
+                            matches!(error, CliError::Signal(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_receipts_preserve_admission_and_propagate_output_failures() {
+        for kind in ["turn", "runtime_work"] {
+            for cancelled in [false, true] {
+                for json in [false, true] {
+                    let mut output = Output::default();
+                    super::write_cancellation_result(&mut output, kind, cancelled, json).unwrap();
+                    assert_eq!(output.flushes, 1);
+                    if json {
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&output.bytes).unwrap();
+                        assert_eq!(
+                            value,
+                            serde_json::json!({
+                                "kind": kind, "cancellation_requested": cancelled,
+                            })
+                        );
+                    } else {
+                        let expected = if cancelled {
+                            format!("{kind} cancellation requested\n")
+                        } else {
+                            format!("no active {kind}\n")
+                        };
+                        assert_eq!(output.bytes, expected.as_bytes());
+                    }
+                    for fail_write in [false, true] {
+                        let mut output = Output {
+                            fail_write,
+                            fail_flush: !fail_write,
+                            ..Output::default()
+                        };
+                        let error =
+                            super::write_cancellation_result(&mut output, kind, cancelled, json)
+                                .unwrap_err();
+                        assert_eq!(error.exit_code(), 1);
+                        assert!(matches!(error, CliError::Signal(error)
+                            if error.kind() == std::io::ErrorKind::BrokenPipe));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turn_admission_output_preserves_outcomes_and_reports_io_failures() {
+        use bcode_session_models::{SessionId, TurnAdmission, TurnReceipt, TurnRejectionReason};
+
+        let session_id = SessionId::new();
+        let receipt = TurnReceipt::from_accepted_event(session_id, 42);
+        for (admission, expected_exit) in [
+            (TurnAdmission::Accepted(receipt.clone()), None),
+            (TurnAdmission::Existing(receipt.clone()), None),
+            (TurnAdmission::Deferred(receipt.clone()), None),
+            (TurnAdmission::CancelledBeforeStart(receipt), Some(4)),
+            (
+                TurnAdmission::Rejected(TurnRejectionReason::ExecutionPolicy),
+                Some(3),
+            ),
+            (
+                TurnAdmission::Rejected(TurnRejectionReason::SessionUnavailable),
+                Some(1),
+            ),
+        ] {
+            for json in [false, true] {
+                let mut output = Output::default();
+                let result = super::write_turn_admission(&mut output, session_id, &admission, json);
+                assert_eq!(
+                    result.err().as_ref().map(CliError::exit_code),
+                    expected_exit
+                );
+                assert_eq!(output.flushes, 1);
+                if json {
+                    let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
+                    assert_eq!(
+                        value,
+                        serde_json::json!({
+                            "session_id": session_id, "admission": admission,
+                        })
+                    );
+                } else {
+                    assert_eq!(output.bytes, format!("{admission:?}\n").as_bytes());
+                }
+                for fail_write in [false, true] {
+                    let mut output = Output {
+                        fail_write,
+                        fail_flush: !fail_write,
+                        ..Output::default()
+                    };
+                    let error =
+                        super::write_turn_admission(&mut output, session_id, &admission, json)
+                            .unwrap_err();
+                    assert_eq!(error.exit_code(), 1);
+                    assert!(matches!(error, CliError::Signal(error)
+                        if error.kind() == std::io::ErrorKind::BrokenPipe));
+                }
+            }
         }
     }
 

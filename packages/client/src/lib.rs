@@ -72,6 +72,9 @@ mod artifact_range_tests {
 }
 
 /// Grouped runtime-work lifecycle span.
+///
+/// Bounded history may omit the start event. Such spans retain observed events with
+/// an empty label and unknown parent/start time; no older history is fetched.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RuntimeWorkSpan {
     pub work_id: WorkId,
@@ -85,6 +88,19 @@ pub struct RuntimeWorkSpan {
 }
 
 impl RuntimeWorkSpan {
+    const fn without_start(work_id: WorkId) -> Self {
+        Self {
+            work_id,
+            parent_work_id: None,
+            label: String::new(),
+            status: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+            cancelled: false,
+            message: None,
+        }
+    }
+
     #[must_use]
     pub fn duration_ms(&self) -> Option<u64> {
         Some(self.finished_at_ms?.saturating_sub(self.started_at_ms?))
@@ -117,16 +133,18 @@ fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
                 );
             }
             SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
-                if let Some(span) = spans.get_mut(&work_id) {
-                    span.cancelled = true;
-                }
+                spans
+                    .entry(work_id.clone())
+                    .or_insert_with(|| RuntimeWorkSpan::without_start(work_id))
+                    .cancelled = true;
             }
             SessionEventKind::RuntimeWorkProgress {
                 work_id, message, ..
             } => {
-                if let Some(span) = spans.get_mut(&work_id) {
-                    span.message = Some(message);
-                }
+                spans
+                    .entry(work_id.clone())
+                    .or_insert_with(|| RuntimeWorkSpan::without_start(work_id))
+                    .message = Some(message);
             }
             SessionEventKind::RuntimeWorkFinished {
                 work_id,
@@ -134,18 +152,164 @@ fn runtime_work_spans(events: Vec<SessionEvent>) -> Vec<RuntimeWorkSpan> {
                 finished_at_ms,
                 message,
             } => {
-                if let Some(span) = spans.get_mut(&work_id) {
-                    span.status = Some(status);
-                    span.finished_at_ms = finished_at_ms;
-                    if message.is_some() {
-                        span.message = message;
-                    }
+                let span = spans
+                    .entry(work_id.clone())
+                    .or_insert_with(|| RuntimeWorkSpan::without_start(work_id));
+                span.status = Some(status);
+                span.finished_at_ms = finished_at_ms;
+                if message.is_some() {
+                    span.message = message;
                 }
             }
             _ => {}
         }
     }
     spans.into_values().collect()
+}
+
+#[cfg(test)]
+mod runtime_work_history_tests {
+    use super::*;
+
+    fn event(kind: SessionEventKind) -> SessionEvent {
+        SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind,
+        }
+    }
+
+    fn started(work_id: &WorkId, label: &str, started_at_ms: u64) -> SessionEventKind {
+        SessionEventKind::RuntimeWorkStarted {
+            work_id: work_id.clone(),
+            kind: bcode_session_models::RuntimeWorkKind::Tool,
+            label: label.into(),
+            tool_call_id: None,
+            plugin_id: None,
+            service_interface: None,
+            operation: None,
+            parent_work_id: Some(WorkId::new("parent")),
+            started_at_ms: Some(started_at_ms),
+            cancellable: true,
+        }
+    }
+
+    #[test]
+    fn complete_history_preserves_start_metadata_and_finish_message() {
+        let work_id = WorkId::new("complete");
+        let spans = runtime_work_spans(vec![
+            event(started(&work_id, "inspect", 10)),
+            event(SessionEventKind::RuntimeWorkProgress {
+                work_id: work_id.clone(),
+                message: "running".into(),
+                progress_at_ms: None,
+                completed_units: None,
+                total_units: None,
+            }),
+            event(SessionEventKind::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status: RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(40),
+                message: Some("done".into()),
+            }),
+        ]);
+        assert_eq!(
+            spans,
+            vec![RuntimeWorkSpan {
+                work_id,
+                parent_work_id: Some(WorkId::new("parent")),
+                label: "inspect".into(),
+                status: Some(RuntimeWorkStatus::Completed),
+                started_at_ms: Some(10),
+                finished_at_ms: Some(40),
+                cancelled: false,
+                message: Some("done".into()),
+            }]
+        );
+        assert_eq!(spans[0].duration_ms(), Some(30));
+    }
+
+    #[test]
+    fn resumed_work_resets_the_previous_partial_attempt() {
+        let work_id = WorkId::new("resumed");
+        let mut events = vec![
+            event(SessionEventKind::RuntimeWorkCancelRequested {
+                work_id: work_id.clone(),
+                requested_at_ms: None,
+                client_id: None,
+            }),
+            event(SessionEventKind::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status: RuntimeWorkStatus::Suspended,
+                finished_at_ms: Some(20),
+                message: Some("suspended".into()),
+            }),
+            event(started(&work_id, "resumed attempt", 30)),
+        ];
+        let spans = runtime_work_spans(events.clone());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].label, "resumed attempt");
+        assert_eq!(spans[0].started_at_ms, Some(30));
+        assert_eq!(spans[0].finished_at_ms, None);
+        assert_eq!(spans[0].status, None);
+        assert_eq!(spans[0].message, None);
+        assert!(!spans[0].cancelled);
+        events.push(event(SessionEventKind::RuntimeWorkFinished {
+            work_id,
+            status: RuntimeWorkStatus::Completed,
+            finished_at_ms: Some(50),
+            message: None,
+        }));
+        let spans = runtime_work_spans(events);
+        assert_eq!(spans[0].status, Some(RuntimeWorkStatus::Completed));
+        assert_eq!(spans[0].duration_ms(), Some(20));
+        assert_eq!(spans[0].message, None);
+        assert!(!spans[0].cancelled);
+    }
+
+    #[test]
+    fn bounded_history_retains_each_lifecycle_event_without_a_start() {
+        let work_id = WorkId::new("partial");
+        let kinds = [
+            SessionEventKind::RuntimeWorkCancelRequested {
+                work_id: work_id.clone(),
+                requested_at_ms: Some(20),
+                client_id: None,
+            },
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: work_id.clone(),
+                message: "progress".into(),
+                progress_at_ms: Some(30),
+                completed_units: None,
+                total_units: None,
+            },
+            SessionEventKind::RuntimeWorkFinished {
+                work_id: work_id.clone(),
+                status: RuntimeWorkStatus::Failed,
+                finished_at_ms: Some(40),
+                message: None,
+            },
+        ];
+        for kind in &kinds {
+            let spans = runtime_work_spans(vec![event(kind.clone())]);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].work_id, work_id);
+            assert!(spans[0].label.is_empty());
+            assert_eq!(spans[0].parent_work_id, None);
+            assert_eq!(spans[0].started_at_ms, None);
+            assert_eq!(spans[0].duration_ms(), None);
+        }
+        let spans = runtime_work_spans(kinds.into_iter().map(event).collect());
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].cancelled);
+        assert_eq!(spans[0].message.as_deref(), Some("progress"));
+        assert_eq!(spans[0].status, Some(RuntimeWorkStatus::Failed));
+        assert_eq!(spans[0].finished_at_ms, Some(40));
+        assert_eq!(spans[0].duration_ms(), None);
+    }
 }
 
 /// Errors returned by the Bcode client.
@@ -4153,7 +4317,7 @@ impl BcodeClient {
     pub async fn list_runtime_work(
         &self,
         session_id: SessionId,
-    ) -> Result<Vec<bcode_ipc::RuntimeWorkSnapshot>, ClientError> {
+    ) -> Result<Vec<bcode_session_models::RuntimeWorkSnapshot>, ClientError> {
         match self
             .send_request(Request::ListRuntimeWork { session_id })
             .await?

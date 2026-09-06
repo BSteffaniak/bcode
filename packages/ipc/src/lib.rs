@@ -8,12 +8,12 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, RuntimeWorkKind, RuntimeWorkStatus,
-    SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationRequest,
-    SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome, SessionEvent,
-    SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
-    SessionId, SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery,
-    SessionLiveEvent, SessionOpenOperationId, SessionOpenOperationSnapshot, SessionSummary, WorkId,
+    ClientId, ProjectionWindowRequest, SessionDerivationPromptPage, SessionDerivationPromptQuery,
+    SessionDerivationRequest, SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome,
+    SessionEvent, SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery,
+    SessionHistoryWindow, SessionId, SessionInputHistoryEntry, SessionInspectionPage,
+    SessionInspectionQuery, SessionLiveEvent, SessionOpenOperationId, SessionOpenOperationSnapshot,
+    SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -2682,16 +2682,8 @@ pub struct WorkflowRunStartResponse {
     pub runtime_work_id: WorkId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeWorkSnapshot {
-    pub work_id: WorkId,
-    pub kind: RuntimeWorkKind,
-    pub label: String,
-    #[serde(default)]
-    pub tool_call_id: Option<String>,
-    pub status: RuntimeWorkStatus,
-    pub cancellable: bool,
-}
+/// Domain-owned runtime-work snapshot, retained here for source compatibility.
+pub use bcode_session_models::RuntimeWorkSnapshot;
 
 /// Successful response payload variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4122,11 +4114,29 @@ fn socket_path_with_digest(base: &Path, digest: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, SessionEventKind, SessionId,
-        SessionSummary, SessionTraceEvent, ToolInvocationResult,
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ModelTurnOutcome, RuntimeWorkKind, RuntimeWorkStatus,
+        SessionEventKind, SessionId, SessionSummary, SessionTraceEvent, ToolInvocationResult,
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn runtime_work_snapshot_preserves_domain_identity_and_wire_shape() {
+        let mut wire = serde_json::json!({
+            "work_id": "work-1", "kind": "tool", "label": "inspect λ",
+            "tool_call_id": "call-1", "status": "cancelling", "cancellable": true,
+        });
+        let ipc: RuntimeWorkSnapshot = serde_json::from_value(wire.clone()).unwrap();
+        let domain: bcode_session_models::RuntimeWorkSnapshot = ipc;
+        assert_eq!(domain.status, RuntimeWorkStatus::Cancelling);
+        assert_eq!(serde_json::to_value(&domain).unwrap(), wire);
+        wire.as_object_mut().unwrap().remove("tool_call_id");
+        let domain: bcode_session_models::RuntimeWorkSnapshot =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(domain.tool_call_id, None);
+        wire["status"] = serde_json::json!("future_status");
+        assert!(serde_json::from_value::<RuntimeWorkSnapshot>(wire).is_err());
+    }
 
     #[test]
     fn pending_exchange_summary_preserves_domain_identity_and_wire_shape() {
