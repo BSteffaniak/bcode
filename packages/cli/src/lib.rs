@@ -8574,35 +8574,23 @@ async fn run_auth_interactive_flow(
                 &request,
             )
             .map_err(plugin_service_call_error)?;
-        response
-            .validate()
-            .map_err(|error| CliError::LoginProfile(error.to_string()))?;
-        // Failed/cancelled flows must not execute further interactive effects.
-        let terminal = auth_flow_terminal_result(response.status)?.is_some();
+        // Validate and report diagnostics before returning terminal failures;
+        // failed/cancelled flows must not execute further interactive effects.
+        let terminal = prepare_auth_flow_response(&mut std::io::stderr().lock(), &response)?;
         let mut input = None;
         for effect in &response.effects {
+            write_auth_effect(&mut std::io::stdout().lock(), effect)?;
             match effect {
                 bcode_provider_auth_models::AuthFlowEffect::OpenBrowser { url } => {
-                    println!("Open in browser: {url}");
                     open_browser(url);
                 }
                 bcode_provider_auth_models::AuthFlowEffect::DisplayDeviceCode {
                     verification_url,
-                    user_code,
                     ..
                 } => {
-                    println!("Open {verification_url} and enter code {user_code}");
                     open_browser(verification_url);
                 }
-                bcode_provider_auth_models::AuthFlowEffect::Prompt {
-                    prompt_id,
-                    message,
-                    choices,
-                } => {
-                    println!("{message}");
-                    if !choices.is_empty() {
-                        println!("Choices: {}", choices.join(", "));
-                    }
+                bcode_provider_auth_models::AuthFlowEffect::Prompt { prompt_id, .. } => {
                     let value = read_stdin_line()?;
                     effect
                         .validate_answer(&value)
@@ -8615,17 +8603,8 @@ async fn run_auth_interactive_flow(
                 bcode_provider_auth_models::AuthFlowEffect::Wait { millis } => {
                     tokio::time::sleep(Duration::from_millis(*millis)).await;
                 }
-                bcode_provider_auth_models::AuthFlowEffect::Message { message } => {
-                    println!("{message}");
-                }
+                bcode_provider_auth_models::AuthFlowEffect::Message { .. } => {}
             }
-        }
-        for diagnostic in &response.diagnostics {
-            write_auth_diagnostic(
-                &mut std::io::stderr().lock(),
-                &diagnostic.code,
-                &diagnostic.message,
-            )?;
         }
         if terminal {
             if !response.credentials.is_empty() {
@@ -8645,6 +8624,52 @@ async fn run_auth_interactive_flow(
         request.state = response.state;
         request.input = input;
     }
+}
+
+fn write_auth_effect(
+    writer: &mut impl std::io::Write,
+    effect: &bcode_provider_auth_models::AuthFlowEffect,
+) -> Result<(), CliError> {
+    use bcode_provider_auth_models::AuthFlowEffect;
+    match effect {
+        AuthFlowEffect::OpenBrowser { url } => writeln!(writer, "Open in browser: {url}")?,
+        AuthFlowEffect::DisplayDeviceCode {
+            verification_url,
+            user_code,
+            ..
+        } => {
+            writeln!(writer, "Open {verification_url} and enter code {user_code}")?;
+        }
+        AuthFlowEffect::Prompt {
+            message, choices, ..
+        } => {
+            writeln!(writer, "{message}")?;
+            if !choices.is_empty() {
+                writeln!(writer, "Choices: {}", choices.join(", "))?;
+            }
+        }
+        AuthFlowEffect::Message { message } => writeln!(writer, "{message}")?,
+        AuthFlowEffect::Wait { .. } => return Ok(()),
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn prepare_auth_flow_response(
+    writer: &mut impl std::io::Write,
+    response: &bcode_provider_auth_models::AuthFlowResponse,
+) -> Result<bool, CliError> {
+    response
+        .validate()
+        .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    for diagnostic in &response.diagnostics {
+        write_auth_diagnostic(writer, &diagnostic.code, &diagnostic.message)?;
+        if let Some(remediation) = &diagnostic.remediation {
+            writeln!(writer, "  remediation: {remediation}")?;
+            writer.flush()?;
+        }
+    }
+    Ok(auth_flow_terminal_result(response.status)?.is_some())
 }
 
 fn write_auth_diagnostic(
@@ -8670,14 +8695,15 @@ fn auth_flow_terminal_result(
     }
 }
 
-const MAX_CLI_AUTH_INPUT_BYTES: usize = 64 * 1024;
+const MAX_CLI_AUTH_INPUT_BYTES: usize = bcode_provider_auth_models::MAX_AUTH_TEXT_BYTES;
 
 fn read_stdin_line() -> Result<String, CliError> {
     read_auth_input_line(std::io::stdin().lock())
 }
 
 fn read_auth_input_line(reader: impl std::io::BufRead) -> Result<String, CliError> {
-    let mut limited = std::io::Read::take(reader, (MAX_CLI_AUTH_INPUT_BYTES + 1) as u64);
+    // Allow a full-size answer plus CRLF and one byte to detect overflow.
+    let mut limited = std::io::Read::take(reader, (MAX_CLI_AUTH_INPUT_BYTES + 3) as u64);
     let mut bytes = Vec::new();
     std::io::BufRead::read_until(&mut limited, b'\n', &mut bytes)?;
     if bytes.is_empty() {
@@ -8685,15 +8711,20 @@ fn read_auth_input_line(reader: impl std::io::BufRead) -> Result<String, CliErro
             "authentication input ended before a response".to_owned(),
         ));
     }
-    if bytes.len() > MAX_CLI_AUTH_INPUT_BYTES {
-        return Err(CliError::InvalidArguments(
-            "authentication response exceeds 65536 bytes".to_owned(),
-        ));
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
     }
-    let value = String::from_utf8(bytes).map_err(|_| {
+    if bytes.len() > MAX_CLI_AUTH_INPUT_BYTES {
+        return Err(CliError::InvalidArguments(format!(
+            "authentication response exceeds {MAX_CLI_AUTH_INPUT_BYTES} bytes"
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| {
         CliError::InvalidArguments("authentication response must be valid UTF-8".to_owned())
-    })?;
-    Ok(value.trim().to_owned())
+    })
 }
 
 fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) {
@@ -17254,6 +17285,122 @@ auth_profile = "openai"
     }
 
     #[test]
+    fn auth_effect_output_is_fallible_and_preserves_prompt_choices() {
+        use bcode_provider_auth_models::AuthFlowEffect;
+        let effects = [
+            AuthFlowEffect::OpenBrowser {
+                url: "https://example.com".to_owned(),
+            },
+            AuthFlowEffect::Prompt {
+                prompt_id: "confirm".to_owned(),
+                message: "Confirm".to_owned(),
+                choices: vec!["yes".to_owned(), "no".to_owned()],
+            },
+            AuthFlowEffect::DisplayDeviceCode {
+                verification_url: "https://example.com/device".to_owned(),
+                user_code: "ABCD".to_owned(),
+                expires_in_seconds: Some(60),
+            },
+            AuthFlowEffect::Message {
+                message: "Done".to_owned(),
+            },
+        ];
+        let mut output = Vec::new();
+        for effect in &effects {
+            write_auth_effect(&mut output, effect).unwrap();
+            let mut empty = &mut [][..];
+            assert!(write_auth_effect(&mut empty, effect).is_err());
+        }
+        assert_eq!(
+            output,
+            b"Open in browser: https://example.com\nConfirm\nChoices: yes, no\nOpen https://example.com/device and enter code ABCD\nDone\n"
+        );
+        let mut empty = &mut [][..];
+        write_auth_effect(&mut empty, &AuthFlowEffect::Wait { millis: 1 }).unwrap();
+    }
+
+    #[test]
+    fn auth_output_propagates_flush_failures() {
+        struct FlushFailure;
+        impl std::io::Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let effect = bcode_provider_auth_models::AuthFlowEffect::Message {
+            message: "Ready".to_owned(),
+        };
+        for result in [
+            write_auth_effect(&mut FlushFailure, &effect),
+            write_auth_diagnostic(&mut FlushFailure, "ready", "Ready"),
+        ] {
+            assert!(
+                matches!(result, Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+            );
+        }
+        write_auth_effect(
+            &mut FlushFailure,
+            &bcode_provider_auth_models::AuthFlowEffect::Wait { millis: 1 },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn auth_terminal_diagnostics_are_reported_only_after_validation() {
+        use bcode_provider_auth_models::{
+            AUTH_FLOW_SCHEMA_VERSION, AuthDiagnostic, AuthDiagnosticSeverity, AuthFlowResponse,
+            AuthFlowStatus,
+        };
+        for status in [AuthFlowStatus::Failed, AuthFlowStatus::Cancelled] {
+            let mut response = AuthFlowResponse {
+                schema_version: AUTH_FLOW_SCHEMA_VERSION,
+                status,
+                state: None,
+                effects: Vec::new(),
+                credentials: BTreeMap::new(),
+                diagnostics: vec![AuthDiagnostic {
+                    code: "denied".to_owned(),
+                    severity: AuthDiagnosticSeverity::Error,
+                    message: "Access denied".to_owned(),
+                    remediation: None,
+                }],
+            };
+            let mut output = Vec::new();
+            let error = prepare_auth_flow_response(&mut output, &response).unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                if status == AuthFlowStatus::Cancelled {
+                    4
+                } else {
+                    1
+                }
+            );
+            assert_eq!(output, b"Diagnostic [denied]: Access denied\n");
+            response.diagnostics[0].remediation = Some("Check provider access".to_owned());
+            output.clear();
+            assert!(prepare_auth_flow_response(&mut output, &response).is_err());
+            assert_eq!(
+                output,
+                b"Diagnostic [denied]: Access denied\n  remediation: Check provider access\n"
+            );
+            // Permit the diagnostic line but fail on remediation output.
+            let mut storage = [0_u8; 35];
+            let mut limited = &mut storage[..];
+            let error = prepare_auth_flow_response(&mut limited, &response).unwrap_err();
+            assert!(
+                matches!(error, CliError::Signal(error) if error.kind() == std::io::ErrorKind::WriteZero)
+            );
+            response.schema_version += 1;
+            output.clear();
+            assert!(prepare_auth_flow_response(&mut output, &response).is_err());
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
     fn auth_diagnostic_output_is_fallible() {
         struct Broken;
         impl std::io::Write for Broken {
@@ -17271,9 +17418,31 @@ auth_profile = "openai"
     }
 
     #[test]
+    fn auth_input_preserves_exact_choices_and_full_size_lines() {
+        let prompt = bcode_provider_auth_models::AuthFlowEffect::Prompt {
+            prompt_id: "choice".to_owned(),
+            message: "Choose".to_owned(),
+            choices: vec![" yes ".to_owned()],
+        };
+        let answer = read_auth_input_line(std::io::Cursor::new(b" yes \r\n")).unwrap();
+        prompt.validate_answer(&answer).unwrap();
+        for ending in ["", "\n", "\r\n"] {
+            let answer = "é".repeat(MAX_CLI_AUTH_INPUT_BYTES / 2);
+            let mut input = std::io::Cursor::new(format!("{answer}{ending}"));
+            assert_eq!(read_auth_input_line(&mut input).unwrap(), answer);
+            let oversized = format!("{answer}x{ending}");
+            assert!(read_auth_input_line(std::io::Cursor::new(oversized)).is_err());
+        }
+        assert_eq!(
+            read_auth_input_line(std::io::Cursor::new(b"value\r")).unwrap(),
+            "value\r"
+        );
+    }
+
+    #[test]
     fn auth_input_is_bounded_and_preserves_following_lines() {
         let mut input = std::io::Cursor::new(b" first \r\nsecond\n");
-        assert_eq!(read_auth_input_line(&mut input).unwrap(), "first");
+        assert_eq!(read_auth_input_line(&mut input).unwrap(), " first ");
         assert_eq!(read_auth_input_line(&mut input).unwrap(), "second");
         assert!(read_auth_input_line(&mut input).is_err());
         assert_eq!(
@@ -17283,7 +17452,7 @@ auth_profile = "openai"
         assert!(read_auth_input_line(std::io::Cursor::new([0xff])).is_err());
         let mut oversized = std::io::Cursor::new(vec![b'x'; MAX_CLI_AUTH_INPUT_BYTES + 20]);
         assert!(read_auth_input_line(&mut oversized).is_err());
-        assert_eq!(oversized.position(), (MAX_CLI_AUTH_INPUT_BYTES + 1) as u64);
+        assert_eq!(oversized.position(), (MAX_CLI_AUTH_INPUT_BYTES + 3) as u64);
         assert_eq!(
             read_auth_input_line(std::io::Cursor::new(vec![b'x'; MAX_CLI_AUTH_INPUT_BYTES]))
                 .unwrap()
