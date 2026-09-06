@@ -7000,6 +7000,7 @@ mod tests {
                 .await
                 .expect("restore test fixture");
         }
+        assert_runtime_timestamp_damage_rejected(&db).await;
         assert_eq!(
             db.runtime_work_history(1)
                 .await
@@ -7007,6 +7008,39 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    async fn assert_runtime_timestamp_damage_rejected(db: &SessionDb) {
+        for column in ["started_at_ms", "finished_at_ms"] {
+            db.database()
+                .update("runtime_work")
+                .value(column, -1_i64)
+                .where_eq("work_id", "unknown-projection")
+                .execute(db.database())
+                .await
+                .expect("damage timestamp fixture");
+            assert!(matches!(db.runtime_work_history(1).await,
+                Err(SessionDbError::InvalidRow { column: invalid }) if invalid == column));
+            assert!(matches!(db.active_runtime_work().await,
+                Err(SessionDbError::InvalidRow { column: invalid }) if invalid == column));
+            let row = db
+                .database()
+                .select("runtime_work")
+                .columns(&[column])
+                .where_eq("work_id", "unknown-projection")
+                .execute_first(db.database())
+                .await
+                .expect("inspect timestamp")
+                .expect("row");
+            assert_eq!(required_i64(&row, column).expect("unchanged timestamp"), -1);
+            db.database()
+                .update("runtime_work")
+                .value(column, DatabaseValue::Null)
+                .where_eq("work_id", "unknown-projection")
+                .execute(db.database())
+                .await
+                .expect("restore timestamp fixture");
+        }
     }
 
     #[tokio::test]
