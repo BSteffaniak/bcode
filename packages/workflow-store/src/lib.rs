@@ -19889,6 +19889,21 @@ mod tests {
     fn schema_16_migration_adds_source_index_without_rebuilding_graph() {
         let (temp, store) = initialized_store();
         let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
+        let node_id = &nodes[0].node.id;
+        let edge = bcode_workflow::EdgeDefinition {
+            from: node_id.clone(),
+            to: node_id.clone(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 42, 1, ?1, ?1, ?2)",
+                rusqlite::params![node_id, serde_json::to_string(&edge).expect("serialize")],
+            )
+            .expect("persist edge");
+        let edges = store.run_graph_edges("run-1", None, 100).expect("edges");
         store
             .connection
             .execute_batch(
@@ -19906,6 +19921,18 @@ mod tests {
         assert_eq!(
             store.run_graph_nodes("run-1", None, 100).expect("nodes"),
             nodes
+        );
+        assert_eq!(
+            store
+                .run_graph_edges("run-1", None, 100)
+                .expect("preserved edges"),
+            edges
+        );
+        assert_eq!(
+            store
+                .run_graph_outgoing_edges("run-1", node_id, None, 100)
+                .expect("indexed edges"),
+            edges
         );
         let index_count: u64 = store.connection.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'workflow_run_graph_edges_source'",
