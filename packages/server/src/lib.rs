@@ -82,9 +82,9 @@ use bcode_ipc::{
     RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
     RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
     RalphStatusSummary, RalphValidationSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, SessionCatalogSourceStatus, SessionCatalogStatus, WorktreeCreateRequest,
-    WorktreeListRequest, WorktreeRemoveRequest, decode_request, encode_envelope_frames,
-    event_envelope, recv_envelope, response_envelope, write_encoded_envelope_frames,
+    ServerStopMode, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
+    decode_request, encode_envelope_frames, event_envelope, recv_envelope, response_envelope,
+    write_encoded_envelope_frames,
 };
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
@@ -115,6 +115,7 @@ use bcode_session_models::{
     WorkId,
 };
 use bcode_session_models::{ExecutionSessionProvenance, PermissionSummary};
+use bcode_session_models::{SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_skill::{
     SkillPromptCatalogMode, SkillPromptCatalogOptions, SkillRegistry, SkillRegistryOptions,
     anchor_skill_source_roots, evaluate_skill_tool_call, format_skill_catalog_for_prompt,

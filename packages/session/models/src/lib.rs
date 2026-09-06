@@ -37,6 +37,39 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
+/// Session catalog discovery status, versioned by the enclosing application protocol.
+///
+/// This describes derived discovery state, not canonical session validity or authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCatalogStatus {
+    /// Discovery has not started.
+    #[default]
+    NotStarted,
+    /// Discovery is in progress.
+    Loading,
+    /// Discovery completed successfully.
+    Loaded,
+    /// Discovery returned partial results with a diagnostic.
+    Degraded(String),
+    /// Discovery failed with a diagnostic.
+    Failed(String),
+}
+
+/// Per-source catalog discovery state, versioned by the enclosing application protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogSourceStatus {
+    /// Stable discovery source identifier.
+    pub source_id: String,
+    /// Human-readable discovery source name.
+    pub display_name: String,
+    /// Current discovery state.
+    pub status: SessionCatalogStatus,
+    /// Last update in milliseconds since the Unix epoch; zero when unavailable.
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
 /// Maximum byte count accepted by a single session artifact range read.
 pub const MAX_SESSION_ARTIFACT_RANGE_BYTES: u32 = 1024 * 1024;
 

@@ -1,7 +1,7 @@
 //! Transport-neutral application operations for session lifecycle behavior.
 
 use super::{ServerState, session_catalog::SessionCatalogSnapshot};
-use bcode_ipc::SessionCatalogStatus;
+use bcode_session_models::SessionCatalogStatus;
 use bcode_session_models::SessionSummary;
 use std::{
     path::{Path, PathBuf},

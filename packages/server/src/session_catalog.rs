@@ -1,9 +1,9 @@
 //! Unified non-blocking session catalog snapshots.
 
 use crate::ServerState;
-use bcode_ipc::{SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session::SessionCatalogEntry;
 use bcode_session_import::ImportableSessionStatus;
+use bcode_session_models::{SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session_models::{SessionId, SessionImportSummary, SessionSummary, SessionTitleSource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

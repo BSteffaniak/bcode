@@ -15,18 +15,19 @@ use bcode_ipc::{
     RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
     RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
     SessionBulkMigrationOperationStatus, SessionBulkMigrationStartRequest,
-    SessionCatalogSourceStatus, SessionCatalogStatus, SessionCompatibilityInventoryRequest,
-    SessionCompatibilityInventoryResponse, SessionImportWarning, WorktreeCreateOperationStatus,
-    WorktreeCreateRequest, WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse,
-    WorktreeRemoveRequest, WorktreeRemoveResponse, current_working_directory, decode_event,
-    decode_response, default_endpoint, recv_envelope, request_envelope, send_envelope,
+    SessionCompatibilityInventoryRequest, SessionCompatibilityInventoryResponse,
+    SessionImportWarning, WorktreeCreateOperationStatus, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
+    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_session_models::{
-    ClientId, ProjectionWindowRequest, SessionDerivationPromptPage, SessionDerivationPromptQuery,
-    SessionDerivationRequest, SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome,
-    SessionEvent, SessionEventKind, SessionHistoryAroundQuery, SessionHistoryPage,
-    SessionHistoryQuery, SessionHistoryWindow, SessionId, SessionInputHistoryEntry,
-    SessionInspectionPage, SessionInspectionQuery, SessionSummary, WorkId,
+    ClientId, ProjectionWindowRequest, SessionCatalogSourceStatus, SessionCatalogStatus,
+    SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationRequest,
+    SessionDerivationSourceSnapshot, SessionDerivationTerminalOutcome, SessionEvent,
+    SessionEventKind, SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery,
+    SessionHistoryWindow, SessionId, SessionInputHistoryEntry, SessionInspectionPage,
+    SessionInspectionQuery, SessionSummary, WorkId,
 };
 use bcode_session_models::{PendingToolExchangeSummary, PermissionSummary};
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};

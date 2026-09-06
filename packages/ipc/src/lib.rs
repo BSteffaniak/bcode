@@ -1159,26 +1159,65 @@ pub struct ClientRuntimeContext {
     pub env_keys: BTreeMap<String, bool>,
 }
 
-/// Persistent session catalog discovery status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionCatalogStatus {
-    #[default]
-    NotStarted,
-    Loading,
-    Loaded,
-    Degraded(String),
-    Failed(String),
-}
+// Compatibility exports; catalog observation contracts belong to the session domain.
+pub use bcode_session_models::{SessionCatalogSourceStatus, SessionCatalogStatus};
 
-/// Per-source session catalog discovery status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionCatalogSourceStatus {
-    pub source_id: String,
-    pub display_name: String,
-    pub status: SessionCatalogStatus,
-    #[serde(default)]
-    pub updated_at_ms: u64,
+#[cfg(test)]
+mod catalog_contract_tests {
+    use super::{SessionCatalogSourceStatus, SessionCatalogStatus};
+
+    #[test]
+    fn catalog_status_wire_values_remain_domain_owned() {
+        for (status, json) in [
+            (
+                SessionCatalogStatus::NotStarted,
+                serde_json::json!("not_started"),
+            ),
+            (SessionCatalogStatus::Loading, serde_json::json!("loading")),
+            (SessionCatalogStatus::Loaded, serde_json::json!("loaded")),
+            (
+                SessionCatalogStatus::Degraded("partial".into()),
+                serde_json::json!({"degraded": "partial"}),
+            ),
+            (
+                SessionCatalogStatus::Failed("unavailable".into()),
+                serde_json::json!({"failed": "unavailable"}),
+            ),
+        ] {
+            let domain: bcode_session_models::SessionCatalogStatus = status;
+            assert_eq!(serde_json::to_value(&domain).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<SessionCatalogStatus>(json).unwrap(),
+                domain
+            );
+        }
+        assert!(
+            serde_json::from_value::<SessionCatalogStatus>(serde_json::json!("future_status"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_source_preserves_legacy_timestamp_default_and_wire_shape() {
+        let legacy = serde_json::json!({
+            "source_id": "native", "display_name": "Bcode", "status": "loaded"
+        });
+        let source: bcode_session_models::SessionCatalogSourceStatus =
+            serde_json::from_value::<SessionCatalogSourceStatus>(legacy).unwrap();
+        assert_eq!(source.updated_at_ms, 0);
+        let expected = serde_json::json!({
+            "source_id": "native", "display_name": "Bcode", "status": "loaded", "updated_at_ms": 42
+        });
+        let source = SessionCatalogSourceStatus {
+            updated_at_ms: 42,
+            ..source
+        };
+        assert_eq!(serde_json::to_value(&source).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<SessionCatalogSourceStatus>(expected).unwrap(),
+            source
+        );
+    }
 }
 
 /// Local server status summary.
