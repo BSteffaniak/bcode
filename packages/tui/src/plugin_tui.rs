@@ -1675,6 +1675,7 @@ library = "libdynamic_visual_test.dylib"
             dynamic_cache.cache
         );
         drop(dynamic_cache);
+        drop(presentation);
         assert_eq!(routed.header.title.as_deref(), Some("Dynamic shell"));
         assert_eq!(routed.header.timeout_ms, Some(321));
         assert_eq!(routed_text(&routed), "dynamic:success:artifact-0");
@@ -2024,6 +2025,7 @@ library = "libdynamic_visual_test.dylib"
                     "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 })
             );
+            drop(presentation);
         }
     }
 
