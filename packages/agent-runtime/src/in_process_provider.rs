@@ -211,28 +211,39 @@ where
     /// Panics if an internal turn-registry lock has been poisoned.
     pub fn shutdown_wait(&mut self) -> RuntimeFuture<'_, ()> {
         self.closed = true;
-        for state in self.turns.lock().expect("turn registry").values() {
+        let mut after = None;
+        loop {
+            let next = {
+                let turns = self.turns.lock().expect("turn registry");
+                let lower = after
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                turns
+                    .range::<String, _>((lower, std::ops::Bound::Unbounded))
+                    .next()
+                    .map(|(id, state)| (id.clone(), Arc::clone(state)))
+            };
+            let Some((id, state)) = next else { break };
+            after = Some(id);
+            // Cancellation may synchronously wake code that accesses the registry.
             state.finish_cancelled();
             state.cancellation.cancel();
         }
         Box::pin(async move {
-            let drain = async {
-                loop {
-                    let next = self
-                        .turns
-                        .lock()
-                        .expect("turn registry")
-                        .iter()
-                        .next()
-                        .map(|(id, state)| (id.clone(), Arc::clone(state)));
-                    let Some((id, state)) = next else {
-                        break;
-                    };
-                    state.released.cancelled().await;
-                    self.turns.lock().expect("turn registry").remove(&id);
-                }
-            };
-            drain.await;
+            loop {
+                let next = self
+                    .turns
+                    .lock()
+                    .expect("turn registry")
+                    .iter()
+                    .next()
+                    .map(|(id, state)| (id.clone(), Arc::clone(state)));
+                let Some((id, state)) = next else {
+                    break;
+                };
+                state.released.cancelled().await;
+                self.turns.lock().expect("turn registry").remove(&id);
+            }
             Ok(())
         })
     }
@@ -801,6 +812,119 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_wait_requires_every_worker_release() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        let first = Arc::new(InProcessTurnState::new());
+        let second = Arc::new(InProcessTurnState::new());
+        provider.turns.lock().unwrap().extend([
+            ("a".into(), Arc::clone(&first)),
+            ("b".into(), Arc::clone(&second)),
+        ]);
+        {
+            let mut wait = provider.shutdown_wait();
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(first.cancellation.is_cancelled());
+            assert!(second.cancellation.is_cancelled());
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+            first.released.cancel();
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+        }
+        assert_eq!(provider.turns.lock().unwrap().len(), 1);
+        assert!(provider.turns.lock().unwrap().contains_key("b"));
+        second.released.cancel();
+        {
+            let mut wait = provider.shutdown_wait();
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                wait.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+        }
+        assert!(provider.turns.lock().unwrap().is_empty());
+        drop(provider);
+    }
+
+    #[test]
+    fn shutdown_cancellation_wakes_outside_registry_lock() {
+        struct RegistryWake(Arc<Mutex<BTreeMap<String, Arc<InProcessTurnState>>>>);
+        impl std::task::Wake for RegistryWake {
+            fn wake(self: Arc<Self>) {
+                let mut turns = self
+                    .0
+                    .try_lock()
+                    .expect("registry held during cancellation wake");
+                let state = turns.remove("held").expect("woken turn remains owned");
+                drop(turns);
+                state.released.cancel();
+            }
+        }
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        let state = Arc::new(InProcessTurnState::new());
+        provider
+            .turns
+            .lock()
+            .unwrap()
+            .insert("held".into(), Arc::clone(&state));
+        let later = Arc::new(InProcessTurnState::new());
+        provider
+            .turns
+            .lock()
+            .unwrap()
+            .insert("later".into(), Arc::clone(&later));
+        let waker = std::task::Waker::from(Arc::new(RegistryWake(Arc::clone(&provider.turns))));
+        let mut cancelled = Box::pin(state.cancellation.cancelled());
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
+        drop(provider.shutdown_wait());
+        assert!(cancelled.as_mut().poll(&mut context).is_ready());
+        assert!(state.released.is_cancelled());
+        assert!(later.cancellation.is_cancelled());
+        assert_eq!(provider.turns.lock().unwrap().len(), 1);
+        later.released.cancel();
+        {
+            let mut wait = provider.shutdown_wait();
+            assert!(matches!(
+                wait.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+        }
+        drop(provider);
+    }
+
+    #[test]
+    fn shutdown_wait_is_woken_by_worker_release() {
+        struct ReleaseWake(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for ReleaseWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        let state = Arc::new(InProcessTurnState::new());
+        provider
+            .turns
+            .lock()
+            .unwrap()
+            .insert("held".into(), Arc::clone(&state));
+        let wake = Arc::new(ReleaseWake(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&wake));
+        {
+            let mut wait = provider.shutdown_wait();
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+            assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+            state.released.cancel();
+            assert!(wake.0.load(Ordering::SeqCst) > 0);
+            assert!(matches!(
+                wait.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+        }
+        assert!(provider.turns.lock().unwrap().is_empty());
+        drop(provider);
+    }
+
+    #[test]
     fn shutdown_wait_needs_no_runtime_and_retains_abandoned_work() {
         let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
         let state = Arc::new(InProcessTurnState::new());
@@ -1352,6 +1476,99 @@ mod tests {
         .await
         .expect("provider future resource released");
         assert!(adapter.turns.lock().expect("turns").is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_releases_all_running_provider_resources() {
+        struct Resources {
+            started: std::sync::atomic::AtomicUsize,
+            released: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        struct ResourceCount(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for ResourceCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+        impl InProcessModelProvider for Resources {
+            fn run_turn(
+                &self,
+                _: ModelTurnRequest,
+                _: InProcessProviderContext,
+            ) -> InProcessProviderFuture<'_> {
+                Box::pin(async move {
+                    let _resource = ResourceCount(Arc::clone(&self.released));
+                    self.started.fetch_add(1, Ordering::Release);
+                    std::future::pending().await
+                })
+            }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut adapter = InProcessModelProviderAdapter::new(Resources {
+            started: std::sync::atomic::AtomicUsize::new(0),
+            released: Arc::clone(&released),
+        });
+        for _ in 0..2 {
+            adapter
+                .start_turn(None, &model_request("multiple resources"))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.provider.started.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both provider workers started");
+        assert_eq!(released.load(Ordering::Acquire), 0);
+        tokio::time::timeout(Duration::from_secs(2), adapter.shutdown_wait())
+            .await
+            .expect("all workers released")
+            .unwrap();
+        assert_eq!(released.load(Ordering::Acquire), 2);
+        assert!(adapter.turns.lock().unwrap().is_empty());
+        adapter.shutdown_wait().await.unwrap();
+        drop(adapter);
+        assert_eq!(released.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_acknowledges_running_provider_resource_release() {
+        let started = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let mut adapter = InProcessModelProviderAdapter::new(ResourceProvider {
+            started: Arc::clone(&started),
+            released: Arc::clone(&released),
+        });
+        adapter
+            .start_turn(None, &model_request("shutdown resource"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider acquired resource");
+        assert!(!released.load(Ordering::Acquire));
+        {
+            let invoker: &mut dyn ModelProviderInvoker = &mut adapter;
+            tokio::time::timeout(Duration::from_secs(2), invoker.shutdown_wait())
+                .await
+                .expect("shutdown completed")
+                .unwrap();
+        }
+        assert!(released.load(Ordering::Acquire));
+        assert!(adapter.turns.lock().unwrap().is_empty());
+        assert!(
+            adapter
+                .start_turn(None, &model_request("closed"))
+                .await
+                .is_err()
+        );
+        drop(adapter);
     }
 
     #[tokio::test]
