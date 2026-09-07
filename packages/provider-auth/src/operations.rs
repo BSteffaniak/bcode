@@ -76,6 +76,112 @@ pub fn update_credentials(
     })
 }
 
+/// Registered auth-provider identity bound by the host from its plugin registry.
+///
+/// The host looks this up by the requested provider ID; the caller cannot supply it.
+#[derive(Debug, Clone, Copy)]
+pub struct RegisteredAuthProviderOwner<'a> {
+    /// Plugin that registered the provider contribution.
+    pub plugin_id: &'a str,
+    /// Methods the registered contribution declares.
+    pub methods: &'a [AuthMethodContribution],
+}
+
+/// Host-owned resolution for one `bcode.provider-auth-host` bridge request.
+///
+/// Both the daemon and the embedded runtime route plugin-initiated
+/// [`bcode_provider_auth_models::OP_UPDATE_CREDENTIALS`] requests through this function so the
+/// ownership rules stay identical across hosts:
+///
+/// * The caller plugin must be the plugin that registered the target auth provider.
+/// * The requested profile must resolve for that provider and owner.
+/// * The resolved profile's scheme must name a method the registration declares.
+/// * Vault custody and credential-shape checks are enforced by [`update_credentials`].
+///
+/// Requests for other interfaces or operations return
+/// [`bcode_tool::ToolInvocationServiceResolution::Unsupported`] so hosts can chain resolvers.
+#[must_use]
+pub fn resolve_credential_update_service_request<'registry>(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    caller_plugin_id: &str,
+    registered_provider: impl FnOnce(&str) -> Option<RegisteredAuthProviderOwner<'registry>>,
+    request: bcode_tool::ToolInvocationServiceRequest,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_UPDATE_CREDENTIALS};
+    use bcode_tool::ToolInvocationServiceResolution as Resolution;
+
+    if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_UPDATE_CREDENTIALS
+    {
+        return Resolution::Unsupported;
+    }
+    let Ok(update) = serde_json::from_value::<AuthCredentialUpdateRequest>(request.payload) else {
+        return Resolution::Failed {
+            code: "invalid_request".to_owned(),
+            message: "invalid provider-auth credential update request".to_owned(),
+        };
+    };
+    let provider_id = update.provider_id.clone();
+    let Some(registered) = registered_provider(&provider_id) else {
+        return Resolution::Failed {
+            code: "auth_provider_unregistered".to_owned(),
+            message: "authentication provider is not registered".to_owned(),
+        };
+    };
+    if registered.plugin_id != caller_plugin_id {
+        return Resolution::Failed {
+            code: "auth_owner_mismatch".to_owned(),
+            message: "authentication provider is owned by another plugin".to_owned(),
+        };
+    }
+    let resolved = match crate::resolve_auth_provider_profile(
+        config,
+        &provider_id,
+        caller_plugin_id,
+        Some(&update.profile),
+        runtime,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Resolution::Failed {
+                code: "auth_profile_unavailable".to_owned(),
+                message: error.to_string(),
+            };
+        }
+    };
+    let Some(method) = registered
+        .methods
+        .iter()
+        .find(|method| resolved.profile.scheme.as_deref() == Some(method.method_id()))
+    else {
+        return Resolution::Failed {
+            code: "auth_method_unavailable".to_owned(),
+            message: "owned auth profile method is not registered".to_owned(),
+        };
+    };
+    match update_credentials(
+        AuthCredentialUpdateContext {
+            caller_plugin_id,
+            provider_id: &provider_id,
+            resolved: &resolved,
+            method,
+        },
+        update,
+    ) {
+        Ok(response) => serde_json::to_value(response).map_or_else(
+            |_| Resolution::Failed {
+                code: "auth_response_encode_failed".to_owned(),
+                message: "credential update response could not be encoded".to_owned(),
+            },
+            |payload| Resolution::Responded { payload },
+        ),
+        Err(error) => Resolution::Failed {
+            code: "auth_credential_update_failed".to_owned(),
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Host security-inspection failure.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthSecurityInspectionError {
@@ -442,5 +548,188 @@ mod tests {
             .is_err()
         );
         assert!(!invalid_vault.exists());
+    }
+
+    fn update_service_request(
+        provider_id: &str,
+        profile: &str,
+        access_token: &str,
+    ) -> bcode_tool::ToolInvocationServiceRequest {
+        bcode_tool::ToolInvocationServiceRequest {
+            invocation_id: "turn-1".to_owned(),
+            request_id: "turn-1-credential-refresh".to_owned(),
+            route_id: None,
+            interface_id: bcode_provider_auth_models::AUTH_HOST_INTERFACE_ID.to_owned(),
+            operation: bcode_provider_auth_models::OP_UPDATE_CREDENTIALS.to_owned(),
+            payload: serde_json::to_value(AuthCredentialUpdateRequest {
+                schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                provider_id: provider_id.to_owned(),
+                profile: profile.to_owned(),
+                credentials: BTreeMap::from([
+                    ("access_token".to_owned(), Some(access_token.to_owned())),
+                    (
+                        "refresh_token".to_owned(),
+                        Some("rotated-refresh".to_owned()),
+                    ),
+                    ("expires_at".to_owned(), Some("4102444800".to_owned())),
+                    ("id_token".to_owned(), None),
+                    ("account_id".to_owned(), None),
+                ]),
+            })
+            .expect("update payload"),
+        }
+    }
+
+    fn failed_code(resolution: &bcode_tool::ToolInvocationServiceResolution) -> &str {
+        match resolution {
+            bcode_tool::ToolInvocationServiceResolution::Failed { code, .. } => code,
+            other => panic!("expected failed resolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn credential_update_service_request_binds_registry_ownership_and_persists_to_vault() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vault = temp.path().join("vault");
+        let resolved = resolved(&vault);
+        let method = method();
+        let methods = vec![method.clone()];
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                profiles: BTreeMap::from([("openai".to_owned(), resolved.profile.clone())]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let runtime = bcode_config::RuntimeAuthSubscriptions::default();
+        let registry = |plugin_id: &'static str| {
+            let registered = BTreeMap::from([(
+                resolved.provider_id.clone(),
+                RegisteredAuthProviderOwner {
+                    plugin_id,
+                    methods: &methods,
+                },
+            )]);
+            move |provider_id: &str| registered.get(provider_id).copied()
+        };
+
+        // Foreign interface/operation: hosts must be able to chain resolvers.
+        let mut unrelated = update_service_request("openai", "openai", "ignored");
+        unrelated.operation = "inspect_security".to_owned();
+        assert!(matches!(
+            resolve_credential_update_service_request(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                registry("bcode.openai-compatible"),
+                unrelated,
+            ),
+            bcode_tool::ToolInvocationServiceResolution::Unsupported
+        ));
+
+        // Unregistered provider IDs fail before any profile lookup.
+        assert_eq!(
+            failed_code(&resolve_credential_update_service_request(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                registry("bcode.openai-compatible"),
+                update_service_request("xai", "openai", "leak"),
+            )),
+            "auth_provider_unregistered"
+        );
+
+        // The caller must be the plugin that registered the provider.
+        assert_eq!(
+            failed_code(&resolve_credential_update_service_request(
+                &config,
+                &runtime,
+                "bcode.other",
+                registry("bcode.openai-compatible"),
+                update_service_request("openai", "openai", "leak"),
+            )),
+            "auth_owner_mismatch"
+        );
+
+        // The profile must resolve for the provider and owner.
+        assert_eq!(
+            failed_code(&resolve_credential_update_service_request(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                registry("bcode.openai-compatible"),
+                update_service_request("openai", "missing-profile", "leak"),
+            )),
+            "auth_profile_unavailable"
+        );
+
+        // The resolved profile scheme must name a registered method.
+        let api_key_only = vec![AuthMethodContribution::SecretFields {
+            method_id: "api_key".to_owned(),
+            display_name: "API key".to_owned(),
+            fields: Vec::new(),
+            supports_verification: false,
+            supports_revocation: false,
+        }];
+        assert_eq!(
+            failed_code(&resolve_credential_update_service_request(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                |_: &str| Some(RegisteredAuthProviderOwner {
+                    plugin_id: "bcode.openai-compatible",
+                    methods: &api_key_only,
+                }),
+                update_service_request("openai", "openai", "leak"),
+            )),
+            "auth_method_unavailable"
+        );
+        assert!(
+            !vault.exists(),
+            "rejected requests must not touch the vault"
+        );
+
+        // Owned, well-formed request persists through host custody.
+        let resolution = resolve_credential_update_service_request(
+            &config,
+            &runtime,
+            "bcode.openai-compatible",
+            registry("bcode.openai-compatible"),
+            update_service_request("openai", "openai", "fresh-access"),
+        );
+        let bcode_tool::ToolInvocationServiceResolution::Responded { payload } = resolution else {
+            panic!("expected responded resolution, got {resolution:?}");
+        };
+        let response: AuthCredentialUpdateResponse =
+            serde_json::from_value(payload).expect("update response");
+        assert_eq!(
+            response.updated_credentials,
+            vec![
+                "access_token",
+                "account_id",
+                "expires_at",
+                "id_token",
+                "refresh_token",
+            ]
+        );
+        let stored =
+            AuthVaultLifecycle::new(&resolved, "openai", "bcode.openai-compatible", &method)
+                .expect("owned lifecycle")
+                .read()
+                .expect("read vault");
+        assert_eq!(
+            stored.get("access_token").map(String::as_str),
+            Some("fresh-access")
+        );
+        assert_eq!(
+            stored.get("refresh_token").map(String::as_str),
+            Some("rotated-refresh")
+        );
+        assert_eq!(
+            stored.get("expires_at").map(String::as_str),
+            Some("4102444800")
+        );
+        assert!(!stored.contains_key("id_token"));
     }
 }

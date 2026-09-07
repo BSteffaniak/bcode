@@ -3834,20 +3834,6 @@ fn provider_auth_bridge_resolution(
     caller_plugin_id: &str,
     request: bcode_tool::ToolInvocationServiceRequest,
 ) -> bcode_tool::ToolInvocationServiceResolution {
-    use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_UPDATE_CREDENTIALS};
-
-    if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_UPDATE_CREDENTIALS
-    {
-        return bcode_tool::ToolInvocationServiceResolution::Unsupported;
-    }
-    let Ok(update) = serde_json::from_value::<
-        bcode_provider_auth_models::AuthCredentialUpdateRequest,
-    >(request.payload) else {
-        return bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "invalid_request".to_owned(),
-            message: "invalid provider-auth credential update request".to_owned(),
-        };
-    };
     let Ok(config) = bcode_config::load_config() else {
         return bcode_tool::ToolInvocationServiceResolution::Failed {
             code: "auth_config_unavailable".to_owned(),
@@ -3855,66 +3841,20 @@ fn provider_auth_bridge_resolution(
         };
     };
     let runtime = bcode_config::load_runtime_auth_subscriptions();
-    let Some(registered) = plugins.auth_provider(&update.provider_id) else {
-        return bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "auth_provider_unregistered".to_owned(),
-            message: "authentication provider is not registered".to_owned(),
-        };
-    };
-    if registered.plugin_id != caller_plugin_id {
-        return bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "auth_owner_mismatch".to_owned(),
-            message: "authentication provider is owned by another plugin".to_owned(),
-        };
-    }
-    let provider_id = update.provider_id.clone();
-    let resolved = match bcode_provider_auth::resolve_auth_provider_profile(
+    bcode_provider_auth::operations::resolve_credential_update_service_request(
         &config,
-        &provider_id,
-        caller_plugin_id,
-        Some(&update.profile),
         &runtime,
-    ) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            return bcode_tool::ToolInvocationServiceResolution::Failed {
-                code: "auth_profile_unavailable".to_owned(),
-                message: error.to_string(),
-            };
-        }
-    };
-    let method = registered
-        .contribution
-        .methods
-        .iter()
-        .find(|method| resolved.profile.scheme.as_deref() == Some(method.method_id()));
-    let Some(method) = method else {
-        return bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "auth_method_unavailable".to_owned(),
-            message: "owned auth profile method is not registered".to_owned(),
-        };
-    };
-    match bcode_provider_auth::operations::update_credentials(
-        bcode_provider_auth::operations::AuthCredentialUpdateContext {
-            caller_plugin_id,
-            provider_id: &provider_id,
-            resolved: &resolved,
-            method,
+        caller_plugin_id,
+        |provider_id| {
+            plugins.auth_provider(provider_id).map(|registered| {
+                bcode_provider_auth::operations::RegisteredAuthProviderOwner {
+                    plugin_id: &registered.plugin_id,
+                    methods: &registered.contribution.methods,
+                }
+            })
         },
-        update,
-    ) {
-        Ok(response) => serde_json::to_value(response).map_or_else(
-            |_| bcode_tool::ToolInvocationServiceResolution::Failed {
-                code: "auth_response_encode_failed".to_owned(),
-                message: "credential update response could not be encoded".to_owned(),
-            },
-            |payload| bcode_tool::ToolInvocationServiceResolution::Responded { payload },
-        ),
-        Err(error) => bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "auth_credential_update_failed".to_owned(),
-            message: error.to_string(),
-        },
-    }
+        request,
+    )
 }
 
 #[cfg(feature = "embedded-plugins")]

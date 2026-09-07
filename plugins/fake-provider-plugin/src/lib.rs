@@ -150,6 +150,145 @@ pub struct FakeProviderPlugin {
     state: Mutex<FakeProviderState>,
 }
 
+/// Provider ID the fake plugin registers for host credential-custody tests.
+pub const FAKE_AUTH_PROVIDER_ID: &str = "fake";
+/// Auth method ID the fake plugin registers; profiles must use this scheme.
+pub const FAKE_AUTH_METHOD_ID: &str = "fake_token";
+/// Provider setting that asks a turn to persist a refreshed credential via the host bridge.
+///
+/// The value becomes the new `access_token`. The turn errors when the host bridge is missing
+/// or rejects the update, so hosts can prove refresh persistence works end to end.
+pub const FAKE_PERSIST_REFRESHED_TOKEN_SETTING: &str = "fake_persist_refreshed_access_token";
+
+impl ConcurrentRustPlugin for FakeProviderPlugin {
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+
+    fn register_auth_providers_concurrent(
+        &self,
+        registrar: AuthRegistrar,
+    ) -> Result<(), PluginError> {
+        register_fake_auth_provider(&registrar)
+    }
+}
+
+impl RustPlugin for FakeProviderPlugin {
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_provider_service(&context)
+    }
+
+    fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
+        register_fake_auth_provider(&registrar)
+    }
+}
+
+fn register_fake_auth_provider(registrar: &AuthRegistrar) -> Result<(), PluginError> {
+    use bcode_provider_auth_models::{
+        AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthCredentialStorage, AuthMethodContribution,
+        AuthProviderContribution,
+    };
+
+    registrar
+        .register(&AuthProviderContribution {
+            schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: FAKE_AUTH_PROVIDER_ID.to_owned(),
+            display_name: "Fake provider".to_owned(),
+            methods: vec![AuthMethodContribution::Interactive {
+                method_id: FAKE_AUTH_METHOD_ID.to_owned(),
+                display_name: "Fake token".to_owned(),
+                operation: "fake_auth_flow".to_owned(),
+                credentials: ["access_token", "refresh_token", "expires_at"]
+                    .into_iter()
+                    .map(|credential_id| AuthCredentialStorage {
+                        credential_id: credential_id.to_owned(),
+                        storage_key: format!("FAKE_{}", credential_id.to_ascii_uppercase()),
+                    })
+                    .collect(),
+                supports_revocation: false,
+            }],
+        })
+        .map_err(|error| {
+            PluginError::failed(format!("failed to register fake authentication: {error}"))
+        })
+}
+
+/// Persist a refreshed credential through the host-owned `bcode.provider-auth-host` bridge.
+///
+/// Mirrors what a real provider does after rotating an OAuth token mid-turn: the plugin never
+/// touches the vault; it submits canonical credential IDs and the host binds ownership.
+fn persist_fake_refreshed_token(
+    context: &NativeServiceContext,
+    request: &ModelTurnRequest,
+    access_token: &str,
+) -> Result<(), ProviderError> {
+    let Some(profile) = request
+        .provider_context
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.profile.as_deref())
+    else {
+        return Err(fake_persist_error(
+            "refreshed credentials require an owned auth profile",
+        ));
+    };
+    let payload = serde_json::to_value(bcode_provider_auth_models::AuthCredentialUpdateRequest {
+        schema_version: bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+        provider_id: FAKE_AUTH_PROVIDER_ID.to_owned(),
+        profile: profile.to_owned(),
+        credentials: BTreeMap::from([
+            ("access_token".to_owned(), Some(access_token.to_owned())),
+            (
+                "expires_at".to_owned(),
+                Some(u64::MAX.saturating_sub(1).to_string()),
+            ),
+        ]),
+    })
+    .map_err(|error| fake_persist_error(format!("encode credential update: {error}")))?;
+    let response = context
+        .bridge
+        .request(&ServiceBridgeRequest::InvokeService(
+            bcode_tool::ToolInvocationServiceRequest {
+                invocation_id: request.turn_id.clone(),
+                request_id: format!("{}-credential-refresh", request.turn_id),
+                route_id: None,
+                interface_id: bcode_provider_auth_models::AUTH_HOST_INTERFACE_ID.to_owned(),
+                operation: bcode_provider_auth_models::OP_UPDATE_CREDENTIALS.to_owned(),
+                payload,
+            },
+        ))
+        .map_err(|error| fake_persist_error(format!("host credential update failed: {error}")))?;
+    match response {
+        ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Responded { .. },
+        ) => Ok(()),
+        ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Failed {
+            code,
+            message,
+        }) => Err(fake_persist_error(format!(
+            "host credential update failed ({code}): {message}"
+        ))),
+        other => Err(fake_persist_error(format!(
+            "unexpected host credential update response: {other:?}"
+        ))),
+    }
+}
+
+fn fake_persist_error(message: impl Into<String>) -> ProviderError {
+    ProviderError {
+        code: "token_refresh_persist_failed".to_owned(),
+        category: ProviderErrorCategory::Auth,
+        message: message.into(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    }
+}
+
 #[derive(Debug, Default)]
 struct FakeProviderState {
     next_turn: u64,
@@ -214,18 +353,6 @@ impl FakeTurn {
     }
 }
 
-impl ConcurrentRustPlugin for FakeProviderPlugin {
-    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
-        self.invoke_provider_service(&context)
-    }
-}
-
-impl RustPlugin for FakeProviderPlugin {
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        self.invoke_provider_service(&context)
-    }
-}
-
 fn configured_structured_output_execution(
     settings: &BTreeMap<String, String>,
 ) -> bcode_model::CapabilityExecution {
@@ -280,7 +407,7 @@ impl FakeProviderPlugin {
             }
             OP_COMPACT_CONTEXT => Self::compact_context(&context.request),
             OP_START_TURN => self.start_turn(
-                &context.request,
+                context,
                 context.request.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2,
             ),
             OP_RUN_TURN => self.run_turn(context),
@@ -420,12 +547,26 @@ impl FakeProviderPlugin {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
-        let request = match request.payload_json::<ModelTurnRequest>() {
+    fn start_turn(
+        &self,
+        context: &NativeServiceContext,
+        positioned_output: bool,
+    ) -> ServiceResponse {
+        let request = match context.request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
         if let Some(error) = validate_fake_request(&request) {
+            return json_response(&StartTurnResponse {
+                provider_turn_id: insert_fake_error_turn(&self.state, error),
+            });
+        }
+        if let Some(access_token) = request
+            .provider_context
+            .settings
+            .get(FAKE_PERSIST_REFRESHED_TOKEN_SETTING)
+            && let Err(error) = persist_fake_refreshed_token(context, &request, access_token)
+        {
             return json_response(&StartTurnResponse {
                 provider_turn_id: insert_fake_error_turn(&self.state, error),
             });
@@ -540,7 +681,7 @@ impl FakeProviderPlugin {
     /// and turn state is removed as this call unwinds, so no separate cancel or finish operation is
     /// needed on the push path.
     fn run_turn(&self, context: &NativeServiceContext) -> ServiceResponse {
-        let start = self.start_turn(&context.request, true);
+        let start = self.start_turn(context, true);
         if start.error.is_some() {
             return start;
         }

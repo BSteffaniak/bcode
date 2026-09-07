@@ -8258,11 +8258,11 @@ fn persist_refreshed_chatgpt_auth(
                 payload,
             },
         ))
-        .map_err(|_| {
+        .map_err(|error| {
             provider_error(
                 "token_refresh_persist_failed",
                 ProviderErrorCategory::Auth,
-                "host credential update failed",
+                format!("host credential update failed: {error}"),
             )
         })?;
     match response {
@@ -8280,12 +8280,12 @@ fn persist_refreshed_chatgpt_auth(
             )
         }),
         ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Failed {
+            code,
             message,
-            ..
         }) => Err(provider_error(
             "token_refresh_persist_failed",
             ProviderErrorCategory::Auth,
-            message,
+            format!("host credential update failed ({code}): {message}"),
         )),
         ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Cancelled) => {
             Err(provider_error(

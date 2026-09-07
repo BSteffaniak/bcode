@@ -16417,6 +16417,7 @@ async fn run_model_turn_inner(
                 catalog_provider_id: catalog_provider_id.as_deref(),
                 catalog_identity: catalog_identity.as_ref(),
                 streaming: &turn_config.model.streaming,
+                config: &turn_config,
             },
             Arc::clone(&cancel_state),
             command_context,
@@ -17734,6 +17735,9 @@ struct ModelTurnRoundContext<'a> {
     catalog_provider_id: Option<&'a str>,
     catalog_identity: Option<&'a bcode_model_catalog::ModelCatalogIdentity>,
     streaming: &'a bcode_config::StreamingConfig,
+    /// Configuration the session resolved its provider context from; host services the provider
+    /// calls back into during the turn (credential refresh persistence) resolve against it.
+    config: &'a bcode_config::BcodeConfig,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -17755,6 +17759,7 @@ async fn run_model_turn_round(
         catalog_provider_id,
         catalog_identity,
         streaming,
+        config,
     } = round;
     let round_start = Instant::now();
     let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
@@ -17790,12 +17795,18 @@ async fn run_model_turn_round(
         };
         let invocation = state
             .plugins
-            .invoke_service_with_events_scoped(
+            .invoke_service_with_events_and_bridge_scoped(
                 &push_plugin_id,
                 push_interface_id,
                 OP_RUN_TURN,
                 payload,
                 scope,
+                Some(server_model_provider_bridge(
+                    state.plugins.clone(),
+                    config.clone(),
+                    &request.turn_id,
+                    &push_plugin_id,
+                )),
             )
             .await;
         state.metrics.record_histogram_with_labels(
@@ -17832,15 +17843,12 @@ async fn run_model_turn_round(
             session_id,
             command_context,
             cancel_state.as_ref(),
-            Box::pin(invoke_model_provider_json_blocking_scoped::<
-                _,
-                StartTurnResponse,
-            >(
+            Box::pin(invoke_model_provider_start_turn_scoped(
                 state,
                 provider_plugin_id.map(ToString::to_string),
-                OP_START_TURN,
-                request.clone(),
+                request,
                 scope,
+                config,
             )),
         )
         .await;
@@ -21127,6 +21135,59 @@ where
         PluginInvocationScope::Global,
     )
     .await
+}
+
+/// Start one request/response (`start_turn` + `poll_turn_events`) provider turn.
+///
+/// Unlike the generic JSON invocation helper, this attaches the model-provider host bridge so a
+/// provider that refreshes credentials while starting the turn can persist them through
+/// `bcode.provider-auth-host`. Poll, cancel, and finish calls do not refresh credentials and stay
+/// on the bridge-less helper.
+async fn invoke_model_provider_start_turn_scoped(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    request: &ModelTurnRequest,
+    scope: PluginInvocationScope,
+    config: &bcode_config::BcodeConfig,
+) -> Result<StartTurnResponse, String> {
+    let (provider_plugin_id, interface_id) =
+        if let Some(provider_plugin_id) = provider_plugin_id.as_deref() {
+            let interface_id = model_provider_interface_for_plugin(state, provider_plugin_id)
+                .ok_or_else(|| format!("plugin {provider_plugin_id} is not a model provider"))?;
+            (provider_plugin_id.to_owned(), interface_id)
+        } else {
+            unique_model_provider_route(state)?
+        };
+    let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let bridge = server_model_provider_bridge(
+        state.plugins.clone(),
+        config.clone(),
+        &request.turn_id,
+        &provider_plugin_id,
+    );
+    let mut labels = MetricLabels::new();
+    labels.insert("provider_plugin_id".to_owned(), provider_plugin_id.clone());
+    labels.insert("operation".to_owned(), OP_START_TURN.to_owned());
+    labels.insert("scope".to_owned(), plugin_scope_kind(&scope).to_owned());
+    state
+        .metrics
+        .time_result_async("model.provider.service", labels, async {
+            let response = state
+                .plugins
+                .invoke_service_with_bridge_scoped(
+                    &provider_plugin_id,
+                    interface_id,
+                    OP_START_TURN,
+                    payload,
+                    scope,
+                    Some(bridge),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            bcode_plugin::decode_service_response::<StartTurnResponse>(response)
+                .map_err(|error| error.to_string())
+        })
+        .await
 }
 
 async fn invoke_model_provider_json_blocking_scoped<Q, R>(
@@ -24830,15 +24891,40 @@ fn request_server_plugin_bridge(
     }
 }
 
+/// Resolve one `bcode.provider-auth-host` request from a plugin the daemon is invoking.
+///
+/// `config` must be the configuration the invoking session resolved its provider context from,
+/// so profile lookups target the same declarative `auth.profiles.*` entries that produced the
+/// credentials the plugin is refreshing or inspecting. Registered-provider ownership is bound from
+/// the daemon's plugin registry; the caller cannot supply it.
 fn auth_host_service_resolution(
-    state: &ServerState,
+    plugins: &bcode_plugin::PluginRuntimeHost,
+    config: &bcode_config::BcodeConfig,
     caller_plugin_id: &str,
     request: bcode_tool::ToolInvocationServiceRequest,
 ) -> bcode_tool::ToolInvocationServiceResolution {
     use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_INSPECT_SECURITY};
 
-    if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_INSPECT_SECURITY {
+    if request.interface_id != AUTH_HOST_INTERFACE_ID {
         return bcode_tool::ToolInvocationServiceResolution::Unsupported;
+    }
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let registered_provider = |provider_id: &str| {
+        plugins.auth_provider(provider_id).map(|registered| {
+            bcode_provider_auth::operations::RegisteredAuthProviderOwner {
+                plugin_id: &registered.plugin_id,
+                methods: &registered.contribution.methods,
+            }
+        })
+    };
+    if request.operation != OP_INSPECT_SECURITY {
+        return bcode_provider_auth::operations::resolve_credential_update_service_request(
+            config,
+            &runtime,
+            caller_plugin_id,
+            registered_provider,
+            request,
+        );
     }
     let Ok(inspection) = serde_json::from_value::<
         bcode_provider_auth_models::AuthSecurityInspectionRequest,
@@ -24848,7 +24934,7 @@ fn auth_host_service_resolution(
             message: "invalid provider-auth security inspection request".to_owned(),
         };
     };
-    let Some(provider) = state.plugins.auth_provider(&inspection.provider_id) else {
+    let Some(provider) = registered_provider(&inspection.provider_id) else {
         return bcode_tool::ToolInvocationServiceResolution::Failed {
             code: "unknown_provider".to_owned(),
             message: "authentication provider is not registered".to_owned(),
@@ -24860,15 +24946,8 @@ fn auth_host_service_resolution(
             message: "authentication provider is owned by another plugin".to_owned(),
         };
     }
-    let Ok(config) = bcode_config::load_config() else {
-        return bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "auth_config_unavailable".to_owned(),
-            message: "authentication configuration is unavailable".to_owned(),
-        };
-    };
-    let runtime = bcode_config::load_runtime_auth_subscriptions();
     let resolved = match bcode_provider_auth::resolve_auth_provider_profile(
-        &config,
+        config,
         &inspection.provider_id,
         caller_plugin_id,
         Some(&inspection.profile),
@@ -24901,8 +24980,52 @@ fn auth_host_service_resolution(
     }
 }
 
+/// Build the duplex bridge one model-provider turn invocation uses to reach host services.
+///
+/// Provider plugins call back into the daemon during a turn to persist refreshed credentials
+/// through `bcode.provider-auth-host`. The bridge is bound to the provider's own `turn_id`
+/// invocation identity and to the caller plugin so a plugin cannot mutate credentials it does not
+/// own or attribute a request to another turn. Requests outside the provider-auth interface are
+/// unsupported here: exchanges, inputs, and artifacts are tool-invocation capabilities.
+fn server_model_provider_bridge(
+    plugins: bcode_plugin::PluginRuntimeHost,
+    config: bcode_config::BcodeConfig,
+    turn_id: &str,
+    caller_plugin_id: &str,
+) -> PluginInvocationBridge {
+    let turn_id = turn_id.to_owned();
+    let caller_plugin_id = caller_plugin_id.to_owned();
+    PluginInvocationBridge::new(move |request, _cancellation| match request {
+        ServiceBridgeRequest::InvokeService(request) if request.invocation_id == turn_id => {
+            Ok(ServiceBridgeResponse::Service(
+                auth_host_service_resolution(&plugins, &config, &caller_plugin_id, request),
+            ))
+        }
+        ServiceBridgeRequest::InvokeService(_) => Ok(ServiceBridgeResponse::Service(
+            ToolInvocationServiceResolution::Failed {
+                code: "invocation_id_mismatch".to_string(),
+                message: "service request does not belong to the provider turn invocation"
+                    .to_string(),
+            },
+        )),
+        ServiceBridgeRequest::Exchange(_) => Ok(ServiceBridgeResponse::Exchange(
+            ToolExchangeResolution::NoCompatibleConsumer,
+        )),
+        ServiceBridgeRequest::ReceiveInput { .. } => Ok(ServiceBridgeResponse::Input(
+            ToolInvocationInputResolution::Closed,
+        )),
+        ServiceBridgeRequest::WriteArtifact(_) => Ok(ServiceBridgeResponse::Artifact(
+            ToolArtifactWriteResolution::Failed {
+                code: "unsupported".to_string(),
+                message: "model provider turns do not write session artifacts".to_string(),
+            },
+        )),
+    })
+}
+
 fn server_workflow_plugin_bridge(
     state: Arc<ServerState>,
+    config: bcode_config::BcodeConfig,
     parent_session_id: SessionId,
     dispatch_identity: &str,
     caller_plugin_id: &str,
@@ -24949,7 +25072,7 @@ fn server_workflow_plugin_bridge(
             if request.invocation_id == dispatch_identity =>
         {
             Ok(ServiceBridgeResponse::Service(
-                auth_host_service_resolution(&state, &caller_plugin_id, request),
+                auth_host_service_resolution(&state.plugins, &config, &caller_plugin_id, request),
             ))
         }
         ServiceBridgeRequest::InvokeService(_) => Ok(ServiceBridgeResponse::Service(
@@ -29562,6 +29685,7 @@ async fn dispatch_workflow_plugin_block(
             PluginInvocationScope::session(parent_session_id.to_string()),
             Some(server_workflow_plugin_bridge(
                 Arc::clone(state),
+                state.session_config(parent_session_id).await,
                 parent_session_id,
                 &request.dispatch_identity,
                 &block.plugin_id,
@@ -38089,6 +38213,154 @@ library = "test"
         .await;
 
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        drop(state);
+    }
+
+    /// Declarative auth profile that binds the fake provider's registered method to `vault`.
+    fn fake_provider_auth_profile(vault: &Path) -> bcode_config::AuthProfileConfig {
+        bcode_config::AuthProfileConfig {
+            backend: "sshenv".to_owned(),
+            provider_id: Some(bcode_fake_provider_plugin::FAKE_AUTH_PROVIDER_ID.to_owned()),
+            owner_plugin_id: Some("bcode.fake-provider".to_owned()),
+            scheme: Some(bcode_fake_provider_plugin::FAKE_AUTH_METHOD_ID.to_owned()),
+            map: ["access_token", "refresh_token", "expires_at"]
+                .into_iter()
+                .map(|credential| {
+                    (
+                        credential.to_owned(),
+                        bcode_config::AuthCredentialMapping {
+                            env: None,
+                            key: Some(format!("FAKE_{}", credential.to_ascii_uppercase())),
+                        },
+                    )
+                })
+                .collect(),
+            settings: BTreeMap::from([
+                ("profile".to_owned(), "fake".to_owned()),
+                ("vault".to_owned(), vault.display().to_string()),
+                ("device_seal".to_owned(), "off".to_owned()),
+            ]),
+        }
+    }
+
+    /// Read the credentials the fake provider's registered method owns in `profile`'s vault.
+    fn read_fake_provider_vault(
+        state: &ServerState,
+        profile: bcode_config::AuthProfileConfig,
+    ) -> BTreeMap<String, String> {
+        let registered = state
+            .plugins
+            .auth_provider(bcode_fake_provider_plugin::FAKE_AUTH_PROVIDER_ID)
+            .expect("fake auth provider registered");
+        let method = registered
+            .contribution
+            .methods
+            .iter()
+            .find(|method| method.method_id() == bcode_fake_provider_plugin::FAKE_AUTH_METHOD_ID)
+            .expect("fake auth method");
+        let resolved = bcode_provider_auth::ResolvedAuthProfile {
+            profile_name: "fake".to_owned(),
+            provider_id: bcode_fake_provider_plugin::FAKE_AUTH_PROVIDER_ID.to_owned(),
+            owner_plugin_id: "bcode.fake-provider".to_owned(),
+            profile,
+            source: bcode_provider_auth::AuthProfileSource::Declarative,
+        };
+        bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
+            &resolved,
+            bcode_fake_provider_plugin::FAKE_AUTH_PROVIDER_ID,
+            "bcode.fake-provider",
+            method,
+        )
+        .expect("owned vault lifecycle")
+        .read()
+        .expect("read persisted credentials")
+    }
+
+    /// Provider plugins refresh OAuth tokens while starting a turn and must persist the rotated
+    /// credentials through the host bridge. The daemon previously invoked provider turns without
+    /// any bridge, so every refresh failed with `token_refresh_persist_failed` once the access
+    /// token aged out. This drives a real turn through the daemon's push path and asserts the
+    /// refreshed credential lands in the session-configured vault.
+    #[tokio::test]
+    async fn daemon_model_turn_persists_provider_refreshed_credentials_through_host_bridge() {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let profile = fake_provider_auth_profile(&vault_dir.path().join("vault"));
+        let mut session_config = bcode_config::BcodeConfig::default();
+        session_config.model.prompt_cache.mode = bcode_model::PromptCacheMode::Off;
+        session_config
+            .auth
+            .profiles
+            .insert("fake".to_owned(), profile.clone());
+
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("refresh persist".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let trigger = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "refresh my token".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("trigger");
+        let provider_context = bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([(
+                bcode_fake_provider_plugin::FAKE_PERSIST_REFRESHED_TOKEN_SETTING.to_owned(),
+                "rotated-access-token".to_owned(),
+            )]),
+            auth_profile: Some("fake".to_owned()),
+            auth: Some(bcode_model::ProviderAuthContext {
+                profile: Some("fake".to_owned()),
+                scheme: Some(bcode_fake_provider_plugin::FAKE_AUTH_METHOD_ID.to_owned()),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let state = test_server_state_with_fake_provider(sessions);
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                provider_context: provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+
+        let completion = run_test_model_turn(
+            &state,
+            session_id,
+            &trigger,
+            ClientRuntimeContext {
+                selected_provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                selected_model_id: Some("fake-echo".to_owned()),
+                provider_context,
+                effective_config_toml: Some(Box::new(
+                    bcode_config::encode_effective_config(&session_config)
+                        .expect("encode session config"),
+                )),
+                ..ClientRuntimeContext::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Completed,
+            "{:?}",
+            completion.message
+        );
+        let stored = read_fake_provider_vault(&state, profile);
+        assert_eq!(
+            stored.get("access_token").map(String::as_str),
+            Some("rotated-access-token")
+        );
         drop(state);
     }
 
@@ -59193,6 +59465,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = Arc::new(test_server_state(SessionManager::default()));
         let bridge = server_workflow_plugin_bridge(
             Arc::clone(&state),
+            bcode_config::BcodeConfig::default(),
             session_id,
             invocation_id,
             "bcode.test",
@@ -59243,6 +59516,113 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if code == "invocation_id_mismatch"
         ));
         let _ = remove_session_artifact_dir(&default_session_artifact_dir(session_id));
+    }
+
+    /// The provider-turn bridge only serves `bcode.provider-auth-host` requests, and only when the
+    /// request carries the turn's own invocation identity and the caller owns the target provider.
+    #[test]
+    fn model_provider_bridge_fences_invocation_identity_and_provider_ownership() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let update_request = |invocation_id: &str, provider_id: &str| {
+            ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
+                invocation_id: invocation_id.to_owned(),
+                request_id: format!("{invocation_id}-credential-refresh"),
+                route_id: None,
+                interface_id: bcode_provider_auth_models::AUTH_HOST_INTERFACE_ID.to_owned(),
+                operation: bcode_provider_auth_models::OP_UPDATE_CREDENTIALS.to_owned(),
+                payload: serde_json::to_value(
+                    bcode_provider_auth_models::AuthCredentialUpdateRequest {
+                        schema_version:
+                            bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                        provider_id: provider_id.to_owned(),
+                        profile: "fake".to_owned(),
+                        credentials: BTreeMap::from([(
+                            "access_token".to_owned(),
+                            Some("rotated".to_owned()),
+                        )]),
+                    },
+                )
+                .expect("update payload"),
+            })
+        };
+        let failed_code = |response: ServiceBridgeResponse| match response {
+            ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed {
+                code,
+                ..
+            }) => code,
+            other => panic!("expected failed service resolution, got {other:?}"),
+        };
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+
+        let owner_bridge = server_model_provider_bridge(
+            state.plugins.clone(),
+            bcode_config::BcodeConfig::default(),
+            "turn-1",
+            "bcode.fake-provider",
+        );
+        assert_eq!(
+            failed_code(
+                owner_bridge
+                    .request(update_request("turn-2", "fake"), cancellation.clone())
+                    .expect("bridge")
+            ),
+            "invocation_id_mismatch"
+        );
+        // Owned request with a matching turn reaches host resolution; the empty config makes
+        // profile resolution fail, proving the request got past the identity and ownership fences.
+        assert_eq!(
+            failed_code(
+                owner_bridge
+                    .request(update_request("turn-1", "fake"), cancellation.clone())
+                    .expect("bridge")
+            ),
+            "auth_profile_unavailable"
+        );
+
+        let foreign_bridge = server_model_provider_bridge(
+            state.plugins.clone(),
+            bcode_config::BcodeConfig::default(),
+            "turn-1",
+            "bcode.other-provider",
+        );
+        assert_eq!(
+            failed_code(
+                foreign_bridge
+                    .request(update_request("turn-1", "fake"), cancellation.clone())
+                    .expect("bridge")
+            ),
+            "auth_owner_mismatch"
+        );
+
+        // Tool-invocation capabilities are not available to provider turns.
+        assert!(matches!(
+            owner_bridge
+                .request(
+                    ServiceBridgeRequest::ReceiveInput {
+                        invocation_id: "turn-1".to_owned(),
+                        timeout_ms: None,
+                    },
+                    cancellation.clone(),
+                )
+                .expect("bridge"),
+            ServiceBridgeResponse::Input(ToolInvocationInputResolution::Closed)
+        ));
+        assert!(matches!(
+            owner_bridge
+                .request(
+                    ServiceBridgeRequest::WriteArtifact(ToolArtifactWriteRequest {
+                        invocation_id: "turn-1".to_owned(),
+                        artifact_id: "rejected".to_owned(),
+                        content_type: "text/plain".to_owned(),
+                        bytes: b"no".to_vec(),
+                        metadata: serde_json::Value::Null,
+                    }),
+                    cancellation,
+                )
+                .expect("bridge"),
+            ServiceBridgeResponse::Artifact(ToolArtifactWriteResolution::Failed { .. })
+        ));
+        drop(state);
     }
 
     #[tokio::test]
