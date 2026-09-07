@@ -55704,6 +55704,60 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn model_status_uses_client_compaction_policy_before_next_turn() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("context policy".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        let client_id = ClientId::new();
+        let mut config = bcode_config::BcodeConfig::default();
+        config.model.compaction.mode = bcode_config::CompactionMode::ProactiveAndOverflow;
+        let context = |config: &bcode_config::BcodeConfig| ClientRuntimeContext {
+            effective_config_toml: Some(Box::new(
+                bcode_config::encode_effective_config(config).expect("encode config"),
+            )),
+            ..ClientRuntimeContext::default()
+        };
+        state
+            .set_session_config_from_runtime_context(session_id, Some(&context(&config)))
+            .await;
+
+        // Reopen with a full-context profile, without submitting a model turn.
+        config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
+        state
+            .set_client_runtime_context(client_id, Some(context(&config)))
+            .await;
+        let status = session_operations::model_status(&state, client_id, session_id).await;
+        assert_eq!(status.compaction_mode.as_deref(), Some("on_overflow"));
+        assert_eq!(
+            state.session_config(session_id).await.model.compaction.mode,
+            bcode_config::CompactionMode::ProactiveAndOverflow,
+            "status must not mutate the cached execution policy"
+        );
+
+        // A client without a config still sees the cached session policy.
+        let status = session_operations::model_status(&state, ClientId::new(), session_id).await;
+        assert_eq!(
+            status.compaction_mode.as_deref(),
+            Some("proactive_and_overflow")
+        );
+
+        config.model.compaction.mode = bcode_config::CompactionMode::ProactiveAndOverflow;
+        state
+            .set_client_runtime_context(client_id, Some(context(&config)))
+            .await;
+        let status = session_operations::model_status(&state, client_id, session_id).await;
+        drop(state);
+        assert_eq!(
+            status.compaction_mode.as_deref(),
+            Some("proactive_and_overflow")
+        );
+    }
+
+    #[tokio::test]
     async fn client_runtime_configs_are_isolated_per_session_and_resume_replaces_non_sticky_config()
     {
         let sessions = SessionManager::default();

@@ -133,13 +133,22 @@ pub async fn model_status(
     client_id: bcode_session_models::ClientId,
     session_id: bcode_session_models::SessionId,
 ) -> bcode_ipc::SessionModelStatus {
-    let selection = super::session_model_selection_with_runtime_context(
-        state,
-        session_id,
-        state.client_runtime_context(client_id).await,
-    )
-    .await;
-    let config = state.session_config(session_id).await;
+    let runtime_context = state.client_runtime_context(client_id).await;
+    // Status describes the policy this client will use for its next turn, not the
+    // cached policy of the last client that submitted a turn to this session.
+    // Keep this read-only so inspecting a session cannot change another client's policy.
+    let config = if let Some(config) = runtime_context
+        .as_ref()
+        .and_then(|context| context.effective_config_toml.as_deref())
+        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+    {
+        config
+    } else {
+        state.session_config(session_id).await
+    };
+    let selection =
+        super::session_model_selection_with_runtime_context(state, session_id, runtime_context)
+            .await;
     super::model_status_for_selection(state, selection, Some(session_id), &config).await
 }
 
