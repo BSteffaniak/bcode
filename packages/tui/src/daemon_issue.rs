@@ -338,8 +338,9 @@ mod tests {
                 .text()
                 .contains("daemon did not respond")
         );
-        assert!(app.session_view_snapshot().transcript.items.is_empty());
+        let canonical_empty = app.session_view_snapshot().transcript.items.is_empty();
         drop(app);
+        assert!(canonical_empty);
     }
 
     #[test]
@@ -369,11 +370,12 @@ mod tests {
             ),
             "the failure diagnostic is process-local, so it cannot re-enter the daemon append path"
         );
+        let canonical_empty = app.session_view_snapshot().transcript.items.is_empty();
+        drop(app);
         assert!(
-            app.session_view_snapshot().transcript.items.is_empty(),
+            canonical_empty,
             "the diagnostic never becomes canonical history"
         );
-        drop(app);
     }
 
     #[test]

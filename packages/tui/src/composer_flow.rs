@@ -152,12 +152,8 @@ mod tests {
         app.stage_submission();
 
         assert_eq!(app.take_pending_submission(), "manual steering");
-        assert_eq!(
-            app.plugin_status()
-                .next()
-                .map(|status| status.text.as_str()),
-            Some("Loop active")
-        );
+        let status = app.plugin_status().next().map(|status| status.text.clone());
         drop(app);
+        assert_eq!(status.as_deref(), Some("Loop active"));
     }
 }

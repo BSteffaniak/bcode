@@ -2576,9 +2576,7 @@ impl BmuxApp {
 
     /// Apply configured reasoning output visibility.
     pub fn apply_thinking_config(&mut self, config: TuiThinkingConfig) {
-        self.reasoning_display_mode = config.mode;
-        self.session_view
-            .set_reasoning_display_mode(reasoning_view_mode(config.mode));
+        self.set_reasoning_display_mode(config.mode);
         self.set_reasoning_visible(config.show);
     }
 
@@ -2595,7 +2593,7 @@ impl BmuxApp {
             self.session_view
                 .set_reasoning_display_mode(reasoning_view_mode(mode));
             self.refresh_thinking_label();
-            self.rebuild_transcript_from_history();
+            self.apply_session_view_terminal_adapter();
         }
     }
 
@@ -5132,8 +5130,9 @@ mod tests {
         reconstructed.take_same_session_transcript_state_from(&source);
         drop(source);
 
-        assert!(reconstructed.transcript().is_empty());
+        let is_empty = reconstructed.transcript().is_empty();
         drop(reconstructed);
+        assert!(is_empty);
     }
 
     #[test]
@@ -5150,8 +5149,9 @@ mod tests {
         opened.take_same_session_transcript_state_from(&draft);
         drop(draft);
 
-        assert!(opened.transcript().is_empty());
+        let is_empty = opened.transcript().is_empty();
         drop(opened);
+        assert!(is_empty);
     }
 
     #[test]
@@ -5169,13 +5169,22 @@ mod tests {
         }];
         let mut live = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
         live.push_ephemeral_system_plain("local issue".to_owned());
+        let live_transcript = live
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(live);
+        assert_eq!(live_transcript, ["canonical", "local issue"]);
 
         let reconstructed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-
-        assert_eq!(reconstructed.transcript().len(), 1);
-        assert_eq!(reconstructed.transcript()[0].text(), "canonical");
+        let transcript = reconstructed
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(reconstructed);
+        assert_eq!(transcript, ["canonical"]);
     }
 
     #[test]
@@ -5212,17 +5221,18 @@ mod tests {
         let mut completed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
         completed.take_same_session_transcript_state_from(&intermediate);
         drop(intermediate);
+        let transcript = completed
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
+        drop(completed);
 
         assert_eq!(
-            completed
-                .transcript()
-                .iter()
-                .map(TranscriptItem::text)
-                .collect::<Vec<_>>(),
+            transcript,
             ["canonical", "local issue"],
             "the notice survives the full reopen chain and reanchors to canonical history"
         );
-        drop(completed);
     }
 
     #[test]
@@ -5265,8 +5275,9 @@ mod tests {
             .expect("notice");
         assert!(notice.source_view_item_id().is_none());
         assert!(notice.event_sequence().is_none());
-        assert_eq!(app.transcript_index_for_sequence(1), Some(0));
+        let canonical_index = app.transcript_index_for_sequence(1);
         drop(app);
+        assert_eq!(canonical_index, Some(0));
     }
 
     #[test]
@@ -5325,15 +5336,13 @@ mod tests {
             &[],
             false,
         );
-        assert_eq!(
-            replayed
-                .transcript()
-                .iter()
-                .map(TranscriptItem::text)
-                .collect::<Vec<_>>(),
-            ["durable note"]
-        );
+        let transcript = replayed
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(replayed);
+        assert_eq!(transcript, ["durable note"]);
     }
 
     #[test]
@@ -5363,14 +5372,13 @@ mod tests {
         assert_ne!(app.presented_theme().fingerprint, fingerprint_before);
         assert_eq!(app.transcript_projection_revision(), transcript_revision);
         assert_eq!(app.markdown_presentation_revision(), markdown_revision);
-        assert_eq!(
-            app.transcript()
-                .iter()
-                .map(|item| (item.id(), item.text().to_owned()))
-                .collect::<Vec<_>>(),
-            transcript_before
-        );
+        let transcript_after = app
+            .transcript()
+            .iter()
+            .map(|item| (item.id(), item.text().to_owned()))
+            .collect::<Vec<_>>();
         drop(app);
+        assert_eq!(transcript_after, transcript_before);
     }
 
     #[test]
@@ -5424,15 +5432,13 @@ mod tests {
         );
         assert_eq!(app.display_agent_id(), "build");
         assert_eq!(app.presented_theme().accent, Color::Rgb(34, 211, 238));
-        assert_eq!(
-            invalidation_deadline(
-                &app,
-                THEME_TRANSITION_INVALIDATION_KEY,
-                queried_at + Duration::from_millis(200),
-            ),
-            None
+        let final_deadline = invalidation_deadline(
+            &app,
+            THEME_TRANSITION_INVALIDATION_KEY,
+            queried_at + Duration::from_millis(200),
         );
         drop(app);
+        assert_eq!(final_deadline, None);
     }
 
     #[test]
@@ -5481,8 +5487,9 @@ mod tests {
         )
         .expect("corrected revision");
         assert_eq!(app.reload_theme_if_valid(), Some("external"));
-        assert_ne!(app.presented_theme().fingerprint, valid.fingerprint);
+        let fingerprint = app.presented_theme().fingerprint;
         drop(app);
+        assert_ne!(fingerprint, valid.fingerprint);
     }
 
     #[test]
@@ -5506,8 +5513,9 @@ mod tests {
         assert!(app.reload_theme_if_valid().is_none());
 
         app.cancel_theme_preview();
-        assert_eq!(app.presented_theme().fingerprint, configured.fingerprint);
+        let fingerprint = app.presented_theme().fingerprint;
         drop(app);
+        assert_eq!(fingerprint, configured.fingerprint);
     }
 
     #[test]
@@ -5536,8 +5544,9 @@ mod tests {
         )
         .expect("next valid theme");
         assert_eq!(app.reload_theme_if_valid(), Some("live"));
-        assert_ne!(app.presented_theme().fingerprint, valid.fingerprint);
+        let fingerprint = app.presented_theme().fingerprint;
         drop(app);
+        assert_ne!(fingerprint, valid.fingerprint);
     }
 
     #[test]
@@ -5591,8 +5600,9 @@ mod tests {
         assert!(app.preview_theme("nord"));
         assert!(app.preview_theme("terminal-native"));
 
-        assert_eq!(app.theme_catalog_discovery_count(), 1);
+        let discovery_count = app.theme_catalog_discovery_count();
         drop(app);
+        assert_eq!(discovery_count, 1);
     }
 
     #[test]
@@ -5611,8 +5621,9 @@ mod tests {
 
         assert!(app.apply_theme("bcode-light"));
         assert_eq!(app.tui_config().theme.name, "bcode-light");
-        assert!(!app.preview_theme("does-not-exist"));
+        let unknown_theme_accepted = app.preview_theme("does-not-exist");
         drop(app);
+        assert!(!unknown_theme_accepted);
     }
 
     #[test]
@@ -5679,13 +5690,12 @@ mod tests {
 
         app.set_active_interaction_layout(None);
         crate::transcript_projection::sync_layout_for_test(&mut app, 80);
-        assert_eq!(
-            app.transcript_item_row_range(index)
-                .expect("restored fallback range")
-                .len(),
-            fallback
-        );
+        let restored_height = app
+            .transcript_item_row_range(index)
+            .expect("restored fallback range")
+            .len();
         drop(app);
+        assert_eq!(restored_height, fallback);
     }
 
     #[test]
@@ -5748,11 +5758,9 @@ mod tests {
         );
         app.drain_transcript_dirty_items();
         app.set_active_interaction_layout(Some(("second".to_owned(), 7)));
-        assert_eq!(
-            app.transcript_dirty_items_for_test(),
-            &BTreeSet::from([first_id, second_id])
-        );
+        let dirty_items = app.transcript_dirty_items_for_test().clone();
         drop(app);
+        assert_eq!(dirty_items, BTreeSet::from([first_id, second_id]));
     }
 
     #[test]
@@ -5776,8 +5784,9 @@ mod tests {
         app.replace_latest_transcript_window(&[event(1, "earlier"), later], false);
 
         assert_eq!(app.drain_transcript_dirty_items(), BTreeSet::from([1]));
-        assert_eq!(app.transcript()[1].text(), "later");
+        let text = app.transcript()[1].text().to_owned();
         drop(app);
+        assert_eq!(text, "later");
     }
 
     fn interaction(id: &str) -> bcode_session_view_models::InteractionViewSummary {
@@ -5868,8 +5877,9 @@ mod tests {
 
         assert!(app.activate_markdown_contribution("fragment-link"));
         assert_eq!(app.transcript_viewport_top_row_for_test(80, 10), 24);
-        assert_eq!(app.status(), "Navigated to Markdown section");
+        let status = app.status().to_owned();
         drop(app);
+        assert_eq!(status, "Navigated to Markdown section");
     }
 
     #[test]
@@ -5902,8 +5912,9 @@ mod tests {
         assert!(app.scroll_transcript_down(3));
         assert_eq!(app.transcript_viewport_top_row_for_test(100, 6), 41);
         assert!(app.activate_markdown_contribution("fragment-link"));
-        assert_eq!(app.transcript_viewport_top_row_for_test(100, 6), 38);
+        let top_row = app.transcript_viewport_top_row_for_test(100, 6);
         drop(app);
+        assert_eq!(top_row, 38);
     }
 
     #[test]
@@ -5929,8 +5940,9 @@ mod tests {
         ]);
 
         assert!(app.activate_markdown_contribution("fragment-link"));
-        assert_eq!(app.status(), "Markdown fragment target was not found");
+        let status = app.status().to_owned();
         drop(app);
+        assert_eq!(status, "Markdown fragment target was not found");
     }
 
     #[test]
@@ -5944,8 +5956,9 @@ mod tests {
         app.sync_transcript_scroll_max(37, 0, 47, 10);
 
         assert_eq!(app.transcript_top_row(10), top_row);
-        assert_eq!(app.scroll_offset(), 47 - top_row - 10);
+        let scroll_offset = app.scroll_offset();
         drop(app);
+        assert_eq!(scroll_offset, 47 - top_row - 10);
     }
 
     #[test]
@@ -5958,8 +5971,9 @@ mod tests {
         assert_eq!(app.markdown_presentation_revision(), initial + 1);
 
         app.apply_tui_config(config);
-        assert_eq!(app.markdown_presentation_revision(), initial + 1);
+        let revision = app.markdown_presentation_revision();
         drop(app);
+        assert_eq!(revision, initial + 1);
     }
 
     #[test]
@@ -5975,8 +5989,9 @@ mod tests {
         assert!(app.focus_markdown_contribution("details"));
         assert!(app.activate_focused_markdown_contribution());
         assert_eq!(app.markdown_details_open().get("details"), Some(&true));
-        assert_eq!(app.markdown_presentation_revision(), 2);
+        let revision = app.markdown_presentation_revision();
         drop(app);
+        assert_eq!(revision, 2);
     }
 
     #[test]
@@ -5992,8 +6007,9 @@ mod tests {
 
         app.reconcile_markdown_details(&BTreeSet::new());
         assert!(app.markdown_details_open().is_empty());
-        assert_eq!(app.markdown_presentation_revision(), 2);
+        let revision = app.markdown_presentation_revision();
         drop(app);
+        assert_eq!(revision, 2);
     }
 
     fn markdown_footnote_reference(
@@ -6053,8 +6069,9 @@ mod tests {
             "reference",
             "definition",
         )]);
-        assert_eq!(app.focused_markdown_contribution(), Some("reference"));
+        let focused = app.focused_markdown_contribution().map(str::to_owned);
         drop(app);
+        assert_eq!(focused.as_deref(), Some("reference"));
     }
 
     #[test]
@@ -6070,8 +6087,9 @@ mod tests {
         assert_eq!(app.focused_markdown_contribution(), Some("definition"));
         assert!(app.activate_focused_markdown_contribution());
         assert_eq!(app.focused_markdown_contribution(), Some("reference-2"));
-        assert!(app.footnote_return_targets.is_empty());
+        let return_targets_empty = app.footnote_return_targets.is_empty();
         drop(app);
+        assert!(return_targets_empty);
     }
 
     #[test]
@@ -6084,8 +6102,9 @@ mod tests {
         ]);
 
         assert!(app.activate_markdown_contribution("definition"));
-        assert_eq!(app.focused_markdown_contribution(), Some("reference-1"));
+        let focused = app.focused_markdown_contribution().map(str::to_owned);
         drop(app);
+        assert_eq!(focused.as_deref(), Some("reference-1"));
     }
 
     #[test]
@@ -6101,8 +6120,9 @@ mod tests {
         app.reconcile_markdown_interactions(Vec::new());
 
         assert!(app.footnote_return_targets.is_empty());
-        assert_eq!(app.focused_markdown_contribution(), None);
+        let focused = app.focused_markdown_contribution().map(str::to_owned);
         drop(app);
+        assert_eq!(focused, None);
     }
 
     #[test]
@@ -6149,10 +6169,11 @@ mod tests {
             &[InvalidationKey::new(LATEST_BAR_ANIMATION_INVALIDATION_KEY)],
             now + LATEST_BAR_ACTIVE_WINDOW,
         );
+        let deadline_cleared = app.latest_bar_next_frame_at.is_none();
+        drop(app);
         assert_eq!(finished, UiInvalidation::Paint);
         assert_eq!(damage, [TemporalDamage::LatestBar]);
-        assert!(app.latest_bar_next_frame_at.is_none());
-        drop(app);
+        assert!(deadline_cleared);
     }
 
     #[test]
@@ -6172,8 +6193,9 @@ mod tests {
             app.drain_elapsed_dirty_visuals(),
             BTreeSet::from(["call-item".to_owned()])
         );
-        assert!(app.drain_elapsed_dirty_visuals().is_empty());
+        let remaining_dirty_visuals = app.drain_elapsed_dirty_visuals();
         drop(app);
+        assert!(remaining_dirty_visuals.is_empty());
     }
 
     #[test]
@@ -6322,12 +6344,12 @@ mod tests {
             },
         ));
 
-        assert!(
-            app.tool_elapsed_invalidation_requests(now, now_system)
-                .next()
-                .is_none()
-        );
+        let elapsed_requests_cleared = app
+            .tool_elapsed_invalidation_requests(now, now_system)
+            .next()
+            .is_none();
         drop(app);
+        assert!(elapsed_requests_cleared);
     }
 
     #[test]
@@ -6379,8 +6401,9 @@ mod tests {
             ),
             SessionEventApplication::Live,
         );
-        assert_eq!(app.transcript, before);
+        let transcript = std::mem::take(&mut app.transcript);
         drop(app);
+        assert_eq!(transcript, before);
     }
 
     #[test]
@@ -6422,11 +6445,12 @@ mod tests {
                 && matches!(item.kind(), &TranscriptItemKind::AssistantMessage)
         }));
         assert_eq!(app.scroll_offset(), before_scroll);
-        assert!(matches!(
+        let targeted_item = matches!(
             app.last_transcript_damage,
             TranscriptDocumentDamage::Items(ref ids) if ids.contains(&item_id)
-        ));
+        );
         drop(app);
+        assert!(targeted_item);
     }
 
     #[test]
@@ -6450,11 +6474,12 @@ mod tests {
             app.next_streaming_presentation_deadline(Instant::now())
                 .is_none()
         );
-        assert!(matches!(
+        let item_damage = matches!(
             app.last_transcript_damage,
             TranscriptDocumentDamage::Items(_)
-        ));
+        );
         drop(app);
+        assert!(item_damage);
     }
 
     #[test]
@@ -6484,8 +6509,9 @@ mod tests {
                 text: "raw reasoning".to_owned(),
             },
         });
-        assert_eq!(app.transcript, before);
+        let transcript = std::mem::take(&mut app.transcript);
         drop(app);
+        assert_eq!(transcript, before);
     }
 
     #[test]
@@ -6519,8 +6545,9 @@ mod tests {
             app.apply_session_view_terminal_adapter(),
             TranscriptDocumentDamage::FullReset
         );
-        assert!(app.transcript.source_index_is_consistent());
+        let index_is_consistent = app.transcript.source_index_is_consistent();
         drop(app);
+        assert!(index_is_consistent);
     }
 
     #[test]
@@ -6539,9 +6566,10 @@ mod tests {
         app.absorb_session_live_event(&live("first"));
         let render_id = app.transcript()[0].id();
         app.absorb_session_live_event(&live(" second"));
-        assert_eq!(app.transcript()[0].id(), render_id);
-        assert_eq!(app.transcript()[0].text(), "first second");
+        let transcript = std::mem::take(&mut app.transcript);
         drop(app);
+        assert_eq!(transcript.items()[0].id(), render_id);
+        assert_eq!(transcript.items()[0].text(), "first second");
     }
 
     #[test]
@@ -6591,12 +6619,12 @@ mod tests {
 
         app.session_view.clear_history_window();
         app.apply_session_view_terminal_adapter();
-        assert!(
-            app.transcript()
-                .iter()
-                .all(|item| item.source_view_item_id() != Some(&id))
-        );
+        let removed = app
+            .transcript()
+            .iter()
+            .all(|item| item.source_view_item_id() != Some(&id));
         drop(app);
+        assert!(removed);
     }
 
     #[test]
@@ -6608,9 +6636,10 @@ mod tests {
         assert_eq!(first.first().map(String::as_str), Some("call-000"));
         assert_eq!(first.last().map(String::as_str), Some("call-063"));
         let second = app.drain_elapsed_dirty_visuals_bounded(64);
-        assert_eq!(second.len(), 36);
-        assert!(app.drain_elapsed_dirty_visuals_bounded(64).is_empty());
+        let remaining = app.drain_elapsed_dirty_visuals_bounded(64);
         drop(app);
+        assert_eq!(second.len(), 36);
+        assert!(remaining.is_empty());
     }
 
     #[test]
@@ -6667,8 +6696,9 @@ mod tests {
                 if message.text.contains("stale partial")
         )));
         assert_eq!(app.timeline_entries().len(), 1);
-        assert!(app.has_older_history());
+        let has_older_history = app.has_older_history();
         drop(app);
+        assert!(has_older_history);
     }
 
     #[test]
@@ -6722,12 +6752,13 @@ mod tests {
             },
         });
 
-        assert!(matches!(
+        let has_live_message = matches!(
             &app.session_view_snapshot().transcript.items[2].kind,
             bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
                 if message.text == "live"
-        ));
+        );
         drop(app);
+        assert!(has_live_message);
     }
 
     #[test]
@@ -6757,13 +6788,14 @@ mod tests {
             },
         }];
 
-        let app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        assert_eq!(app.transcript.len(), 1);
-        let item = &app.transcript.items()[0];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        let transcript = std::mem::take(&mut app.transcript);
+        drop(app);
+        assert_eq!(transcript.len(), 1);
+        let item = &transcript.items()[0];
         assert!(item.text().contains("context compaction"));
         assert!(!item.text().contains(secret));
         assert!(!item.text().contains("portable summary"));
-        drop(app);
     }
 
     #[test]
@@ -6784,8 +6816,9 @@ mod tests {
         }]);
 
         assert_eq!(app.active_skill_count(), 1);
-        assert!(app.session_view_snapshot().active_skills.contains("review"));
+        let has_review = app.session_view_snapshot().active_skills.contains("review");
         drop(app);
+        assert!(has_review);
     }
 
     #[test]
@@ -6830,8 +6863,9 @@ mod tests {
                 .active_skills
                 .contains("event-skill")
         );
-        assert_eq!(app.status(), "deactivated skill: event-skill");
+        let status = app.status().to_owned();
         drop(app);
+        assert_eq!(status, "deactivated skill: event-skill");
     }
 
     #[test]
@@ -6854,8 +6888,9 @@ mod tests {
 
         assert!(app.session_view_snapshot().runtime_work.is_empty());
         assert!(app.session_view_snapshot().transcript.items.is_empty());
-        assert!(app.transcript().is_empty());
+        let transcript_is_empty = app.transcript().is_empty();
         drop(app);
+        assert!(transcript_is_empty);
     }
 
     #[test]
@@ -6892,8 +6927,9 @@ mod tests {
             2,
             bcode_session_models::ToolInvocationLifecycleStage::Completed,
         ));
-        assert!(matches!(app.activity(), ActivityState::Idle));
+        let is_idle = matches!(app.activity(), ActivityState::Idle);
         drop(app);
+        assert!(is_idle);
     }
 
     #[test]
@@ -6918,8 +6954,9 @@ mod tests {
 
         app.apply_runtime_work_snapshots(&[]);
         assert!(matches!(app.activity(), ActivityState::Idle));
-        assert!(app.session_view_snapshot().runtime_work.is_empty());
+        let work_is_empty = app.session_view_snapshot().runtime_work.is_empty();
         drop(app);
+        assert!(work_is_empty);
     }
 
     #[test]
@@ -6941,8 +6978,9 @@ mod tests {
         let app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
 
         assert_eq!(app.reasoning_effort(), Some("high"));
-        assert_eq!(app.reasoning_summary(), Some("detailed"));
+        let summary = app.reasoning_summary().map(str::to_owned);
         drop(app);
+        assert_eq!(summary.as_deref(), Some("detailed"));
     }
 
     #[test]
@@ -6988,8 +7026,9 @@ mod tests {
                 deactivated_at_ms: 3,
             },
         ));
-        assert_eq!(app.active_skill_count(), 0);
+        let active_skill_count = app.active_skill_count();
         drop(app);
+        assert_eq!(active_skill_count, 0);
     }
 
     #[test]
@@ -7024,8 +7063,10 @@ mod tests {
             .find(|item| item.sequence == Some(2))
             .expect("shared ralph lifecycle item");
         let expected = terminal_item_from_shared(shared);
-        let actual = app
-            .transcript()
+        let transcript = std::mem::take(&mut app.transcript);
+        drop(app);
+        let actual = transcript
+            .items()
             .iter()
             .last()
             .expect("ralph lifecycle item");
@@ -7036,7 +7077,6 @@ mod tests {
             actual.text(),
             "Ralph started\n* Loop: loop\n* running\n* State: .bcode/ralph/loop"
         );
-        drop(app);
     }
 
     #[test]
@@ -7086,7 +7126,18 @@ mod tests {
             },
         ));
 
-        let terminal = app.transcript().iter().collect::<Vec<_>>();
+        let transcript = std::mem::take(&mut app.transcript);
+        let status = app.status().to_owned();
+        let shared_items = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(terminal_item_from_shared)
+            .map(|item| (item.role(), item.text().to_owned(), item.kind().clone()))
+            .collect::<Vec<_>>();
+        drop(app);
+        let terminal = transcript.items().iter().collect::<Vec<_>>();
         assert_eq!(terminal.len(), 3);
         assert_eq!(terminal[0].role(), "Skill");
         assert_eq!(terminal[0].text(), "invoked review\nArguments: {}");
@@ -7097,27 +7148,17 @@ mod tests {
             "loaded review\nSource: user skills\nFile: /skills/review/SKILL.md\nBytes: 42 truncated\n\nPreview:\npreview"
         );
         assert_eq!(terminal[1].kind(), &TranscriptItemKind::Generic);
-        assert_eq!(
-            app.status(),
-            "loaded skill context: review (42 bytes truncated)"
-        );
+        assert_eq!(status, "loaded skill context: review (42 bytes truncated)");
         assert_eq!(terminal[2].role(), "Skill error");
         assert_eq!(terminal[2].text(), "review: boom");
         assert_eq!(terminal[2].kind(), &TranscriptItemKind::SkillError);
         assert_eq!(
-            app.session_view_snapshot()
-                .transcript
-                .items
-                .iter()
-                .map(terminal_item_from_shared)
-                .map(|item| (item.role(), item.text().to_owned(), item.kind().clone()))
-                .collect::<Vec<_>>(),
+            shared_items,
             terminal
                 .iter()
                 .map(|item| (item.role(), item.text().to_owned(), item.kind().clone()))
                 .collect::<Vec<_>>()
         );
-        drop(app);
     }
 
     #[test]
@@ -7162,13 +7203,14 @@ mod tests {
             },
         ));
 
-        assert_eq!(app.session_view_snapshot().runtime.cost, before);
+        let cost = app.session_view_snapshot().runtime.cost.clone();
+        drop(app);
+        assert_eq!(cost, before);
         assert!(
             TokenUsageMeter::default()
-                .footer_summary(None, 0, &app.session_view_snapshot().runtime.cost)
+                .footer_summary(None, 0, &cost)
                 .ends_with("spent 0 tok · ~$0.02")
         );
-        drop(app);
     }
 
     #[test]
@@ -7223,14 +7265,13 @@ mod tests {
                 .as_deref(),
             Some("high")
         );
-        assert_eq!(
-            app.session_view_snapshot()
-                .runtime
-                .reasoning_summary
-                .as_deref(),
-            Some("detailed")
-        );
+        let summary = app
+            .session_view_snapshot()
+            .runtime
+            .reasoning_summary
+            .clone();
         drop(app);
+        assert_eq!(summary.as_deref(), Some("detailed"));
     }
 
     #[test]
@@ -7280,16 +7321,16 @@ mod tests {
             .session_view_snapshot()
             .runtime
             .context_occupancy
-            .as_ref()
+            .clone()
             .expect("hydrated occupancy");
+        drop(app);
         let meter = TokenUsageMeter {
             context_window: Some(10_000),
             ..TokenUsageMeter::default()
         };
 
         assert!(hydrated.observation.context_tokens.is_estimated());
-        assert_eq!(meter.context_summary(Some(hydrated)), "~2,500/10k 25%");
-        drop(app);
+        assert_eq!(meter.context_summary(Some(&hydrated)), "~2,500/10k 25%");
     }
 
     #[test]
@@ -7310,16 +7351,16 @@ mod tests {
             .session_view_snapshot()
             .runtime
             .context_occupancy
-            .as_ref()
+            .clone()
             .expect("live occupancy");
+        drop(app);
         let meter = TokenUsageMeter {
             context_window: Some(10_000),
             ..TokenUsageMeter::default()
         };
 
         assert!(!live.observation.context_tokens.is_estimated());
-        assert_eq!(meter.context_summary(Some(live)), "2,500/10k 25%");
-        drop(app);
+        assert_eq!(meter.context_summary(Some(&live)), "2,500/10k 25%");
     }
 
     #[test]
@@ -7387,13 +7428,13 @@ mod tests {
                 occupancy: Box::new(None),
             },
         });
-        assert!(
-            app.session_view_snapshot()
-                .runtime
-                .context_occupancy
-                .is_none()
-        );
+        let occupancy_cleared = app
+            .session_view_snapshot()
+            .runtime
+            .context_occupancy
+            .is_none();
         drop(app);
+        assert!(occupancy_cleared);
     }
 
     #[test]
@@ -7421,8 +7462,9 @@ mod tests {
         assert_eq!(app.frame_observation(), before_frame);
         assert_eq!(app.scroll_offset(), before_scroll);
         assert_eq!(app.reasoning_visible(), before_visible);
-        assert_eq!(app.reasoning_effort(), Some("high"));
+        let effort = app.reasoning_effort().map(str::to_owned);
         drop(app);
+        assert_eq!(effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -7450,8 +7492,9 @@ mod tests {
         ));
 
         assert_eq!(app.frame_observation(), before);
-        assert_eq!(app.reasoning_effort(), Some("high"));
+        let effort = app.reasoning_effort().map(str::to_owned);
         drop(app);
+        assert_eq!(effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -7500,8 +7543,9 @@ mod tests {
         });
 
         assert_eq!(app.frame_observation(), before);
-        assert_eq!(app.reasoning_effort(), Some("high"));
+        let effort = app.reasoning_effort().map(str::to_owned);
         drop(app);
+        assert_eq!(effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -7519,11 +7563,9 @@ mod tests {
 
         app.set_reasoning_visible(app.reasoning_visible());
 
-        assert_eq!(
-            app.transcript().iter().cloned().collect::<Vec<_>>(),
-            before_items
-        );
+        let after_items = app.transcript().iter().cloned().collect::<Vec<_>>();
         drop(app);
+        assert_eq!(after_items, before_items);
     }
 
     #[test]
@@ -7549,11 +7591,15 @@ mod tests {
             "high", "xhigh", "max", "none",
         ];
 
-        for expected in expected {
-            assert_eq!(app.cycle_pending_reasoning_effort(), Some(expected));
-            assert_eq!(app.frame_observation(), frame);
-        }
+        let observed = expected.map(|_| {
+            let effort = app.cycle_pending_reasoning_effort().map(str::to_owned);
+            (effort, app.frame_observation())
+        });
         drop(app);
+        for ((effort, observed_frame), expected) in observed.into_iter().zip(expected) {
+            assert_eq!(effort.as_deref(), Some(expected));
+            assert_eq!(observed_frame, frame);
+        }
     }
 
     #[test]
@@ -7564,8 +7610,9 @@ mod tests {
 
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("high"));
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("low"));
-        assert_eq!(app.cycle_pending_reasoning_effort(), Some("high"));
+        let effort = app.cycle_pending_reasoning_effort().map(str::to_owned);
         drop(app);
+        assert_eq!(effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -7578,8 +7625,9 @@ mod tests {
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("high"));
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("none"));
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("low"));
-        assert_eq!(app.reasoning_effort_generation, 4);
+        let generation = app.reasoning_effort_generation;
         drop(app);
+        assert_eq!(generation, 4);
     }
 
     #[test]
@@ -7590,8 +7638,9 @@ mod tests {
         app.clear_pending_reasoning_effort_for_session_change();
 
         assert_eq!(app.pending_reasoning_effort_generation(), None);
-        assert_eq!(app.reasoning_effort(), None);
+        let effort = app.reasoning_effort().map(str::to_owned);
         drop(app);
+        assert_eq!(effort, None);
     }
 
     #[test]
@@ -7602,8 +7651,9 @@ mod tests {
         assert_eq!(app.reasoning_effort(), Some("high"));
 
         app.reconcile_pending_reasoning_effort("high");
-        assert_eq!(app.reasoning_effort(), None);
+        let effort = app.reasoning_effort().map(str::to_owned);
         drop(app);
+        assert_eq!(effort, None);
     }
 
     #[test]
@@ -7617,8 +7667,9 @@ mod tests {
         assert_eq!(app.pending_reasoning_effort_generation(), Some(newer));
 
         app.clear_pending_reasoning_effort(newer);
-        assert_eq!(app.reasoning_effort(), None);
+        let effort = app.reasoning_effort().map(str::to_owned);
         drop(app);
+        assert_eq!(effort, None);
     }
 
     #[test]
@@ -7656,8 +7707,9 @@ mod tests {
         assert_eq!(runtime.active_turn_id.as_deref(), Some("turn-shared"));
         assert!(runtime.cancelling);
         assert!(matches!(app.activity(), ActivityState::Cancelling));
-        assert_eq!(app.status(), "cancellation requested");
+        let status = app.status().to_owned();
         drop(app);
+        assert_eq!(status, "cancellation requested");
     }
 
     #[test]
@@ -7705,11 +7757,16 @@ mod tests {
             .find(|item| item.sequence == Some(2))
             .expect("shared model-turn error item");
         let expected = terminal_item_from_shared(shared);
-        let actual = app.transcript().iter().last().expect("terminal error item");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("terminal error item")
+            .clone();
+        drop(app);
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
-        drop(app);
     }
 
     #[test]
@@ -7726,8 +7783,9 @@ mod tests {
         ));
 
         assert_eq!(app.session_title(), Some("renamed session"));
-        assert_eq!(app.status(), "session: renamed session");
+        let status = app.status().to_owned();
         drop(app);
+        assert_eq!(status, "session: renamed session");
     }
 
     #[test]
@@ -7765,11 +7823,16 @@ mod tests {
             .find(|item| item.sequence == Some(1))
             .expect("shared working-directory item");
         let expected = terminal_item_from_shared(shared);
-        let actual = app.transcript().iter().last().expect("terminal item");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("terminal item")
+            .clone();
+        drop(app);
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
-        drop(app);
     }
 
     #[test]
@@ -7801,7 +7864,12 @@ mod tests {
                 .context_occupancy
                 .is_none()
         );
-        let terminal = app.transcript().iter().last().expect("compaction item");
+        let terminal = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("compaction item")
+            .clone();
         let shared = app
             .session_view_snapshot()
             .transcript
@@ -7810,12 +7878,12 @@ mod tests {
             .find(|item| item.sequence == Some(8))
             .expect("shared compaction item");
         let expected = terminal_item_from_shared(shared);
+        drop(app);
         assert_eq!(terminal.role(), "Compaction");
         assert_eq!(terminal.text(), "local context compaction: summary");
         assert_eq!(terminal.role(), expected.role());
         assert_eq!(terminal.text(), expected.text());
         assert_eq!(terminal.kind(), expected.kind());
-        drop(app);
     }
 
     #[test]
@@ -7850,7 +7918,8 @@ mod tests {
             .transcript()
             .iter()
             .last()
-            .expect("provider compaction item");
+            .expect("provider compaction item")
+            .clone();
         let shared = app
             .session_view_snapshot()
             .transcript
@@ -7859,6 +7928,7 @@ mod tests {
             .find(|item| item.sequence == Some(9))
             .expect("shared provider compaction item");
         let expected = terminal_item_from_shared(shared);
+        drop(app);
         assert_eq!(terminal.role(), "Compaction");
         assert_eq!(
             terminal.text(),
@@ -7867,7 +7937,6 @@ mod tests {
         assert_eq!(terminal.role(), expected.role());
         assert_eq!(terminal.text(), expected.text());
         assert_eq!(terminal.kind(), expected.kind());
-        drop(app);
     }
 
     #[test]
@@ -7899,11 +7968,11 @@ mod tests {
             .next()
             .expect("timeline entry");
         assert_eq!(entry.text(), "shared user");
-        let actual = app.transcript().iter().last().expect("user item");
+        let actual = app.transcript().iter().last().expect("user item").clone();
+        drop(app);
         assert_eq!(actual.role(), "You");
         assert_eq!(actual.text(), "shared user");
         assert_eq!(actual.event_sequence(), Some(1));
-        drop(app);
     }
 
     #[test]
@@ -7935,8 +8004,9 @@ mod tests {
         assert_eq!(actual.role(), "Assistant");
         assert_eq!(actual.text(), "shared stream");
         assert!(actual.streaming());
-        assert_eq!(app.transcript().len(), 1);
+        let item_count = app.transcript().len();
         drop(app);
+        assert_eq!(item_count, 1);
     }
 
     #[test]
@@ -7962,11 +8032,16 @@ mod tests {
             app.latest_shared_terminal_text("Assistant").as_deref(),
             Some("final shared")
         );
-        let actual = app.transcript().iter().last().expect("assistant item");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("assistant item")
+            .clone();
+        drop(app);
         assert_eq!(actual.role(), "Assistant");
         assert_eq!(actual.text(), "final shared");
         assert!(!actual.streaming());
-        drop(app);
     }
 
     #[test]
@@ -8026,15 +8101,14 @@ mod tests {
         assert!(!assistants[0].streaming());
         assert_eq!(assistants[0].id(), render_id);
         assert_eq!(assistants[0].source_view_item_id(), Some(&source_id));
-        assert_eq!(
-            app.session_view_snapshot()
-                .runtime
-                .latest_usage
-                .as_ref()
-                .and_then(bcode_session_models::SessionTokenUsage::metered_total_tokens),
-            Some(6_176)
-        );
+        let metered_total = app
+            .session_view_snapshot()
+            .runtime
+            .latest_usage
+            .as_ref()
+            .and_then(bcode_session_models::SessionTokenUsage::metered_total_tokens);
         drop(app);
+        assert_eq!(metered_total, Some(6_176));
     }
 
     #[test]
@@ -8103,8 +8177,8 @@ mod tests {
             None,
             bcode_config::TuiDiffViewerConfig::default(),
         );
-        assert_eq!(streaming_body, finalized_rows[1..]);
         drop(app);
+        assert_eq!(streaming_body, finalized_rows[1..]);
     }
 
     #[test]
@@ -8131,11 +8205,16 @@ mod tests {
                 .as_deref(),
             Some("final reasoning")
         );
-        let actual = app.transcript().iter().last().expect("reasoning item");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("reasoning item")
+            .clone();
+        drop(app);
         assert_eq!(actual.role(), "Reasoning summary");
         assert_eq!(actual.text(), "final reasoning");
         assert!(!actual.streaming());
-        drop(app);
     }
 
     #[test]
@@ -8179,20 +8258,20 @@ mod tests {
         assert_eq!(terminal[2].role(), "Reasoning summary");
         assert_eq!(terminal[2].text(), "second thought");
         assert!(!terminal[2].streaming());
-        assert_eq!(
-            app.session_view_snapshot()
-                .transcript
-                .items
-                .iter()
-                .map(terminal_item_from_shared)
-                .map(|item| (item.role(), item.text().to_owned(), item.streaming()))
-                .collect::<Vec<_>>(),
-            terminal
-                .iter()
-                .map(|item| (item.role(), item.text().to_owned(), item.streaming()))
-                .collect::<Vec<_>>()
-        );
+        let shared_items = app
+            .session_view_snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(terminal_item_from_shared)
+            .map(|item| (item.role(), item.text().to_owned(), item.streaming()))
+            .collect::<Vec<_>>();
+        let terminal_items = terminal
+            .iter()
+            .map(|item| (item.role(), item.text().to_owned(), item.streaming()))
+            .collect::<Vec<_>>();
         drop(app);
+        assert_eq!(shared_items, terminal_items);
     }
 
     #[test]
@@ -8254,15 +8333,16 @@ mod tests {
         ));
 
         assert!(!app.active_tool_loop());
-        assert!(matches!(
+        let finished = matches!(
             app.session_view_snapshot()
                 .tools
                 .get("tool-shared")
                 .expect("shared finished tool")
                 .status,
             bcode_session_view_models::ToolInvocationViewStatus::Finished
-        ));
+        );
         drop(app);
+        assert!(finished);
     }
 
     #[test]
@@ -8298,11 +8378,16 @@ mod tests {
             .find(|item| item.sequence == Some(1))
             .expect("shared tool item");
         let expected = terminal_item_from_shared(shared);
-        let actual = app.transcript().iter().last().expect("terminal tool item");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("terminal tool item")
+            .clone();
+        drop(app);
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
-        drop(app);
     }
 
     #[test]
@@ -8350,11 +8435,16 @@ mod tests {
             })
             .expect("shared tool item");
         let expected = terminal_item_from_shared(shared);
-        let actual = app.transcript().iter().last().expect("terminal tool item");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("terminal tool item")
+            .clone();
+        drop(app);
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
-        drop(app);
     }
 
     #[test]
@@ -8401,12 +8491,13 @@ mod tests {
             })
             .expect("shared finished tool item");
         let expected = terminal_item_from_shared(shared);
-        let actual = terminal.last().expect("terminal result item");
+        let actual = (*terminal.last().expect("terminal result item")).clone();
+        let sequence = shared.sequence;
+        drop(app);
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
-        assert_eq!(actual.event_sequence(), shared.sequence);
-        drop(app);
+        assert_eq!(actual.event_sequence(), sequence);
     }
 
     #[test]
@@ -8440,11 +8531,16 @@ mod tests {
             .find(|item| item.sequence == Some(1))
             .expect("shared permission item");
         let expected = terminal_item_from_shared(shared);
-        let actual = app.transcript().iter().last().expect("terminal item");
+        let actual = app
+            .transcript()
+            .iter()
+            .last()
+            .expect("terminal item")
+            .clone();
+        drop(app);
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
-        drop(app);
     }
 
     #[test]
@@ -8480,12 +8576,14 @@ mod tests {
             .transcript()
             .iter()
             .last()
-            .expect("terminal permission item");
+            .expect("terminal permission item")
+            .clone();
+        let sequence = shared.sequence;
+        drop(app);
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
-        assert_eq!(actual.event_sequence(), shared.sequence);
-        drop(app);
+        assert_eq!(actual.event_sequence(), sequence);
     }
 
     fn shared_projection_terminal_adapter_events(session_id: SessionId) -> Vec<SessionEvent> {
@@ -8623,8 +8721,9 @@ mod tests {
                 },
             },
         });
-        assert!(app.transcript().is_empty());
+        let transcript_empty = app.transcript().is_empty();
         drop(app);
+        assert!(transcript_empty);
     }
 
     #[test]
@@ -8678,8 +8777,9 @@ mod tests {
             bcode_session_models::ToolContributionOperation::Upsert,
             "stale",
         ));
-        assert!(app.transcript().is_empty());
+        let transcript_empty = app.transcript().is_empty();
         drop(app);
+        assert!(transcript_empty);
     }
 
     #[test]
@@ -8706,7 +8806,8 @@ mod tests {
                 },
             },
         });
-        assert!(app.transcript().is_empty());
+        let transcript_empty = app.transcript().is_empty();
         drop(app);
+        assert!(transcript_empty);
     }
 }

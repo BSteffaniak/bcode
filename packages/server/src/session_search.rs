@@ -5070,17 +5070,18 @@ pub(crate) mod tests {
                 .copied(),
             Some(1)
         );
+        let failed_sessions = state
+            .metrics
+            .snapshot()
+            .counters
+            .get("server.session_search.ingestion_session_failed_total")
+            .copied();
+        drop(state);
         assert_eq!(
-            state
-                .metrics
-                .snapshot()
-                .counters
-                .get("server.session_search.ingestion_session_failed_total")
-                .copied(),
+            failed_sessions,
             Some(1),
             "a deferred session must not be re-attempted before its backoff elapses"
         );
-        drop(state);
     }
 
     #[tokio::test]
@@ -5333,6 +5334,14 @@ pub(crate) mod tests {
         .await
         .expect("backfill returns explicit per-session overlap result");
 
+        blocker.notify_one();
+        let mut terminal = operation.subscribe();
+        terminal
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("migration reaches terminal outcome");
+        drop(state);
+
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
         assert_eq!(response.failed_sessions, 1);
         assert_eq!(response.sessions.len(), 1);
@@ -5344,14 +5353,6 @@ pub(crate) mod tests {
         assert_eq!(error.code, SearchErrorCode::ProviderUnavailable);
         assert!(error.retryable);
         assert!(error.message.contains("migration is active"));
-
-        blocker.notify_one();
-        let mut terminal = operation.subscribe();
-        terminal
-            .wait_for(|snapshot| snapshot.outcome.is_some())
-            .await
-            .expect("migration reaches terminal outcome");
-        drop(state);
     }
 
     #[tokio::test]
@@ -5394,6 +5395,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("backfill returns explicit per-session repair overlap result");
+        drop(maintenance);
         drop(state);
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
@@ -5401,7 +5403,6 @@ pub(crate) mod tests {
         let error = response.sessions[0].error.as_ref().expect("overlap error");
         assert!(error.retryable);
         assert!(error.message.contains("maintenance") || error.message.contains("owned"));
-        drop(maintenance);
     }
 
     #[tokio::test]
@@ -5554,9 +5555,10 @@ pub(crate) mod tests {
 
         process_dirty_sessions(&state).await;
 
-        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 2);
-        assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+        let pending = state.session_search_dirty.snapshot().await.0;
         drop(state);
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 2);
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
