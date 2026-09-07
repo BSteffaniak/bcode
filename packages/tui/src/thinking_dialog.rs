@@ -1,6 +1,6 @@
 //! TUI reasoning output settings modal state.
 
-use bcode_ipc::SessionModelStatus;
+use bcode_model::SessionModelStatus;
 use bmux_keyboard::{KeyCode, KeyStroke};
 
 /// Outcome from one reasoning-settings dialog keyboard update.
@@ -267,8 +267,8 @@ mod tests {
     use super::{ThinkingDialogOutcome, ThinkingDialogState};
     use bmux_keyboard::{KeyCode, KeyStroke};
 
-    fn status() -> bcode_ipc::SessionModelStatus {
-        bcode_ipc::SessionModelStatus {
+    fn status() -> bcode_model::SessionModelStatus {
+        bcode_model::SessionModelStatus {
             provider_plugin_id: None,
             requested_model_id: None,
             effective_model_id: None,

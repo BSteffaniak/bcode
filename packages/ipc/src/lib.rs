@@ -1381,71 +1381,8 @@ pub struct DaemonStatus {
 /// Compatibility export of the session-owned restored selection contract.
 pub use bcode_session_models::SessionRuntimeSelection;
 
-/// Active model metadata for a session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionModelStatus {
-    #[serde(default)]
-    pub provider_plugin_id: Option<String>,
-    /// User-facing requested model id before alias/default resolution.
-    #[serde(default)]
-    pub requested_model_id: Option<String>,
-    /// Concrete effective model id used for metadata and provider requests.
-    #[serde(default)]
-    pub effective_model_id: Option<String>,
-    /// Legacy display model field retained for wire compatibility.
-    #[serde(default)]
-    pub model_id: Option<String>,
-    /// User-friendly display name from model catalog.
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub context_window: Option<u32>,
-    /// Authoritative active context occupancy.
-    #[serde(default)]
-    pub context_occupancy: Option<Box<bcode_session_models::RequestContextOccupancy>>,
-    /// Projection error preventing a trustworthy occupancy value.
-    #[serde(default)]
-    pub request_context_error: Option<String>,
-    #[serde(default)]
-    pub auth_profile: Option<String>,
-    #[serde(default)]
-    pub context_format_version: Option<u16>,
-    #[serde(default)]
-    pub compatibility_key: Option<String>,
-    #[serde(default)]
-    pub max_output_tokens: Option<u32>,
-    #[serde(default)]
-    pub reasoning: Option<bcode_model::ModelReasoningInfo>,
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-    #[serde(default)]
-    pub reasoning_summary: Option<String>,
-    #[serde(default)]
-    pub prompt_cache_mode: Option<String>,
-    #[serde(default)]
-    pub conversation_reuse_mode: Option<String>,
-    #[serde(default)]
-    pub compaction_mode: Option<String>,
-    #[serde(default)]
-    pub compaction_backend: Option<String>,
-    #[serde(default)]
-    pub proactive_compaction_threshold_percent: Option<u8>,
-    /// Configured absolute proactive threshold when model-specific token policy is active.
-    #[serde(default)]
-    pub proactive_compaction_threshold_tokens: Option<u64>,
-    /// Effective proactive threshold after safe-capacity capping.
-    #[serde(default)]
-    pub proactive_compaction_effective_threshold_tokens: Option<u64>,
-    /// Threshold source (`percent` or `tokens`).
-    #[serde(default)]
-    pub proactive_compaction_threshold_source: Option<String>,
-    #[serde(default)]
-    pub cache: Option<bcode_model::ModelCacheInfo>,
-    #[serde(default)]
-    pub metadata_source: Option<bcode_model::ModelMetadataSource>,
-    #[serde(default)]
-    pub pricing: Option<bcode_model::ModelPricingInfo>,
-}
+/// Compatibility export of the model-owned application status contract.
+pub use bcode_model::SessionModelStatus;
 
 /// Manifest-declared plugin contributions available without executing plugin code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4218,6 +4155,46 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn model_status_preserves_domain_identity_and_wire_shape() {
+        let wire = serde_json::json!({
+            "provider_plugin_id": "provider", "requested_model_id": "alias",
+            "effective_model_id": "concrete", "model_id": "concrete",
+            "display_name": "Model", "context_window": 128_000,
+            "context_occupancy": null, "request_context_error": null,
+            "auth_profile": "work", "context_format_version": 1,
+            "compatibility_key": "format", "max_output_tokens": 8192,
+            "reasoning": null, "reasoning_effort": "high", "reasoning_summary": "auto",
+            "prompt_cache_mode": "auto", "conversation_reuse_mode": "auto",
+            "compaction_mode": "auto", "compaction_backend": "local",
+            "proactive_compaction_threshold_percent": 80,
+            "proactive_compaction_threshold_tokens": 100_000,
+            "proactive_compaction_effective_threshold_tokens": 96_000,
+            "proactive_compaction_threshold_source": "tokens",
+            "cache": null, "metadata_source": null, "pricing": null
+        });
+        let ipc: SessionModelStatus = serde_json::from_value(wire.clone()).unwrap();
+        let domain: bcode_model::SessionModelStatus = ipc;
+        assert_eq!(serde_json::to_value(&domain).unwrap(), wire);
+        let empty: bcode_model::SessionModelStatus =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let encoded = serde_json::to_value(&empty).unwrap();
+        assert_eq!(
+            encoded.as_object().unwrap().len(),
+            wire.as_object().unwrap().len()
+        );
+        assert!(
+            encoded
+                .as_object()
+                .unwrap()
+                .values()
+                .all(serde_json::Value::is_null)
+        );
+        let mut invalid = wire;
+        invalid["context_window"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<SessionModelStatus>(invalid).is_err());
+    }
 
     #[test]
     fn runtime_work_snapshot_preserves_domain_identity_and_wire_shape() {

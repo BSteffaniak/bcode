@@ -35,6 +35,7 @@ bcode_session_models         = { workspace = true }
 bcode_session_search         = { workspace = true }
 bcode_settings               = { workspace = true }
 bcode_skill_models           = { workspace = true }
+bcode_tool_models            = { workspace = true }
 bcode_tui                    = { workspace = true }
 bcode_workflow               = { workspace = true }
 bcode_workflow_discovery     = { workspace = true }

@@ -132,7 +132,7 @@ pub async fn model_status(
     state: &ServerState,
     client_id: bcode_session_models::ClientId,
     session_id: bcode_session_models::SessionId,
-) -> bcode_ipc::SessionModelStatus {
+) -> bcode_model::SessionModelStatus {
     let runtime_context = state.client_runtime_context(client_id).await;
     // Status describes the policy this client will use for its next turn, not the
     // cached policy of the last client that submitted a turn to this session.
@@ -156,7 +156,7 @@ pub async fn model_status(
 pub async fn default_model_status(
     state: &ServerState,
     client_id: bcode_session_models::ClientId,
-) -> bcode_ipc::SessionModelStatus {
+) -> bcode_model::SessionModelStatus {
     let runtime_context = state.client_runtime_context(client_id).await;
     let config = runtime_context
         .as_ref()

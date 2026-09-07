@@ -70,11 +70,15 @@ struct QuestionAnswer {
     custom: Option<String>,
 }
 
-fn effective_interaction_state(
+const fn effective_interaction_state(
     interaction: &InteractionViewSummary,
 ) -> bcode_session_view_models::InteractionViewState {
     if interaction.resolved
-        && interaction.state == bcode_session_view_models::InteractionViewState::Pending
+        && !matches!(
+            interaction.state,
+            bcode_session_view_models::InteractionViewState::Resolved
+                | bcode_session_view_models::InteractionViewState::Cancelled
+        )
     {
         let cancelled = matches!(
             interaction.resolution,
@@ -85,14 +89,6 @@ fn effective_interaction_state(
         } else {
             bcode_session_view_models::InteractionViewState::Resolved
         }
-    } else if interaction.state == bcode_session_view_models::InteractionViewState::Pending
-        && interaction
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.get("validation_error"))
-            .is_some_and(|error| !error.is_null())
-    {
-        bcode_session_view_models::InteractionViewState::ValidationError
     } else {
         interaction.state
     }
@@ -105,6 +101,11 @@ pub(super) fn interaction_request(
 ) -> Containers {
     let item_id = semantic_dom_id("interaction", &interaction.interaction_id);
     let state = effective_interaction_state(interaction);
+    let detail = (state == interaction.state)
+        .then_some(interaction.status_detail.as_deref())
+        .flatten();
+    let input_session_id =
+        session_id.filter(|_| state != bcode_session_view_models::InteractionViewState::Submitting);
     let (status, status_detail) = match state {
         bcode_session_view_models::InteractionViewState::Pending => ("pending response", None),
         bcode_session_view_models::InteractionViewState::Submitting => {
@@ -116,12 +117,8 @@ pub(super) fn interaction_request(
         bcode_session_view_models::InteractionViewState::ActionError => {
             ("action error", interaction.status_detail.as_deref())
         }
-        bcode_session_view_models::InteractionViewState::Resolved => {
-            ("resolved", interaction.status_detail.as_deref())
-        }
-        bcode_session_view_models::InteractionViewState::Cancelled => {
-            ("cancelled", interaction.status_detail.as_deref())
-        }
+        bcode_session_view_models::InteractionViewState::Resolved => ("resolved", detail),
+        bcode_session_view_models::InteractionViewState::Cancelled => ("cancelled", detail),
     };
     let status_color = match state {
         bcode_session_view_models::InteractionViewState::Resolved => color::SUCCESS,
@@ -143,7 +140,7 @@ pub(super) fn interaction_request(
         @if let Some(detail) = status_detail {
             div color=(status_color) font-size=((typeface::DETAIL)) margin-bottom=((space::S6)) { (detail) }
         }
-        @if interaction.resolved {
+        @if interaction.resolved || matches!(state, bcode_session_view_models::InteractionViewState::Resolved | bcode_session_view_models::InteractionViewState::Cancelled) {
             @if let Some(resolution) = &interaction.resolution {
                 (json_panel(
                     "resolution",
@@ -153,14 +150,14 @@ pub(super) fn interaction_request(
         } @else {
             @if interaction.kind == "bcode.question" {
                 @if let Some(snapshot) = interaction.snapshot.as_ref().and_then(|value| serde_json::from_value::<QuestionSnapshot>(value.clone()).ok()) {
-                    (question_interaction(&snapshot, interaction, session_id, context))
+                    (question_interaction(&snapshot, interaction, input_session_id, context))
                 } @else if let Some(snapshot) = &interaction.snapshot {
                     (json_panel("controller snapshot", snapshot))
                 }
             } @else if let Some(snapshot) = &interaction.snapshot {
                 (json_panel("controller snapshot", snapshot))
             }
-            @if let Some(session_id) = session_id {
+            @if let Some(session_id) = input_session_id {
                 (generic_interaction_controls(interaction, session_id, context))
             }
         }
@@ -192,8 +189,8 @@ fn generic_interaction_controls(
                 input type=hidden name="session_id" value=(session_id.to_string());
                 input type=hidden name="interaction_id" value=(interaction.interaction_id.clone());
                 div gap=((space::SM)) {
-                    div #generic-interaction-kind-label color=(color::MUTED) font-size=((typeface::DETAIL)) { "Interaction operation" }
-                    select #generic-interaction-kind name="kind" selected="submit" data-label-id="generic-interaction-kind-label" padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
+                    div id=(semantic_dom_id("generic-interaction-kind-label", &interaction.interaction_id)) color=(color::MUTED) font-size=((typeface::DETAIL)) { "Interaction operation" }
+                    select id=(semantic_dom_id("generic-interaction-kind", &interaction.interaction_id)) name="kind" selected="submit" data-label-id=(semantic_dom_id("generic-interaction-kind-label", &interaction.interaction_id)) padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
                         option value="activate" { "activate control" }
                         option value="change" { "change control value" }
                         option value="focus" { "focus control" }
@@ -202,13 +199,17 @@ fn generic_interaction_controls(
                         option value="submit" { "submit interaction" }
                         option value="cancel" { "cancel interaction" }
                     }
-                    div #generic-interaction-control-label color=(color::MUTED) font-size=((typeface::DETAIL)) { "Control identifier" }
-                    input #generic-interaction-control name="control_id" type=text data-label-id="generic-interaction-control-label" placeholder="control id (activate/change/focus/blur)" padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT);
-                    div #generic-interaction-value-label color=(color::MUTED) font-size=((typeface::DETAIL)) { "Response value" }
-                    input #generic-interaction-value name="value" type=text data-label-id="generic-interaction-value-label" placeholder="response value or JSON (submit/change)" padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT);
-                    input type=hidden name="value_is_json" value="true";
-                    div #generic-interaction-direction-label color=(color::MUTED) font-size=((typeface::DETAIL)) { "Focus direction" }
-                    select #generic-interaction-direction name="direction" selected="next" data-label-id="generic-interaction-direction-label" padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
+                    div id=(semantic_dom_id("generic-interaction-control-label", &interaction.interaction_id)) color=(color::MUTED) font-size=((typeface::DETAIL)) { "Control identifier" }
+                    input id=(semantic_dom_id("generic-interaction-control", &interaction.interaction_id)) name="control_id" type=text data-label-id=(semantic_dom_id("generic-interaction-control-label", &interaction.interaction_id)) placeholder="control id (activate/change/focus/blur)" padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT);
+                    div id=(semantic_dom_id("generic-interaction-value-label", &interaction.interaction_id)) color=(color::MUTED) font-size=((typeface::DETAIL)) { "Response value" }
+                    input id=(semantic_dom_id("generic-interaction-value", &interaction.interaction_id)) name="value" type=text data-label-id=(semantic_dom_id("generic-interaction-value-label", &interaction.interaction_id)) placeholder="response value or JSON (submit/change)" padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT);
+                    div id=(semantic_dom_id("generic-interaction-format-label", &interaction.interaction_id)) color=(color::MUTED) font-size=((typeface::DETAIL)) { "Response format" }
+                    select id=(semantic_dom_id("generic-interaction-format", &interaction.interaction_id)) name="value_is_json" selected="true" data-label-id=(semantic_dom_id("generic-interaction-format-label", &interaction.interaction_id)) padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
+                        option value="true" { "JSON" }
+                        option value="false" { "Plain text" }
+                    }
+                    div id=(semantic_dom_id("generic-interaction-direction-label", &interaction.interaction_id)) color=(color::MUTED) font-size=((typeface::DETAIL)) { "Focus direction" }
+                    select id=(semantic_dom_id("generic-interaction-direction", &interaction.interaction_id)) name="direction" selected="next" data-label-id=(semantic_dom_id("generic-interaction-direction-label", &interaction.interaction_id)) padding=((space::SM)) border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) color=(color::TEXT) {
                         option value="next" { "next" }
                         option value="previous" { "previous" }
                     }
@@ -229,9 +230,11 @@ fn question_interaction(
 ) -> Containers {
     container! {
         div gap=((space::MD)) {
-            @if let Some(validation_error) = &snapshot.validation_error {
-                div color=(color::ERROR) background=(surface::ERROR_INSET) border=((1, color::ERROR_BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) {
-                    "Validation error: " (validation_error)
+            @if interaction.state == bcode_session_view_models::InteractionViewState::ValidationError {
+                @if let Some(validation_error) = &snapshot.validation_error {
+                    div color=(color::ERROR) background=(surface::ERROR_INSET) border=((1, color::ERROR_BORDER)) border-radius=((radius::CONTROL)) padding=((space::SM)) {
+                        "Validation error: " (validation_error)
+                    }
                 }
             }
             @for (question_index, question) in snapshot.request.questions.iter().enumerate() {
@@ -281,6 +284,8 @@ fn question_interaction(
                                 ))
                             }
                         }
+                    } @else {
+                        (question_read_only_answers(snapshot, question, question_index))
                     }
                 }
             }
@@ -289,6 +294,35 @@ fn question_interaction(
                     (question_terminal_action(interaction, session_id, context, "submit", "submit answers", accent::POSITIVE))
                     (question_terminal_action(interaction, session_id, context, "cancel", "cancel", accent::DESTRUCTIVE))
                 }
+            }
+        }
+    }
+}
+
+fn question_read_only_answers(
+    snapshot: &QuestionSnapshot,
+    question: &Question,
+    question_index: usize,
+) -> Containers {
+    let selected = snapshot.selected_option_indices.get(question_index);
+    let custom = snapshot
+        .answers
+        .iter()
+        .find(|answer| answer.question_index == question_index)
+        .and_then(|answer| answer.custom.as_deref());
+    container! {
+        div gap=((space::S6)) {
+            @for (option_index, option) in question.options.iter().enumerate() {
+                div color=(color::STRONG) {
+                    (if selected.is_some_and(|indices| indices.contains(&option_index)) { "✓ " } else { "○ " })
+                    (option.label.clone())
+                    @if let Some(description) = &option.description {
+                        div color=(color::MUTED) { (description) }
+                    }
+                }
+            }
+            @if let Some(custom) = custom {
+                div color=(color::STRONG) { "Custom answer: " (custom) }
             }
         }
     }
@@ -309,7 +343,10 @@ fn question_option(
         .selected_option_indices
         .get(question_index)
         .is_some_and(|selected| selected.contains(&option_index));
-    let option_label_id = format!("question-{question_index}-option-{option_index}-label");
+    let option_label_id = semantic_dom_id(
+        &format!("question-{question_index}-option-{option_index}-label"),
+        &interaction.interaction_id,
+    );
     container! {
         form hx-post=(context.action_target(PresentationAction::ResolveInteraction)) hx-target="#bcode-web-shell" hx-swap=this {
             input type=hidden name="session_id" value=(session_id.to_string());
@@ -347,7 +384,10 @@ fn question_custom_answer(
         .find(|answer| answer.question_index == question_index)
         .and_then(|answer| answer.custom.as_deref())
         .unwrap_or_default();
-    let custom_label_id = format!("question-{question_index}-custom-label");
+    let custom_label_id = semantic_dom_id(
+        &format!("question-{question_index}-custom-label"),
+        &interaction.interaction_id,
+    );
     container! {
         form hx-post=(context.action_target(PresentationAction::ResolveInteraction)) hx-target="#bcode-web-shell" hx-swap=this direction=row gap=((space::S6)) {
             input type=hidden name="session_id" value=(session_id.to_string());

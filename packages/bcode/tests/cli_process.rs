@@ -1129,6 +1129,170 @@ fn missing_interaction_payload_is_io_failure_not_interrupt() {
 }
 
 #[test]
+fn invocation_input_process_rejects_invalid_envelopes_before_daemon_access() {
+    for json in [false, true] {
+        for (contents, diagnostic) in [
+            (
+                br#"{"schema_version":"private-sentinel"}"#.to_vec(),
+                "invalid invocation input envelope",
+            ),
+            (b"{} {}".to_vec(), "trailing characters"),
+            (
+                vec![b' '; 256 * 1024 + 1],
+                "interaction JSON exceeds 262144 bytes",
+            ),
+        ] {
+            let mut arguments = vec![
+                "interaction",
+                "input",
+                "00000000-0000-4000-8000-000000000001",
+                "--payload",
+                "payload.json",
+            ];
+            if json {
+                arguments.push("--json");
+            }
+            let output = run_cli_with_fixture(&arguments, true, Stdio::piped(), |root| {
+                std::fs::write(root.join("payload.json"), contents).unwrap();
+            });
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{stderr}");
+            assert!(output.stdout.is_empty());
+            assert!(stderr.contains(diagnostic), "{stderr}");
+            assert!(!stderr.contains("private-sentinel"), "{stderr}");
+            assert!(!stderr.contains("panicked"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn invocation_input_process_stdin_preserves_bounds_and_envelope_validation() {
+    use std::io::{Seek as _, Write as _};
+    let mut valid = br#"{
+        "invocation_id":"call", "input_id":"input", "producer_id":"plugin",
+        "schema":"plugin.input", "schema_version":1, "payload":"private-sentinel"
+    }"#
+    .to_vec();
+    valid.resize(256 * 1024, b' ');
+    for (contents, code, diagnostic) in [
+        (valid, 1, "error:"),
+        (
+            vec![b' '; 256 * 1024 + 1],
+            2,
+            "interaction JSON exceeds 262144 bytes",
+        ),
+        (
+            br#"{"schema_version":"private-sentinel"}"#.to_vec(),
+            2,
+            "invalid invocation input envelope",
+        ),
+    ] {
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(&contents).unwrap();
+        input.rewind().unwrap();
+        let output = run_cli_with_stdio(
+            &[
+                "interaction",
+                "input",
+                "00000000-0000-4000-8000-000000000001",
+                "--payload",
+                "-",
+                "--json",
+            ],
+            true,
+            Stdio::piped(),
+            Stdio::from(input),
+            |_| {},
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert!(!stderr.contains("private-sentinel"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+#[test]
+fn invocation_input_process_reports_daemon_failure_without_acceptance() {
+    for json in [false, true] {
+        let mut arguments = vec![
+            "interaction",
+            "input",
+            "00000000-0000-4000-8000-000000000001",
+            "--payload",
+            "payload.json",
+        ];
+        if json {
+            arguments.push("--json");
+        }
+        let output = run_cli_with_fixture(&arguments, true, Stdio::piped(), |root| {
+            std::fs::write(
+                root.join("payload.json"),
+                br#"{
+                "invocation_id":"call", "input_id":"input", "producer_id":"plugin",
+                "schema":"plugin.input", "schema_version":1, "payload":"private-sentinel"
+            }"#,
+            )
+            .unwrap();
+        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.starts_with("error:"), "{stderr}");
+        assert!(
+            !stderr.contains("invalid invocation input envelope"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("private-sentinel"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+#[test]
+fn artifact_range_process_enforces_bounds_before_daemon_access() {
+    for length in ["0", "1048577", "4294967295"] {
+        let output = run_cli_with_state(
+            &[
+                "session",
+                "artifact-range",
+                "00000000-0000-4000-8000-000000000001",
+                "artifact",
+                "reference",
+                "--length",
+                length,
+            ],
+            true,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains("invalid value"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+    for length in ["1", "1048576"] {
+        let output = run_cli_with_state(
+            &[
+                "session",
+                "artifact-range",
+                "00000000-0000-4000-8000-000000000001",
+                "artifact",
+                "reference",
+                "--offset",
+                "18446744073709551615",
+                "--length",
+                length,
+            ],
+            true,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+#[test]
 fn invalid_interaction_files_fail_before_daemon_access() {
     for (contents, diagnostic) in [
         (b"{invalid".to_vec(), "key must be a string"),

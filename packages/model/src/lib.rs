@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod status;
+pub use status::SessionModelStatus;
+
 mod context_management;
 pub use context_management::{
     CompactContextRequest, CompactContextResponse, ContextManagementCapabilities,

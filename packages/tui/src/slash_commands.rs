@@ -402,7 +402,7 @@ const fn thinking_mode_label(mode: bcode_config::TuiThinkingMode) -> &'static st
 }
 
 fn thinking_status(
-    status: &bcode_ipc::SessionModelStatus,
+    status: &bcode_model::SessionModelStatus,
     display_mode: bcode_config::TuiThinkingMode,
     display_visible: bool,
 ) -> String {
@@ -441,7 +441,7 @@ fn thinking_status(
     )
 }
 
-fn thinking_capabilities(status: &bcode_ipc::SessionModelStatus) -> String {
+fn thinking_capabilities(status: &bcode_model::SessionModelStatus) -> String {
     let Some(reasoning) = &status.reasoning else {
         return "reasoning output: no provider-declared reasoning capabilities for this model"
             .to_owned();
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn thinking_status_distinguishes_provider_request_from_local_display() {
-        let status = bcode_ipc::SessionModelStatus {
+        let status = bcode_model::SessionModelStatus {
             provider_plugin_id: Some("provider".to_owned()),
             requested_model_id: Some("model".to_owned()),
             effective_model_id: Some("model".to_owned()),

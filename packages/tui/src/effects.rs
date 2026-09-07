@@ -494,7 +494,7 @@ pub enum TuiEffectResult {
         /// Whether at least one daemon-backed request completed successfully.
         daemon_connected: bool,
         /// Default model status, if available.
-        model: Option<bcode_ipc::SessionModelStatus>,
+        model: Option<bcode_model::SessionModelStatus>,
         /// Restored composer draft, if available.
         composer_draft: Option<String>,
         /// First non-critical error encountered.
@@ -512,7 +512,7 @@ pub enum TuiEffectResult {
     /// Targeted model projection refresh completed.
     SessionModelStatusLoaded {
         session_id: SessionId,
-        result: Result<bcode_ipc::SessionModelStatus, ClientError>,
+        result: Result<bcode_model::SessionModelStatus, ClientError>,
     },
     /// Targeted plugin status projection refresh completed.
     PluginStatusLoaded {
@@ -674,7 +674,7 @@ pub enum TuiEffectResult {
         /// Initially focused setting.
         focus: super::thinking_dialog::ThinkingDialogFocus,
         /// Loaded model status.
-        result: Result<bcode_ipc::SessionModelStatus, ClientError>,
+        result: Result<bcode_model::SessionModelStatus, ClientError>,
     },
     /// Bounded timeline jump history loaded.
     TimelineJumpLoaded {
@@ -897,7 +897,7 @@ pub struct SkillActionResult {
 #[derive(Debug)]
 pub struct SessionStatusHydration {
     /// Model status, if available.
-    pub model: Option<bcode_ipc::SessionModelStatus>,
+    pub model: Option<bcode_model::SessionModelStatus>,
     /// Active skills captured during bounded attach hydration.
     pub active_skills: Option<Vec<bcode_skill_models::SkillContextResponse>>,
     /// Runtime work snapshots, if available.

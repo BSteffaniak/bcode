@@ -13802,7 +13802,7 @@ async fn model_status_for_selection(
     selection: SessionModelSelection,
     session_id: Option<SessionId>,
     config: &bcode_config::BcodeConfig,
-) -> bcode_ipc::SessionModelStatus {
+) -> bcode_model::SessionModelStatus {
     let mut models = resolved_provider_models(
         state,
         selection.provider_plugin_id.clone(),
@@ -13893,7 +13893,7 @@ async fn model_status_for_selection(
         )
         .threshold_tokens
     });
-    bcode_ipc::SessionModelStatus {
+    bcode_model::SessionModelStatus {
         provider_plugin_id: selection.provider_plugin_id,
         requested_model_id: selection.requested_model_id.clone(),
         effective_model_id: model_id.clone(),
@@ -34459,10 +34459,20 @@ mod tests {
         )
         .await;
         server.abort();
+        assert!(server.await.expect_err("listener aborted").is_cancelled());
+        drop(state);
+        assert_backfill_operation_is_lost_after_restart(socket_dir.path(), started.operation_id)
+            .await;
+    }
 
+    #[cfg(unix)]
+    async fn assert_backfill_operation_is_lost_after_restart(
+        socket_dir: &std::path::Path,
+        operation_id: String,
+    ) {
         let restarted_state = Arc::new(test_server_state(SessionManager::default()));
         let restarted_endpoint =
-            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("restarted.sock"));
+            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("restarted.sock"));
         let listener = LocalIpcListener::bind(&restarted_endpoint).expect("restarted IPC listener");
         let restarted_server = tokio::spawn(async move {
             let stream = listener
@@ -34476,13 +34486,16 @@ mod tests {
         let restarted_client = bcode_client::BcodeClient::new(restarted_endpoint);
         assert!(
             restarted_client
-                .session_search_backfill_status(started.operation_id)
+                .session_search_backfill_status(operation_id)
                 .await
                 .is_err(),
             "in-process operation notification state must not survive daemon restart"
         );
         restarted_server.abort();
-        drop(state);
+        // The handler may already have returned after the client's one-shot request.
+        if let Err(error) = restarted_server.await {
+            assert!(error.is_cancelled(), "restarted handler failed: {error}");
+        }
     }
 
     #[cfg(unix)]
@@ -38834,6 +38847,157 @@ library = "test"
             ToolExchangeResolution::NoCompatibleConsumer
         );
     }
+    #[tokio::test]
+    async fn invocation_input_delivery_and_rejection_match_real_ipc() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let session_id = SessionId::new();
+        let (inputs, mut received) = mpsc::channel(1);
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session_id,
+            "call",
+            ActivePluginInvocation {
+                producer_plugin_id: "plugin".into(),
+                inputs,
+            },
+            None,
+        )
+        .expect("register invocation");
+        let input = ToolInvocationInput {
+            invocation_id: "call".into(),
+            input_id: "input".into(),
+            producer_id: "plugin".into(),
+            schema: "plugin.input".into(),
+            schema_version: 2,
+            payload: serde_json::json!(["λ", {"opaque": true}]),
+        };
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("input.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        plugin_operations::route_invocation_input(&state, session_id, input.clone()).unwrap();
+        assert_eq!(received.try_recv().unwrap(), input);
+        client
+            .send_invocation_input(session_id, input.clone())
+            .await
+            .unwrap();
+        assert_eq!(received.try_recv().unwrap(), input);
+        assert_invalid_invocation_inputs(&state, &client, session_id, &input).await;
+        let mut wrong_producer = input.clone();
+        wrong_producer.producer_id = "private-wrong-producer".into();
+        assert_invocation_input_rejection(
+            &state,
+            &client,
+            session_id,
+            wrong_producer,
+            plugin_operations::RouteInvocationInputError::ProducerMismatch,
+        )
+        .await;
+        assert!(received.try_recv().is_err());
+        client
+            .send_invocation_input(session_id, input.clone())
+            .await
+            .unwrap();
+        assert_invocation_input_rejection(
+            &state,
+            &client,
+            session_id,
+            input.clone(),
+            plugin_operations::RouteInvocationInputError::QueueFull,
+        )
+        .await;
+        assert_eq!(received.try_recv().unwrap(), input);
+        drop(received);
+        assert_invocation_input_rejection(
+            &state,
+            &client,
+            session_id,
+            input.clone(),
+            plugin_operations::RouteInvocationInputError::RouteClosed,
+        )
+        .await;
+        drop(registration);
+        assert_invocation_input_rejection(
+            &state,
+            &client,
+            session_id,
+            input,
+            plugin_operations::RouteInvocationInputError::NotActive,
+        )
+        .await;
+        drop(state);
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn assert_invalid_invocation_inputs(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+        input: &ToolInvocationInput,
+    ) {
+        use plugin_operations::RouteInvocationInputError as Error;
+        assert_invocation_input_rejection(
+            state,
+            client,
+            SessionId::new(),
+            input.clone(),
+            Error::NotActive,
+        )
+        .await;
+        for expected in [
+            Error::InvalidProducer,
+            Error::InvalidSchema,
+            Error::InvalidInputId,
+            Error::TooLarge,
+        ] {
+            let mut invalid = input.clone();
+            match expected {
+                Error::InvalidProducer => invalid.producer_id = " \t".into(),
+                Error::InvalidSchema => invalid.schema_version = 0,
+                Error::InvalidInputId => invalid.input_id = " \n".into(),
+                Error::TooLarge => invalid.payload = serde_json::json!("x".repeat(64 * 1024)),
+                _ => unreachable!(),
+            }
+            assert_invocation_input_rejection(state, client, session_id, invalid, expected).await;
+        }
+        let mut invalid = input.clone();
+        invalid.schema = " \t".into();
+        assert_invocation_input_rejection(state, client, session_id, invalid, Error::InvalidSchema)
+            .await;
+    }
+
+    async fn assert_invocation_input_rejection(
+        state: &ServerState,
+        client: &bcode_client::BcodeClient,
+        session_id: SessionId,
+        input: ToolInvocationInput,
+        expected: plugin_operations::RouteInvocationInputError,
+    ) {
+        assert_eq!(
+            plugin_operations::route_invocation_input(state, session_id, input.clone()),
+            Err(expected)
+        );
+        let error = client
+            .send_invocation_input(session_id, input)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, bcode_client::ClientError::Server { code, message }
+            if code == expected.code() && message == expected.message())
+        );
+    }
+
     #[test]
     fn generic_invocation_inputs_enqueue_opaque_bounded_payloads() {
         let (sender, mut receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
@@ -49426,7 +49590,9 @@ library = "test"
             Arc::clone(&state),
             stopped,
         ));
-        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut stream = LocalIpcStream::connect(&endpoint)
+            .await
+            .expect("connect artifact client");
         let session_id = SessionId::new();
         for length in [0, MAX_ARTIFACT_RANGE_BYTES + 1, u32::MAX] {
             let direct = artifact_operations::read_range(
@@ -49434,18 +49600,21 @@ library = "test"
             )
             .await
             .expect_err("invalid direct range");
-            let error = client
-                .session_artifact_range(
+            // Bypass client-side validation only to exercise the server's untrusted wire boundary.
+            let response = send_correlated_test_request(
+                &mut stream,
+                u64::from(length) + 1,
+                &Request::ReadSessionArtifact {
                     session_id,
-                    "missing".to_owned(),
-                    "missing".to_owned(),
-                    0,
+                    artifact_id: "missing".into(),
+                    reference_key: "missing".into(),
+                    offset: 0,
                     length,
-                )
-                .await
-                .expect_err("invalid IPC range");
-            let bcode_client::ClientError::Server { code, message } = error else {
-                panic!("expected server rejection, got {error}");
+                },
+            )
+            .await;
+            let Response::Err(bcode_ipc::ErrorResponse { code, message }) = response else {
+                panic!("expected server rejection, got {response:?}");
             };
             assert_eq!(code, direct.code());
             assert_eq!(message, direct.message());
@@ -53586,6 +53755,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("session");
+        let other_session = sessions
+            .create_session(
+                Some("other interaction session".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("other session");
         let state = Arc::new(test_server_state(sessions));
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
@@ -53624,17 +53800,57 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "unknown-route-token",
         ));
 
-        for (index, (kind, value, expected)) in [
+        for (index, (kind, value, value_is_json, expected)) in [
             (
                 "submit",
                 Some("%7B%22accepted%22%3Atrue%7D"),
+                true,
                 bcode_session_models::ToolExchangeResolution::Responded {
                     payload: serde_json::json!({"accepted": true}),
                 },
             ),
             (
+                "submit",
+                Some("true"),
+                false,
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!("true"),
+                },
+            ),
+            (
+                "submit",
+                Some("%20%E9%9B%AA%20%2B%20%26%20%25%20"),
+                false,
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!(" 雪 + & % "),
+                },
+            ),
+            (
+                "submit",
+                Some(""),
+                false,
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!(""),
+                },
+            ),
+            (
+                "submit",
+                Some("null"),
+                true,
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::Value::Null,
+                },
+            ),
+            (
                 "cancel",
                 None,
+                true,
+                bcode_session_models::ToolExchangeResolution::Cancelled,
+            ),
+            (
+                "cancel",
+                Some("%7Binvalid-json"),
+                true,
                 bcode_session_models::ToolExchangeResolution::Cancelled,
             ),
         ]
@@ -53671,21 +53887,117 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 "application/x-www-form-urlencoded".to_owned(),
             );
             let mut body = format!(
-                "session_id={}&interaction_id={interaction_id}&kind={kind}&value_is_json=true",
+                "session_id={}&interaction_id={interaction_id}&kind={kind}&value_is_json={value_is_json}",
                 session.id
             );
+            if kind == "submit" && value_is_json {
+                for suffix in ["", "&value=%7B%22private-answer%22%3A%22secret%22%2C%7D"] {
+                    request.body = Some(Arc::new(format!("{body}{suffix}").into_bytes().into()));
+                    let rendered = router
+                        .navigate(request.clone())
+                        .await
+                        .expect("invalid response route")
+                        .expect("invalid response content");
+                    let rendered = format!("{rendered:?}");
+                    assert!(!rendered.contains("private-answer"));
+                    assert!(!rendered.contains("secret"));
+                    assert!(rendered.contains(if suffix.is_empty() {
+                        "interaction response is required"
+                    } else {
+                        "invalid interaction response JSON"
+                    }));
+                    assert_eq!(*resolution.lock().await, None);
+                    assert!(
+                        state
+                            .pending_tool_exchanges
+                            .lock()
+                            .await
+                            .contains_key(&interaction_id)
+                    );
+                }
+            }
             if let Some(value) = value {
                 body.push_str("&value=");
                 body.push_str(value);
             }
             request.body = Some(Arc::new(body.into_bytes().into()));
 
+            for wrong_kind in ["submit", "cancel"] {
+                let mut wrong_session = request.clone();
+                wrong_session.body = Some(Arc::new(
+                    format!(
+                        "session_id={}&interaction_id={interaction_id}&kind={wrong_kind}&value_is_json=true&value=true",
+                        other_session.id
+                    )
+                    .into_bytes()
+                    .into(),
+                ));
+                let _rendered = router
+                    .navigate(wrong_session)
+                    .await
+                    .expect("wrong-session interaction route")
+                    .expect("wrong-session interaction content");
+                assert_eq!(*resolution.lock().await, None);
+                assert!(
+                    state
+                        .pending_tool_exchanges
+                        .lock()
+                        .await
+                        .contains_key(&interaction_id)
+                );
+            }
+
+            let mut unauthorized = hyperchad::router::RouteRequest::from_path(
+                "/actions/interaction?token=wrong-token",
+                hyperchad::router::RequestInfo::default(),
+            );
+            unauthorized.headers = request.headers.clone();
+            unauthorized.body = request.body.clone();
             let _rendered = router
-                .navigate(request)
+                .navigate(unauthorized)
+                .await
+                .expect("unauthorized interaction route")
+                .expect("unauthorized interaction content");
+            assert_eq!(*resolution.lock().await, None);
+            assert!(
+                state
+                    .pending_tool_exchanges
+                    .lock()
+                    .await
+                    .contains_key(&interaction_id)
+            );
+
+            for kinds in ["kind=submit&kind=cancel", "kind=cancel&kind=submit"] {
+                let mut ambiguous = request.clone();
+                ambiguous.body = Some(Arc::new(
+                    format!(
+                        "session_id={}&interaction_id={interaction_id}&{kinds}&value_is_json=true&value=true",
+                        session.id
+                    )
+                    .into_bytes()
+                    .into(),
+                ));
+                let _rendered = router
+                    .navigate(ambiguous)
+                    .await
+                    .expect("ambiguous interaction route")
+                    .expect("ambiguous interaction content");
+                assert_eq!(*resolution.lock().await, None);
+                assert!(
+                    state
+                        .pending_tool_exchanges
+                        .lock()
+                        .await
+                        .contains_key(&interaction_id)
+                );
+            }
+
+            let _rendered = router
+                .navigate(request.clone())
                 .await
                 .expect("unknown interaction route")
                 .expect("unknown interaction content");
-            assert_eq!(*resolution.lock().await, Some(expected));
+            assert_eq!(*resolution.lock().await, Some(expected.clone()));
             assert!(
                 !state
                     .pending_tool_exchanges
@@ -53693,6 +54005,30 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .await
                     .contains_key(&interaction_id)
             );
+            // Stale browser actions must not replace a submitted or cancelled result.
+            for stale_kind in ["submit", "cancel"] {
+                request.body = Some(Arc::new(
+                    format!(
+                        "session_id={}&interaction_id={interaction_id}&kind={stale_kind}&value_is_json=true&value=false",
+                        session.id
+                    )
+                    .into_bytes()
+                    .into(),
+                ));
+                let _rendered = router
+                    .navigate(request.clone())
+                    .await
+                    .expect("stale interaction route")
+                    .expect("stale interaction content");
+                assert_eq!(*resolution.lock().await, Some(expected.clone()));
+                assert!(
+                    !state
+                        .pending_tool_exchanges
+                        .lock()
+                        .await
+                        .contains_key(&interaction_id)
+                );
+            }
         }
         server.abort();
         drop(state);

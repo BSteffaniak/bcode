@@ -1316,6 +1316,175 @@ fn unknown_interactions_keep_bounded_active_controls_and_resolved_history() {
 }
 
 #[test]
+fn opaque_snapshot_does_not_override_semantic_interaction_state() {
+    let interaction = InteractionViewSummary {
+        producer_id: Some("example.plugin".to_owned()),
+        exchange_schema: Some("example.opaque".to_owned()),
+        exchange_schema_version: Some(1),
+        interaction_id: "opaque-1".to_owned(),
+        kind: "example.opaque".to_owned(),
+        tool_call_id: None,
+        title: None,
+        required: true,
+        snapshot: Some(serde_json::json!({"validation_error": "opaque data"})),
+        state: bcode_session_view_models::InteractionViewState::Pending,
+        status_detail: None,
+        resolved: false,
+        resolution: None,
+    };
+    let rendered = format!(
+        "{:?}",
+        interaction_request(
+            &interaction,
+            None,
+            &crate::context::tests::GuardedTestContext
+        )
+    );
+    assert!(rendered.contains("pending response"));
+    assert!(!rendered.contains("Validation error"));
+}
+
+#[test]
+fn terminal_and_submitting_interactions_hide_controls_without_resolved_flag() {
+    for state in [
+        bcode_session_view_models::InteractionViewState::Resolved,
+        bcode_session_view_models::InteractionViewState::Cancelled,
+        bcode_session_view_models::InteractionViewState::Submitting,
+    ] {
+        let interaction = InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
+            interaction_id: "terminal-1".to_owned(),
+            kind: "example.opaque".to_owned(),
+            tool_call_id: None,
+            title: None,
+            required: true,
+            snapshot: Some(serde_json::json!({"pending": true})),
+            state,
+            status_detail: None,
+            resolved: false,
+            resolution: None,
+        };
+        let rendered = format!(
+            "{:?}",
+            interaction_request(
+                &interaction,
+                Some(bcode_session_models::SessionId::new()),
+                &crate::context::tests::GuardedTestContext
+            )
+        );
+        assert!(!rendered.contains("send interaction input"));
+        assert!(!rendered.contains("generic semantic controls"));
+        assert_eq!(
+            rendered.contains("controller snapshot"),
+            state == bcode_session_view_models::InteractionViewState::Submitting
+        );
+    }
+}
+
+#[test]
+fn resolved_interaction_does_not_display_stale_nonterminal_status() {
+    for state in [
+        bcode_session_view_models::InteractionViewState::Pending,
+        bcode_session_view_models::InteractionViewState::Submitting,
+        bcode_session_view_models::InteractionViewState::ValidationError,
+        bcode_session_view_models::InteractionViewState::ActionError,
+    ] {
+        let mut interaction = InteractionViewSummary {
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
+            interaction_id: "resolved-1".to_owned(),
+            kind: "example.opaque".to_owned(),
+            tool_call_id: None,
+            title: None,
+            required: true,
+            snapshot: None,
+            state,
+            status_detail: Some("stale action failure".to_owned()),
+            resolved: true,
+            resolution: Some(bcode_session_models::ToolExchangeResolution::Cancelled),
+        };
+        let rendered = format!(
+            "{:?}",
+            interaction_request(
+                &interaction,
+                None,
+                &crate::context::tests::GuardedTestContext
+            )
+        );
+        assert!(rendered.contains("cancelled"));
+        assert!(!rendered.contains("stale action failure"));
+        for stale in [
+            "pending response",
+            "submitting",
+            "validation error",
+            "action error",
+        ] {
+            assert!(!rendered.contains(stale));
+        }
+        interaction.resolution = Some(bcode_session_models::ToolExchangeResolution::Responded {
+            payload: serde_json::json!({"answer": true}),
+        });
+        let rendered = format!(
+            "{:?}",
+            interaction_request(
+                &interaction,
+                None,
+                &crate::context::tests::GuardedTestContext
+            )
+        );
+        assert!(rendered.contains("resolved"));
+        assert!(!rendered.contains("cancelled"));
+        assert!(!rendered.contains("stale action failure"));
+        interaction.state = bcode_session_view_models::InteractionViewState::Resolved;
+        interaction.status_detail = Some("response accepted".to_owned());
+        let rendered = format!(
+            "{:?}",
+            interaction_request(
+                &interaction,
+                None,
+                &crate::context::tests::GuardedTestContext
+            )
+        );
+        assert!(rendered.contains("response accepted"));
+    }
+}
+
+fn assert_question_labels_are_scoped(interaction: &InteractionViewSummary) {
+    let other = InteractionViewSummary {
+        interaction_id: "other-question".to_owned(),
+        ..interaction.clone()
+    };
+    let rendered = format!(
+        "{:?}",
+        interaction_request(
+            &other,
+            Some(bcode_session_models::SessionId::new()),
+            &crate::context::tests::GuardedTestContext
+        )
+    );
+    for prefix in [
+        "question-0-option-0-label",
+        "question-0-custom-label",
+        "generic-interaction-kind",
+        "generic-interaction-kind-label",
+        "generic-interaction-control",
+        "generic-interaction-control-label",
+        "generic-interaction-value",
+        "generic-interaction-value-label",
+        "generic-interaction-format",
+        "generic-interaction-format-label",
+        "generic-interaction-direction",
+        "generic-interaction-direction-label",
+    ] {
+        assert!(rendered.contains(&semantic_dom_id(prefix, &other.interaction_id)));
+        assert!(!rendered.contains(&semantic_dom_id(prefix, &interaction.interaction_id)));
+    }
+}
+
+#[test]
 fn question_snapshot_renders_polished_controls_and_generic_fallback() {
     let interaction = InteractionViewSummary {
         producer_id: None,
@@ -1386,6 +1555,34 @@ fn question_snapshot_renders_polished_controls_and_generic_fallback() {
         assert!(rendered.contains(label));
     }
     assert!(rendered.contains("/actions/interaction?"));
+    for prefix in ["question-0-option-0-label", "question-0-custom-label"] {
+        assert!(rendered.contains(&semantic_dom_id(prefix, &interaction.interaction_id)));
+    }
+    assert_question_labels_are_scoped(&interaction);
+
+    let submitting = InteractionViewSummary {
+        state: bcode_session_view_models::InteractionViewState::Submitting,
+        status_detail: None,
+        ..interaction
+    };
+    let rendered = format!(
+        "{:?}",
+        interaction_request(
+            &submitting,
+            Some(bcode_session_models::SessionId::new()),
+            &crate::context::tests::GuardedTestContext
+        )
+    );
+    assert!(rendered.contains("Proceed?"));
+    assert!(rendered.contains("submitting"));
+    assert!(rendered.contains("Yes"));
+    assert!(rendered.contains("Continue"));
+    assert!(rendered.contains("✓ "));
+    assert!(!rendered.contains("Please answer required question 1 before submitting."));
+    assert!(!rendered.contains("Validation error"));
+    assert!(!rendered.contains("/actions/interaction?"));
+    assert!(!rendered.contains("submit answers"));
+    assert!(!rendered.contains("generic semantic controls"));
 }
 
 #[test]
@@ -1442,6 +1639,22 @@ fn question_snapshot_renders_multiple_checkbox_and_exclusive_custom_semantics() 
     assert!(text.contains("☐ Beta"));
     assert!(text.contains("Second option"));
     assert!(rendered.contains("other"));
+
+    let read_only = interaction_request(
+        &interaction,
+        None,
+        &crate::context::StaticPresentationContext,
+    );
+    let mut text = String::new();
+    for container in &read_only {
+        container_text(container, &mut text);
+    }
+    assert!(text.contains("✓ Alpha"));
+    assert!(text.contains("○ Beta"));
+    assert!(text.contains("Second option"));
+    assert!(text.contains("Custom answer: other"));
+    assert!(!text.contains("submit answers"));
+    assert!(!format!("{read_only:?}").contains("/actions/interaction?"));
 }
 
 #[test]

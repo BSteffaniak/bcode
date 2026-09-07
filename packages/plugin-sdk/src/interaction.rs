@@ -115,6 +115,10 @@ pub enum PluginInteractionRegistryError {
     UnsupportedKind(String),
     /// Factory failed to open a controller.
     OpenFailed(String),
+    /// A factory advertised a blank interaction kind.
+    InvalidKind,
+    /// More than one factory advertised the same interaction kind.
+    ConflictingFactories,
 }
 
 impl fmt::Display for PluginInteractionRegistryError {
@@ -123,6 +127,8 @@ impl fmt::Display for PluginInteractionRegistryError {
             Self::UnsupportedKind(kind) => {
                 write!(formatter, "unsupported interaction kind: {kind}")
             }
+            Self::InvalidKind => formatter.write_str("invalid interaction kind"),
+            Self::ConflictingFactories => formatter.write_str("conflicting controller factories"),
             Self::OpenFailed(message) => write!(formatter, "failed to open interaction: {message}"),
         }
     }
@@ -161,7 +167,7 @@ pub trait PluginInteractionControllerFactory: Send + Sync {
 /// Registry of renderer-neutral interaction controller factories.
 #[derive(Default)]
 pub struct PluginInteractionRegistry {
-    factories: BTreeMap<String, Box<dyn PluginInteractionControllerFactory>>,
+    factories: BTreeMap<String, Option<Box<dyn PluginInteractionControllerFactory>>>,
 }
 
 impl fmt::Debug for PluginInteractionRegistry {
@@ -178,9 +184,39 @@ impl fmt::Debug for PluginInteractionRegistry {
 
 impl PluginInteractionRegistry {
     /// Register a low-level controller factory.
+    ///
+    /// Duplicate kinds are permanently ambiguous for this registry and cannot be opened.
+    /// Empty or whitespace-only kinds are invalid and are not registered.
     pub fn register_factory(&mut self, factory: Box<dyn PluginInteractionControllerFactory>) {
-        self.factories
-            .insert(factory.interaction_kind().to_owned(), factory);
+        let _ = self.try_register_factory(factory);
+    }
+
+    /// Register a factory and report invalid or conflicting registration.
+    ///
+    /// Conflicts disable the kind, including the previously registered factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginInteractionRegistryError::InvalidKind`] for blank kinds or
+    /// [`PluginInteractionRegistryError::ConflictingFactories`] for duplicate kinds.
+    pub fn try_register_factory(
+        &mut self,
+        factory: Box<dyn PluginInteractionControllerFactory>,
+    ) -> Result<(), PluginInteractionRegistryError> {
+        let kind = factory.interaction_kind();
+        if kind.trim().is_empty() {
+            return Err(PluginInteractionRegistryError::InvalidKind);
+        }
+        match self.factories.entry(kind.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(factory));
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+                Err(PluginInteractionRegistryError::ConflictingFactories)
+            }
+        }
     }
 
     /// Register a typed interaction with the default JSON adapter.
@@ -194,14 +230,14 @@ impl PluginInteractionRegistry {
     /// Return whether this registry supports `kind`.
     #[must_use]
     pub fn supports(&self, kind: &str) -> bool {
-        self.factories.contains_key(kind)
+        self.factories.get(kind).is_some_and(Option::is_some)
     }
 
     /// Open a registered controller.
     ///
     /// # Errors
     ///
-    /// Returns an error when no factory exists, initialization fails, or the returned
+    /// Returns an error when no factory exists, registrations conflict, initialization fails, or the returned
     /// controller kind differs from the registered kind. Factory error details are
     /// not exposed because they may contain sensitive request data.
     pub fn open(
@@ -213,6 +249,9 @@ impl PluginInteractionRegistry {
             .factories
             .get(kind)
             .ok_or_else(|| PluginInteractionRegistryError::UnsupportedKind(kind.to_owned()))?;
+        let factory = factory
+            .as_ref()
+            .ok_or(PluginInteractionRegistryError::ConflictingFactories)?;
         let controller = factory.open(request).map_err(|_| {
             PluginInteractionRegistryError::OpenFailed(
                 "controller initialization failed".to_owned(),
@@ -352,6 +391,180 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_does_not_register_blank_kinds() {
+        struct Factory(&'static str);
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                self.0
+            }
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                panic!("invalid factory must never open")
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        for kind in ["", " ", "\t\n", "\u{2003}"] {
+            for _ in 0..2 {
+                assert_eq!(
+                    registry.try_register_factory(Box::new(Factory(kind))),
+                    Err(PluginInteractionRegistryError::InvalidKind)
+                );
+                assert!(!registry.supports(kind));
+                let Err(error) = registry.open(kind, Value::Null) else {
+                    panic!("blank kind opened")
+                };
+                assert_eq!(
+                    error,
+                    PluginInteractionRegistryError::UnsupportedKind(kind.to_owned())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registry_preserves_valid_kind_and_request_identity() {
+        struct Controller(Value);
+        impl PluginInteractionController for Controller {
+            fn kind(&self) -> &'static str {
+                " example "
+            }
+            fn snapshot_json(&self) -> Value {
+                self.0.clone()
+            }
+            fn handle_input(&mut self, _: InteractionInput) -> InteractionOutput {
+                panic!("no input expected")
+            }
+        }
+        struct Factory;
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                " example "
+            }
+            fn open(
+                &self,
+                request: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                Ok(Box::new(Controller(request)))
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.register_factory(Box::new(Factory));
+        assert!(registry.supports(" example "));
+        assert!(!registry.supports("example"));
+        let request = serde_json::json!({"opaque": [null, 42, "original"]});
+        let controller = registry.open(" example ", request.clone()).unwrap();
+        assert_eq!(controller.kind(), " example ");
+        assert_eq!(controller.snapshot_json(), request);
+    }
+
+    #[test]
+    fn registry_conflicting_factories_fail_closed_without_opening() {
+        struct Factory(&'static str);
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                self.0
+            }
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                panic!("conflicting factory must not be invoked")
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.register_factory(Box::new(Factory("other")));
+        registry
+            .try_register_factory(Box::new(Factory("duplicate")))
+            .unwrap();
+        assert!(registry.supports("duplicate"));
+        for _ in 0..3 {
+            assert_eq!(
+                registry.try_register_factory(Box::new(Factory("duplicate"))),
+                Err(PluginInteractionRegistryError::ConflictingFactories)
+            );
+            assert!(!registry.supports("duplicate"));
+            assert!(registry.supports("other"));
+            let Err(error) = registry.open("duplicate", Value::Null) else {
+                panic!("ambiguous registry opened")
+            };
+            assert_eq!(error, PluginInteractionRegistryError::ConflictingFactories);
+        }
+    }
+
+    #[test]
+    fn registry_releases_conflicting_factory_resources() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Factory(Arc<AtomicUsize>);
+        impl Drop for Factory {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                "resource-owner"
+            }
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                panic!("conflicting factory must not open")
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut registry = PluginInteractionRegistry::default();
+        registry.register_factory(Box::new(Factory(Arc::clone(&dropped))));
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        registry.register_factory(Box::new(Factory(Arc::clone(&dropped))));
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        registry.register_factory(Box::new(Factory(Arc::clone(&dropped))));
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        assert!(!registry.supports("resource-owner"));
+        drop(registry);
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        assert_eq!(Arc::strong_count(&dropped), 1);
+    }
+
+    #[test]
+    fn registry_competing_factories_are_order_independent() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Factory(usize, Arc<AtomicUsize>);
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                "competing"
+            }
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                self.1.store(self.0, Ordering::SeqCst);
+                Err(std::io::Error::other("factory invoked").into())
+            }
+        }
+        for order in [[1, 2], [2, 1]] {
+            let invoked = Arc::new(AtomicUsize::new(0));
+            let mut registry = PluginInteractionRegistry::default();
+            for identity in order {
+                registry.register_factory(Box::new(Factory(identity, Arc::clone(&invoked))));
+            }
+            let Err(error) = registry.open("competing", Value::Null) else {
+                panic!("ambiguous registry opened")
+            };
+            assert_eq!(error, PluginInteractionRegistryError::ConflictingFactories);
+            assert_eq!(invoked.load(Ordering::SeqCst), 0);
+            assert!(!registry.supports("competing"));
+        }
+    }
 
     #[test]
     fn registry_does_not_expose_factory_error_details() {

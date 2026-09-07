@@ -84,7 +84,13 @@ impl std::fmt::Debug for HyperChadAppState {
 
 #[derive(Default)]
 struct LocalInteractionControllers {
-    entries: BTreeMap<String, bcode_plugin_sdk::interaction::BoxedPluginInteractionController>,
+    entries: BTreeMap<
+        String,
+        (
+            bcode_session_models::ToolExchangeRequest,
+            bcode_plugin_sdk::interaction::BoxedPluginInteractionController,
+        ),
+    >,
 }
 
 struct InteractionSubmissionGuard {
@@ -92,16 +98,28 @@ struct InteractionSubmissionGuard {
     submissions: Arc<Mutex<BTreeSet<String>>>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InteractionSubmissionError {
+    Busy,
+    Unavailable,
+}
+
 impl InteractionSubmissionGuard {
-    fn acquire(submissions: &Arc<Mutex<BTreeSet<String>>>, interaction_id: &str) -> Option<Self> {
-        submissions
+    fn acquire(
+        submissions: &Arc<Mutex<BTreeSet<String>>>,
+        interaction_id: &str,
+    ) -> Result<Self, InteractionSubmissionError> {
+        if !submissions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map_err(|_| InteractionSubmissionError::Unavailable)?
             .insert(interaction_id.to_owned())
-            .then(|| Self {
-                interaction_id: interaction_id.to_owned(),
-                submissions: Arc::clone(submissions),
-            })
+        {
+            return Err(InteractionSubmissionError::Busy);
+        }
+        Ok(Self {
+            interaction_id: interaction_id.to_owned(),
+            submissions: Arc::clone(submissions),
+        })
     }
 }
 
@@ -662,22 +680,41 @@ async fn hydrate_pending_permissions(
 fn local_interaction_snapshot(
     exchange: &bcode_session_models::ToolExchangeRequest,
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, ClientError> {
     let interaction_id = &exchange.exchange_id;
-    let mut controllers = interaction_controllers
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut controllers = interaction_controllers.lock().map_err(|_| {
+        ClientError::Protocol("interaction controller state is unavailable".to_owned())
+    })?;
     if !controllers.entries.contains_key(interaction_id)
-        && let Some(controller) = local_interaction_controller(exchange)
+        && let Some(controller) = local_interaction_controller(exchange)?
     {
         controllers
             .entries
-            .insert(interaction_id.clone(), controller);
+            .insert(interaction_id.clone(), (exchange.clone(), controller));
     }
     controllers.entries.get(interaction_id).map_or_else(
-        || exchange.payload.clone(),
-        |controller| controller.snapshot_json(),
+        || Ok(exchange.payload.clone()),
+        |(original, controller)| {
+            if original == exchange {
+                Ok(controller.snapshot_json())
+            } else {
+                Err(ClientError::Protocol(
+                    "interaction request changed for an existing controller".to_owned(),
+                ))
+            }
+        },
     )
+}
+
+fn local_interaction_validation_error(
+    snapshot: &serde_json::Value,
+    adapter: Option<&bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability>,
+) -> Option<String> {
+    adapter?;
+    snapshot
+        .get("validation_error")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 async fn hydrate_pending_interactions(
@@ -693,7 +730,9 @@ async fn hydrate_pending_interactions(
         .collect::<BTreeSet<_>>();
     interaction_controllers
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .map_err(|_| {
+            ClientError::Protocol("interaction controller state is unavailable".to_owned())
+        })?
         .entries
         .retain(|interaction_id, _| pending_ids.contains(interaction_id.as_str()));
     for request in exchanges
@@ -702,12 +741,9 @@ async fn hydrate_pending_interactions(
     {
         let exchange = request.request;
         let interaction_id = exchange.exchange_id.clone();
-        let snapshot = local_interaction_snapshot(&exchange, interaction_controllers);
-        let validation_error = snapshot
-            .get("validation_error")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned);
+        let snapshot = local_interaction_snapshot(&exchange, interaction_controllers)?;
         let adapter = local_interaction_adapter(&exchange);
+        let validation_error = local_interaction_validation_error(&snapshot, adapter.as_ref());
         let kind = adapter.as_ref().map_or_else(
             || exchange.schema.clone(),
             |adapter| adapter.interaction_kind.clone(),
@@ -769,20 +805,33 @@ const fn local_interaction_adapter(
     None
 }
 
-#[cfg(feature = "static-bundled-question-plugin")]
 fn local_interaction_controller(
     exchange: &bcode_session_models::ToolExchangeRequest,
-) -> Option<bcode_plugin_sdk::interaction::BoxedPluginInteractionController> {
-    let adapter = local_interaction_adapter(exchange)?;
-    bcode_bundled_plugins::interaction_registry(&exchange.producer_id)?
+) -> Result<Option<bcode_plugin_sdk::interaction::BoxedPluginInteractionController>, ClientError> {
+    let Some(adapter) = local_interaction_adapter(exchange) else {
+        return Ok(None);
+    };
+    let registry = local_interaction_registry(&exchange.producer_id)
+        .ok_or_else(|| ClientError::Protocol("interaction controller is unavailable".to_owned()))?;
+    registry
         .open(&adapter.interaction_kind, exchange.payload.clone())
-        .ok()
+        .map(Some)
+        .map_err(|_| {
+            ClientError::Protocol("interaction controller initialization failed".to_owned())
+        })
+}
+
+#[cfg(feature = "static-bundled-question-plugin")]
+fn local_interaction_registry(
+    producer_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionRegistry> {
+    bcode_bundled_plugins::interaction_registry(producer_id)
 }
 
 #[cfg(not(feature = "static-bundled-question-plugin"))]
-const fn local_interaction_controller(
-    _exchange: &bcode_session_models::ToolExchangeRequest,
-) -> Option<bcode_plugin_sdk::interaction::BoxedPluginInteractionController> {
+const fn local_interaction_registry(
+    _producer_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionRegistry> {
     None
 }
 
@@ -1313,23 +1362,29 @@ impl HyperChadAppState {
         &self,
         exchange: &bcode_session_models::ToolExchangeRequest,
         input: bcode_tool::InteractionInput,
-    ) -> Option<bcode_tool::InteractionOutput> {
+    ) -> Result<Option<bcode_tool::InteractionOutput>, ClientError> {
         let interaction_id = &exchange.exchange_id;
-        let mut controllers = self
-            .interaction_controllers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut controllers = self.interaction_controllers.lock().map_err(|_| {
+            ClientError::Protocol("interaction controller state is unavailable".to_owned())
+        })?;
         if !controllers.entries.contains_key(interaction_id)
-            && let Some(controller) = local_interaction_controller(exchange)
+            && let Some(controller) = local_interaction_controller(exchange)?
         {
             controllers
                 .entries
-                .insert(interaction_id.clone(), controller);
+                .insert(interaction_id.clone(), (exchange.clone(), controller));
         }
-        controllers
-            .entries
-            .get_mut(interaction_id)
-            .map(|controller| controller.handle_input(input))
+        let Some((original, controller)) = controllers.entries.get_mut(interaction_id) else {
+            return Ok(None);
+        };
+        if original != exchange {
+            return Err(ClientError::Protocol(
+                "interaction request changed for an existing controller".to_owned(),
+            ));
+        }
+        let output = controller.handle_input(input);
+        drop(controllers);
+        Ok(Some(output))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1373,7 +1428,32 @@ impl HyperChadAppState {
                 .render_session_or_initial(Some(session_id), "interaction is no longer pending")
                 .await;
         };
-        let controller_output = self.apply_local_interaction_input(&exchange, input);
+        // Fence controller mutation as well as the subsequent canonical resolution.
+        let _submission = match InteractionSubmissionGuard::acquire(
+            &self.interaction_submissions,
+            &exchange.exchange_id,
+        ) {
+            Ok(guard) => guard,
+            Err(InteractionSubmissionError::Unavailable) => {
+                return error_page(
+                    "Interaction submission state is unavailable. Reopen the frontend to retry.",
+                );
+            }
+            Err(InteractionSubmissionError::Busy) => {
+                return self
+                    .render_interaction_status(
+                        session_id,
+                        &exchange.exchange_id,
+                        bcode_session_view_models::InteractionViewState::Submitting,
+                        "Interaction response is already being submitted.",
+                    )
+                    .await;
+            }
+        };
+        let controller_output = match self.apply_local_interaction_input(&exchange, input) {
+            Ok(output) => output,
+            Err(error) => return error_page(&client_error_message(&error)),
+        };
         let resolution_and_status = if let Some(output) = controller_output {
             match output {
                 bcode_tool::InteractionOutput::None | bcode_tool::InteractionOutput::Redraw => {
@@ -1391,7 +1471,7 @@ impl HyperChadAppState {
                 ),
             }
         } else {
-            match generic_interaction_resolution(&exchange, &form) {
+            match generic_interaction_resolution(&form) {
                 Ok(Some(resolution)) => resolution,
                 Ok(None) => {
                     return self
@@ -1409,19 +1489,6 @@ impl HyperChadAppState {
             }
         };
         let (resolution, status) = resolution_and_status;
-        let Some(_submission) = InteractionSubmissionGuard::acquire(
-            &self.interaction_submissions,
-            &exchange.exchange_id,
-        ) else {
-            return self
-                .render_interaction_status(
-                    session_id,
-                    &exchange.exchange_id,
-                    bcode_session_view_models::InteractionViewState::Submitting,
-                    "Interaction response is already being submitted.",
-                )
-                .await;
-        };
         // Scope the per-request client so its runtime context is dropped before the tail renders;
         // the boxed future keeps this handler's frame under clippy's stack-size threshold.
         let result = {
@@ -1635,7 +1702,6 @@ fn semantic_notice(status: &str) -> (bcode_session_view_models::SessionViewNotic
 }
 
 fn generic_interaction_resolution(
-    exchange: &bcode_session_models::ToolExchangeRequest,
     form: &InteractionForm,
 ) -> Result<Option<(bcode_session_models::ToolExchangeResolution, &'static str)>, String> {
     match form.kind {
@@ -1646,9 +1712,9 @@ fn generic_interaction_resolution(
         InteractionInputKind::Submit => {
             let payload = match form.value.as_deref() {
                 Some(value) if form.value_is_json => serde_json::from_str(value)
-                    .map_err(|error| format!("invalid interaction response JSON: {error}"))?,
+                    .map_err(|_| "invalid interaction response JSON".to_owned())?,
                 Some(value) => serde_json::Value::String(value.to_owned()),
-                None => exchange.payload.clone(),
+                None => return Err("interaction response is required".to_owned()),
             };
             Ok(Some((
                 bcode_session_models::ToolExchangeResolution::Responded { payload },
@@ -1704,7 +1770,7 @@ fn interaction_input_from_form(
                 .ok_or_else(|| "interaction value is required".to_owned())?;
             let value = if form.value_is_json {
                 serde_json::from_str::<InteractionValue>(value)
-                    .map_err(|error| format!("invalid interaction value JSON: {error}"))?
+                    .map_err(|_| "invalid interaction value JSON".to_owned())?
             } else {
                 InteractionValue::String(value.to_owned())
             };
@@ -2555,7 +2621,7 @@ mod tests {
             response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
         };
         let controllers = Arc::new(Mutex::new(LocalInteractionControllers::default()));
-        let first = local_interaction_snapshot(&exchange, &controllers);
+        let first = local_interaction_snapshot(&exchange, &controllers).unwrap();
         assert_eq!(first["answers"][0]["custom"], serde_json::Value::Null);
         let output = {
             let mut controllers = controllers
@@ -2565,6 +2631,7 @@ mod tests {
                 .entries
                 .get_mut(&exchange.exchange_id)
                 .expect("question controller")
+                .1
                 .handle_input(bcode_tool::InteractionInput::Change {
                     control_id: bcode_tool::InteractionControlId::new("question-0.custom"),
                     value: bcode_tool::InteractionValue::String("preserved answer".to_owned()),
@@ -2572,8 +2639,8 @@ mod tests {
         };
         assert_eq!(output, bcode_tool::InteractionOutput::Redraw);
 
-        let rerendered = local_interaction_snapshot(&exchange, &controllers);
-        let reconnected = local_interaction_snapshot(&exchange, &controllers);
+        let rerendered = local_interaction_snapshot(&exchange, &controllers).unwrap();
+        let reconnected = local_interaction_snapshot(&exchange, &controllers).unwrap();
         assert_eq!(rerendered["answers"][0]["custom"], "preserved answer");
         assert_eq!(reconnected, rerendered);
     }
@@ -2583,10 +2650,67 @@ mod tests {
         let submissions = Arc::new(Mutex::new(BTreeSet::new()));
         let guard = InteractionSubmissionGuard::acquire(&submissions, "interaction-1")
             .expect("first submission should acquire the guard");
-        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-1").is_none());
-        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-2").is_some());
+        assert_eq!(
+            InteractionSubmissionGuard::acquire(&submissions, "interaction-1").err(),
+            Some(InteractionSubmissionError::Busy)
+        );
+        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-2").is_ok());
         drop(guard);
-        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-1").is_some());
+        assert!(InteractionSubmissionGuard::acquire(&submissions, "interaction-1").is_ok());
+    }
+
+    #[test]
+    fn poisoned_submission_state_rejects_acquisition_and_allows_cleanup() {
+        let submissions = Arc::new(Mutex::new(BTreeSet::new()));
+        let guard = InteractionSubmissionGuard::acquire(&submissions, "interaction-1")
+            .expect("acquire before poisoning");
+        let poisoned = Arc::clone(&submissions);
+        assert!(
+            std::thread::spawn(move || {
+                let _lock = poisoned.lock().unwrap();
+                panic!("poison submission state");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(
+            InteractionSubmissionGuard::acquire(&submissions, "interaction-1").err(),
+            Some(InteractionSubmissionError::Unavailable)
+        );
+        assert_eq!(
+            InteractionSubmissionGuard::acquire(&submissions, "interaction-2").err(),
+            Some(InteractionSubmissionError::Unavailable)
+        );
+        drop(guard);
+        assert!(submissions.lock().unwrap_err().into_inner().is_empty());
+        assert_eq!(
+            InteractionSubmissionGuard::acquire(&submissions, "interaction-1").err(),
+            Some(InteractionSubmissionError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_submission_releases_guard_for_retry() {
+        let submissions = Arc::new(Mutex::new(BTreeSet::new()));
+        let task_submissions = Arc::clone(&submissions);
+        let (ready, acquired) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = InteractionSubmissionGuard::acquire(&task_submissions, "interaction-1")
+                .expect("acquire submission guard");
+            ready.send(()).expect("notify test of acquisition");
+            std::future::pending::<()>().await;
+        });
+        acquired.await.expect("submission acquired guard");
+        assert_eq!(
+            InteractionSubmissionGuard::acquire(&submissions, "interaction-1").err(),
+            Some(InteractionSubmissionError::Busy)
+        );
+        task.abort();
+        assert!(task.await.expect_err("submission aborted").is_cancelled());
+        let retry = InteractionSubmissionGuard::acquire(&submissions, "interaction-1")
+            .expect("cancelled submission must allow retry");
+        drop(retry);
+        assert!(submissions.lock().unwrap().is_empty());
     }
 
     #[cfg(feature = "static-bundled-question-plugin")]
@@ -2617,6 +2741,7 @@ mod tests {
             response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
         };
         let mut controller = local_interaction_controller(&exchange)
+            .expect("question controller should initialize")
             .expect("question adapter should be available locally");
         assert_eq!(
             controller.handle_input(bcode_tool::InteractionInput::Activate {
@@ -2651,6 +2776,123 @@ mod tests {
         assert_eq!(adapter.interaction_kind, "bcode.question");
         assert_eq!(adapter.platform_id, "web");
         assert_eq!(adapter.tui_surface_kind, None);
+        let controllers = Arc::new(Mutex::new(LocalInteractionControllers::default()));
+        let initial = local_interaction_snapshot(&exchange, &controllers).unwrap();
+        assert_ne!(initial, serde_json::Value::Null);
+        let mut conflicting = exchange.clone();
+        conflicting.payload = serde_json::json!({"private": "different request"});
+        let error = local_interaction_snapshot(&conflicting, &controllers).unwrap_err();
+        assert!(
+            matches!(&error, ClientError::Protocol(message) if message == "interaction request changed for an existing controller")
+        );
+        assert!(!error.to_string().contains("different request"));
+        let mut app = HyperChadAppState::new(BcodeClient::default_endpoint(), "test-token");
+        app.interaction_controllers = Arc::clone(&controllers);
+        assert!(matches!(
+            app.apply_local_interaction_input(&conflicting, bcode_tool::InteractionInput::Submit),
+            Err(ClientError::Protocol(_))
+        ));
+        assert_eq!(
+            local_interaction_snapshot(&exchange, &controllers).unwrap(),
+            initial
+        );
+        let poisoned = Arc::clone(&controllers);
+        assert!(
+            std::thread::spawn(move || {
+                let _lock = poisoned.lock().unwrap();
+                panic!("private plugin panic details");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            local_interaction_snapshot(&exchange, &controllers),
+            Err(ClientError::Protocol(message)) if message == "interaction controller state is unavailable"
+        ));
+        assert!(matches!(
+            app.apply_local_interaction_input(&exchange, bcode_tool::InteractionInput::Submit),
+            Err(ClientError::Protocol(message)) if message == "interaction controller state is unavailable"
+        ));
+    }
+
+    #[cfg(feature = "static-bundled-question-plugin")]
+    #[test]
+    fn malformed_question_controller_does_not_fall_back() {
+        let exchange = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "malformed-question".to_owned(),
+            producer_id: "bcode.question".to_owned(),
+            schema: "bcode.question.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"questions": "private invalid request"}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let app = HyperChadAppState::new(BcodeClient::default_endpoint(), "test-token");
+        assert!(matches!(
+            local_interaction_snapshot(&exchange, &app.interaction_controllers),
+            Err(ClientError::Protocol(message)) if message == "interaction controller initialization failed"
+        ));
+        assert!(matches!(
+            app.apply_local_interaction_input(&exchange, bcode_tool::InteractionInput::Submit),
+            Err(ClientError::Protocol(message)) if message == "interaction controller initialization failed"
+        ));
+        assert!(
+            app.interaction_controllers
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "static-bundled-question-plugin")]
+    #[test]
+    fn unsupported_question_version_remains_opaque() {
+        let exchange = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-future".to_owned(),
+            exchange_id: "future-question".to_owned(),
+            producer_id: "bcode.question".to_owned(),
+            schema: "bcode.question.request".to_owned(),
+            schema_version: u32::MAX,
+            payload: serde_json::json!({
+                "questions": "opaque future representation",
+                "validation_error": "not a host validation error"
+            }),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let app = HyperChadAppState::new(BcodeClient::default_endpoint(), "test-token");
+        assert!(local_interaction_adapter(&exchange).is_none());
+        assert_eq!(
+            local_interaction_validation_error(
+                &exchange.payload,
+                local_interaction_adapter(&exchange).as_ref()
+            ),
+            None
+        );
+        assert_eq!(
+            local_interaction_snapshot(&exchange, &app.interaction_controllers).unwrap(),
+            exchange.payload
+        );
+        for input in [
+            bcode_tool::InteractionInput::Submit,
+            bcode_tool::InteractionInput::Cancel,
+        ] {
+            assert_eq!(
+                app.apply_local_interaction_input(&exchange, input).unwrap(),
+                None
+            );
+        }
+        assert!(
+            app.interaction_controllers
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let adapter = generic_interaction_adapter(&exchange);
+        assert_eq!(adapter.exchange_schema, exchange.schema);
+        assert_eq!(adapter.min_schema_version, exchange.schema_version);
+        assert_eq!(adapter.max_schema_version, exchange.schema_version);
     }
 
     #[test]
@@ -3286,6 +3528,29 @@ mod tests {
     }
 
     #[test]
+    fn interaction_change_json_errors_do_not_echo_submitted_values() {
+        for value in [
+            r#"{"secret-answer": "private-value",}"#,
+            r#"["private-value",]"#,
+            "private-value",
+        ] {
+            let form = InteractionForm {
+                session_id: SessionId::new().to_string(),
+                interaction_id: "interaction-1".to_owned(),
+                kind: InteractionInputKind::Change,
+                control_id: Some("answer".to_owned()),
+                value: Some(value.to_owned()),
+                value_is_json: true,
+                direction: None,
+            };
+            assert_eq!(
+                interaction_input_from_form(&form),
+                Err("invalid interaction value JSON".to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn interaction_change_form_parses_explicit_json_values() {
         let form = InteractionForm {
             session_id: SessionId::new().to_string(),
@@ -3328,14 +3593,11 @@ mod tests {
         };
 
         assert_eq!(
-            generic_interaction_resolution(
-                &exchange,
-                &form(
-                    InteractionInputKind::Submit,
-                    Some("{\"accepted\":true}"),
-                    true
-                ),
-            ),
+            generic_interaction_resolution(&form(
+                InteractionInputKind::Submit,
+                Some("{\"accepted\":true}"),
+                true
+            ),),
             Ok(Some((
                 bcode_session_models::ToolExchangeResolution::Responded {
                     payload: serde_json::json!({"accepted": true}),
@@ -3344,41 +3606,46 @@ mod tests {
             )))
         );
         assert_eq!(
-            generic_interaction_resolution(
-                &exchange,
-                &form(InteractionInputKind::Submit, None, false),
-            ),
-            Ok(Some((
-                bcode_session_models::ToolExchangeResolution::Responded {
-                    payload: exchange.payload.clone(),
-                },
-                "interaction submitted",
-            )))
+            generic_interaction_resolution(&form(InteractionInputKind::Submit, None, false),),
+            Err("interaction response is required".to_owned())
         );
+        for (value, is_json, payload) in [
+            ("null", true, serde_json::Value::Null),
+            ("", false, serde_json::Value::String(String::new())),
+        ] {
+            assert_eq!(
+                generic_interaction_resolution(&form(
+                    InteractionInputKind::Submit,
+                    Some(value),
+                    is_json
+                ),),
+                Ok(Some((
+                    bcode_session_models::ToolExchangeResolution::Responded { payload },
+                    "interaction submitted",
+                )))
+            );
+        }
         assert_eq!(
-            generic_interaction_resolution(
-                &exchange,
-                &form(InteractionInputKind::Cancel, None, false),
-            ),
+            generic_interaction_resolution(&form(InteractionInputKind::Cancel, None, false),),
             Ok(Some((
                 bcode_session_models::ToolExchangeResolution::Cancelled,
                 "interaction cancelled",
             )))
         );
         assert_eq!(
-            generic_interaction_resolution(
-                &exchange,
-                &form(InteractionInputKind::Focus, None, false),
-            ),
+            generic_interaction_resolution(&form(InteractionInputKind::Focus, None, false),),
             Ok(None)
         );
-        assert!(
-            generic_interaction_resolution(
-                &exchange,
-                &form(InteractionInputKind::Submit, Some("{"), true),
-            )
-            .is_err()
-        );
+        for invalid in ["{", r#"{"private-answer":"secret",}"#, "private-answer"] {
+            assert_eq!(
+                generic_interaction_resolution(&form(
+                    InteractionInputKind::Submit,
+                    Some(invalid),
+                    true
+                ),),
+                Err("invalid interaction response JSON".to_owned())
+            );
+        }
 
         let adapter = generic_interaction_adapter(&exchange);
         assert_eq!(adapter.producer_id, exchange.producer_id);

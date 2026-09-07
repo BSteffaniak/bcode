@@ -1872,7 +1872,7 @@ impl BmuxApp {
     }
 
     /// Apply hydrated model metadata to the app.
-    pub fn apply_model_status(&mut self, status: bcode_ipc::SessionModelStatus) {
+    pub fn apply_model_status(&mut self, status: bcode_model::SessionModelStatus) {
         let provider_plugin_id = status
             .provider_plugin_id
             .clone()
@@ -4905,14 +4905,13 @@ mod tests {
         app.push_ephemeral_system_plain("send failed".to_owned());
         app.absorb_session_event(&event(2, "after"));
 
-        assert_eq!(
-            app.transcript()
-                .iter()
-                .map(|item| item.text().to_owned())
-                .collect::<Vec<_>>(),
-            ["before", "send failed", "after"]
-        );
+        let transcript = app
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(app);
+        assert_eq!(transcript, ["before", "send failed", "after"]);
     }
 
     #[test]
@@ -4935,14 +4934,16 @@ mod tests {
         app.push_ephemeral_system_plain("notice two".to_owned());
         app.absorb_session_event(&event(3, "third"));
 
+        let transcript = app
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
+        drop(app);
         assert_eq!(
-            app.transcript()
-                .iter()
-                .map(|item| item.text().to_owned())
-                .collect::<Vec<_>>(),
+            transcript,
             ["first", "notice one", "second", "notice two", "third"]
         );
-        drop(app);
     }
 
     #[test]
@@ -4965,14 +4966,13 @@ mod tests {
 
         app.replace_latest_transcript_window(&[event(1, "earlier"), later], false);
 
-        assert_eq!(
-            app.transcript()
-                .iter()
-                .map(TranscriptItem::text)
-                .collect::<Vec<_>>(),
-            ["earlier", "later", "local issue"]
-        );
+        let transcript = app
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(app);
+        assert_eq!(transcript, ["earlier", "later", "local issue"]);
     }
 
     #[test]
@@ -4992,29 +4992,25 @@ mod tests {
             BmuxApp::new_with_history(Some(session_id), &[event(5, "five")], &[], false);
         before.push_ephemeral_system_plain("local issue".to_owned());
         before.replace_transcript_window(&[event(8, "eight")], true, true, 8);
-        assert_eq!(
-            before
-                .transcript()
-                .iter()
-                .map(TranscriptItem::text)
-                .collect::<Vec<_>>(),
-            ["local issue", "eight"]
-        );
+        let transcript = before
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(before);
+        assert_eq!(transcript, ["local issue", "eight"]);
 
         let mut after =
             BmuxApp::new_with_history(Some(session_id), &[event(5, "five")], &[], false);
         after.push_ephemeral_system_plain("local issue".to_owned());
         after.replace_transcript_window(&[event(2, "two")], true, true, 2);
-        assert_eq!(
-            after
-                .transcript()
-                .iter()
-                .map(TranscriptItem::text)
-                .collect::<Vec<_>>(),
-            ["two", "local issue"]
-        );
+        let transcript = after
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(after);
+        assert_eq!(transcript, ["two", "local issue"]);
     }
 
     #[test]
@@ -5040,14 +5036,13 @@ mod tests {
 
         app.replace_latest_transcript_window(&[event(1, "one"), event(3, "three")], false);
 
-        assert_eq!(
-            app.transcript()
-                .iter()
-                .map(TranscriptItem::text)
-                .collect::<Vec<_>>(),
-            ["one", "local issue", "three"]
-        );
+        let transcript = app
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(app);
+        assert_eq!(transcript, ["one", "local issue", "three"]);
     }
 
     #[test]
@@ -5067,8 +5062,9 @@ mod tests {
         app.push_ephemeral_system_plain("local issue".to_owned());
         app.absorb_session_event(&event(2, "two"));
 
-        assert_eq!(app.transcript_index_for_sequence(2), Some(2));
+        let index = app.transcript_index_for_sequence(2);
         drop(app);
+        assert_eq!(index, Some(2));
     }
 
     #[test]
@@ -5077,13 +5073,15 @@ mod tests {
 
         app.push_ephemeral_system_plain("local issue".to_owned());
 
-        assert!(matches!(
+        let has_local_provenance = matches!(
             app.transcript.origin(0),
             Some(TranscriptPresentationOrigin::Ephemeral { source, .. })
                 if source == "bcode.tui"
-        ));
-        assert!(app.session_view_snapshot().transcript.items.is_empty());
+        );
+        let canonical_transcript_is_empty = app.session_view_snapshot().transcript.items.is_empty();
         drop(app);
+        assert!(has_local_provenance);
+        assert!(canonical_transcript_is_empty);
     }
 
     #[test]
@@ -5106,15 +5104,13 @@ mod tests {
         reconstructed.take_same_session_transcript_state_from(&source);
         drop(source);
 
-        assert_eq!(
-            reconstructed
-                .transcript()
-                .iter()
-                .map(TranscriptItem::text)
-                .collect::<Vec<_>>(),
-            ["before", "local issue"]
-        );
+        let transcript = reconstructed
+            .transcript()
+            .iter()
+            .map(|item| item.text().to_owned())
+            .collect::<Vec<_>>();
         drop(reconstructed);
+        assert_eq!(transcript, ["before", "local issue"]);
     }
 
     #[test]
@@ -7471,7 +7467,7 @@ mod tests {
         let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
         app.last_transcript_damage = TranscriptDocumentDamage::None;
         let before = app.frame_observation();
-        app.apply_model_status(bcode_ipc::SessionModelStatus {
+        app.apply_model_status(bcode_model::SessionModelStatus {
             provider_plugin_id: None,
             requested_model_id: None,
             effective_model_id: None,

@@ -152,7 +152,14 @@ impl CliError {
             | Self::InvalidExchangeResolution
             | Self::Json(_) => 2,
             Self::Client(ClientError::Server { code, .. })
-                if code == "invalid_exchange_resolution" =>
+                if matches!(
+                    code.as_str(),
+                    "invalid_exchange_resolution"
+                        | "invalid_invocation_input_producer"
+                        | "invalid_invocation_input_schema"
+                        | "invalid_invocation_input_id"
+                        | "invocation_input_too_large"
+                ) =>
             {
                 2
             }
@@ -2248,6 +2255,18 @@ fn filter_session_exchanges(
 
 async fn handle_interaction_command(command: InteractionCommand) -> Result<(), CliError> {
     match command {
+        InteractionCommand::Input {
+            session_id,
+            payload,
+            json,
+        } => {
+            let input = read_invocation_input(&payload)?;
+            ensure_server_running().await?;
+            BcodeClient::default_endpoint()
+                .send_invocation_input(session_id, input)
+                .await?;
+            write_invocation_input_receipt(&mut std::io::stdout().lock(), json)?;
+        }
         InteractionCommand::List { session_id, json } => {
             ensure_server_running().await?;
             let client = BcodeClient::default_endpoint();
@@ -2285,6 +2304,24 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
             print_interaction_resolution(resolved, json)?;
         }
     }
+    Ok(())
+}
+
+fn read_invocation_input(path: &Path) -> Result<bcode_tool_models::ToolInvocationInput, CliError> {
+    serde_json::from_value(read_bounded_interaction_json(path)?)
+        .map_err(|_| CliError::InvalidArguments("invalid invocation input envelope".to_owned()))
+}
+
+fn write_invocation_input_receipt(
+    output: &mut impl std::io::Write,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        writeln!(output, "{{\"accepted\":true}}")?;
+    } else {
+        writeln!(output, "Invocation input accepted")?;
+    }
+    output.flush()?;
     Ok(())
 }
 
@@ -3943,8 +3980,26 @@ enum StateCommand {
     },
 }
 
+#[derive(Debug, clap::Args)]
+struct ArtifactRangeArgs {
+    session_id: SessionId,
+    artifact_id: String,
+    reference_key: String,
+    /// Starting byte offset within the referenced artifact.
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    /// Maximum bytes to read (1 through the shared artifact-range limit).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES)))]
+    length: u32,
+    /// Write only returned bytes, without a newline or metadata. Empty output may mean EOF.
+    #[arg(long)]
+    raw: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Read a bounded artifact byte range as JSON, including reference and availability metadata.
+    ArtifactRange(ArtifactRangeArgs),
     /// List agent profiles available from the daemon for session selection.
     Agents {
         #[arg(long)]
@@ -5124,6 +5179,18 @@ enum PermissionCommand {
 
 #[derive(Debug, Subcommand)]
 enum InteractionCommand {
+    /// Enqueue schema-aware input for an active invocation; acceptance is not completion.
+    Input {
+        /// Canonical session owning the active invocation.
+        session_id: SessionId,
+        /// Complete `ToolInvocationInput` JSON envelope from file or stdin (`-`).
+        /// Input is capped at 256 KiB; the daemon enforces a 64-KiB encoded envelope limit.
+        #[arg(long, value_name = "FILE")]
+        payload: PathBuf,
+        /// Print a JSON acceptance receipt. This does not confer retry safety.
+        #[arg(long)]
+        json: bool,
+    },
     /// List pending renderer-neutral tool exchanges.
     List {
         /// Restrict pending exchanges to one canonical session.
@@ -5350,9 +5417,48 @@ fn write_skill_list(
     Ok(())
 }
 
+fn write_artifact_range(
+    output: &mut impl std::io::Write,
+    range: &bcode_session_models::SessionArtifactRange,
+    raw: bool,
+) -> Result<(), CliError> {
+    if raw {
+        output.write_all(&range.bytes)?;
+        output.flush()?;
+        Ok(())
+    } else {
+        write_json_result(output, range)
+    }
+}
+
+async fn read_artifact_range_to(
+    client: &BcodeClient,
+    args: ArtifactRangeArgs,
+    output: &mut impl std::io::Write,
+) -> Result<(), CliError> {
+    let range = client
+        .session_artifact_range(
+            args.session_id,
+            args.artifact_id,
+            args.reference_key,
+            args.offset,
+            args.length,
+        )
+        .await?;
+    write_artifact_range(output, &range, args.raw)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
+        SessionCommand::ArtifactRange(args) => {
+            Box::pin(read_artifact_range_to(
+                &BcodeClient::default_endpoint(),
+                args,
+                &mut std::io::stdout(),
+            ))
+            .await?;
+        }
         SessionCommand::Agents { json } => {
             ensure_server_running().await?;
             let agents = BcodeClient::default_endpoint().list_agents().await?;
@@ -10177,7 +10283,7 @@ async fn model_status(session_id: Option<SessionId>, json: bool) -> Result<(), C
 
 fn write_model_status(
     output: &mut impl std::io::Write,
-    status: &bcode_ipc::SessionModelStatus,
+    status: &bcode_model::SessionModelStatus,
 ) -> Result<(), CliError> {
     writeln!(
         output,
@@ -21946,6 +22052,29 @@ mod exit_code_tests {
     use super::{CliError, ClientError};
 
     #[test]
+    fn invocation_input_exit_codes_use_explicit_operation_categories() {
+        for (code, expected) in [
+            ("invalid_invocation_input_producer", 2),
+            ("invalid_invocation_input_schema", 2),
+            ("invalid_invocation_input_id", 2),
+            ("invocation_input_too_large", 2),
+            ("plugin_invocation_not_active", 1),
+            ("plugin_invocation_producer_mismatch", 1),
+            ("invocation_input_queue_full", 1),
+            ("invocation_input_route_closed", 1),
+            ("invalid_invocation_input_future_variant", 1),
+        ] {
+            for message in ["invalid input", "cancelled", "authorization denied"] {
+                let error = CliError::Client(ClientError::Server {
+                    code: code.to_owned(),
+                    message: message.to_owned(),
+                });
+                assert_eq!(error.exit_code(), expected, "{code}: {message}");
+            }
+        }
+    }
+
+    #[test]
     fn exit_codes_distinguish_usage_authorization_cancellation_and_runtime_failures() {
         assert_eq!(
             CliError::InvalidArguments("bad input".to_owned()).exit_code(),
@@ -22194,6 +22323,237 @@ mod json_stream_output_tests {
         }
     }
 
+    #[cfg(unix)]
+    fn parsed_artifact_range_args(id: &str, raw: bool) -> super::ArtifactRangeArgs {
+        use clap::Parser as _;
+        let mut arguments = vec![
+            "bcode",
+            "session",
+            "artifact-range",
+            id,
+            "artifact",
+            "reference",
+            "--offset",
+            "1",
+            "--length",
+            "3",
+        ];
+        if raw {
+            arguments.push("--raw");
+        }
+        let cli = super::Cli::try_parse_from(arguments).unwrap();
+        let super::Commands::Session { command } = cli.command.unwrap() else {
+            panic!("session command")
+        };
+        let super::SessionCommand::ArtifactRange(args) = command else {
+            panic!("artifact command")
+        };
+        args
+    }
+
+    #[cfg(unix)]
+    fn assert_artifact_output(
+        bytes: &[u8],
+        expected: &bcode_session_models::SessionArtifactRange,
+        raw: bool,
+    ) {
+        if raw {
+            assert_eq!(bytes, expected.bytes);
+        } else {
+            assert_eq!(
+                &serde_json::from_slice::<bcode_session_models::SessionArtifactRange>(bytes)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_range_handler_preserves_ipc_success_and_failure_output() {
+        for (raw, outcome) in [false, true]
+            .into_iter()
+            .flat_map(|raw| (0..3).map(move |outcome| (raw, outcome)))
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("a.sock"));
+            let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+            let session_id = bcode_session_models::SessionId::new();
+            let expected = bcode_session_models::SessionArtifactRange {
+                artifact_id: "artifact".into(),
+                reference_key: "reference".into(),
+                content_type: Some("application/octet-stream".into()),
+                offset: 1,
+                total_bytes: 4,
+                reference_bytes: Some(4),
+                reference_revision: 7,
+                finalized: true,
+                finalized_event_seq: Some(9),
+                availability: None,
+                complete: Some(true),
+                checksum_sha256: None,
+                bytes: vec![0, 255, 10],
+            };
+            let artifact_response = match outcome {
+                0 => bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionArtifactRange {
+                    range: expected.clone(),
+                }),
+                1 => {
+                    let mut invalid = expected.clone();
+                    invalid.reference_key = "unrequested-reference".into();
+                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionArtifactRange {
+                        range: invalid,
+                    })
+                }
+                _ => bcode_ipc::Response::Err(bcode_ipc::ErrorResponse {
+                    code: "artifact_unavailable".into(),
+                    message: "artifact unavailable".into(),
+                }),
+            };
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let daemon = bcode_ipc::DaemonStatus {
+                    namespace: bcode_ipc::daemon_namespace(),
+                    protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                    artifact_id: Some(bcode_ipc::ArtifactId::current()),
+                    build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.into(),
+                    storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+                    session_event_schema_version: Some(
+                        bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    ),
+                    state_location_id: Some(bcode_ipc::state_location_id()),
+                    ..Default::default()
+                };
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon,
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                assert!(
+                    matches!(bcode_ipc::decode_request(&request.payload).unwrap(),
+                    bcode_ipc::Request::ReadSessionArtifact { session_id: id, artifact_id, reference_key, offset: 1, length: 3 }
+                    if id == session_id && artifact_id == "artifact" && reference_key == "reference")
+                );
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &artifact_response).unwrap(),
+                )
+                .await
+                .unwrap();
+            });
+            let args = parsed_artifact_range_args(&session_id.to_string(), raw);
+            let mut output = Output::default();
+            let result = super::read_artifact_range_to(
+                &bcode_client::BcodeClient::new(endpoint),
+                args,
+                &mut output,
+            )
+            .await;
+            if outcome != 0 {
+                assert!(result.is_err());
+                assert!(output.bytes.is_empty());
+                assert_eq!(output.flushes, 0);
+            } else {
+                result.unwrap();
+                assert_eq!(output.flushes, 1);
+                assert_artifact_output(&output.bytes, &expected, raw);
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn artifact_range_output_preserves_binary_and_metadata() {
+        let mut range = bcode_session_models::SessionArtifactRange {
+            artifact_id: "artifact".into(),
+            reference_key: "reference".into(),
+            content_type: Some("application/octet-stream".into()),
+            offset: 0,
+            total_bytes: 3,
+            reference_bytes: Some(3),
+            reference_revision: 7,
+            finalized: true,
+            finalized_event_seq: Some(9),
+            availability: None,
+            complete: Some(true),
+            checksum_sha256: None,
+            bytes: vec![0, 255, 10],
+        };
+        for raw in [false, true] {
+            let mut output = Output::default();
+            super::write_artifact_range(&mut output, &range, raw).unwrap();
+            assert_eq!(output.flushes, 1);
+            if raw {
+                assert_eq!(output.bytes, range.bytes);
+            } else {
+                assert_eq!(
+                    serde_json::from_slice::<bcode_session_models::SessionArtifactRange>(
+                        &output.bytes
+                    )
+                    .unwrap(),
+                    range
+                );
+            }
+            for fail_flush in [false, true] {
+                let mut output = Output {
+                    fail_write: !fail_flush,
+                    fail_flush,
+                    ..Output::default()
+                };
+                assert!(
+                    matches!(super::write_artifact_range(&mut output, &range, raw),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                );
+            }
+        }
+        range.bytes.clear();
+        range.offset = range.total_bytes;
+        let mut output = Output::default();
+        super::write_artifact_range(&mut output, &range, true).unwrap();
+        assert!(output.bytes.is_empty());
+        assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn invocation_input_receipt_flushes_and_propagates_output_failures() {
+        for json in [false, true] {
+            let mut output = Output::default();
+            super::write_invocation_input_receipt(&mut output, json).unwrap();
+            assert_eq!(output.flushes, 1);
+            assert_eq!(
+                output.bytes,
+                if json {
+                    b"{\"accepted\":true}\n".as_slice()
+                } else {
+                    b"Invocation input accepted\n".as_slice()
+                }
+            );
+            for fail_flush in [false, true] {
+                let mut output = Output {
+                    fail_write: !fail_flush,
+                    fail_flush,
+                    ..Output::default()
+                };
+                assert!(matches!(
+                    super::write_invocation_input_receipt(&mut output, json),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+                ));
+                assert_eq!(output.flushes, usize::from(fail_flush));
+                assert_eq!(output.bytes.is_empty(), !fail_flush);
+            }
+        }
+    }
+
     #[test]
     fn model_validation_exposes_provider_owned_remediation() {
         let failure = bcode_model::ProviderFailureContext {
@@ -22422,13 +22782,14 @@ mod json_stream_output_tests {
 
     #[test]
     fn model_status_preserves_values_and_propagates_output_failures() {
-        let empty: bcode_ipc::SessionModelStatus =
+        let empty: bcode_model::SessionModelStatus =
             serde_json::from_value(serde_json::json!({})).unwrap();
-        let populated: bcode_ipc::SessionModelStatus = serde_json::from_value(serde_json::json!({
-            "provider_plugin_id": "provider", "model_id": "model",
-            "context_window": 32000, "max_output_tokens": 4096
-        }))
-        .unwrap();
+        let populated: bcode_model::SessionModelStatus =
+            serde_json::from_value(serde_json::json!({
+                "provider_plugin_id": "provider", "model_id": "model",
+                "context_window": 32000, "max_output_tokens": 4096
+            }))
+            .unwrap();
         for (status, expected) in [
             (
                 empty,
@@ -23491,6 +23852,52 @@ mod interaction_cli_tests {
                     "interaction JSON exceeds {MAX_CLI_INTERACTION_JSON_BYTES} bytes"
                 )
         ));
+    }
+
+    #[test]
+    fn invocation_input_reads_typed_envelopes_and_reports_acceptance() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input = serde_json::json!({
+            "invocation_id": "call", "input_id": "input", "producer_id": "plugin",
+            "schema": "plugin.input", "schema_version": 2, "payload": [true, "λ"]
+        });
+        std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
+        let decoded = super::read_invocation_input(file.path()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), input);
+        std::fs::write(file.path(), r#"{"schema_version":"private-sentinel"}"#).unwrap();
+        let error = super::read_invocation_input(file.path()).unwrap_err();
+        assert!(matches!(error, CliError::InvalidArguments(_)));
+        assert!(!error.to_string().contains("private-sentinel"));
+        for json in [false, true] {
+            let mut output = Vec::new();
+            super::write_invocation_input_receipt(&mut output, json).unwrap();
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                    serde_json::json!({"accepted": true})
+                );
+            } else {
+                assert_eq!(output, b"Invocation input accepted\n");
+            }
+        }
+    }
+
+    #[test]
+    fn invocation_input_command_parses() {
+        let session_id = bcode_session_models::SessionId::new();
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "interaction",
+            "input",
+            &session_id.to_string(),
+            "--payload",
+            "-",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Commands::Interaction {
+            command: InteractionCommand::Input { session_id: actual, payload, json: true }
+        }) if actual == session_id && payload == std::path::Path::new("-")));
     }
 
     #[test]

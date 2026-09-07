@@ -1571,6 +1571,7 @@ dependencies = [
  "bcode_session_search",
  "bcode_settings",
  "bcode_skill_models",
+ "bcode_tool_models",
  "bcode_tui",
  "bcode_workflow",
  "bcode_workflow_discovery",

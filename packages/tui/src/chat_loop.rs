@@ -3078,7 +3078,7 @@ fn apply_auth_security_result(chat: &mut ActiveChat, status: Option<String>) {
 
 fn apply_draft_status_result(
     chat: &mut ActiveChat,
-    model: Option<bcode_ipc::SessionModelStatus>,
+    model: Option<bcode_model::SessionModelStatus>,
     composer_draft: Option<String>,
     error: Option<String>,
 ) {

@@ -55,6 +55,7 @@ fn validate_artifact_range_response(
     if range.artifact_id != artifact_id
         || range.reference_key != reference_key
         || range.offset != offset
+        || offset > range.total_bytes
         || range.bytes.len() as u64 > u64::from(length)
         || range.bytes.len() as u64
             > u64::from(bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES)
@@ -2208,6 +2209,10 @@ impl BcodeClient {
 
     /// Deliver opaque schema-versioned input to an active invocation.
     ///
+    /// Success means the active invocation's bounded queue accepted the input, not that
+    /// the plugin processed it. A lost response leaves delivery uncertain. This operation
+    /// does not automatically replay input; `input_id` does not confer host deduplication.
+    ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the input.
@@ -2232,8 +2237,9 @@ impl BcodeClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the daemon cannot be reached, rejects the reference/range, or returns
-    /// an unexpected payload.
+    /// Returns an error before transport when `length` is outside the documented bounds.
+    /// Otherwise returns an error when the daemon cannot be reached, rejects the reference/range,
+    /// or returns an unexpected payload.
     pub async fn session_artifact_range(
         &self,
         session_id: SessionId,
@@ -2242,6 +2248,12 @@ impl BcodeClient {
         offset: u64,
         length: u32,
     ) -> Result<SessionArtifactRange, ClientError> {
+        if length == 0 || length > bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES {
+            return Err(ClientError::Protocol(format!(
+                "artifact range length must be between 1 and {} bytes",
+                bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES,
+            )));
+        }
         match self
             .send_request(Request::ReadSessionArtifact {
                 session_id,
@@ -2814,7 +2826,7 @@ impl BcodeClient {
     pub async fn session_model_status(
         &self,
         session_id: SessionId,
-    ) -> Result<bcode_ipc::SessionModelStatus, ClientError> {
+    ) -> Result<bcode_model::SessionModelStatus, ClientError> {
         match self
             .send_request(Request::SessionModelStatus { session_id })
             .await?
@@ -2829,7 +2841,9 @@ impl BcodeClient {
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
-    pub async fn default_model_status(&self) -> Result<bcode_ipc::SessionModelStatus, ClientError> {
+    pub async fn default_model_status(
+        &self,
+    ) -> Result<bcode_model::SessionModelStatus, ClientError> {
         match self.send_request(Request::DefaultModelStatus).await? {
             ResponsePayload::SessionModelStatus { status } => Ok(status),
             _ => Err(ClientError::UnexpectedResponse),
@@ -6712,69 +6726,125 @@ mod client_timeout_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn artifact_client_rejects_empty_before_eof_over_ipc() {
+    async fn artifact_client_rejects_invalid_lengths_before_connecting() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bca-{}", SessionOpenOperationId::new()));
-        std::fs::create_dir_all(&socket_dir).expect("socket directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("range.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
-        let server = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept client");
-            let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
-            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
-                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
-                client_id: bcode_session_models::ClientId::new(),
-                daemon: matching_daemon_status(),
-            });
-            bcode_ipc::send_envelope(
-                &mut stream,
-                &bcode_ipc::response_envelope(hello.request_id, &response).expect("hello envelope"),
-            )
-            .await
-            .expect("send hello");
-            let request = bcode_ipc::recv_envelope(&mut stream)
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("bounds.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_millis(50));
+        for length in [
+            0,
+            bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES + 1,
+            u32::MAX,
+        ] {
+            let error = client
+                .session_artifact_range(
+                    SessionId::new(),
+                    "private-artifact".into(),
+                    "private-reference".into(),
+                    0,
+                    length,
+                )
                 .await
-                .expect("range request");
-            let response =
-                bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionArtifactRange {
-                    range: super::SessionArtifactRange {
-                        artifact_id: "artifact".to_owned(),
-                        reference_key: "reference".to_owned(),
-                        content_type: None,
-                        offset: 0,
-                        total_bytes: 1,
-                        reference_bytes: Some(1),
-                        reference_revision: 1,
-                        finalized: true,
-                        finalized_event_seq: Some(1),
-                        availability: None,
-                        complete: Some(true),
-                        checksum_sha256: None,
-                        bytes: Vec::new(),
-                    },
+                .unwrap_err();
+            assert!(matches!(error, ClientError::Protocol(ref message)
+                if message == &format!("artifact range length must be between 1 and {} bytes", bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES)));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(listener);
+        std::fs::remove_dir_all(socket_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_client_validates_binary_and_eof_ranges_over_ipc() {
+        for (offset, bytes, valid) in [
+            (0, vec![], false),
+            (0, vec![0, 255], true),
+            (2, vec![], true),
+            (3, vec![], false),
+            (u64::MAX, vec![], false),
+        ] {
+            let expected_bytes = bytes.clone();
+            let socket_dir =
+                std::path::PathBuf::from(format!("/tmp/bca-{}", SessionOpenOperationId::new()));
+            std::fs::create_dir_all(&socket_dir).expect("socket directory");
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("range.sock"));
+            let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.expect("accept client");
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
                 });
-            bcode_ipc::send_envelope(
-                &mut stream,
-                &bcode_ipc::response_envelope(request.request_id, &response)
-                    .expect("range envelope"),
-            )
-            .await
-            .expect("send range");
-        });
-        let client = BcodeClient::new(endpoint);
-        let error = client
-            .session_artifact_range(
-                SessionId::new(),
-                "artifact".to_owned(),
-                "reference".to_owned(),
-                0,
-                1,
-            )
-            .await
-            .expect_err("inconsistent range must fail");
-        assert!(matches!(error, ClientError::Protocol(_)));
-        server.await.expect("server task");
-        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response)
+                        .expect("hello envelope"),
+                )
+                .await
+                .expect("send hello");
+                let request = bcode_ipc::recv_envelope(&mut stream)
+                    .await
+                    .expect("range request");
+                let response =
+                    bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionArtifactRange {
+                        range: super::SessionArtifactRange {
+                            artifact_id: "artifact".to_owned(),
+                            reference_key: "reference".to_owned(),
+                            content_type: None,
+                            offset,
+                            total_bytes: 2,
+                            reference_bytes: Some(2),
+                            reference_revision: 1,
+                            finalized: true,
+                            finalized_event_seq: Some(1),
+                            availability: None,
+                            complete: Some(true),
+                            checksum_sha256: None,
+                            bytes,
+                        },
+                    });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &response)
+                        .expect("range envelope"),
+                )
+                .await
+                .expect("send range");
+            });
+            let client = BcodeClient::new(endpoint);
+            let result = client
+                .session_artifact_range(
+                    SessionId::new(),
+                    "artifact".to_owned(),
+                    "reference".to_owned(),
+                    offset,
+                    2,
+                )
+                .await;
+            if valid {
+                let range = result.expect("valid range");
+                assert_eq!(range.bytes, expected_bytes);
+                assert_eq!(range.offset, offset);
+                assert_eq!(range.next_offset(), 2);
+                assert!(range.is_eof());
+                assert_eq!(range.finalized_event_seq, Some(1));
+            } else {
+                assert!(matches!(result, Err(ClientError::Protocol(_))));
+            }
+            server.await.expect("server task");
+            std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+        }
     }
 
     #[cfg(unix)]
@@ -6953,11 +7023,18 @@ mod client_timeout_tests {
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("single-send.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let daemon = matching_daemon_status();
-        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let server_accepted = std::sync::Arc::clone(&accepted);
+        let session_id = SessionId::new();
+        let input = bcode_tool::ToolInvocationInput {
+            invocation_id: "call".into(),
+            input_id: "input".into(),
+            producer_id: "plugin".into(),
+            schema: "plugin.input".into(),
+            schema_version: 1,
+            payload: serde_json::json!({"opaque": "λ"}),
+        };
+        let expected_input = input.clone();
         let server = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept client");
-            server_accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
             let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
                 protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
@@ -6974,19 +7051,27 @@ mod client_timeout_tests {
                 .expect("application request");
             assert!(matches!(
                 bcode_ipc::decode_request(&request.payload).expect("decode request"),
-                bcode_ipc::Request::Ping
+                bcode_ipc::Request::InvocationInput { session_id: actual, input }
+                    if actual == session_id && input == expected_input
             ));
             drop(stream);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "uncertain input must not be replayed on a second connection"
+            );
         });
 
         let client = BcodeClient::new(endpoint)
             .with_daemon_availability(super::DaemonAvailability::AutoStart)
             .with_request_timeout(Duration::from_secs(1));
-        let error = client.ping().await.expect_err("response EOF must fail");
+        let error = client
+            .send_invocation_input(session_id, input)
+            .await
+            .expect_err("response EOF must fail");
         assert!(matches!(error, ClientError::Codec(_)));
         server.await.expect("server task");
-        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
     }
 

@@ -115,19 +115,7 @@ pub fn route_invocation_input(
     session_id: bcode_session_models::SessionId,
     input: bcode_tool::ToolInvocationInput,
 ) -> Result<(), RouteInvocationInputError> {
-    if input.producer_id.trim().is_empty() {
-        return Err(RouteInvocationInputError::InvalidProducer);
-    }
-    if input.schema.trim().is_empty() || input.schema_version == 0 {
-        return Err(RouteInvocationInputError::InvalidSchema);
-    }
-    if input.input_id.trim().is_empty() {
-        return Err(RouteInvocationInputError::InvalidInputId);
-    }
-    let encoded = serde_json::to_vec(&input).map_err(|_| RouteInvocationInputError::TooLarge)?;
-    if encoded.len() > 64 * 1024 {
-        return Err(RouteInvocationInputError::TooLarge);
-    }
+    validate_invocation_input(&input)?;
     let active = {
         let invocations = state
             .active_plugin_invocations
@@ -141,12 +129,31 @@ pub fn route_invocation_input(
     if active.producer_plugin_id != input.producer_id {
         return Err(RouteInvocationInputError::ProducerMismatch);
     }
-    enqueue_invocation_input(&active, input)
+    enqueue_validated_invocation_input(&active, input)
 }
 
-pub fn enqueue_invocation_input(
-    active: &super::ActivePluginInvocation,
-    input: bcode_tool::ToolInvocationInput,
+const MAX_INVOCATION_INPUT_BYTES: usize = 64 * 1024;
+
+struct InvocationInputBudget {
+    remaining: usize,
+}
+
+impl std::io::Write for InvocationInputBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("invocation input exceeds encoded size limit"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_invocation_input(
+    input: &bcode_tool::ToolInvocationInput,
 ) -> Result<(), RouteInvocationInputError> {
     if input.producer_id.trim().is_empty() {
         return Err(RouteInvocationInputError::InvalidProducer);
@@ -157,10 +164,29 @@ pub fn enqueue_invocation_input(
     if input.input_id.trim().is_empty() {
         return Err(RouteInvocationInputError::InvalidInputId);
     }
-    let encoded = serde_json::to_vec(&input).map_err(|_| RouteInvocationInputError::TooLarge)?;
-    if encoded.len() > 64 * 1024 {
-        return Err(RouteInvocationInputError::TooLarge);
-    }
+    serde_json::to_writer(
+        InvocationInputBudget {
+            remaining: MAX_INVOCATION_INPUT_BYTES,
+        },
+        input,
+    )
+    .map_err(|_| RouteInvocationInputError::TooLarge)
+}
+
+/// Validate and enqueue input from an already authorized invocation route.
+#[cfg(test)]
+pub fn enqueue_invocation_input(
+    active: &super::ActivePluginInvocation,
+    input: bcode_tool::ToolInvocationInput,
+) -> Result<(), RouteInvocationInputError> {
+    validate_invocation_input(&input)?;
+    enqueue_validated_invocation_input(active, input)
+}
+
+fn enqueue_validated_invocation_input(
+    active: &super::ActivePluginInvocation,
+    input: bcode_tool::ToolInvocationInput,
+) -> Result<(), RouteInvocationInputError> {
     active.inputs.try_send(input).map_err(|error| match error {
         mpsc::error::TrySendError::Full(_) => RouteInvocationInputError::QueueFull,
         mpsc::error::TrySendError::Closed(_) => RouteInvocationInputError::RouteClosed,
@@ -297,6 +323,47 @@ pub async fn publish_event(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invocation_input_budget_counts_envelope_escaping_and_utf8() {
+        for character in ['a', '\n', 'λ'] {
+            let mut input = bcode_tool::ToolInvocationInput {
+                invocation_id: "invocation".into(),
+                input_id: "input".into(),
+                producer_id: "producer".into(),
+                schema: "schema".into(),
+                schema_version: 1,
+                payload: serde_json::json!(""),
+            };
+            let overhead = serde_json::to_vec(&input).unwrap().len();
+            let width = serde_json::to_string(&character.to_string()).unwrap().len() - 2;
+            let remaining = super::MAX_INVOCATION_INPUT_BYTES - overhead;
+            let mut payload = character.to_string().repeat(remaining / width);
+            payload.push_str(&"a".repeat(remaining % width));
+            input.payload = serde_json::json!(payload);
+            assert_eq!(
+                serde_json::to_vec(&input).unwrap().len(),
+                super::MAX_INVOCATION_INPUT_BYTES
+            );
+            assert_eq!(super::validate_invocation_input(&input), Ok(()));
+            payload.push('a');
+            input.payload = serde_json::json!(payload);
+            assert_eq!(
+                super::validate_invocation_input(&input),
+                Err(super::RouteInvocationInputError::TooLarge)
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_input_budget_rejects_overflow_without_consuming_budget() {
+        use std::io::Write as _;
+        let mut budget = super::InvocationInputBudget { remaining: 3 };
+        assert!(budget.write_all(b"four").is_err());
+        assert_eq!(budget.remaining, 3);
+        budget.write_all(b"abc").unwrap();
+        assert_eq!(budget.remaining, 0);
+        assert!(budget.write_all(b"x").is_err());
+    }
     #[tokio::test]
     async fn service_bridge_drains_queued_request_before_closure() {
         let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
