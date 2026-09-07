@@ -755,15 +755,25 @@ pub async fn set_model(
             bcode_session_models::ModelSelectionSource::UserExplicit,
         )
         .await?;
+    let selected_provider = super::provider_to_selection(&provider);
+    let selected_model = super::model_to_selection(&model_id);
+    // Provider auth is provider-scoped: resolve the context for the provider the user picked
+    // rather than inheriting whatever the daemon's default model profile authenticated against.
+    let provider_context = super::provider_context_for_selection(
+        state,
+        &state.session_config(session_id).await,
+        selected_provider.as_deref(),
+        selected_model.as_deref(),
+    );
     let selection = super::SessionModelSelection {
-        provider_plugin_id: super::provider_to_selection(&provider),
+        provider_plugin_id: selected_provider,
         requested_model_id: None,
-        model_id: super::model_to_selection(&model_id),
+        model_id: selected_model,
         thinking_level: None,
         reasoning_effort: state.selected_reasoning.effort.clone(),
         reasoning_summary: state.selected_reasoning.summary.clone(),
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-        provider_context: state.selected_provider_context.clone(),
+        provider_context,
     };
     state
         .session_model_selections

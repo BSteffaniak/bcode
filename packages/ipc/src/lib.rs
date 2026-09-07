@@ -1150,6 +1150,16 @@ pub struct ClientRuntimeContext {
     pub requested_model_id: Option<String>,
     #[serde(default)]
     pub provider_context: bcode_model::ProviderRequestContext,
+    /// Provider-neutral process environment forwarded from the client shell.
+    ///
+    /// This is the subset of `provider_context.env` that came directly from the client's process
+    /// environment (a fixed allowlist of provider configuration variables) rather than from a
+    /// resolved auth profile or pool. Unlike `provider_context.auth`, it is not scoped to the
+    /// client's selected provider, so the daemon may apply it to a session whose explicitly
+    /// selected provider differs from the client's default. Older clients leave it empty, in which
+    /// case no cross-provider environment is applied.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub process_env: BTreeMap<String, String>,
     /// Renderer-owned adapters available on this client connection.
     #[serde(default)]
     pub interaction_adapters:
@@ -6076,6 +6086,7 @@ mod tests {
                     },
                 ],
                 env_keys: BTreeMap::from([("OPENROUTER_API_KEY".to_string(), true)]),
+                process_env: BTreeMap::from([("AWS_REGION".to_string(), "us-east-1".to_string())]),
             }),
         };
 

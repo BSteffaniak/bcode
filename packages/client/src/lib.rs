@@ -634,6 +634,9 @@ fn current_runtime_context() -> ClientRuntimeContext {
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
+    // Snapshot before auth profile/pool materialization adds profile-scoped values, so the daemon
+    // can distinguish provider-neutral shell environment from credentials tied to one provider.
+    let process_env = env.clone();
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
     resolved.auth_pool = selected_auth_pool(&config, &resolved);
@@ -665,6 +668,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
             env,
             api_surface: None,
         },
+        process_env,
         interaction_adapters: Vec::new(),
         env_keys,
     }

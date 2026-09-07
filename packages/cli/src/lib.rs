@@ -614,10 +614,10 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
     let client = BcodeClient::default_endpoint();
     match *command {
         WorkflowCommand::Author { command } => {
-            handle_workflow_author_command(&client, command).await?;
+            Box::pin(handle_workflow_author_command(&client, command)).await?;
         }
         WorkflowCommand::Package { command } => {
-            handle_workflow_package_command(&client, command).await?;
+            Box::pin(handle_workflow_package_command(&client, command)).await?;
         }
         WorkflowCommand::Events {
             run_id,

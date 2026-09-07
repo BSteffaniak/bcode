@@ -20723,11 +20723,15 @@ async fn session_model_selection_with_runtime_context(
     // The client's transient auth is resolved from the client's own default model profile. It is
     // only meaningful for the provider that profile targets; stamping it onto a sticky selection
     // for a different provider would shadow that provider's saved credentials with foreign ones.
+    // The client's provider-neutral process environment still applies so the selected provider
+    // can honor the launching shell (for example `AWS_BEARER_TOKEN_BEDROCK`).
     if runtime_context_targets_selection(state, &context, &selection) {
         overlay_transient_provider_context(
             &mut selection.provider_context,
             context.provider_context,
         );
+    } else {
+        overlay_transient_process_env(&mut selection.provider_context, context.process_env);
     }
     selection
 }
@@ -20800,6 +20804,61 @@ async fn attached_client_runtime_context(
         .then_some(first)
 }
 
+/// Resolve the provider context a session should use for an explicitly selected provider/model.
+///
+/// Provider auth is provider-scoped: the daemon's default `selected_provider_context` belongs to
+/// the provider its default model profile targets and must never be stamped onto a selection for
+/// another provider (`ChatGPT` credentials on a Bedrock turn shadow Bedrock's own auth and produce
+/// misleading "missing credential" failures).
+///
+/// Resolution order:
+///
+/// * The default context when the selected provider matches the default provider.
+/// * Otherwise the best-matching `[model.profiles.*]` in `config` that targets the selected
+///   provider — an exact model match first, then any profile for that provider — resolved through
+///   the same auth materialization path startup uses.
+/// * Otherwise an empty context, letting the provider plugin fall back to its own environment and
+///   configuration resolution.
+fn provider_context_for_selection(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    provider_plugin_id: Option<&str>,
+    model_id: Option<&str>,
+) -> bcode_model::ProviderRequestContext {
+    let Some(provider_plugin_id) = provider_plugin_id else {
+        return state.selected_provider_context.clone();
+    };
+    if state.selected_provider_plugin_id.as_deref() == Some(provider_plugin_id) {
+        return state.selected_provider_context.clone();
+    }
+    let mut profiles = config
+        .model
+        .profiles
+        .iter()
+        .filter(|(_, profile)| profile.provider_plugin_id == provider_plugin_id)
+        .collect::<Vec<_>>();
+    // Prefer an exact model match, then the config's default profile, then config order.
+    profiles.sort_by_key(|(name, profile)| {
+        (
+            profile.model_id.as_deref() != model_id,
+            config.model.profile.as_deref() != Some(name.as_str()),
+        )
+    });
+    let Some((profile_name, _)) = profiles.first() else {
+        return bcode_model::ProviderRequestContext::default();
+    };
+    let Some(selection) = config.resolved_model_profile(profile_name) else {
+        return bcode_model::ProviderRequestContext::default();
+    };
+    bcode_provider_auth::resolve_provider_request_context(
+        bcode_provider_auth::ProviderRequestContextResolution { config, selection },
+    )
+}
+
+/// Overlay a client's transient provider context onto a same-provider selection.
+///
+/// Auth profile, pool, candidates, and materialized credentials are profile-scoped and replace the
+/// selection's values. Process environment is merged additively.
 fn overlay_transient_provider_context(
     selection: &mut bcode_model::ProviderRequestContext,
     runtime: bcode_model::ProviderRequestContext,
@@ -20819,6 +20878,23 @@ fn overlay_transient_provider_context(
     selection.auth_pool_routing = runtime.auth_pool_routing;
     selection.auth_pool_selection_reason = runtime.auth_pool_selection_reason;
     selection.env.extend(runtime.env);
+}
+
+/// Overlay only the client's process environment onto a selection for a different provider.
+///
+/// The client's auth profile, pool, and credentials were resolved for the provider its default
+/// model profile targets and are meaningless — or actively harmful — for another provider. Its
+/// process environment, however, is provider-neutral: the client forwards a fixed allowlist of
+/// provider configuration variables (`AWS_*`, `OPENAI_*`, …) so provider plugins can honor the
+/// launching shell without reading the daemon's own environment. Values already materialized from
+/// the selection's own auth profile keep precedence.
+fn overlay_transient_process_env(
+    selection: &mut bcode_model::ProviderRequestContext,
+    runtime_env: BTreeMap<String, String>,
+) {
+    for (key, value) in runtime_env {
+        selection.env.entry(key).or_insert(value);
+    }
 }
 
 fn default_model_selection_with_runtime_context(
@@ -20932,6 +21008,12 @@ async fn session_model_selection(
             state.selected_reasoning.summary.clone(),
         ),
     };
+    let provider_context = provider_context_for_selection(
+        state,
+        &state.session_config(session_id).await,
+        provider_plugin_id.as_deref(),
+        model_id.as_deref(),
+    );
     let selection = SessionModelSelection {
         provider_plugin_id,
         requested_model_id: persisted_model.clone(),
@@ -20940,7 +21022,7 @@ async fn session_model_selection(
         reasoning_effort,
         reasoning_summary,
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
-        provider_context: state.selected_provider_context.clone(),
+        provider_context,
     };
     let origin = origin_for_selection_source(runtime_selection.model_selection_source);
     state
@@ -55956,6 +56038,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     env: BTreeMap::from([("OPENAI_API_KEY".to_owned(), "foreign-key".to_owned())]),
                     ..bcode_model::ProviderRequestContext::default()
                 },
+                process_env: BTreeMap::from([
+                    ("AWS_REGION".to_owned(), "us-east-1".to_owned()),
+                    ("dialect".to_owned(), "must-not-clobber".to_owned()),
+                ]),
                 ..ClientRuntimeContext::default()
             }),
         )
@@ -55966,9 +56052,129 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some("bcode.openai-compatible")
         );
         assert_eq!(selection.model_id.as_deref(), Some("gpt-5.6"));
+        let mut expected = sticky_context.clone();
+        // Provider-neutral shell environment still reaches the selected provider; profile-scoped
+        // auth (profile, credentials, and the env the client's profile materialized) does not.
+        expected
+            .env
+            .insert("AWS_REGION".to_owned(), "us-east-1".to_owned());
+        expected
+            .env
+            .insert("dialect".to_owned(), "must-not-clobber".to_owned());
         assert_eq!(
-            selection.provider_context, sticky_context,
+            selection.provider_context, expected,
             "foreign-provider client auth must not be overlaid onto a sticky selection"
+        );
+        assert!(selection.provider_context.auth.is_none());
+        assert!(
+            !selection
+                .provider_context
+                .env
+                .contains_key("OPENAI_API_KEY")
+        );
+        drop(state);
+    }
+
+    /// Switching a session to a provider other than the daemon's default must resolve that
+    /// provider's own context rather than inheriting the default profile's credentials. Inheriting
+    /// them left Bedrock turns carrying `ChatGPT` auth and no way to reach `AWS_*` configuration.
+    #[tokio::test]
+    async fn set_model_resolves_provider_scoped_context_instead_of_inheriting_default_auth() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("switch provider".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let mut state = test_server_state(sessions);
+        state.selected_provider_plugin_id = Some("bcode.openai-compatible".to_owned());
+        state.selected_model_id = Some("gpt-5.6".to_owned());
+        state.selected_provider_context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("openai".to_owned()),
+            auth_pool: Some("openai".to_owned()),
+            auth: Some(bcode_model::ProviderAuthContext {
+                profile: Some("openai".to_owned()),
+                scheme: Some("chatgpt".to_owned()),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            settings: BTreeMap::from([("dialect".to_owned(), "chatgpt_codex".to_owned())]),
+            ..bcode_model::ProviderRequestContext::default()
+        };
+        let mut config = bcode_config::BcodeConfig::default();
+        config.model.profiles.insert(
+            "bedrock-luna".to_owned(),
+            bcode_config::ModelProfileConfig {
+                provider_plugin_id: "bcode.bedrock".to_owned(),
+                model_id: Some("us.openai.gpt-5.6-luna".to_owned()),
+                settings: BTreeMap::from([("transport".to_owned(), "mantle".to_owned())]),
+                ..bcode_config::ModelProfileConfig::default()
+            },
+        );
+        config.model.profiles.insert(
+            "bedrock-other".to_owned(),
+            bcode_config::ModelProfileConfig {
+                provider_plugin_id: "bcode.bedrock".to_owned(),
+                model_id: Some("us.anthropic.other".to_owned()),
+                settings: BTreeMap::from([("transport".to_owned(), "runtime".to_owned())]),
+                ..bcode_config::ModelProfileConfig::default()
+            },
+        );
+        state
+            .session_configs
+            .lock()
+            .await
+            .insert(session_id, config);
+
+        let select = |provider: &str, model: &str| {
+            let provider = provider.to_owned();
+            let model = model.to_owned();
+            let state = &state;
+            async move {
+                session_operations::set_model(state, session_id, Some(provider), model)
+                    .await
+                    .expect("set model");
+                state
+                    .session_model_selections
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .expect("selection")
+            }
+        };
+
+        // Same provider as the daemon default keeps the default context.
+        let same = select("bcode.openai-compatible", "gpt-5.5").await;
+        assert_eq!(same.provider_context, state.selected_provider_context);
+
+        // A different provider resolves the matching model profile for that provider.
+        let bedrock = select("bcode.bedrock", "us.openai.gpt-5.6-luna").await;
+        assert_eq!(bedrock.provider_plugin_id.as_deref(), Some("bcode.bedrock"));
+        assert!(
+            bedrock.provider_context.auth.is_none(),
+            "default openai auth must not leak onto a bedrock selection"
+        );
+        assert_eq!(bedrock.provider_context.auth_profile, None);
+        assert_eq!(bedrock.provider_context.auth_pool, None);
+        assert_eq!(
+            bedrock.provider_context.model_profile.as_deref(),
+            Some("bedrock-luna")
+        );
+        assert_eq!(
+            bedrock
+                .provider_context
+                .settings
+                .get("transport")
+                .map(String::as_str),
+            Some("mantle")
+        );
+        assert!(!bedrock.provider_context.settings.contains_key("dialect"));
+
+        // A provider with no configured profile gets an empty context, not the default one.
+        let unconfigured = select("bcode.xai", "grok").await;
+        assert_eq!(
+            unconfigured.provider_context,
+            bcode_model::ProviderRequestContext::default()
         );
         drop(state);
     }

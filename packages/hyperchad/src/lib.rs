@@ -1422,16 +1422,18 @@ impl HyperChadAppState {
                 )
                 .await;
         };
-        let client = if local_interaction_adapter(&exchange).is_none() {
-            self.client
-                .clone()
-                .with_interaction_adapter(generic_interaction_adapter(&exchange))
-        } else {
-            self.client.clone()
+        // Scope the per-request client so its runtime context is dropped before the tail renders;
+        // the boxed future keeps this handler's frame under clippy's stack-size threshold.
+        let result = {
+            let client = if local_interaction_adapter(&exchange).is_none() {
+                self.client
+                    .clone()
+                    .with_interaction_adapter(generic_interaction_adapter(&exchange))
+            } else {
+                self.client.clone()
+            };
+            Box::pin(client.resolve_tool_exchange(exchange.exchange_id.clone(), resolution)).await
         };
-        let result = client
-            .resolve_tool_exchange(exchange.exchange_id.clone(), resolution)
-            .await;
         match result {
             Ok(true) => {
                 self.interaction_controllers
