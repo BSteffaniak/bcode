@@ -766,6 +766,44 @@ pub trait ProviderTurnCleanup: Send {}
 
 /// Invokes normalized provider turn operations.
 pub trait ModelProviderInvoker: Send {
+    /// Close provider admission and await resource release without selecting a deadline.
+    ///
+    /// Supporting implementations close admission on call, even if the returned future
+    /// is never polled. Hosts may apply their own deadline; abandoning the wait retains
+    /// cleanup ownership for retry. Success acknowledges release of admitted work.
+    /// This operation does not select or change the provider's execution backend.
+    ///
+    /// The default rejects unsupported shutdown without claiming admission closure.
+    ///
+    /// # Errors
+    /// Returns an error when shutdown is unsupported or release cannot be acknowledged.
+    fn shutdown_wait(&mut self) -> RuntimeFuture<'_, ()> {
+        Box::pin(async {
+            Err(RuntimeError::ProviderInvocation(
+                "provider shutdown wait is unsupported".into(),
+            ))
+        })
+    }
+
+    /// Close provider admission and await release of all admitted work.
+    ///
+    /// Supporting implementations close admission when called, even if the returned
+    /// future is abandoned. Success acknowledges resource release, not just a
+    /// cancellation request. Timeout or abandonment retains cleanup ownership for
+    /// retry. `budget` uses the implementation's selected execution clock.
+    ///
+    /// The default rejects unsupported shutdown and does not claim admission closure.
+    ///
+    /// # Errors
+    /// Returns an error when shutdown is unsupported or cleanup is incomplete.
+    fn shutdown(&mut self, _budget: Duration) -> RuntimeFuture<'_, ()> {
+        Box::pin(async {
+            Err(RuntimeError::ProviderInvocation(
+                "provider shutdown is unsupported".into(),
+            ))
+        })
+    }
+
     /// Acquire an owned cleanup handle for a successfully started turn.
     ///
     /// The runtime drops this handle on every exit, including caller abandonment. Implementations
@@ -824,6 +862,14 @@ impl<T> ModelProviderInvoker for Box<T>
 where
     T: ModelProviderInvoker + ?Sized,
 {
+    fn shutdown_wait(&mut self) -> RuntimeFuture<'_, ()> {
+        (**self).shutdown_wait()
+    }
+
+    fn shutdown(&mut self, budget: Duration) -> RuntimeFuture<'_, ()> {
+        (**self).shutdown(budget)
+    }
+
     fn turn_cleanup_handle(
         &mut self,
         provider_plugin_id: Option<&str>,
@@ -4230,6 +4276,26 @@ mod tests {
                 cancelled: false,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_provider_shutdown_does_not_claim_cleanup() {
+        let mut provider = Box::new(FakeProvider::new([]));
+        {
+            let invoker: &mut dyn ModelProviderInvoker = &mut provider;
+            assert!(matches!(
+                invoker.shutdown_wait().await,
+                Err(RuntimeError::ProviderInvocation(message))
+                    if message == "provider shutdown wait is unsupported"
+            ));
+            assert!(matches!(
+                invoker.shutdown(Duration::ZERO).await,
+                Err(RuntimeError::ProviderInvocation(message))
+                    if message == "provider shutdown is unsupported"
+            ));
+        }
+        assert!(!provider.cancelled);
+        assert!(!provider.finished);
     }
 
     impl ModelProviderInvoker for FakeProvider {

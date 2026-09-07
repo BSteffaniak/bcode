@@ -321,16 +321,24 @@ mod tests {
             .expect("queue bridge request");
         drop(sender);
         let (complete, result) = tokio::sync::oneshot::channel::<u32>();
-        let mut driver = Box::pin(super::drive_service_bridge(&state, None, requests, result));
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
-        assert_eq!(
-            received.try_recv().expect("queued request answered"),
-            Err("command invocation bridge supports nested application services only".to_owned())
-        );
-        complete.send(42).expect("complete invocation");
-        assert_eq!(driver.await.expect("invocation result"), 42);
+        let value = async {
+            let driver = super::drive_service_bridge(&state, None, requests, result);
+            tokio::pin!(driver);
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
+            assert_eq!(
+                received.try_recv().expect("queued request answered"),
+                Err(
+                    "command invocation bridge supports nested application services only"
+                        .to_owned()
+                )
+            );
+            complete.send(42).expect("complete invocation");
+            driver.await.expect("invocation result")
+        }
+        .await;
         drop(state);
+        assert_eq!(value, 42);
     }
 
     #[tokio::test]
@@ -339,13 +347,18 @@ mod tests {
         let (bridge, requests) = crate::server_plugin_bridge();
         drop(bridge);
         let (complete, result) = tokio::sync::oneshot::channel::<u32>();
-        let mut driver = Box::pin(super::drive_service_bridge(&state, None, requests, result));
-        let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(waker);
-        assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
-        complete.send(42).expect("invocation still awaited");
-        assert_eq!(driver.await.expect("invocation result"), 42);
+        let value = async {
+            let driver = super::drive_service_bridge(&state, None, requests, result);
+            tokio::pin!(driver);
+            let waker = std::task::Waker::noop();
+            let mut context = std::task::Context::from_waker(waker);
+            assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
+            complete.send(42).expect("invocation still awaited");
+            driver.await.expect("invocation result")
+        }
+        .await;
         drop(state);
+        assert_eq!(value, 42);
     }
 
     #[tokio::test]
@@ -354,11 +367,16 @@ mod tests {
         let (bridge, requests) = crate::server_plugin_bridge();
         drop(bridge);
         let (complete, result) = tokio::sync::oneshot::channel::<u32>();
-        let mut driver = Box::pin(super::drive_service_bridge(&state, None, requests, result));
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
-        drop(complete);
-        assert!(driver.await.is_err());
+        let outcome = async {
+            let driver = super::drive_service_bridge(&state, None, requests, result);
+            tokio::pin!(driver);
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
+            drop(complete);
+            driver.await
+        }
+        .await;
         drop(state);
+        assert!(outcome.is_err());
     }
 }

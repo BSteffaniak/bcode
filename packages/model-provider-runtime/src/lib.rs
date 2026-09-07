@@ -530,12 +530,25 @@ pub struct TurnState {
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
     positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    terminal: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 }
 
 impl TurnState {
     /// Queue a provider event for the host to poll.
+    ///
+    /// Events published after `TurnFinished` are ignored, even after the terminal
+    /// event has been drained. Terminal publication does not acknowledge worker release.
     pub fn push(&self, event: ProviderTurnEvent) {
+        let Ok(mut events) = self.events.lock() else {
+            return;
+        };
+        if self.terminal.load(Ordering::Acquire) {
+            return;
+        }
+        if matches!(&event, ProviderTurnEvent::TurnFinished { .. }) {
+            self.terminal.store(true, Ordering::Release);
+        }
         let event = if self.positioned_output.load(Ordering::Acquire) {
             match self.output_positions.lock() {
                 Ok(mut positions) => positions.position(event),
@@ -544,9 +557,7 @@ impl TurnState {
         } else {
             event
         };
-        if let Ok(mut events) = self.events.lock() {
-            events.push_back(event);
-        }
+        events.push_back(event);
     }
 
     /// Enable positioned v2 semantic output for this turn.
@@ -1330,23 +1341,40 @@ impl ProviderRuntime {
     ///
     /// Must run on a different runtime. Timeout or cancellation retains ownership;
     /// neither permits unloading plugin code. No blocking waiter is spawned.
+    /// Admission closes on call, even when the returned future is never polled.
+    /// The timeout starts when the future is polled and uses the host Tokio clock.
     ///
     /// # Errors
     ///
     /// * Returns [`ProviderRuntimeError::RuntimeThreadWait`] on a provider worker.
     /// * Returns [`ProviderRuntimeError::ShutdownTimeout`] if teardown exceeds `timeout`.
     /// * Returns [`ProviderRuntimeError::ShutdownFailed`] if teardown is not acknowledged.
-    pub async fn shutdown_async(&self, timeout: Duration) -> Result<(), ProviderRuntimeError> {
-        self.check_blocking_caller()?;
-        let status = *self.stopped_async.borrow();
-        match status {
-            Some(true) => return Ok(()),
-            Some(false) => return Err(ProviderRuntimeError::ShutdownFailed),
-            None => {}
-        }
-        tokio::time::timeout(timeout, self.shutdown_wait())
-            .await
-            .map_err(|_| ProviderRuntimeError::ShutdownTimeout)?
+    pub fn shutdown_async(
+        &self,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<(), ProviderRuntimeError>> + Send + '_ {
+        let caller = self.check_blocking_caller();
+        let wait = self.shutdown_wait();
+        let timed = async move {
+            caller?;
+            self.check_blocking_caller()?;
+            let status = *self.stopped_async.borrow();
+            match status {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(ProviderRuntimeError::ShutdownFailed),
+                None => {}
+            }
+            tokio::time::timeout(timeout, wait)
+                .await
+                .map_err(|_| ProviderRuntimeError::ShutdownTimeout)?
+        };
+        let mut timed = Box::pin(timed);
+        std::future::poll_fn(move |context| {
+            if let Err(error) = self.check_blocking_caller() {
+                return std::task::Poll::Ready(Err(error));
+            }
+            timed.as_mut().poll(context)
+        })
     }
 
     /// Request shutdown and await resource release without choosing a deadline.
@@ -1354,28 +1382,43 @@ impl ProviderRuntime {
     /// Embedding hosts may wrap this future in their own deadline mechanism. This
     /// wait neither spawns work nor requires a Tokio timer. Provider execution still
     /// uses its native runtime. Abandoning the wait does not undo shutdown or release
-    /// ownership; retain this runtime until teardown is acknowledged.
+    /// ownership; retain this runtime until teardown is acknowledged. Admission
+    /// closes when this method is called, even if its returned future is never polled.
     ///
     /// # Errors
     ///
     /// * Returns [`ProviderRuntimeError::RuntimeThreadWait`] on a provider worker.
     /// * Returns [`ProviderRuntimeError::ShutdownFailed`] if teardown is not acknowledged.
-    pub async fn shutdown_wait(&self) -> Result<(), ProviderRuntimeError> {
-        self.check_blocking_caller()?;
-        let mut stopped = self.stopped_async.clone();
-        self.request_shutdown();
-        loop {
-            let status = *stopped.borrow_and_update();
-            match status {
-                Some(true) => return Ok(()),
-                Some(false) => return Err(ProviderRuntimeError::ShutdownFailed),
-                None => {}
-            }
-            stopped
-                .changed()
-                .await
-                .map_err(|_| ProviderRuntimeError::ShutdownFailed)?;
+    pub fn shutdown_wait(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ProviderRuntimeError>> + Send + '_ {
+        let caller = self.check_blocking_caller();
+        if caller.is_ok() {
+            self.request_shutdown();
         }
+        let mut stopped = self.stopped_async.clone();
+        let wait = async move {
+            caller?;
+            loop {
+                let status = *stopped.borrow_and_update();
+                match status {
+                    Some(true) => return Ok(()),
+                    Some(false) => return Err(ProviderRuntimeError::ShutdownFailed),
+                    None => {}
+                }
+                stopped
+                    .changed()
+                    .await
+                    .map_err(|_| ProviderRuntimeError::ShutdownFailed)?;
+            }
+        };
+        let mut wait = Box::pin(wait);
+        std::future::poll_fn(move |context| {
+            if let Err(error) = self.check_blocking_caller() {
+                return std::task::Poll::Ready(Err(error));
+            }
+            wait.as_mut().poll(context)
+        })
     }
 
     /// Request shutdown and wait at most `timeout` for runtime resources to be released.
@@ -1423,10 +1466,7 @@ impl ProviderRuntime {
     /// # Errors
     ///
     /// Returns [`ProviderRuntimeError::ShuttingDown`] when shutdown has been requested.
-    pub fn try_spawn<F>(
-        &self,
-        future: F,
-    ) -> Result<tokio::task::JoinHandle<F::Output>, ProviderRuntimeError>
+    pub fn try_spawn<F>(&self, future: F) -> Result<ProviderTask<F::Output>, ProviderRuntimeError>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -1440,7 +1480,11 @@ impl ProviderRuntime {
         }
         let task = self.handle.spawn(future);
         drop(admission);
-        Ok(task)
+        Ok(ProviderTask {
+            task: Some(task),
+            cleanup_failed: false,
+            admission_rejected: false,
+        })
     }
 
     /// Spawn async provider work onto the shared runtime.
@@ -1448,17 +1492,17 @@ impl ProviderRuntime {
     /// The returned handle may be dropped when the caller does not need the task
     /// result, such as provider turn streaming where completion is reported via
     /// queued provider events. After shutdown is requested, the supplied future is dropped
-    /// without polling and the returned handle is cancelled.
-    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    /// without polling. Awaiting or cleaning up the returned handle reports
+    /// [`ProviderRuntimeError::ShuttingDown`].
+    pub fn spawn<F>(&self, future: F) -> ProviderTask<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.try_spawn(future).unwrap_or_else(|_| {
-            // Preserve the join-handle API while never polling rejected user work.
-            let task = self.handle.spawn(std::future::pending::<F::Output>());
-            task.abort();
-            task
+        self.try_spawn(future).unwrap_or(ProviderTask {
+            task: None,
+            cleanup_failed: false,
+            admission_rejected: true,
         })
     }
 
@@ -1535,8 +1579,100 @@ impl ProviderRuntime {
     }
 }
 
+/// A provider-owned task result and cancellation handle.
+///
+/// Dropping this handle detaches the result, not the work: streaming providers may
+/// deliver completion through turn events instead. The runtime retains execution
+/// ownership until shutdown is acknowledged. Use [`Self::abort`] to request task
+/// cancellation, then await the handle to observe completion. Aborting cannot undo
+/// committed external effects or stop blocking work already in progress.
+#[derive(Debug)]
+pub struct ProviderTask<T> {
+    task: Option<tokio::task::JoinHandle<T>>,
+    cleanup_failed: bool,
+    admission_rejected: bool,
+}
+
+impl<T> ProviderTask<T> {
+    /// Request cancellation without waiting for task destruction.
+    pub fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    /// Request cancellation and await destruction of this task's future.
+    ///
+    /// Cancellation is requested on call, even if the wait is never polled.
+    /// Abandoning the wait retains the handle for another attempt. Successful
+    /// completion discards any returned value and is repeatable. This does not
+    /// acknowledge detached child tasks or blocking work; use runtime shutdown
+    /// for that stronger guarantee. A caller may apply its own timeout.
+    ///
+    /// # Errors
+    /// Returns [`ProviderRuntimeError::ShuttingDown`] if admission was rejected.
+    /// Returns [`ProviderRuntimeError::TaskDropped`] if the task panicked. This
+    /// failure remains observable on subsequent cleanup calls, including after
+    /// the task result was consumed through [`Future`].
+    pub fn cancel_and_wait(
+        &mut self,
+    ) -> impl Future<Output = Result<(), ProviderRuntimeError>> + '_ {
+        self.abort();
+        async move {
+            let Some(task) = self.task.as_mut() else {
+                return if self.admission_rejected {
+                    Err(ProviderRuntimeError::ShuttingDown)
+                } else if self.cleanup_failed {
+                    Err(ProviderRuntimeError::TaskDropped)
+                } else {
+                    Ok(())
+                };
+            };
+            let result = task.await;
+            self.cleanup_failed = result.as_ref().is_err_and(|error| !error.is_cancelled());
+            self.task = None;
+            match result {
+                Ok(_) => Ok(()),
+                Err(error) if error.is_cancelled() => Ok(()),
+                Err(_) => Err(ProviderRuntimeError::TaskDropped),
+            }
+        }
+    }
+
+    /// Whether task execution has finished, including cancellation or panic.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+}
+
+impl<T> Future for ProviderTask<T> {
+    type Output = Result<T, ProviderRuntimeError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let Some(task) = self.task.as_mut() else {
+            return std::task::Poll::Ready(Err(if self.admission_rejected {
+                ProviderRuntimeError::ShuttingDown
+            } else {
+                ProviderRuntimeError::TaskDropped
+            }));
+        };
+        let result = std::pin::Pin::new(task).poll(context);
+        if let std::task::Poll::Ready(result) = &result {
+            self.cleanup_failed = result.as_ref().is_err_and(|error| !error.is_cancelled());
+            self.task = None;
+        }
+        result.map(|result| result.map_err(|_| ProviderRuntimeError::TaskDropped))
+    }
+}
+
 // Request/reply work must not detach when the caller abandons its wait.
-struct ProviderRequestTask<T>(tokio::task::JoinHandle<T>);
+struct ProviderRequestTask<T>(ProviderTask<T>);
 
 impl<T> Drop for ProviderRequestTask<T> {
     fn drop(&mut self) {
@@ -1814,6 +1950,74 @@ mod output_position_tests {
         assert!(!turn.is_cancelled());
         store.finish(&id);
         assert!(turn.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn provider_task_reports_results_and_normalizes_failures() {
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let task = runtime.try_spawn(async { 42 }).expect("admitted");
+        assert_eq!(task.await.expect("result"), 42);
+        let task = runtime.spawn(std::future::pending::<()>());
+        task.abort();
+        assert!(matches!(task.await, Err(ProviderRuntimeError::TaskDropped)));
+        let task = runtime.spawn(async { panic!("private provider panic") });
+        assert!(matches!(task.await, Err(ProviderRuntimeError::TaskDropped)));
+        runtime.shutdown_wait().await.expect("shutdown");
+        assert!(matches!(
+            runtime.try_spawn(async {}),
+            Err(ProviderRuntimeError::ShuttingDown)
+        ));
+        assert!(matches!(
+            runtime.spawn(async {}).await,
+            Err(ProviderRuntimeError::ShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn rejected_spawn_releases_input_and_completes_without_an_executor() {
+        let runtime = ProviderRuntime::new().expect("runtime");
+        runtime.request_shutdown();
+        for stopped in [false, true] {
+            if stopped {
+                runtime.shutdown(Duration::from_secs(5)).expect("shutdown");
+            }
+            let (sender, mut receiver) = tokio::sync::oneshot::channel::<()>();
+            let mut task = runtime.spawn(async move {
+                sender.send(()).expect("must never be polled");
+            });
+            // Rejected futures release captured resources synchronously, even
+            // before the provider worker has acknowledged shutdown.
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ));
+            assert!(task.is_finished());
+            task.abort();
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                std::pin::Pin::new(&mut task).poll(&mut context),
+                std::task::Poll::Ready(Err(ProviderRuntimeError::ShuttingDown))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_provider_task_preserves_streaming_work() {
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            wait.await.expect("release");
+            completed.send(()).expect("completion observer");
+        });
+        assert!(!task.is_finished());
+        drop(task);
+        release.send(()).expect("streaming work retained");
+        tokio::time::timeout(Duration::from_secs(5), completion)
+            .await
+            .expect("completion deadline")
+            .expect("streaming completion");
+        runtime.shutdown_wait().await.expect("shutdown");
     }
 
     #[test]

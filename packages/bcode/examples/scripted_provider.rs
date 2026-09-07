@@ -15,27 +15,185 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "simulation-example")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Validate before initializing any simulator globals or admitting application work.
+    let seed = simulation_input("SIMULATOR_SEED")?;
+    let epoch = simulation_input("SIMULATOR_EPOCH_OFFSET")?;
+    let step_ms = simulation_input("SIMULATOR_STEP_MULTIPLIER")?;
+    if step_ms == 0 {
+        return Err("SIMULATOR_STEP_MULTIPLIER must be positive so deadlines can advance".into());
+    }
+    eprintln!(
+        "diagnostic simulation: seed={seed} epoch_ms={epoch} step_ms={step_ms}; not a replay artifact"
+    );
     // The harness, not application code, advances simulated time. One poll per step
     // is an explicit exploration policy, not a claim of exhaustive schedule coverage.
     switchy::time::simulator::reset_step();
+    run_simulated(run(), 10_000, 10_000)
+}
+
+#[cfg(feature = "simulation-example")]
+fn run_simulated(
+    scenario: impl std::future::Future<Output = bcode::Result<()>> + Send + 'static,
+    execution_steps: usize,
+    drain_steps: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use futures::FutureExt as _;
     let runtime = switchy::unsync::Builder::new().build()?;
-    let mut task = runtime.spawn(run());
-    for _ in 0..10_000 {
+    // Catch root panics inside the task so scenario-owned work is released first.
+    let mut task = runtime.spawn(std::panic::AssertUnwindSafe(scenario).catch_unwind());
+    let mut outcome: Result<(), Box<dyn std::error::Error>> =
+        Err("simulation harness step budget exhausted (not a product timeout)".into());
+    for _ in 0..execution_steps {
         runtime.tick();
         if task.is_finished() {
-            let result = runtime.block_on(task)?;
-            // Do not call unbounded `wait`: runtime-wide bounded draining is not
-            // exposed upstream yet. This diagnostic example runs once per process
-            // and does not certify cleanup or in-process run isolation.
-            result?;
-            return Ok(());
+            outcome = match runtime.block_on(&mut task) {
+                Ok(Ok(result)) => result.map_err(Into::into),
+                Ok(Err(_)) => Err("simulation scenario panicked".into()),
+                Err(_) => Err("simulation root task failed".into()),
+            };
+            break;
         }
         let _ = switchy::time::simulator::next_step();
     }
     task.abort();
-    // Request cancellation; a single poll is not proof of runtime-wide cleanup.
-    runtime.tick();
-    Err("simulation harness step budget exhausted (not a product timeout)".into())
+    drop(task);
+    // Task polls may block: this bounds scheduling steps, not wall-clock shutdown.
+    for step in 0..=drain_steps {
+        if runtime.try_finish() {
+            return outcome;
+        }
+        if step != drain_steps {
+            runtime.tick();
+            let _ = switchy::time::simulator::next_step();
+        }
+    }
+    if let Err(error) = outcome {
+        return Err(format!(
+            "{error}; simulation drain step budget exhausted; cleanup is unverified"
+        )
+        .into());
+    }
+    Err("simulation drain step budget exhausted; cleanup is unverified".into())
+}
+
+#[cfg(feature = "simulation-example")]
+fn simulation_input(name: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let value = std::env::var(name).map_err(|_| {
+        format!("{name} must be explicitly set; example: SIMULATOR_SEED=1 SIMULATOR_EPOCH_OFFSET=1700000000000 SIMULATOR_STEP_MULTIPLIER=1")
+    })?;
+    value.parse().map_err(|_| {
+        // Do not echo arbitrary environment values into diagnostics.
+        format!("{name} must be an unsigned 64-bit integer").into()
+    })
+}
+
+#[cfg(all(test, feature = "simulation-example"))]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn sdk_scenario_completes_and_drains_under_simulation() {
+        run_simulated(run(), 10_000, 10_000)
+            .expect("SDK scenario completes with acknowledged simulator drain");
+    }
+
+    #[test]
+    fn budget_exhaustion_releases_root_captures() {
+        let released = bcode::CancellationToken::new();
+        let release = WorkerRelease(released.clone());
+        let result = run_simulated(
+            async move {
+                let _release = release;
+                std::future::pending().await
+            },
+            0,
+            100,
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "simulation harness step budget exhausted (not a product timeout)"
+        );
+        assert!(released.is_cancelled());
+    }
+
+    struct PanickingProvider(bool);
+
+    impl bcode::InProcessModelProvider for PanickingProvider {
+        fn run_turn(
+            &self,
+            _: bcode::ModelTurnRequest,
+            _: bcode::InProcessProviderContext,
+        ) -> bcode::InProcessProviderFuture<'_> {
+            assert!(!self.0, "fixture construction panic");
+            Box::pin(async { panic!("fixture polling panic") })
+        }
+    }
+
+    #[test]
+    fn provider_panics_are_normalized_without_unwinding_scheduler() {
+        for construction in [false, true] {
+            run_simulated(
+                async move {
+                    let mut provider =
+                        bcode::InProcessModelProviderAdapter::new(PanickingProvider(construction));
+                    let error = bcode::Agent::builder()
+                        .build()
+                        .generate_text_with_provider(&mut provider, "panic")
+                        .await
+                        .expect_err("provider failure");
+                    assert!(matches!(error,
+                    bcode::BcodeError::Runtime(bcode::RuntimeError::Provider { code, message, .. })
+                    if code == "in_process_worker_stopped"
+                    && message == "in-process provider worker stopped before completing its turn"));
+                    Ok(())
+                },
+                1000,
+                100,
+            )
+            .expect("scheduler survives provider panic and drains");
+        }
+    }
+
+    #[test]
+    fn sdk_shutdown_drains_abandoned_provider_and_fences_admission() {
+        run_simulated(
+            run_in_process_cleanup(InProcessCleanup::Shutdown),
+            1000,
+            100,
+        )
+        .expect("SDK shutdown releases worker under simulation");
+    }
+
+    #[test]
+    fn sdk_host_deadline_shutdown_wait_drains_provider() {
+        run_simulated(
+            run_in_process_cleanup(InProcessCleanup::ShutdownWait),
+            1000,
+            100,
+        )
+        .expect("host-bounded shutdown wait releases provider worker");
+    }
+
+    #[test]
+    fn root_panic_drains_spawned_work_and_preserves_failure() {
+        let released = bcode::CancellationToken::new();
+        let release = WorkerRelease(released.clone());
+        let result = run_simulated(
+            async move {
+                switchy::unsync::task::spawn(async move {
+                    drop(release);
+                });
+                panic!("fixture root panic");
+            },
+            100,
+            100,
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "simulation scenario panicked"
+        );
+        assert!(released.is_cancelled());
+    }
 }
 
 struct InProcessEcho;
@@ -116,6 +274,8 @@ impl bcode::InProcessModelProvider for PendingInProcess {
 
 #[derive(Clone, Copy, Debug)]
 enum InProcessCleanup {
+    Shutdown,
+    ShutdownWait,
     AdapterDrop,
     Cancel,
     Deadline,
@@ -164,6 +324,35 @@ async fn run_in_process_cleanup(mode: InProcessCleanup) -> bcode::Result<()> {
         );
     }
     drop(generation);
+    if matches!(
+        mode,
+        InProcessCleanup::Shutdown | InProcessCleanup::ShutdownWait
+    ) {
+        if matches!(mode, InProcessCleanup::ShutdownWait) {
+            {
+                let invoker: &mut dyn bcode::ModelProviderInvoker = &mut provider;
+                drop(invoker.shutdown_wait());
+            }
+            let error = agent
+                .generate_text_with_provider(&mut provider, "unpolled shutdown")
+                .await
+                .expect_err("unpolled trait shutdown fences SDK admission");
+            assert!(matches!(error, bcode::BcodeError::Runtime(
+                bcode::RuntimeError::Provider { code, error, .. }
+            ) if code == "in_process_admission_closed" && !error.retryable));
+            let invoker: &mut dyn bcode::ModelProviderInvoker = &mut provider;
+            switchy::unsync::select! {
+                result = invoker.shutdown_wait() => result?,
+                () = switchy::unsync::time::sleep(Duration::from_secs(2)) => panic!("host shutdown deadline expired"),
+            }
+        } else {
+            provider.shutdown(Duration::from_secs(2)).await?;
+        }
+        assert!(
+            released.is_cancelled(),
+            "shutdown acknowledges worker release"
+        );
+    }
     // Returned terminal outcomes must release the worker without adapter destruction.
     let provider = (!matches!(mode, InProcessCleanup::AdapterDrop)).then_some(provider);
     switchy::unsync::select! {
@@ -187,6 +376,20 @@ async fn run_in_process_cleanup(mode: InProcessCleanup) -> bcode::Result<()> {
         "{mode:?}: terminal worker rejects late output"
     );
     if let Some(mut provider) = provider {
+        if matches!(
+            mode,
+            InProcessCleanup::Shutdown | InProcessCleanup::ShutdownWait
+        ) {
+            let error = agent
+                .generate_text_with_provider(&mut provider, "closed adapter")
+                .await
+                .expect_err("shutdown fences admission");
+            assert!(matches!(error, bcode::BcodeError::Runtime(
+                bcode::RuntimeError::Provider { code, error, .. }
+            ) if code == "in_process_admission_closed" && !error.retryable));
+            provider.shutdown(Duration::from_secs(2)).await?;
+            return Ok(());
+        }
         let response = agent
             .generate_text_with_provider(&mut provider, "recover worker")
             .await?;
@@ -211,6 +414,8 @@ async fn run() -> bcode::Result<()> {
     run_cache_storage_panic().await?;
     run_cache_clock_errors().await?;
     for mode in [
+        InProcessCleanup::Shutdown,
+        InProcessCleanup::ShutdownWait,
         InProcessCleanup::AdapterDrop,
         InProcessCleanup::Cancel,
         InProcessCleanup::Deadline,

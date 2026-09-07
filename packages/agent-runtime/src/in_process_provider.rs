@@ -82,7 +82,8 @@ impl InProcessProviderEventSink {
     ///
     /// # Errors
     ///
-    /// Returns an error when the event is adapter-owned or the turn is already terminal.
+    /// Returns an error when the event is adapter-owned, the turn is terminal, or
+    /// the configured event-count capacity is exhausted.
     pub fn emit(&self, event: ProviderTurnEvent) -> Result<(), InProcessProviderEmitError> {
         if is_adapter_owned_event(&event) {
             return Err(InProcessProviderEmitError::AdapterOwnedEvent);
@@ -98,6 +99,9 @@ pub enum InProcessProviderEmitError {
     /// The event is owned by [`InProcessModelProviderAdapter`].
     #[error("provider lifecycle events are owned by the in-process adapter")]
     AdapterOwnedEvent,
+    /// The event queue or encoded event size reached its configured limit; the turn is terminated.
+    #[error("in-process provider event buffer is full")]
+    BufferFull,
     /// The provider round has already reached a terminal state.
     #[error("in-process provider turn is already finished")]
     TurnFinished,
@@ -122,6 +126,9 @@ pub trait InProcessModelProvider: Send + Sync + 'static {
 pub struct InProcessModelProviderAdapter<P> {
     provider: Arc<P>,
     next_turn: AtomicU64,
+    closed: bool,
+    event_capacity: std::num::NonZeroUsize,
+    event_byte_limit: std::num::NonZeroUsize,
     turns: Arc<Mutex<BTreeMap<String, Arc<InProcessTurnState>>>>,
 }
 
@@ -135,8 +142,99 @@ where
         Self {
             provider: Arc::new(provider),
             next_turn: AtomicU64::new(0),
+            closed: false,
+            event_capacity: const { std::num::NonZeroUsize::new(1024).unwrap() },
+            event_byte_limit: const { std::num::NonZeroUsize::new(1024 * 1024).unwrap() },
             turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Limit queued events for subsequently started turns.
+    ///
+    /// Defaults to 1024 events. Two additional slots are reserved for terminal
+    /// error/cancellation and finish events. Overflow terminates the turn rather
+    /// than silently dropping output. This limits event count, not payload bytes.
+    #[must_use]
+    pub const fn with_event_capacity(mut self, capacity: std::num::NonZeroUsize) -> Self {
+        self.event_capacity = capacity;
+        self
+    }
+
+    /// Limit the JSON-encoded size of each subsequently emitted provider event.
+    ///
+    /// Defaults to one MiB. Size checking does not allocate an encoded copy.
+    /// Oversized or unencodable events fail the turn without retaining the payload.
+    /// Returned provider errors are also checked; oversized errors are replaced
+    /// with a fixed non-retryable diagnostic. Adapter-owned lifecycle events and
+    /// fixed diagnostics are exempt so even tiny limits permit terminal delivery.
+    /// This bounds accepted event representations, not provider-side allocations.
+    #[must_use]
+    pub const fn with_event_byte_limit(mut self, limit: std::num::NonZeroUsize) -> Self {
+        self.event_byte_limit = limit;
+        self
+    }
+
+    /// Close admission, cancel admitted turns, and await worker release.
+    ///
+    /// Admission closes and cancellation is requested when this method is called,
+    /// even if the returned future is never polled. Success releases retained turn
+    /// state. Timeout or abandonment retains ownership for a subsequent retry.
+    /// The deadline uses the selected runtime clock and requires cooperative tasks.
+    ///
+    /// # Panics
+    /// Panics if an internal turn-registry lock has been poisoned.
+    ///
+    /// # Errors
+    /// Returns an invocation error if workers have not acknowledged release within
+    /// `budget`. The adapter remains closed after either success or failure.
+    pub fn shutdown(&mut self, budget: std::time::Duration) -> RuntimeFuture<'_, ()> {
+        let drain = self.shutdown_wait();
+        Box::pin(async move {
+            switchy::unsync::time::timeout(budget, drain)
+                .await
+                .map_err(|_| {
+                    crate::RuntimeError::ProviderInvocation(
+                        "in-process provider shutdown incomplete; retry cleanup".into(),
+                    )
+                })?
+        })
+    }
+
+    /// Close admission, cancel admitted turns, and await release without a timer.
+    ///
+    /// Hosts may wrap this wait in their own deadline. Admission closes and cancellation
+    /// is requested on call, even if the future is never polled. An abandoned wait
+    /// retains cleanup ownership for retry; success releases retained turn state.
+    /// This does not change the execution backend used by provider workers.
+    ///
+    /// # Panics
+    /// Panics if an internal turn-registry lock has been poisoned.
+    pub fn shutdown_wait(&mut self) -> RuntimeFuture<'_, ()> {
+        self.closed = true;
+        for state in self.turns.lock().expect("turn registry").values() {
+            state.finish_cancelled();
+            state.cancellation.cancel();
+        }
+        Box::pin(async move {
+            let drain = async {
+                loop {
+                    let next = self
+                        .turns
+                        .lock()
+                        .expect("turn registry")
+                        .iter()
+                        .next()
+                        .map(|(id, state)| (id.clone(), Arc::clone(state)));
+                    let Some((id, state)) = next else {
+                        break;
+                    };
+                    state.released.cancelled().await;
+                    self.turns.lock().expect("turn registry").remove(&id);
+                }
+            };
+            drain.await;
+            Ok(())
+        })
     }
 
     fn turn_id(&self) -> Result<String, crate::RuntimeError> {
@@ -157,20 +255,32 @@ where
 struct InProcessTurnCleanup {
     turns: Arc<Mutex<BTreeMap<String, Arc<InProcessTurnState>>>>,
     turn_id: String,
+    armed: bool,
 }
 
 impl crate::ProviderTurnCleanup for InProcessTurnCleanup {}
 
 impl Drop for InProcessTurnCleanup {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let state = self
             .turns
             .lock()
             .expect("in-process provider turn lock should not be poisoned")
-            .remove(&self.turn_id);
+            .get(&self.turn_id)
+            .cloned();
         if let Some(state) = state {
+            state.abandoned.store(true, Ordering::Release);
             state.finish_cancelled();
             state.cancellation.cancel();
+            if state.released.is_cancelled() {
+                self.turns
+                    .lock()
+                    .expect("turn registry")
+                    .remove(&self.turn_id);
+            }
         }
     }
 }
@@ -179,6 +289,14 @@ impl<P> ModelProviderInvoker for InProcessModelProviderAdapter<P>
 where
     P: InProcessModelProvider,
 {
+    fn shutdown_wait(&mut self) -> RuntimeFuture<'_, ()> {
+        Self::shutdown_wait(self)
+    }
+
+    fn shutdown(&mut self, budget: std::time::Duration) -> RuntimeFuture<'_, ()> {
+        Self::shutdown(self, budget)
+    }
+
     fn turn_cleanup_handle(
         &mut self,
         _provider_plugin_id: Option<&str>,
@@ -187,6 +305,7 @@ where
         Some(Box::new(InProcessTurnCleanup {
             turns: self.turns.clone(),
             turn_id: provider_turn_id.to_owned(),
+            armed: true,
         }))
     }
 
@@ -196,17 +315,44 @@ where
         request: &'a ModelTurnRequest,
     ) -> RuntimeFuture<'a, StartTurnResponse> {
         Box::pin(async move {
+            if self.closed {
+                let error = in_process_provider_error(
+                    "in_process_admission_closed",
+                    ProviderErrorCategory::ProviderInternal,
+                    "in-process provider admission is closed",
+                );
+                return Err(crate::RuntimeError::Provider {
+                    code: error.code.clone(),
+                    message: error.message.clone(),
+                    error: Box::new(error),
+                });
+            }
             let provider_turn_id = self.turn_id()?;
-            let state = Arc::new(InProcessTurnState::new());
+            let state = Arc::new(InProcessTurnState {
+                capacity: self.event_capacity.get(),
+                byte_limit: self.event_byte_limit.get(),
+                ..InProcessTurnState::new()
+            });
             state.push(ProviderTurnEvent::TurnStarted);
             self.turns
                 .lock()
                 .expect("in-process provider turn lock should not be poisoned")
                 .insert(provider_turn_id.clone(), Arc::clone(&state));
+            let mut acquisition = InProcessTurnCleanup {
+                turns: Arc::clone(&self.turns),
+                turn_id: provider_turn_id.clone(),
+                armed: true,
+            };
             let provider = Arc::clone(&self.provider);
             let request = request.clone();
-            let worker = InProcessWorkerGuard(Arc::clone(&state));
+            let worker = RegisteredWorker {
+                worker: Some(InProcessWorkerGuard(Arc::clone(&state))),
+                turns: Arc::clone(&self.turns),
+                id: provider_turn_id.clone(),
+                state: Arc::clone(&state),
+            };
             switchy::unsync::task::spawn(async move {
+                use futures::FutureExt as _;
                 let _worker = worker;
                 let context = InProcessProviderContext {
                     events: InProcessProviderEventSink {
@@ -214,15 +360,24 @@ where
                     },
                     cancellation: state.cancellation.clone(),
                 };
+                let execution = std::panic::AssertUnwindSafe(async {
+                    provider.run_turn(request, context).await
+                })
+                .catch_unwind();
                 switchy::unsync::select! {
                     biased;
                     () = state.cancellation.cancelled() => state.finish_cancelled(),
-                    result = async { provider.run_turn(request, context).await } => match result {
-                        Ok(outcome) => state.finish(outcome.stop_reason()),
-                        Err(error) => state.finish_error(error),
+                    result = execution => match result {
+                        Ok(Ok(outcome)) => state.finish(outcome.stop_reason()),
+                        Ok(Err(error)) => state.finish_error(error),
+                        // The worker guard publishes the normalized failure and release
+                        // acknowledgment; no panic payload crosses the provider boundary.
+                        Err(_) => {},
                     },
                 }
             });
+            acquisition.armed = false;
+            drop(acquisition);
             Ok(StartTurnResponse { provider_turn_id })
         })
     }
@@ -275,12 +430,22 @@ where
             .turns
             .lock()
             .expect("in-process provider turn lock should not be poisoned")
-            .remove(&request.provider_turn_id);
-        if let Some(state) = state {
+            .get(&request.provider_turn_id)
+            .cloned();
+        if let Some(state) = &state {
             state.finish_cancelled();
             state.cancellation.cancel();
         }
-        Box::pin(async { Ok(AckResponse::default()) })
+        Box::pin(async move {
+            if let Some(state) = state {
+                state.released.cancelled().await;
+                self.turns
+                    .lock()
+                    .expect("in-process provider turn lock should not be poisoned")
+                    .remove(&request.provider_turn_id);
+            }
+            Ok(AckResponse::default())
+        })
     }
 }
 
@@ -310,9 +475,47 @@ where
 
 #[derive(Debug)]
 struct InProcessTurnState {
+    capacity: usize,
+    byte_limit: usize,
     events: Mutex<VecDeque<ProviderTurnEvent>>,
     cancellation: CancellationToken,
+    released: CancellationToken,
+    abandoned: AtomicBool,
     terminal: AtomicBool,
+}
+
+struct EventSizeBudget(usize);
+
+impl std::io::Write for EventSizeBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("provider event exceeds size budget"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct RegisteredWorker {
+    worker: Option<InProcessWorkerGuard>,
+    turns: Arc<Mutex<BTreeMap<String, Arc<InProcessTurnState>>>>,
+    id: String,
+    state: Arc<InProcessTurnState>,
+}
+
+impl Drop for RegisteredWorker {
+    fn drop(&mut self) {
+        // Release must precede registry removal: shutdown never loses sight of
+        // work that has not yet relinquished its provider future.
+        drop(self.worker.take());
+        if self.state.abandoned.load(Ordering::Acquire) {
+            self.turns.lock().expect("turn registry").remove(&self.id);
+        }
+    }
 }
 
 struct InProcessWorkerGuard(Arc<InProcessTurnState>);
@@ -325,14 +528,19 @@ impl Drop for InProcessWorkerGuard {
             "in-process provider worker stopped before completing its turn",
         ));
         self.0.cancellation.cancel();
+        self.0.released.cancel();
     }
 }
 
 impl InProcessTurnState {
     fn new() -> Self {
         Self {
+            capacity: 1024,
+            byte_limit: 1024 * 1024,
             events: Mutex::new(VecDeque::new()),
             cancellation: CancellationToken::new(),
+            released: CancellationToken::new(),
+            abandoned: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
         }
     }
@@ -352,6 +560,26 @@ impl InProcessTurnState {
         if self.terminal.load(Ordering::Acquire) {
             drop(events);
             return Err(InProcessProviderEmitError::TurnFinished);
+        }
+        let invalid_size = serde_json::to_writer(EventSizeBudget(self.byte_limit), &event).is_err();
+        if events.len() >= self.capacity || invalid_size {
+            if self.begin_finish() {
+                events.extend([
+                    ProviderTurnEvent::Error {
+                        error: in_process_provider_error(
+                            "in_process_buffer_full",
+                            ProviderErrorCategory::ProviderInternal,
+                            "in-process provider event buffer is full",
+                        ),
+                    },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::Error,
+                    },
+                ]);
+            }
+            drop(events);
+            self.cancellation.cancel();
+            return Err(InProcessProviderEmitError::BufferFull);
         }
         events.push_back(event);
         drop(events);
@@ -387,8 +615,20 @@ impl InProcessTurnState {
     }
 
     fn finish_error(&self, error: ProviderError) {
+        let event = ProviderTurnEvent::Error { error };
+        let event = if serde_json::to_writer(EventSizeBudget(self.byte_limit), &event).is_ok() {
+            event
+        } else {
+            ProviderTurnEvent::Error {
+                error: in_process_provider_error(
+                    "in_process_error_too_large",
+                    ProviderErrorCategory::ProviderInternal,
+                    "in-process provider error exceeds the event size limit",
+                ),
+            }
+        };
         self.finish_events([
-            ProviderTurnEvent::Error { error },
+            event,
             ProviderTurnEvent::TurnFinished {
                 stop_reason: StopReason::Error,
             },
@@ -472,6 +712,279 @@ mod tests {
                     .expect("emit usage");
                 Ok(InProcessProviderOutcome::EndTurn)
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn event_overflow_is_terminal_and_worker_is_released() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider)
+            .with_event_capacity(std::num::NonZeroUsize::new(1).unwrap());
+        let error = AgentRuntime::new()
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "overflow"))
+            .await
+            .expect_err("producer exceeds queue capacity");
+        let RuntimeError::ProviderAfterOutput(error) = error else {
+            panic!("overflow after output must prevent retry");
+        };
+        assert!(matches!(*error, RuntimeError::Provider { code, .. }
+            if code == "in_process_buffer_full"));
+        assert!(provider.turns.lock().expect("turn registry").is_empty());
+    }
+
+    #[tokio::test]
+    async fn boxed_provider_shutdown_delegates_and_rejects_new_turns() {
+        let mut provider: Box<dyn ModelProviderInvoker> =
+            Box::new(InProcessModelProviderAdapter::new(EchoProvider));
+        provider.shutdown(Duration::from_secs(1)).await.unwrap();
+        let error = AgentRuntime::new()
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "closed"))
+            .await
+            .expect_err("boxed shutdown closes admission");
+        assert!(matches!(error, RuntimeError::Provider { code, error, .. }
+            if code == "in_process_admission_closed" && !error.retryable));
+    }
+
+    #[tokio::test]
+    async fn abandoned_turn_remains_owned_until_shutdown_acknowledgment() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        let state = Arc::new(InProcessTurnState::new());
+        provider
+            .turns
+            .lock()
+            .unwrap()
+            .insert("abandoned".into(), state.clone());
+        drop(provider.turn_cleanup_handle(None, "abandoned"));
+        assert!(state.cancellation.is_cancelled());
+        assert_eq!(provider.turns.lock().unwrap().len(), 1);
+        assert!(provider.shutdown(Duration::from_millis(1)).await.is_err());
+        state.released.cancel();
+        provider.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(provider.turns.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_retains_ownership_and_retry_drains() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        let state = Arc::new(InProcessTurnState::new());
+        provider
+            .turns
+            .lock()
+            .unwrap()
+            .insert("held".into(), state.clone());
+        drop(provider.shutdown(Duration::from_secs(1)));
+        assert!(provider.closed);
+        assert!(state.cancellation.is_cancelled());
+        assert!(provider.shutdown(Duration::from_millis(1)).await.is_err());
+        assert_eq!(provider.turns.lock().unwrap().len(), 1);
+        state.released.cancel();
+        provider.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(provider.turns.lock().unwrap().is_empty());
+        provider.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(
+            AgentRuntime::new()
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "rejected"),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn boxed_provider_shutdown_wait_delegates_and_closes_before_polling() {
+        let mut provider: Box<dyn ModelProviderInvoker> =
+            Box::new(InProcessModelProviderAdapter::new(EchoProvider));
+        drop(provider.shutdown_wait());
+        let request = model_request("closed");
+        assert!(provider.start_turn(None, &request).await.is_err());
+        provider.shutdown_wait().await.unwrap();
+        provider.shutdown_wait().await.unwrap();
+        drop(provider);
+    }
+
+    #[test]
+    fn shutdown_wait_needs_no_runtime_and_retains_abandoned_work() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        let state = Arc::new(InProcessTurnState::new());
+        provider
+            .turns
+            .lock()
+            .unwrap()
+            .insert("held".into(), state.clone());
+        drop(provider.shutdown_wait());
+        assert!(provider.closed);
+        assert!(state.cancellation.is_cancelled());
+        {
+            let mut wait = provider.shutdown_wait();
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+        }
+        assert_eq!(provider.turns.lock().unwrap().len(), 1);
+        state.released.cancel();
+        {
+            let mut wait = provider.shutdown_wait();
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                wait.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+        }
+        assert!(provider.turns.lock().unwrap().is_empty());
+        drop(provider);
+    }
+
+    #[test]
+    fn terminal_error_limit_preserves_valid_errors_and_replaces_oversized_errors() {
+        let mut error = in_process_provider_error(
+            "provider_failure",
+            ProviderErrorCategory::ProviderInternal,
+            "failure",
+        );
+        error.retryable = true;
+        error.provider_message = Some("private payload".repeat(100).into());
+        let event = ProviderTurnEvent::Error {
+            error: error.clone(),
+        };
+        let size = serde_json::to_vec(&event).unwrap().len();
+        let state = InProcessTurnState {
+            byte_limit: size,
+            ..InProcessTurnState::new()
+        };
+        state.finish_error(error.clone());
+        let events = state.drain();
+        assert_eq!(
+            serde_json::to_value(&events[0]).unwrap(),
+            serde_json::to_value(&event).unwrap()
+        );
+        for byte_limit in [1, size - 1] {
+            let state = InProcessTurnState {
+                byte_limit,
+                ..InProcessTurnState::new()
+            };
+            state.finish_error(error.clone());
+            state.finish(StopReason::EndTurn);
+            let events = state.drain();
+            assert_eq!(events.len(), 2);
+            assert!(matches!(&events[0], ProviderTurnEvent::Error { error }
+                if error.code == "in_process_error_too_large"
+                    && !error.retryable && error.provider_message.is_none()));
+            assert!(matches!(
+                events[1],
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::Error
+                }
+            ));
+            assert!(
+                !serde_json::to_string(&events)
+                    .unwrap()
+                    .contains("private payload")
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_event_is_rejected_without_retaining_payload() {
+        let event = ProviderTurnEvent::TextDelta {
+            text: "sensitive large payload".repeat(100),
+        };
+        let size = serde_json::to_vec(&event).unwrap().len();
+        let state = InProcessTurnState {
+            byte_limit: size,
+            ..InProcessTurnState::new()
+        };
+        state
+            .push_nonterminal(event.clone())
+            .expect("exact byte limit accepted");
+        assert_eq!(state.drain().len(), 1);
+        let state = InProcessTurnState {
+            byte_limit: size - 1,
+            ..InProcessTurnState::new()
+        };
+        assert_eq!(
+            state.push_nonterminal(event),
+            Err(InProcessProviderEmitError::BufferFull)
+        );
+        let events = state.drain();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], ProviderTurnEvent::Error { error }
+            if error.code == "in_process_buffer_full"));
+        assert!(state.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn overflow_retains_bounded_history_and_rejects_late_events() {
+        let state = InProcessTurnState {
+            capacity: 1,
+            ..InProcessTurnState::new()
+        };
+        let event = || ProviderTurnEvent::TextDelta {
+            text: "delta".into(),
+        };
+        assert!(state.push_nonterminal(event()).is_ok());
+        assert_eq!(
+            state.push_nonterminal(event()),
+            Err(InProcessProviderEmitError::BufferFull)
+        );
+        assert_eq!(
+            state.push_nonterminal(event()),
+            Err(InProcessProviderEmitError::TurnFinished)
+        );
+        state.finish(StopReason::EndTurn);
+        let events = state.drain();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events.last(),
+            Some(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Error
+            })
+        ));
+        assert!(state.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn abandoned_finish_retains_state_until_worker_release() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        let started = provider
+            .start_turn(None, &model_request("finish ownership"))
+            .await
+            .expect("start");
+        let request = FinishTurnRequest {
+            provider_turn_id: started.provider_turn_id,
+        };
+        let state =
+            provider.turns.lock().expect("turn registry")[&request.provider_turn_id].clone();
+        // The current-thread executor has not polled the spawned worker yet.
+        let mut finish = provider.finish_turn(None, &request);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(finish.as_mut().poll(&mut context).is_pending());
+        drop(finish);
+        assert!(state.cancellation.is_cancelled());
+        assert!(!state.released.is_cancelled());
+        assert!(
+            provider
+                .turns
+                .lock()
+                .expect("turn registry")
+                .contains_key(&request.provider_turn_id)
+        );
+        provider
+            .finish_turn(None, &request)
+            .await
+            .expect("resume finish");
+        assert!(state.released.is_cancelled());
+        assert!(provider.turns.lock().expect("turn registry").is_empty());
+    }
+
+    #[test]
+    fn failed_worker_spawn_releases_partial_turn_acquisition() {
+        let mut provider = InProcessModelProviderAdapter::new(EchoProvider);
+        for _ in 0..2 {
+            let request = model_request("no executor");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut start = provider.start_turn(None, &request);
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                let _ = start.as_mut().poll(&mut context);
+            }));
+            assert!(result.is_err(), "native spawning requires an executor");
+            assert!(provider.turns.lock().expect("turn registry").is_empty());
         }
     }
 
@@ -867,7 +1380,7 @@ mod tests {
         .expect("provider acquired resource");
         assert!(!released.load(Ordering::Acquire));
         drop(generation);
-        assert!(adapter.turns.lock().expect("registry").is_empty());
+        assert_eq!(adapter.turns.lock().expect("registry").len(), 1);
         assert!(runtime.active_turn_generation().is_none());
         tokio::time::timeout(Duration::from_secs(2), async {
             while !released.load(Ordering::Acquire) {
@@ -876,6 +1389,8 @@ mod tests {
         })
         .await
         .expect("abandoned provider resource released while adapter remains alive");
+        adapter.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(adapter.turns.lock().expect("registry").is_empty());
     }
 
     #[tokio::test]

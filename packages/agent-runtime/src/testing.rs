@@ -712,6 +712,21 @@ fn script_exhausted_error() -> RuntimeError {
     })
 }
 
+fn unknown_turn_error(provider_turn_id: &str) -> RuntimeError {
+    runtime_provider_error(ProviderError {
+        code: "unknown_scripted_turn".to_string(),
+        category: ProviderErrorCategory::InvalidRequest,
+        message: format!("scripted provider turn {provider_turn_id} is not active"),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +757,7 @@ mod tests {
         assert!(state.active.is_empty());
         assert!(state.cancellations.is_empty());
         assert_eq!(state.finishes, [started.provider_turn_id]);
+        drop(state);
     }
 
     #[tokio::test]
@@ -772,13 +788,18 @@ mod tests {
             assert!(state.active.contains_key(&started.provider_turn_id));
             assert_eq!(state.requests.len(), 1);
             assert_eq!(state.turns.len(), 1);
+            drop(state);
         }
         drop(cleanup);
         let state = lock_state(&provider.state);
         assert!(state.active.is_empty());
-        assert_eq!(state.cancellations, [started.provider_turn_id.clone()]);
+        assert_eq!(
+            state.cancellations,
+            std::slice::from_ref(&started.provider_turn_id)
+        );
         assert_eq!(state.finishes, [started.provider_turn_id]);
         assert_eq!(state.turns.len(), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -795,6 +816,7 @@ mod tests {
             assert!(state.cancellations.is_empty());
             assert!(state.finishes.is_empty());
             assert_eq!(state.turns.len(), 1);
+            drop(state);
         }
         let response = crate::AgentRuntime::new()
             .run_text_turn(
@@ -809,20 +831,6 @@ mod tests {
         assert_eq!(state.requests.len(), 1);
         assert_eq!(state.finishes.len(), 1);
         assert!(state.cancellations.is_empty());
+        drop(state);
     }
-}
-
-fn unknown_turn_error(provider_turn_id: &str) -> RuntimeError {
-    runtime_provider_error(ProviderError {
-        code: "unknown_scripted_turn".to_string(),
-        category: ProviderErrorCategory::InvalidRequest,
-        message: format!("scripted provider turn {provider_turn_id} is not active"),
-        retryable: false,
-        provider_message: None,
-        failure: None,
-        request_id: None,
-        diagnostic_context: Box::default(),
-        sources: Box::default(),
-        retry: None,
-    })
 }

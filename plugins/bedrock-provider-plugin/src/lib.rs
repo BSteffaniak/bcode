@@ -116,6 +116,27 @@ trait BedrockTurnExecutor: Send + Sync {
     );
 }
 
+struct BedrockWorkerCompletion {
+    turn: TurnState,
+    completed: bool,
+}
+
+impl Drop for BedrockWorkerCompletion {
+    fn drop(&mut self) {
+        if !self.completed && self.turn.is_cancelled() && !std::thread::panicking() {
+            self.turn.push(ProviderTurnEvent::Cancelled);
+            self.turn.push(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Cancelled,
+            });
+        } else if !self.completed {
+            push_runtime_error(
+                &self.turn,
+                "provider worker ended before completing the turn",
+            );
+        }
+    }
+}
+
 impl BedrockTurnExecutor for AwsBedrockTurnExecutor {
     fn start(
         &self,
@@ -124,9 +145,14 @@ impl BedrockTurnExecutor for AwsBedrockTurnExecutor {
         turn: TurnState,
         discovery: Arc<Mutex<DiscoveryCache>>,
     ) {
-        let worker_turn = turn.clone();
+        let mut completion = BedrockWorkerCompletion {
+            turn: turn.clone(),
+            completed: false,
+        };
         if let Err(error) = runtime.try_spawn(async move {
-            stream_bedrock_turn(&request, &worker_turn, discovery).await;
+            stream_bedrock_turn(&request, &completion.turn, discovery).await;
+            completion.completed = true;
+            drop(completion);
         }) {
             push_runtime_error(&turn, &error.to_string());
         }
@@ -390,22 +416,17 @@ fn stream_turn_events(turn: &TurnState, context: &NativeServiceContext) -> Servi
     loop {
         if context.cancellation.is_cancelled() {
             turn.cancel();
-            for event in turn.drain() {
-                emit_provider_turn_event(context, &event);
-            }
+            let stop_reason = forward_turn_events(turn, |event| {
+                emit_provider_turn_event(context, event);
+            })
+            .unwrap_or(StopReason::Cancelled);
             return json_response(&RunTurnResponse {
-                stop_reason: Some(StopReason::Cancelled),
+                stop_reason: Some(stop_reason),
             });
         }
-        let mut terminal = None;
-        for event in turn.drain() {
-            emit_provider_turn_event(context, &event);
-            match &event {
-                ProviderTurnEvent::TurnFinished { stop_reason } => terminal = Some(*stop_reason),
-                ProviderTurnEvent::Cancelled => terminal = Some(StopReason::Cancelled),
-                _ => {}
-            }
-        }
+        let terminal = forward_turn_events(turn, |event| {
+            emit_provider_turn_event(context, event);
+        });
         if let Some(stop_reason) = terminal {
             return json_response(&RunTurnResponse {
                 stop_reason: Some(stop_reason),
@@ -413,6 +434,22 @@ fn stream_turn_events(turn: &TurnState, context: &NativeServiceContext) -> Servi
         }
         let _cancelled = context.cancellation.wait_cancelled(TURN_DRAIN_INTERVAL);
     }
+}
+
+fn forward_turn_events(
+    turn: &TurnState,
+    mut emit: impl FnMut(&ProviderTurnEvent),
+) -> Option<StopReason> {
+    let mut terminal = None;
+    for event in turn.drain() {
+        emit(&event);
+        match event {
+            ProviderTurnEvent::TurnFinished { stop_reason } => terminal = Some(stop_reason),
+            ProviderTurnEvent::Cancelled => terminal = Some(StopReason::Cancelled),
+            _ => {}
+        }
+    }
+    terminal
 }
 
 /// Emit one provider turn event as an incremental service event.
@@ -5328,6 +5365,32 @@ struct DiscoveryCache {
     inflight: BTreeMap<DiscoveryCacheKey, Arc<tokio::sync::Semaphore>>,
 }
 
+/// Owns one discovery acquisition until completion or caller abandonment.
+struct DiscoveryReservation<'a> {
+    cache: &'a Mutex<DiscoveryCache>,
+    key: DiscoveryCacheKey,
+    done: Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for DiscoveryReservation<'_> {
+    fn drop(&mut self) {
+        // Recover only to release ownership; poisoned data is not used as discovery output.
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache
+            .inflight
+            .get(&self.key)
+            .is_some_and(|done| Arc::ptr_eq(done, &self.done))
+        {
+            cache.inflight.remove(&self.key);
+        }
+        drop(cache);
+        self.done.close();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DiscoveryFailure {
     code: String,
@@ -5526,24 +5589,31 @@ async fn refresh_discovery_shared(
     settings: &Settings,
     key: DiscoveryCacheKey,
 ) {
-    let inflight = {
+    let acquisition = {
         let Ok(mut guard) = cache.lock() else {
             return;
         };
-        let existing = guard.inflight.get(&key).map(Arc::clone);
-        if existing.is_none() {
-            guard
-                .inflight
-                .insert(key.clone(), Arc::new(tokio::sync::Semaphore::new(0)));
+        match guard.inflight.entry(key.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => Err(Arc::clone(entry.get())),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let done = Arc::new(tokio::sync::Semaphore::new(0));
+                entry.insert(Arc::clone(&done));
+                Ok(DiscoveryReservation {
+                    cache,
+                    key: key.clone(),
+                    done,
+                })
+            }
         }
-        existing
     };
-    if let Some(done) = inflight {
-        // The owner closes the semaphore on completion; acquiring on a closed semaphore returns
-        // immediately, so a waiter registering after completion cannot hang.
-        drop(done.acquire().await);
-        return;
-    }
+    let reservation = match acquisition {
+        Ok(reservation) => reservation,
+        Err(done) => {
+            // Closing retains completion for followers registering after release.
+            drop(done.acquire().await);
+            return;
+        }
+    };
     let outcome = discover_models(settings).await;
     match outcome {
         Ok(discovery) => {
@@ -5579,13 +5649,7 @@ async fn refresh_discovery_shared(
             }
         }
     }
-    let done = cache
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.inflight.remove(&key));
-    if let Some(done) = done {
-        done.close();
-    }
+    drop(reservation);
 }
 
 /// Most recent recorded discovery failure for one cache key.
@@ -7399,6 +7463,159 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_abort_and_panic_publish_terminal_outcomes() {
+        let runtime = ProviderRuntime::new().unwrap();
+        for cancelled in [false, true] {
+            let turn = TurnState::default();
+            if cancelled {
+                turn.cancel();
+            }
+            let completion = BedrockWorkerCompletion {
+                turn: turn.clone(),
+                completed: false,
+            };
+            let (started, start) = tokio::sync::oneshot::channel();
+            let mut task = runtime.spawn(async move {
+                let _completion = completion;
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            start.await.unwrap();
+            task.cancel_and_wait().await.unwrap();
+            let events = turn.drain();
+            let expected = if cancelled {
+                StopReason::Cancelled
+            } else {
+                StopReason::Error
+            };
+            assert!(
+                matches!(events.last(), Some(ProviderTurnEvent::TurnFinished { stop_reason }) if *stop_reason == expected)
+            );
+            assert_eq!(events.len(), 2);
+        }
+        for cancelled in [false, true] {
+            let turn = TurnState::default();
+            if cancelled {
+                turn.cancel();
+            }
+            let completion = BedrockWorkerCompletion {
+                turn: turn.clone(),
+                completed: false,
+            };
+            let task = runtime.spawn(async move {
+                let _completion = completion;
+                panic!("private worker panic");
+            });
+            assert!(task.await.is_err());
+            assert!(matches!(
+                turn.drain().as_slice(),
+                [
+                    ProviderTurnEvent::Error { .. },
+                    ProviderTurnEvent::TurnFinished {
+                        stop_reason: StopReason::Error
+                    }
+                ]
+            ));
+        }
+        runtime.shutdown_wait().await.unwrap();
+    }
+
+    #[test]
+    fn interrupted_worker_publishes_terminal_failure_without_overwriting_completion() {
+        let turn = TurnState::default();
+        drop(BedrockWorkerCompletion {
+            turn: turn.clone(),
+            completed: false,
+        });
+        assert!(matches!(
+            turn.drain().as_slice(),
+            [
+                ProviderTurnEvent::Error { .. },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::Error
+                }
+            ]
+        ));
+        let turn = TurnState::default();
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        });
+        drop(BedrockWorkerCompletion {
+            turn: turn.clone(),
+            completed: false,
+        });
+        assert!(matches!(
+            turn.drain().as_slice(),
+            [ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn
+            }]
+        ));
+    }
+
+    #[test]
+    fn push_response_preserves_terminal_outcome_under_late_host_cancellation() {
+        for queued in [
+            None,
+            Some(StopReason::EndTurn),
+            Some(StopReason::ToolCall),
+            Some(StopReason::Error),
+        ] {
+            let turn = TurnState::default();
+            if let Some(stop_reason) = queued {
+                turn.push(ProviderTurnEvent::TurnFinished { stop_reason });
+            }
+            let context = NativeServiceContext {
+                plugin_id: PROVIDER_ID.to_string(),
+                request: ServiceRequest {
+                    interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),
+                    operation: OP_RUN_TURN.to_string(),
+                    payload: Vec::new(),
+                },
+                config: PluginConfigContext::default(),
+                events: ServiceEventEmitter::default(),
+                cancellation: ServiceCancellation::default(),
+                bridge: ServiceBridge::default(),
+                transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            };
+            context.cancellation.cancel();
+            let response = stream_turn_events(&turn, &context);
+            assert!(response.error.is_none());
+            let response: RunTurnResponse = serde_json::from_slice(&response.payload).unwrap();
+            assert_eq!(
+                response.stop_reason,
+                Some(queued.unwrap_or(StopReason::Cancelled))
+            );
+            assert!(turn.is_cancelled());
+            assert!(turn.drain().is_empty());
+        }
+    }
+
+    #[test]
+    fn forwarding_preserves_completed_turn_when_cancellation_arrives_late() {
+        for reason in [StopReason::EndTurn, StopReason::ToolCall, StopReason::Error] {
+            let turn = TurnState::default();
+            turn.push(ProviderTurnEvent::TurnFinished {
+                stop_reason: reason,
+            });
+            turn.cancel();
+            let mut emitted = Vec::new();
+            assert_eq!(
+                forward_turn_events(&turn, |event| emitted.push(event.clone())),
+                Some(reason)
+            );
+            assert!(
+                matches!(emitted.as_slice(), [ProviderTurnEvent::TurnFinished { stop_reason }] if *stop_reason == reason)
+            );
+        }
+        let turn = TurnState::default();
+        turn.cancel();
+        assert_eq!(
+            forward_turn_events(&turn, |_| panic!("no queued events")),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_turn_skips_discovery_and_request_setup() {
@@ -11471,6 +11688,76 @@ mod tests {
             }
             other => panic!("the default picker must expand Responses models, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn abandoned_discovery_releases_reservation_and_wakes_followers() {
+        let cache = Arc::new(Mutex::new(DiscoveryCache::default()));
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".into(),
+            aws_profile: None,
+            endpoint_url: None,
+            bearer_auth: false,
+        };
+        let done = Arc::new(tokio::sync::Semaphore::new(0));
+        cache
+            .lock()
+            .unwrap()
+            .inflight
+            .insert(key.clone(), Arc::clone(&done));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let owned_cache = Arc::clone(&cache);
+        let owned_done = Arc::clone(&done);
+        let task = tokio::spawn(async move {
+            let reservation = DiscoveryReservation {
+                cache: &owned_cache,
+                key,
+                done: owned_done,
+            };
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(reservation);
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(cache.lock().unwrap().inflight.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), done.acquire())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_discovery_cleanup_preserves_replacement() {
+        let cache = Mutex::new(DiscoveryCache::default());
+        let key = DiscoveryCacheKey {
+            region: "us-east-1".into(),
+            aws_profile: None,
+            endpoint_url: None,
+            bearer_auth: false,
+        };
+        let old = Arc::new(tokio::sync::Semaphore::new(0));
+        let replacement = Arc::new(tokio::sync::Semaphore::new(0));
+        let reservation = DiscoveryReservation {
+            cache: &cache,
+            key: key.clone(),
+            done: Arc::clone(&old),
+        };
+        cache
+            .lock()
+            .unwrap()
+            .inflight
+            .insert(key.clone(), Arc::clone(&replacement));
+        drop(reservation);
+        assert!(old.is_closed());
+        assert!(!replacement.is_closed());
+        assert!(Arc::ptr_eq(
+            &cache.lock().unwrap().inflight[&key],
+            &replacement
+        ));
     }
 
     #[test]

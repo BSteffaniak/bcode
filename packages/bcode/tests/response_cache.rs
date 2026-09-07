@@ -49,6 +49,147 @@ impl ModelResponseCache for MemoryCache {
     }
 }
 
+struct FailingReservedLookup {
+    owner: Mutex<Option<bcode::ModelResponseCacheReservation>>,
+    aborts: AtomicUsize,
+    panic: bool,
+}
+
+impl ModelResponseCache for FailingReservedLookup {
+    fn get(&self, _: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+        panic!("reservation-aware lookup required")
+    }
+
+    fn get_reserved(
+        &self,
+        _: &AgentTurnRequest,
+        reservation: &bcode::ModelResponseCacheReservation,
+    ) -> bcode::Result<Option<GenerateTextResponse>> {
+        let previous = self.owner.lock().unwrap().replace(reservation.clone());
+        assert!(previous.is_none(), "previous acquisition leaked");
+        assert!(!self.panic, "private lookup failure");
+        Err(bcode::BcodeError::Cache(
+            "lookup failed after acquisition".into(),
+        ))
+    }
+
+    fn put(&self, _: &AgentTurnRequest, _: &GenerateTextResponse) -> bcode::Result<()> {
+        panic!("failed lookup must not store")
+    }
+
+    fn abort_reserved(
+        &self,
+        _: &AgentTurnRequest,
+        reservation: &bcode::ModelResponseCacheReservation,
+    ) {
+        let owned = self
+            .owner
+            .lock()
+            .unwrap()
+            .take()
+            .expect("owned acquisition");
+        assert!(owned.same_acquisition(reservation));
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn failed_blocking_lookup_releases_partial_acquisition() {
+    for panic in [false, true] {
+        let cache = Arc::new(FailingReservedLookup {
+            owner: Mutex::new(None),
+            aborts: AtomicUsize::new(0),
+            panic,
+        });
+        let agent = Agent::builder().response_cache(cache.clone()).build();
+        let mut provider = CountingProvider::default();
+        for attempts in 1..=2 {
+            let result = agent
+                .generate_text_with_provider(&mut provider, "partial lookup")
+                .await;
+            let expected = if panic {
+                "cache lookup task failed"
+            } else {
+                "lookup failed after acquisition"
+            };
+            assert!(
+                matches!(result, Err(bcode::BcodeError::Cache(message)) if message == expected)
+            );
+            assert!(cache.owner.lock().unwrap().is_none());
+            assert_eq!(cache.aborts.load(Ordering::SeqCst), attempts);
+            assert_eq!(provider.starts, 0);
+        }
+    }
+}
+
+struct AsyncStoreCache {
+    started: bcode::CancellationToken,
+    release: bcode::CancellationToken,
+    aborts: AtomicUsize,
+    panic: bool,
+}
+
+impl ModelResponseCache for AsyncStoreCache {
+    fn get(&self, _: &AgentTurnRequest) -> bcode::Result<Option<GenerateTextResponse>> {
+        Ok(None)
+    }
+
+    fn put(&self, _: &AgentTurnRequest, _: &GenerateTextResponse) -> bcode::Result<()> {
+        panic!("synchronous storage must not be selected")
+    }
+
+    fn put_reserved_async<'a>(
+        &'a self,
+        _: &'a AgentTurnRequest,
+        _: &'a GenerateTextResponse,
+        _: &'a bcode::ModelResponseCacheReservation,
+    ) -> Option<bcode::ModelResponseCacheStoreFuture<'a>> {
+        Some(Box::pin(async move {
+            self.started.cancel();
+            self.release.cancelled().await;
+            assert!(!self.panic, "private storage failure");
+            Ok(())
+        }))
+    }
+
+    fn abort(&self, _: &AgentTurnRequest) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn async_cache_storage_owns_completion_panic_and_abandonment() {
+    for mode in 0..3 {
+        let cache = Arc::new(AsyncStoreCache {
+            started: bcode::CancellationToken::new(),
+            release: bcode::CancellationToken::new(),
+            aborts: AtomicUsize::new(0),
+            panic: mode == 1,
+        });
+        let agent = Agent::builder().response_cache(cache.clone()).build();
+        let mut provider = CountingProvider::default();
+        let mut request = Box::pin(agent.generate_text_with_provider(&mut provider, "async store"));
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("storage unexpectedly completed: {result:?}"),
+            () = cache.started.cancelled() => {}
+        }
+        if mode == 2 {
+            drop(request);
+        } else {
+            cache.release.cancel();
+            let result = request.await;
+            if mode == 1 {
+                assert!(matches!(result, Err(bcode::BcodeError::Cache(message))
+                    if message == "cache storage task failed"));
+            } else {
+                assert_eq!(result.expect("async completion").text, "cached response");
+            }
+        }
+        assert_eq!(cache.aborts.load(Ordering::SeqCst), usize::from(mode != 0));
+    }
+}
+
 #[derive(Debug, Default)]
 struct CountingProvider {
     starts: u32,

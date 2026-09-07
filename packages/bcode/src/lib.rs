@@ -2265,6 +2265,10 @@ pub type ModelResponseCacheLookupFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<GenerateTextResponse>>> + Send + 'a>,
 >;
 
+/// Future returned by a cache adapter's nonblocking completion path.
+pub type ModelResponseCacheStoreFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
 /// Application-owned cache adapter for completed non-streaming model responses.
 ///
 /// The adapter owns cache-key construction, expiration, capacity, and storage. It receives the
@@ -2295,6 +2299,9 @@ pub trait ModelResponseCache: Send + Sync {
     /// Look up a response, associating a miss with the supplied ownership token.
     ///
     /// Legacy adapters delegate to `get` and retain their existing unfenced semantics.
+    /// The SDK owns cleanup before invoking this method, including when it errors or
+    /// panics after acquiring a miss. `abort_reserved` must tolerate a token that did
+    /// not acquire work. A cache hit must not retain an acquisition.
     /// # Errors
     /// Returns cache lookup errors.
     fn get_reserved(
@@ -2317,6 +2324,22 @@ pub trait ModelResponseCache: Send + Sync {
         _reservation: &ModelResponseCacheReservation,
     ) -> Result<()> {
         self.put(request, response)
+    }
+
+    /// Optionally complete a reservation without a blocking worker.
+    ///
+    /// Returning `None` retains the synchronous compatibility path. The SDK retains
+    /// acquisition ownership while polling and aborts it on error, panic, cancellation,
+    /// or caller abandonment. Implementations must fence writes against stale owners
+    /// and must not detach work that can commit after the future is dropped.
+    /// Errors describe storage or reservation ownership failures.
+    fn put_reserved_async<'a>(
+        &'a self,
+        _request: &'a AgentTurnRequest,
+        _response: &'a GenerateTextResponse,
+        _reservation: &'a ModelResponseCacheReservation,
+    ) -> Option<ModelResponseCacheStoreFuture<'a>> {
+        None
     }
 
     /// Release only the supplied acquisition. Legacy adapters delegate to `abort`.
@@ -2472,6 +2495,17 @@ impl InMemoryModelResponseCache {
 }
 
 impl ModelResponseCache for InMemoryModelResponseCache {
+    fn put_reserved_async<'a>(
+        &'a self,
+        request: &'a AgentTurnRequest,
+        response: &'a GenerateTextResponse,
+        reservation: &'a ModelResponseCacheReservation,
+    ) -> Option<ModelResponseCacheStoreFuture<'a>> {
+        Some(Box::pin(async move {
+            self.store_response(request, response, Some(reservation))
+        }))
+    }
+
     fn get_reserved_async<'a>(
         &'a self,
         request: &'a AgentTurnRequest,
@@ -2890,18 +2924,21 @@ async fn response_cache_get(
         if request.cancellation.is_cancelled() {
             return Err(BcodeError::Runtime(RuntimeError::Cancelled));
         }
-        let reservation = ModelResponseCacheReservation::new();
-        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cache.get_reserved(&request, &reservation)
-        }))
-        .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))??;
-        let miss = response.is_none().then(|| ResponseCacheMiss {
+        let mut miss = ResponseCacheMiss {
             cache,
             request,
-            reservation,
+            reservation: ModelResponseCacheReservation::new(),
             completed: false,
-        });
-        Ok((response, miss))
+        };
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            miss.cache.get_reserved(&miss.request, &miss.reservation)
+        }))
+        .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))??;
+        if response.is_some() {
+            miss.completed = true;
+            return Ok((response, None));
+        }
+        Ok((response, Some(miss)))
     });
     switchy::unsync::select! {
         biased;
@@ -2911,10 +2948,31 @@ async fn response_cache_get(
     }
 }
 
-async fn response_cache_put(miss: ResponseCacheMiss, response: GenerateTextResponse) -> Result<()> {
+async fn response_cache_put(
+    mut miss: ResponseCacheMiss,
+    response: GenerateTextResponse,
+) -> Result<()> {
     let cancellation = miss.request.cancellation.clone();
     if cancellation.is_cancelled() {
         return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+    }
+    {
+        use futures::FutureExt as _;
+        let asynchronous = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            miss.cache
+                .put_reserved_async(&miss.request, &response, &miss.reservation)
+        }))
+        .map_err(|_| BcodeError::Cache("cache storage task failed".into()))?;
+        if let Some(storage) = asynchronous {
+            switchy::unsync::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(BcodeError::Runtime(RuntimeError::Cancelled)),
+                result = std::panic::AssertUnwindSafe(storage).catch_unwind() => result
+                    .map_err(|_| BcodeError::Cache("cache storage task failed".into()))??,
+            }
+            miss.completed = true;
+            return Ok(());
+        }
     }
     let storage = switchy::unsync::task::spawn_blocking(move || miss.store(&response));
     switchy::unsync::select! {

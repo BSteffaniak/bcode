@@ -10,12 +10,176 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[test]
+fn terminal_turn_rejects_late_events_even_after_drain() {
+    use bcode_model::ProviderTurnEvent;
+    use bcode_model::StopReason;
+    use bcode_model_provider_runtime::TurnStore;
+
+    let mut store = TurnStore::default();
+    let (id, turn) = store.insert_started("test");
+    drop(store.drain(&id));
+    let late_worker = turn.clone();
+    turn.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::EndTurn,
+    });
+    late_worker.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::Error,
+    });
+    let events = store.drain(&id);
+    assert!(matches!(
+        events.as_slice(),
+        [ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn
+        }]
+    ));
+    late_worker.push(ProviderTurnEvent::TurnFinished {
+        stop_reason: StopReason::Error,
+    });
+    assert!(store.drain(&id).is_empty());
+}
+
 struct Released(mpsc::Sender<()>);
 
 impl Drop for Released {
     fn drop(&mut self) {
         let _ = self.0.send(());
     }
+}
+
+#[tokio::test]
+async fn rejected_spawn_preserves_admission_failure_and_releases_future() {
+    let runtime = ProviderRuntime::new().unwrap();
+    runtime.shutdown_wait().await.unwrap();
+    let (released, release) = mpsc::channel();
+    let resource = Released(released);
+    let mut task = runtime.spawn(async move {
+        let _resource = resource;
+        panic!("rejected work must never run");
+    });
+    release
+        .try_recv()
+        .expect("rejected future is dropped synchronously");
+    assert!(task.is_finished());
+    for _ in 0..2 {
+        assert!(matches!(
+            (&mut task).await,
+            Err(ProviderRuntimeError::ShuttingDown)
+        ));
+        assert!(matches!(
+            task.cancel_and_wait().await,
+            Err(ProviderRuntimeError::ShuttingDown)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn task_cleanup_timeout_retains_handle_until_destructor_releases() {
+    struct HeldDestructor {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for HeldDestructor {
+        fn drop(&mut self) {
+            let _ = self.entered.take().unwrap().send(());
+            let _ = self.release.recv();
+        }
+    }
+    let runtime = ProviderRuntime::new().unwrap();
+    let (release, held) = mpsc::channel();
+    let (entered, destructing) = tokio::sync::oneshot::channel();
+    let resource = HeldDestructor {
+        entered: Some(entered),
+        release: held,
+    };
+    let mut task = runtime.spawn(async move {
+        let _resource = resource;
+        std::future::pending::<()>().await;
+    });
+    task.abort();
+    destructing.await.unwrap();
+    let timed_out = tokio::time::timeout(Duration::from_millis(1), task.cancel_and_wait())
+        .await
+        .is_err();
+    let still_running = !task.is_finished();
+    // Unblock before assertions so a failed assertion cannot deadlock runtime Drop.
+    release.send(()).unwrap();
+    task.cancel_and_wait().await.unwrap();
+    assert!(timed_out);
+    assert!(still_running);
+    assert_eq!(runtime.execute(async { 42 }).await.unwrap(), 42);
+    runtime.shutdown_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_after_consuming_task_result_does_not_repoll_join_handle() {
+    let runtime = ProviderRuntime::new().unwrap();
+    let mut task = runtime.spawn(async { 42 });
+    assert_eq!((&mut task).await.unwrap(), 42);
+    task.cancel_and_wait().await.unwrap();
+    assert!(task.is_finished());
+    assert!(matches!(
+        (&mut task).await,
+        Err(ProviderRuntimeError::TaskDropped)
+    ));
+    let mut failed = runtime.spawn(async { panic!("task failure") });
+    assert!(matches!(
+        (&mut failed).await,
+        Err(ProviderRuntimeError::TaskDropped)
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            failed.cancel_and_wait().await,
+            Err(ProviderRuntimeError::TaskDropped)
+        ));
+    }
+    runtime.shutdown_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_and_wait_acknowledges_task_destruction_without_runtime_shutdown() {
+    let runtime = ProviderRuntime::new().unwrap();
+    let (started, start) = tokio::sync::oneshot::channel();
+    let (released, release) = tokio::sync::oneshot::channel::<()>();
+    let mut task = runtime.spawn(async move {
+        let _released = released;
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    start.await.unwrap();
+    drop(task.cancel_and_wait());
+    task.cancel_and_wait().await.unwrap();
+    assert!(task.is_finished());
+    assert!(release.await.is_err());
+    task.cancel_and_wait().await.unwrap();
+    assert_eq!(runtime.execute(async { 42 }).await.unwrap(), 42);
+    runtime.shutdown_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn unpolled_timed_shutdown_closes_admission_and_can_be_awaited_again() {
+    let runtime = ProviderRuntime::new().unwrap();
+    drop(runtime.shutdown_async(Duration::from_secs(5)));
+    assert!(matches!(
+        runtime.execute(async {}).await,
+        Err(ProviderRuntimeError::ShuttingDown)
+    ));
+    runtime
+        .shutdown_async(Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unpolled_shutdown_wait_closes_admission_and_remains_retryable() {
+    let runtime = ProviderRuntime::new().unwrap();
+    drop(runtime.shutdown_wait());
+    assert!(matches!(
+        runtime.execute(async {}).await,
+        Err(ProviderRuntimeError::ShuttingDown)
+    ));
+    runtime.shutdown_wait().await.unwrap();
+    runtime.shutdown_wait().await.unwrap();
 }
 
 #[tokio::test]
@@ -71,7 +235,7 @@ async fn async_shutdown_acknowledges_task_release_and_is_repeatable() {
         .await
         .unwrap();
     receiver.try_recv().expect("task captures released");
-    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(matches!(task.await, Err(ProviderRuntimeError::TaskDropped)));
     runtime
         .shutdown_async(Duration::from_secs(5))
         .await
@@ -242,6 +406,56 @@ fn runtime_worker_rejects_self_wait_without_starting_shutdown() {
         .unwrap();
     assert_eq!(runtime.block_on(async { 42 }).unwrap(), 42);
     runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn shutdown_wait_created_off_worker_rejects_polling_on_worker() {
+    for timed in [false, true] {
+        let host = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        let runtime = Arc::new(ProviderRuntime::new().unwrap());
+        let worker = Arc::clone(&runtime);
+        let host_owner = Arc::clone(&host);
+        let result = runtime
+            .block_on(async move {
+                let wait = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let _entered = host.enter();
+                            let mut wait: std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = Result<(), ProviderRuntimeError>,
+                                        > + Send
+                                        + '_,
+                                >,
+                            > = if timed {
+                                Box::pin(worker.shutdown_async(Duration::from_secs(5)))
+                            } else {
+                                Box::pin(worker.shutdown_wait())
+                            };
+                            let mut context =
+                                std::task::Context::from_waker(std::task::Waker::noop());
+                            assert!(wait.as_mut().poll(&mut context).is_pending());
+                            wait
+                        })
+                        .join()
+                        .unwrap()
+                });
+                wait.await
+            })
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ProviderRuntimeError::RuntimeThreadWait)
+        ));
+        runtime.shutdown(Duration::from_secs(5)).unwrap();
+        drop(host_owner);
+    }
 }
 
 #[test]

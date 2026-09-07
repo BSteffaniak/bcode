@@ -148,7 +148,7 @@ use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -1772,6 +1772,20 @@ impl LoadedPlugin {
 /// Plugin discovery/loading errors.
 #[derive(Debug, Error)]
 pub enum PluginLoadError {
+    /// An event dispatcher failed delivery or termination; the retained cause is stable.
+    #[error("plugin '{plugin_id}' event dispatcher cleanup failed: {source}")]
+    EventDispatcherCleanup {
+        /// Plugin whose dispatcher failed.
+        plugin_id: String,
+        /// Original delivery or termination failure.
+        source: Arc<Self>,
+    },
+    /// The caller's wait budget expired while executor-owned cleanup remains incomplete.
+    #[error("plugin deactivation wait timed out; retain the host and retry cleanup")]
+    DeactivationTimeout,
+    /// Cleanup execution ended without an acknowledgment; retrying its callback is unsafe.
+    #[error("plugin '{plugin_id}' deactivation outcome is unknown; callback will not be retried")]
+    DeactivationOutcomeUnknown { plugin_id: String },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse manifest {path}: {source}")]
@@ -2564,7 +2578,24 @@ struct PluginEventInvocation {
 }
 
 #[derive(Debug)]
+struct PluginQueueCount {
+    metrics: Arc<PluginExecutorMetrics>,
+    class: PluginInvocationClass,
+    dispatched: bool,
+}
+
+impl Drop for PluginQueueCount {
+    fn drop(&mut self) {
+        self.metrics.dequeue(self.class);
+        if !self.dispatched {
+            self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Debug)]
 enum PluginExecutorMessage {
+    Queued(Box<Self>, PluginQueueCount),
     Service(PluginInvocation),
     Event(PluginEventInvocation),
     Deactivate(oneshot::Sender<Result<(), PluginLoadError>>),
@@ -2617,6 +2648,13 @@ impl StreamingServiceInvocation {
             return Err(Self::closed_response_error());
         }
         loop {
+            if !self.response_taken {
+                match self.response.try_recv() {
+                    Ok(response) => self.observe_response(Some(response)),
+                    Err(oneshot::error::TryRecvError::Closed) => self.observe_response(None),
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
             match self.events.try_recv() {
                 Ok(payload) => {
                     return Ok(StreamingServiceInvocationEvent::Event(payload));
@@ -2627,7 +2665,7 @@ impl StreamingServiceInvocation {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
             }
             if let Some(response) = self.pending_response.take() {
-                self.completed = true;
+                self.complete();
                 return Ok(StreamingServiceInvocationEvent::Response(response));
             }
             tokio::select! {
@@ -2641,37 +2679,53 @@ impl StreamingServiceInvocation {
                     }
                 }
                 response = &mut self.response, if !self.response_taken => {
-                    self.response_taken = true;
-                    self.pending_response = Some(match response {
-                        Ok(response) => response,
-                        Err(_error) => {
-                            return Err(Self::closed_response_error());
-                        }
-                    });
+                    self.observe_response(response.ok());
                 }
             }
         }
+    }
+
+    fn observe_response(&mut self, response: Option<Result<ServiceResponse, PluginLoadError>>) {
+        self.response_taken = true;
+        if response.is_none() {
+            self.cancel.cancel();
+        }
+        self.pending_response = response;
+        self.events.close();
     }
 
     async fn take_final_response(
         &mut self,
     ) -> Result<StreamingServiceInvocationEvent, PluginLoadError> {
         if let Some(response) = self.pending_response.take() {
-            self.completed = true;
+            self.complete();
             return Ok(StreamingServiceInvocationEvent::Response(response));
         }
         if self.response_taken {
-            return Err(Self::closed_response_error());
+            return Err(self.fail_closed_response());
         }
         let response = (&mut self.response).await;
         self.response_taken = true;
         match response {
             Ok(response) => {
-                self.completed = true;
+                self.complete();
                 Ok(StreamingServiceInvocationEvent::Response(response))
             }
-            Err(_error) => Err(Self::closed_response_error()),
+            Err(_error) => Err(self.fail_closed_response()),
         }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+        self.events.close();
+        // Executor-owned work retains its own permit until it actually exits.
+        drop(self.resource_permit.take());
+    }
+
+    fn fail_closed_response(&mut self) -> PluginLoadError {
+        self.cancel.cancel();
+        self.complete();
+        Self::closed_response_error()
     }
 
     #[must_use]
@@ -2699,6 +2753,19 @@ pub struct PluginExecutorHandle {
     concurrency: PluginConcurrency,
     executor: PluginExecutorKind,
     metrics: Arc<PluginExecutorMetrics>,
+    deactivation: tokio::sync::Mutex<PluginDeactivation>,
+    worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+    closing: std::sync::atomic::AtomicBool,
+    admission_closed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct PluginDeactivation {
+    task: Option<tokio::task::JoinHandle<Result<(), PluginLoadError>>>,
+    response: Option<oneshot::Receiver<Result<(), PluginLoadError>>>,
+    completed: bool,
+    outcome_unknown: bool,
 }
 
 #[derive(Debug)]
@@ -2709,7 +2776,7 @@ enum PluginExecutorKind {
 
 impl PluginExecutorHandle {
     #[must_use]
-    const fn new(
+    fn new(
         manifest: PluginManifest,
         concurrency: PluginConcurrency,
         executor: PluginExecutorKind,
@@ -2720,6 +2787,16 @@ impl PluginExecutorHandle {
             concurrency,
             executor,
             metrics,
+            lifecycle: Arc::new(tokio::sync::RwLock::new(())),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            admission_closed: tokio::sync::Notify::new(),
+            worker: tokio::sync::Mutex::const_new(None),
+            deactivation: tokio::sync::Mutex::const_new(PluginDeactivation {
+                task: None,
+                response: None,
+                completed: false,
+                outcome_unknown: false,
+            }),
         }
     }
 
@@ -2814,13 +2891,11 @@ impl PluginExecutorHandle {
                 };
                 let plugin = Arc::clone(plugin);
                 let metrics = Arc::clone(&self.metrics);
-                tokio::task::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        execute_plugin_service_invocation(&plugin, invocation, &metrics)
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(PluginLoadError::Io(std::io::Error::other(error))));
+                let lifecycle = self.admit_concurrent().await?;
+                tokio::task::spawn_blocking(move || {
+                    let _lifecycle = lifecycle;
+                    let _permit = permit;
+                    let result = execute_plugin_service_invocation(&plugin, invocation, &metrics);
                     let _ = response.send(result);
                 });
             }
@@ -2902,7 +2977,9 @@ impl PluginExecutorHandle {
                     };
                     let plugin = Arc::clone(plugin);
                     let metrics = Arc::clone(&self.metrics);
+                    let lifecycle = self.admit_concurrent().await?;
                     tokio::task::spawn_blocking(move || {
+                        let _lifecycle = lifecycle;
                         let _permit = permit;
                         execute_plugin_service_invocation(&plugin, invocation, &metrics)
                     })
@@ -2921,14 +2998,29 @@ impl PluginExecutorHandle {
         class: PluginInvocationClass,
         message: PluginExecutorMessage,
     ) -> Result<(), PluginLoadError> {
+        let closed = self.admission_closed.notified();
+        if self.closing.load(Ordering::Acquire) {
+            return Err(PluginLoadError::PluginNotLoaded(self.manifest.id.clone()));
+        }
         {
-            let permit = sender
-                .reserve()
-                .await
-                .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
+            let permit = tokio::select! {
+                biased;
+                () = closed => return Err(PluginLoadError::PluginNotLoaded(self.manifest.id.clone())),
+                permit = sender.reserve() => permit.map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?,
+            };
+            if self.closing.load(Ordering::Acquire) {
+                return Err(PluginLoadError::PluginNotLoaded(self.manifest.id.clone()));
+            }
             // Once counted, transfer ownership without a cancellation point.
             self.metrics.enqueue(class);
-            permit.send(message);
+            permit.send(PluginExecutorMessage::Queued(
+                Box::new(message),
+                PluginQueueCount {
+                    metrics: Arc::clone(&self.metrics),
+                    class,
+                    dispatched: false,
+                },
+            ));
         }
         Ok(())
     }
@@ -2973,7 +3065,9 @@ impl PluginExecutorHandle {
                     payload,
                     response: oneshot::channel().0,
                 };
+                let lifecycle = self.admit_concurrent().await?;
                 tokio::task::spawn_blocking(move || {
+                    let _lifecycle = lifecycle;
                     let _permit = permit;
                     execute_plugin_event_invocation(&plugin, invocation, &metrics)
                 })
@@ -2983,23 +3077,123 @@ impl PluginExecutorHandle {
         }
     }
 
-    async fn deactivate(&self) -> Result<(), PluginLoadError> {
-        let (response, receiver) = oneshot::channel();
+    async fn admit_concurrent(
+        &self,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, PluginLoadError> {
+        let closed = self.admission_closed.notified();
+        if self.closing.load(Ordering::Acquire) {
+            return Err(PluginLoadError::PluginNotLoaded(self.manifest.id.clone()));
+        }
+        let permit = tokio::select! {
+            biased;
+            () = closed => return Err(PluginLoadError::PluginNotLoaded(self.manifest.id.clone())),
+            permit = Arc::clone(&self.lifecycle).read_owned() => permit,
+        };
+        if self.closing.load(Ordering::Acquire) {
+            return Err(PluginLoadError::PluginNotLoaded(self.manifest.id.clone()));
+        }
+        Ok(permit)
+    }
+
+    async fn join_worker(&self) -> Result<(), PluginLoadError> {
+        let mut worker = self.worker.lock().await;
+        if let Some(task) = worker.as_mut() {
+            let result = task.await;
+            *worker = None;
+            result.map_err(|_| PluginLoadError::DeactivationOutcomeUnknown {
+                plugin_id: self.manifest.id.clone(),
+            })?;
+        }
+        drop(worker);
+        Ok(())
+    }
+
+    fn deactivate(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), PluginLoadError>> + Send + '_ {
+        self.closing.store(true, Ordering::Release);
+        self.admission_closed.notify_waiters();
+        if let PluginExecutorKind::Concurrent(_, Some(semaphore)) = &self.executor {
+            semaphore.close();
+        }
+        self.await_deactivation()
+    }
+
+    async fn await_deactivation(&self) -> Result<(), PluginLoadError> {
+        let mut deactivation = self.deactivation.lock().await;
+        if deactivation.outcome_unknown {
+            // Release a terminated worker without delaying unrelated plugin cleanup.
+            if let Ok(mut worker) = self.worker.try_lock()
+                && worker
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let _ = worker.as_mut().expect("finished worker").await;
+                *worker = None;
+            }
+            return Err(PluginLoadError::DeactivationOutcomeUnknown {
+                plugin_id: self.manifest.id.clone(),
+            });
+        }
+        if deactivation.completed {
+            let result = self.join_worker().await;
+            deactivation.outcome_unknown = result.is_err();
+            return result;
+        }
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
-                sender
-                    .send(PluginExecutorMessage::Deactivate(response))
-                    .await
-                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?;
-                receiver
-                    .await
-                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+                if deactivation.response.is_none() {
+                    let (response, receiver) = oneshot::channel();
+                    if sender
+                        .send(PluginExecutorMessage::Deactivate(response))
+                        .await
+                        .is_err()
+                    {
+                        deactivation.outcome_unknown = true;
+                        return Err(PluginLoadError::DeactivationOutcomeUnknown {
+                            plugin_id: self.manifest.id.clone(),
+                        });
+                    }
+                    deactivation.response = Some(receiver);
+                }
+                let acknowledged = deactivation
+                    .response
+                    .as_mut()
+                    .expect("retained response")
+                    .await;
+                deactivation.outcome_unknown = acknowledged.is_err();
+                let result = acknowledged
+                    .map_err(|_| PluginLoadError::DeactivationOutcomeUnknown {
+                        plugin_id: self.manifest.id.clone(),
+                    })
+                    .and_then(std::convert::identity);
+                deactivation.response = None;
+                deactivation.completed = result.is_ok();
+                result?;
+                let result = self.join_worker().await;
+                deactivation.outcome_unknown = result.is_err();
+                result
             }
             PluginExecutorKind::Concurrent(plugin, _) => {
-                let plugin = Arc::clone(plugin);
-                tokio::task::spawn_blocking(move || plugin.deactivate())
-                    .await
-                    .map_err(|_| PluginLoadError::PluginNotLoaded(self.manifest.id.clone()))?
+                if deactivation.task.is_none() {
+                    let lifecycle = Arc::clone(&self.lifecycle).write_owned().await;
+                    let plugin = Arc::clone(plugin);
+                    deactivation.task = Some(tokio::task::spawn_blocking(move || {
+                        let _lifecycle = lifecycle;
+                        plugin.deactivate()
+                    }));
+                }
+                let task = deactivation.task.as_mut().expect("owned deactivation task");
+                let joined = task.await;
+                deactivation.outcome_unknown = joined.is_err();
+                let result = joined
+                    .map_err(|_| PluginLoadError::DeactivationOutcomeUnknown {
+                        plugin_id: self.manifest.id.clone(),
+                    })
+                    .and_then(std::convert::identity);
+                deactivation.task = None;
+                deactivation.completed = result.is_ok();
+                result
             }
         }
     }
@@ -3330,7 +3524,9 @@ struct PluginEventDispatcher {
     executor: Arc<PluginExecutorHandle>,
     sender: mpsc::Sender<QueuedPluginEvent>,
     receiver: Mutex<Option<mpsc::Receiver<QueuedPluginEvent>>>,
-    started: AtomicBool,
+    worker: Mutex<Option<tokio::task::JoinHandle<Result<(), PluginLoadError>>>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    stop_failed: tokio::sync::Mutex<Option<Arc<PluginLoadError>>>,
 }
 
 impl PluginEventDispatcher {
@@ -3341,16 +3537,18 @@ impl PluginEventDispatcher {
             executor,
             sender,
             receiver: Mutex::new(Some(receiver)),
-            started: AtomicBool::new(false),
+            worker: Mutex::new(None),
+            shutdown: tokio::sync::watch::channel(false).0,
+            stop_failed: tokio::sync::Mutex::new(None),
         }
     }
 
     fn start(&self) {
-        if self
-            .started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let mut worker = self
+            .worker
+            .lock()
+            .expect("plugin event dispatcher worker lock");
+        if worker.is_some() || *self.shutdown.borrow() {
             return;
         }
         let Some(receiver) = self
@@ -3361,7 +3559,56 @@ impl PluginEventDispatcher {
         else {
             return;
         };
-        spawn_plugin_event_dispatcher(self.plugin_id.clone(), Arc::clone(&self.executor), receiver);
+        *worker = Some(spawn_plugin_event_dispatcher(
+            self.plugin_id.clone(),
+            Arc::clone(&self.executor),
+            receiver,
+            self.shutdown.subscribe(),
+        ));
+    }
+
+    async fn stop(&self) -> Result<(), PluginLoadError> {
+        let mut failed = self.stop_failed.lock().await;
+        if let Some(source) = failed.as_ref() {
+            return Err(PluginLoadError::EventDispatcherCleanup {
+                plugin_id: self.plugin_id.clone(),
+                source: Arc::clone(source),
+            });
+        }
+        self.shutdown.send_replace(true);
+        let result = std::future::poll_fn(|context| {
+            let mut worker = self
+                .worker
+                .lock()
+                .expect("plugin event dispatcher worker lock");
+            let Some(task) = worker.as_mut() else {
+                self.receiver
+                    .lock()
+                    .expect("plugin event dispatcher receiver lock")
+                    .take();
+                return std::task::Poll::Ready(Ok(()));
+            };
+            let result =
+                std::task::ready!(std::future::Future::poll(std::pin::Pin::new(task), context,));
+            *worker = None;
+            drop(worker);
+            std::task::Poll::Ready(result.unwrap_or_else(|_| {
+                Err(PluginLoadError::DeactivationOutcomeUnknown {
+                    plugin_id: self.plugin_id.clone(),
+                })
+            }))
+        })
+        .await;
+        let result = result.map_err(|error| {
+            let source = Arc::new(error);
+            *failed = Some(Arc::clone(&source));
+            PluginLoadError::EventDispatcherCleanup {
+                plugin_id: self.plugin_id.clone(),
+                source,
+            }
+        });
+        drop(failed);
+        result
     }
 
     fn try_send(
@@ -3369,7 +3616,15 @@ impl PluginEventDispatcher {
         event: QueuedPluginEvent,
     ) -> Result<(), mpsc::error::TrySendError<QueuedPluginEvent>> {
         self.start();
-        self.sender.try_send(event)
+        // Keep admission ordered with shutdown's send_replace: a successful send
+        // must finish before shutdown can publish the closed state.
+        let shutdown = self.shutdown.borrow();
+        if *shutdown {
+            return Err(mpsc::error::TrySendError::Closed(event));
+        }
+        let result = self.sender.try_send(event);
+        drop(shutdown);
+        result
     }
 }
 
@@ -4156,14 +4411,61 @@ impl PluginRuntimeHost {
         Ok(delivered)
     }
 
+    /// Bound the wait for plugin deactivation without abandoning executor-owned cleanup.
+    ///
+    /// A timeout does not prove termination or stop a blocking lifecycle callback.
+    /// Retain this host and retry this method or [`Self::deactivate_all`] to observe
+    /// completion. Plugins later in shutdown order may not yet have been attempted.
+    /// Once cleanup starts, asynchronous event admission remains closed even if
+    /// this wait times out; retrying observes cleanup rather than restarting delivery.
+    ///
+    /// # Errors
+    /// Returns a lifecycle error or [`PluginLoadError::DeactivationTimeout`] when
+    /// the supplied wait budget expires.
+    pub fn deactivate_all_with_timeout(
+        &self,
+        budget: Duration,
+    ) -> impl std::future::Future<Output = Result<(), PluginLoadError>> + Send + '_ {
+        let cleanup = self.deactivate_all();
+        async move {
+            tokio::time::timeout(budget, cleanup)
+                .await
+                .map_err(|_| PluginLoadError::DeactivationTimeout)?
+        }
+    }
+
     /// Deactivate all loaded plugins through their plugin-local executors.
+    ///
+    /// Permanently closes asynchronous event admission when called, even if the returned
+    /// future is never polled. Closure applies across this host and its clones. The future
+    /// drains admitted events, then deactivates plugin executors. Retain
+    /// the host after a failed or abandoned wait to preserve cleanup ownership.
     ///
     /// # Errors
     ///
-    /// Returns the first deactivation error after attempting every loaded executor.
-    pub async fn deactivate_all(&self) -> Result<(), PluginLoadError> {
+    /// Returns the first cleanup error after attempting every plugin. Executors whose
+    /// event dispatcher failed to join are not deactivated because dispatched work
+    /// may still be running.
+    pub fn deactivate_all(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), PluginLoadError>> + Send + '_ {
+        for dispatcher in self.event_dispatchers.values() {
+            dispatcher.shutdown.send_replace(true);
+        }
+        self.drain_and_deactivate()
+    }
+
+    async fn drain_and_deactivate(&self) -> Result<(), PluginLoadError> {
         let mut first_error = None;
         for plugin_id in self.registry.manifests.keys().rev() {
+            if let Some(dispatcher) = self.event_dispatchers.get(plugin_id)
+                && let Err(error) = dispatcher.stop().await
+            {
+                first_error.get_or_insert(error);
+                // A failed dispatcher join does not prove its dispatched work ended.
+                // Keep this plugin alive rather than race deactivation with that work.
+                continue;
+            }
             if let Some(executor) = self.executors.get(plugin_id)
                 && let Err(error) = executor.deactivate().await
             {
@@ -4189,10 +4491,15 @@ impl From<PluginHost> for PluginRuntimeHost {
             manifests.insert(plugin_id.clone(), manifest.clone());
             let metrics = Arc::new(PluginExecutorMetrics::default());
             let concurrency = PluginConcurrency::from(&manifest.concurrency);
+            let mut worker = None;
             let executor = match concurrency {
                 PluginConcurrency::Exclusive => {
                     let (sender, receiver) = mpsc::channel(32);
-                    spawn_exclusive_plugin_executor(plugin, receiver, Arc::clone(&metrics));
+                    worker = Some(spawn_exclusive_plugin_executor(
+                        plugin,
+                        receiver,
+                        Arc::clone(&metrics),
+                    ));
                     PluginExecutorKind::Exclusive(sender)
                 }
                 PluginConcurrency::Limited(max) => PluginExecutorKind::Concurrent(
@@ -4203,12 +4510,10 @@ impl From<PluginHost> for PluginRuntimeHost {
                     PluginExecutorKind::Concurrent(Arc::new(plugin), None)
                 }
             };
-            let handle = Arc::new(PluginExecutorHandle::new(
-                manifest.clone(),
-                concurrency,
-                executor,
-                metrics,
-            ));
+            let mut handle =
+                PluginExecutorHandle::new(manifest.clone(), concurrency, executor, metrics);
+            *handle.worker.get_mut() = worker;
+            let handle = Arc::new(handle);
             let dispatcher = Arc::new(PluginEventDispatcher::new(
                 plugin_id.clone(),
                 Arc::clone(&handle),
@@ -4282,9 +4587,25 @@ fn spawn_plugin_event_dispatcher(
     plugin_id: String,
     executor: Arc<PluginExecutorHandle>,
     mut receiver: mpsc::Receiver<QueuedPluginEvent>,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<Result<(), PluginLoadError>> {
     tokio::spawn(async move {
-        while let Some(event) = receiver.recv().await {
+        let mut first_error = None;
+        loop {
+            if *shutdown.borrow() {
+                receiver.close();
+            }
+            let event = tokio::select! {
+                biased;
+                changed = shutdown.changed(), if !receiver.is_closed() => {
+                    if changed.is_err() { receiver.close(); }
+                    continue;
+                },
+                event = receiver.recv() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
             if let Err(error) = executor.handle_event(event.topic, event.payload).await {
                 tracing::warn!(
                     target: "bcode_plugin::events",
@@ -4292,9 +4613,37 @@ fn spawn_plugin_event_dispatcher(
                     %error,
                     "asynchronous plugin event delivery failed"
                 );
+                first_error.get_or_insert(error);
             }
         }
-    });
+        first_error.map_or(Ok(()), Err)
+    })
+}
+
+struct RunningPluginInvocation<'a> {
+    metrics: &'a PluginExecutorMetrics,
+    succeeded: bool,
+}
+
+impl<'a> RunningPluginInvocation<'a> {
+    fn new(metrics: &'a PluginExecutorMetrics) -> Self {
+        metrics.running.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            succeeded: false,
+        }
+    }
+}
+
+impl Drop for RunningPluginInvocation<'_> {
+    fn drop(&mut self) {
+        self.metrics.running.fetch_sub(1, Ordering::Relaxed);
+        if self.succeeded {
+            self.metrics.completed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn execute_plugin_service_invocation(
@@ -4308,7 +4657,7 @@ fn execute_plugin_service_invocation(
             invocation_id: invocation.id,
         });
     }
-    metrics.running.fetch_add(1, Ordering::Relaxed);
+    let mut running = RunningPluginInvocation::new(metrics);
     let started_at = Instant::now();
     tracing::debug!(
         target: "bcode_plugin::runtime",
@@ -4339,12 +4688,8 @@ fn execute_plugin_service_invocation(
         },
         &invocation.cancellation.cancellation,
     );
-    metrics.running.fetch_sub(1, Ordering::Relaxed);
-    if response.is_ok() {
-        metrics.completed.fetch_add(1, Ordering::Relaxed);
-    } else {
-        metrics.failed.fetch_add(1, Ordering::Relaxed);
-    }
+    running.succeeded = response.is_ok();
+    drop(running);
     tracing::debug!(
         target: "bcode_plugin::runtime",
         plugin_id = %plugin.manifest.id,
@@ -4361,7 +4706,7 @@ fn execute_plugin_event_invocation(
     invocation: PluginEventInvocation,
     metrics: &PluginExecutorMetrics,
 ) -> Result<(), PluginLoadError> {
-    metrics.running.fetch_add(1, Ordering::Relaxed);
+    let mut running = RunningPluginInvocation::new(metrics);
     let started_at = Instant::now();
     tracing::debug!(
         target: "bcode_plugin::runtime",
@@ -4373,12 +4718,8 @@ fn execute_plugin_event_invocation(
         "plugin event invocation started"
     );
     let response = plugin.handle_event(invocation.topic, invocation.payload);
-    metrics.running.fetch_sub(1, Ordering::Relaxed);
-    if response.is_ok() {
-        metrics.completed.fetch_add(1, Ordering::Relaxed);
-    } else {
-        metrics.failed.fetch_add(1, Ordering::Relaxed);
-    }
+    running.succeeded = response.is_ok();
+    drop(running);
     tracing::debug!(
         target: "bcode_plugin::runtime",
         plugin_id = %plugin.manifest.id,
@@ -4395,15 +4736,20 @@ fn spawn_exclusive_plugin_executor(
     plugin: LoadedPlugin,
     mut receiver: mpsc::Receiver<PluginExecutorMessage>,
     metrics: Arc<PluginExecutorMetrics>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let plugin_id = plugin.manifest.id.clone();
         let mut plugin = Some(plugin);
         let mut stopping = false;
-        while let Some(message) = receiver.blocking_recv() {
+        while let Some(mut message) = receiver.blocking_recv() {
+            while let PluginExecutorMessage::Queued(inner, mut count) = message {
+                count.dispatched = true;
+                drop(count);
+                message = *inner;
+            }
             match message {
+                PluginExecutorMessage::Queued(_, _) => unreachable!("queue envelopes removed"),
                 PluginExecutorMessage::Service(mut invocation) => {
-                    metrics.dequeue(invocation.class);
                     let queue_wait_ms = elapsed_ms(invocation.enqueued_at);
                     metrics.registry().record_histogram_with_labels(
                         "plugin.queue_wait.duration_ms",
@@ -4428,44 +4774,24 @@ fn spawn_exclusive_plugin_executor(
                     );
                     let _ = response_sender.send(response);
                 }
-                PluginExecutorMessage::Event(invocation) => {
-                    metrics.dequeue(invocation.class);
-                    metrics.running.fetch_add(1, Ordering::Relaxed);
-                    let started_at = Instant::now();
-                    tracing::debug!(
-                        target: "bcode_plugin::runtime",
-                        plugin_id = %plugin_id,
-                        invocation_id = invocation.id.get(),
-                        class = ?invocation.class,
-                        queue_wait_ms = invocation.enqueued_at.elapsed().as_millis(),
-                        topic = %invocation.topic,
-                        "plugin event invocation started"
+                PluginExecutorMessage::Event(mut invocation) => {
+                    let (unused_response, _) = oneshot::channel();
+                    let response_sender =
+                        std::mem::replace(&mut invocation.response, unused_response);
+                    let response = plugin.as_ref().filter(|_| !stopping).map_or_else(
+                        || {
+                            metrics.failed.fetch_add(1, Ordering::Relaxed);
+                            Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
+                        },
+                        |plugin| execute_plugin_event_invocation(plugin, invocation, &metrics),
                     );
-                    let response = if let Some(plugin) = plugin.as_ref().filter(|_| !stopping) {
-                        plugin.handle_event(invocation.topic, invocation.payload)
-                    } else {
-                        Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
-                    };
-                    metrics.running.fetch_sub(1, Ordering::Relaxed);
-                    if response.is_ok() {
-                        metrics.completed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics.failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    tracing::debug!(
-                        target: "bcode_plugin::runtime",
-                        plugin_id = %plugin_id,
-                        invocation_id = invocation.id.get(),
-                        duration_ms = started_at.elapsed().as_millis(),
-                        success = response.is_ok(),
-                        "plugin event invocation finished"
-                    );
-                    let _ = invocation.response.send(response);
+                    let _ = response_sender.send(response);
                 }
                 PluginExecutorMessage::Deactivate(response) => {
                     stopping = true;
                     let result = plugin.as_ref().map_or(Ok(()), LoadedPlugin::deactivate);
                     if result.is_ok() {
+                        receiver.close();
                         drop(plugin.take());
                     }
                     let _ = response.send(result);
@@ -4481,7 +4807,7 @@ fn spawn_exclusive_plugin_executor(
                 "exclusive plugin executor stopped with incomplete deactivation"
             );
         }
-    });
+    })
 }
 
 fn classify_invocation(interface_id: &str, operation: &str) -> PluginInvocationClass {
@@ -6776,6 +7102,188 @@ library = "libexample_plugin.dylib"
     }
 
     #[tokio::test]
+    async fn terminal_stream_releases_only_its_own_resource_ownership() {
+        for lost_response in [false, true] {
+            let resources = PluginResourceLimiter::new(1, 1);
+            let permit = Arc::new(
+                resources
+                    .acquire(&PluginInvocationScope::Global)
+                    .await
+                    .unwrap(),
+            );
+            let executor_permit = Arc::clone(&permit);
+            let (response_tx, response) = oneshot::channel();
+            let (events_tx, events) = mpsc::unbounded_channel();
+            drop(events_tx);
+            let mut invocation = StreamingServiceInvocation {
+                response,
+                pending_response: None,
+                response_taken: false,
+                completed: false,
+                events,
+                cancel: PluginInvocationCancelHandle {
+                    id: PluginInvocationId(1),
+                    cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                },
+                resource_permit: Some(permit),
+            };
+            if lost_response {
+                drop(response_tx);
+                assert!(invocation.next_event().await.is_err());
+            } else {
+                response_tx.send(Ok(ServiceResponse::text("done"))).unwrap();
+                assert!(matches!(
+                    invocation.next_event().await.unwrap(),
+                    StreamingServiceInvocationEvent::Response(Ok(_))
+                ));
+            }
+            assert!(invocation.resource_permit.is_none());
+            assert_eq!(resources.global.available_permits(), 0);
+            drop(executor_permit);
+            assert_eq!(resources.global.available_permits(), 1);
+            assert!(invocation.next_event().await.is_err());
+            drop(invocation);
+        }
+    }
+
+    #[tokio::test]
+    async fn exclusive_event_success_does_not_count_queue_release_as_failure() {
+        let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: test_manifest("successful-event-queue"),
+            backend: LoadedPluginBackend::Static {
+                vtable: test_large_vtable(),
+            },
+        };
+        let metrics = Arc::new(PluginExecutorMetrics::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let handle = PluginExecutorHandle::new(
+            test_manifest("successful-event-queue"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::clone(&metrics),
+        );
+        spawn_exclusive_plugin_executor(plugin, receiver, Arc::clone(&metrics));
+        for _ in 0..2 {
+            handle
+                .handle_event("test".into(), Vec::new())
+                .await
+                .unwrap();
+        }
+        handle.deactivate().await.unwrap();
+        handle.deactivate().await.unwrap();
+        assert!(matches!(
+            handle
+                .handle_event("after-shutdown".into(), Vec::new())
+                .await,
+            Err(PluginLoadError::PluginNotLoaded(_))
+        ));
+        drop(handle);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.running.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.completed.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn exclusive_callback_panic_releases_queued_events() {
+        static RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+            std::sync::Mutex::new(None);
+        static STARTED: std::sync::Mutex<Option<oneshot::Sender<()>>> = std::sync::Mutex::new(None);
+        let (release, wait) = std::sync::mpsc::channel();
+        *RELEASE.lock().unwrap() = Some(wait);
+        let (started, ready) = oneshot::channel();
+        *STARTED.lock().unwrap() = Some(started);
+        let mut vtable = test_large_vtable();
+        vtable.handle_event = |_, _, _| {
+            STARTED.lock().unwrap().take().unwrap().send(()).unwrap();
+            let wait = RELEASE.lock().unwrap().take().unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            panic!("exclusive callback failed");
+        };
+        let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: test_manifest("panic-queue"),
+            backend: LoadedPluginBackend::Static { vtable },
+        };
+        let metrics = Arc::new(PluginExecutorMetrics::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let handle = PluginExecutorHandle::new(
+            test_manifest("panic-queue"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender.clone()),
+            Arc::clone(&metrics),
+        );
+        spawn_exclusive_plugin_executor(plugin, receiver, Arc::clone(&metrics));
+        let mut responses = Vec::new();
+        for id in 1..=2 {
+            let (response, receiver) = oneshot::channel();
+            handle
+                .enqueue_exclusive(
+                    &sender,
+                    PluginInvocationClass::EventDelivery,
+                    PluginExecutorMessage::Event(PluginEventInvocation {
+                        id: PluginInvocationId(id),
+                        class: PluginInvocationClass::EventDelivery,
+                        enqueued_at: Instant::now(),
+                        topic: "test".into(),
+                        payload: Vec::new(),
+                        response,
+                    }),
+                )
+                .await
+                .unwrap();
+            responses.push(receiver);
+        }
+        drop(handle);
+        ready.await.unwrap();
+        assert_eq!(metrics.running.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 1);
+        release.send(()).unwrap();
+        drop(release);
+        for response in responses {
+            assert!(response.await.is_err());
+        }
+        // Channel closure precedes dropping the queued envelope's count.
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.queued.load(Ordering::Relaxed) != 0
+                || metrics.failed.load(Ordering::Relaxed) != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("executor releases queue accounting");
+        assert_eq!(metrics.running.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_count_releases_when_reserved_send_outlives_receiver() {
+        let metrics = Arc::new(PluginExecutorMetrics::default());
+        let (sender, receiver) = mpsc::channel(1);
+        let permit = sender.reserve().await.unwrap();
+        metrics.enqueue(PluginInvocationClass::Service);
+        let (response, _) = oneshot::channel();
+        {
+            drop(receiver);
+            permit
+        }
+        .send(PluginExecutorMessage::Queued(
+            Box::new(PluginExecutorMessage::Deactivate(response)),
+            PluginQueueCount {
+                metrics: Arc::clone(&metrics),
+                class: PluginInvocationClass::Service,
+                dispatched: false,
+            },
+        ));
+        drop(sender);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn cancelled_exclusive_queue_wait_does_not_leave_phantom_work() {
         let (sender, mut receiver) = mpsc::channel(1);
         let metrics = Arc::new(PluginExecutorMetrics::default());
@@ -6817,8 +7325,7 @@ library = "libexample_plugin.dylib"
             .expect("enqueue after cancellation");
         drop(handle);
         assert_eq!(metrics.queued.load(Ordering::Relaxed), 1);
-        receiver.recv().await.expect("committed message");
-        metrics.dequeue(PluginInvocationClass::Service);
+        drop(receiver.recv().await.expect("committed message"));
         assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
     }
 
@@ -7302,7 +7809,7 @@ library = "libexample_plugin.dylib"
         let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
         let task_plugin = Arc::clone(&plugin);
         let task_cancellation = cancellation.clone();
-        let started = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task_started = Arc::clone(&started);
         let task = std::thread::spawn(move || {
             task_plugin.invoke_service_with_bridge(
@@ -7416,14 +7923,20 @@ library = "libexample_plugin.dylib"
             },
             resource_permit: None,
         };
+        events_tx.send(b"queued".to_vec()).expect("queued event");
         response_tx
             .send(Ok(ServiceResponse::text("done")))
             .expect("response");
         assert!(matches!(
+            invocation.next_event().await.expect("queued event first"),
+            StreamingServiceInvocationEvent::Event(payload) if payload == b"queued"
+        ));
+        assert!(events_tx.send(b"after-response".to_vec()).is_err());
+        assert!(matches!(
             invocation.next_event().await.expect("final response"),
             StreamingServiceInvocationEvent::Response(Ok(_))
         ));
-        events_tx.send(b"late".to_vec()).expect("retained sender");
+        assert!(events_tx.send(b"late".to_vec()).is_err());
         assert!(invocation.try_recv_event().is_none());
         for _ in 0..2 {
             let mut next = Box::pin(invocation.next_event());
@@ -7437,6 +7950,137 @@ library = "libexample_plugin.dylib"
             .await;
         }
         drop(invocation);
+    }
+
+    #[test]
+    fn event_callback_panic_releases_execution_accounting() {
+        let mut vtable = test_large_vtable();
+        vtable.handle_event = |_, _, _| panic!("event callback failed");
+        let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: test_manifest("panicking-event"),
+            backend: LoadedPluginBackend::Static { vtable },
+        };
+        let metrics = PluginExecutorMetrics::default();
+        let invocation = PluginEventInvocation {
+            id: PluginInvocationId(1),
+            class: PluginInvocationClass::EventDelivery,
+            enqueued_at: Instant::now(),
+            topic: "test".into(),
+            payload: Vec::new(),
+            response: oneshot::channel().0,
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_plugin_event_invocation(&plugin, invocation, &metrics)
+        }));
+        drop(plugin);
+        assert!(outcome.is_err());
+        assert_eq!(metrics.running.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.completed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn running_invocation_accounting_survives_unwind() {
+        let metrics = PluginExecutorMetrics::default();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _running = RunningPluginInvocation::new(&metrics);
+            assert_eq!(metrics.running.load(Ordering::Relaxed), 1);
+            panic!("callback failure");
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(metrics.running.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.completed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_stream_observes_response_loss_without_an_event_wakeup() {
+        let (response_tx, response) = oneshot::channel();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let mut invocation = StreamingServiceInvocation {
+            response,
+            pending_response: None,
+            response_taken: false,
+            completed: false,
+            events,
+            cancel: PluginInvocationCancelHandle {
+                id: PluginInvocationId(1),
+                cancellation: cancellation.clone(),
+            },
+            resource_permit: None,
+        };
+        {
+            let mut next = Box::pin(invocation.next_event());
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(response_tx);
+            std::future::poll_fn(|cx| {
+                assert!(matches!(
+                    std::future::Future::poll(next.as_mut(), cx),
+                    std::task::Poll::Ready(Err(_))
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(cancellation.is_cancelled());
+        assert!(events_tx.send(b"late".to_vec()).is_err());
+        assert!(invocation.next_event().await.is_err());
+        drop(invocation);
+    }
+
+    #[tokio::test]
+    async fn lost_streaming_response_is_terminal_and_cancels_work() {
+        for retain_events in [false, true] {
+            let (response_tx, response) = oneshot::channel();
+            let (events_tx, events) = mpsc::unbounded_channel();
+            let events_tx = retain_events.then_some(events_tx);
+            let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+            let mut invocation = StreamingServiceInvocation {
+                response,
+                pending_response: None,
+                response_taken: false,
+                completed: false,
+                events,
+                cancel: PluginInvocationCancelHandle {
+                    id: PluginInvocationId(1),
+                    cancellation: cancellation.clone(),
+                },
+                resource_permit: None,
+            };
+            drop(response_tx);
+            if let Some(events_tx) = &events_tx {
+                events_tx.send(b"queued".to_vec()).unwrap();
+                assert!(matches!(
+                    invocation.next_event().await.unwrap(),
+                    StreamingServiceInvocationEvent::Event(payload) if payload == b"queued"
+                ));
+                assert!(cancellation.is_cancelled());
+                assert!(events_tx.send(b"late".to_vec()).is_err());
+            }
+            for _ in 0..2 {
+                let mut next = Box::pin(invocation.next_event());
+                std::future::poll_fn(|cx| {
+                    assert!(matches!(
+                        std::future::Future::poll(next.as_mut(), cx),
+                        std::task::Poll::Ready(Err(PluginLoadError::ServiceInvokeFailed { .. }))
+                    ));
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            }
+            assert!(cancellation.is_cancelled());
+            if let Some(events_tx) = events_tx {
+                assert!(events_tx.send(b"late".to_vec()).is_err());
+                assert!(invocation.try_recv_event().is_none());
+            }
+            drop(invocation);
+        }
     }
 
     #[tokio::test]
@@ -7763,7 +8407,7 @@ library = "libexample_plugin.dylib"
             let mut vtable = test_large_vtable();
             vtable.deactivate = deactivate;
             let (sender, receiver) = mpsc::channel(2);
-            spawn_exclusive_plugin_executor(
+            let worker = spawn_exclusive_plugin_executor(
                 LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest("abandoned-cleanup"),
@@ -7778,19 +8422,1151 @@ library = "libexample_plugin.dylib"
                 .send(PluginExecutorMessage::Deactivate(response))
                 .await
                 .expect("queue abandoned cleanup");
-            let (response, completion) = oneshot::channel();
-            sender
-                .send(PluginExecutorMessage::Deactivate(response))
+            worker
                 .await
-                .expect("queue cleanup acknowledgment");
-            completion
-                .await
-                .expect("executor responds")
-                .expect("cleanup succeeds");
+                .expect("executor exits after abandoned cleanup");
+            assert!(sender.is_closed());
             drop(sender);
         });
         drop(tokio);
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lost_deactivation_acknowledgment_is_stable_and_not_retried() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let executor = PluginExecutorHandle::new(
+            test_manifest("lost-cleanup"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let (response, receiver) = oneshot::channel();
+        drop(response);
+        executor.deactivation.lock().await.response = Some(receiver);
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.deactivate().await,
+                Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+            ));
+        }
+        drop(executor);
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn event_dispatcher_shutdown_joins_and_closes_admission() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let dispatcher = PluginEventDispatcher::new(
+            "event-shutdown".to_owned(),
+            Arc::new(PluginExecutorHandle::new(
+                test_manifest("event-shutdown"),
+                PluginConcurrency::Exclusive,
+                PluginExecutorKind::Exclusive(sender),
+                Arc::new(PluginExecutorMetrics::default()),
+            )),
+        );
+        dispatcher.start();
+        assert!(dispatcher.worker.lock().unwrap().is_some());
+        dispatcher.stop().await.unwrap();
+        dispatcher.stop().await.unwrap();
+        assert!(dispatcher.worker.lock().unwrap().is_none());
+        assert!(matches!(
+            dispatcher.try_send(QueuedPluginEvent {
+                topic: "late".to_owned(),
+                payload: vec![]
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        drop(dispatcher);
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unstarted_dispatcher_shutdown_releases_receiver_without_spawning() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let dispatcher = PluginEventDispatcher::new(
+            "unstarted".to_owned(),
+            Arc::new(PluginExecutorHandle::new(
+                test_manifest("unstarted"),
+                PluginConcurrency::Exclusive,
+                PluginExecutorKind::Exclusive(sender),
+                Arc::new(PluginExecutorMetrics::default()),
+            )),
+        );
+        assert!(dispatcher.receiver.lock().unwrap().is_some());
+        dispatcher.stop().await.unwrap();
+        dispatcher.stop().await.unwrap();
+        assert!(dispatcher.receiver.lock().unwrap().is_none());
+        assert!(dispatcher.sender.is_closed());
+        dispatcher.start();
+        assert!(dispatcher.worker.lock().unwrap().is_none());
+        assert!(matches!(
+            dispatcher.try_send(QueuedPluginEvent {
+                topic: "late".to_owned(),
+                payload: vec![],
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        drop(dispatcher);
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_worker_failure_is_stable_and_not_restarted() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let dispatcher = PluginEventDispatcher::new(
+            "event-failure".to_owned(),
+            Arc::new(PluginExecutorHandle::new(
+                test_manifest("event-failure"),
+                PluginConcurrency::Exclusive,
+                PluginExecutorKind::Exclusive(sender),
+                Arc::new(PluginExecutorMetrics::default()),
+            )),
+        );
+        dispatcher.start();
+        dispatcher.worker.lock().unwrap().as_ref().unwrap().abort();
+        for _ in 0..2 {
+            assert!(matches!(
+                dispatcher.stop().await,
+                Err(PluginLoadError::EventDispatcherCleanup { source, .. })
+                    if matches!(source.as_ref(), PluginLoadError::DeactivationOutcomeUnknown { .. })
+            ));
+        }
+        dispatcher.start();
+        assert!(dispatcher.worker.lock().unwrap().is_none());
+        assert!(matches!(
+            dispatcher.try_send(QueuedPluginEvent {
+                topic: "late".to_owned(),
+                payload: vec![],
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        drop(dispatcher);
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_dispatcher_prevents_unsafe_deactivation_but_not_other_cleanup() {
+        let runtime = PluginRuntimeHost::from(PluginHost {
+            configs: BTreeMap::new(),
+            command_registry: bcode_command::CommandRegistry::new(),
+            auth_provider_registry: AuthProviderRegistry::new(),
+            loaded: ["z-failed", "a-healthy"]
+                .into_iter()
+                .map(|id| LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest(id),
+                    backend: LoadedPluginBackend::Static {
+                        vtable: test_large_vtable(),
+                    },
+                })
+                .collect(),
+        });
+        runtime.event_dispatchers["z-failed"].start();
+        runtime.event_dispatchers["z-failed"]
+            .worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort();
+        for _ in 0..2 {
+            assert!(matches!(runtime.deactivate_all().await,
+                Err(PluginLoadError::EventDispatcherCleanup { plugin_id, .. }) if plugin_id == "z-failed"));
+        }
+        assert!(
+            !runtime.executors["z-failed"]
+                .deactivation
+                .lock()
+                .await
+                .completed
+        );
+        assert!(
+            runtime.executors["a-healthy"]
+                .deactivation
+                .lock()
+                .await
+                .completed
+        );
+        // This fixture dispatched no work; explicitly release its executor after
+        // verifying the host correctly refuses to infer that safety fact.
+        runtime.executors["z-failed"].deactivate().await.unwrap();
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn abandoned_dispatcher_shutdown_waits_for_admitted_event() {
+        for fail_first in [false, true] {
+            check_abandoned_dispatcher_drain(fail_first).await;
+        }
+    }
+
+    async fn check_abandoned_dispatcher_drain(fail_first: bool) {
+        let (sender, mut messages) = mpsc::channel(1);
+        let dispatcher = PluginEventDispatcher::new(
+            "event-drain".to_owned(),
+            Arc::new(PluginExecutorHandle::new(
+                test_manifest("event-drain"),
+                PluginConcurrency::Exclusive,
+                PluginExecutorKind::Exclusive(sender),
+                Arc::new(PluginExecutorMetrics::default()),
+            )),
+        );
+        dispatcher
+            .try_send(QueuedPluginEvent {
+                topic: "admitted".to_owned(),
+                payload: vec![42],
+            })
+            .unwrap();
+        let PluginExecutorMessage::Queued(message, count) = messages.recv().await.unwrap() else {
+            panic!("expected queued event");
+        };
+        let PluginExecutorMessage::Event(invocation) = *message else {
+            panic!("expected event");
+        };
+        assert_eq!(invocation.topic, "admitted");
+        assert_eq!(invocation.payload, vec![42]);
+        dispatcher
+            .try_send(QueuedPluginEvent {
+                topic: "queued".to_owned(),
+                payload: vec![43],
+            })
+            .unwrap();
+        {
+            let wait = dispatcher.stop();
+            tokio::pin!(wait);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(wait.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(dispatcher.worker.lock().unwrap().is_some());
+        assert!(matches!(
+            dispatcher.try_send(QueuedPluginEvent {
+                topic: "late".to_owned(),
+                payload: vec![],
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        invocation
+            .response
+            .send(if fail_first {
+                Err(PluginLoadError::PluginNotLoaded("event-drain".to_owned()))
+            } else {
+                Ok(())
+            })
+            .unwrap();
+        drop(count);
+        let PluginExecutorMessage::Queued(message, count) = messages.recv().await.unwrap() else {
+            panic!("expected queued event during shutdown");
+        };
+        let PluginExecutorMessage::Event(invocation) = *message else {
+            panic!("expected second event");
+        };
+        assert_eq!(invocation.topic, "queued");
+        assert_eq!(invocation.payload, vec![43]);
+        {
+            let wait = dispatcher.stop();
+            tokio::pin!(wait);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(wait.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        invocation.response.send(Ok(())).unwrap();
+        drop(count);
+        if fail_first {
+            for _ in 0..2 {
+                assert!(matches!(dispatcher.stop().await,
+                    Err(PluginLoadError::EventDispatcherCleanup { source, .. })
+                        if matches!(source.as_ref(), PluginLoadError::PluginNotLoaded(plugin_id) if plugin_id == "event-drain")));
+            }
+        } else {
+            dispatcher.stop().await.unwrap();
+            dispatcher.stop().await.unwrap();
+        }
+        assert!(dispatcher.worker.lock().unwrap().is_none());
+        drop(dispatcher);
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn limited_cleanup_wakes_queued_callers_before_active_work_finishes() {
+        check_limited_cleanup_wakes_queued_callers(false).await;
+        check_limited_cleanup_wakes_queued_callers(true).await;
+    }
+
+    async fn check_limited_cleanup_wakes_queued_callers(poll_cleanup: bool) {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let executor = PluginExecutorHandle::new(
+            test_manifest("limited-cleanup"),
+            PluginConcurrency::Limited(1),
+            PluginExecutorKind::Concurrent(
+                Arc::new(LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest("limited-cleanup"),
+                    backend: LoadedPluginBackend::Static {
+                        vtable: test_large_vtable(),
+                    },
+                }),
+                Some(Arc::clone(&semaphore)),
+            ),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let active = executor.admit_concurrent().await.unwrap();
+        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        {
+            let queued = executor.handle_event("queued".to_owned(), vec![]);
+            tokio::pin!(queued);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(queued.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if poll_cleanup {
+                let cleanup = executor.deactivate();
+                tokio::pin!(cleanup);
+                std::future::poll_fn(|context| {
+                    assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            } else {
+                drop(executor.deactivate());
+            }
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), queued)
+                    .await
+                    .unwrap(),
+                Err(PluginLoadError::PluginNotLoaded(_))
+            ));
+        }
+        assert!(semaphore.is_closed());
+        drop(permit);
+        drop(active);
+        executor.deactivate().await.unwrap();
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn closed_concurrent_admission_does_not_wait_for_lifecycle_writer() {
+        check_closed_concurrent_admission(false).await;
+        check_closed_concurrent_admission(true).await;
+    }
+
+    async fn check_closed_concurrent_admission(poll_cleanup: bool) {
+        let executor = PluginExecutorHandle::new(
+            test_manifest("closed-admission"),
+            PluginConcurrency::Concurrent,
+            PluginExecutorKind::Concurrent(
+                Arc::new(LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest("closed-admission"),
+                    backend: LoadedPluginBackend::Static {
+                        vtable: test_large_vtable(),
+                    },
+                }),
+                None,
+            ),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let writer = Arc::clone(&executor.lifecycle).write_owned().await;
+        {
+            let admission = executor.admit_concurrent();
+            tokio::pin!(admission);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(admission.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if poll_cleanup {
+                let cleanup = executor.deactivate();
+                tokio::pin!(cleanup);
+                std::future::poll_fn(|context| {
+                    assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            } else {
+                drop(executor.deactivate());
+            }
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    std::future::Future::poll(admission.as_mut(), context),
+                    std::task::Poll::Ready(Err(PluginLoadError::PluginNotLoaded(_)))
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        {
+            let admission = executor.admit_concurrent();
+            tokio::pin!(admission);
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    std::future::Future::poll(admission.as_mut(), context),
+                    std::task::Poll::Ready(Err(PluginLoadError::PluginNotLoaded(_)))
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(writer);
+        executor.deactivate().await.unwrap();
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cleanup_waits_for_abandoned_event_callback() {
+        for limited in [false, true] {
+            check_cleanup_waits_for_abandoned_event(limited).await;
+        }
+    }
+
+    async fn check_cleanup_waits_for_abandoned_event(limited: bool) {
+        static RELEASE: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(None);
+        static ENTERED: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+        static CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+        fn event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
+            ENTERED.lock().unwrap().take().unwrap().send(()).unwrap();
+            let receiver = RELEASE.lock().unwrap().take().unwrap();
+            i32::from(receiver.recv_timeout(Duration::from_secs(5)).is_err())
+        }
+        let (release, receiver) = std::sync::mpsc::channel();
+        let (entered, started) = oneshot::channel();
+        *RELEASE.lock().unwrap() = Some(receiver);
+        *ENTERED.lock().unwrap() = Some(entered);
+        CLEANUPS.store(0, Ordering::SeqCst);
+        let mut vtable = test_large_vtable();
+        vtable.handle_event = event;
+        vtable.deactivate = |_| {
+            CLEANUPS.fetch_add(1, Ordering::SeqCst);
+            0
+        };
+        let executor = PluginExecutorHandle::new(
+            test_manifest("abandoned-event"),
+            if limited {
+                PluginConcurrency::Limited(1)
+            } else {
+                PluginConcurrency::Concurrent
+            },
+            PluginExecutorKind::Concurrent(
+                Arc::new(LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest("abandoned-event"),
+                    backend: LoadedPluginBackend::Static { vtable },
+                }),
+                limited.then(|| Arc::new(Semaphore::new(1))),
+            ),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        {
+            let event = executor.handle_event("blocked".to_owned(), vec![]);
+            tokio::pin!(event);
+            tokio::select! {
+                result = &mut event => panic!("callback returned early: {result:?}"),
+                result = started => result.unwrap(),
+            }
+        }
+        {
+            let cleanup = executor.deactivate();
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 0);
+        assert!(executor.admit_concurrent().await.is_err());
+        release.send(()).unwrap();
+        executor.deactivate().await.unwrap();
+        executor.deactivate().await.unwrap();
+        assert!(executor.admit_concurrent().await.is_err());
+        drop(executor);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_closes_admission_before_waiting_for_cleanup_ownership() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let executor = PluginExecutorHandle::new(
+            test_manifest("cleanup-ownership"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let ownership = executor.deactivation.lock().await;
+        {
+            let cleanup = executor.deactivate();
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(executor.closing.load(Ordering::Acquire));
+        assert!(matches!(
+            executor.handle_event("closed".to_owned(), vec![]).await,
+            Err(PluginLoadError::PluginNotLoaded(_))
+        ));
+        assert!(messages.try_recv().is_err());
+        drop(ownership);
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn exclusive_cleanup_closes_admission_before_queue_space_is_available() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let (response, _receiver) = oneshot::channel();
+        sender
+            .send(PluginExecutorMessage::Deactivate(response))
+            .await
+            .unwrap();
+        let executor = PluginExecutorHandle::new(
+            test_manifest("full-cleanup-queue"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        {
+            let waiting = executor.handle_event("waiting".to_owned(), vec![]);
+            let second = executor.handle_event("second".to_owned(), vec![]);
+            tokio::pin!(waiting, second);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(waiting.as_mut(), context).is_pending());
+                assert!(std::future::Future::poll(second.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            {
+                let cleanup = executor.deactivate();
+                tokio::pin!(cleanup);
+                std::future::poll_fn(|context| {
+                    assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            }
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    std::future::Future::poll(waiting.as_mut(), context),
+                    std::task::Poll::Ready(Err(PluginLoadError::PluginNotLoaded(_)))
+                ));
+                assert!(matches!(
+                    std::future::Future::poll(second.as_mut(), context),
+                    std::task::Poll::Ready(Err(PluginLoadError::PluginNotLoaded(_)))
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(messages.try_recv().is_ok());
+        }
+        {
+            let event = executor.handle_event("closed".to_owned(), vec![]);
+            tokio::pin!(event);
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    std::future::Future::poll(event.as_mut(), context),
+                    std::task::Poll::Ready(Err(PluginLoadError::PluginNotLoaded(_)))
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(messages.try_recv().is_err());
+        {
+            let cleanup = executor.deactivate();
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let PluginExecutorMessage::Deactivate(response) = messages.try_recv().unwrap() else {
+                panic!("only cleanup may enter after admission closes");
+            };
+            response.send(Ok(())).unwrap();
+            cleanup.await.unwrap();
+        }
+        executor.deactivate().await.unwrap();
+        assert!(messages.try_recv().is_err());
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn unpolled_executor_cleanup_closes_admission_without_dispatch() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let executor = PluginExecutorHandle::new(
+            test_manifest("unpolled-executor"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        drop(executor.deactivate());
+        assert!(matches!(
+            executor.handle_event("closed".to_owned(), vec![]).await,
+            Err(PluginLoadError::PluginNotLoaded(_))
+        ));
+        assert!(messages.try_recv().is_err());
+        {
+            let cleanup = executor.deactivate();
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let PluginExecutorMessage::Deactivate(response) = messages.try_recv().unwrap() else {
+                panic!("cleanup request expected");
+            };
+            response.send(Ok(())).unwrap();
+            cleanup.await.unwrap();
+        }
+        executor.deactivate().await.unwrap();
+        assert!(messages.try_recv().is_err());
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn unpolled_executor_cleanup_wakes_backpressured_admission() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let capacity = sender.clone().reserve_owned().await.unwrap();
+        let executor = PluginExecutorHandle::new(
+            test_manifest("backpressured-cleanup"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        {
+            let event = executor.handle_event("blocked".to_owned(), vec![]);
+            tokio::pin!(event);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(event.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(executor.deactivate());
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), event)
+                    .await
+                    .unwrap(),
+                Err(PluginLoadError::PluginNotLoaded(_))
+            ));
+        }
+        assert!(messages.try_recv().is_err());
+        drop(capacity);
+        {
+            let cleanup = executor.deactivate();
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let PluginExecutorMessage::Deactivate(response) = messages.try_recv().unwrap() else {
+                panic!("cleanup request expected");
+            };
+            response.send(Ok(())).unwrap();
+            cleanup.await.unwrap();
+        }
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn lost_cleanup_acknowledgment_is_not_redispatched() {
+        for abandon in [false, true] {
+            check_lost_cleanup_acknowledgment(abandon).await;
+        }
+    }
+
+    async fn check_lost_cleanup_acknowledgment(abandon: bool) {
+        let (sender, mut messages) = mpsc::channel(1);
+        let executor = PluginExecutorHandle::new(
+            test_manifest("lost-acknowledgment"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        {
+            let cleanup = executor.deactivate();
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(cleanup.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let PluginExecutorMessage::Deactivate(response) = messages.try_recv().unwrap() else {
+                panic!("cleanup request expected");
+            };
+            drop(response);
+            if !abandon {
+                assert!(matches!(
+                    cleanup.await,
+                    Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+                ));
+            }
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.deactivate().await,
+                Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+            ));
+        }
+        assert!(executor.deactivation.lock().await.response.is_none());
+        assert!(matches!(
+            executor.deactivate().await,
+            Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+        ));
+        assert!(messages.try_recv().is_err());
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn missing_exclusive_worker_has_stable_unknown_cleanup_outcome() {
+        let (sender, messages) = mpsc::channel(1);
+        drop(messages);
+        let executor = PluginExecutorHandle::new(
+            test_manifest("missing-worker"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        for _ in 0..2 {
+            assert!(matches!(executor.deactivate().await,
+                Err(PluginLoadError::DeactivationOutcomeUnknown { plugin_id }) if plugin_id == "missing-worker"));
+        }
+        assert!(executor.deactivation.lock().await.outcome_unknown);
+        assert!(matches!(
+            executor.handle_event("closed".to_owned(), vec![]).await,
+            Err(PluginLoadError::PluginNotLoaded(_))
+        ));
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn abandoned_worker_join_retains_ownership_until_retry() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let mut executor = PluginExecutorHandle::new(
+            test_manifest("worker-wait"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let (release, released) = oneshot::channel();
+        *executor.worker.get_mut() = Some(tokio::spawn(async move {
+            released.await.unwrap();
+        }));
+        executor.deactivation.get_mut().completed = true;
+        {
+            let wait = executor.deactivate();
+            tokio::pin!(wait);
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(wait.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(executor.worker.lock().await.is_some());
+        release.send(()).unwrap();
+        executor.deactivate().await.unwrap();
+        executor.deactivate().await.unwrap();
+        assert!(executor.worker.lock().await.is_none());
+        drop(executor);
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_cleanup_does_not_wait_for_worker_handle_lock() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let mut executor = PluginExecutorHandle::new(
+            test_manifest("contended-worker"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        executor.deactivation.get_mut().outcome_unknown = true;
+        let (release, released) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            released.await.unwrap();
+        });
+        *executor.worker.get_mut() = Some(task);
+        let worker = executor.worker.lock().await;
+        {
+            let cleanup = executor.deactivate();
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    std::future::Future::poll(cleanup.as_mut(), context),
+                    std::task::Poll::Ready(Err(PluginLoadError::DeactivationOutcomeUnknown { .. }))
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(messages.try_recv().is_err());
+        assert!(!worker.as_ref().unwrap().is_finished());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !worker.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released worker terminates");
+        assert!(matches!(
+            executor.deactivate().await,
+            Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+        ));
+        assert!(worker.as_ref().unwrap().is_finished());
+        drop(worker);
+        assert!(matches!(
+            executor.deactivate().await,
+            Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+        ));
+        assert!(executor.worker.lock().await.is_none());
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn unknown_cleanup_retains_worker_until_termination_is_observed() {
+        for fails in [false, true] {
+            check_unknown_cleanup_worker_termination(fails).await;
+        }
+    }
+
+    async fn check_unknown_cleanup_worker_termination(fails: bool) {
+        let (sender, mut messages) = mpsc::channel(1);
+        let mut executor = PluginExecutorHandle::new(
+            test_manifest("unknown-worker"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let (release, released) = oneshot::channel();
+        *executor.worker.get_mut() = Some(tokio::spawn(async move {
+            released.await.unwrap();
+            assert!(!fails, "worker failed after unknown cleanup");
+        }));
+        executor.deactivation.get_mut().outcome_unknown = true;
+        assert!(matches!(
+            executor.deactivate().await,
+            Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+        ));
+        assert!(executor.worker.lock().await.is_some());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !executor.worker.lock().await.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released worker terminates");
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.deactivate().await,
+                Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+            ));
+        }
+        assert!(executor.worker.lock().await.is_none());
+        assert!(messages.try_recv().is_err());
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn failed_worker_join_is_stable_and_releases_completed_handle() {
+        let (sender, mut messages) = mpsc::channel(1);
+        let mut executor = PluginExecutorHandle::new(
+            test_manifest("worker-failure"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        *executor.worker.get_mut() = Some(tokio::spawn(async { panic!("worker failed") }));
+        executor.deactivation.get_mut().completed = true;
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.deactivate().await,
+                Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+            ));
+        }
+        assert!(executor.worker.lock().await.is_none());
+        drop(executor);
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_deactivation_join_is_stable_and_not_retried() {
+        let plugin = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: test_manifest("lost-join"),
+            backend: LoadedPluginBackend::Static {
+                vtable: test_large_vtable(),
+            },
+        };
+        let executor = PluginExecutorHandle::new(
+            plugin.manifest.clone(),
+            PluginConcurrency::Concurrent,
+            PluginExecutorKind::Concurrent(Arc::new(plugin), None),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        executor.deactivation.lock().await.task =
+            Some(tokio::spawn(async { panic!("lost cleanup task") }));
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.deactivate().await,
+                Err(PluginLoadError::DeactivationOutcomeUnknown { .. })
+            ));
+        }
+        assert!(executor.deactivation.lock().await.task.is_none());
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn unknown_cleanup_outcome_does_not_block_other_plugins() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        CALLS.store(0, Ordering::SeqCst);
+        let mut vtable = test_large_vtable();
+        vtable.deactivate = deactivate;
+        let runtime = PluginRuntimeHost::from(PluginHost {
+            configs: BTreeMap::new(),
+            command_registry: bcode_command::CommandRegistry::new(),
+            auth_provider_registry: AuthProviderRegistry::new(),
+            loaded: ["a-healthy", "z-unknown"]
+                .into_iter()
+                .map(|id| LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest(id),
+                    backend: LoadedPluginBackend::Static { vtable },
+                })
+                .collect(),
+        });
+        runtime
+            .executors
+            .get("z-unknown")
+            .unwrap()
+            .deactivation
+            .lock()
+            .await
+            .outcome_unknown = true;
+        for _ in 0..2 {
+            assert!(
+                matches!(runtime.deactivate_all().await, Err(PluginLoadError::DeactivationOutcomeUnknown { plugin_id }) if plugin_id == "z-unknown")
+            );
+            assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        }
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn unpolled_host_cleanup_closes_event_admission() {
+        for timed in [false, true] {
+            check_unpolled_host_cleanup(timed).await;
+        }
+    }
+
+    async fn check_unpolled_host_cleanup(timed: bool) {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let mut vtable = test_large_vtable();
+        vtable.deactivate = |_| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        };
+        let runtime = PluginRuntimeHost::from(PluginHost {
+            configs: BTreeMap::new(),
+            command_registry: bcode_command::CommandRegistry::new(),
+            auth_provider_registry: AuthProviderRegistry::new(),
+            loaded: vec![LoadedPlugin {
+                config: ResolvedPluginConfig::default(),
+                manifest: test_manifest("unpolled-cleanup"),
+                backend: LoadedPluginBackend::Static { vtable },
+            }],
+        });
+        assert!(!runtime.event_dispatchers.is_empty());
+        let clone = runtime.clone();
+        if timed {
+            drop(runtime.deactivate_all_with_timeout(Duration::from_secs(1)));
+        } else {
+            drop(runtime.deactivate_all());
+        }
+        for dispatcher in clone.event_dispatchers.values() {
+            assert!(*dispatcher.shutdown.borrow());
+            assert!(
+                dispatcher
+                    .try_send(QueuedPluginEvent {
+                        topic: "after-close".into(),
+                        payload: vec![],
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+        clone.deactivate_all().await.unwrap();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        drop(clone);
+        runtime.deactivate_all().await.unwrap();
+        drop(runtime);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_deactivation_remains_retryable_until_success() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+            i32::from(CALLS.fetch_add(1, Ordering::SeqCst) == 0)
+        }
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio.block_on(async {
+            for concurrency in [
+                PluginConcurrencyConfig::Concurrent,
+                PluginConcurrencyConfig::Exclusive,
+                PluginConcurrencyConfig::Limited { max: 1 },
+            ] {
+                CALLS.store(0, Ordering::SeqCst);
+                let mut vtable = test_large_vtable();
+                vtable.deactivate = deactivate;
+                let mut manifest = test_manifest("deactivation-failure-retry");
+                manifest.concurrency = concurrency;
+                let runtime = PluginRuntimeHost::from(PluginHost {
+                    configs: BTreeMap::new(),
+                    command_registry: bcode_command::CommandRegistry::new(),
+                    auth_provider_registry: AuthProviderRegistry::new(),
+                    loaded: vec![LoadedPlugin {
+                        config: ResolvedPluginConfig::default(),
+                        manifest,
+                        backend: LoadedPluginBackend::Static { vtable },
+                    }],
+                });
+                assert!(matches!(
+                    runtime.deactivate_all().await,
+                    Err(PluginLoadError::LifecycleFailed {
+                        hook: "deactivate",
+                        ..
+                    })
+                ));
+                assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+                runtime.deactivate_all().await.unwrap();
+                runtime.deactivate_all().await.unwrap();
+                drop(runtime);
+                assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn deactivation_retry_reuses_abandoned_work() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+            std::sync::Mutex::new(None);
+        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            let receiver = RELEASE.lock().unwrap().take();
+            receiver.map_or(0, |receiver| {
+                i32::from(receiver.recv_timeout(Duration::from_secs(5)).is_err())
+            })
+        }
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio.block_on(async {
+            for concurrency in [
+                PluginConcurrencyConfig::Concurrent,
+                PluginConcurrencyConfig::Exclusive,
+                PluginConcurrencyConfig::Limited { max: 1 },
+            ] {
+                let (release, receiver) = std::sync::mpsc::channel();
+                *RELEASE.lock().unwrap() = Some(receiver);
+                CALLS.store(0, Ordering::SeqCst);
+                let mut vtable = test_large_vtable();
+                vtable.deactivate = deactivate;
+                let mut manifest = test_manifest("deactivation-retry");
+                manifest.concurrency = concurrency.clone();
+                let runtime = PluginRuntimeHost::from(PluginHost {
+                    configs: BTreeMap::new(),
+                    command_registry: bcode_command::CommandRegistry::new(),
+                    auth_provider_registry: AuthProviderRegistry::new(),
+                    loaded: vec![
+                        LoadedPlugin {
+                            config: ResolvedPluginConfig::default(),
+                            manifest,
+                            backend: LoadedPluginBackend::Static { vtable },
+                        },
+                        LoadedPlugin {
+                            config: ResolvedPluginConfig::default(),
+                            manifest: test_manifest("a-later-cleanup"),
+                            backend: LoadedPluginBackend::Static {
+                                vtable: test_large_vtable(),
+                            },
+                        },
+                    ],
+                });
+                let mut wait = Box::pin(runtime.deactivate_all());
+                tokio::select! {
+                    result = &mut wait => panic!("cleanup completed before release: {result:?}"),
+                    () = async {
+                        while CALLS.load(Ordering::SeqCst) == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    } => {}
+                }
+                assert!(matches!(
+                    runtime.event_dispatchers["a-later-cleanup"].try_send(QueuedPluginEvent {
+                        topic: "late".to_owned(),
+                        payload: vec![],
+                    }),
+                    Err(mpsc::error::TrySendError::Closed(_))
+                ));
+                // A second caller's budget includes waiting for the cleanup lock.
+                assert!(matches!(
+                    runtime
+                        .deactivate_all_with_timeout(Duration::from_millis(1))
+                        .await,
+                    Err(PluginLoadError::DeactivationTimeout)
+                ));
+                assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+                // Dropping the pinned reference alone would not abandon the underlying future.
+                drop(wait);
+                assert!(matches!(
+                    runtime
+                        .deactivate_all_with_timeout(Duration::from_millis(1))
+                        .await,
+                    Err(PluginLoadError::DeactivationTimeout)
+                ));
+                assert_eq!(
+                    runtime.executors["deactivation-retry"]
+                        .worker
+                        .lock()
+                        .await
+                        .is_some(),
+                    matches!(concurrency, PluginConcurrencyConfig::Exclusive),
+                );
+                release.send(()).unwrap();
+                runtime.deactivate_all().await.unwrap();
+                assert!(
+                    runtime.executors["deactivation-retry"]
+                        .worker
+                        .lock()
+                        .await
+                        .is_none()
+                );
+                runtime.deactivate_all().await.unwrap();
+                drop(runtime);
+                assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+            }
+        });
     }
 
     #[test]
@@ -7832,15 +9608,18 @@ library = "libexample_plugin.dylib"
 
     #[test]
     fn runtime_deactivation_attempts_every_plugin_after_errors() {
+        use std::sync::atomic::AtomicBool;
+
         static CALLS: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+        static FAIL: AtomicBool = AtomicBool::new(true);
 
         fn first(_: *const std::ffi::c_void) -> i32 {
             CALLS.lock().expect("calls lock").push("z");
-            17
+            i32::from(FAIL.load(Ordering::SeqCst)) * 17
         }
         fn second(_: *const std::ffi::c_void) -> i32 {
             CALLS.lock().expect("calls lock").push("m");
-            23
+            i32::from(FAIL.load(Ordering::SeqCst)) * 23
         }
         fn last(_: *const std::ffi::c_void) -> i32 {
             CALLS.lock().expect("calls lock").push("a");
@@ -7855,8 +9634,10 @@ library = "libexample_plugin.dylib"
             for concurrency in [
                 PluginConcurrencyConfig::Concurrent,
                 PluginConcurrencyConfig::Exclusive,
+                PluginConcurrencyConfig::Limited { max: 1 },
             ] {
                 CALLS.lock().expect("calls lock").clear();
+                FAIL.store(true, Ordering::SeqCst);
                 let mut loaded = Vec::new();
                 for (id, deactivate) in [
                     ("a", last as fn(*const std::ffi::c_void) -> i32),
@@ -7889,7 +9670,39 @@ library = "libexample_plugin.dylib"
                     }) if plugin_id == "z"
                 ));
                 assert_eq!(*CALLS.lock().expect("calls lock"), ["z", "m", "a"]);
+                let retry = runtime.deactivate_all().await;
+                assert!(matches!(
+                    retry,
+                    Err(PluginLoadError::LifecycleFailed {
+                        plugin_id,
+                        hook: "deactivate",
+                        code: 17,
+                    }) if plugin_id == "z"
+                ));
+                assert_eq!(
+                    *CALLS.lock().expect("calls lock"),
+                    ["z", "m", "a", "z", "m"]
+                );
+                FAIL.store(false, Ordering::SeqCst);
+                runtime.deactivate_all().await.unwrap();
+                runtime.deactivate_all().await.unwrap();
+                for dispatcher in runtime.event_dispatchers.values() {
+                    assert!(dispatcher.worker.lock().unwrap().is_none());
+                }
+                for executor in runtime.executors.values() {
+                    assert!(executor.worker.lock().await.is_none());
+                    let cleanup = executor.deactivation.lock().await;
+                    assert!(cleanup.completed);
+                    assert!(!cleanup.outcome_unknown);
+                    assert!(cleanup.task.is_none());
+                    assert!(cleanup.response.is_none());
+                    drop(cleanup);
+                }
                 drop(runtime);
+                assert_eq!(
+                    *CALLS.lock().expect("calls lock"),
+                    ["z", "m", "a", "z", "m", "z", "m"]
+                );
             }
         });
     }
