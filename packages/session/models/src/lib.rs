@@ -2656,6 +2656,9 @@ pub enum SessionLiveEventKind {
     ToolContributionPlaced { envelope: ToolContributionEnvelope },
     /// Invocation-owned current presentation replacement published only to attached clients.
     ToolPresentationUpdated { update: ToolPresentationUpdate },
+    /// Session-owner accounting projection after a canonical usage commit.
+    /// Checkpointed replacement; missed delivery is recovered by bounded attach, not replay.
+    UsageSummaryChanged { summary: Box<SessionUsageSummary> },
     /// Authoritative current context occupancy after a durable projection update.
     RequestContextOccupancyChanged {
         /// Current occupancy, or `None` when a model/compaction boundary cleared it.
@@ -3182,6 +3185,11 @@ pub struct SessionTokenUsage {
 /// Compact canonical accounting state derived from all model-usage events in a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsageSummary {
+    /// Canonical boundary represented by this snapshot, supplied by the session owner.
+    ///
+    /// This is a projection checkpoint, not a durable transport resume token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_sequence: Option<u64>,
     /// Cumulative metered tokens across the latest canonical observation for every request.
     #[serde(default)]
     pub cumulative_metered_tokens: u64,
@@ -3230,6 +3238,11 @@ impl SessionTokenUsage {
             }
             _ => {}
         }
+        if let Some(request) = &self.request
+            && self.request_id.as_deref() != Some(request.request_id.as_str())
+        {
+            return Err("usage request identity does not match its attribution".to_owned());
+        }
         if let Some(SessionCostEstimate::Estimated {
             total_micros,
             components,
@@ -3259,12 +3272,22 @@ impl SessionTokenUsage {
         })
     }
 
-    /// Return uncached input tokens when both input and cached counts are known.
+    /// Return ordinary input after removing cache-read and cache-write subsets.
     #[must_use]
     pub const fn uncached_input_tokens(&self) -> Option<u32> {
-        match (self.input_tokens, self.cached_input_tokens) {
-            (Some(input), Some(cached)) => Some(input.saturating_sub(cached)),
-            _ => self.input_tokens,
+        match self.input_tokens {
+            Some(input) => Some(
+                input
+                    .saturating_sub(match self.cached_input_tokens {
+                        Some(tokens) => tokens,
+                        None => 0,
+                    })
+                    .saturating_sub(match self.cache_write_input_tokens {
+                        Some(tokens) => tokens,
+                        None => 0,
+                    }),
+            ),
+            None => None,
         }
     }
 }

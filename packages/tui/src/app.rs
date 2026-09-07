@@ -3270,6 +3270,11 @@ impl BmuxApp {
                 );
                 self.viewport.preserve_for_append();
             }
+            SessionLiveEventKind::UsageSummaryChanged { .. } => {
+                if let Some(usage) = &self.session_view.snapshot().runtime.latest_usage {
+                    self.token_usage.absorb(usage);
+                }
+            }
             SessionLiveEventKind::ToolContributionPlaced { .. }
             | SessionLiveEventKind::ToolPresentationUpdated { .. }
             | SessionLiveEventKind::RequestContextOccupancyChanged { .. }
@@ -4659,7 +4664,9 @@ impl TokenUsageMeter {
                 ));
             }
         }
-        if cost.unavailable_usage_count > 0 {
+        if cost.unavailable_usage_count > 0
+            || cost.observed_usage_count > cost.estimated_usage_count
+        {
             parts.push(if cost.estimated_usage_count > 0 {
                 "cost partial".to_string()
             } else {

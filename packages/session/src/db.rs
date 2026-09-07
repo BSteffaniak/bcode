@@ -2293,21 +2293,9 @@ impl SessionDb {
                 expected,
             });
         }
-        let row = self
-            .db
-            .select("session_usage_projection")
-            .columns(&["summary_json"])
-            .where_eq("projection_id", DatabaseValue::Int32(1))
-            .execute_first(&**self.db)
-            .await?;
-        let Some(row) = row else {
-            return Ok(SessionUsageSummary::default());
-        };
-        serde_json::from_str(&required_string(&row, "summary_json")?).map_err(|_| {
-            SessionDbError::InvalidRow {
-                column: "session_usage_projection.summary_json".to_owned(),
-            }
-        })
+        let mut summary = read_session_usage_summary(&**self.db).await?;
+        summary.through_sequence = Some(expected);
+        Ok(summary)
     }
 
     /// Return input history from the indexed projection table.
@@ -4727,89 +4715,67 @@ async fn project_session_usage(
         .where_eq("request_key", request_key.clone())
         .execute_first(db)
         .await?;
-    let accepted = existing
+    let current = existing
         .as_ref()
         .map(|row| {
-            let current: SessionTokenUsage =
-                serde_json::from_str(&required_string(row, "usage_json")?).map_err(|_| {
-                    SessionDbError::InvalidRow {
-                        column: "session_usage_requests.usage_json".to_owned(),
-                    }
-                })?;
-            Ok::<_, SessionDbError>(
-                !current.terminal
-                    && (usage.observation_ordinal > current.observation_ordinal
-                        || (usage.observation_ordinal == current.observation_ordinal
-                            && usage == &current)),
+            serde_json::from_str::<SessionTokenUsage>(&required_string(row, "usage_json")?).map_err(
+                |_| SessionDbError::InvalidRow {
+                    column: "session_usage_requests.usage_json".to_owned(),
+                },
             )
         })
-        .transpose()?
-        .unwrap_or(true);
-    if accepted {
-        db.upsert("session_usage_requests")
-            .unique(&["request_key"])
-            .value("request_key", request_key)
-            .value(
-                "usage_json",
-                serde_json::to_string(usage).expect("session usage serializes"),
-            )
-            .value("event_seq", seq_to_value(event.sequence))
-            .execute(db)
-            .await?;
+        .transpose()?;
+    let accounting_error = |message: String| SessionDbError::InvalidRow {
+        column: format!("session_usage: {message}"),
+    };
+    if !crate::usage::accepts(current.as_ref(), usage).map_err(accounting_error)? {
+        return Ok(());
     }
-    rebuild_session_usage_summary(db).await
-}
-
-async fn rebuild_session_usage_summary(db: &dyn Database) -> SessionDbResult<()> {
-    let rows = db
-        .select("session_usage_requests")
-        .columns(&["usage_json", "event_seq"])
+    let mut summary = read_session_usage_summary(db).await?;
+    crate::usage::replace(&mut summary, current.as_ref(), usage).map_err(accounting_error)?;
+    db.upsert("session_usage_requests")
+        .unique(&["request_key"])
+        .value("request_key", request_key)
+        .value("usage_json", serde_json::to_string(usage)?)
+        .value("event_seq", seq_to_value(event.sequence))
         .execute(db)
         .await?;
-    let mut summary = SessionUsageSummary::default();
-    let mut latest_sequence = None;
-    for row in rows {
-        let usage: SessionTokenUsage = serde_json::from_str(&required_string(&row, "usage_json")?)
-            .map_err(|_| SessionDbError::InvalidRow {
-                column: "session_usage_requests.usage_json".to_owned(),
-            })?;
-        summary.observed_usage_count = summary.observed_usage_count.saturating_add(1);
-        if let Some(tokens) = usage.metered_total_tokens() {
-            summary.cumulative_metered_tokens = summary
-                .cumulative_metered_tokens
-                .saturating_add(u64::from(tokens));
-        }
-        match &usage.cost {
-            Some(bcode_session_models::SessionCostEstimate::Estimated {
-                currency,
-                total_micros,
-                ..
-            }) => {
-                let total = summary.totals_micros.entry(currency.clone()).or_default();
-                *total = total.saturating_add(*total_micros);
-                summary.estimated_usage_count = summary.estimated_usage_count.saturating_add(1);
-            }
-            Some(bcode_session_models::SessionCostEstimate::Unavailable { .. }) => {
-                summary.unavailable_usage_count = summary.unavailable_usage_count.saturating_add(1);
-            }
-            None => {}
-        }
-        let sequence = required_i64(&row, "event_seq").map(i64_to_u64)?;
-        if latest_sequence.is_none_or(|latest| sequence > latest) {
-            latest_sequence = Some(sequence);
-            summary.latest_usage = Some(usage);
-        }
-    }
     db.upsert("session_usage_projection")
         .unique(&["projection_id"])
         .value("projection_id", DatabaseValue::Int32(1))
-        .value(
-            "summary_json",
-            serde_json::to_string(&summary).expect("session usage summary serializes"),
-        )
+        .value("summary_json", serde_json::to_string(&summary)?)
         .execute(db)
         .await?;
     Ok(())
+}
+
+async fn read_session_usage_summary(db: &dyn Database) -> SessionDbResult<SessionUsageSummary> {
+    let row = db
+        .select("session_usage_projection")
+        .columns(&["summary_json"])
+        .where_eq("projection_id", DatabaseValue::Int32(1))
+        .execute_first(db)
+        .await?;
+    let Some(row) = row else {
+        if db
+            .select("session_usage_requests")
+            .columns(&["request_key"])
+            .limit(1)
+            .execute_first(db)
+            .await?
+            .is_some()
+        {
+            return Err(SessionDbError::InvalidRow {
+                column: "missing session_usage_projection for existing requests".to_owned(),
+            });
+        }
+        return Ok(SessionUsageSummary::default());
+    };
+    serde_json::from_str(&required_string(&row, "summary_json")?).map_err(|_| {
+        SessionDbError::InvalidRow {
+            column: "session_usage_projection.summary_json".to_owned(),
+        }
+    })
 }
 
 async fn update_session_state(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
@@ -8296,6 +8262,78 @@ mod tests {
             writer.last_event_sequence().await.expect("canonical tail"),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn session_usage_rejects_conflicts_atomically_and_missing_projection() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .unwrap();
+        let pending = SessionTokenUsage {
+            request_id: Some("attempt".into()),
+            observation_id: Some("attempt:pending".into()),
+            cost: Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                reason: bcode_session_models::SessionCostUnavailableReason::ProviderUsageIncomplete,
+            }),
+            ..Default::default()
+        };
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .unwrap();
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn".into(),
+                usage: pending.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+        let mut conflict = pending.clone();
+        conflict.input_tokens = Some(100);
+        assert!(
+            db.append_event(&event(
+                session_id,
+                2,
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn".into(),
+                    usage: conflict
+                }
+            ))
+            .await
+            .is_err()
+        );
+        assert_eq!(db.last_event_sequence().await.unwrap(), Some(1));
+        db.append_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn".into(),
+                usage: pending,
+            },
+        ))
+        .await
+        .unwrap();
+        let summary = db.session_usage_summary().await.unwrap();
+        assert_eq!(summary.through_sequence, Some(2));
+        assert_eq!(summary.observed_usage_count, 1);
+        assert_eq!(summary.unavailable_usage_count, 1);
+        db.database()
+            .delete("session_usage_projection")
+            .execute(db.database())
+            .await
+            .unwrap();
+        assert!(db.session_usage_summary().await.is_err());
     }
 
     #[tokio::test]

@@ -1028,8 +1028,10 @@ pub async fn collect_compaction_summary_once(
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     let turn_id = format!(
-        "{session_id}-compact-{}",
-        transcript.compacted_through_sequence
+        // Logical compaction boundaries may be retried: each dispatch needs its own identity.
+        "{session_id}-compact-{}-{}",
+        transcript.compacted_through_sequence,
+        uuid::Uuid::new_v4()
     );
     let target = Box::pin(resolve_model_request_target(
         state,
@@ -1043,14 +1045,57 @@ pub async fn collect_compaction_summary_once(
     .map_err(|error| CompactionError::Provider(error.to_string()))?;
     let request = build_compaction_request(
         session_id,
-        target.model_id,
-        target.provider_context,
+        target.model_id.clone(),
+        target.provider_context.clone(),
         prompt_text,
         turn_id.clone(),
     );
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
+
+    let attempt = ModelRequestAttempt {
+        identity: bcode_session_models::ModelRequestIdentity {
+            provider_plugin_id: selection
+                .provider_plugin_id
+                .clone()
+                .unwrap_or_else(|| "<auto>".to_owned()),
+            requested_model_id: selection.model_id.clone(),
+            effective_model_id: request.model_id.clone(),
+            request_id: turn_id.clone(),
+            model_turn_id: turn_id.clone(),
+            round: 0,
+            request_fingerprint: stable_json_hash(&request),
+            effective_auth_profile: request.provider_context.auth_profile.clone(),
+            context_format_version: None,
+            compatibility_key: None,
+            context_epoch: 0,
+        },
+        provider_turn_id: String::new(),
+        pricing: target.pricing,
+        catalog_provider_id: target.catalog_provider_id,
+        catalog_entry_id: target
+            .catalog_identity
+            .as_ref()
+            .map(|identity| identity.catalog_entry_id.clone()),
+        catalog_family: target
+            .catalog_identity
+            .as_ref()
+            .and_then(|identity| identity.family.clone()),
+        catalog_api_surface: target
+            .catalog_identity
+            .as_ref()
+            .and_then(|identity| identity.api_surface),
+        reuse_key: None,
+        request_message_count: request.messages.len(),
+        context_through_sequence: transcript.compacted_through_sequence,
+        portable_context: String::new(),
+        local_estimate: local_request_estimate(&request),
+        managed_compaction_persisted: false,
+    };
+    record_pending_request_usage(state, session_id, &attempt)
+        .await
+        .map_err(CompactionError::Provider)?;
 
     // Prefer push delivery when the provider serves the streaming interface. Compaction keeps its own
     // narrower progress rules and tool-call-is-error policy; only the transport changes.
@@ -1062,7 +1107,7 @@ pub async fn collect_compaction_summary_once(
         return stream_compaction_summary(
             state,
             session_id,
-            &turn_id,
+            &attempt,
             state
                 .plugins
                 .invoke_service_with_events(
@@ -1144,7 +1189,7 @@ pub async fn collect_compaction_summary_once(
             session_id,
             selection,
             &provider_turn_id,
-            &turn_id,
+            &attempt,
             context,
             cancel_state,
         )
@@ -1155,7 +1200,7 @@ pub async fn collect_compaction_summary_once(
             session_id,
             selection,
             &provider_turn_id,
-            &turn_id,
+            &attempt,
             cancel_state,
         )
         .await
@@ -1293,8 +1338,40 @@ pub fn compaction_error_detail(error: CompactionError) -> String {
 async fn stream_compaction_summary(
     state: &ServerState,
     session_id: SessionId,
-    turn_id: &str,
+    attempt: &ModelRequestAttempt,
     mut invocation: bcode_plugin::StreamingServiceInvocation,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+) -> Result<String, CompactionError> {
+    let result = stream_compaction_summary_inner(
+        state,
+        session_id,
+        attempt,
+        &mut invocation,
+        command_context,
+        cancel_state,
+    )
+    .await;
+    if result.is_err()
+        && let Some(usage) = receive_final_billing_usage(&mut invocation).await
+        && let Err(error) = append_model_usage_event(
+            state,
+            session_id,
+            attempt.identity.model_turn_id.clone(),
+            session_token_usage(&usage, Some(attempt)),
+        )
+        .await
+    {
+        append_system_event(state, session_id, error).await;
+    }
+    result
+}
+
+async fn stream_compaction_summary_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    attempt: &ModelRequestAttempt,
+    invocation: &mut bcode_plugin::StreamingServiceInvocation,
     mut command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
@@ -1378,7 +1455,7 @@ async fn stream_compaction_summary(
                 match handle_compaction_events(
                     state,
                     session_id,
-                    turn_id,
+                    attempt,
                     &mut summary,
                     vec![event],
                 )
@@ -1406,7 +1483,7 @@ pub async fn poll_compaction_summary_actor_aware(
     session_id: SessionId,
     selection: &SessionModelSelection,
     provider_turn_id: &str,
-    turn_id: &str,
+    attempt: &ModelRequestAttempt,
     command_context: &mut RuntimeCommandContext<'_>,
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
@@ -1445,7 +1522,7 @@ pub async fn poll_compaction_summary_actor_aware(
             continue;
         }
         let saw_progress = compaction_events_include_progress(&response.events);
-        match handle_compaction_events(state, session_id, turn_id, &mut summary, response.events)
+        match handle_compaction_events(state, session_id, attempt, &mut summary, response.events)
             .await
         {
             CompactionPollStatus::Continue => {
@@ -1523,7 +1600,7 @@ pub async fn poll_compaction_summary(
     session_id: SessionId,
     selection: &SessionModelSelection,
     provider_turn_id: &str,
-    turn_id: &str,
+    attempt: &ModelRequestAttempt,
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
@@ -1547,7 +1624,7 @@ pub async fn poll_compaction_summary(
             continue;
         }
         let saw_progress = compaction_events_include_progress(&response.events);
-        match handle_compaction_events(state, session_id, turn_id, &mut summary, response.events)
+        match handle_compaction_events(state, session_id, attempt, &mut summary, response.events)
             .await
         {
             CompactionPollStatus::Continue => {
@@ -1609,7 +1686,7 @@ pub enum CompactionPollStatus {
 pub async fn handle_compaction_events(
     state: &ServerState,
     session_id: SessionId,
-    turn_id: &str,
+    attempt: &ModelRequestAttempt,
     summary: &mut String,
     events: Vec<ProviderTurnEvent>,
 ) -> CompactionPollStatus {
@@ -1628,13 +1705,16 @@ pub async fn handle_compaction_events(
             },
             ProviderTurnEvent::TextDelta { text } => summary.push_str(&text),
             ProviderTurnEvent::Usage { usage } => {
-                append_model_usage_event(
+                if let Err(error) = append_model_usage_event(
                     state,
                     session_id,
-                    turn_id.to_string(),
-                    session_token_usage(&usage, None),
+                    attempt.identity.model_turn_id.clone(),
+                    session_token_usage(&usage, Some(attempt)),
                 )
-                .await;
+                .await
+                {
+                    return CompactionPollStatus::Failed(error);
+                }
             }
             ProviderTurnEvent::Warning { message } => {
                 append_system_event(state, session_id, format!("model warning: {message}")).await;

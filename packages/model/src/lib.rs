@@ -1401,6 +1401,53 @@ pub struct ModelCostComponent {
 }
 
 impl ModelPricingInfo {
+    /// Explain a failed estimate using normalized usage facts.
+    /// Call only after `estimate_cost` returns `None`.
+    #[must_use]
+    pub fn cost_unavailable_reason(
+        &self,
+        usage: &TokenUsage,
+    ) -> bcode_session_models::SessionCostUnavailableReason {
+        use bcode_session_models::SessionCostUnavailableReason as Reason;
+        if usage.input_tokens.is_none() || usage.output_tokens.is_none() {
+            return Reason::ProviderUsageIncomplete;
+        }
+        if !usage.has_valid_input_breakdown() {
+            return Reason::ConflictingUsage;
+        }
+        if !usage.details.is_empty() && normalized_pricing_usages(usage).is_none() {
+            return Reason::DetailedUsageUnavailable;
+        }
+        if usage.details.is_empty()
+            && ((self.cached_input.is_some()
+                || self
+                    .rules
+                    .iter()
+                    .any(|rule| rule.bucket == ModelPricingBucket::CacheReadInput))
+                && usage.cached_input_tokens.is_none()
+                || (self.cache_write_input.is_some()
+                    || self
+                        .rules
+                        .iter()
+                        .any(|rule| rule.bucket == ModelPricingBucket::CacheWriteInput))
+                    && usage.cache_write_input_tokens.is_none())
+        {
+            return Reason::ProviderUsageIncomplete;
+        }
+        if self.rules.iter().any(|rule| {
+            rule.service_tier.is_some() && usage.pricing_context.service_tier.is_none()
+                || rule.invocation_class.is_some()
+                    && usage.pricing_context.invocation_class.is_none()
+                || rule.billing_scope.is_some() && usage.pricing_context.billing_scope.is_none()
+                || (rule.min_request_input_tokens.is_some()
+                    || rule.max_request_input_tokens.is_some())
+                    && usage.pricing_context.request_input_tokens.is_none()
+        }) {
+            return Reason::RequiredPricingContextUnavailable;
+        }
+        Reason::PricingRuleUnavailableOrAmbiguous
+    }
+
     /// Estimate cost for provider-reported token usage.
     /// Returns `Some` only when the provider reported complete input/output usage and every
     /// non-zero separately priced cache bucket has corresponding pricing. Conditional pricing
@@ -1414,15 +1461,9 @@ impl ModelPricingInfo {
         }
         let input = usage.input_tokens?;
         let output = usage.output_tokens?;
-        if !usage.has_valid_input_breakdown() {
-            return None;
-        }
+        let normalized = normalized_pricing_usages(usage)?;
         if !usage.details.is_empty() {
-            if detailed_input_tokens(&usage.details) != u64::from(input) {
-                return None;
-            }
-            let components = usage
-                .details
+            let components = normalized
                 .iter()
                 .map(|detail| {
                     let price = match detail.bucket {
@@ -1436,15 +1477,15 @@ impl ModelPricingInfo {
                         modality: Some(detail.modality),
                         tokens: detail.tokens,
                         price,
-                        cost_micros: price_bucket_micros(detail.tokens, Some(price)),
+                        cost_micros: price_bucket_micros(detail.tokens, Some(price))?,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
             return Some(ModelCostEstimate {
                 currency: self.currency.clone(),
-                total_micros: components.iter().fold(0_u64, |total, component| {
-                    total.saturating_add(component.cost_micros)
-                }),
+                total_micros: components.iter().try_fold(0_u64, |total, component| {
+                    total.checked_add(component.cost_micros)
+                })?,
                 components,
                 source: self.source,
                 revision: self.revision.clone(),
@@ -1481,19 +1522,20 @@ impl ModelPricingInfo {
         ]
         .into_iter()
         .filter(|(_, tokens, _)| *tokens > 0)
-        .filter_map(|(bucket, tokens, price)| {
-            price.map(|price| ModelCostComponent {
+        .map(|(bucket, tokens, price)| {
+            let price = price?;
+            Some(ModelCostComponent {
                 bucket,
                 modality: Some(ModelTokenModality::Text),
                 tokens,
                 price,
-                cost_micros: price_bucket_micros(tokens, Some(price)),
+                cost_micros: price_bucket_micros(tokens, Some(price))?,
             })
         })
-        .collect::<Vec<_>>();
-        let total_micros = components.iter().fold(0_u64, |total, component| {
-            total.saturating_add(component.cost_micros)
-        });
+        .collect::<Option<Vec<_>>>()?;
+        let total_micros = components.iter().try_fold(0_u64, |total, component| {
+            total.checked_add(component.cost_micros)
+        })?;
         Some(ModelCostEstimate {
             currency: self.currency.clone(),
             total_micros,
@@ -1514,6 +1556,17 @@ impl ModelPricingInfo {
             return self.estimate_cost(usage);
         }
         let usages = normalized_pricing_usages(usage)?;
+        // Missing cache counters are unknown, not an implicit cold cache. Detailed
+        // usage can prove coverage, including a provider-contract zero bucket.
+        if usage.details.is_empty()
+            && self.rules.iter().any(|rule| match rule.bucket {
+                ModelPricingBucket::CacheReadInput => usage.cached_input_tokens.is_none(),
+                ModelPricingBucket::CacheWriteInput => usage.cache_write_input_tokens.is_none(),
+                ModelPricingBucket::Input | ModelPricingBucket::Output => false,
+            })
+        {
+            return None;
+        }
         if usage.details.is_empty()
             && self.rules.iter().any(|rule| {
                 rule.modality
@@ -1532,7 +1585,7 @@ impl ModelPricingInfo {
             let [rule] = matching.as_slice() else {
                 return None;
             };
-            let cost_micros = price_bucket_micros(usage.tokens, Some(rule.price));
+            let cost_micros = price_bucket_micros(usage.tokens, Some(rule.price))?;
             components.push(ModelCostComponent {
                 bucket: usage.bucket,
                 modality: Some(usage.modality),
@@ -1543,9 +1596,9 @@ impl ModelPricingInfo {
         }
         Some(ModelCostEstimate {
             currency: self.currency.clone(),
-            total_micros: components.iter().fold(0_u64, |total, component| {
-                total.saturating_add(component.cost_micros)
-            }),
+            total_micros: components.iter().try_fold(0_u64, |total, component| {
+                total.checked_add(component.cost_micros)
+            })?,
             components,
             source: self.source,
             revision: self.revision.clone(),
@@ -1569,20 +1622,49 @@ fn detailed_input_tokens(details: &[ModelTokenUsageDetail]) -> u64 {
 }
 
 fn normalized_pricing_usages(usage: &TokenUsage) -> Option<Vec<ModelTokenUsageDetail>> {
-    if !usage.details.is_empty() {
-        if usage
-            .input_tokens
-            .is_none_or(|input| detailed_input_tokens(&usage.details) == u64::from(input))
-        {
-            return Some(usage.details.to_vec());
-        }
-        return None;
-    }
-    if !usage.has_valid_input_breakdown() {
-        return None;
-    }
     let input = usage.input_tokens?;
     let output = usage.output_tokens?;
+    if usage
+        .total_tokens
+        .is_some_and(|total| u64::from(total) < u64::from(input) + u64::from(output))
+        || usage
+            .reasoning_tokens
+            .is_some_and(|reasoning| reasoning > output)
+        || !usage.has_valid_input_breakdown()
+    {
+        return None;
+    }
+    if !usage.details.is_empty() {
+        let mut identities = std::collections::BTreeSet::new();
+        let mut buckets = std::collections::BTreeMap::<ModelPricingBucket, u64>::new();
+        for detail in &usage.details {
+            if !identities.insert((detail.bucket, detail.modality, detail.cache_ttl_seconds)) {
+                return None;
+            }
+            let total = buckets.entry(detail.bucket).or_default();
+            *total = total.checked_add(u64::from(detail.tokens))?;
+        }
+        let bucket = |kind| buckets.get(&kind).copied().unwrap_or_default();
+        if detailed_input_tokens(&usage.details) != u64::from(input)
+            || bucket(ModelPricingBucket::Output) != u64::from(output)
+            || usage.cached_input_tokens.is_some_and(|tokens| {
+                bucket(ModelPricingBucket::CacheReadInput) != u64::from(tokens)
+            })
+            || usage.cache_write_input_tokens.is_some_and(|tokens| {
+                bucket(ModelPricingBucket::CacheWriteInput) != u64::from(tokens)
+            })
+        {
+            return None;
+        }
+        return Some(
+            usage
+                .details
+                .iter()
+                .filter(|detail| detail.tokens > 0)
+                .cloned()
+                .collect(),
+        );
+    }
     let cached = usage.cached_input_tokens.unwrap_or_default();
     let cache_write = usage.cache_write_input_tokens.unwrap_or_default();
     let mut details = Vec::new();
@@ -1640,10 +1722,8 @@ fn pricing_rule_matches(
         })
 }
 
-fn price_bucket_micros(tokens: u32, price: Option<ModelTokenPrice>) -> u64 {
-    price.map_or(0, |price| {
-        u64::from(tokens).saturating_mul(price.micros) / 1_000_000
-    })
+fn price_bucket_micros(tokens: u32, price: Option<ModelTokenPrice>) -> Option<u64> {
+    u64::try_from(u128::from(tokens) * u128::from(price?.micros) / 1_000_000).ok()
 }
 
 /// Source used by a provider to resolve model metadata such as token limits.
@@ -3216,10 +3296,9 @@ impl TokenUsage {
         self.input_tokens.map_or_else(
             || self.cached_input_tokens.is_none() && self.cache_write_input_tokens.is_none(),
             |input| {
-                self.cached_input_tokens
-                    .unwrap_or_default()
-                    .saturating_add(self.cache_write_input_tokens.unwrap_or_default())
-                    <= input
+                u64::from(self.cached_input_tokens.unwrap_or_default())
+                    + u64::from(self.cache_write_input_tokens.unwrap_or_default())
+                    <= u64::from(input)
             },
         )
     }
@@ -4400,6 +4479,73 @@ mod tests {
         assert_eq!(cost.total_micros, 1_325_000);
         assert_eq!(cost.components[0].tokens, 100_000);
         assert_eq!(cost.components[1].tokens, 900_000);
+    }
+
+    #[test]
+    fn pricing_requires_known_cache_and_complete_output_details() {
+        let flat: ModelPricingInfo = serde_json::from_value(serde_json::json!({
+            "currency": "USD", "unit": "per_million_tokens", "source": "user_override",
+            "input": {"micros": 1_000_000}, "cached_input": {"micros": 100_000},
+            "output": {"micros": 1_000_000}
+        }))
+        .unwrap();
+        let mut conditional = flat.clone();
+        conditional.rules = serde_json::from_value(serde_json::json!([
+            {"bucket": "input", "price": {"micros": 1_000_000}},
+            {"bucket": "cache_read_input", "price": {"micros": 100_000}},
+            {"bucket": "output", "price": {"micros": 1_000_000}}
+        ]))
+        .unwrap();
+        for pricing in [flat, conditional] {
+            let mut usage = TokenUsage {
+                input_tokens: Some(1000),
+                output_tokens: Some(100),
+                ..Default::default()
+            };
+            assert!(pricing.estimate_cost(&usage).is_none());
+            usage.cached_input_tokens = Some(0);
+            assert_eq!(pricing.estimate_cost(&usage).unwrap().total_micros, 1100);
+            usage.details = vec![ModelTokenUsageDetail {
+                bucket: ModelPricingBucket::Input,
+                modality: ModelTokenModality::Text,
+                tokens: 1000,
+                cache_ttl_seconds: None,
+            }]
+            .into_boxed_slice();
+            assert!(pricing.estimate_cost(&usage).is_none());
+            usage.details = vec![
+                ModelTokenUsageDetail {
+                    bucket: ModelPricingBucket::Input,
+                    modality: ModelTokenModality::Text,
+                    tokens: 1000,
+                    cache_ttl_seconds: None,
+                },
+                ModelTokenUsageDetail {
+                    bucket: ModelPricingBucket::Output,
+                    modality: ModelTokenModality::Text,
+                    tokens: 100,
+                    cache_ttl_seconds: None,
+                },
+            ]
+            .into_boxed_slice();
+            assert_eq!(pricing.estimate_cost(&usage).unwrap().total_micros, 1100);
+        }
+    }
+
+    #[test]
+    fn pricing_arithmetic_uses_wide_intermediate_and_rejects_overflow() {
+        let price = Some(ModelTokenPrice::from_micros(u64::MAX));
+        assert_eq!(super::price_bucket_micros(1_000_000, price), Some(u64::MAX));
+        assert_eq!(super::price_bucket_micros(1_000_001, price), None);
+        assert!(
+            !TokenUsage {
+                input_tokens: Some(u32::MAX),
+                cached_input_tokens: Some(u32::MAX),
+                cache_write_input_tokens: Some(1),
+                ..Default::default()
+            }
+            .has_valid_input_breakdown()
+        );
     }
 
     #[test]

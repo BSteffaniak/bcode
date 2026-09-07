@@ -47,6 +47,7 @@ mod store;
 mod store_executor;
 mod subscription;
 mod tools;
+mod usage;
 
 use actor::{AttachMode, SessionHandle};
 pub use actor::{
@@ -2870,6 +2871,72 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
+
+    #[tokio::test]
+    async fn usage_pending_and_final_commits_publish_checkpointed_totals() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let mut subscription = manager.subscribe_session_events(session.id).await.unwrap();
+        let mut usage = bcode_session_models::SessionTokenUsage {
+            request_id: Some("attempt".into()),
+            observation_id: Some("attempt:pending".into()),
+            cost: Some(bcode_session_models::SessionCostEstimate::Unavailable {
+                reason: bcode_session_models::SessionCostUnavailableReason::ProviderUsageIncomplete,
+            }),
+            ..Default::default()
+        };
+        let pending = manager
+            .append_model_usage(session.id, "turn".into(), usage.clone())
+            .await
+            .unwrap();
+        let bcode_session_models::SessionLiveEventKind::UsageSummaryChanged { summary } =
+            subscription.live_events.recv().await.unwrap().kind
+        else {
+            panic!("accounting update")
+        };
+        assert_eq!(summary.through_sequence, Some(pending.sequence));
+        assert_eq!(summary.unavailable_usage_count, 1);
+        assert!(summary.totals_micros.is_empty());
+        usage.observation_id = Some("attempt:usage".into());
+        usage.observation_ordinal = 1;
+        usage.terminal = true;
+        usage.cost = Some(bcode_session_models::SessionCostEstimate::Estimated {
+            currency: "USD".into(),
+            total_micros: 10,
+            source: "fixture".into(),
+            revision: None,
+            components: vec![bcode_session_models::SessionCostComponent {
+                bucket: "input".into(),
+                modality: None,
+                tokens: 10,
+                price_micros: 1_000_000,
+                cost_micros: 10,
+            }],
+        });
+        let final_event = manager
+            .append_model_usage(session.id, "turn".into(), usage.clone())
+            .await
+            .unwrap();
+        let bcode_session_models::SessionLiveEventKind::UsageSummaryChanged { summary } =
+            subscription.live_events.recv().await.unwrap().kind
+        else {
+            panic!("accounting update")
+        };
+        assert_eq!(summary.through_sequence, Some(final_event.sequence));
+        assert_eq!(summary.totals_micros["USD"], 10);
+        assert_eq!(summary.unavailable_usage_count, 0);
+        assert_eq!(summary.observed_usage_count, 1);
+        usage.output_tokens = Some(1);
+        assert!(
+            manager
+                .append_model_usage(session.id, "turn".into(), usage)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn model_usage_append_returns_the_same_event_stored_and_broadcast() {

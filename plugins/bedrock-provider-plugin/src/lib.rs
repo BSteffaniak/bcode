@@ -2356,6 +2356,9 @@ struct AnthropicMessagesAccumulator {
     /// truncated turn is indistinguishable from a completed one.
     stop_reason: Option<StopReason>,
     /// Latest cumulative usage for this provider request.
+    // Flush whatever the provider reported even when the enclosing future is dropped
+    // by cancellation. Output remains unknown until a terminal usage report arrives.
+    usage_sink: Option<TurnState>,
     usage: Option<TokenUsage>,
     /// Effective cache retention used for Anthropic cache writes.
     cache_ttl_seconds: Option<u64>,
@@ -2369,6 +2372,28 @@ struct AnthropicMessagesAccumulator {
 struct UsageEmissionState {
     final_usage: bool,
     exact_input: bool,
+}
+
+impl Drop for AnthropicMessagesAccumulator {
+    fn drop(&mut self) {
+        if !self.usage_state.final_usage
+            && let (Some(turn), Some(mut usage)) = (self.usage_sink.take(), self.usage.take())
+        {
+            if !self.saw_terminal_stop_reason() {
+                // message_start output=0 is not the final output of an interrupted response.
+                usage.output_tokens = None;
+                usage.total_tokens = None;
+                usage.details = usage
+                    .details
+                    .into_vec()
+                    .into_iter()
+                    .filter(|detail| detail.bucket != bcode_model::ModelPricingBucket::Output)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+            }
+            turn.push(ProviderTurnEvent::Usage { usage });
+        }
+    }
 }
 
 impl AnthropicMessagesAccumulator {
@@ -2396,6 +2421,7 @@ impl AnthropicMessagesAccumulator {
             synthetic,
             stop_reason: None,
             usage: None,
+            usage_sink: None,
             cache_ttl_seconds,
             billing_scope,
             usage_state: UsageEmissionState {
@@ -2411,6 +2437,7 @@ impl AnthropicMessagesAccumulator {
         event: &serde_json::Value,
         turn: &TurnState,
     ) -> Result<Option<StreamOutcome>, ProviderError> {
+        self.usage_sink = Some(turn.clone());
         match event.get("type").and_then(serde_json::Value::as_str) {
             Some("message_start") => {
                 self.record_usage(
@@ -2666,10 +2693,9 @@ impl AnthropicMessagesAccumulator {
             return;
         };
         let read = |key| usage.get(key).and_then(json_u32);
-        let merge = |previous: Option<u32>, current: Option<u32>| match (previous, current) {
-            (Some(previous), Some(current)) => Some(previous.max(current)),
-            (previous, current) => current.or(previous),
-        };
+        // Messages reports cumulative snapshots, not deltas. A later reported field
+        // replaces the earlier value; omitted fields retain their previous observation.
+        let merge = |previous: Option<u32>, current: Option<u32>| current.or(previous);
         let previous = self.usage.take().unwrap_or_default();
         let previous_ordinary_input = previous.uncached_input_tokens();
         let ordinary_input_tokens = merge(previous_ordinary_input, read("input_tokens"));
@@ -2682,26 +2708,61 @@ impl AnthropicMessagesAccumulator {
             previous.cache_write_input_tokens,
             read("cache_creation_input_tokens"),
         );
-        let input_tokens = ordinary_input_tokens.map(|ordinary| {
+        let input_tokens = ordinary_input_tokens.and_then(|ordinary| {
             ordinary
-                .saturating_add(cached_input_tokens.unwrap_or_default())
-                .saturating_add(cache_write_input_tokens.unwrap_or_default())
+                .checked_add(cached_input_tokens.unwrap_or_default())?
+                .checked_add(cache_write_input_tokens.unwrap_or_default())
         });
         let cache_ttl_seconds = (cache_write_input_tokens.unwrap_or_default() > 0)
             .then_some(self.cache_ttl_seconds.unwrap_or(300));
-        let details = anthropic_messages_pricing_details(
+        let mut details = anthropic_messages_pricing_details(
             input_tokens,
             output_tokens,
             cached_input_tokens,
             cache_write_input_tokens,
             cache_ttl_seconds,
-        );
+        )
+        .into_vec();
+        // A single request can write both short- and long-lived cache entries.
+        let writes = if let Some(creation) = usage.get("cache_creation") {
+            [
+                ("ephemeral_5m_input_tokens", 300),
+                ("ephemeral_1h_input_tokens", 3600),
+            ]
+            .into_iter()
+            .filter_map(|(key, ttl)| {
+                creation
+                    .get(key)
+                    .and_then(json_u32)
+                    .map(|tokens| (ttl, tokens))
+            })
+            .collect::<Vec<_>>()
+        } else {
+            previous
+                .details
+                .iter()
+                .filter(|detail| detail.bucket == bcode_model::ModelPricingBucket::CacheWriteInput)
+                .filter_map(|detail| detail.cache_ttl_seconds.map(|ttl| (ttl, detail.tokens)))
+                .collect()
+        };
+        if !writes.is_empty() {
+            details
+                .retain(|detail| detail.bucket != bcode_model::ModelPricingBucket::CacheWriteInput);
+            details.extend(writes.into_iter().map(|(ttl, tokens)| {
+                bcode_model::ModelTokenUsageDetail {
+                    bucket: bcode_model::ModelPricingBucket::CacheWriteInput,
+                    modality: bcode_model::ModelTokenModality::Text,
+                    tokens,
+                    cache_ttl_seconds: Some(ttl),
+                }
+            }));
+        }
         self.usage = Some(TokenUsage {
             input_tokens,
             output_tokens,
             cached_input_tokens,
             cache_write_input_tokens,
-            details,
+            details: details.into_boxed_slice(),
             pricing_context: Box::new(bcode_model::ModelPricingContext {
                 service_tier: Some("standard".to_string()),
                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
@@ -2734,10 +2795,10 @@ impl AnthropicMessagesAccumulator {
         if self.usage_state.final_usage {
             return;
         }
+        self.emit_exact_input(turn);
         let Some(usage) = self.usage.take() else {
             return;
         };
-        self.emit_exact_input(turn);
         turn.push(ProviderTurnEvent::Usage { usage });
         self.usage_state.final_usage = true;
     }
@@ -9285,6 +9346,61 @@ mod tests {
                             && detail.tokens == 80
                             && detail.cache_ttl_seconds == Some(300))
         )));
+    }
+
+    #[test]
+    fn interrupted_anthropic_usage_preserves_input_without_claiming_final_output() {
+        let turn = TurnState::default();
+        {
+            let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+            accumulator.process(&serde_json::json!({"type":"message_start", "message":{"usage":{
+                "input_tokens":12,"output_tokens":0,"cache_read_input_tokens":400,"cache_creation_input_tokens":80
+            }}}), &turn).unwrap();
+        }
+        let usages = turn
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::Usage { usage } => Some(usage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].input_tokens, Some(492));
+        assert_eq!(usages[0].output_tokens, None);
+    }
+
+    #[test]
+    fn anthropic_usage_preserves_mixed_cache_write_ttls() {
+        let turn = TurnState::default();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        accumulator.process(&serde_json::json!({"type":"message_start", "message":{"usage":{
+            "input_tokens":12,"output_tokens":0,"cache_read_input_tokens":400,"cache_creation_input_tokens":80,
+            "cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":50}
+        }}}), &turn).unwrap();
+        accumulator.process(&serde_json::json!({"type":"message_delta", "delta":{"stop_reason":"end_turn"}, "usage":{"output_tokens":7}}), &turn).unwrap();
+        accumulator
+            .process(&serde_json::json!({"type":"message_stop"}), &turn)
+            .unwrap();
+        drop(accumulator);
+        let usages = turn
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::Usage { usage } => Some(usage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usages.len(), 1);
+        let writes = usages[0]
+            .details
+            .iter()
+            .filter(|detail| detail.bucket == bcode_model::ModelPricingBucket::CacheWriteInput)
+            .map(|detail| (detail.cache_ttl_seconds, detail.tokens))
+            .collect::<Vec<_>>();
+        assert_eq!(writes, vec![(Some(300), 30), (Some(3600), 50)]);
+        assert_eq!(usages[0].input_tokens, Some(492));
+        assert_eq!(usages[0].output_tokens, Some(7));
     }
 
     #[test]

@@ -1313,8 +1313,8 @@ fi
 
 if ! rg -q 'pub cost: Option<SessionCostEstimate>' packages/session/models/src/lib.rs \
   || ! rg -q 'pub struct SessionCostSummary' packages/session-view/models/src/lib.rs \
-  || ! rg -q 'SessionCostSummary::rebuild' packages/session-view/src/lib.rs; then
-  echo "Session cost architecture violation: canonical usage must own fixed estimates and session-view must own aggregate semantics." >&2
+  || ! rg -q 'UsageSummaryChanged' packages/session-view/src/lib.rs; then
+  echo "Session cost architecture violation: canonical usage must own fixed estimates and session-view must consume the checkpointed session accounting projection." >&2
   violations=1
 fi
 
@@ -1322,6 +1322,17 @@ if rg -n 'estimate_cost|ModelPricingInfo|bcode_model_catalog' packages/session-v
     >/tmp/bcode-session-view-repricing.txt; then
   echo "Session cost architecture violation: session-view may aggregate fixed outcomes but must not reprice history." >&2
   cat /tmp/bcode-session-view-repricing.txt >&2
+  violations=1
+fi
+
+if rg -n 'rebuild_session_usage_summary' packages/session/src --glob '*.rs'; then
+  echo "Session cost architecture violation: usage appends must update one contribution, not rescan the request ledger." >&2
+  violations=1
+fi
+if ! rg -q 'through_sequence' packages/session/models/src/lib.rs \
+  || ! rg -q 'record_pending_request_usage' packages/server/src/lib.rs \
+  || ! rg -q 'checkpointed_cost_survives_live_usage_reconnect_and_paging' packages/session-view/src/lib.rs; then
+  echo "Session cost architecture violation: accounting needs checkpointed hydration, dispatch coverage, and regression tests." >&2
   violations=1
 fi
 

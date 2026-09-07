@@ -101,4 +101,12 @@ async fn multi_round_response_exposes_aggregate_usage_and_cost() {
     assert_eq!(cost.currency, "USD");
     assert_eq!(cost.total_micros, 39);
     assert_eq!(cost.source, ModelPricingSource::UserOverride);
+    let mut incomplete = response;
+    for step in &mut incomplete.steps {
+        if let bcode::GenerationStep::Model { usage, .. } = step {
+            *usage = None;
+            break;
+        }
+    }
+    assert!(incomplete.estimated_cost(&pricing).is_none());
 }

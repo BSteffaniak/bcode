@@ -244,6 +244,8 @@ impl SessionHandle {
             ownership_guards: BTreeMap::new(),
             db,
             last_manifest_summary: None,
+            memory_usage: bcode_session_models::SessionUsageSummary::default(),
+            memory_usage_requests: BTreeMap::new(),
             commands: receiver,
             ownership_releases,
             ownership_release_receiver,
@@ -775,6 +777,9 @@ struct SessionActor {
     /// The manifest is a disposable display cache; tracking what it currently contains lets the
     /// append path skip rewriting it when a durable event did not change any manifest field.
     last_manifest_summary: Option<ManifestSummaryIdentity>,
+    // Only storage-free sessions retain their canonical request contributions here.
+    memory_usage: bcode_session_models::SessionUsageSummary,
+    memory_usage_requests: BTreeMap<String, bcode_session_models::SessionTokenUsage>,
     commands: mpsc::Receiver<SessionCommand>,
     ownership_releases: mpsc::UnboundedSender<OwnershipRelease>,
     ownership_release_receiver: mpsc::UnboundedReceiver<OwnershipRelease>,
@@ -1536,6 +1541,24 @@ impl SessionActor {
         .await
     }
 
+    fn project_memory_usage(&mut self, kind: &SessionEventKind) -> Result<(), SessionError> {
+        if self.store.is_none()
+            && let SessionEventKind::ModelUsage { usage, .. } = kind
+        {
+            let key = usage
+                .request_id
+                .clone()
+                .unwrap_or_else(|| format!("event:{}", self.state.next_sequence));
+            let previous = self.memory_usage_requests.get(&key);
+            if crate::usage::accepts(previous, usage).map_err(SessionError::EventSerialization)? {
+                crate::usage::replace(&mut self.memory_usage, previous, usage)
+                    .map_err(SessionError::EventSerialization)?;
+                self.memory_usage_requests.insert(key, usage.clone());
+            }
+        }
+        Ok(())
+    }
+
     async fn append_event(
         &mut self,
         kind: SessionEventKind,
@@ -1553,6 +1576,7 @@ impl SessionActor {
             .as_ref()
             .and_then(|provenance| provenance.source_timestamp_ms)
             .unwrap_or(activity_timestamp_ms);
+        self.project_memory_usage(&kind)?;
         let event = if let Some(store) = self.store.clone() {
             let lock_started_at = Instant::now();
             let _write_guard = crate::lease::acquire_session_write_lock(
@@ -1604,6 +1628,13 @@ impl SessionActor {
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.retire_live_text_checkpoint_for_durable_event(&event.kind);
+        if matches!(event.kind, SessionEventKind::ModelUsage { .. }) {
+            let summary = self.session_usage_summary().await?;
+            self.state.total_metered_tokens = summary.cumulative_metered_tokens;
+            self.publish_live_event(SessionLiveEventKind::UsageSummaryChanged {
+                summary: Box::new(summary),
+            });
+        }
         let manifest_started_at = Instant::now();
         self.update_manifest_and_schedule_catalog().await;
         if let Some(metrics) = &metrics {
@@ -2080,20 +2111,10 @@ impl SessionActor {
         if let Some(db) = self.existing_session_db().await? {
             return db.session_usage_summary().await.map_err(SessionError::from);
         }
-        if let Some(events) = &self.state.events {
-            let mut latest = BTreeMap::new();
-            for event in events {
-                if let SessionEventKind::ModelUsage { usage, .. } = &event.kind {
-                    let key = usage
-                        .request_id
-                        .clone()
-                        .unwrap_or_else(|| format!("event:{}", event.sequence));
-                    latest.insert(key, (event.sequence, usage.clone()));
-                }
-            }
-            return Ok(session_usage_summary_from_observations(
-                latest.into_values(),
-            ));
+        if self.store.is_none() {
+            let mut summary = self.memory_usage.clone();
+            summary.through_sequence = Some(expected_last_sequence);
+            return Ok(summary);
         }
         Err(SessionError::ProjectionStale {
             session_id: self.state.summary.id,
@@ -2655,41 +2676,6 @@ pub struct SessionSnapshot {
     pub working_directory: PathBuf,
     pub load_status: SessionLoadStatusKind,
     pub owned: bool,
-}
-
-fn session_usage_summary_from_observations(
-    observations: impl Iterator<Item = (u64, bcode_session_models::SessionTokenUsage)>,
-) -> bcode_session_models::SessionUsageSummary {
-    let mut summary = bcode_session_models::SessionUsageSummary::default();
-    let mut latest_sequence = None;
-    for (sequence, usage) in observations {
-        summary.observed_usage_count = summary.observed_usage_count.saturating_add(1);
-        if let Some(tokens) = usage.metered_total_tokens() {
-            summary.cumulative_metered_tokens = summary
-                .cumulative_metered_tokens
-                .saturating_add(u64::from(tokens));
-        }
-        match &usage.cost {
-            Some(bcode_session_models::SessionCostEstimate::Estimated {
-                currency,
-                total_micros,
-                ..
-            }) => {
-                let total = summary.totals_micros.entry(currency.clone()).or_default();
-                *total = total.saturating_add(*total_micros);
-                summary.estimated_usage_count = summary.estimated_usage_count.saturating_add(1);
-            }
-            Some(bcode_session_models::SessionCostEstimate::Unavailable { .. }) => {
-                summary.unavailable_usage_count = summary.unavailable_usage_count.saturating_add(1);
-            }
-            None => {}
-        }
-        if latest_sequence.is_none_or(|latest| sequence > latest) {
-            latest_sequence = Some(sequence);
-            summary.latest_usage = Some(usage);
-        }
-    }
-    summary
 }
 
 impl SessionSnapshot {

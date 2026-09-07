@@ -100,6 +100,16 @@ observation from persisted session usage so eval telemetry and live verification
 numbers. Measurements use stable string keys from `bcode_prompt_cache_models::measurement` so they
 can flow into eval artifacts unchanged.
 
+The cache planner is not a billing oracle. Session cost uses each attempt's provider-reported
+ordinary input, cache reads, cache writes (including separately reported TTLs), and output with
+request-time pricing. A provider/model/auth switch can be cold, warm, partially cached, or evicted;
+no previous request's cache count is carried into the next request's cost. Missing counters are
+unknown unless the provider contract or complete detailed usage proves a zero. Detailed input and
+output must both reconcile with aggregates. Ambiguous cached-audio splits remain unpriced rather
+than assigning all cached tokens to text. Actual response service tiers override request defaults.
+See [session persistence](session-persistence-architecture.md#incremental-cost-accounting) for
+cumulative projection and interruption coverage.
+
 ## End-to-end eval
 
 `fixtures/evals/prompt-cache/suite.toml` runs a real Bcode session through a twelve-file

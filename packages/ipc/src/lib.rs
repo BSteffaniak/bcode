@@ -99,7 +99,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// field name is unchanged; only its derivation widened, and a stale peer computing
 /// the narrower identity now mismatches and is refused rather than silently sharing
 /// a daemon across config directories.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 32;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 33;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =

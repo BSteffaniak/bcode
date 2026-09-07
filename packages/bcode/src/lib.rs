@@ -9353,7 +9353,9 @@ impl GenerateTextResponse {
 
     /// Estimate total turn cost by pricing every provider round independently.
     ///
-    /// The returned value retains currency and pricing-source provenance. `None` means complete
+    /// This helper applies the caller-supplied tariff to every round; it is not the canonical
+    /// mixed-model session ledger. Callers with different round tariffs must retain per-request
+    /// pricing. The returned value retains currency and pricing-source provenance. `None` means complete
     /// reported usage and pricing coverage were unavailable; it never means zero cost.
     #[must_use]
     pub fn estimated_cost(&self, pricing: &ModelPricingInfo) -> Option<ModelCostEstimate> {
@@ -9361,9 +9363,11 @@ impl GenerateTextResponse {
             .steps
             .iter()
             .filter_map(|step| match step {
-                GenerationStep::Model {
-                    usage: Some(usage), ..
-                } => Some(pricing.estimate_cost(usage)),
+                GenerationStep::Model { usage, .. } => Some(
+                    usage
+                        .as_ref()
+                        .and_then(|usage| pricing.estimate_cost(usage)),
+                ),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
@@ -9379,9 +9383,9 @@ impl GenerateTextResponse {
         }
         Some(ModelCostEstimate {
             currency,
-            total_micros: round_estimates.iter().fold(0_u64, |total, estimate| {
-                total.saturating_add(estimate.total_micros)
-            }),
+            total_micros: round_estimates.iter().try_fold(0_u64, |total, estimate| {
+                total.checked_add(estimate.total_micros)
+            })?,
             components: round_estimates
                 .into_iter()
                 .flat_map(|estimate| estimate.components)
@@ -9431,8 +9435,25 @@ fn flush_generation_model(steps: &mut Vec<GenerationStep>, model: &mut Generatio
     }
 }
 
+fn flush_generation_calls(
+    steps: &mut Vec<GenerationStep>,
+    model: &mut GenerationModelRound,
+    calls: &mut Vec<ToolCall>,
+) {
+    flush_generation_model(steps, model);
+    steps.extend(
+        std::mem::take(calls)
+            .into_iter()
+            .map(|call| GenerationStep::ToolCall {
+                round: model.round,
+                call,
+            }),
+    );
+}
+
 fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
     let mut steps = Vec::new();
+    let mut pending_tool_calls = Vec::new();
     let mut model = GenerationModelRound {
         round: 0,
         started: false,
@@ -9466,11 +9487,7 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
                         model.reasoning_events.push(event.clone());
                     }
                     ProviderOutputEvent::ToolCallFinished { call } => {
-                        flush_generation_model(&mut steps, &mut model);
-                        steps.push(GenerationStep::ToolCall {
-                            round: model.round,
-                            call: call.clone(),
-                        });
+                        pending_tool_calls.push(call.clone());
                     }
                     ProviderOutputEvent::ToolCallStarted { .. }
                     | ProviderOutputEvent::ToolCallDelta { .. } => {}
@@ -9496,16 +9513,18 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
                 model.usage = Some(usage.clone());
             }
             AgentEvent::ToolCallFinished(call) => {
-                flush_generation_model(&mut steps, &mut model);
-                steps.push(GenerationStep::ToolCall {
+                model.started = true;
+                pending_tool_calls.push(call.clone());
+            }
+            AgentEvent::ToolResult(result) => {
+                // Provider usage commonly arrives after tool-call assembly. Flush only
+                // when execution begins, not when arguments finish streaming.
+                flush_generation_calls(&mut steps, &mut model, &mut pending_tool_calls);
+                steps.push(GenerationStep::ToolResult {
                     round: model.round,
-                    call: call.clone(),
+                    result: result.clone(),
                 });
             }
-            AgentEvent::ToolResult(result) => steps.push(GenerationStep::ToolResult {
-                round: model.round,
-                result: result.clone(),
-            }),
             event @ (AgentEvent::ExactRequestInputTokens(_)
             | AgentEvent::RequestProjection(_)
             | AgentEvent::ContextCompacted
@@ -9522,7 +9541,7 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
             | AgentEvent::Cancelled => {}
         }
     }
-    flush_generation_model(&mut steps, &mut model);
+    flush_generation_calls(&mut steps, &mut model, &mut pending_tool_calls);
     steps.push(GenerationStep::FinalResponse {
         text: runtime.text.clone(),
         stop_reason: runtime.stop_reason,

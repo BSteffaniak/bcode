@@ -114,6 +114,7 @@ Required migration invariants:
 | `AssistantReasoningActivity` | Incremental stable reasoning lifecycle. | transcript | Frontend-selected visibility, representation, disclosure, and styling. | **Complete**. |
 | `ToolContributionPlaced` | Opaque plugin contribution with explicit semantic placement. | transcript | Plugin adapter or generic portable fallback. | **Complete**. |
 | `ToolPresentationUpdated` | Revision-checked plugin presentation on the canonical invocation or supplemental identity. | transcript | Renderer-specific plugin adapter or generic fallback. | **Complete**. |
+| `UsageSummaryChanged` | Checkpointed session-owner cumulative cost, token usage, and unavailable coverage; stale replacements rejected. | non-transcript | Cumulative spend and partial-cost indicator. | **Complete**. |
 | `RequestContextOccupancyChanged` | Authoritative current occupancy with stale-update rejection. | non-transcript | Footer context accounting. | **Complete**. |
 | `ToolInvocationProgress` | Active invocation progress while the invocation remains open. | non-transcript | Activity chrome and plugin presentation refresh. | **Complete**. |
 | `ProviderStreamProgress` | Turn-correlated provider progress and retry timing. | non-transcript | Activity chrome, timers, and animation. | **Complete**. |

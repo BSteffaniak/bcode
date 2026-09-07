@@ -560,6 +560,33 @@ silently rebuild them. Bounded session attach returns the compact usage summary 
 resident transcript window, so reconnecting or loading older transcript pages cannot change the
 session-wide token or cost totals.
 
+### Incremental cost accounting
+
+The session actor owns cumulative cost projection updates. Each usage append atomically reads only
+its request's previous contribution and the compact total, validates duplicate/terminal semantics,
+then replaces that contribution using checked arithmetic. It never enumerates the request ledger on
+the append path. Identical and older deliveries are no-ops; conflicting duplicates fail closed.
+
+Attach includes a `through_sequence` accounting checkpoint. After each committed usage event the
+actor emits `UsageSummaryChanged` with a complete checkpointed replacement. Attached session views
+consume these replacements, not usage in transcript windows; older or equal checkpoints cannot
+replace a newer one. Live delivery is not durable resume: lag or disconnection requires bounded
+reattach, which recovers the canonical projection. IPC version 33 defines this transfer. The optional
+checkpoint is transport metadata and does not reprice or reinterpret existing stored estimates.
+
+Every new provider dispatch records a request-attributed, nonterminal unavailable usage observation
+before starting provider work. Final reported usage replaces that same request contribution exactly
+once. Retries use distinct attempt identities, including retries within a logical round and compaction
+retries. An interrupted dispatch, cancellation without final usage, or daemon loss leaves unavailable
+coverage rather than implying zero cost. Completed observed estimates retain their request-time rates
+and currencies; selection changes and cache plans never reprice them. A currently executing request
+can temporarily make coverage partial. A missing provider report cannot be reconstructed from context
+occupancy, cache expectations, or the selected model.
+
+These changes preserve previously recorded amounts; they do not reconstruct historical unrecorded
+attempts or verify provider invoices. Such reconciliation requires explicit maintenance and trustworthy
+billing evidence, never ordinary attach-time replay or mutable catalog repricing.
+
 ## Normal bounded reads
 
 Normal attach and history paths use database projections and bounded range queries. They do not full

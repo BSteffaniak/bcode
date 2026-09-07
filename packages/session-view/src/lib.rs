@@ -435,6 +435,8 @@ pub struct SessionView {
     pending_text_presentations: BTreeMap<TranscriptViewItemId, PendingTextPresentation>,
     usage_by_request: BTreeMap<String, bcode_session_models::SessionTokenUsage>,
     unattributed_metered_tokens: u64,
+    unattributed_cost: bcode_session_view_models::SessionCostSummary,
+    usage_checkpoint: Option<u64>,
 }
 
 impl Default for SessionView {
@@ -462,6 +464,8 @@ impl SessionView {
             pending_text_presentations: BTreeMap::new(),
             usage_by_request: BTreeMap::new(),
             unattributed_metered_tokens: 0,
+            unattributed_cost: bcode_session_view_models::SessionCostSummary::default(),
+            usage_checkpoint: None,
         }
     }
 
@@ -585,6 +589,13 @@ impl SessionView {
 
     /// Replace cumulative runtime accounting from the canonical session usage projection.
     pub fn set_usage_summary(&mut self, summary: bcode_session_models::SessionUsageSummary) {
+        if self
+            .usage_checkpoint
+            .is_some_and(|current| summary.through_sequence.is_none_or(|next| next <= current))
+        {
+            return;
+        }
+        self.usage_checkpoint = summary.through_sequence;
         self.usage_by_request.clear();
         self.unattributed_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cumulative_metered_tokens = summary.cumulative_metered_tokens;
@@ -594,6 +605,7 @@ impl SessionView {
             unavailable_usage_count: summary.unavailable_usage_count,
             observed_usage_count: summary.observed_usage_count,
         };
+        self.unattributed_cost = self.snapshot.runtime.cost.clone();
         self.snapshot.runtime.latest_usage = summary.latest_usage;
         self.bump_revision();
     }
@@ -993,6 +1005,8 @@ impl SessionView {
         replacement.snapshot.runtime = previous.runtime;
         replacement.usage_by_request = self.usage_by_request.clone();
         replacement.unattributed_metered_tokens = self.unattributed_metered_tokens;
+        replacement.unattributed_cost = self.unattributed_cost.clone();
+        replacement.usage_checkpoint = self.usage_checkpoint;
         replacement.snapshot.session_summary = previous.session_summary;
         replacement.snapshot.transcript.source_start_sequence =
             previous.transcript.source_start_sequence;
@@ -1594,6 +1608,11 @@ impl SessionView {
                 }
             }
             SessionEventKind::ModelUsage { turn_id: _, usage } => {
+                // Attached views consume the session owner's bounded accounting projection.
+                // Raw transcript windows are not a second canonical accounting source.
+                if self.usage_checkpoint.is_some() {
+                    return;
+                }
                 let mut accepted = true;
                 if let Some(request_id) = &usage.request_id {
                     accepted = self.usage_by_request.get(request_id).is_none_or(|current| {
@@ -1616,10 +1635,10 @@ impl SessionView {
                                 .map(u64::from)
                                 .fold(0_u64, u64::saturating_add),
                         );
-                    self.snapshot.runtime.cost =
-                        bcode_session_view_models::SessionCostSummary::rebuild(
-                            self.usage_by_request.values(),
-                        );
+                    self.snapshot.runtime.cost = self.unattributed_cost.clone();
+                    for observed in self.usage_by_request.values() {
+                        self.snapshot.runtime.cost.observe(observed);
+                    }
                 } else {
                     if let Some(tokens) = usage.metered_total_tokens() {
                         self.unattributed_metered_tokens = self
@@ -1631,6 +1650,7 @@ impl SessionView {
                             .cumulative_metered_tokens
                             .saturating_add(u64::from(tokens));
                     }
+                    self.unattributed_cost.observe(usage);
                     self.snapshot.runtime.cost.observe(usage);
                 }
                 if accepted {
@@ -2122,6 +2142,14 @@ impl SessionView {
     /// Apply one live-only session event.
     #[allow(clippy::too_many_lines)] // Exhaustive live-event routing remains explicit at the projection boundary.
     pub fn apply_live_event(&mut self, event: &SessionLiveEvent) {
+        if matches!(event.kind, SessionLiveEventKind::UsageSummaryChanged { .. })
+            && self
+                .snapshot
+                .session_id
+                .is_some_and(|session_id| session_id != event.session_id)
+        {
+            return;
+        }
         self.snapshot.session_id = Some(event.session_id);
         match &event.kind {
             SessionLiveEventKind::AssistantTextStreamUpdated {
@@ -2254,6 +2282,9 @@ impl SessionView {
                     },
                 });
                 self.bump_revision();
+            }
+            SessionLiveEventKind::UsageSummaryChanged { summary } => {
+                self.set_usage_summary((**summary).clone());
             }
             SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
                 self.set_context_occupancy((**occupancy).clone());
@@ -5593,6 +5624,116 @@ mod tests {
             },
         ));
         assert_eq!(transcript_item_text(view.snapshot(), &id), Some("complete"));
+    }
+
+    #[test]
+    fn hydrated_unattributed_cost_is_not_discarded_by_request_keyed_usage() {
+        let mut view = SessionView::new();
+        view.set_usage_summary(bcode_session_models::SessionUsageSummary {
+            totals_micros: BTreeMap::from([("USD".into(), 100)]),
+            estimated_usage_count: 1,
+            observed_usage_count: 2,
+            unavailable_usage_count: 1,
+            ..Default::default()
+        });
+        view.apply_event(&event(
+            SessionId::new(),
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn".into(),
+                usage: SessionTokenUsage {
+                    request_id: Some("new".into()),
+                    observation_id: Some("new:usage".into()),
+                    terminal: true,
+                    cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                        currency: "EUR".into(),
+                        total_micros: 5,
+                        components: Vec::new(),
+                        source: "fixture".into(),
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            },
+        ));
+        assert_eq!(view.snapshot().runtime.cost.totals_micros["USD"], 100);
+        assert_eq!(view.snapshot().runtime.cost.totals_micros["EUR"], 5);
+        assert_eq!(view.snapshot().runtime.cost.unavailable_usage_count, 1);
+    }
+
+    #[test]
+    fn checkpointed_cost_survives_live_usage_reconnect_and_paging() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let summary = |sequence, cost| bcode_session_models::SessionUsageSummary {
+            through_sequence: Some(sequence),
+            totals_micros: BTreeMap::from([("USD".to_owned(), cost)]),
+            estimated_usage_count: 563,
+            observed_usage_count: 563,
+            ..Default::default()
+        };
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: std::path::PathBuf::from("/tmp"),
+            },
+        ));
+        view.set_usage_summary(summary(8740, 313_851_733));
+        let usage = event(
+            session_id,
+            8768,
+            SessionEventKind::ModelUsage {
+                turn_id: "new-provider".to_owned(),
+                usage: SessionTokenUsage {
+                    request_id: Some("openai-request".to_owned()),
+                    observation_id: Some("openai-request:usage".to_owned()),
+                    terminal: true,
+                    cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                        currency: "USD".to_owned(),
+                        total_micros: 10_935_220,
+                        components: Vec::new(),
+                        source: "fixture".to_owned(),
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            },
+        );
+        view.apply_event(&usage);
+        assert_eq!(
+            view.snapshot().runtime.cost.totals_micros["USD"],
+            313_851_733
+        );
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::UsageSummaryChanged {
+                summary: Box::new(summary(8768, 324_786_953)),
+            },
+        });
+        view.apply_event(&usage);
+        view.set_usage_summary(summary(8740, 313_851_733));
+        view.set_usage_summary(summary(8768, 1));
+        assert_eq!(
+            view.snapshot().runtime.cost.totals_micros["USD"],
+            324_786_953
+        );
+        assert!(view.usage_by_request.is_empty());
+        view.apply_live_event(&SessionLiveEvent {
+            session_id: SessionId::new(),
+            kind: SessionLiveEventKind::UsageSummaryChanged {
+                summary: Box::new(summary(9999, 1)),
+            },
+        });
+        assert_eq!(
+            view.snapshot().runtime.cost.totals_micros["USD"],
+            324_786_953
+        );
+        for sequence in 8769..18_769 {
+            view.set_usage_summary(summary(sequence, 324_786_953 + sequence));
+            assert!(view.usage_by_request.is_empty());
+        }
     }
 
     #[test]

@@ -15120,6 +15120,7 @@ const STRUCTURED_RESULT_CORRECTION_INSTRUCTION: &str = "The previous structured 
 
 #[derive(Debug, Clone, Default)]
 struct ModelPollOutcome {
+    reported_usage: Option<TokenUsage>,
     stop_reason: Option<bcode_model::StopReason>,
     completion: Option<ModelTurnCompletion>,
     assistant_output: Option<String>,
@@ -16189,9 +16190,9 @@ async fn run_model_turn_inner(
         let PreparedModelRequest {
             mut request,
             mut context_projection,
-            pricing,
-            catalog_provider_id,
-            catalog_identity,
+            mut pricing,
+            mut catalog_provider_id,
+            mut catalog_identity,
             structured_output_execution,
         } = prepared;
         let structured_output_phase = if structured_output_finalization {
@@ -16304,6 +16305,9 @@ async fn run_model_turn_inner(
                     }
                 };
                 request = prepared.request;
+                pricing = prepared.pricing;
+                catalog_provider_id = prepared.catalog_provider_id;
+                catalog_identity = prepared.catalog_identity;
                 let desired_structured_output = request.structured_output.clone();
                 let phase = if structured_output_finalization {
                     StructuredOutputPhase::Finalization
@@ -16453,7 +16457,10 @@ async fn run_model_turn_inner(
         )
         .await
         {
-            ModelTurnRetry::Continue => continue,
+            ModelTurnRetry::Continue => {
+                rounds.complete_provider_round();
+                continue;
+            }
             ModelTurnRetry::Return(completion) => return completion,
             ModelTurnRetry::None => {}
         }
@@ -17779,6 +17786,27 @@ async fn run_model_turn_round(
     let scope = active_plugin_scope_for_session(state, session_id).await;
     let start_timer = state.metrics.timer();
 
+    let mut active_model_turn = ModelRequestAttempt {
+        identity: context_projection.request.clone(),
+        provider_turn_id: String::new(),
+        pricing: pricing.cloned(),
+        catalog_provider_id: catalog_provider_id.map(ToOwned::to_owned),
+        catalog_entry_id: catalog_identity.map(|identity| identity.catalog_entry_id.clone()),
+        catalog_family: catalog_identity.and_then(|identity| identity.family.clone()),
+        catalog_api_surface: catalog_identity.and_then(|identity| identity.api_surface),
+        reuse_key: request.conversation_reuse.key.clone(),
+        request_message_count: request.messages.len(),
+        context_through_sequence: context_projection.context_through_sequence,
+        portable_context: bounded_portable_context(&request.messages),
+        local_estimate: context_projection.local_estimate,
+        managed_compaction_persisted: false,
+    };
+    // A durable unknown-cost observation fences the billing attempt before dispatch.
+    // Interrupted dispatch is ambiguous, never implicitly free or safe to replay.
+    record_pending_request_usage(state, session_id, &active_model_turn)
+        .await
+        .map_err(|error| ModelTurnCompletion::with_message(ModelTurnOutcome::Error, error))?;
+
     // Prefer push delivery when the provider serves the streaming interface. Events then arrive as
     // the provider produces them, with no poll interval between them.
     let (delivery, provider_turn_id) = if let Some((push_plugin_id, push_interface_id)) =
@@ -17888,21 +17916,7 @@ async fn run_model_turn_round(
     };
 
     let delivery_is_push = delivery.is_push();
-    let active_model_turn = ModelRequestAttempt {
-        identity: context_projection.request.clone(),
-        provider_turn_id: provider_turn_id.clone(),
-        pricing: pricing.cloned(),
-        catalog_provider_id: catalog_provider_id.map(ToOwned::to_owned),
-        catalog_entry_id: catalog_identity.map(|identity| identity.catalog_entry_id.clone()),
-        catalog_family: catalog_identity.and_then(|identity| identity.family.clone()),
-        catalog_api_surface: catalog_identity.and_then(|identity| identity.api_surface),
-        reuse_key: request.conversation_reuse.key.clone(),
-        request_message_count: request.messages.len(),
-        context_through_sequence: context_projection.context_through_sequence,
-        portable_context: bounded_portable_context(&request.messages),
-        local_estimate: context_projection.local_estimate,
-        managed_compaction_persisted: false,
-    };
+    active_model_turn.provider_turn_id = provider_turn_id.clone();
     begin_provider_round(command_context, active_model_turn).await;
 
     append_trace_event(
@@ -18690,6 +18704,17 @@ async fn stream_model_turn_events(
         }
     }
     outcome.stream.record_close("loop_exited");
+    if outcome.reported_usage.is_none() {
+        drain_interrupted_request_usage(
+            state,
+            session_id,
+            provider_turn_id,
+            turn_id,
+            &mut invocation,
+            &mut outcome,
+        )
+        .await;
+    }
 
     finish_all_tool_request_drafts(
         state,
@@ -18727,6 +18752,50 @@ async fn stream_model_turn_events(
         *next_output_position = max_position.saturating_add(1);
     }
     (assistant, outcome)
+}
+
+/// Give provider cancellation finalizers a bounded opportunity to deliver billing evidence.
+/// Only usage is accepted here: late text/tools must not reopen terminal execution.
+async fn drain_interrupted_request_usage(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_turn_id: &str,
+    turn_id: &str,
+    invocation: &mut bcode_plugin::StreamingServiceInvocation,
+    outcome: &mut ModelPollOutcome,
+) {
+    let received_usage = receive_final_billing_usage(invocation).await;
+    // The timeout bounds provider waiting, never cancellation of a canonical commit.
+    if let Some(usage) = received_usage {
+        let terminal_completion = outcome.completion.clone();
+        handle_provider_usage_event(state, session_id, provider_turn_id, turn_id, usage, outcome)
+            .await;
+        // Billing cleanup cannot change a cancellation/timeout into a different outcome.
+        if terminal_completion.is_some() {
+            outcome.completion = terminal_completion;
+        }
+    }
+}
+
+async fn receive_final_billing_usage(
+    invocation: &mut bcode_plugin::StreamingServiceInvocation,
+) -> Option<TokenUsage> {
+    invocation.cancel.cancel();
+    tokio::time::timeout(Duration::from_millis(250), async {
+        for _ in 0..128 {
+            let payload = match invocation.next_event().await {
+                Ok(StreamingServiceInvocationEvent::Event(payload)) => payload,
+                Ok(StreamingServiceInvocationEvent::Response(_)) | Err(_) => break,
+            };
+            if let Ok(ProviderTurnEvent::Usage { usage }) = serde_json::from_slice(&payload) {
+                return Some(usage);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -19807,6 +19876,16 @@ async fn handle_provider_usage_event(
                 .await;
         }
     }
+    if let Some(previous) = &outcome.reported_usage {
+        if previous != &usage {
+            outcome.completion = Some(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                "provider emitted conflicting duplicate usage",
+            ));
+        }
+        return;
+    }
+    outcome.reported_usage = Some(usage.clone());
     append_provider_event_trace(state, session_id, turn_id, "usage", None).await;
     update_provider_usage_state(state, session_id, &usage).await;
     let attempt = state
@@ -19816,13 +19895,20 @@ async fn handle_provider_usage_event(
             turn.model_attempt_for_provider_turn(provider_turn_id)
                 .cloned()
         });
-    append_model_usage_event(
+    if let Err(error) = append_model_usage_event(
         state,
         session_id,
         turn_id.to_owned(),
         session_token_usage(&usage, attempt.as_ref()),
     )
-    .await;
+    .await
+    {
+        append_system_event(state, session_id, error.clone()).await;
+        outcome.completion = Some(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Error,
+            error,
+        ));
+    }
 }
 
 async fn handle_provider_request_projection_event(
@@ -21815,6 +21901,10 @@ async fn build_model_turn_request(
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
     metadata.insert(
+        "bcode_request_attempt_id".to_owned(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    metadata.insert(
         bcode_model::APPLICATION_TURN_ID_METADATA_KEY.to_string(),
         format!("{session_id}-{}", trigger_event.sequence),
     );
@@ -22012,16 +22102,21 @@ async fn projected_request_context(
         .get("bcode_context_through_sequence")
         .and_then(|value| value.parse().ok())
         .unwrap_or_default();
-    let request_id = request.turn_id.clone();
+    let request_id = request
+        .metadata
+        .get("bcode_request_attempt_id")
+        .cloned()
+        .unwrap_or_else(|| request.turn_id.clone());
     let invocation = bcode_session_models::ModelRequestIdentity {
         provider_plugin_id: provider_plugin_id.unwrap_or("<auto>").to_string(),
         requested_model_id: request.metadata.get("bcode_requested_model_id").cloned(),
         effective_model_id: request.model_id.clone(),
         request_id: request_id.clone(),
-        model_turn_id: request_id
+        model_turn_id: request
+            .turn_id
             .rsplit_once('-')
-            .map_or_else(|| request_id.clone(), |(turn, _)| turn.to_string()),
-        round: model_round_from_turn_id(&request_id).unwrap_or_default(),
+            .map_or_else(|| request.turn_id.clone(), |(turn, _)| turn.to_string()),
+        round: model_round_from_turn_id(&request.turn_id).unwrap_or_default(),
         request_fingerprint: stable_json_hash(request),
         effective_auth_profile: request.provider_context.auth_profile.clone(),
         context_format_version: request
@@ -31324,20 +31419,42 @@ async fn append_exact_request_context_observation(
     }
 }
 
+async fn record_pending_request_usage(
+    state: &ServerState,
+    session_id: SessionId,
+    attempt: &ModelRequestAttempt,
+) -> Result<(), String> {
+    let mut usage = session_token_usage(&TokenUsage::default(), Some(attempt));
+    usage.terminal = false;
+    usage.observation_ordinal = 0;
+    usage.observation_id = Some(format!("{}:pending", attempt.identity.request_id));
+    usage.cost = Some(bcode_session_models::SessionCostEstimate::Unavailable {
+        reason: bcode_session_models::SessionCostUnavailableReason::ProviderUsageIncomplete,
+    });
+    let event = state
+        .sessions
+        .append_model_usage(session_id, attempt.identity.model_turn_id.clone(), usage)
+        .await
+        .map_err(|_| "could not persist request accounting before provider dispatch".to_owned())?;
+    publish_session_event(state, &event).await;
+    Ok(())
+}
+
 async fn append_model_usage_event(
     state: &ServerState,
     session_id: SessionId,
     turn_id: String,
     usage: SessionTokenUsage,
-) {
-    match state
+) -> Result<(), String> {
+    let event = state
         .sessions
         .append_model_usage(session_id, turn_id, usage)
         .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append model usage: {error}"),
-    }
+        .map_err(|_| {
+            "provider usage could not be committed; session cost coverage is incomplete".to_owned()
+        })?;
+    publish_session_event(state, &event).await;
+    Ok(())
 }
 
 fn session_token_usage(
@@ -31361,7 +31478,7 @@ fn session_token_usage(
                     pricing.estimate_cost(usage).map_or_else(
                         || {
                             Some(bcode_session_models::SessionCostEstimate::Unavailable {
-                                reason: bcode_session_models::SessionCostUnavailableReason::PricingRuleUnavailableOrAmbiguous,
+                                reason: pricing.cost_unavailable_reason(usage),
                             })
                         },
                         |estimate| Some(session_cost_estimate(estimate)),
@@ -31374,7 +31491,7 @@ fn session_token_usage(
     SessionTokenUsage {
         request_id: attempt.map(|attempt| attempt.identity.request_id.clone()),
         observation_id: attempt.map(|attempt| format!("{}:usage", attempt.identity.request_id)),
-        observation_ordinal: 0,
+        observation_ordinal: u32::from(attempt.is_some()),
         terminal: attempt.is_some(),
         request: attempt.map(|attempt| Box::new(attempt.identity.clone())),
         catalog_provider_id: attempt.and_then(|attempt| attempt.catalog_provider_id.clone()),
@@ -40256,6 +40373,111 @@ library = "test"
             bcode_session_models::RequestContextTokenCount::ProviderExact(84)
         );
         assert_eq!(observation.local_estimate, attempt.local_estimate);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn request_cost_lifecycle_captures_rates_and_preserves_interrupted_coverage() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = test_server_state(sessions);
+        let identity: bcode_session_models::ModelRequestIdentity = serde_json::from_value(serde_json::json!({
+            "provider_plugin_id":"provider-one","requested_model_id":"alias","effective_model_id":"model-one",
+            "request_id":"attempt-one","model_turn_id":"logical-turn","round":0,"request_fingerprint":"fixture",
+            "context_epoch":0
+        })).unwrap();
+        let pricing: bcode_model::ModelPricingInfo = serde_json::from_value(serde_json::json!({
+            "currency":"USD","unit":"per_million_tokens","source":"user_override","revision":"frozen",
+            "input":{"micros":1_000_000},"cached_input":{"micros":100_000},"output":{"micros":1_000_000}
+        })).unwrap();
+        let mut attempt = ModelRequestAttempt {
+            identity,
+            provider_turn_id: "provider-turn".into(),
+            pricing: Some(pricing),
+            catalog_provider_id: Some("provider-one".into()),
+            catalog_entry_id: Some("model-one".into()),
+            catalog_family: None,
+            catalog_api_surface: None,
+            reuse_key: None,
+            request_message_count: 1,
+            context_through_sequence: 0,
+            portable_context: String::new(),
+            local_estimate: bcode_session_models::LocalContextEstimate {
+                tokens: 100,
+                algorithm_version: 1,
+            },
+            managed_compaction_persisted: false,
+        };
+        record_pending_request_usage(&state, session.id, &attempt)
+            .await
+            .unwrap();
+        let cold = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cached_input_tokens: Some(0),
+            ..Default::default()
+        };
+        let priced = session_token_usage(&cold, Some(&attempt));
+        append_model_usage_event(&state, session.id, "logical-turn".into(), priced.clone())
+            .await
+            .unwrap();
+        append_model_usage_event(&state, session.id, "logical-turn".into(), priced)
+            .await
+            .unwrap();
+        attempt.identity.request_id = "attempt-two".into();
+        attempt.identity.provider_plugin_id = "provider-two".into();
+        // A cancelled/new-provider attempt cannot remove the first provider's charge.
+        record_pending_request_usage(&state, session.id, &attempt)
+            .await
+            .unwrap();
+        let attached = state
+            .sessions
+            .attach_session_recent(session.id, ClientId::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(attached.usage_summary.totals_micros["USD"], 110);
+        assert_eq!(attached.usage_summary.observed_usage_count, 2);
+        assert_eq!(attached.usage_summary.unavailable_usage_count, 1);
+        let warm = TokenUsage {
+            cached_input_tokens: Some(90),
+            ..cold
+        };
+        append_model_usage_event(
+            &state,
+            session.id,
+            "logical-turn".into(),
+            session_token_usage(&warm, Some(&attempt)),
+        )
+        .await
+        .unwrap();
+        let attached = state
+            .sessions
+            .attach_session_recent(session.id, ClientId::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(attached.usage_summary.totals_micros["USD"], 139);
+        assert_eq!(attached.usage_summary.unavailable_usage_count, 0);
+        attempt.identity.request_id = "compaction-attempt".into();
+        record_pending_request_usage(&state, session.id, &attempt)
+            .await
+            .unwrap();
+        let _ = context_compaction::handle_compaction_events(
+            &state,
+            session.id,
+            &attempt,
+            &mut String::new(),
+            vec![ProviderTurnEvent::Usage { usage: warm }],
+        )
+        .await;
+        let attached = state
+            .sessions
+            .attach_session_recent(session.id, ClientId::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(attached.usage_summary.totals_micros["USD"], 168);
         drop(state);
     }
 

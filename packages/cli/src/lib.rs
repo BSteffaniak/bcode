@@ -15634,6 +15634,12 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
             "live tool progress call={} sequence={} stage={:?}",
             event.invocation_id, event.sequence, event.stage
         ),
+        SessionLiveEventKind::UsageSummaryChanged { summary } => {
+            format!(
+                "live cumulative cost: {:?}; unavailable requests: {}",
+                summary.totals_micros, summary.unavailable_usage_count
+            )
+        }
         SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
             format!("live context occupancy: {occupancy:?}")
         }

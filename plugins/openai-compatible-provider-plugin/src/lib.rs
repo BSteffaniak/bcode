@@ -1958,6 +1958,8 @@ struct ChatMessageToolCallFunction {
 struct ChatCompletionChunk {
     choices: Vec<ChatChunkChoice>,
     #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
     usage: Option<OpenAiUsage>,
 }
 
@@ -5101,9 +5103,27 @@ fn process_responses_stream_line(
                 }
                 return Ok(StreamOutcome::MaxTokens);
             }
+            if let Some(usage) = openai_usage_from_responses_event(&event) {
+                processor.sink.push(ProviderTurnEvent::Usage {
+                    usage: token_usage_from_openai_usage_with_context(
+                        usage,
+                        processor.dialect,
+                        processor.pricing_context.clone(),
+                    ),
+                });
+            }
             return Err(responses_incomplete_error(&event));
         }
         "response.failed" | "error" => {
+            if let Some(usage) = openai_usage_from_responses_event(&event) {
+                processor.sink.push(ProviderTurnEvent::Usage {
+                    usage: token_usage_from_openai_usage_with_context(
+                        usage,
+                        processor.dialect,
+                        processor.pricing_context.clone(),
+                    ),
+                });
+            }
             return Err(responses_failed_error(&event));
         }
         _ => {}
@@ -5284,7 +5304,8 @@ fn process_stream_line(
             error.to_string(),
         )
     })?;
-    if let Some(usage) = chunk.usage {
+    if let Some(mut usage) = chunk.usage {
+        usage.service_tier = chunk.service_tier.or(usage.service_tier);
         let exact_input = usage.prompt_tokens.or(usage.input_tokens);
         turn.push(ProviderTurnEvent::Usage {
             usage: token_usage_from_openai_usage(usage, OpenAiCompatibleDialect::ChatCompletions),
@@ -5337,12 +5358,13 @@ fn openai_usage_context(request: &ModelTurnRequest) -> OpenAiUsageContext {
         service_tier: options
             .as_ref()
             .and_then(|options| options.service_tier)
-            .map(|tier| match tier {
-                OpenAiServiceTier::Auto | OpenAiServiceTier::Default => "standard",
-                OpenAiServiceTier::Flex => "flex",
-                OpenAiServiceTier::Priority => "priority",
-            })
-            .map(str::to_string),
+            .and_then(|tier| match tier {
+                // Auto/priority/flex are requests, not confirmation of the billed tier.
+                OpenAiServiceTier::Default => Some("standard".to_owned()),
+                OpenAiServiceTier::Auto | OpenAiServiceTier::Flex | OpenAiServiceTier::Priority => {
+                    None
+                }
+            }),
         prompt_cache_retention: options
             .and_then(|options| options.prompt_cache_retention)
             .map(|retention| match retention {
@@ -5411,19 +5433,45 @@ fn token_usage_from_openai_usage_with_context(
     // OpenAI Chat Completions `prompt_tokens` and Responses `input_tokens` are totals that already
     // include cached tokens. Cached details are a billed subset, not additional model-visible
     // input, across both native OpenAI and compatible surfaces using this contract.
-    let total_tokens = usage.total_tokens;
     let output_tokens = usage.completion_tokens.or(usage.output_tokens);
-    let details = openai_modality_usage_details(
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        input_audio_tokens,
-        output_audio_tokens,
-    );
+    let ambiguous_modality = input_audio_tokens.is_some_and(|audio| {
+        audio > input_tokens.unwrap_or_default()
+            || (audio > 0 && cached_input_tokens.is_none_or(|cached| cached > 0))
+    }) || output_audio_tokens
+        .is_some_and(|audio| audio > output_tokens.unwrap_or_default());
+    let details = if ambiguous_modality {
+        // Preserve evidence without inventing a cached-audio allocation. Incomplete
+        // details intentionally make pricing unavailable.
+        [
+            (bcode_model::ModelPricingBucket::Input, input_audio_tokens),
+            (bcode_model::ModelPricingBucket::Output, output_audio_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(bucket, tokens)| {
+            tokens
+                .filter(|tokens| *tokens > 0)
+                .map(|tokens| bcode_model::ModelTokenUsageDetail {
+                    bucket,
+                    modality: bcode_model::ModelTokenModality::Audio,
+                    tokens,
+                    cache_ttl_seconds: None,
+                })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+    } else {
+        openai_modality_usage_details(
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            input_audio_tokens,
+            output_audio_tokens,
+        )
+    };
     TokenUsage {
         input_tokens,
         output_tokens,
-        total_tokens,
+        total_tokens: usage.total_tokens,
         cached_input_tokens,
         cache_write_input_tokens: None,
         details,
@@ -5458,12 +5506,8 @@ fn openai_modality_usage_details(
         return Box::default();
     }
     let cached = cached_input_tokens.unwrap_or_default();
-    let input_audio = input_audio_tokens
-        .unwrap_or_default()
-        .min(input_tokens.unwrap_or_default());
-    let output_audio = output_audio_tokens
-        .unwrap_or_default()
-        .min(output_tokens.unwrap_or_default());
+    let input_audio = input_audio_tokens.unwrap_or_default();
+    let output_audio = output_audio_tokens.unwrap_or_default();
     let mut details = Vec::new();
     for (bucket, modality, tokens) in [
         (
@@ -5514,7 +5558,16 @@ fn openai_usage_from_responses_event(event: &serde_json::Value) -> Option<OpenAi
         .get("response")
         .and_then(|response| response.get("usage"))
         .or_else(|| event.get("usage"))?;
-    serde_json::from_value(usage.clone()).ok()
+    let mut usage: OpenAiUsage = serde_json::from_value(usage.clone()).ok()?;
+    if let Some(tier) = event
+        .get("response")
+        .unwrap_or(event)
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+    {
+        usage.service_tier = Some(tier.to_owned());
+    }
+    Some(usage)
 }
 
 #[cfg(test)]
@@ -11567,6 +11620,23 @@ mod tests {
                 && detail.tokens == 1
         }));
         assert_eq!(usage.reasoning_tokens, Some(2));
+    }
+
+    #[test]
+    fn response_usage_uses_reported_tier_and_does_not_guess_cached_audio() {
+        let event = serde_json::json!({"response": {
+            "service_tier":"flex", "usage":{"input_tokens":100,"output_tokens":10,
+                "input_tokens_details":{"cached_tokens":30,"audio_tokens":20}}
+        }});
+        let usage = token_usage_from_responses_event(&event, OpenAiCompatibleDialect::ResponsesApi)
+            .unwrap();
+        assert_eq!(usage.pricing_context.service_tier.as_deref(), Some("flex"));
+        let pricing: bcode_model::ModelPricingInfo = serde_json::from_value(serde_json::json!({
+            "currency":"USD","unit":"per_million_tokens","source":"user_override",
+            "input":{"micros":1_000_000},"cached_input":{"micros":100_000},"output":{"micros":1_000_000}
+        }))
+        .unwrap();
+        assert!(pricing.estimate_cost(&usage).is_none());
     }
 
     #[test]
