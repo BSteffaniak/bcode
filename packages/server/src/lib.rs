@@ -4783,6 +4783,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
+        Request::InspectWorkflowRunGraph { .. } => "inspect_workflow_run_graph",
         Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
         Request::WorkflowRunView { .. } => "workflow_run_view",
         Request::WorkflowCatalogView { .. } => "workflow_catalog_view",
@@ -6245,6 +6246,15 @@ async fn handle_workflow_run_request(
 ) -> Result<(), ServerError> {
     state.require_workflow_store()?;
     match request {
+        RuntimeAndModelRequest::InspectWorkflowRunGraph { request } => {
+            let graph = workflow_operations::inspect_graph_page(state, &request)?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunGraphInspection { graph }),
+            )
+            .await
+        }
         RuntimeAndModelRequest::InspectWorkflowRun { run_id, limit } => {
             let inspection = workflow_operations::inspect_run(state, &run_id, limit).await?;
             send_response(
@@ -62325,6 +62335,53 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let inspection = workflow_operations::inspect_run(&state, "input-wake-run", 10)
             .await
             .expect("inspection");
+        let graph = inspection.graph.as_ref().expect("run-owned graph");
+        assert_eq!(graph.revision, 1);
+        assert!(graph.nodes_complete);
+        assert!(graph.edges_complete);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|record| record.node.id == "terminal")
+        );
+        let bounded = workflow_operations::inspect_run(&state, "input-wake-run", 1)
+            .await
+            .expect("bounded inspection");
+        let bounded_graph = bounded.graph.expect("bounded graph");
+        assert_eq!(bounded_graph.nodes.len(), 1);
+        assert!(!bounded_graph.nodes_complete);
+        assert!(bounded_graph.edges.len() <= 1);
+        let mut page_request = bcode_ipc::WorkflowRunGraphPageRequest {
+            run_id: "input-wake-run".to_string(),
+            expected_revision: graph.revision,
+            after_node_id: Some(bounded_graph.nodes[0].node.id.clone()),
+            after_edge_id: bounded_graph.edges.last().map(|edge| edge.edge_id),
+            limit: 1,
+        };
+        let page_envelope = bcode_ipc::request_envelope(
+            2,
+            &Request::InspectWorkflowRunGraph {
+                request: page_request.clone(),
+            },
+        )
+        .expect("graph page request");
+        bcode_ipc::send_envelope(&mut stream, &page_envelope)
+            .await
+            .expect("send graph page request");
+        let page_response = bcode_ipc::recv_envelope(&mut stream)
+            .await
+            .expect("graph page response");
+        let Response::Ok(ResponsePayload::WorkflowRunGraphInspection { graph: page }) =
+            bcode_ipc::decode_response(&page_response.payload).expect("decode graph page")
+        else {
+            panic!("unexpected graph page response");
+        };
+        assert_eq!(page.revision, graph.revision);
+        assert_eq!(page.nodes, graph.nodes[1..2]);
+        assert_eq!(page.nodes_complete, graph.nodes.len() == 2);
+        page_request.expected_revision += 1;
+        assert!(workflow_operations::inspect_graph_page(&state, &page_request).is_err());
         let terminal = inspection.terminal_output.expect("terminal output");
         assert_eq!(
             run.terminal_output_id.as_deref(),

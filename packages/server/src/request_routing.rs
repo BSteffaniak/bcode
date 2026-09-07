@@ -495,6 +495,10 @@ pub enum WorkflowDefinitionRequest {
 /// Requests owned by the `RuntimeAndModel` dispatcher (31 variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAndModelRequest {
+    /// Read one bounded run graph page at an expected revision.
+    InspectWorkflowRunGraph {
+        request: bcode_ipc::WorkflowRunGraphPageRequest,
+    },
     /// Return one bounded aggregate workflow inspection snapshot.
     InspectWorkflowRun {
         run_id: String,
@@ -1137,6 +1141,11 @@ impl RoutedRequest {
                     version,
                 },
             )),
+            Request::InspectWorkflowRunGraph { request } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::InspectWorkflowRunGraph {
+                    request,
+                }))
+            }
             Request::InspectWorkflowRun { run_id, limit } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::InspectWorkflowRun {
                     run_id,

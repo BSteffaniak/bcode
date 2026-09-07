@@ -4039,6 +4039,24 @@ impl BcodeClient {
         }
     }
 
+    /// Read one bounded run-owned graph page.
+    ///
+    /// # Errors
+    /// Returns an error for transport failures, missing or damaged graphs, invalid
+    /// cursors or limits, or an expected revision that is no longer current.
+    pub async fn inspect_workflow_run_graph(
+        &self,
+        request: bcode_ipc::WorkflowRunGraphPageRequest,
+    ) -> Result<bcode_ipc::WorkflowRunGraphInspection, ClientError> {
+        match self
+            .send_request(Request::InspectWorkflowRunGraph { request })
+            .await?
+        {
+            ResponsePayload::WorkflowRunGraphInspection { graph } => Ok(graph),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return one bounded aggregate workflow inspection snapshot.
     ///
     /// # Errors

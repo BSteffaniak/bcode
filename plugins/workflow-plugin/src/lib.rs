@@ -157,6 +157,11 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Inspect workflow graph and history",
         ),
         (
+            "workflow.graph",
+            "Workflow: Graph Page",
+            "Read run graph nodes and edges at an expected revision",
+        ),
+        (
             "workflow.doctor",
             "Workflow: Doctor",
             "Diagnose one workflow run without mutation",
@@ -208,7 +213,7 @@ fn command_contributions() -> Vec<CommandContribution> {
             name: id.to_string(),
             aliases: BTreeSet::new(),
         }),
-        arguments: Vec::new(),
+        arguments: graph_command_arguments(id),
         session: bcode_command::CommandSessionRequirement::Optional,
         execution: bcode_command::CommandExecution::Immediate,
         owner: CommandOwner::Plugin {
@@ -220,6 +225,53 @@ fn command_contributions() -> Vec<CommandContribution> {
         },
     })
     .collect()
+}
+
+fn graph_command_arguments(id: &str) -> Vec<bcode_command::CommandArgumentContribution> {
+    use bcode_command::CommandArgumentKind::{Integer, String as Text};
+
+    let fields = match id {
+        "workflow.graph" => vec![
+            ("run_id", Text, true, "Run identity"),
+            (
+                "expected_revision",
+                Integer,
+                true,
+                "Positive graph revision from workflow.inspect; restart pagination on conflict",
+            ),
+            (
+                "after_node_id",
+                Text,
+                false,
+                "Exclusive last node identity from the previous page",
+            ),
+            (
+                "after_edge_id",
+                Integer,
+                false,
+                "Exclusive last edge identity from the previous page (zero is valid)",
+            ),
+            (
+                "limit",
+                Integer,
+                false,
+                "Maximum nodes and edges per page, 1 through 100; defaults to 100",
+            ),
+        ],
+        "workflow.inspect" => vec![("run_id", Text, true, "Run identity")],
+        _ => return Vec::new(),
+    };
+    fields
+        .into_iter()
+        .map(
+            |(name, kind, required, description)| bcode_command::CommandArgumentContribution {
+                name: name.to_string(),
+                kind,
+                required,
+                description: Some(description.to_string()),
+            },
+        )
+        .collect()
 }
 
 fn invoke_command(request: &ServiceRequest) -> ServiceResponse {
@@ -655,6 +707,15 @@ pub(crate) async fn execute_command(
             options.insert("run_id".to_string(), serde_json::json!(run_id));
             format!("{} changed={changed}", request.command_id)
         }
+        "workflow.graph" => {
+            let page = graph_page_request(&request)?;
+            let graph = client
+                .inspect_workflow_run_graph(page)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("graph".to_string(), serde_json::json!(graph));
+            format!("workflow graph revision {}", graph.revision)
+        }
         "workflow.inspect" => {
             let run_id = required_arg(&request, "run_id")?;
             let inspection = client
@@ -663,6 +724,7 @@ pub(crate) async fn execute_command(
                 .map_err(|error| error.to_string())?;
             options.extend([
                 ("run".to_string(), serde_json::json!(inspection.run)),
+                ("graph".to_string(), serde_json::json!(inspection.graph)),
                 (
                     "definition".to_string(),
                     serde_json::json!(inspection.definition),
@@ -1168,6 +1230,38 @@ fn optional_json_arg(
         .transpose()
 }
 
+fn graph_page_request(
+    request: &InvokeCommandRequest,
+) -> Result<bcode_ipc::WorkflowRunGraphPageRequest, String> {
+    let expected_revision = parse_arg::<u64>(request, "expected_revision")?;
+    if expected_revision == 0 {
+        return Err("expected_revision must be positive".to_string());
+    }
+    let limit = if request.args.contains_key("limit") {
+        parse_arg::<usize>(request, "limit")?
+    } else {
+        QUERY_LIMIT
+    };
+    if !(1..=QUERY_LIMIT).contains(&limit) {
+        return Err(format!("limit must be between 1 and {QUERY_LIMIT}"));
+    }
+    Ok(bcode_ipc::WorkflowRunGraphPageRequest {
+        run_id: required_arg(request, "run_id")?,
+        expected_revision,
+        after_node_id: request
+            .args
+            .contains_key("after_node_id")
+            .then(|| required_arg(request, "after_node_id"))
+            .transpose()?,
+        after_edge_id: request
+            .args
+            .contains_key("after_edge_id")
+            .then(|| parse_arg(request, "after_edge_id"))
+            .transpose()?,
+        limit,
+    })
+}
+
 fn required_arg(request: &InvokeCommandRequest, name: &str) -> Result<String, String> {
     request
         .args
@@ -1402,6 +1496,82 @@ mod tests {
             context: None,
         };
         assert!(optional_json_arg(&oversized, "input").is_err());
+    }
+
+    #[test]
+    fn graph_command_declares_its_required_inputs_and_optional_cursors() {
+        let commands = command_contributions();
+        let graph = commands
+            .iter()
+            .find(|command| command.id == "workflow.graph")
+            .expect("graph command");
+        let required = graph
+            .arguments
+            .iter()
+            .filter(|argument| argument.required)
+            .map(|argument| argument.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(required, ["run_id", "expected_revision"]);
+        let mut request = InvokeCommandRequest {
+            command_id: graph.id.clone(),
+            args: BTreeMap::from([
+                ("run_id".to_string(), "run-1".to_string()),
+                ("expected_revision".to_string(), "1".to_string()),
+            ]),
+            context: None,
+        };
+        assert!(graph_page_request(&request).is_ok());
+        for argument in &graph.arguments {
+            if argument.required {
+                let value = request.args.remove(&argument.name).expect("required value");
+                assert!(graph_page_request(&request).is_err());
+                request.args.insert(argument.name.clone(), value);
+            }
+        }
+        assert_eq!(graph.arguments.len(), 5);
+        assert!(
+            graph
+                .arguments
+                .iter()
+                .all(|argument| argument.description.is_some())
+        );
+    }
+
+    #[test]
+    fn graph_page_arguments_preserve_cursors_and_reject_invalid_bounds() {
+        let mut request = InvokeCommandRequest {
+            command_id: "workflow.graph".to_string(),
+            args: parse_arguments(
+                "run_id=run-1 expected_revision=3 after_node_id=node-2 after_edge_id=0 limit=1",
+            ),
+            context: None,
+        };
+        let page = graph_page_request(&request).expect("graph request");
+        assert_eq!(page.run_id, "run-1");
+        assert_eq!(page.expected_revision, 3);
+        assert_eq!(page.after_node_id.as_deref(), Some("node-2"));
+        assert_eq!(page.after_edge_id, Some(0));
+        assert_eq!(page.limit, 1);
+        for (name, value) in [
+            ("expected_revision", "0"),
+            ("after_edge_id", "invalid"),
+            ("after_node_id", ""),
+            ("limit", "0"),
+            ("limit", "100000"),
+        ] {
+            let old = request.args.insert(name.to_string(), value.to_string());
+            assert!(graph_page_request(&request).is_err(), "{name}={value}");
+            request
+                .args
+                .insert(name.to_string(), old.expect("existing argument"));
+        }
+        request.args.remove("limit");
+        assert_eq!(
+            graph_page_request(&request).expect("default limit").limit,
+            QUERY_LIMIT
+        );
+        request.args.remove("expected_revision");
+        assert!(graph_page_request(&request).is_err());
     }
 
     #[test]

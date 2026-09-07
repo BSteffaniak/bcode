@@ -5073,6 +5073,79 @@ pub fn run_outputs(
         .collect())
 }
 
+pub fn inspect_graph_page(
+    state: &ServerState,
+    request: &bcode_ipc::WorkflowRunGraphPageRequest,
+) -> Result<bcode_ipc::WorkflowRunGraphInspection, bcode_workflow_store::WorkflowStoreError> {
+    let store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    inspect_run_graph(
+        &store,
+        &request.run_id,
+        request.after_node_id.as_deref(),
+        request.after_edge_id,
+        Some(request.expected_revision),
+        request.limit,
+    )
+}
+
+fn inspect_run_graph(
+    store: &bcode_workflow_store::WorkflowStore,
+    run_id: &str,
+    after_node_id: Option<&str>,
+    after_edge_id: Option<u64>,
+    expected_revision: Option<u64>,
+    limit: usize,
+) -> Result<bcode_ipc::WorkflowRunGraphInspection, bcode_workflow_store::WorkflowStoreError> {
+    let revision = store.run_graph_revision(run_id)?.ok_or_else(|| {
+        bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow run graph not found".to_string(),
+        )
+    })?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            format!("workflow graph revision conflict: current revision is {revision}"),
+        ));
+    }
+    let nodes = store.run_graph_nodes(run_id, after_node_id, limit)?;
+    let edges = store.run_graph_edges(run_id, after_edge_id, limit)?;
+    let nodes_complete = match nodes.last() {
+        Some(last) => store
+            .run_graph_nodes(run_id, Some(&last.node.id), 1)?
+            .is_empty(),
+        None => true,
+    };
+    let edges_complete = match edges.last() {
+        Some(last) => store
+            .run_graph_edges(run_id, Some(last.edge_id), 1)?
+            .is_empty(),
+        None => true,
+    };
+    Ok(bcode_ipc::WorkflowRunGraphInspection {
+        revision,
+        nodes: nodes
+            .into_iter()
+            .map(|record| bcode_ipc::WorkflowRunGraphNodeInspection {
+                revision: record.revision,
+                node: record.node,
+                entry: record.entry,
+                exit: record.exit,
+            })
+            .collect(),
+        edges: edges
+            .into_iter()
+            .map(|record| bcode_ipc::WorkflowRunGraphEdgeInspection {
+                edge_id: record.edge_id,
+                edge: record.edge,
+            })
+            .collect(),
+        nodes_complete,
+        edges_complete,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn inspect_run(
     state: &ServerState,
@@ -5081,6 +5154,7 @@ pub async fn inspect_run(
 ) -> Result<bcode_ipc::WorkflowRunInspection, super::ServerError> {
     let (
         run,
+        graph,
         definition,
         terminal_output,
         activations,
@@ -5143,6 +5217,7 @@ pub async fn inspect_run(
         let execution_session_links = store.execution_session_links_for_run(run_id, limit)?;
         (
             run,
+            inspect_run_graph(&store, run_id, None, None, None, limit)?,
             definition,
             terminal_output,
             store.activations_for_run(run_id, limit)?,
@@ -5220,6 +5295,7 @@ pub async fn inspect_run(
     };
     Ok(bcode_ipc::WorkflowRunInspection {
         run,
+        graph: Some(graph),
         definition,
         terminal_output,
         activations,

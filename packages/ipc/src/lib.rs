@@ -679,6 +679,10 @@ pub enum Request {
         definition_id: String,
         version: u32,
     },
+    /// Read a bounded run graph page at an expected revision.
+    InspectWorkflowRunGraph {
+        request: WorkflowRunGraphPageRequest,
+    },
     /// Return one bounded aggregate workflow inspection snapshot.
     InspectWorkflowRun {
         run_id: String,
@@ -2605,10 +2609,60 @@ pub struct SkippedWorkflowRun {
     pub reason: String,
 }
 
+/// Read independent node and edge pages from one expected graph revision.
+///
+/// A revision mismatch is rejected; callers must restart pagination. Cursors are
+/// exclusive stable identities from the previous page, not offsets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphPageRequest {
+    pub run_id: String,
+    pub expected_revision: u64,
+    pub after_node_id: Option<String>,
+    pub after_edge_id: Option<u64>,
+    pub limit: usize,
+}
+
+/// Bounded run-owned graph page captured by workflow inspection.
+///
+/// The revision is an optimistic concurrency token, not a schema version. A
+/// complete flag means that collection has no rows after this page; when a
+/// cursor was supplied, earlier rows are deliberately omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphInspection {
+    pub revision: u64,
+    pub nodes: Vec<WorkflowRunGraphNodeInspection>,
+    pub edges: Vec<WorkflowRunGraphEdgeInspection>,
+    pub nodes_complete: bool,
+    pub edges_complete: bool,
+}
+
+/// One immutable executable node in the inspected run graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphNodeInspection {
+    pub revision: u64,
+    pub node: bcode_workflow::NodeDefinition,
+    pub entry: bool,
+    pub exit: bool,
+}
+
+/// One stable edge identity and its executable definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphEdgeInspection {
+    pub edge_id: u64,
+    pub edge: bcode_workflow::EdgeDefinition,
+}
+
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
     pub run: bcode_workflow_store::WorkflowRunSummary,
+    /// Absent for older senders; absence must not be interpreted as an empty graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<WorkflowRunGraphInspection>,
     pub definition: bcode_workflow_store::StoredWorkflowDefinition,
     /// Canonical successful terminal value, present only for a completed run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3054,6 +3108,9 @@ pub enum ResponsePayload {
     },
     WorkflowDefinitionDescription {
         definition: Option<bcode_workflow_store::StoredWorkflowDefinition>,
+    },
+    WorkflowRunGraphInspection {
+        graph: WorkflowRunGraphInspection,
     },
     WorkflowRunInspection {
         inspection: Box<WorkflowRunInspection>,

@@ -11,13 +11,25 @@ use std::path::PathBuf;
     about = "Discover templates and operate durable workflow runtime/UI surfaces"
 )]
 struct WorkflowCli {
-    /// Workflow action: list, register, run, status, pause, resume, cancel, inspect,
+    /// Workflow action: list, register, run, status, pause, resume, cancel, inspect, graph,
     /// retry-node, provide-input, approve-mutation, or deny-mutation.
     #[arg(default_value = "status")]
     action: String,
     /// Definition or run identity for the selected action.
     #[arg(long)]
     id: Option<String>,
+    /// Expected run graph revision for `graph` (from `inspect`).
+    #[arg(long)]
+    expected_revision: Option<u64>,
+    /// Exclusive node identity cursor for `graph`.
+    #[arg(long)]
+    after_node_id: Option<String>,
+    /// Exclusive edge identity cursor for `graph`.
+    #[arg(long)]
+    after_edge_id: Option<u64>,
+    /// Maximum nodes and edges returned by `graph`.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Exact positive definition version.
     #[arg(long)]
     version: Option<u32>,
@@ -150,6 +162,22 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             action => format!("workflow.{action}"),
         };
         let mut args = BTreeMap::new();
+        for (name, value) in [
+            (
+                "expected_revision",
+                cli.expected_revision.map(|value| value.to_string()),
+            ),
+            ("after_node_id", cli.after_node_id),
+            (
+                "after_edge_id",
+                cli.after_edge_id.map(|value| value.to_string()),
+            ),
+            ("limit", cli.limit.map(|value| value.to_string())),
+        ] {
+            if let Some(value) = value {
+                args.insert(name.to_string(), value);
+            }
+        }
         if let Some(id) = cli.id {
             let key = if matches!(cli.action.as_str(), "run" | "register") {
                 "definition_id"
