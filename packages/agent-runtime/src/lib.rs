@@ -550,6 +550,14 @@ impl StreamLifecycle {
 }
 
 impl AgentRuntimeStream {
+    /// Request cancellation while retaining the stream to observe its terminal outcome.
+    ///
+    /// This is idempotent and does not cancel an already completed turn. Returning
+    /// does not acknowledge worker termination or provider resource release.
+    pub fn cancel(&self) {
+        self.lifecycle.cancel_if_running();
+    }
+
     /// Receive the next stream item.
     ///
     /// This convenience method is equivalent to [`StreamExt::next`] and does not require importing
@@ -609,6 +617,14 @@ pub struct AgentLoopStream {
 }
 
 impl AgentLoopStream {
+    /// Request cancellation while retaining the stream to observe its terminal outcome.
+    ///
+    /// This is idempotent and does not cancel an already completed turn. Returning
+    /// does not acknowledge worker termination or provider resource release.
+    pub fn cancel(&self) {
+        self.lifecycle.cancel_if_running();
+    }
+
     /// Receive the next scoped stream item.
     ///
     /// This convenience method is equivalent to [`StreamExt::next`] and does not require importing
@@ -8691,6 +8707,40 @@ mod tests {
             terminal,
             Some(AgentRuntimeStreamItem::Error(RuntimeError::Timeout { .. }))
         ));
+        assert!(lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(lifecycle.finished.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn explicit_stream_cancel_preserves_terminal_observation() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Pending,
+            },
+            AgentTurnRequest::new("test-model", "hello"),
+        );
+        wait_for_flag(&lifecycle.polling, "provider should enter polling").await;
+        stream.cancel();
+        stream.cancel();
+        let terminals = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut terminals = 0;
+            while let Some(item) = stream.next().await {
+                match item {
+                    AgentRuntimeStreamItem::Error(RuntimeError::Cancelled) => terminals += 1,
+                    AgentRuntimeStreamItem::Event(_) => {}
+                    other => panic!("unexpected outcome: {other:?}"),
+                }
+            }
+            terminals
+        })
+        .await
+        .expect("cancelled stream terminates");
+        assert_eq!(terminals, 1);
+        wait_for_flag(&lifecycle.dropped, "provider task should terminate").await;
         assert!(lifecycle.cancelled.load(Ordering::Acquire));
         assert!(lifecycle.finished.load(Ordering::Acquire));
         assert_eq!(runtime.active_turn_generation(), None);

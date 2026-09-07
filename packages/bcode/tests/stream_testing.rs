@@ -140,6 +140,28 @@ async fn recorder_budget_is_additional_to_existing_items() {
 }
 
 #[tokio::test]
+async fn stream_cancel_preserves_typed_terminal_observation() {
+    let mut stream = stream_text_builder()
+        .prompt("hello")
+        .run(ScriptedProvider::new([ScriptedProviderTurn::new()
+            .events([ProviderTurnEvent::TurnStarted])
+            .pending()]));
+    assert!(stream.next().await.is_some());
+    stream.cancel();
+    stream.cancel();
+    let transcript = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        TextStreamRecorder::new(stream).finish(),
+    )
+    .await
+    .expect("cancelled stream terminates");
+    transcript.assert_cancelled().expect("typed cancellation");
+    transcript
+        .assert_terminal_coherence()
+        .expect("one coherent terminal outcome");
+}
+
+#[tokio::test]
 async fn recorder_cancels_and_asserts_typed_terminal_state() {
     let cancellation = CancellationToken::new();
     let stream = stream_text_builder()

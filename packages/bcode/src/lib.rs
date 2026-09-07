@@ -1069,6 +1069,15 @@ impl fmt::Debug for TextStream {
 }
 
 impl TextStream {
+    /// Request cancellation while retaining terminal-outcome observation.
+    ///
+    /// This is idempotent and does not acknowledge provider resource release.
+    pub fn cancel(&self) {
+        if let Some(stream) = &self.stream {
+            stream.cancel();
+        }
+    }
+
     fn start<P>(agent: &Agent, provider: P, request: AgentTurnRequest) -> Self
     where
         P: ModelProviderInvoker + 'static,
@@ -1390,6 +1399,15 @@ impl<T> ObjectStream<T>
 where
     T: DeserializeOwned,
 {
+    /// Request cancellation while retaining terminal-outcome observation.
+    ///
+    /// This is idempotent and does not acknowledge provider resource release.
+    pub fn cancel(&self) {
+        if let Some(stream) = &self.stream {
+            stream.cancel();
+        }
+    }
+
     fn accept_stream_item(&mut self, item: TextStreamItem) {
         accept_object_stream_item(
             &self.schema,
@@ -3466,6 +3484,15 @@ impl fmt::Debug for ScopedAgentStream {
 }
 
 impl ScopedAgentStream {
+    /// Request cancellation while retaining terminal-outcome observation.
+    ///
+    /// This is idempotent and does not acknowledge provider resource release.
+    pub fn cancel(&self) {
+        if let Some(stream) = &self.stream {
+            stream.cancel();
+        }
+    }
+
     fn map_item(
         &mut self,
         item: bcode_agent_runtime::AgentLoopStreamItem,
