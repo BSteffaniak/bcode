@@ -230,6 +230,9 @@ pub enum ServerError {
     WorkflowDefinitionUnsupported(String),
     #[error("workflow capability is unavailable: {0}")]
     WorkflowCapabilityUnavailable(String),
+    /// Workflow storage initialization failed with a normalized, secret-safe diagnostic.
+    #[error("{0}")]
+    WorkflowStorageUnavailable(String),
     #[error("authored-workflow application operation is unauthorized: {0}")]
     WorkflowApplicationOperationUnauthorized(String),
     #[error("authored-workflow computation timed out: {0}")]
@@ -1360,7 +1363,12 @@ fn workflow_store_or_degraded(
             tracing::error!(%error, "workflow capability is unavailable; daemon startup will continue");
             let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(degraded_root)
                 .expect("isolated degraded workflow store must open");
-            (store, Some(error.to_string()))
+            let reason = match error {
+                WorkflowStoreError::UpgradeOwnershipUnavailable => "workflow storage upgrade is blocked by another owner; retry startup after that owner releases the store".to_string(),
+                WorkflowStoreError::UnsupportedStore { actual, expected } => format!("workflow storage schema {actual:?} is unsupported; this build requires {expected}; use a compatible build or reviewed maintenance; existing state was preserved"),
+                _ => "workflow storage initialization or safe upgrade failed; inspect local diagnostics and run reviewed maintenance before retrying startup; no automatic reset was performed".to_string(),
+            };
+            (store, Some(reason))
         }
     }
 }
@@ -1370,9 +1378,7 @@ impl ServerState {
         self.workflow_store_unavailable
             .as_ref()
             .map_or(Ok(()), |reason| {
-                Err(ServerError::WorkflowCapabilityUnavailable(format!(
-                    "workflow storage requires explicit maintenance: {reason}"
-                )))
+                Err(ServerError::WorkflowStorageUnavailable(reason.clone()))
             })
     }
 
@@ -1523,7 +1529,10 @@ impl ServerState {
         let (workflow_store, workflow_store_unavailable) = init.workflow_store.map_or_else(
             || {
                 workflow_store_or_degraded(
-                    bcode_workflow_store::WorkflowStore::open_default(),
+                    bcode_workflow_store::WorkflowStore::initialize_in_state_dir(
+                        &bcode_config::default_state_dir(),
+                        current_time_ms(),
+                    ),
                     &bcode_config::default_state_dir()
                         .join("degraded-domains")
                         .join(format!("workflow-{}", std::process::id())),
@@ -4390,6 +4399,10 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
             "workflow_authoring_conflict",
             "workflow authoring state changed; refresh and retry",
         ),
+        WorkflowStoreError::UpgradeOwnershipUnavailable => (
+            "workflow_store_upgrade_blocked",
+            "workflow storage upgrade is blocked by another owner; retry startup after that owner releases the store",
+        ),
         WorkflowStoreError::UnsupportedStore { .. } => (
             "workflow_store_reset_required",
             "workflow store requires explicit maintenance",
@@ -4418,6 +4431,9 @@ fn request_error_response(error: &ServerError) -> ErrorResponse {
             "workflow_definition_unsupported",
             "workflow definition is unsupported by this host",
         ),
+        ServerError::WorkflowStorageUnavailable(message) => {
+            return ErrorResponse::new("workflow_capability_unavailable", message.clone());
+        }
         ServerError::WorkflowCapabilityUnavailable(_) => (
             "workflow_capability_unavailable",
             "a required workflow capability is unavailable",
@@ -59686,13 +59702,43 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let degraded = root.path().join("degraded");
 
         let (store, unavailable) = workflow_store_or_degraded(
-            bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()),
+            bcode_workflow_store::WorkflowStore::initialize_in_state_dir(root.path(), 1),
             &degraded,
         );
 
         assert!(unavailable.is_some());
         assert!(store.path().starts_with(&degraded));
         assert_eq!(std::fs::read(&canonical).expect("unchanged bytes"), before);
+    }
+
+    #[test]
+    fn workflow_startup_diagnostics_are_actionable_and_secret_safe() {
+        let root = tempfile::tempdir().expect("root");
+        for (error, expected) in [
+            (
+                WorkflowStoreError::UpgradeOwnershipUnavailable,
+                "blocked by another owner",
+            ),
+            (
+                WorkflowStoreError::UnsupportedStore {
+                    actual: Some(999),
+                    expected: 17,
+                },
+                "schema Some(999) is unsupported",
+            ),
+            (
+                WorkflowStoreError::InvalidData("secret-private-payload".to_string()),
+                "inspect local diagnostics",
+            ),
+        ] {
+            let (_, reason) = workflow_store_or_degraded(Err(error), root.path());
+            let response = request_error_response(&ServerError::WorkflowStorageUnavailable(
+                reason.expect("reason"),
+            ));
+            assert_eq!(response.code, "workflow_capability_unavailable");
+            assert!(response.message.contains(expected));
+            assert!(!response.message.contains("secret-private-payload"));
+        }
     }
 
     #[test]

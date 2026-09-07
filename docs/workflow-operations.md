@@ -83,9 +83,15 @@ Completed, cancelled, failed, and repair-required terminal transitions remain au
 
 ## Migration and backup safety
 
-Normal status/open/history paths never migrate, rebuild, or repair. Workflow-store schema migrations run only through the defined migration ledger and fail closed on unsupported future state.
+Normal status/open/history paths never migrate, rebuild, or repair. Domain-owned startup coordination
+automatically upgrades supported workflow schemas 14–16 after verifying exclusive ownership, creating
+a verified database backup, and validating the transactional conversion. It does not stop other owners
+or reset incompatible storage. Blocked ownership, unsupported future state, or failed upgrades leave
+the domain unavailable with actionable diagnostics; unrelated capabilities remain available. Retry
+startup after resolving the reported condition. `bcode workflow migrate-store` remains available for
+explicit migration using the same engine. See [workflow persistence](workflow-persistence-architecture.md#schema-upgrades-and-explicit-reset).
 
-Before any destructive rebuild, reindex, or migration of user-created workflow state:
+Before any destructive rebuild, reindex, or ambiguous conversion of user-created workflow state:
 
 1. stop all writers and acquire exclusive maintenance ownership;
 2. create and verify a backup of the canonical workflow database and owned artifact roots;

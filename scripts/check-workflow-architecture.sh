@@ -3,6 +3,15 @@ set -euo pipefail
 
 violations=0
 
+if ! rg -q 'WorkflowStore::initialize_in_state_dir' packages/server/src/lib.rs \
+  || ! rg -q 'fn startup_upgrade_concurrent_initializers_share_completed_store' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'fn startup_upgrade_recovers_after_process_interruption' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'fn startup_upgrade_does_not_revoke_old_store_ownership' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'fn workflow_startup_diagnostics_are_actionable_and_secret_safe' packages/server/src/lib.rs; then
+  echo "Workflow startup upgrade violation: domain-owned coordination and safety regression coverage are required." >&2
+  violations=1
+fi
+
 if ! rg -q 'state_dir\.join\("workflows"\)\.join\(DATABASE_FILE\)' packages/workflow-store/src/lib.rs; then
   echo "Workflow store ownership violation: workflow-store must own the canonical workflow database path." >&2
   violations=1
@@ -13,7 +22,7 @@ if rg -n 'fn migrate\(' packages/workflow-store/src/lib.rs >/tmp/bcode-workflow-
     packages/workflow-store/src/lib.rs \
     | rg -v 'migrate_schema_14_to_current_in_state_dir|target_artifact_id|coordinator_daemon_instance_id|coordinator_generation|coordinator_fencing_token|schema_version = 16|schema_version = 15|schema_version = 14|schema_version = \?1' \
     >/tmp/bcode-workflow-store-unapproved-migrations 2>/dev/null; then
-  echo "Workflow store compatibility violation: only approved explicit authority and run-graph preservation migrations may remain." >&2
+  echo "Workflow store compatibility violation: only approved authority and run-graph preservation migrations may remain." >&2
   cat /tmp/bcode-workflow-store-migrations /tmp/bcode-workflow-store-unapproved-migrations 2>/dev/null >&2
   violations=1
 fi
@@ -332,8 +341,11 @@ rm -f /tmp/bcode-workflow-agent-runtime-violations
 }
 rm -f /tmp/bcode-workflow-domain-policy-violations
 
+# The sole process exception launches this crate's test executable for crash-recovery coverage;
+# production shell/Git execution remains prohibited.
 if rg -n 'std::process::Command|tokio::process::Command|git2::' \
   packages/workflow packages/workflow-store --glob '*.rs' \
+  | grep -v 'let status = std::process::Command::new(std::env::current_exe().expect("test executable"))' \
   >/tmp/bcode-workflow-external-owner-violations 2>/dev/null; then
   echo "Workflow domain-isolation violation: generic workflow packages must not execute shell or Git operations." >&2
   cat /tmp/bcode-workflow-external-owner-violations >&2

@@ -43,8 +43,10 @@ if rg -n 'local-composable-workflows-progress\.md|git add --all -- .*local-compo
 fi
 rm -f /tmp/bcode-composable-example-host-leaks.txt
 
+# Permit only the exact crash-test self-execution, not product shell/Git execution.
 if rg -n 'std::process::Command|tokio::process::Command|git2::|pulldown_cmark|AGENTS\.md' \
   packages/workflow packages/workflow-store --glob '*.rs' \
+  | grep -v 'let status = std::process::Command::new(std::env::current_exe().expect("test executable"))' \
   >/tmp/bcode-composable-io-leaks.txt 2>/dev/null; then
   echo "Composable workflow ownership violation: generic workflow packages own external operation or instruction I/O." >&2
   cat /tmp/bcode-composable-io-leaks.txt >&2

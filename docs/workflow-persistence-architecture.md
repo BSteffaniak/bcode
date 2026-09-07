@@ -362,20 +362,27 @@ explicit doctor/reconcile/repair operations. Maintenance acquires exclusive work
 ownership and records its outcome. Normal read paths remain non-mutating even when the database is
 damaged or stale.
 
-## Clean-break schema and explicit reset
+## Schema upgrades and explicit reset
 
-The migration safety contract in `INVARIANTS.md` permits known, lossless automatic upgrades through domain-owned coordination with verified exclusive migration ownership, protection against incompatible concurrent access, and interruption-safe recovery. The workflow implementation described below still requires explicit migration; automatic workflow upgrade coordination is not yet implemented. Ordinary reads remain bounded and non-mutating, and destructive or ambiguous conversions still require explicit maintenance.
+The workflow database has one current schema version. A missing database is initialized directly
+at that version. Domain-owned startup coordination automatically upgrades supported schemas 14–16
+under the migration safety contract in `INVARIANTS.md`. Ordinary store opens and status/history
+reads never migrate. Unsupported, malformed, or future contracts fail closed without reset.
 
-The workflow database has one supported schema version. A missing database is initialized directly
-at that version. An existing database with an absent, malformed, older, or future contract is
-rejected without writes; normal startup never migrates or reinterprets it.
+Startup waits at most five seconds for verified exclusive workflow-store ownership, rechecks the
+schema after acquiring it, and retains ownership through migration and reopening. Competing
+initializers can share the completed current-format store. Existing owners are never terminated
+or revoked to obtain migration access. A SQLite write reservation spans the verified backup and
+transactional schema/data conversion, preventing an uncoordinated writer from changing the source
+between backup and commit. Integrity is verified before commit. Interrupted transactions roll back;
+retained backups are not overwritten, and a retry uses a fresh backup name. A committed migration
+can reopen even if receipt publication was interrupted; the schema transaction remains authoritative.
 
-Normal workflow startup opens the canonical store fail-closed. An incompatible, corrupt, or
-maintenance-required workflow store disables only the workflow domain: daemon readiness and
-unrelated session/model/tool capabilities continue, workflow requests return a stable unavailable
-error, and the canonical workflow bytes remain untouched until explicit maintenance. The immediately
-preceding schema has an explicit offline, backup-verified, non-destructive migration command;
-unsupported older or damaged stores still require reviewed reset or future migration support. Core runtime,
+An incompatible, corrupt, blocked, or maintenance-required store disables only the workflow domain:
+daemon readiness and unrelated session/model/tool capabilities continue. Workflow requests return
+normalized actionable unavailable diagnostics without exposing private storage errors. Startup never
+resets state. The explicit `bcode workflow migrate-store` command uses the same migration engine;
+unsupported older or damaged stores require reviewed maintenance or future migration support. Core runtime,
 model, auth, and session requests use separate typed routing and never pass through workflow
 availability gates. Passive plugin session-status hydration treats an unavailable optional workflow
 domain as no contribution rather than a session or skill failure. The unavailable domain uses only
