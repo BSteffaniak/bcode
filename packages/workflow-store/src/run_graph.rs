@@ -151,7 +151,10 @@ pub fn migrate(transaction: &Transaction<'_>) -> Result<(), WorkflowStoreError> 
                 CASE WHEN typeof(definition.definition_json) = 'text'
                      AND length(CAST(definition.definition_json AS BLOB)) <= ?1
                      THEN definition.definition_json END,
-                definition.checksum_sha256, definition.definition_id FROM workflow_runs run
+                CASE WHEN typeof(definition.checksum_sha256) = 'text'
+                          AND length(CAST(definition.checksum_sha256 AS BLOB)) = 64
+                     THEN definition.checksum_sha256 END,
+                definition.definition_id FROM workflow_runs run
          LEFT JOIN workflow_definitions definition ON definition.definition_id = run.definition_id
              AND definition.version = run.definition_version ORDER BY run.run_id",
     )?;
@@ -169,8 +172,8 @@ pub fn migrate(transaction: &Transaction<'_>) -> Result<(), WorkflowStoreError> 
                     .to_string(),
             )
         })?;
-        let checksum: String = row.get(2)?;
-        if super::sha256_hex(payload.as_bytes()) != checksum {
+        let checksum: Option<String> = row.get(2)?;
+        if checksum.as_deref() != Some(super::sha256_hex(payload.as_bytes()).as_str()) {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow definition checksum mismatch during graph migration".to_string(),
             ));
@@ -215,6 +218,77 @@ pub fn initial_node(
     node_id: &str,
 ) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
     initial_node_record(connection, run_id, node_id).map(|record| record.map(|record| record.node))
+}
+
+pub fn initial_exit(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    initial_node_record(connection, run_id, node_id)?
+        .map(|record| record.exit)
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "completed workflow node is missing from the run graph".to_string(),
+            )
+        })
+}
+
+pub fn initial_edge_between(
+    connection: &Connection,
+    run_id: &str,
+    source_node_id: &str,
+    target_node_id: &str,
+) -> Result<Option<EdgeDefinition>, WorkflowStoreError> {
+    super::validate_id("target_node_id", target_node_id)?;
+    let mut cursor = None;
+    loop {
+        let edges = initial_outgoing_edges(connection, run_id, source_node_id, cursor)?;
+        if edges.is_empty() {
+            return Ok(None);
+        }
+        cursor = edges.last().map(|edge| edge.edge_id);
+        if let Some(record) = edges
+            .into_iter()
+            .find(|record| record.edge.to == target_node_id)
+        {
+            return Ok(Some(record.edge));
+        }
+    }
+}
+
+pub fn initial_incoming_edges(
+    connection: &Connection,
+    run_id: &str,
+    target_node_id: &str,
+    after_edge_id: Option<u64>,
+) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+    super::validate_id("target_node_id", target_node_id)?;
+    WorkflowStore::graph_edge_page(
+        connection,
+        run_id,
+        Some(EdgeEndpoint::Target(target_node_id)),
+        after_edge_id,
+        None,
+        100,
+    )
+}
+
+pub fn initial_outgoing_edges(
+    connection: &Connection,
+    run_id: &str,
+    source_node_id: &str,
+    after_edge_id: Option<u64>,
+) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+    super::validate_id("source_node_id", source_node_id)?;
+    WorkflowStore::graph_edge_page(
+        connection,
+        run_id,
+        Some(EdgeEndpoint::Source(source_node_id)),
+        after_edge_id,
+        None,
+        100,
+    )
 }
 
 fn initial_node_record(
@@ -313,7 +387,7 @@ impl WorkflowStore {
         after_edge_id: Option<u64>,
         limit: usize,
     ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
-        self.graph_edge_page(run_id, None, after_edge_id, None, limit)
+        Self::graph_edge_page(&self.connection, run_id, None, after_edge_id, None, limit)
     }
 
     /// Read one exact edge from the initial run graph by its stable identity.
@@ -330,9 +404,7 @@ impl WorkflowStore {
         let edge_id = i64::try_from(edge_id).map_err(|_| {
             WorkflowStoreError::InvalidData("edge identity exceeds storage range".to_string())
         })?;
-        Ok(self
-            .graph_edge_page(run_id, None, None, Some(edge_id), 1)?
-            .pop())
+        Ok(Self::graph_edge_page(&self.connection, run_id, None, None, Some(edge_id), 1)?.pop())
     }
 
     /// Read a bounded page of initial edges targeting one node, ordered by edge identity.
@@ -349,7 +421,8 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
         super::validate_id("target_node_id", target_node_id)?;
-        self.graph_edge_page(
+        Self::graph_edge_page(
+            &self.connection,
             run_id,
             Some(EdgeEndpoint::Target(target_node_id)),
             after_edge_id,
@@ -372,7 +445,8 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
         super::validate_id("source_node_id", source_node_id)?;
-        self.graph_edge_page(
+        Self::graph_edge_page(
+            &self.connection,
             run_id,
             Some(EdgeEndpoint::Source(source_node_id)),
             after_edge_id,
@@ -382,7 +456,7 @@ impl WorkflowStore {
     }
 
     fn graph_edge_page(
-        &self,
+        connection: &Connection,
         run_id: &str,
         endpoint: Option<EdgeEndpoint<'_>>,
         after_edge_id: Option<u64>,
@@ -397,7 +471,7 @@ impl WorkflowStore {
                 WorkflowStoreError::InvalidData("edge cursor exceeds storage range".to_string())
             })?
             .unwrap_or(i64::MIN);
-        let Some(revision) = self.run_graph_revision(run_id)? else {
+        let Some(revision) = graph_revision(connection, run_id)? else {
             return Ok(Vec::new());
         };
         if revision != 1 {
@@ -435,11 +509,11 @@ impl WorkflowStore {
                  AND source.node_id = edge.source_node_id AND source.revision = 1
              LEFT JOIN workflow_run_graph_nodes target ON target.run_id = edge.run_id
                  AND target.node_id = edge.target_node_id AND target.revision = 1
-             WHERE edge.run_id = ?1 AND edge.revision <= 1
+             WHERE edge.run_id = ?1
                  AND edge.edge_id {cursor_operator} ?2 {target_filter} {identity_filter}
              ORDER BY edge.edge_id, edge.revision LIMIT ?3",
         );
-        let mut statement = self.connection.prepare(&sql)?;
+        let mut statement = connection.prepare(&sql)?;
         let mut rows = statement.query(rusqlite::params![
             run_id,
             after_edge_id,

@@ -15287,6 +15287,31 @@ pub fn validate_parallel_join_configuration(
     definition: &WorkflowDefinition,
     node: &NodeDefinition,
 ) -> Result<(), WorkflowError> {
+    for member in parallel_join_member_ids(node)? {
+        if !definition.nodes.contains_key(member)
+            || !definition.edges.iter().any(|edge| {
+                edge.from == member && edge.to == node.id && matches!(edge.kind, EdgeKind::Direct)
+            })
+        {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: format!(
+                    "parallel join member '{member}' must exist and have a direct edge to the join"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Return the declared parallel join members after validating both side lists.
+///
+/// Topology validation remains the caller's responsibility.
+///
+/// # Errors
+///
+/// Returns an error for missing, empty, non-string, duplicate, or overlapping member lists.
+pub fn parallel_join_member_ids(node: &NodeDefinition) -> Result<Vec<&str>, WorkflowError> {
     let invalid = |message: String| WorkflowError::Build {
         path: node.id.clone(),
         message,
@@ -15327,18 +15352,7 @@ pub fn validate_parallel_join_configuration(
             "parallel join members must be unique and belong to exactly one side".to_string(),
         ));
     }
-    for member in left.into_iter().chain(right) {
-        if !definition.nodes.contains_key(member)
-            || !definition.edges.iter().any(|edge| {
-                edge.from == member && edge.to == node.id && matches!(edge.kind, EdgeKind::Direct)
-            })
-        {
-            return Err(invalid(format!(
-                "parallel join member '{member}' must exist and have a direct edge to the join"
-            )));
-        }
-    }
-    Ok(())
+    Ok(left.into_iter().chain(right).collect())
 }
 
 fn validate_repeat_outcome_configuration(node: &NodeDefinition) -> Result<(), WorkflowError> {

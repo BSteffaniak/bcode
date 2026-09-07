@@ -4927,7 +4927,7 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when identity/limit validation, definition/output decoding, or querying
+    /// Returns an error when identity/limit validation, admitted graph/output decoding, or querying
     /// fails. Malformed persisted typed outcomes fail closed.
     pub fn repeat_outcomes(
         &self,
@@ -4938,12 +4938,8 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT output.run_id, output.node_id, output.activation_id, output.output_id, \
-                    output.value_json, output.checksum_sha256, output.created_at_ms, \
-                    definition.definition_json \
+                    output.value_json, output.checksum_sha256, output.created_at_ms \
              FROM workflow_outputs output \
-             JOIN workflow_runs run ON run.run_id = output.run_id \
-             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-               AND definition.version = run.definition_version \
              WHERE output.run_id = ?1 \
                AND json_type(output.value_json, '$.iterations_completed') = 'integer' \
              ORDER BY output.created_at_ms, output.output_id LIMIT ?2",
@@ -4958,7 +4954,6 @@ impl WorkflowStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, u64>(6)?,
-                    row.get::<_, String>(7)?,
                 ))
             })?
             .map(|row| match row {
@@ -4970,12 +4965,10 @@ impl WorkflowStore {
                     value_json,
                     checksum,
                     created_at,
-                    definition,
                 )) => (|| {
-                    let definition: WorkflowDefinition = serde_json::from_str(&definition)?;
-                    let node = definition.node(&node_id).ok_or_else(|| {
+                    let node = self.run_graph_node(&run_id, &node_id)?.ok_or_else(|| {
                         WorkflowStoreError::InvalidData(format!(
-                            "repeat output references missing node: {node_id}"
+                            "repeat output references missing run-graph node: {node_id}"
                         ))
                     })?;
                     if node.kind != bcode_workflow::NodeKind::Repeat
@@ -5133,8 +5126,9 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns an error for malformed identity, missing run, duplicate activation, or database
-    /// failure.
+    /// Returns an error for malformed identity, missing run or admitted graph node,
+    /// unsupported or damaged graph state, invalid input, duplicate activation,
+    /// exceeded execution limits, or database failure.
     pub fn create_activation(
         &mut self,
         activation: &NewActivation,
@@ -7415,27 +7409,28 @@ impl WorkflowStore {
                 "workflow child receipt conflicts with the canonical link".to_string(),
             ));
         }
-        let parent = self.run_summary(&request.run_id)?.ok_or_else(|| {
-            WorkflowStoreError::InvalidData("workflow child parent run is missing".to_string())
-        })?;
-        let stored = self
-            .definition(&parent.definition_id, parent.definition_version)?
+        let node = self
+            .run_graph_node(&request.run_id, &request.node_id)?
             .ok_or_else(|| {
                 WorkflowStoreError::InvalidData(
-                    "workflow child parent definition is missing".to_string(),
+                    "workflow child parent call is missing from run graph".to_string(),
                 )
             })?;
-        let definition: WorkflowDefinition = serde_json::from_str(&stored.definition_json)?;
-        let node = definition.node(&request.node_id).ok_or_else(|| {
-            WorkflowStoreError::InvalidData(
-                "workflow child parent call definition is missing".to_string(),
-            )
-        })?;
+        if node.kind != bcode_workflow::NodeKind::WorkflowCall {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child parent node is not an admitted workflow call".to_string(),
+            ));
+        }
         let configuration: bcode_workflow::WorkflowCallConfiguration =
-            serde_json::from_value(node.configuration.clone())?;
+            serde_json::from_value(node.configuration)?;
         configuration
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if configuration.target != link.target {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child link conflicts with admitted call target".to_string(),
+            ));
+        }
         let child = self.run_summary(child_run_id)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData("workflow child run is missing".to_string())
         })?;
@@ -8379,14 +8374,6 @@ impl WorkflowStore {
         settled_at_ms: u64,
     ) -> Result<Vec<NewActivation>, WorkflowStoreError> {
         let transaction = self.connection.transaction()?;
-        let definition_json: String = transaction.query_row(
-            "SELECT definition.definition_json FROM workflow_runs run \
-             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-               AND definition.version = run.definition_version WHERE run.run_id = ?1",
-            [&activation.run_id],
-            |row| row.get(0),
-        )?;
-        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
         let predicate: bcode_workflow::PredicateExpression = serde_json::from_value(
             activation
                 .node
@@ -8487,77 +8474,90 @@ impl WorkflowStore {
         )?;
         let mut activated = Vec::new();
         if should_repeat && within_iteration_bound {
-            for edge in definition.edges.iter().filter(|edge| {
-                edge.from == activation.node_id
-                    && matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. })
-            }) {
-                let node = definition.node(&edge.to).ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(format!(
-                        "workflow repeat target is missing: {}",
-                        edge.to
-                    ))
-                })?;
-                let transformed_input = if let Some(transform) = &edge.transform {
-                    let run_input_json: Option<String> = transaction.query_row(
-                        "SELECT input_json FROM workflow_runs WHERE run_id = ?1",
-                        [&activation.run_id],
-                        |row| row.get(0),
-                    )?;
-                    let run_input = run_input_json
-                        .as_deref()
-                        .map(serde_json::from_str)
-                        .transpose()?
-                        .unwrap_or(serde_json::Value::Null);
-                    transform
-                        .evaluate(&[
-                            bcode_workflow::WorkflowTransformInput {
-                                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
-                                value: input,
-                            },
-                            bcode_workflow::WorkflowTransformInput {
-                                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
-                                value: &run_input,
-                            },
-                        ])
-                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
-                } else {
-                    input.clone()
-                };
-                let next = NewActivation {
-                    run_id: activation.run_id.clone(),
-                    node_id: edge.to.clone(),
-                    activation_id: activation_identity(
-                        &activation.run_id,
-                        &edge.to,
-                        next_generation,
-                    ),
-                    dependency_generation: next_generation,
-                    input: Some(transformed_input.clone()),
-                    created_at_ms: settled_at_ms,
-                };
-                validate_json_schema(
-                    &format!("workflow repeat input for node {}", node.id),
-                    &node.input.schema,
-                    &transformed_input,
-                )
-                .map_err(|error| {
-                    WorkflowStoreError::TargetInputValidation(Box::new(
-                        TargetInputValidationFailure {
-                            run_id: activation.run_id.clone(),
-                            source_node_id: activation.node_id.clone(),
-                            source_activation_id: activation.activation_id.clone(),
-                            target_node_id: node.id.clone(),
-                            target_schema_id: node.input.type_name.clone(),
-                            message: error.to_string(),
-                        },
-                    ))
-                })?;
-                insert_activation_with_status(
+            let mut after_edge_id = None;
+            loop {
+                let edges = run_graph::initial_outgoing_edges(
                     &transaction,
-                    &next,
-                    activation_status_for_node(node),
+                    &activation.run_id,
+                    &activation.node_id,
+                    after_edge_id,
                 )?;
-                activated.push(next);
+                let Some(last) = edges.last() else { break };
+                after_edge_id = Some(last.edge_id);
+                for record in edges {
+                    let edge = record.edge;
+                    if !matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. }) {
+                        continue;
+                    }
+                    let node = run_graph::initial_node(&transaction, &activation.run_id, &edge.to)?
+                        .ok_or_else(|| {
+                            WorkflowStoreError::InvalidData(format!(
+                                "workflow repeat target is missing from run graph: {}",
+                                edge.to
+                            ))
+                        })?;
+                    let transformed_input = if let Some(transform) = &edge.transform {
+                        let run_input_json: Option<String> = transaction.query_row(
+                            "SELECT input_json FROM workflow_runs WHERE run_id = ?1",
+                            [&activation.run_id],
+                            |row| row.get(0),
+                        )?;
+                        let run_input = run_input_json
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()?
+                            .unwrap_or(serde_json::Value::Null);
+                        transform
+                            .evaluate(&[
+                                bcode_workflow::WorkflowTransformInput {
+                                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                                    value: input,
+                                },
+                                bcode_workflow::WorkflowTransformInput {
+                                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                                    value: &run_input,
+                                },
+                            ])
+                            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+                    } else {
+                        input.clone()
+                    };
+                    let next = NewActivation {
+                        run_id: activation.run_id.clone(),
+                        node_id: edge.to.clone(),
+                        activation_id: activation_identity(
+                            &activation.run_id,
+                            &edge.to,
+                            next_generation,
+                        ),
+                        dependency_generation: next_generation,
+                        input: Some(transformed_input.clone()),
+                        created_at_ms: settled_at_ms,
+                    };
+                    validate_json_schema(
+                        &format!("workflow repeat input for node {}", node.id),
+                        &node.input.schema,
+                        &transformed_input,
+                    )
+                    .map_err(|error| {
+                        WorkflowStoreError::TargetInputValidation(Box::new(
+                            TargetInputValidationFailure {
+                                run_id: activation.run_id.clone(),
+                                source_node_id: activation.node_id.clone(),
+                                source_activation_id: activation.activation_id.clone(),
+                                target_node_id: node.id.clone(),
+                                target_schema_id: node.input.type_name.clone(),
+                                message: error.to_string(),
+                            },
+                        ))
+                    })?;
+                    insert_activation_with_status(
+                        &transaction,
+                        &next,
+                        activation_status_for_node(&node),
+                    )?;
+                    activated.push(next);
+                }
             }
         } else if iteration_bound_exhausted
             && exhaustion_policy == bcode_workflow::WorkflowRepeatExhaustionPolicy::Fail
@@ -10008,33 +10008,21 @@ impl WorkflowStore {
         validate_id("node_id", node_id)?;
         validate_id("activation_id", activation_id)?;
         let transaction = self.connection.transaction()?;
-        let (status, input_json, definition_json, run_status, cancellation_requested): (
+        let (status, input_json, run_status, cancellation_requested): (
             String,
             Option<String>,
-            String,
             String,
             bool,
         ) = transaction
             .query_row(
-                "SELECT activation.status, activation.input_json, definition.definition_json, \
+                "SELECT activation.status, activation.input_json, \
                  run.status, run.cancellation_requested_at_ms IS NOT NULL \
                  FROM workflow_activations activation \
                  JOIN workflow_runs run ON run.run_id = activation.run_id \
-                 JOIN workflow_definitions definition \
-                   ON definition.definition_id = run.definition_id \
-                  AND definition.version = run.definition_version \
                  WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
                    AND activation.activation_id = ?3",
                 (run_id, node_id, activation_id),
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -10057,10 +10045,20 @@ impl WorkflowStore {
                 kind.as_str()
             )));
         }
-        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-        let node = definition.node(node_id).ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!("workflow node not found: {node_id}"))
+        let node = run_graph::initial_node(&transaction, run_id, node_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow waiting run-graph node not found: {node_id}"
+            ))
         })?;
+        let expected_kind = match kind {
+            WorkflowWaitKind::Input => bcode_workflow::NodeKind::Input,
+            WorkflowWaitKind::Approval => bcode_workflow::NodeKind::Approval,
+        };
+        if node.kind != expected_kind {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow wait status conflicts with admitted node kind".to_string(),
+            ));
+        }
         let value = match kind {
             WorkflowWaitKind::Input => supplied_value.ok_or_else(|| {
                 WorkflowStoreError::InvalidData("input gate requires a value".to_string())
@@ -10082,7 +10080,7 @@ impl WorkflowStore {
                 run_id: run_id.to_string(),
                 node_id: node_id.to_string(),
                 activation_id: activation_id.to_string(),
-                schema_id: node.output.type_name.clone(),
+                schema_id: node.output.type_name,
                 schema_version: 1,
                 value,
                 artifact_reference: None,
@@ -10334,20 +10332,16 @@ where
         transaction,
         &output.run_id,
         &output.node_id,
+        &output.activation_id,
         false,
         output.created_at_ms,
     )?
     .is_some_and(|settlement| settlement.run_failed);
     fault.after_boundary(WorkflowOutputBoundary::SuccessorsMaterialized, output)?;
-    let active_count: u64 = transaction.query_row(
-        "SELECT COUNT(*) FROM workflow_activations WHERE run_id = ?1 \
-         AND status IN ('pending', 'running')",
-        [&output.run_id],
-        |row| row.get(0),
-    )?;
+    let has_unfinished = run_has_unfinished_activations(transaction, &output.run_id)?;
     let run_status = if parallel_failure {
         RunStatus::Failed
-    } else if active_count == 0 && completed_is_exit {
+    } else if !has_unfinished && completed_is_exit {
         transaction.execute(
             "UPDATE workflow_runs SET status = 'completed', terminal_output_id = ?3, \
              terminal_output_checksum_sha256 = ?4, updated_at_ms = ?2 \
@@ -10375,6 +10369,31 @@ where
         activated,
         run_status,
     })
+}
+
+fn run_has_unfinished_activations(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    let unsupported_status: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 \
+         AND (typeof(status) != 'text' OR status NOT IN \
+             ('pending', 'running', 'waiting_input', 'waiting_approval', \
+              'waiting_mutation_approval', 'completed', 'skipped', 'failed', 'cancelled')))",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if unsupported_status {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow run has unsupported activation status".to_string(),
+        ));
+    }
+    Ok(transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 \
+         AND status NOT IN ('completed', 'skipped', 'failed', 'cancelled'))",
+        [run_id],
+        |row| row.get(0),
+    )?)
 }
 
 fn evaluate_predicate(
@@ -10416,12 +10435,22 @@ fn skip_branch_nodes(
     node_ids: &[String],
     created_at_ms: u64,
 ) -> Result<(), WorkflowStoreError> {
+    let mut absent_nodes = std::collections::BTreeSet::new();
     for node_id in node_ids {
+        run_graph::initial_node(transaction, run_id, node_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow branch skip references missing run-graph node: {node_id}"
+            ))
+        })?;
+        if activation_status_at_generation(transaction, run_id, node_id, generation)?.is_none() {
+            absent_nodes.insert(node_id);
+        }
+    }
+    for node_id in absent_nodes {
         transaction.execute(
             "INSERT INTO workflow_activations \
              (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, NULL, 'skipped', ?5) \
-             ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, NULL, 'skipped', ?5)",
             (
                 run_id,
                 node_id,
@@ -10434,45 +10463,132 @@ fn skip_branch_nodes(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum TransformRunField {
+    Input,
+    AuthoredProvenance,
+}
+
+impl TransformRunField {
+    const fn column(self) -> &'static str {
+        match self {
+            Self::Input => "input_json",
+            Self::AuthoredProvenance => "authored_provenance_json",
+        }
+    }
+}
+
+fn transform_run_json(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    field: TransformRunField,
+) -> Result<Option<String>, WorkflowStoreError> {
+    let column = field.column();
+    let (value, absent): (Option<String>, bool) = transaction.query_row(
+        &format!(
+            "SELECT CASE WHEN typeof({column}) = 'text' \
+                 AND length(CAST({column} AS BLOB)) <= ?2 THEN {column} END, \
+                 {column} IS NULL FROM workflow_runs WHERE run_id = ?1"
+        ),
+        (run_id, MAX_INLINE_JSON_BYTES),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if value.is_none() && !absent {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow transform {column} is invalid or oversized"
+        )));
+    }
+    Ok(value)
+}
+
 fn activation_output_value(
     transaction: &Transaction<'_>,
     run_id: &str,
     node_id: &str,
     generation: u64,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    let value_json: String = transaction.query_row(
-        "SELECT output.value_json FROM workflow_activations activation \
-         JOIN workflow_outputs output ON output.output_id = activation.output_id \
+    if activation_status_at_generation(transaction, run_id, node_id, generation)?.as_deref()
+        != Some("completed")
+    {
+        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+    }
+    let mut statement = transaction.prepare(
+        "SELECT CASE WHEN output.run_id = activation.run_id \
+                      AND output.node_id = activation.node_id \
+                      AND output.activation_id = activation.activation_id \
+                      AND typeof(output.value_json) = 'text' \
+                      AND length(CAST(output.value_json AS BLOB)) <= ?4 \
+                 THEN output.value_json END, \
+                CASE WHEN typeof(output.checksum_sha256) = 'text' \
+                          AND length(CAST(output.checksum_sha256 AS BLOB)) = 64 \
+                     THEN output.checksum_sha256 END \
+         FROM workflow_activations activation \
+         LEFT JOIN workflow_outputs output ON output.output_id = activation.output_id \
          WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
-           AND activation.dependency_generation = ?3 AND activation.status = 'completed'",
-        (run_id, node_id, generation),
-        |row| row.get(0),
+           AND activation.dependency_generation = ?3 AND activation.status = 'completed' LIMIT 2",
     )?;
+    let mut rows = statement.query(rusqlite::params![
+        run_id,
+        node_id,
+        generation,
+        MAX_INLINE_JSON_BYTES
+    ])?;
+    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let value_json: Option<String> = row.get(0)?;
+    let checksum: Option<String> = row.get(1)?;
+    if rows.next()?.is_some() {
+        return Err(WorkflowStoreError::InvalidData(
+            "multiple completed workflow activations claim the same node generation".to_string(),
+        ));
+    }
+    let value_json = value_json.ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "completed workflow activation output is missing, inconsistent, or oversized"
+                .to_string(),
+        )
+    })?;
+    if checksum.as_deref() != Some(sha256_hex(value_json.as_bytes()).as_str()) {
+        return Err(WorkflowStoreError::InvalidData(
+            "completed workflow activation output checksum mismatch".to_string(),
+        ));
+    }
     Ok(serde_json::from_str(&value_json)?)
 }
 
 fn parallel_join_members(
     transaction: &Transaction<'_>,
-    definition: &WorkflowDefinition,
     run_id: &str,
     target: &bcode_workflow::NodeDefinition,
     generation: u64,
 ) -> Result<(serde_json::Value, serde_json::Value), WorkflowStoreError> {
     let member = |field: &str| {
         let exits = configured_node_ids(&target.configuration, field)?;
-        exits
-            .iter()
-            .find_map(|node_id| {
-                definition.node(node_id).and_then(|_| {
-                    activation_output_value(transaction, run_id, node_id, generation).ok()
-                })
-            })
-            .ok_or_else(|| {
+        let mut completed = None;
+        for node_id in exits {
+            run_graph::initial_node(transaction, run_id, &node_id)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(format!(
-                    "parallel join {} has no completed {field} member output",
-                    target.id
+                    "parallel join references missing run-graph member: {node_id}"
                 ))
-            })
+            })?;
+            match activation_output_value(transaction, run_id, &node_id, generation) {
+                Ok(value) => {
+                    if completed.replace(value).is_some() {
+                        return Err(WorkflowStoreError::InvalidData(format!(
+                            "parallel join {} has ambiguous completed {field} members",
+                            target.id
+                        )));
+                    }
+                }
+                Err(WorkflowStoreError::Database(rusqlite::Error::QueryReturnedNoRows)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        completed.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "parallel join {} has no completed {field} member output",
+                target.id
+            ))
+        })
     };
     Ok((member("left_exits")?, member("right_exits")?))
 }
@@ -10480,23 +10596,24 @@ fn parallel_join_members(
 #[allow(clippy::too_many_lines)]
 fn activation_input(
     transaction: &Transaction<'_>,
-    definition: &WorkflowDefinition,
     output: &ValidatedOutput,
     target: &bcode_workflow::NodeDefinition,
     generation: u64,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    let edge_transform = definition
-        .edges
-        .iter()
-        .find(|edge| edge.from == output.node_id && edge.to == target.id)
-        .and_then(|edge| edge.transform.as_ref());
+    let edge_transform =
+        run_graph::initial_edge_between(transaction, &output.run_id, &output.node_id, &target.id)?
+            .and_then(|edge| edge.transform);
     let input = if let Some(transform) = edge_transform {
-        let (run_input_json, authored_provenance_json): (Option<String>, Option<String>) =
-            transaction.query_row(
-                "SELECT input_json, authored_provenance_json FROM workflow_runs WHERE run_id = ?1",
-                [&output.run_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
+        transform
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let run_input_json =
+            transform_run_json(transaction, &output.run_id, TransformRunField::Input)?;
+        let authored_provenance_json = transform_run_json(
+            transaction,
+            &output.run_id,
+            TransformRunField::AuthoredProvenance,
+        )?;
         let run_input = run_input_json
             .as_deref()
             .map(serde_json::from_str)
@@ -10510,29 +10627,25 @@ fn activation_input(
                 provenance.configuration
             });
         let join_members = (target.kind == bcode_workflow::NodeKind::Parallel)
-            .then(|| {
-                parallel_join_members(transaction, definition, &output.run_id, target, generation)
-            })
+            .then(|| parallel_join_members(transaction, &output.run_id, target, generation))
             .transpose()?;
-        let dependency_values = definition
-            .edges
-            .iter()
-            .filter(|edge| edge.to == target.id)
-            .map(|edge| {
-                activation_output_value(transaction, &output.run_id, &edge.from, generation).map(
-                    |value| {
-                        (
-                            format!(
-                                "{}{}",
-                                bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX,
-                                edge.from
-                            ),
-                            value,
-                        )
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut dependency_values = Vec::new();
+        for source in transform.referenced_sources() {
+            let Some(node_id) =
+                source.strip_prefix(bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX)
+            else {
+                continue;
+            };
+            if run_graph::initial_edge_between(transaction, &output.run_id, node_id, &target.id)?
+                .is_none()
+            {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "transform references a non-dependency node: {node_id}"
+                )));
+            }
+            let value = activation_output_value(transaction, &output.run_id, node_id, generation)?;
+            dependency_values.push((source, value));
+        }
         let mut inputs = vec![
             bcode_workflow::WorkflowTransformInput {
                 name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
@@ -10566,8 +10679,7 @@ fn activation_input(
             .evaluate(&inputs)
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
     } else if target.kind == bcode_workflow::NodeKind::Parallel {
-        let (left, right) =
-            parallel_join_members(transaction, definition, &output.run_id, target, generation)?;
+        let (left, right) = parallel_join_members(transaction, &output.run_id, target, generation)?;
         serde_json::Value::Array(vec![left, right])
     } else {
         output.value.clone()
@@ -10590,6 +10702,54 @@ fn activation_input(
     Ok(input)
 }
 
+fn successor_dependencies_ready(
+    transaction: &Transaction<'_>,
+    output: &ValidatedOutput,
+    node_id: &str,
+    generation: u64,
+) -> Result<bool, WorkflowStoreError> {
+    let mut cursor = None;
+    let mut direct_ready = true;
+    let mut conditional_ready = true;
+    let mut reached_by_conditional = false;
+    loop {
+        let edges =
+            run_graph::initial_incoming_edges(transaction, &output.run_id, node_id, cursor)?;
+        if edges.is_empty() {
+            break;
+        }
+        cursor = edges.last().map(|edge| edge.edge_id);
+        for record in edges {
+            let edge = record.edge;
+            let conditional = edge.from == output.node_id
+                && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. });
+            let direct = matches!(edge.kind, bcode_workflow::EdgeKind::Direct);
+            if !conditional && !direct {
+                continue;
+            }
+            let completed = activation_status_at_generation(
+                transaction,
+                &output.run_id,
+                &edge.from,
+                generation,
+            )?
+            .as_deref()
+            .is_some_and(|status| matches!(status, "completed" | "skipped"));
+            if conditional {
+                reached_by_conditional = true;
+                conditional_ready &= completed;
+            } else {
+                direct_ready &= completed;
+            }
+        }
+    }
+    Ok(if reached_by_conditional {
+        conditional_ready
+    } else {
+        direct_ready
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn materialize_direct_successors<F>(
     transaction: &Transaction<'_>,
@@ -10599,69 +10759,63 @@ fn materialize_direct_successors<F>(
 where
     F: WorkflowOutputFault + ?Sized,
 {
-    let (definition_json, generation): (String, u64) = transaction.query_row(
-        "SELECT definition.definition_json, activation.dependency_generation \
-         FROM workflow_runs run \
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-           AND definition.version = run.definition_version \
-         JOIN workflow_activations activation ON activation.run_id = run.run_id \
-           AND activation.node_id = ?2 AND activation.activation_id = ?3 \
-         WHERE run.run_id = ?1",
+    let generation: u64 = transaction.query_row(
+        "SELECT dependency_generation FROM workflow_activations \
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
         (&output.run_id, &output.node_id, &output.activation_id),
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )?;
-    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-    let mut completed_is_exit = definition
-        .exits
-        .iter()
-        .any(|node_id| node_id == &output.node_id);
-    let mut targets = definition
-        .edges
-        .iter()
-        .filter(|edge| {
-            if edge.from != output.node_id {
-                return false;
-            }
-            match &edge.kind {
+    let mut completed_is_exit =
+        run_graph::initial_exit(transaction, &output.run_id, &output.node_id)?;
+    let mut targets = Vec::new();
+    let mut cursor = None;
+    let mut has_outgoing = false;
+    let mut all_conditional = true;
+    loop {
+        let edges = run_graph::initial_outgoing_edges(
+            transaction,
+            &output.run_id,
+            &output.node_id,
+            cursor,
+        )?;
+        if edges.is_empty() {
+            break;
+        }
+        cursor = edges.last().map(|edge| edge.edge_id);
+        for record in edges {
+            let edge = record.edge;
+            has_outgoing = true;
+            all_conditional &= matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. });
+            let selected = match &edge.kind {
                 bcode_workflow::EdgeKind::Direct => true,
                 bcode_workflow::EdgeKind::Conditional {
                     predicate,
                     expected,
-                } => evaluate_predicate(predicate, &output.value)
-                    .is_ok_and(|selected| selected == *expected),
+                } => evaluate_predicate(predicate, &output.value)? == *expected,
                 bcode_workflow::EdgeKind::Back { .. } | bcode_workflow::EdgeKind::Retry { .. } => {
                     false
                 }
+            };
+            if selected {
+                targets.push(edge.to);
             }
-        })
-        .map(|edge| edge.to.clone())
-        .collect::<Vec<_>>();
-    if targets.is_empty()
-        && definition
-            .edges
-            .iter()
-            .any(|edge| edge.from == output.node_id)
-        && definition.edges.iter().all(|edge| {
-            edge.from != output.node_id
-                || matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. })
-        })
-    {
+        }
+    }
+    if targets.is_empty() && has_outgoing && all_conditional {
         completed_is_exit = true;
     }
     for target in &targets {
-        if definition
-            .node(target)
-            .is_some_and(|node| node.kind == bcode_workflow::NodeKind::Parallel)
-        {
-            bcode_workflow::validate_parallel_join_configuration(
-                &definition,
-                definition.node(target).expect("checked"),
-            )
-            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let node =
+            run_graph::initial_node(transaction, &output.run_id, target)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow successor node is missing from the run graph: {target}"
+                ))
+            })?;
+        if node.kind == bcode_workflow::NodeKind::Parallel {
+            validate_parallel_run_topology(transaction, &output.run_id, &node)?;
         }
     }
-    if let Some(branch) = definition
-        .node(&output.node_id)
+    if let Some(branch) = run_graph::initial_node(transaction, &output.run_id, &output.node_id)?
         .filter(|node| node.kind == bcode_workflow::NodeKind::Branch)
     {
         let expression: bcode_workflow::PredicateExpression =
@@ -10721,48 +10875,21 @@ where
     targets.dedup();
     let mut activated = Vec::new();
     for node_id in targets {
-        let reached_by_conditional = definition.edges.iter().any(|edge| {
-            edge.from == output.node_id
-                && edge.to == node_id
-                && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. })
-        });
-        let dependencies = definition
-            .edges
-            .iter()
-            .filter(|edge| edge.to == node_id)
-            .filter(|edge| {
-                if reached_by_conditional {
-                    edge.from == output.node_id
-                        && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. })
-                } else {
-                    matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
-                }
-            })
-            .map(|edge| edge.from.as_str())
-            .collect::<Vec<_>>();
-        let mut ready = true;
-        for dependency in dependencies {
-            let completed = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 \
-                 AND node_id = ?2 AND dependency_generation = ?3 \
-                 AND status IN ('completed', 'skipped'))",
-                (&output.run_id, dependency, generation),
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !completed {
-                ready = false;
-                break;
-            }
-        }
-        if !ready {
+        if activation_status_at_generation(transaction, &output.run_id, &node_id, generation)?
+            .is_some()
+        {
             continue;
         }
-        let target = definition.node(&node_id).ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!(
-                "workflow successor node is missing: {node_id}"
-            ))
-        })?;
-        let input = activation_input(transaction, &definition, output, target, generation)?;
+        if !successor_dependencies_ready(transaction, output, &node_id, generation)? {
+            continue;
+        }
+        let target =
+            run_graph::initial_node(transaction, &output.run_id, &node_id)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow successor node is missing from the run graph: {node_id}"
+                ))
+            })?;
+        let input = activation_input(transaction, output, &target, generation)?;
         let activation = NewActivation {
             run_id: output.run_id.clone(),
             node_id: node_id.clone(),
@@ -10771,17 +10898,11 @@ where
             input: Some(input),
             created_at_ms: output.created_at_ms,
         };
-        let node = definition.node(&node_id).ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!(
-                "workflow successor references missing node: {node_id}"
-            ))
-        })?;
-        let status = activation_status_for_node(node);
+        let status = activation_status_for_node(&target);
         let changed = transaction.execute(
             "INSERT INTO workflow_activations \
              (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 &activation.run_id,
                 &activation.node_id,
@@ -10796,20 +10917,23 @@ where
                 activation.created_at_ms,
             ),
         )?;
-        if changed == 1 {
-            append_event(
-                transaction,
-                &activation.run_id,
-                if status == "pending" {
-                    "activation_created"
-                } else {
-                    "activation_waiting"
-                },
-                &serde_json::json!({"activation": activation, "status": status}).to_string(),
-                activation.created_at_ms,
-            )?;
-            activated.push(activation);
+        if changed != 1 {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow successor insertion did not create exactly one activation: {node_id}"
+            )));
         }
+        append_event(
+            transaction,
+            &activation.run_id,
+            if status == "pending" {
+                "activation_created"
+            } else {
+                "activation_waiting"
+            },
+            &serde_json::json!({"activation": activation, "status": status}).to_string(),
+            activation.created_at_ms,
+        )?;
+        activated.push(activation);
     }
     Ok((activated, completed_is_exit))
 }
@@ -10836,36 +10960,44 @@ fn prepared_read_only_dispatches_scoped(
 ) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
     let mut statement = connection.prepare(
         "SELECT attempt.run_id, attempt.node_id, attempt.activation_id, attempt.attempt, \
-         attempt.dispatch_identity, activation.dependency_generation, activation.input_json, \
-         activation.created_at_ms, definition.definition_json, attempt.intent_json \
+         attempt.dispatch_identity, activation.dependency_generation, \
+         CASE WHEN typeof(activation.input_json) = 'text' \
+                   AND length(CAST(activation.input_json AS BLOB)) <= ?3 \
+              THEN activation.input_json END, \
+         activation.created_at_ms, \
+         CASE WHEN typeof(attempt.intent_json) = 'text' \
+                   AND length(CAST(attempt.intent_json AS BLOB)) <= ?3 \
+              THEN attempt.intent_json END, activation.input_json IS NULL \
          FROM workflow_attempts attempt \
          JOIN workflow_activations activation ON activation.run_id = attempt.run_id \
            AND activation.node_id = attempt.node_id \
            AND activation.activation_id = attempt.activation_id \
          JOIN workflow_runs run ON run.run_id = attempt.run_id \
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-           AND definition.version = run.definition_version \
          WHERE attempt.status = 'prepared' AND attempt.side_effect = 'read_only' \
+           AND activation.status = 'running' \
            AND attempt.receipt_json IS NULL AND run.status = 'running' \
            AND run.cancellation_requested_at_ms IS NULL \
            AND (?1 IS NULL OR attempt.run_id = ?1) \
          ORDER BY attempt.prepared_at_ms, attempt.dispatch_identity LIMIT ?2",
     )?;
     statement
-        .query_map(rusqlite::params![run_id, limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, u32>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, u64>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, u64>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-            ))
-        })?
+        .query_map(
+            rusqlite::params![run_id, limit, MAX_INLINE_JSON_BYTES],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, bool>(9)?,
+                ))
+            },
+        )?
         .map(|row| {
             let (
                 run_id,
@@ -10876,15 +11008,25 @@ fn prepared_read_only_dispatches_scoped(
                 dependency_generation,
                 input_json,
                 created_at_ms,
-                definition_json,
                 intent_json,
+                input_absent,
             ) = row?;
-            let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-            let node = definition.node(&node_id).cloned().ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "prepared workflow attempt references missing node: {node_id}"
-                ))
+            let intent_json = intent_json.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "prepared workflow attempt intent is oversized or not text".to_string(),
+                )
             })?;
+            if input_json.is_none() && !input_absent {
+                return Err(WorkflowStoreError::InvalidData(
+                    "prepared workflow activation input is oversized or not text".to_string(),
+                ));
+            }
+            let node =
+                run_graph::initial_node(connection, &run_id, &node_id)?.ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "prepared workflow attempt references missing run-graph node: {node_id}"
+                    ))
+                })?;
             Ok(PreparedActivationDispatch {
                 activation: PendingActivation {
                     run_id,
@@ -11045,7 +11187,9 @@ fn parallel_member_ids(
             join.id, member_node_id
         )));
     }
-    Ok(left.into_iter().chain(right).collect())
+    bcode_workflow::parallel_join_member_ids(join)
+        .map(|members| members.into_iter().map(str::to_string).collect())
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -11054,35 +11198,141 @@ struct ParallelFailureSettlement {
     sibling_cancellations: Vec<ActiveAttemptCancellation>,
 }
 
+fn validate_parallel_run_topology(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node: &bcode_workflow::NodeDefinition,
+) -> Result<(), WorkflowStoreError> {
+    let members = bcode_workflow::parallel_join_member_ids(node)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let mut missing = members.into_iter().collect::<BTreeSet<_>>();
+    let mut cursor = None;
+    loop {
+        let edges = run_graph::initial_incoming_edges(transaction, run_id, &node.id, cursor)?;
+        if edges.is_empty() {
+            break;
+        }
+        cursor = edges.last().map(|edge| edge.edge_id);
+        for record in edges {
+            if matches!(record.edge.kind, bcode_workflow::EdgeKind::Direct)
+                && missing.contains(record.edge.from.as_str())
+                && run_graph::initial_node(transaction, run_id, &record.edge.from)?.is_some()
+            {
+                missing.remove(record.edge.from.as_str());
+            }
+        }
+    }
+    if let Some(member) = missing.first() {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "parallel join member '{member}' must exist and have a direct edge to the join"
+        )));
+    }
+    Ok(())
+}
+
+fn parallel_join_for_member(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    member_node_id: &str,
+) -> Result<Option<bcode_workflow::NodeDefinition>, WorkflowStoreError> {
+    let mut cursor = None;
+    let mut selected: Option<bcode_workflow::NodeDefinition> = None;
+    loop {
+        let edges = run_graph::initial_outgoing_edges(transaction, run_id, member_node_id, cursor)?;
+        if edges.is_empty() {
+            return Ok(selected);
+        }
+        cursor = edges.last().map(|edge| edge.edge_id);
+        for record in edges {
+            if !matches!(record.edge.kind, bcode_workflow::EdgeKind::Direct) {
+                continue;
+            }
+            let node = run_graph::initial_node(transaction, run_id, &record.edge.to)?.ok_or_else(
+                || {
+                    WorkflowStoreError::InvalidData(format!(
+                        "parallel settlement references missing run-graph node: {}",
+                        record.edge.to
+                    ))
+                },
+            )?;
+            if node.kind == bcode_workflow::NodeKind::Parallel
+                && parallel_member_ids(&node, member_node_id)?
+                    .iter()
+                    .any(|id| id == member_node_id)
+                && selected
+                    .as_ref()
+                    .is_none_or(|previous| node.id < previous.id)
+            {
+                selected = Some(node);
+            }
+        }
+    }
+}
+
+fn activation_status_at_generation(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node_id: &str,
+    generation: u64,
+) -> Result<Option<String>, WorkflowStoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT CASE WHEN typeof(status) = 'text' AND length(CAST(status AS BLOB)) <= 32 \
+                     THEN status END FROM workflow_activations \
+         WHERE run_id = ?1 AND node_id = ?2 AND dependency_generation = ?3 LIMIT 2",
+    )?;
+    let mut rows = statement.query((run_id, node_id, generation))?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let status: Option<String> = row.get(0)?;
+    if rows.next()?.is_some() {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow node has ambiguous activations: {node_id}"
+        )));
+    }
+    match status.as_deref() {
+        Some(
+            "pending"
+            | "running"
+            | "waiting_input"
+            | "waiting_approval"
+            | "waiting_mutation_approval"
+            | "completed"
+            | "skipped"
+            | "failed"
+            | "cancelled",
+        ) => Ok(status),
+        _ => Err(WorkflowStoreError::InvalidData(format!(
+            "workflow node has unsupported activation status: {node_id}"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn settle_parallel_failure(
     transaction: &Transaction<'_>,
     run_id: &str,
     member_node_id: &str,
+    activation_id: &str,
     member_failed: bool,
     settled_at_ms: u64,
 ) -> Result<Option<ParallelFailureSettlement>, WorkflowStoreError> {
-    let (definition_json, generation): (String, u64) = transaction.query_row(
-        "SELECT definition.definition_json, activation.dependency_generation \
-         FROM workflow_runs run \
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-           AND definition.version = run.definition_version \
-         JOIN workflow_activations activation ON activation.run_id = run.run_id \
-           AND activation.node_id = ?2 \
-         WHERE run.run_id = ?1",
-        (run_id, member_node_id),
-        |row| Ok((row.get(0)?, row.get(1)?)),
+    let generation: u64 = transaction.query_row(
+        "SELECT dependency_generation FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2 \
+         AND activation_id = ?3",
+        (run_id, member_node_id, activation_id),
+        |row| row.get(0),
     )?;
-    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-    for join in definition
-        .nodes
-        .values()
-        .filter(|node| node.kind == bcode_workflow::NodeKind::Parallel)
-    {
-        let members = parallel_member_ids(join, member_node_id)?;
-        if !members.iter().any(|member| member == member_node_id) {
-            continue;
+    if let Some(join) = parallel_join_for_member(transaction, run_id, member_node_id)? {
+        let members = parallel_member_ids(&join, member_node_id)?;
+        for member in &members {
+            if run_graph::initial_node(transaction, run_id, member)?.is_none() {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "parallel settlement references missing member: {member}"
+                )));
+            }
         }
+        validate_parallel_run_topology(transaction, run_id, &join)?;
         let policy: bcode_workflow::ParallelFailurePolicy = serde_json::from_value(
             join.configuration
                 .get("failure_policy")
@@ -11093,15 +11343,11 @@ fn settle_parallel_failure(
         let mut all_terminal = true;
         let mut has_failure = false;
         let mut sibling_cancellations = Vec::new();
-        for member in members {
-            let status: Option<String> = transaction
-                .query_row(
-                    "SELECT status FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2 \
-                     AND dependency_generation = ?3",
-                    (run_id, &member, generation),
-                    |row| row.get(0),
-                )
-                .optional()?;
+        let statuses = members
+            .iter()
+            .map(|member| activation_status_at_generation(transaction, run_id, member, generation))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (member, status) in members.into_iter().zip(statuses) {
             let terminal = status.as_deref().is_some_and(|status| {
                 matches!(status, "completed" | "skipped" | "failed" | "cancelled")
             });
@@ -11109,7 +11355,8 @@ fn settle_parallel_failure(
             has_failure |= status
                 .as_deref()
                 .is_some_and(|status| matches!(status, "failed" | "cancelled"));
-            if policy == bcode_workflow::ParallelFailurePolicy::FailFast
+            if member_failed
+                && policy == bcode_workflow::ParallelFailurePolicy::FailFast
                 && member != member_node_id
                 && !terminal
             {
@@ -11232,24 +11479,22 @@ fn schedule_retry_for_observation_transaction(
     failure_kind: bcode_workflow::AutomaticRetryFailureKind,
     scheduled_at_ms: u64,
 ) -> Result<Option<AutomaticRetrySchedule>, WorkflowStoreError> {
-    let (definition_json, retry_cap): (String, u32) = transaction.query_row(
-        "SELECT definition.definition_json, run.retry_cap FROM workflow_runs run \
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-           AND definition.version = run.definition_version WHERE run.run_id = ?1",
+    let retry_cap: u32 = transaction.query_row(
+        "SELECT retry_cap FROM workflow_runs WHERE run_id = ?1",
         [&request.run_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )?;
-    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-    let node = definition.node(&request.node_id).ok_or_else(|| {
-        WorkflowStoreError::InvalidData(format!(
-            "retry observation references missing node: {}",
-            request.node_id
-        ))
-    })?;
+    let node = run_graph::initial_node(transaction, &request.run_id, &request.node_id)?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "retry observation references missing run-graph node: {}",
+                request.node_id
+            ))
+        })?;
     if node.kind != bcode_workflow::NodeKind::PluginBlock {
         return Ok(None);
     }
-    let block: WorkflowBlockDefinition = serde_json::from_value(node.configuration.clone())?;
+    let block: WorkflowBlockDefinition = serde_json::from_value(node.configuration)?;
     let Some(policy) = block.automatic_retry else {
         return Ok(None);
     };
@@ -11461,6 +11706,7 @@ fn apply_attempt_observation(
                     transaction,
                     &request.run_id,
                     &request.node_id,
+                    &request.activation_id,
                     true,
                     reconciled_at_ms,
                 )?;
@@ -12541,20 +12787,13 @@ fn insert_activation_with_status(
             activation.run_id, activation.node_id, activation.activation_id
         ))
     })?;
-    let definition_json: String = transaction.query_row(
-        "SELECT definition.definition_json FROM workflow_runs run \
-         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-           AND definition.version = run.definition_version WHERE run.run_id = ?1",
-        [&activation.run_id],
-        |row| row.get(0),
-    )?;
-    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-    let node = definition.node(&activation.node_id).ok_or_else(|| {
-        WorkflowStoreError::InvalidData(format!(
-            "workflow activation references missing node: {}",
-            activation.node_id
-        ))
-    })?;
+    let node = run_graph::initial_node(transaction, &activation.run_id, &activation.node_id)?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow activation references missing run-graph node: {}",
+                activation.node_id
+            ))
+        })?;
     validate_json_schema(
         &format!("workflow activation input for node {}", activation.node_id),
         &node.input.schema,
@@ -16768,6 +17007,258 @@ mod tests {
     }
 
     #[test]
+    fn prepared_recovery_rejects_malformed_json_without_writes() {
+        for column in ["input_json", "intent_json"] {
+            let (_temp, mut store) = initialized_store();
+            store
+                .prepare_pending_activation(
+                    "run-1",
+                    "review",
+                    &activation_id(),
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"operation": "review"}),
+                    12,
+                )
+                .expect("prepare")
+                .expect("activation");
+            let sql = if column == "input_json" {
+                "UPDATE workflow_activations SET input_json = ?1 WHERE run_id = 'run-1'"
+            } else {
+                "UPDATE workflow_attempts SET intent_json = ?1 WHERE run_id = 'run-1'"
+            };
+            store
+                .connection
+                .execute(sql, ["{"])
+                .expect("malformed JSON fixture");
+            let before = store.connection.total_changes();
+            assert!(
+                prepared_read_only_dispatches_for_run(&store.connection, "unrelated-run", 10)
+                    .expect("unrelated scope must not decode damaged rows")
+                    .is_empty()
+            );
+            assert!(prepared_read_only_dispatches(&store.connection, 10).is_err());
+            assert!(prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn prepared_recovery_preserves_absent_and_null_inputs() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        for (input, expected) in [(None, None), (Some("null"), Some(serde_json::Value::Null))] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_activations SET input_json = ?1 WHERE run_id = 'run-1'",
+                    [input],
+                )
+                .expect("input fixture");
+            let before = store.connection.total_changes();
+            for recovered in [
+                prepared_read_only_dispatches(&store.connection, 10).expect("global recovery"),
+                prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10)
+                    .expect("run recovery"),
+            ] {
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(recovered[0].activation.input, expected);
+            }
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn prepared_recovery_rejects_oversized_input_without_writes() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        for input in [
+            rusqlite::types::Value::Text(
+                serde_json::to_string(&"x".repeat(MAX_INLINE_JSON_BYTES)).expect("json"),
+            ),
+            rusqlite::types::Value::Blob(b"null".to_vec()),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_activations SET input_json = ?1 WHERE run_id = 'run-1'",
+                    [&input],
+                )
+                .expect("damaged input fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                prepared_read_only_dispatches(&store.connection, 10),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn prepared_recovery_rejects_oversized_intent_without_writes() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        for intent in [
+            rusqlite::types::Value::Text(
+                serde_json::to_string(&"x".repeat(MAX_INLINE_JSON_BYTES)).expect("json"),
+            ),
+            rusqlite::types::Value::Blob(b"{}".to_vec()),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_attempts SET intent_json = ?1 WHERE run_id = 'run-1'",
+                    [&intent],
+                )
+                .expect("damaged intent fixture");
+            let before = store.connection.total_changes();
+            assert!(
+                matches!(prepared_read_only_dispatches(&store.connection, 10),
+            Err(WorkflowStoreError::InvalidData(message)) if message.contains("attempt intent is oversized or not text"))
+            );
+            assert!(prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn prepared_recovery_requires_running_activations() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        assert_eq!(
+            prepared_read_only_dispatches(&store.connection, 10)
+                .expect("recoverable")
+                .len(),
+            1
+        );
+        for status in [
+            "pending",
+            "waiting_input",
+            "waiting_approval",
+            "waiting_mutation_approval",
+            "completed",
+            "cancelled",
+            "failed",
+            "skipped",
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_activations SET status = ?1 WHERE run_id = 'run-1'",
+                    [status],
+                )
+                .expect("non-running activation");
+            let before = store.connection.total_changes();
+            assert!(
+                prepared_read_only_dispatches(&store.connection, 10)
+                    .expect("global recovery")
+                    .is_empty()
+            );
+            assert!(
+                prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10)
+                    .expect("run recovery")
+                    .is_empty()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn prepared_recovery_requires_admitted_graph_without_writes() {
+        let (temp, mut store) = initialized_store();
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        let mut source = definition("example");
+        source.nodes.clear();
+        let json = serde_json::to_string(&source).expect("source");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2",
+                rusqlite::params![json, sha256_hex(json.as_bytes())],
+            )
+            .expect("source fixture");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            prepared_read_only_dispatches(&store.connection, 10).expect("admitted recovery"),
+            vec![prepared]
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        for damage in [
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'review'",
+            "UPDATE workflow_run_graphs SET revision = 2",
+            "DELETE FROM workflow_run_graph_nodes WHERE node_id = 'review'",
+        ] {
+            store
+                .connection
+                .execute_batch(damage)
+                .expect("damage fixture");
+            let before = store.connection.total_changes();
+            assert!(prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+            store
+                .connection
+                .execute_batch("UPDATE workflow_run_graphs SET revision = 1")
+                .expect("restore revision");
+            store.connection.execute(
+                "INSERT OR REPLACE INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 1, ?1, 1, 1)",
+                [serde_json::to_string(&definition("example").nodes["review"]).expect("node")],
+            ).expect("restore node fixture");
+        }
+    }
+
+    #[test]
     fn prepared_attempt_identity_is_stable_and_conflicting_intent_fails_closed() {
         let (_temp, mut store) = initialized_store();
         let attempt = PreparedAttempt {
@@ -17264,6 +17755,48 @@ mod tests {
             .expect("settled");
         assert_eq!(settled.payload["iterations_completed"], 1);
         assert_eq!(settled.payload["outcome"], "iteration_limit_reached");
+        verify_repeat_outcome_graph_authority(store, temp.path(), &definition, &outcomes);
+    }
+
+    fn verify_repeat_outcome_graph_authority(
+        store: WorkflowStore,
+        state_dir: &Path,
+        definition: &WorkflowDefinition,
+        outcomes: &[WorkflowRepeatOutcomeSummary],
+    ) {
+        let mut source = definition.clone();
+        source.nodes.clear();
+        let json = serde_json::to_string(&source).expect("source");
+        store.connection.execute(
+            "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2 WHERE definition_id = 'repeat-outcome'",
+            rusqlite::params![json, sha256_hex(json.as_bytes())],
+        ).expect("source fixture");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(state_dir).expect("reopen");
+        assert_eq!(
+            store
+                .repeat_outcomes("repeat-outcome-run", 10)
+                .expect("admitted outcomes"),
+            outcomes
+        );
+        for damage in [
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'repeat-control'",
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'repeat-outcome-run'",
+            "DELETE FROM workflow_run_graph_nodes WHERE node_id = 'repeat-control'",
+        ] {
+            store
+                .connection
+                .execute_batch(damage)
+                .expect("damage fixture");
+            let before = store.connection.total_changes();
+            assert!(store.repeat_outcomes("repeat-outcome-run", 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+            store.connection.execute(
+                "INSERT OR REPLACE INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('repeat-outcome-run', 'repeat-control', 1, ?1, 0, 1)",
+                [serde_json::to_string(&definition.nodes["repeat-control"]).expect("node")],
+            ).expect("restore node fixture");
+            store.connection.execute_batch("UPDATE workflow_run_graphs SET revision = 1 WHERE run_id = 'repeat-outcome-run'").expect("restore revision");
+        }
     }
 
     #[test]
@@ -18603,6 +19136,23 @@ mod tests {
             })
             .expect("receipt");
 
+        // Source configuration is not the admitted execution's retry authority.
+        definition
+            .nodes
+            .get_mut("review")
+            .expect("node")
+            .configuration["automatic_retry"] = serde_json::Value::Null;
+        let source_json = serde_json::to_string(&definition).expect("source");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2",
+                rusqlite::params![source_json, sha256_hex(source_json.as_bytes())],
+            )
+            .expect("source fixture");
+        drop(store);
+        let mut store =
+            WorkflowStore::open_in_state_dir(temp.path()).expect("reopen before observation");
         let summary = store
             .reconcile_receipt_backed_attempts(&RetryableFailureObserver, 10, 20)
             .expect("reconcile");
@@ -18640,6 +19190,39 @@ mod tests {
                 .expect("duplicate")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn automatic_retry_observation_rejects_graph_damage_before_writes() {
+        for damage in [
+            "DELETE FROM workflow_run_graph_nodes WHERE node_id = 'review'",
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'review'",
+            "UPDATE workflow_run_graphs SET revision = 2",
+        ] {
+            let (_temp, mut store) = initialized_store();
+            let request = AttemptReconciliationRequest {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: 1,
+                dispatch_identity: "test".to_string(),
+                side_effect: DispatchSideEffect::ReadOnly,
+                receipt: serde_json::json!({}),
+            };
+            let transaction = store.connection.transaction().expect("transaction");
+            transaction.execute_batch(damage).expect("damage fixture");
+            let before = transaction.total_changes();
+            assert!(
+                schedule_retry_for_observation_transaction(
+                    &transaction,
+                    &request,
+                    bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable,
+                    20,
+                )
+                .is_err()
+            );
+            assert_eq!(transaction.total_changes(), before);
+        }
     }
 
     #[test]
@@ -19720,6 +20303,23 @@ mod tests {
         invalid: &WorkflowDefinition,
         stale_checksum: bool,
     ) {
+        verify_graph_migration_rejects_definition_checksum(invalid, stale_checksum, None);
+    }
+
+    #[test]
+    fn graph_migration_preserves_oversized_checksums() {
+        verify_graph_migration_rejects_definition_checksum(
+            &definition("example"),
+            true,
+            Some(&"x".repeat(MAX_INLINE_JSON_BYTES + 1)),
+        );
+    }
+
+    fn verify_graph_migration_rejects_definition_checksum(
+        invalid: &WorkflowDefinition,
+        stale_checksum: bool,
+        checksum_override: Option<&str>,
+    ) {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         store
@@ -19744,7 +20344,12 @@ mod tests {
                 [&payload],
             )
             .expect("future definition");
-        if !stale_checksum {
+        if let Some(checksum) = checksum_override {
+            connection.execute(
+                "UPDATE workflow_definitions SET checksum_sha256 = ?1 WHERE definition_id = 'example'",
+                [checksum],
+            ).expect("checksum damage fixture");
+        } else if !stale_checksum {
             connection
                 .execute(
                     "UPDATE workflow_definitions SET checksum_sha256 = ?1 WHERE definition_id = 'example'",
@@ -21379,6 +21984,580 @@ mod tests {
     }
 
     #[test]
+    fn transform_run_json_bounds_payloads_and_preserves_absence() {
+        let (_temp, mut store) = initialized_store();
+        let transaction = store.connection.transaction().expect("transaction");
+        for field in [
+            TransformRunField::Input,
+            TransformRunField::AuthoredProvenance,
+        ] {
+            let column = field.column();
+            for (value, valid) in [
+                (rusqlite::types::Value::Null, true),
+                (rusqlite::types::Value::Text("null".to_string()), true),
+                (rusqlite::types::Value::Blob(b"null".to_vec()), false),
+                (
+                    rusqlite::types::Value::Text("x".repeat(MAX_INLINE_JSON_BYTES)),
+                    true,
+                ),
+                (
+                    rusqlite::types::Value::Text("é".repeat(MAX_INLINE_JSON_BYTES / 2)),
+                    true,
+                ),
+                (
+                    rusqlite::types::Value::Text("é".repeat(MAX_INLINE_JSON_BYTES / 2 + 1)),
+                    false,
+                ),
+                (
+                    rusqlite::types::Value::Text("x".repeat(MAX_INLINE_JSON_BYTES + 1)),
+                    false,
+                ),
+            ] {
+                transaction
+                    .execute(
+                        &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                        [&value],
+                    )
+                    .expect("payload fixture");
+                let changes = transaction.total_changes();
+                let result = transform_run_json(&transaction, "run-1", field);
+                assert_eq!(result.is_ok(), valid);
+                if valid {
+                    assert_eq!(
+                        result.expect("valid payload"),
+                        match value {
+                            rusqlite::types::Value::Text(text) => Some(text),
+                            _ => None,
+                        }
+                    );
+                }
+                assert_eq!(transaction.total_changes(), changes);
+            }
+        }
+    }
+
+    #[test]
+    fn branch_skip_rejects_identity_collision_and_deduplicates_nodes() {
+        let (_temp, mut store) = initialized_store();
+        let transaction = store.connection.transaction().expect("transaction");
+        let nodes = ["review".to_string(), "review".to_string()];
+        skip_branch_nodes(&transaction, "run-1", 1, &nodes, 20).expect("duplicate node IDs");
+        assert_eq!(
+            activation_status_at_generation(&transaction, "run-1", "review", 1)
+                .expect("unique skipped activation")
+                .as_deref(),
+            Some("skipped")
+        );
+        transaction
+            .execute(
+                "UPDATE workflow_activations SET dependency_generation = 2 \
+             WHERE run_id = 'run-1' AND dependency_generation = 1",
+                [],
+            )
+            .expect("identity collision fixture");
+        let changes = transaction.total_changes();
+        assert!(skip_branch_nodes(&transaction, "run-1", 1, &nodes, 30).is_err());
+        assert_eq!(transaction.total_changes(), changes);
+        assert!(
+            activation_status_at_generation(&transaction, "run-1", "review", 1)
+                .expect("absent generation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn branch_skip_preserves_existing_generation_with_distinct_identity() {
+        let (_temp, mut store) = initialized_store();
+        store.connection.execute(
+            "UPDATE workflow_activations SET activation_id = 'existing-identity' WHERE run_id = 'run-1'",
+            [],
+        ).expect("identity fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let changes = transaction.total_changes();
+        skip_branch_nodes(&transaction, "run-1", 0, &["review".to_string()], 20)
+            .expect("existing generation");
+        assert_eq!(transaction.total_changes(), changes);
+        assert_eq!(
+            activation_status_at_generation(&transaction, "run-1", "review", 0)
+                .expect("unambiguous generation")
+                .as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn branch_skip_is_idempotent_and_rejects_ambiguous_generation() {
+        let (_temp, mut store) = initialized_store();
+        let transaction = store.connection.transaction().expect("transaction");
+        let nodes = ["review".to_string()];
+        skip_branch_nodes(&transaction, "run-1", 1, &nodes, 20).expect("first skip");
+        let changes = transaction.total_changes();
+        skip_branch_nodes(&transaction, "run-1", 1, &nodes, 30).expect("duplicate skip");
+        assert_eq!(transaction.total_changes(), changes);
+        let (status, created_at): (String, u64) = transaction
+            .query_row(
+                "SELECT status, created_at_ms FROM workflow_activations \
+             WHERE run_id = 'run-1' AND node_id = 'review' AND dependency_generation = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("skipped activation");
+        assert_eq!(status, "skipped");
+        assert_eq!(created_at, 20);
+        transaction
+            .execute(
+                "INSERT INTO workflow_activations \
+             (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             VALUES ('run-1', 'review', 'duplicate-generation', 1, 'skipped', 20)",
+                [],
+            )
+            .expect("ambiguous generation fixture");
+        let changes = transaction.total_changes();
+        let error = skip_branch_nodes(&transaction, "run-1", 1, &nodes, 40)
+            .expect_err("ambiguous generation");
+        assert!(error.to_string().contains("ambiguous activations"));
+        assert_eq!(transaction.total_changes(), changes);
+    }
+
+    #[test]
+    fn branch_skip_rejects_unknown_existing_activation_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'future_status' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("future state fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let changes = transaction.total_changes();
+        let error = skip_branch_nodes(&transaction, "run-1", 0, &["review".to_string()], 20)
+            .expect_err("unknown state must not be silently skipped");
+        assert!(error.to_string().contains("unsupported activation status"));
+        assert_eq!(transaction.total_changes(), changes);
+    }
+
+    #[test]
+    fn unknown_activation_state_does_not_block_other_run_completion() {
+        let (_temp, mut store) = initialized_store();
+        let mut other = new_run();
+        other.run_id = "run-2".to_string();
+        store.create_run(&other).expect("second run");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'future_status' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("future state fixture");
+        let original_events = store.event_history("run-1", None, 100).expect("events");
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "other-exit-output".to_string(),
+                run_id: "run-2".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_identity("run-2", "review", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("unaffected run completes");
+        assert_eq!(result.run_status, RunStatus::Completed);
+        assert_eq!(
+            store
+                .run_summary("run-2")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            store.event_history("run-1", None, 100).expect("events"),
+            original_events
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved status");
+        assert_eq!(status, "future_status");
+    }
+
+    #[test]
+    fn unfinished_activation_check_classifies_states_and_isolates_runs() {
+        let (_temp, mut store) = initialized_store();
+        let transaction = store.connection.transaction().expect("transaction");
+        for (status, unfinished) in [
+            ("pending", true),
+            ("running", true),
+            ("waiting_input", true),
+            ("waiting_approval", true),
+            ("waiting_mutation_approval", true),
+            ("completed", false),
+            ("skipped", false),
+            ("failed", false),
+            ("cancelled", false),
+        ] {
+            transaction
+                .execute(
+                    "UPDATE workflow_activations SET status = ?1 WHERE run_id = 'run-1'",
+                    [status],
+                )
+                .expect("status fixture");
+            let changes = transaction.total_changes();
+            assert_eq!(
+                run_has_unfinished_activations(&transaction, "run-1").expect("supported status"),
+                unfinished,
+                "{status}"
+            );
+            assert_eq!(transaction.total_changes(), changes);
+        }
+        transaction
+            .execute(
+                "UPDATE workflow_activations SET status = 'future_status' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("future status fixture");
+        let changes = transaction.total_changes();
+        assert!(run_has_unfinished_activations(&transaction, "run-1").is_err());
+        assert!(
+            !run_has_unfinished_activations(&transaction, "unrelated-run")
+                .expect("unrelated run remains readable")
+        );
+        assert_eq!(transaction.total_changes(), changes);
+    }
+
+    #[test]
+    fn exit_output_rejects_unknown_activation_state_atomically() {
+        let (_temp, mut store) = initialized_store();
+        store.connection.execute(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             VALUES ('run-1', 'review', 'future-activation', 1, 'future_status', 1)",
+            [],
+        ).expect("future fixture");
+        let events = store.event_history("run-1", None, 100).expect("events");
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "exit-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_identity("run-1", "review", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect_err("unsupported state");
+        assert!(error.to_string().contains("unsupported activation status"));
+        assert_eq!(
+            store.event_history("run-1", None, 100).expect("events"),
+            events
+        );
+        assert!(
+            store
+                .output_summaries("run-1", 100)
+                .expect("outputs")
+                .is_empty()
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE activation_id = 'future-activation'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved future status");
+        assert_eq!(status, "future_status");
+    }
+
+    #[test]
+    fn exit_output_does_not_complete_run_with_waiting_activation() {
+        for status in [
+            "waiting_input",
+            "waiting_approval",
+            "waiting_mutation_approval",
+        ] {
+            let (_temp, mut store) = initialized_store();
+            store.connection.execute(
+                "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+                 VALUES ('run-1', 'review', 'waiting-activation', 1, ?1, 1)",
+                [status],
+            ).expect("waiting fixture");
+            let result = store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "exit-output".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "review".to_string(),
+                    activation_id: activation_identity("run-1", "review", 0),
+                    schema_id: "u32".to_string(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 20,
+                })
+                .expect("exit output");
+            assert_eq!(result.run_status, RunStatus::Running);
+            assert_eq!(
+                store
+                    .run_summary("run-1")
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Running
+            );
+            assert!(
+                !store
+                    .event_history("run-1", None, 100)
+                    .expect("events")
+                    .iter()
+                    .any(|event| event.event_type == "run_completed")
+            );
+        }
+    }
+
+    #[test]
+    fn activation_status_reader_preserves_supported_states_and_generation_absence() {
+        let (_temp, mut store) = initialized_store();
+        let transaction = store.connection.transaction().expect("transaction");
+        for status in [
+            "pending",
+            "running",
+            "waiting_input",
+            "waiting_approval",
+            "waiting_mutation_approval",
+            "completed",
+            "skipped",
+            "failed",
+            "cancelled",
+        ] {
+            transaction.execute(
+                "UPDATE workflow_activations SET status = ?1 WHERE run_id = 'run-1' AND node_id = 'review'",
+                [status],
+            ).expect("status fixture");
+            let before = transaction.total_changes();
+            assert_eq!(
+                activation_status_at_generation(&transaction, "run-1", "review", 0)
+                    .expect("supported state")
+                    .as_deref(),
+                Some(status),
+            );
+            assert!(
+                activation_status_at_generation(&transaction, "run-1", "review", 1)
+                    .expect("absent generation")
+                    .is_none()
+            );
+            assert_eq!(transaction.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn successor_readiness_rejects_ambiguous_completed_dependency() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("readiness", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "readiness".to_string();
+        store.create_run(&run).expect("run");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'completed' WHERE run_id = ?1",
+                [&run.run_id],
+            )
+            .expect("completed dependency");
+        let output = ValidatedOutput {
+            output_id: "first-output".to_string(),
+            run_id: run.run_id.clone(),
+            node_id: "first".to_string(),
+            activation_id: activation_identity(&run.run_id, "first", 0),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        let transaction = store.connection.transaction().expect("transaction");
+        assert!(successor_dependencies_ready(&transaction, &output, "second", 0).expect("ready"));
+        transaction.execute(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             SELECT run_id, node_id, 'duplicate', dependency_generation, 'pending', created_at_ms \
+             FROM workflow_activations WHERE run_id = ?1 AND node_id = 'first'",
+            [&run.run_id],
+        ).expect("ambiguous fixture");
+        let before = transaction.total_changes();
+        assert!(
+            successor_dependencies_ready(&transaction, &output, "second", 0)
+                .expect_err("ambiguous dependency")
+                .to_string()
+                .contains("ambiguous activations")
+        );
+        assert_eq!(transaction.total_changes(), before);
+        transaction.execute(
+            "DELETE FROM workflow_activations WHERE run_id = ?1 AND activation_id = 'duplicate'",
+            [&run.run_id],
+        ).expect("remove duplicate fixture");
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'future_status' WHERE run_id = ?1 AND node_id = 'first'",
+            [&run.run_id],
+        ).expect("unsupported dependency fixture");
+        let before = transaction.total_changes();
+        assert!(
+            successor_dependencies_ready(&transaction, &output, "second", 0)
+                .expect_err("unsupported dependency is not a normal wait")
+                .to_string()
+                .contains("unsupported activation status")
+        );
+        assert_eq!(transaction.total_changes(), before);
+        transaction
+            .execute(
+                "DELETE FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = 'first'",
+                [&run.run_id],
+            )
+            .expect("remove dependency node fixture");
+        let before = transaction.total_changes();
+        assert!(
+            successor_dependencies_ready(&transaction, &output, "second", 0)
+                .expect_err("missing dependency node")
+                .to_string()
+                .contains("relationships are inconsistent")
+        );
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn successor_readiness_checks_dependencies_beyond_first_page() {
+        let (_temp, mut store) = initialized_store();
+        let mut plan = definition("example");
+        for id in ["pending", "target"] {
+            let mut node = plan.nodes["review"].clone();
+            node.id = id.to_string();
+            plan.nodes.insert(id.to_string(), node);
+        }
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "target".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        plan.edges = vec![edge.clone(); 100];
+        let mut pending = edge.clone();
+        pending.from = "pending".to_string();
+        plan.edges.push(pending);
+        let output = ValidatedOutput {
+            output_id: "result".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            schema_id: plan.nodes["review"].output.type_name.clone(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 12,
+        };
+        store
+            .persist_validated_output(&output)
+            .expect("completed source");
+        let transaction = store.connection.transaction().expect("transaction");
+        transaction
+            .execute_batch(
+                "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
+            )
+            .expect("replace fixture graph");
+        run_graph::materialize(&transaction, "run-1", &plan).expect("materialize");
+        let before = transaction.total_changes();
+        assert!(
+            !successor_dependencies_ready(&transaction, &output, "target", 0)
+                .expect("pending dependency")
+        );
+        assert_eq!(transaction.total_changes(), before);
+        let mut conditional = edge;
+        conditional.kind = bcode_workflow::EdgeKind::Conditional {
+            predicate: bcode_workflow::PredicateExpression::Equals {
+                version: bcode_workflow::WORKFLOW_PREDICATE_VERSION,
+                path: "status".to_string(),
+                value: serde_json::json!("ready"),
+            },
+            expected: true,
+        };
+        transaction.execute(
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 101, 1, 'review', 'target', ?1)",
+            [serde_json::to_string(&conditional).expect("edge")],
+        ).expect("conditional edge beyond page");
+        let before = transaction.total_changes();
+        assert!(
+            successor_dependencies_ready(&transaction, &output, "target", 0)
+                .expect("conditional dependency")
+        );
+        assert!(
+            !successor_dependencies_ready(&transaction, &output, "target", 1)
+                .expect("different generation")
+        );
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn edge_between_finds_first_match_beyond_a_page_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        let mut plan = definition("example");
+        let mut target = plan.nodes["review"].clone();
+        target.id = "target".to_string();
+        plan.nodes.insert(target.id.clone(), target);
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        plan.edges = vec![edge.clone(); 100];
+        let mut matched = edge;
+        matched.to = "target".to_string();
+        plan.edges.push(matched.clone());
+        plan.edges.push(matched.clone());
+        let transaction = store.connection.transaction().expect("transaction");
+        transaction
+            .execute_batch(
+                "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
+            )
+            .expect("replace fixture graph");
+        run_graph::materialize(&transaction, "run-1", &plan).expect("materialize");
+        // A different later duplicate makes edge ordering observable.
+        let mut later = matched.clone();
+        later.kind = bcode_workflow::EdgeKind::Conditional {
+            predicate: bcode_workflow::PredicateExpression::Equals {
+                version: bcode_workflow::WORKFLOW_PREDICATE_VERSION,
+                path: "status".to_string(),
+                value: serde_json::json!("ready"),
+            },
+            expected: true,
+        };
+        transaction.execute("UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE run_id = 'run-1' AND edge_id = 101", [serde_json::to_string(&later).expect("edge")]).expect("later duplicate");
+        let before = transaction.total_changes();
+        assert_eq!(
+            run_graph::initial_edge_between(&transaction, "run-1", "review", "target")
+                .expect("second page match"),
+            Some(matched)
+        );
+        assert_eq!(
+            run_graph::initial_edge_between(&transaction, "run-1", "review", "absent")
+                .expect("no match"),
+            None
+        );
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
     fn initial_edge_pages_preserve_duplicate_edges_and_detect_damage() {
         let (_temp, mut store) = initialized_store();
         let mut plan = definition("example");
@@ -21978,6 +23157,97 @@ mod tests {
             .expect("attempt")
             .pop()
             .expect("attempt");
+        let admitted_call = store
+            .run_graph_node("parent-run", "call")
+            .expect("graph")
+            .expect("call");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store
+                .observe_child_attempt(&receipt, 4)
+                .expect("running child"),
+            AttemptObservation::Running
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+        for damage in [
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE run_id = 'parent-run' AND node_id = 'call'",
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'parent-run'",
+        ] {
+            store
+                .connection
+                .execute_batch(damage)
+                .expect("damage fixture");
+            let before = store.connection.total_changes();
+            assert!(store.observe_child_attempt(&receipt, 4).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+            store.connection.execute(
+                "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'parent-run' AND node_id = 'call'",
+                [serde_json::to_string(&admitted_call).expect("node")],
+            ).expect("restore fixture");
+            store
+                .connection
+                .execute_batch(
+                    "UPDATE workflow_run_graphs SET revision = 1 WHERE run_id = 'parent-run'",
+                )
+                .expect("restore revision");
+        }
+        let mut wrong_kind = admitted_call.clone();
+        wrong_kind.kind = bcode_workflow::NodeKind::Task;
+        let mut wrong_target = admitted_call.clone();
+        let mut configuration: bcode_workflow::WorkflowCallConfiguration =
+            serde_json::from_value(wrong_target.configuration.clone()).expect("call");
+        configuration.target = bcode_workflow::WorkflowCallTarget::Definition {
+            identity: bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                "different-child",
+                &definition("different-child"),
+            )
+            .expect("identity"),
+        };
+        wrong_target.configuration = serde_json::to_value(configuration).expect("call");
+        for (node, diagnostic) in [
+            (wrong_kind, "not an admitted workflow call"),
+            (wrong_target, "conflicts with admitted call target"),
+        ] {
+            store.connection.execute(
+                "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'parent-run' AND node_id = 'call'",
+                [serde_json::to_string(&node).expect("node")],
+            ).expect("inconsistent call fixture");
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .observe_child_attempt(&receipt, 4)
+                    .expect_err("inconsistent call")
+                    .to_string()
+                    .contains(diagnostic)
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+        store.connection.execute(
+            "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'parent-run' AND node_id = 'call'",
+            [serde_json::to_string(&admitted_call).expect("node")],
+        ).expect("restore call fixture");
+        let mut changed_source = parent_definition.clone();
+        changed_source.nodes.clear();
+        let source_json = serde_json::to_string(&changed_source).expect("source");
+        store.connection.execute(
+            "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2 WHERE definition_id = 'parent'",
+            rusqlite::params![source_json, sha256_hex(source_json.as_bytes())],
+        ).expect("source fixture");
+        drop(store);
+        let mut store =
+            WorkflowStore::open_in_state_dir(temp.path()).expect("reopen before observation");
+        assert!(matches!(
+            store
+                .observe_child_attempt(&receipt, 4)
+                .expect("admitted call"),
+            AttemptObservation::Running
+        ));
+        // Restore source for the cancellation paths not yet moved to the graph.
+        let source_json = serde_json::to_string(&parent_definition).expect("source");
+        store.connection.execute(
+            "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2 WHERE definition_id = 'parent'",
+            rusqlite::params![source_json, sha256_hex(source_json.as_bytes())],
+        ).expect("restore source fixture");
         let (recorded, cancelled_run_ids) = store
             .request_cancellation_tree("parent-run", 4)
             .expect("cancel parent tree");
@@ -23447,6 +24717,46 @@ mod tests {
     }
 
     #[test]
+    fn waiting_resolution_rejects_non_gate_nodes_without_writes() {
+        for status in ["waiting_input", "waiting_approval"] {
+            let (_temp, mut store) = initialized_store();
+            store.connection.execute(
+                "UPDATE workflow_activations SET status = ?1 WHERE run_id = 'run-1' AND node_id = 'review'",
+                [status],
+            ).expect("inconsistent wait fixture");
+            let before = store.connection.total_changes();
+            if status == "waiting_input" {
+                let error = store
+                    .provide_input(
+                        "run-1",
+                        "review",
+                        &activation_id(),
+                        serde_json::json!(3),
+                        20,
+                    )
+                    .expect_err("not an input gate");
+                assert!(error.to_string().contains("admitted node kind"));
+            } else {
+                for accepted in [false, true] {
+                    let error = store
+                        .resolve_approval("run-1", "review", &activation_id(), accepted, 20)
+                        .expect_err("not an approval gate");
+                    assert!(error.to_string().contains("admitted node kind"));
+                }
+            }
+            assert_eq!(store.connection.total_changes(), before);
+            assert_eq!(
+                store
+                    .run_summary("run-1")
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Running
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn durable_approval_denial_is_terminal_and_never_activates_downstream() {
         let temp = tempfile::tempdir().expect("temp");
@@ -23536,6 +24846,48 @@ mod tests {
                 .expect("reopened wait"),
             std::slice::from_ref(&wait)
         );
+        for damage in [
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE run_id = 'approval-run' AND node_id = 'approve'",
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'approval-run'",
+        ] {
+            store
+                .connection
+                .execute_batch(damage)
+                .expect("damage fixture");
+            let before = store.connection.total_changes();
+            for accepted in [false, true] {
+                assert!(
+                    store
+                        .resolve_approval(
+                            "approval-run",
+                            "approve",
+                            &wait.activation_id,
+                            accepted,
+                            19
+                        )
+                        .is_err()
+                );
+                assert_eq!(store.connection.total_changes(), before);
+            }
+            store.connection.execute(
+                "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'approval-run' AND node_id = 'approve'",
+                [serde_json::to_string(&definition.nodes["approve"]).expect("node")],
+            ).expect("restore node fixture");
+            store
+                .connection
+                .execute_batch(
+                    "UPDATE workflow_run_graphs SET revision = 1 WHERE run_id = 'approval-run'",
+                )
+                .expect("restore revision");
+        }
+        // Denial must use the admitted node even if the source fixture changes.
+        let mut source = definition.clone();
+        source.nodes.clear();
+        let json = serde_json::to_string(&source).expect("source");
+        store.connection.execute(
+            "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2 WHERE definition_id = 'approval'",
+            rusqlite::params![json, sha256_hex(json.as_bytes())],
+        ).expect("source fixture");
         let result = store
             .resolve_approval("approval-run", "approve", &wait.activation_id, false, 20)
             .expect("deny");
@@ -24349,6 +25701,204 @@ mod tests {
     }
 
     #[test]
+    fn parallel_join_does_not_hide_later_invalid_or_duplicate_members() {
+        let (_temp, mut store) = initialized_store();
+        let mut target = definition("example").nodes["review"].clone();
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "result".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                schema_id: target.output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 12,
+            })
+            .expect("output");
+        let transaction = store.connection.transaction().expect("transaction");
+        for (exits, diagnostic) in [
+            (
+                serde_json::json!(["review", "absent"]),
+                "missing run-graph member",
+            ),
+            (
+                serde_json::json!(["review", "review"]),
+                "ambiguous completed",
+            ),
+        ] {
+            target.configuration =
+                serde_json::json!({"left_exits": exits, "right_exits": ["review"]});
+            let before = transaction.total_changes();
+            assert!(
+                parallel_join_members(&transaction, "run-1", &target, 0)
+                    .expect_err("invalid members")
+                    .to_string()
+                    .contains(diagnostic)
+            );
+            assert_eq!(transaction.total_changes(), before);
+        }
+        target.configuration =
+            serde_json::json!({"left_exits": ["review"], "right_exits": ["review"]});
+        assert_eq!(
+            parallel_join_members(&transaction, "run-1", &target, 0).expect("members"),
+            (serde_json::json!(2), serde_json::json!(2))
+        );
+    }
+
+    #[test]
+    fn completed_member_output_is_scoped_to_node_and_generation() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "result".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                schema_id: definition("example").nodes["review"]
+                    .output
+                    .type_name
+                    .clone(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 12,
+            })
+            .expect("output");
+        let transaction = store.connection.transaction().expect("transaction");
+        // A later generation may exist without a result. It must neither conflict
+        // with the completed generation nor borrow that generation's output.
+        transaction.execute_batch(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) VALUES ('run-1', 'review', 'later', 1, '1', 'pending', 13)"
+        ).expect("later generation");
+        let before = transaction.total_changes();
+        assert_eq!(
+            activation_output_value(&transaction, "run-1", "review", 0)
+                .expect("completed generation"),
+            serde_json::json!(2)
+        );
+        for (run_id, node_id, generation) in [
+            ("run-1", "review", 1),
+            ("run-1", "absent", 0),
+            ("absent", "review", 0),
+        ] {
+            assert!(matches!(
+                activation_output_value(&transaction, run_id, node_id, generation),
+                Err(WorkflowStoreError::Database(
+                    rusqlite::Error::QueryReturnedNoRows
+                ))
+            ));
+        }
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn completed_member_output_damage_is_not_an_unfinished_member() {
+        for damage in [
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) VALUES ('run-1', 'review', 'conflicting', 0, '1', 'completed', 13)",
+            "UPDATE workflow_activations SET output_id = NULL WHERE node_id = 'review'",
+            "UPDATE workflow_outputs SET checksum_sha256 = 'wrong'",
+            "UPDATE workflow_outputs SET checksum_sha256 = CAST(zeroblob(1048577) AS TEXT)",
+            "UPDATE workflow_outputs SET activation_id = 'different';",
+            "UPDATE workflow_outputs SET value_json = 'not-json'",
+        ] {
+            let (_temp, mut store) = initialized_store();
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "result".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "review".to_string(),
+                    activation_id: activation_id(),
+                    schema_id: definition("example").nodes["review"]
+                        .output
+                        .type_name
+                        .clone(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 12,
+                })
+                .expect("output");
+            let transaction = store.connection.transaction().expect("transaction");
+            assert_eq!(
+                activation_output_value(&transaction, "run-1", "review", 0).expect("value"),
+                serde_json::json!(2)
+            );
+            transaction
+                .execute_batch("PRAGMA defer_foreign_keys = ON;")
+                .expect("damage fixture constraints");
+            transaction.execute_batch(damage).expect("damage fixture");
+            let before = transaction.total_changes();
+            let error = activation_output_value(&transaction, "run-1", "review", 0)
+                .expect_err("damaged output");
+            assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
+            assert_eq!(transaction.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn parallel_join_rejects_missing_admitted_member_before_output_lookup() {
+        let (_temp, mut store) = initialized_store();
+        let mut target = definition("join").nodes["review"].clone();
+        target.configuration = serde_json::json!({
+            "left_exits": ["absent", "review"],
+            "right_exits": ["review"],
+        });
+        let transaction = store.connection.transaction().expect("transaction");
+        let before = transaction.total_changes();
+        let error =
+            parallel_join_members(&transaction, "run-1", &target, 0).expect_err("missing member");
+        assert!(
+            error
+                .to_string()
+                .contains("missing run-graph member: absent")
+        );
+        assert_eq!(transaction.total_changes(), before);
+        target.configuration["left_exits"] = serde_json::json!(["review"]);
+        let error =
+            parallel_join_members(&transaction, "run-1", &target, 0).expect_err("not completed");
+        assert!(error.to_string().contains("no completed left_exits"));
+        transaction
+            .execute_batch(
+                "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'review'",
+            )
+            .expect("damage fixture");
+        let before = transaction.total_changes();
+        let error =
+            parallel_join_members(&transaction, "run-1", &target, 0).expect_err("damaged member");
+        assert!(!error.to_string().contains("no completed left_exits"));
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn branch_skip_validates_all_admitted_nodes_before_writes() {
+        let (_temp, mut store) = initialized_store();
+        let nodes = vec!["review".to_string(), "missing".to_string()];
+        let transaction = store.connection.transaction().expect("transaction");
+        let before = transaction.total_changes();
+        assert!(skip_branch_nodes(&transaction, "run-1", 1, &nodes, 20).is_err());
+        assert_eq!(transaction.total_changes(), before);
+        skip_branch_nodes(&transaction, "run-1", 1, &nodes[..1], 20).expect("admitted node");
+        let status: String = transaction.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'review' AND dependency_generation = 1",
+            [], |row| row.get(0),
+        ).expect("skip");
+        assert_eq!(status, "skipped");
+        let before = transaction.total_changes();
+        skip_branch_nodes(&transaction, "run-1", 1, &nodes[..1], 20).expect("duplicate skip");
+        assert_eq!(transaction.total_changes(), before);
+        transaction
+            .execute_batch(
+                "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'review'",
+            )
+            .expect("damage fixture");
+        let before = transaction.total_changes();
+        assert!(skip_branch_nodes(&transaction, "run-1", 2, &nodes[..1], 21).is_err());
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
     fn branch_target_input_validation_rolls_back_selected_activation() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -24409,6 +25959,141 @@ mod tests {
                 .iter()
                 .all(|activation| activation.node_id != "selected")
         );
+    }
+
+    #[test]
+    fn repeat_back_edges_use_admitted_graph_after_reopen() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = repeat_definition();
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.input = Some(serde_json::json!({"condition_met": false, "iteration": 1}));
+        store.create_run(&run).expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("pending")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "body-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: body.node_id,
+                activation_id: body.activation_id,
+                schema_id: body.node.output.type_name,
+                schema_version: 1,
+                value: run.input.clone().expect("input"),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("output");
+        // Change only the source fixture: the admitted graph must still own execution.
+        definition.edges.clear();
+        definition.nodes.get_mut("body").expect("body").input.schema = serde_json::json!(false);
+        let json = serde_json::to_string(&definition).expect("json");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2",
+                rusqlite::params![json, sha256_hex(json.as_bytes())],
+            )
+            .expect("source fixture");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let settled = store
+            .settle_pending_control_nodes(&run.run_id, 10, 3)
+            .expect("settle");
+        assert_eq!(settled.activated.len(), 1);
+        assert_eq!(settled.activated[0].node_id, "body");
+        assert_eq!(settled.activated[0].dependency_generation, 1);
+        assert_eq!(
+            settled.activated[0].input,
+            Some(serde_json::json!({"condition_met": false, "iteration": 2}))
+        );
+        assert!(
+            store
+                .settle_pending_control_nodes(&run.run_id, 10, 4)
+                .expect("settled already")
+                .activated
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn repeat_target_damage_rolls_back_control_settlement() {
+        for damage in [
+            "UPDATE workflow_run_graph_edges SET edge_json = '{}' WHERE source_node_id = 'repeat-control'",
+            "UPDATE workflow_run_graph_edges SET target_node_id = 'absent' WHERE source_node_id = 'repeat-control'",
+            "UPDATE workflow_run_graph_edges SET revision = 2 WHERE source_node_id = 'repeat-control'",
+            "DELETE FROM workflow_run_graph_nodes WHERE node_id = 'body'",
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'body'",
+            "UPDATE workflow_run_graph_nodes SET is_exit = 2 WHERE node_id = 'body'",
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("example", 1, &repeat_definition())
+                .expect("definition");
+            let mut run = new_run();
+            run.input = Some(serde_json::json!({"condition_met": false, "iteration": 1}));
+            store.create_run(&run).expect("run");
+            let body = store
+                .pending_activations(10)
+                .expect("pending")
+                .pop()
+                .expect("body");
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "body-output".to_string(),
+                    run_id: run.run_id.clone(),
+                    node_id: body.node_id,
+                    activation_id: body.activation_id,
+                    schema_id: body.node.output.type_name,
+                    schema_version: 1,
+                    value: run.input.clone().expect("input"),
+                    artifact_reference: None,
+                    created_at_ms: 2,
+                })
+                .expect("body output");
+            store
+                .connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("fixture");
+            store
+                .connection
+                .execute_batch(damage)
+                .expect("damage fixture");
+            let events = store.event_history(&run.run_id, None, 100).expect("events");
+            let outputs: u64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM workflow_outputs", [], |row| {
+                    row.get(0)
+                })
+                .expect("outputs");
+            assert!(
+                store
+                    .settle_pending_control_nodes(&run.run_id, 10, 3)
+                    .is_err()
+            );
+            assert_eq!(
+                store.event_history(&run.run_id, None, 100).expect("events"),
+                events
+            );
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM workflow_outputs", [], |row| row
+                        .get::<_, u64>(0))
+                    .expect("outputs"),
+                outputs
+            );
+            let pending = store.pending_activations(10).expect("pending");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].node_id, "repeat-control");
+        }
     }
 
     #[test]
@@ -24591,6 +26276,48 @@ mod tests {
     }
 
     #[test]
+    fn create_activation_rejects_graph_damage_without_persisting() {
+        for damage in [
+            "DELETE FROM workflow_run_graph_nodes WHERE node_id = 'review'",
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'review'",
+            "UPDATE workflow_run_graph_nodes SET is_entry = 2 WHERE node_id = 'review'",
+            "UPDATE workflow_run_graphs SET revision = 2",
+        ] {
+            let (_temp, mut store) = initialized_store();
+            let events = store.event_history("run-1", None, 100).expect("events");
+            let before = store
+                .activations_for_run("run-1", 100)
+                .expect("activations");
+            store
+                .connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("fixture");
+            store
+                .connection
+                .execute_batch(damage)
+                .expect("damage fixture");
+            assert!(
+                store
+                    .create_activation(&NewActivation {
+                        activation_id: "new-activation".to_string(),
+                        ..new_activation()
+                    })
+                    .is_err()
+            );
+            assert_eq!(
+                store.event_history("run-1", None, 100).expect("events"),
+                events
+            );
+            assert_eq!(
+                store
+                    .activations_for_run("run-1", 100)
+                    .expect("activations"),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn create_activation_validates_target_schema() {
         let (_temp, mut store) = initialized_store();
         let error = store
@@ -24706,7 +26433,654 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_successor_generation_rolls_back_predecessor_completion() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &sequential_definition())
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        for identity in ["successor-a", "successor-b"] {
+            store.connection.execute(
+                "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+                 VALUES ('run-1', 'second', ?1, 0, 'pending', 10)",
+                [identity],
+            ).expect("ambiguous successor");
+        }
+        let events_before: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM workflow_events", [], |row| row.get(0))
+            .expect("event count before completion");
+        let before = store.connection.total_changes();
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity("run-1", "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect_err("ambiguous generation must fail closed");
+        assert!(matches!(error, WorkflowStoreError::InvalidData(message)
+            if message.contains("ambiguous activations: second")));
+        // The failure is reached after writes, so verify rollback rather than a read-only rejection.
+        assert!(store.connection.total_changes() > before);
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen after rollback");
+        let events_after: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM workflow_events", [], |row| row.get(0))
+            .expect("event count after rollback");
+        assert_eq!(events_after, events_before);
+        let successors: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'second' AND status = 'pending'",
+            [], |row| row.get(0),
+        ).expect("ambiguous state remains preserved");
+        assert_eq!(successors, 2);
+        let status: String = store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'first'",
+            [], |row| row.get(0),
+        ).expect("predecessor status");
+        assert_eq!(status, "pending");
+        let outputs: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("output count");
+        assert_eq!(outputs, 0);
+    }
+
+    #[test]
+    fn unknown_successor_status_rolls_back_completion() {
+        for status in [
+            rusqlite::types::Value::Text("future_status".to_string()),
+            rusqlite::types::Value::Text(String::new()),
+            rusqlite::types::Value::Text("x".repeat(33)),
+            rusqlite::types::Value::Blob(b"pending".to_vec()),
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("example", 1, &sequential_definition())
+                .expect("definition");
+            store.create_run(&new_run()).expect("run");
+            store.connection.execute(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             VALUES ('run-1', 'second', 'future-successor', 0, ?1, 10)", [&status],
+        ).expect("future status");
+            let error = store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "first-output".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "first".to_string(),
+                    activation_id: activation_identity("run-1", "first", 0),
+                    schema_id: "u32".to_string(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 20,
+                })
+                .expect_err("unknown successor must fail closed");
+            assert!(matches!(error, WorkflowStoreError::InvalidData(message)
+            if message.contains("unsupported activation status: second")));
+            let statuses: (String, rusqlite::types::Value) = store.connection.query_row(
+            "SELECT predecessor.status, successor.status FROM workflow_activations predecessor \
+             JOIN workflow_activations successor ON successor.run_id = predecessor.run_id \
+             WHERE predecessor.run_id = 'run-1' AND predecessor.node_id = 'first' AND successor.node_id = 'second'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("preserved statuses");
+            assert_eq!(statuses, ("pending".to_string(), status));
+            let outputs: u64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("output count");
+            assert_eq!(outputs, 0);
+        }
+    }
+
+    #[test]
+    fn ignored_successor_insert_rolls_back_completion() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &sequential_definition())
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER ignore_successor BEFORE INSERT ON workflow_activations \
+             WHEN NEW.node_id = 'second' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .expect("inject ignored insertion");
+        let output = ValidatedOutput {
+            output_id: "first-output".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "first".to_string(),
+            activation_id: activation_identity("run-1", "first", 0),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        let error = store
+            .persist_validated_output(&output)
+            .expect_err("ignored insertion must fail");
+        assert!(matches!(error, WorkflowStoreError::InvalidData(message)
+            if message.contains("did not create exactly one activation: second")));
+        let outputs: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("output count");
+        assert_eq!(outputs, 0);
+        let status: String = store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'first'", [], |row| row.get(0),
+        ).expect("predecessor status");
+        assert_eq!(status, "pending");
+        store
+            .connection
+            .execute_batch("DROP TRIGGER ignore_successor;")
+            .expect("remove injected fault");
+        let result = store
+            .persist_validated_output(&output)
+            .expect("retry rolled-back completion");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(
+            result.activated[0].activation_id,
+            activation_identity("run-1", "second", 0)
+        );
+        let successors: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'second'",
+            [], |row| row.get(0),
+        ).expect("successor count");
+        assert_eq!(successors, 1);
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "second-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "second".to_string(),
+                activation_id: activation_identity("run-1", "second", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(3),
+                artifact_reference: None,
+                created_at_ms: 30,
+            })
+            .expect("finish successor after retry");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen completed run");
+        let outputs: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("durable outputs");
+        assert_eq!(outputs, 2);
+        let run_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal run status");
+        assert_eq!(run_status, "completed");
+    }
+
+    #[test]
+    fn successor_identity_collision_rolls_back_completion() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &sequential_definition())
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        store.connection.execute(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             VALUES ('run-1', 'second', ?1, 1, 'pending', 10)",
+            [activation_identity("run-1", "second", 0)],
+        ).expect("conflicting identity");
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity("run-1", "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect_err("identity collision must not conceal missing successor");
+        assert!(matches!(error, WorkflowStoreError::Database(_)));
+        let outputs: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("output count");
+        assert_eq!(outputs, 0);
+        let status: String = store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'first'", [], |row| row.get(0),
+        ).expect("predecessor status");
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn successor_creation_is_not_suppressed_by_another_generation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &sequential_definition())
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        store.connection.execute(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
+             VALUES ('run-1', 'second', 'other-generation', 1, '7', 'completed', 10)", [],
+        ).expect("other generation");
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity("run-1", "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("source completion");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(result.activated[0].node_id, "second");
+        assert_eq!(result.activated[0].dependency_generation, 0);
+        assert_eq!(
+            result.activated[0].activation_id,
+            activation_identity("run-1", "second", 0)
+        );
+        let (status, input): (String, String) = store.connection.query_row(
+            "SELECT status, input_json FROM workflow_activations WHERE run_id = 'run-1' AND activation_id = 'other-generation'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("other generation preserved");
+        assert_eq!(status, "completed");
+        assert_eq!(input, "7");
+    }
+
+    #[test]
+    fn successor_preserves_existing_generation_with_distinct_identity() {
+        for status in [
+            "pending",
+            "running",
+            "waiting_input",
+            "waiting_approval",
+            "waiting_mutation_approval",
+            "completed",
+            "skipped",
+            "failed",
+            "cancelled",
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("example", 1, &sequential_definition())
+                .expect("definition");
+            store.create_run(&new_run()).expect("run");
+            store.connection.execute(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
+             VALUES ('run-1', 'second', 'existing-successor', 0, '7', ?1, 10)",
+            [status],
+        ).expect("existing successor");
+            let result = store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "first-output".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "first".to_string(),
+                    activation_id: activation_identity("run-1", "first", 0),
+                    schema_id: "u32".to_string(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 20,
+                })
+                .expect("source completion");
+            assert!(result.activated.is_empty());
+            let (identity, input): (String, String) = store.connection.query_row(
+            "SELECT activation_id, input_json FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'second'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("successor preserved");
+            assert_eq!(identity, "existing-successor");
+            assert_eq!(input, "7");
+            let transaction = store.connection.transaction().expect("transaction");
+            assert_eq!(
+                activation_status_at_generation(&transaction, "run-1", "second", 0)
+                    .expect("unique generation")
+                    .as_deref(),
+                Some(status)
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_output_does_not_borrow_result_from_noncompleted_state() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "review-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_identity("run-1", "review", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("completed output");
+        let transaction = store.connection.transaction().expect("transaction");
+        for status in [
+            "pending",
+            "running",
+            "waiting_input",
+            "waiting_approval",
+            "waiting_mutation_approval",
+            "skipped",
+            "failed",
+            "cancelled",
+        ] {
+            transaction
+                .execute(
+                    "UPDATE workflow_activations SET status = ?1 WHERE run_id = 'run-1'",
+                    [status],
+                )
+                .expect("status fixture");
+            let changes = transaction.total_changes();
+            assert!(
+                matches!(
+                    activation_output_value(&transaction, "run-1", "review", 0),
+                    Err(WorkflowStoreError::Database(
+                        rusqlite::Error::QueryReturnedNoRows
+                    ))
+                ),
+                "{status}"
+            );
+            assert_eq!(transaction.total_changes(), changes);
+        }
+    }
+
+    #[test]
+    fn dependency_output_unknown_status_is_not_an_absent_result() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'future_status' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("future state fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let changes = transaction.total_changes();
+        let error = activation_output_value(&transaction, "run-1", "review", 0)
+            .expect_err("unknown status");
+        assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
+        assert!(error.to_string().contains("unsupported activation status"));
+        assert_eq!(transaction.total_changes(), changes);
+        let status: String = transaction
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved status");
+        assert_eq!(status, "future_status");
+    }
+
+    #[test]
+    fn completed_dependency_rejects_conflicting_pending_generation() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "review-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_identity("run-1", "review", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("completed output");
+        store.connection.execute(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             VALUES ('run-1', 'review', 'conflicting-activation', 0, 'pending', 20)",
+            [],
+        ).expect("ambiguous fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let changes = transaction.total_changes();
+        let error = activation_output_value(&transaction, "run-1", "review", 0)
+            .expect_err("mixed statuses cannot conceal duplicate generation");
+        assert!(error.to_string().contains("ambiguous activations"));
+        assert_eq!(transaction.total_changes(), changes);
+    }
+
+    #[test]
+    fn oversized_transform_context_rolls_back_output_and_successor() {
+        for field in [
+            TransformRunField::Input,
+            TransformRunField::AuthoredProvenance,
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            let mut definition = sequential_definition();
+            definition.edges[0].transform = Some(bcode_workflow::WorkflowTransform {
+                version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+                expression: bcode_workflow::WorkflowTransformExpression::Input {
+                    source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
+                    path: String::new(),
+                },
+                output: definition.nodes["second"].input.clone(),
+            });
+            store
+                .persist_definition("example", 1, &definition)
+                .expect("definition");
+            store.create_run(&new_run()).expect("run");
+            store
+                .connection
+                .execute(
+                    &format!(
+                        "UPDATE workflow_runs SET {} = ?1 WHERE run_id = 'run-1'",
+                        field.column()
+                    ),
+                    ["x".repeat(MAX_INLINE_JSON_BYTES + 1)],
+                )
+                .expect("oversized context fixture");
+            let events = store.event_history("run-1", None, 100).expect("events");
+            let error = store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "first-output".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "first".to_string(),
+                    activation_id: activation_identity("run-1", "first", 0),
+                    schema_id: "u32".to_string(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 20,
+                })
+                .expect_err("oversized context");
+            assert!(error.to_string().contains("invalid or oversized"));
+            assert!(
+                store
+                    .output_summaries("run-1", 100)
+                    .expect("outputs")
+                    .is_empty()
+            );
+            assert_eq!(
+                store.event_history("run-1", None, 100).expect("events"),
+                events
+            );
+            let transaction = store.connection.transaction().expect("transaction");
+            assert!(
+                activation_status_at_generation(&transaction, "run-1", "second", 0)
+                    .expect("successor status")
+                    .is_none()
+            );
+            assert_eq!(
+                activation_status_at_generation(&transaction, "run-1", "first", 0)
+                    .expect("source status")
+                    .as_deref(),
+                Some("pending")
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_transform_is_rejected_before_run_context_reads() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = sequential_definition();
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let mut edge = definition.edges[0].clone();
+        let transform = bcode_workflow::WorkflowTransform {
+            version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION + 1,
+            expression: bcode_workflow::WorkflowTransformExpression::Input {
+                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
+                path: String::new(),
+            },
+            output: definition.nodes["second"].input.clone(),
+        };
+        let expected = transform
+            .validate()
+            .expect_err("future version")
+            .to_string();
+        edge.transform = Some(transform);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE run_id = 'run-1'",
+                [serde_json::to_string(&edge).expect("JSON")],
+            )
+            .expect("future transform fixture");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET input_json = 'invalid JSON' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("invalid context fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let changes = transaction.total_changes();
+        let error = activation_input(
+            &transaction,
+            &ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity("run-1", "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            },
+            &definition.nodes["second"],
+            0,
+        )
+        .expect_err("future transform");
+        assert!(error.to_string().contains(&expected));
+        assert_eq!(transaction.total_changes(), changes);
+    }
+
+    #[test]
+    fn transform_non_dependency_reference_rolls_back_output() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = sequential_definition();
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let mut edge = definition.edges[0].clone();
+        edge.transform = Some(bcode_workflow::WorkflowTransform {
+            version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+            expression: bcode_workflow::WorkflowTransformExpression::Input {
+                source: format!(
+                    "{}second",
+                    bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX
+                ),
+                path: String::new(),
+            },
+            output: definition.nodes["second"].input.clone(),
+        });
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE run_id = 'run-1'",
+                [serde_json::to_string(&edge).expect("edge JSON")],
+            )
+            .expect("invalid reference fixture");
+        let events = store.event_history("run-1", None, 100).expect("events");
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity("run-1", "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect_err("non-dependency reference");
+        assert!(error.to_string().contains("non-dependency node"));
+        assert!(
+            store
+                .output_summaries("run-1", 100)
+                .expect("outputs")
+                .is_empty()
+        );
+        assert_eq!(
+            store.event_history("run-1", None, 100).expect("events"),
+            events
+        );
+    }
+
+    #[test]
     fn named_dependency_materialization_rejects_skipped_branch_values_atomically() {
+        check_skipped_dependency_materialization(true);
+    }
+
+    #[test]
+    fn unreferenced_skipped_dependency_does_not_block_transform() {
+        check_skipped_dependency_materialization(false);
+    }
+
+    fn check_skipped_dependency_materialization(reference_skipped: bool) {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         let schema = bcode_workflow::ValueSchema::of::<u32>();
@@ -24728,7 +27102,14 @@ mod tests {
         definition.edges[0].transform = Some(bcode_workflow::WorkflowTransform {
             version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
             expression: bcode_workflow::WorkflowTransformExpression::Input {
-                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string(),
+                source: if reference_skipped {
+                    format!(
+                        "{}skipped",
+                        bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX
+                    )
+                } else {
+                    bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.to_string()
+                },
                 path: String::new(),
             },
             output: definition.nodes["second"].input.clone(),
@@ -24737,17 +27118,7 @@ mod tests {
             from: "skipped".to_string(),
             to: "second".to_string(),
             kind: bcode_workflow::EdgeKind::Direct,
-            transform: Some(bcode_workflow::WorkflowTransform {
-                version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
-                expression: bcode_workflow::WorkflowTransformExpression::Input {
-                    source: format!(
-                        "{}skipped",
-                        bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_DEPENDENCY_PREFIX
-                    ),
-                    path: String::new(),
-                },
-                output: definition.nodes["second"].input.clone(),
-            }),
+            transform: definition.edges[0].transform.clone(),
         });
         store
             .persist_definition("skipped-dependency", 1, &definition)
@@ -24764,19 +27135,31 @@ mod tests {
                 [&run.run_id],
             )
             .expect("skip dependency");
-        let error = store
-            .persist_validated_output(&ValidatedOutput {
-                output_id: "first-output".to_string(),
-                run_id: run.run_id.clone(),
-                node_id: "first".to_string(),
-                activation_id: activation_identity(&run.run_id, "first", 0),
-                schema_id: "u32".to_string(),
-                schema_version: 1,
-                value: serde_json::json!(2),
-                artifact_reference: None,
-                created_at_ms: 3,
-            })
-            .expect_err("skipped dependency has no value");
+        let result = store.persist_validated_output(&ValidatedOutput {
+            output_id: "first-output".to_string(),
+            run_id: run.run_id.clone(),
+            node_id: "first".to_string(),
+            activation_id: activation_identity(&run.run_id, "first", 0),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 3,
+        });
+        if !reference_skipped {
+            result.expect("unreferenced skipped dependency is not loaded");
+            let transaction = store.connection.transaction().expect("transaction");
+            let input: String = transaction.query_row(
+                "SELECT input_json FROM workflow_activations WHERE run_id = ?1 AND node_id = 'second'",
+                [&run.run_id], |row| row.get(0),
+            ).expect("successor input");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&input).expect("JSON"),
+                serde_json::json!(2)
+            );
+            return;
+        }
+        let error = result.expect_err("skipped dependency has no value");
         assert!(!error.to_string().is_empty());
         assert!(
             store
@@ -25242,6 +27625,271 @@ mod tests {
     }
 
     #[test]
+    fn parallel_failure_rejects_missing_sibling_before_writes() {
+        assert_parallel_settlement_damage(
+            "DELETE FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = 'right'",
+            "missing member: right",
+        );
+    }
+
+    #[test]
+    fn parallel_failure_rejects_disconnected_sibling_before_writes() {
+        assert_parallel_settlement_damage(
+            "DELETE FROM workflow_run_graph_edges WHERE run_id = ?1 AND source_node_id = 'right'",
+            "must exist and have a direct edge",
+        );
+    }
+
+    #[test]
+    fn parallel_failure_rejects_unsupported_member_status_before_writes() {
+        assert_parallel_settlement_damage(
+            "UPDATE workflow_activations SET status = 'future_status' WHERE run_id = ?1 AND node_id = 'right'",
+            "unsupported activation status",
+        );
+    }
+
+    #[test]
+    fn parallel_failure_rejects_ambiguous_member_activations_before_writes() {
+        assert_parallel_settlement_damage(
+            "INSERT INTO workflow_activations (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
+             SELECT run_id, node_id, 'duplicate', dependency_generation, status, created_at_ms \
+             FROM workflow_activations WHERE run_id = ?1 AND node_id = 'right'",
+            "ambiguous activations",
+        );
+    }
+
+    #[test]
+    fn parallel_failure_rejects_nontext_and_oversized_status_before_writes() {
+        for damage in [
+            "UPDATE workflow_activations SET status = CAST('pending' AS BLOB) WHERE run_id = ?1 AND node_id = 'right'",
+            "UPDATE workflow_activations SET status = zeroblob(1048576) WHERE run_id = ?1 AND node_id = 'right'",
+            "UPDATE workflow_activations SET status = CAST(zeroblob(1048576) AS TEXT) WHERE run_id = ?1 AND node_id = 'right'",
+        ] {
+            assert_parallel_settlement_damage(damage, "unsupported activation status");
+        }
+    }
+
+    fn assert_parallel_settlement_damage(damage: &str, expected: &str) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = parallel_join_definition();
+        definition
+            .nodes
+            .get_mut("join")
+            .expect("join")
+            .configuration["failure_policy"] = serde_json::json!("fail_fast");
+        store
+            .persist_definition("missing-sibling", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "missing-sibling".to_string();
+        store.create_run(&run).expect("run");
+        store
+            .connection
+            .execute(damage, [&run.run_id])
+            .expect("damage fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let before = transaction.total_changes();
+        let error = settle_parallel_failure(
+            &transaction,
+            &run.run_id,
+            "left",
+            &activation_identity(&run.run_id, "left", 0),
+            true,
+            20,
+        )
+        .expect_err("missing member");
+        assert!(error.to_string().contains(expected));
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn fail_fast_success_does_not_cancel_unfinished_sibling() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = parallel_join_transform_definition();
+        definition
+            .nodes
+            .get_mut("join")
+            .expect("join")
+            .configuration["failure_policy"] = serde_json::json!("fail_fast");
+        store
+            .persist_definition("successful-fail-fast", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "successful-fail-fast".to_string();
+        store.create_run(&run).expect("run");
+        let output = ValidatedOutput {
+            output_id: "left-output".to_string(),
+            run_id: run.run_id.clone(),
+            node_id: "left".to_string(),
+            activation_id: activation_identity(&run.run_id, "left", 0),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(10),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        store
+            .persist_validated_output(&output)
+            .expect("successful member");
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE run_id = ?1 AND node_id = 'right'",
+                [&run.run_id],
+                |row| row.get(0),
+            )
+            .expect("sibling status");
+        assert_eq!(status, "pending");
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "right-output".to_string(),
+                node_id: "right".to_string(),
+                activation_id: activation_identity(&run.run_id, "right", 0),
+                value: serde_json::json!(20),
+                ..output
+            })
+            .expect("sibling can finish");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(result.activated[0].input, Some(serde_json::json!([10, 20])));
+    }
+
+    #[test]
+    fn parallel_failure_uses_exact_activation_generation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("generations", 1, &parallel_join_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "generations".to_string();
+        store.create_run(&run).expect("run");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'completed' WHERE run_id = ?1",
+                [&run.run_id],
+            )
+            .expect("old generation");
+        for node_id in ["left", "right"] {
+            store
+                .create_activation(&NewActivation {
+                    activation_id: activation_identity(&run.run_id, node_id, 1),
+                    run_id: run.run_id.clone(),
+                    node_id: node_id.to_string(),
+                    dependency_generation: 1,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 10,
+                })
+                .expect("next generation");
+        }
+        store.connection.execute(
+            "UPDATE workflow_activations SET status = CASE node_id WHEN 'left' THEN 'failed' ELSE 'completed' END \
+             WHERE run_id = ?1 AND dependency_generation = 1",
+            [&run.run_id],
+        ).expect("new generation outcomes");
+        let transaction = store.connection.transaction().expect("transaction");
+        let result = settle_parallel_failure(
+            &transaction,
+            &run.run_id,
+            "left",
+            &activation_identity(&run.run_id, "left", 1),
+            true,
+            20,
+        )
+        .expect("settlement")
+        .expect("parallel join");
+        assert!(
+            result.run_failed,
+            "must not read successful generation zero"
+        );
+    }
+
+    #[test]
+    fn parallel_failure_rejects_duplicate_sibling_members_without_writes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = parallel_join_definition();
+        definition
+            .nodes
+            .get_mut("join")
+            .expect("join")
+            .configuration["right_exits"] = serde_json::json!(["right", "right"]);
+        store
+            .persist_definition("duplicate-sibling", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "duplicate-sibling".to_string();
+        store.create_run(&run).expect("run");
+        let transaction = store.connection.transaction().expect("transaction");
+        let before = transaction.total_changes();
+        let error = settle_parallel_failure(
+            &transaction,
+            &run.run_id,
+            "left",
+            &activation_identity(&run.run_id, "left", 0),
+            true,
+            20,
+        )
+        .expect_err("duplicate sibling must not be cancelled twice");
+        assert!(error.to_string().contains("members must be unique"));
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn parallel_join_uses_run_graph_despite_authored_definition_damage() {
+        for damage in [
+            "UPDATE workflow_definitions SET definition_json = '{}'",
+            "UPDATE workflow_definitions SET definition_json = x'7b7d'",
+            "UPDATE workflow_definitions SET definition_json = CAST(zeroblob(1048577) AS TEXT)",
+            "UPDATE workflow_definitions SET checksum_sha256 = 'invalid'",
+            "UPDATE workflow_definitions SET checksum_sha256 = printf('%064d', 0)",
+        ] {
+            assert_parallel_definition_independence(damage);
+        }
+    }
+
+    fn assert_parallel_definition_independence(damage: &str) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = parallel_join_transform_definition();
+        store
+            .persist_definition("parallel-damage", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "parallel-damage".to_string();
+        store.create_run(&run).expect("run");
+        store.connection.execute_batch(damage).expect("damage");
+        let output = ValidatedOutput {
+            output_id: "left-output".to_string(),
+            run_id: run.run_id.clone(),
+            node_id: "left".to_string(),
+            activation_id: activation_identity(&run.run_id, "left", 0),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(10),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        store
+            .persist_validated_output(&output)
+            .expect("run-owned left output");
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "right-output".to_string(),
+                node_id: "right".to_string(),
+                activation_id: activation_identity(&run.run_id, "right", 0),
+                value: serde_json::json!(20),
+                ..output
+            })
+            .expect("run-owned join");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(result.activated[0].node_id, "join");
+        assert_eq!(result.activated[0].input, Some(serde_json::json!([10, 20])));
+    }
+
+    #[test]
     fn parallel_join_rejects_ambiguous_member_configuration_atomically() {
         let temp = tempfile::tempdir().expect("temp");
         let mut definition = parallel_join_definition();
@@ -25555,7 +28203,57 @@ mod tests {
         run.run_id = "conditional-task-run".to_string();
         run.definition_id = "conditional-task".to_string();
         store.create_run(&run).expect("run");
+        verify_conditional_successor_rollback(&mut store, &run, &definition);
+    }
+
+    fn verify_conditional_successor_rollback(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        definition: &WorkflowDefinition,
+    ) {
         let source_schema_id = definition.nodes["source"].output.type_name.clone();
+        let mut damaged = definition.clone();
+        if let bcode_workflow::EdgeKind::Conditional { predicate, .. } = &mut damaged.edges[0].kind
+        {
+            *predicate = bcode_workflow::PredicateExpression::Equals {
+                version: bcode_workflow::WORKFLOW_PREDICATE_VERSION + 1,
+                path: "status".to_string(),
+                value: serde_json::json!("ready"),
+            };
+        }
+        store.connection.execute(
+            "UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE run_id = 'conditional-task-run' AND edge_id = 0",
+            [serde_json::to_string(&damaged.edges[0]).expect("damaged edge")],
+        ).expect("damage fixture");
+        assert!(
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "source-output".to_string(),
+                    run_id: run.run_id.clone(),
+                    node_id: "source".to_string(),
+                    activation_id: activation_identity(&run.run_id, "source", 0),
+                    schema_id: source_schema_id.clone(),
+                    schema_version: 1,
+                    value: serde_json::json!({"status": "other"}),
+                    artifact_reference: None,
+                    created_at_ms: 20,
+                })
+                .is_err()
+        );
+        let count: u64 = store
+            .connection
+            .query_row("SELECT count(*) FROM workflow_outputs", [], |row| {
+                row.get(0)
+            })
+            .expect("output count");
+        assert_eq!(
+            count, 0,
+            "predicate failure must roll back output persistence"
+        );
+        store.connection.execute(
+            "UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE run_id = 'conditional-task-run' AND edge_id = 0",
+            [serde_json::to_string(&definition.edges[0]).expect("edge")],
+        ).expect("restore fixture");
         let result = store
             .persist_validated_output(&ValidatedOutput {
                 output_id: "source-output".to_string(),
