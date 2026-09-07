@@ -549,6 +549,39 @@ impl StreamLifecycle {
     }
 }
 
+// Retain a sender until the terminal outcome is published, including when the
+// selected executor drops an unpolled worker or unwinds a panicking worker.
+struct StreamWorker<T> {
+    _sender: mpsc::Sender<T>,
+    terminal: Arc<Mutex<Option<T>>>,
+    lifecycle: Arc<StreamLifecycle>,
+    interrupted: Option<T>,
+}
+
+impl<T> StreamWorker<T> {
+    fn complete(mut self, item: T) {
+        store_terminal(&self.terminal, item);
+        self.lifecycle.complete();
+        self.interrupted = None;
+    }
+}
+
+impl<T> Drop for StreamWorker<T> {
+    fn drop(&mut self) {
+        if let Some(item) = self.interrupted.take() {
+            self.lifecycle.cancel_if_running();
+            store_terminal(&self.terminal, item);
+            self.lifecycle.complete();
+        }
+    }
+}
+
+fn interrupted_stream_worker() -> RuntimeError {
+    RuntimeError::HostExtension(
+        "agent stream worker interrupted; provider cleanup is unverified".into(),
+    )
+}
+
 impl AgentRuntimeStream {
     /// Request cancellation while retaining the stream to observe its terminal outcome.
     ///
@@ -1726,8 +1759,12 @@ impl AgentRuntime {
         let (sender, receiver) = mpsc::channel(capacity);
         let terminal = Arc::new(Mutex::new(None));
         let lifecycle = Arc::new(StreamLifecycle::new(request.cancellation.clone()));
-        let task_lifecycle = Arc::clone(&lifecycle);
-        let task_terminal = Arc::clone(&terminal);
+        let worker = StreamWorker {
+            _sender: sender.clone(),
+            terminal: Arc::clone(&terminal),
+            lifecycle: Arc::clone(&lifecycle),
+            interrupted: Some(AgentLoopStreamItem::Error(interrupted_stream_worker())),
+        };
         let runtime = self.clone();
         let stream_events: Arc<dyn TurnEventSink> = Arc::new(LoopStreamEventSink {
             configured: events,
@@ -1760,8 +1797,7 @@ impl AgentRuntime {
                     Ok(response) => AgentLoopStreamItem::Finished(response),
                     Err(error) => AgentLoopStreamItem::Error(error),
                 };
-                task_lifecycle.complete();
-                store_terminal(&task_terminal, item);
+                worker.complete(item);
             }
             .instrument(parent_span),
         );
@@ -2232,8 +2268,13 @@ impl AgentRuntime {
         let (sender, receiver) = mpsc::channel(capacity);
         let terminal = Arc::new(Mutex::new(None));
         let lifecycle = Arc::new(StreamLifecycle::new(request.cancellation.clone()));
-        let task_lifecycle = Arc::clone(&lifecycle);
         let task_terminal = Arc::clone(&terminal);
+        let worker = StreamWorker {
+            _sender: sender.clone(),
+            terminal: Arc::clone(&terminal),
+            lifecycle: Arc::clone(&lifecycle),
+            interrupted: Some(AgentRuntimeStreamItem::Error(interrupted_stream_worker())),
+        };
         let runtime = self.clone();
         let parent_span = tracing::Span::current();
         switchy::unsync::task::spawn(
@@ -2251,8 +2292,7 @@ impl AgentRuntime {
                     Ok(response) => AgentRuntimeStreamItem::Finished(response),
                     Err(error) => AgentRuntimeStreamItem::Error(error),
                 };
-                task_lifecycle.complete();
-                store_terminal(&task_terminal, item);
+                worker.complete(item);
             }
             .instrument(parent_span),
         );
@@ -7869,6 +7909,7 @@ mod tests {
         Flood,
         ToolCall,
         Pending,
+        Panic,
     }
 
     struct LifecyclePollProvider {
@@ -7963,6 +8004,7 @@ mod tests {
                             }],
                         })
                     }
+                    LifecyclePollOutcome::Panic => panic!("private provider panic payload"),
                     LifecyclePollOutcome::Pending => std::future::pending().await,
                 }
             })
@@ -8744,6 +8786,114 @@ mod tests {
         assert!(lifecycle.cancelled.load(Ordering::Acquire));
         assert!(lifecycle.finished.load(Ordering::Acquire));
         assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn panicking_stream_worker_publishes_one_sanitized_terminal() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle.release_poll.notify_one();
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_text_turn(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Panic,
+            },
+            AgentTurnRequest::new("model", "hello"),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut errors = 0;
+            while let Some(item) = stream.next().await {
+                assert_eq!(errors, 0, "terminal error must be last");
+                match item {
+                    AgentRuntimeStreamItem::Error(RuntimeError::HostExtension(message)) => {
+                        assert_eq!(
+                            message,
+                            "agent stream worker interrupted; provider cleanup is unverified"
+                        );
+                        errors += 1;
+                    }
+                    AgentRuntimeStreamItem::Event(_) => {}
+                    other => panic!("unexpected stream item: {other:?}"),
+                }
+            }
+            assert_eq!(errors, 1);
+        })
+        .await
+        .expect("interrupted stream terminates");
+        assert!(lifecycle.dropped.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+        stream.cancel();
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn panicking_loop_worker_publishes_terminal_before_channel_closure() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle.release_poll.notify_one();
+        let runtime = AgentRuntime::new();
+        let mut stream = runtime.run_streaming_provider_tool_loop(
+            LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Panic,
+            },
+            AgentTurnRequest::new("model", "hello"),
+            Arc::new(UnifiedToolCatalog::new()),
+            Arc::new(AllowBatchAuthorization::default()),
+            Arc::new(FailingLifecycleToolInvoker),
+            RuntimePermissionContext::default(),
+            Vec::new(),
+            ToolExecutionOptions::default(),
+            Arc::new(AcceptingEventSink),
+            InvocationCapabilities::default(),
+            Arc::new(NoopToolRoundObserver),
+            Arc::new(NoopProviderRoundPlanner),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut errors = 0;
+            while let Some(item) = stream.next().await {
+                assert_eq!(errors, 0, "terminal error must be last");
+                match item {
+                    AgentLoopStreamItem::Error(RuntimeError::HostExtension(message)) => {
+                        assert_eq!(
+                            message,
+                            "agent stream worker interrupted; provider cleanup is unverified"
+                        );
+                        errors += 1;
+                    }
+                    AgentLoopStreamItem::Event(_) => {}
+                    other => panic!("unexpected loop item: {other:?}"),
+                }
+            }
+            assert_eq!(errors, 1);
+        })
+        .await
+        .expect("interrupted loop terminates");
+        assert!(lifecycle.dropped.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
+        stream.cancel();
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unpolled_stream_worker_release_preserves_existing_terminal() {
+        for existing in [false, true] {
+            let (sender, mut receiver) = mpsc::channel(1);
+            let terminal = Arc::new(Mutex::new(existing.then_some(7)));
+            let lifecycle = Arc::new(StreamLifecycle::new(CancellationToken::new()));
+            let worker = StreamWorker {
+                _sender: sender,
+                terminal: Arc::clone(&terminal),
+                lifecycle: Arc::clone(&lifecycle),
+                interrupted: Some(9),
+            };
+            let future = async move { worker.complete(11) };
+            drop(future);
+            assert_eq!(receiver.recv().await, None);
+            assert_eq!(take_terminal(&terminal), Some(if existing { 7 } else { 9 }));
+            assert!(take_terminal(&terminal).is_none());
+            assert!(lifecycle.cancellation.is_cancelled());
+            assert!(lifecycle.completed.load(Ordering::Acquire));
+        }
     }
 
     #[tokio::test]

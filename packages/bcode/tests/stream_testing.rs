@@ -140,6 +140,58 @@ async fn recorder_budget_is_additional_to_existing_items() {
 }
 
 #[tokio::test]
+async fn object_stream_cancel_after_partial_json_preserves_terminal_error() {
+    let provider = ScriptedProvider::new([ScriptedProviderTurn::new()
+        .events([ProviderTurnEvent::TextDelta {
+            text: "{\"answer\":".to_owned(),
+        }])
+        .pending()]);
+    let mut stream = bcode::stream_object_builder::<serde_json::Value>()
+        .prompt("hello")
+        .run(provider);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match stream.next().await {
+                Some(bcode::ObjectStreamItem::RawDelta(delta)) => {
+                    assert_eq!(delta, "{\"answer\":");
+                    break;
+                }
+                Some(
+                    bcode::ObjectStreamItem::Event(_) | bcode::ObjectStreamItem::ScopedEvent(_),
+                ) => {}
+                other => panic!("unexpected item before cancellation: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("partial JSON arrives");
+    stream.cancel();
+    stream.cancel();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut errors = 0;
+        while let Some(item) = futures::StreamExt::next(&mut stream).await {
+            assert_eq!(errors, 0, "terminal error must be last");
+            match item {
+                bcode::ObjectStreamItem::Partial(value)
+                | bcode::ObjectStreamItem::ValidatedPartial(value) => {
+                    assert_eq!(value, serde_json::json!({"answer": null}));
+                }
+                bcode::ObjectStreamItem::Error(bcode::BcodeError::Runtime(
+                    RuntimeError::Cancelled,
+                )) => errors += 1,
+                bcode::ObjectStreamItem::Event(_) | bcode::ObjectStreamItem::ScopedEvent(_) => {}
+                other => panic!("unexpected item after cancellation: {other:?}"),
+            }
+        }
+        assert_eq!(errors, 1);
+    })
+    .await
+    .expect("cancelled object stream terminates");
+    stream.cancel();
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn stream_cancel_preserves_typed_terminal_observation() {
     let mut stream = stream_text_builder()
         .prompt("hello")
