@@ -366,6 +366,47 @@ fn workflow_input_stdin_accepts_valid_json_through_exact_limit() {
 }
 
 #[test]
+fn workflow_catalog_view_validates_typed_query_before_daemon_access() {
+    for query in [
+        r#"{"limit":"private-marker"}"#,
+        r#"{"limit":7,"unknown":"private-marker"}"#,
+    ] {
+        let output = run_cli_with_state(&["workflow", "catalog-view", "--query", query], true);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            stderr.contains("invalid workflow catalog query"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("private-marker"), "{stderr}");
+    }
+    let output = run_cli_with_state(
+        &["workflow", "catalog-view", "--query", r#"{"limit":7}"#],
+        true,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn workflow_run_view_reaches_daemon_boundary() {
+    let output = run_cli_with_state(
+        &[
+            "workflow", "run-view", "--run-id", "test-run", "--limit", "7",
+        ],
+        true,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(!stderr.is_empty());
+    assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
+}
+
+#[test]
 fn workflow_approval_requires_exactly_one_decision() {
     let arguments = [
         "workflow",
@@ -856,6 +897,56 @@ fn unusable_state_returns_runtime_error_without_machine_output() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(output.stdout.is_empty(), "unexpected machine output");
     assert!(stderr.starts_with("error:"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn scoped_catalog_commands_report_daemon_failure_without_success_output() {
+    for arguments in [
+        vec!["session", "create", "named", "--cwd", "workspace", "--json"],
+        vec![
+            "session",
+            "list",
+            "--cwd",
+            "workspace",
+            "--with-status",
+            "--json",
+        ],
+        vec![
+            "session",
+            "refresh",
+            "--cwd",
+            "workspace",
+            "--source",
+            "native",
+            "--json",
+        ],
+        vec!["session", "refresh", "--source", "native"],
+    ] {
+        let output = run_cli_with_fixture(&arguments, true, Stdio::piped(), |root| {
+            std::fs::create_dir(root.join("workspace")).expect("workspace fixture");
+        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "unexpected success output: {arguments:?}"
+        );
+        assert!(stderr.starts_with("error:"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+#[test]
+fn catalog_status_requires_json_before_daemon_access() {
+    let output = run_cli_with_state(&["session", "list", "--with-status"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        stderr,
+        "error: one or more required arguments were not provided\n"
+    );
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
 

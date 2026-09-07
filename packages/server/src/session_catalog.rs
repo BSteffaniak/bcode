@@ -50,6 +50,7 @@ struct SourceMetadata {
 struct SourceCache {
     metadata: SourceMetadata,
     state: SourceCacheState,
+    updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -215,42 +216,38 @@ impl SessionCatalog {
     #[allow(clippy::significant_drop_tightening)]
     /// Update a materialized native session cache after a native session mutation.
     pub async fn upsert_native_session(&self, session: SessionSummary) {
-        let changed = {
-            let mut inner = self.inner.lock().await;
-            let Some(source) = inner.sources.get_mut(&native_source_key()) else {
-                return;
-            };
-            let sessions = match &mut source.state {
-                SourceCacheState::Loaded { sessions, .. }
-                | SourceCacheState::Failed { sessions, .. } => sessions,
-                SourceCacheState::Empty | SourceCacheState::Loading => return,
-            };
-            upsert_session(sessions, session)
+        let mut inner = self.inner.lock().await;
+        let Some(source) = inner.sources.get_mut(&native_source_key()) else {
+            return;
         };
-        if changed {
-            self.bump_revision().await;
+        let sessions = match &mut source.state {
+            SourceCacheState::Loaded { sessions, .. }
+            | SourceCacheState::Failed { sessions, .. } => sessions,
+            SourceCacheState::Empty | SourceCacheState::Loading => return,
+        };
+        if upsert_session(sessions, session) {
+            source.updated_at_ms = current_unix_millis();
+            self.bump_revision(&mut inner);
         }
     }
 
     #[allow(clippy::significant_drop_tightening)]
     /// Remove a native session from a materialized native session cache.
     pub async fn remove_native_session(&self, session_id: SessionId) {
-        let changed = {
-            let mut inner = self.inner.lock().await;
-            let Some(source) = inner.sources.get_mut(&native_source_key()) else {
-                return;
-            };
-            let sessions = match &mut source.state {
-                SourceCacheState::Loaded { sessions, .. }
-                | SourceCacheState::Failed { sessions, .. } => sessions,
-                SourceCacheState::Empty | SourceCacheState::Loading => return,
-            };
-            let original_len = sessions.len();
-            sessions.retain(|session| session.id != session_id);
-            sessions.len() != original_len
+        let mut inner = self.inner.lock().await;
+        let Some(source) = inner.sources.get_mut(&native_source_key()) else {
+            return;
         };
-        if changed {
-            self.bump_revision().await;
+        let sessions = match &mut source.state {
+            SourceCacheState::Loaded { sessions, .. }
+            | SourceCacheState::Failed { sessions, .. } => sessions,
+            SourceCacheState::Empty | SourceCacheState::Loading => return,
+        };
+        let original_len = sessions.len();
+        sessions.retain(|session| session.id != session_id);
+        if sessions.len() != original_len {
+            source.updated_at_ms = current_unix_millis();
+            self.bump_revision(&mut inner);
         }
     }
 
@@ -284,11 +281,14 @@ impl SessionCatalog {
                 .or_insert_with(|| SourceCache {
                     metadata: metadata.clone(),
                     state: SourceCacheState::Empty,
+                    updated_at_ms: 0,
                 });
             source.metadata = metadata.clone();
             match source.state {
                 SourceCacheState::Empty | SourceCacheState::Failed { .. } => {
                     source.state = SourceCacheState::Loading;
+                    source.updated_at_ms = current_unix_millis();
+                    self.bump_revision(&mut inner);
                     true
                 }
                 SourceCacheState::Loading | SourceCacheState::Loaded { .. } => false,
@@ -297,7 +297,6 @@ impl SessionCatalog {
         if !should_spawn {
             return;
         }
-        self.bump_revision().await;
         let state = Arc::clone(state);
         let catalog = Arc::clone(&state.session_catalog);
         tokio::spawn(async move {
@@ -337,12 +336,14 @@ impl SessionCatalog {
                     || matches!(&key.scope, CatalogSourceScope::WorkingDirectory(path) if path == working_directory);
                 if in_scope && should_refresh(&key.source_id) {
                     source.state = SourceCacheState::Empty;
+                    source.updated_at_ms = current_unix_millis();
                     changed = true;
                 }
             }
-        }
-        if changed {
-            self.bump_revision().await;
+            if changed {
+                self.bump_revision(&mut inner);
+            }
+            drop(inner);
         }
     }
 
@@ -353,12 +354,14 @@ impl SessionCatalog {
             for (key, source) in &mut inner.sources {
                 if key.source_id == source_id {
                     source.state = SourceCacheState::Empty;
+                    source.updated_at_ms = current_unix_millis();
                     changed = true;
                 }
             }
-        }
-        if changed {
-            self.bump_revision().await;
+            if changed {
+                self.bump_revision(&mut inner);
+            }
+            drop(inner);
         }
     }
 
@@ -374,8 +377,10 @@ impl SessionCatalog {
             let source = inner.sources.entry(key).or_insert_with(|| SourceCache {
                 metadata: metadata.clone(),
                 state: SourceCacheState::Empty,
+                updated_at_ms: 0,
             });
             source.metadata = metadata;
+            source.updated_at_ms = current_unix_millis();
             source.state = match result {
                 Ok(result) => SourceCacheState::Loaded {
                     sessions: result.sessions,
@@ -387,16 +392,13 @@ impl SessionCatalog {
                     diagnostics: SourceDiagnostics::default(),
                 },
             };
+            self.bump_revision(&mut inner);
         }
-        self.bump_revision().await;
     }
 
-    async fn bump_revision(&self) {
-        {
-            let mut inner = self.inner.lock().await;
-            inner.revision = inner.revision.saturating_add(1);
-            let _ = self.revision_tx.send(inner.revision);
-        }
+    fn bump_revision(&self, inner: &mut SessionCatalogInner) {
+        inner.revision = inner.revision.saturating_add(1);
+        self.revision_tx.send_replace(inner.revision);
         self.notify.notify_waiters();
     }
 }
@@ -785,7 +787,7 @@ fn source_status(key: &CatalogSourceKey, source: &SourceCache) -> SessionCatalog
         source_id: key.source_id.clone(),
         display_name: source.metadata.display_name.clone(),
         status: source.status(),
-        updated_at_ms: current_unix_millis(),
+        updated_at_ms: source.updated_at_ms,
     }
 }
 
@@ -975,6 +977,114 @@ mod tests {
             execution: None,
             location,
         }
+    }
+
+    #[tokio::test]
+    async fn catalog_mutations_publish_matching_revisions() {
+        let catalog = SessionCatalog::default();
+        let mut revisions = catalog.subscribe();
+        let session = summary(SessionId::new(), None);
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        assert_eq!(*revisions.borrow_and_update(), 1);
+        catalog.upsert_native_session(session.clone()).await;
+        assert!(!revisions.has_changed().unwrap());
+        let mut renamed = session.clone();
+        renamed.name = Some("renamed".into());
+        catalog.upsert_native_session(renamed).await;
+        let inner = catalog.inner.lock().await;
+        let snapshot = super::snapshot_locked(&inner, &session.working_directory);
+        drop(inner);
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.sessions[0].name.as_deref(), Some("renamed"));
+        assert_eq!(*revisions.borrow_and_update(), snapshot.revision);
+        catalog.remove_native_session(session.id).await;
+        assert_eq!(*revisions.borrow_and_update(), 3);
+        catalog.invalidate_native().await;
+        assert_eq!(*revisions.borrow_and_update(), 4);
+        let inner = catalog.inner.lock().await;
+        let snapshot = super::snapshot_locked(&inner, &session.working_directory);
+        drop(inner);
+        assert_eq!(snapshot.revision, 4);
+        assert!(snapshot.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_timestamps_change_on_updates_not_observation() {
+        let catalog = SessionCatalog::default();
+        let key = super::native_source_key();
+        let session = summary(SessionId::new(), None);
+        catalog
+            .apply_source_result(
+                key.clone(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        {
+            let mut inner = catalog.inner.lock().await;
+            let source = inner.sources.get_mut(&key).unwrap();
+            source.updated_at_ms = 42;
+            let first = super::source_status(&key, source);
+            let second = super::source_status(&key, source);
+            drop(inner);
+            assert_eq!(first.updated_at_ms, 42);
+            assert_eq!(first, second);
+        }
+        catalog.upsert_native_session(session.clone()).await;
+        catalog.remove_native_session(SessionId::new()).await;
+        assert_eq!(catalog.inner.lock().await.sources[&key].updated_at_ms, 42);
+        let mut renamed = session.clone();
+        renamed.name = Some("renamed".into());
+        catalog.upsert_native_session(renamed).await;
+        assert!(catalog.inner.lock().await.sources[&key].updated_at_ms > 42);
+        catalog
+            .inner
+            .lock()
+            .await
+            .sources
+            .get_mut(&key)
+            .unwrap()
+            .updated_at_ms = 42;
+        catalog.remove_native_session(session.id).await;
+        assert!(catalog.inner.lock().await.sources[&key].updated_at_ms > 42);
+        catalog
+            .inner
+            .lock()
+            .await
+            .sources
+            .get_mut(&key)
+            .unwrap()
+            .updated_at_ms = 42;
+        catalog.invalidate_native().await;
+        assert!(catalog.inner.lock().await.sources[&key].updated_at_ms > 42);
+        catalog
+            .inner
+            .lock()
+            .await
+            .sources
+            .get_mut(&key)
+            .unwrap()
+            .updated_at_ms = 42;
+        catalog
+            .apply_source_result(
+                key.clone(),
+                super::native_metadata(),
+                Err("unavailable".into()),
+            )
+            .await;
+        assert!(catalog.inner.lock().await.sources[&key].updated_at_ms > 42);
     }
 
     #[test]

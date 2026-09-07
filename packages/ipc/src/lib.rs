@@ -1167,6 +1167,56 @@ mod catalog_contract_tests {
     use super::{SessionCatalogSourceStatus, SessionCatalogStatus};
 
     #[test]
+    fn import_warning_compatibility_preserves_optional_counts() {
+        let warning: bcode_session_import::ImportWarning =
+            serde_json::from_value::<super::SessionImportWarning>(
+                serde_json::json!({"code": "partial", "message": "Some entries unavailable"}),
+            )
+            .unwrap();
+        assert_eq!(warning.count, None);
+        for count in [None, Some(0), Some(u64::MAX)] {
+            let warning = bcode_session_import::ImportWarning {
+                count,
+                ..warning.clone()
+            };
+            let expected = serde_json::json!({"code": "partial", "message": "Some entries unavailable", "count": count});
+            assert_eq!(serde_json::to_value(&warning).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<super::SessionImportWarning>(expected).unwrap(),
+                warning
+            );
+        }
+    }
+
+    #[test]
+    fn restored_selection_preserves_defaults_and_distinct_model_identities() {
+        let empty: bcode_session_models::SessionRuntimeSelection =
+            serde_json::from_str::<super::SessionRuntimeSelection>("{}").unwrap();
+        assert_eq!(
+            empty,
+            bcode_session_models::SessionRuntimeSelection::default()
+        );
+        let payload = serde_json::json!({
+            "agent_id": "build", "provider_plugin_id": "provider",
+            "requested_model_id": "alias", "effective_model_id": "concrete",
+            "model_id": "compatibility", "reasoning_effort": "high",
+            "reasoning_summary": "auto"
+        });
+        let selection: bcode_session_models::SessionRuntimeSelection =
+            serde_json::from_value::<super::SessionRuntimeSelection>(payload.clone()).unwrap();
+        assert_eq!(selection.requested_model_id.as_deref(), Some("alias"));
+        assert_eq!(selection.effective_model_id.as_deref(), Some("concrete"));
+        assert_eq!(selection.model_id.as_deref(), Some("compatibility"));
+        assert_eq!(serde_json::to_value(selection).unwrap(), payload);
+        assert!(
+            serde_json::from_value::<super::SessionRuntimeSelection>(
+                serde_json::json!({"agent_id": 42})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn catalog_status_wire_values_remain_domain_owned() {
         for (status, json) in [
             (
@@ -1308,27 +1358,8 @@ pub struct DaemonStatus {
     pub started_at_unix_ms: u64,
 }
 
-/// Runtime selections restored from a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionRuntimeSelection {
-    #[serde(default)]
-    pub agent_id: Option<String>,
-    #[serde(default)]
-    pub provider_plugin_id: Option<String>,
-    /// User-facing requested model id.
-    #[serde(default)]
-    pub requested_model_id: Option<String>,
-    /// Concrete effective model id when known.
-    #[serde(default)]
-    pub effective_model_id: Option<String>,
-    /// Legacy model selection field.
-    #[serde(default)]
-    pub model_id: Option<String>,
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-    #[serde(default)]
-    pub reasoning_summary: Option<String>,
-}
+/// Compatibility export of the session-owned restored selection contract.
+pub use bcode_session_models::SessionRuntimeSelection;
 
 /// Active model metadata for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1447,14 +1478,8 @@ pub struct PluginServiceError {
     pub message: String,
 }
 
-/// Warning reported after importing an external session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionImportWarning {
-    pub code: String,
-    pub message: String,
-    #[serde(default)]
-    pub count: Option<u64>,
-}
+/// Compatibility export of the import-domain warning contract.
+pub use bcode_session_import::ImportWarning as SessionImportWarning;
 
 /// Ralph lifecycle session-history append request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

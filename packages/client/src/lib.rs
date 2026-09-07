@@ -16,11 +16,12 @@ use bcode_ipc::{
     RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
     SessionBulkMigrationOperationStatus, SessionBulkMigrationStartRequest,
     SessionCompatibilityInventoryRequest, SessionCompatibilityInventoryResponse,
-    SessionImportWarning, WorktreeCreateOperationStatus, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
-    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
-    default_endpoint, recv_envelope, request_envelope, send_envelope,
+    WorktreeCreateOperationStatus, WorktreeCreateRequest, WorktreeCreateResponse,
+    WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse,
+    current_working_directory, decode_event, decode_response, default_endpoint, recv_envelope,
+    request_envelope, send_envelope,
 };
+use bcode_session_import::ImportWarning as SessionImportWarning;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, SessionCatalogSourceStatus, SessionCatalogStatus,
     SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationRequest,
@@ -32,6 +33,7 @@ use bcode_session_models::{
 use bcode_session_models::{PendingToolExchangeSummary, PermissionSummary};
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -534,7 +536,7 @@ pub struct AttachedSessionHistory {
     pub usage_summary: bcode_session_models::SessionUsageSummary,
     pub import_warnings: Vec<SessionImportWarning>,
     pub draft: Option<String>,
-    pub runtime_selection: bcode_ipc::SessionRuntimeSelection,
+    pub runtime_selection: bcode_session_models::SessionRuntimeSelection,
     /// Projection-window metadata when the attach used a semantic projection request.
     pub projection_window: Option<bcode_session_models::ProjectionWindow>,
 }
@@ -1634,10 +1636,26 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_sessions_with_status(&self) -> Result<SessionList, ClientError> {
+        self.list_sessions_in_working_directory(current_working_directory())
+            .await
+    }
+
+    /// List sessions and catalog status for an explicit working directory.
+    ///
+    /// This selects discovery scope only; it does not confer authority over returned sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_sessions_in_working_directory(
+        &self,
+        working_directory: PathBuf,
+    ) -> Result<SessionList, ClientError> {
+        let working_directory = std::path::absolute(working_directory).map_err(|_| {
+            ClientError::Protocol("cannot resolve catalog working directory".into())
+        })?;
         match self
-            .send_request(Request::ListSessions {
-                working_directory: current_working_directory(),
-            })
+            .send_request(Request::ListSessions { working_directory })
             .await?
         {
             ResponsePayload::SessionList {
@@ -1795,9 +1813,29 @@ impl BcodeClient {
         &self,
         sources: Option<Vec<String>>,
     ) -> Result<SessionList, ClientError> {
+        self.refresh_session_catalog_in_working_directory(current_working_directory(), sources)
+            .await
+    }
+
+    /// Request catalog refresh for an explicit discovery directory and optional source IDs.
+    ///
+    /// The returned snapshot may still be loading. This does not repair canonical history
+    /// or grant authority over discovered sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn refresh_session_catalog_in_working_directory(
+        &self,
+        working_directory: PathBuf,
+        sources: Option<Vec<String>>,
+    ) -> Result<SessionList, ClientError> {
+        let working_directory = std::path::absolute(working_directory).map_err(|_| {
+            ClientError::Protocol("cannot resolve catalog working directory".into())
+        })?;
         match self
             .send_request(Request::RefreshSessionCatalog {
-                working_directory: Some(current_working_directory()),
+                working_directory: Some(working_directory),
                 sources,
             })
             .await?
@@ -5329,10 +5367,26 @@ impl ClientConnection {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn list_sessions_with_status(&mut self) -> Result<SessionList, ClientError> {
+        self.list_sessions_in_working_directory(current_working_directory())
+            .await
+    }
+
+    /// List sessions and catalog status for an explicit working directory on this connection.
+    ///
+    /// This selects discovery scope only; it does not confer authority over returned sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn list_sessions_in_working_directory(
+        &mut self,
+        working_directory: PathBuf,
+    ) -> Result<SessionList, ClientError> {
+        let working_directory = std::path::absolute(working_directory).map_err(|_| {
+            ClientError::Protocol("cannot resolve catalog working directory".into())
+        })?;
         match self
-            .send_request(Request::ListSessions {
-                working_directory: current_working_directory(),
-            })
+            .send_request(Request::ListSessions { working_directory })
             .await?
         {
             ResponsePayload::SessionList {
@@ -6430,6 +6484,138 @@ mod client_timeout_tests {
         }
         server.await.expect("server task");
         std::fs::remove_dir_all(socket_dir).expect("event socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stateless_catalog_requests_preserve_directory_and_sources() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcs-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("catalog.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let expected = std::env::current_dir().unwrap().join("relative-workspace");
+        let server = tokio::spawn(async move {
+            for refresh in [false, true] {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let decoded = bcode_ipc::decode_request(&request.payload).unwrap();
+                let payload = if refresh {
+                    match decoded {
+                        bcode_ipc::Request::RefreshSessionCatalog {
+                            working_directory,
+                            sources,
+                        } => {
+                            assert_eq!(working_directory.as_ref(), Some(&expected));
+                            assert_eq!(sources, Some(vec!["local".to_owned()]));
+                        }
+                        other => panic!("unexpected refresh request: {other:?}"),
+                    }
+                    bcode_ipc::ResponsePayload::SessionCatalogRefreshed {
+                        sessions: vec![],
+                        catalog_status: bcode_session_models::SessionCatalogStatus::Loaded,
+                        catalog_sources: vec![],
+                        catalog_revision: 2,
+                    }
+                } else {
+                    assert!(
+                        matches!(decoded, bcode_ipc::Request::ListSessions { working_directory } if working_directory == expected)
+                    );
+                    bcode_ipc::ResponsePayload::SessionList {
+                        sessions: vec![],
+                        catalog_status: bcode_session_models::SessionCatalogStatus::Loaded,
+                        catalog_sources: vec![],
+                        catalog_revision: 1,
+                    }
+                };
+                let response = bcode_ipc::Response::Ok(payload);
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_secs(5));
+        let listed = client
+            .list_sessions_in_working_directory("relative-workspace".into())
+            .await
+            .unwrap();
+        assert_eq!(listed.catalog_revision, 1);
+        let refreshed = client
+            .refresh_session_catalog_in_working_directory(
+                "relative-workspace".into(),
+                Some(vec!["local".to_owned()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed.catalog_revision, 2);
+        server.await.unwrap();
+        std::fs::remove_dir_all(socket_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_relative_directory_is_resolved_before_transport() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcd-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("catalog.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let expected = std::env::current_dir().unwrap().join("relative-workspace");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+            let decoded = bcode_ipc::decode_request(&request.payload).unwrap();
+            assert!(
+                matches!(decoded, bcode_ipc::Request::ListSessions { working_directory } if working_directory == expected)
+            );
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionList {
+                sessions: vec![],
+                catalog_status: bcode_session_models::SessionCatalogStatus::Loaded,
+                catalog_sources: vec![],
+                catalog_revision: 1,
+            });
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(request.request_id, &response).unwrap(),
+            )
+            .await
+            .unwrap();
+        });
+        let stream = bcode_ipc::LocalIpcStream::connect(&endpoint).await.unwrap();
+        let mut connection = super::ClientConnection {
+            stream,
+            next_request_id: 1,
+            client_id: None,
+            pending_events: std::collections::VecDeque::new(),
+            request_timeout: Duration::from_secs(5),
+            reconnect_client: None,
+            reconnect_name: std::sync::Arc::from(""),
+            restore_state: super::ConnectionRestoreState::default(),
+        };
+        let result = connection
+            .list_sessions_in_working_directory("relative-workspace".into())
+            .await
+            .unwrap();
+        assert_eq!(result.catalog_revision, 1);
+        server.await.unwrap();
+        std::fs::remove_dir_all(socket_dir).unwrap();
     }
 
     #[cfg(unix)]

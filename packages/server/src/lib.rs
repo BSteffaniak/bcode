@@ -20996,12 +20996,12 @@ fn model_to_selection(model: &str) -> Option<String> {
 async fn session_runtime_selection_payload(
     state: &ServerState,
     session_id: SessionId,
-) -> bcode_ipc::SessionRuntimeSelection {
+) -> bcode_session_models::SessionRuntimeSelection {
     let Ok(runtime_selection) = state.sessions.current_runtime_selection(session_id).await else {
-        return bcode_ipc::SessionRuntimeSelection::default();
+        return bcode_session_models::SessionRuntimeSelection::default();
     };
     let resolved = session_model_selection(state, session_id).await;
-    bcode_ipc::SessionRuntimeSelection {
+    bcode_session_models::SessionRuntimeSelection {
         agent_id: runtime_selection.agent_id,
         provider_plugin_id: resolved.provider_plugin_id,
         requested_model_id: resolved.requested_model_id,
@@ -47435,6 +47435,145 @@ library = "test"
             ipc.id
         );
         server.abort();
+    }
+
+    fn assert_catalog_source_observations(
+        earlier: &[SessionCatalogSourceStatus],
+        later: &[SessionCatalogSourceStatus],
+    ) {
+        assert!(!earlier.is_empty());
+        assert_eq!(earlier, later);
+        assert!(earlier.iter().all(|source| source.updated_at_ms > 0));
+    }
+
+    #[tokio::test]
+    async fn session_catalog_scope_matches_direct_and_connected_clients() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(session_root.path()).expect("session manager");
+        let state = Arc::new(test_server_state(sessions));
+        let first_dir = tempfile::tempdir().expect("first directory");
+        let second_dir = tempfile::tempdir().expect("second directory");
+        let first = session_operations::create(
+            &state,
+            Some("first".into()),
+            first_dir.path().to_path_buf(),
+        )
+        .await
+        .expect("first session");
+        let second = session_operations::create(
+            &state,
+            Some("second".into()),
+            second_dir.path().to_path_buf(),
+        )
+        .await
+        .expect("second session");
+        state
+            .sessions
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog loaded");
+        state.session_catalog.refresh_native_now(&state).await;
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client.connect("catalog-test").await.expect("connect");
+        for (directory, expected_id) in
+            [(first_dir.path(), first.id), (second_dir.path(), second.id)]
+        {
+            let direct = session_operations::list(&state, directory)
+                .await
+                .expect("direct list");
+            assert_eq!(direct.sessions.len(), 1);
+            assert_eq!(direct.sessions[0].id, expected_id);
+            let listed = client
+                .list_sessions_in_working_directory(directory.to_path_buf())
+                .await
+                .expect("client list");
+            assert_eq!(listed.sessions, direct.sessions);
+            assert_eq!(listed.catalog_status, direct.status);
+            assert_eq!(listed.catalog_revision, direct.revision);
+            assert_catalog_source_observations(&direct.sources, &listed.catalog_sources);
+            let connected = connection
+                .list_sessions_in_working_directory(directory.to_path_buf())
+                .await
+                .expect("connected list");
+            assert_eq!(connected.sessions, listed.sessions);
+            assert_eq!(connected.catalog_status, listed.catalog_status);
+            assert_eq!(connected.catalog_revision, listed.catalog_revision);
+            assert_catalog_source_observations(&listed.catalog_sources, &connected.catalog_sources);
+            // An unknown selected source must not invalidate unrelated native discovery.
+            let refreshed = client
+                .refresh_session_catalog_in_working_directory(
+                    directory.to_path_buf(),
+                    Some(vec!["not-registered".into()]),
+                )
+                .await
+                .expect("scoped refresh");
+            assert_eq!(refreshed, listed);
+        }
+        assert_native_catalog_refresh_completes(&state, &client, first_dir.path(), first.id).await;
+        drop(connection);
+        let _ = shutdown.send(());
+        server.await.expect("server shutdown");
+    }
+
+    async fn assert_native_catalog_refresh_completes(
+        state: &Arc<ServerState>,
+        client: &bcode_client::BcodeClient,
+        directory: &Path,
+        session_id: SessionId,
+    ) {
+        let before = session_operations::list(state, directory)
+            .await
+            .expect("before refresh");
+        let mut revisions = state.session_catalog.subscribe();
+        let requested = client
+            .refresh_session_catalog_in_working_directory(
+                directory.to_path_buf(),
+                Some(vec!["native".into()]),
+            )
+            .await
+            .expect("native refresh");
+        assert!(requested.catalog_revision > before.revision);
+        assert!(matches!(
+            requested.catalog_status,
+            SessionCatalogStatus::Loading | SessionCatalogStatus::Loaded
+        ));
+        // Observe the catalog directly while waiting; the normal list operation's initial
+        // loading coordination must not mask whether this refresh actually completes.
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = state.session_catalog.snapshot(state, directory).await;
+                match snapshot.status {
+                    SessionCatalogStatus::Loaded => break snapshot,
+                    SessionCatalogStatus::Loading => {
+                        revisions.changed().await.expect("catalog revision");
+                    }
+                    other => panic!("unexpected refresh status: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("refresh completion deadline");
+        assert!(completed.revision >= requested.catalog_revision);
+        assert_eq!(completed.sessions.len(), 1);
+        assert_eq!(completed.sessions[0].id, session_id);
+        assert_eq!(completed.sessions, before.sessions);
+        let observed = client
+            .list_sessions_in_working_directory(directory.to_path_buf())
+            .await
+            .expect("completed list");
+        assert_eq!(observed.sessions, completed.sessions);
+        assert_eq!(observed.catalog_status, completed.status);
+        assert_eq!(observed.catalog_sources, completed.sources);
+        assert_eq!(observed.catalog_revision, completed.revision);
     }
 
     #[tokio::test]

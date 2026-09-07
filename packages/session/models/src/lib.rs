@@ -70,6 +70,32 @@ pub struct SessionCatalogSourceStatus {
     pub updated_at_ms: u64,
 }
 
+/// Runtime selections restored from a session, versioned by the enclosing application protocol.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeSelection {
+    /// Selected agent profile.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Selected provider plugin.
+    #[serde(default)]
+    pub provider_plugin_id: Option<String>,
+    /// User-facing requested model identifier.
+    #[serde(default)]
+    pub requested_model_id: Option<String>,
+    /// Concrete effective model identifier when known.
+    #[serde(default)]
+    pub effective_model_id: Option<String>,
+    /// Compatibility model field retained for existing callers and serialized payloads.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Selected reasoning effort.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Selected reasoning-summary mode.
+    #[serde(default)]
+    pub reasoning_summary: Option<String>,
+}
+
 /// Maximum byte count accepted by a single session artifact range read.
 pub const MAX_SESSION_ARTIFACT_RANGE_BYTES: u32 = 1024 * 1024;
 

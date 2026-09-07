@@ -1,7 +1,7 @@
 //! Session import orchestration for the local server.
 
 use crate::{ErrorResponse, ServerError, ServerState, SharedWriter, send_response};
-use bcode_ipc::{Response, ResponsePayload, SessionImportWarning};
+use bcode_ipc::{Response, ResponsePayload};
 use bcode_session_import::{
     DiscoverImportableSessionsRequest, DiscoverImportableSessionsResponse, ImportableSessionEvent,
     ImportableSessionEventKind, LoadImportableSessionRequest, OP_DISCOVER_IMPORTABLE_SESSIONS,
@@ -293,10 +293,7 @@ pub async fn handle_import_external_session(
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::ExternalSessionImported {
-                    session,
-                    warnings: warnings.into_iter().map(import_warning_to_ipc).collect(),
-                }),
+                Response::Ok(ResponsePayload::ExternalSessionImported { session, warnings }),
             )
             .await
         }
@@ -308,14 +305,6 @@ pub async fn handle_import_external_session(
             )
             .await
         }
-    }
-}
-
-fn import_warning_to_ipc(warning: bcode_session_import::ImportWarning) -> SessionImportWarning {
-    SessionImportWarning {
-        code: warning.code,
-        message: warning.message,
-        count: warning.count,
     }
 }
 

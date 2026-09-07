@@ -625,9 +625,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
             limit,
         } => {
             print_json(
-                &client
-                    .workflow_event_history(run_id, after_sequence, limit)
-                    .await?,
+                &Box::pin(client.workflow_event_history(run_id, after_sequence, limit)).await?,
             )?;
         }
         WorkflowCommand::Attempts {
@@ -669,6 +667,16 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         }
         WorkflowCommand::Doctor { run_id, limit } => {
             print_json(&Box::pin(client.doctor_workflow_run(run_id, limit)).await?)?;
+        }
+        WorkflowCommand::CatalogView { query } => {
+            let request =
+                serde_json::from_value(read_workflow_input_value(&query)?).map_err(|_| {
+                    CliError::InvalidArguments("invalid workflow catalog query".to_owned())
+                })?;
+            print_json(&Box::pin(client.workflow_catalog_view(request)).await?)?;
+        }
+        WorkflowCommand::RunView { run_id, limit } => {
+            print_json(&Box::pin(client.workflow_run_view(run_id, limit)).await?)?;
         }
         WorkflowCommand::RunStatus { run_id } => {
             print_json(&Box::pin(client.workflow_run_status(run_id)).await?)?;
@@ -3316,6 +3324,19 @@ enum WorkflowCommand {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Return the bounded renderer-neutral workflow catalog as JSON.
+    CatalogView {
+        /// Typed catalog query as inline JSON, a JSON file, or `-` for stdin.
+        #[arg(long, value_name = "JSON_OR_FILE")]
+        query: String,
+    },
+    /// Return the bounded renderer-neutral workflow run projection as JSON.
+    RunView {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Return one bounded public run inspection including canonical output and descendants.
     InspectRun {
         #[arg(long)]
@@ -3942,12 +3963,33 @@ enum SessionCommand {
     },
     Create {
         name: Option<String>,
+        /// Create the session in this working directory instead of the current directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
         /// Print the created session summary as JSON.
         #[arg(long)]
         json: bool,
     },
     List {
+        /// Discover sessions for this working directory instead of the current directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Include catalog health, source statuses, and revision in the JSON result.
+        #[arg(long, requires = "json")]
+        with_status: bool,
         /// Print the session summaries as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly refresh catalog discovery; the returned snapshot may still be loading.
+    Refresh {
+        /// Discovery directory; defaults to the caller's working directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Refresh only these source IDs (repeatable); omit to refresh all sources.
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        /// Emit a versioned snapshot including catalog health and source statuses.
         #[arg(long)]
         json: bool,
     },
@@ -5345,8 +5387,24 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
                 output.flush()?;
             }
         }
-        SessionCommand::Create { name, json } => Box::pin(create_session(name, json)).await?,
-        SessionCommand::List { json } => Box::pin(list_sessions(json)).await?,
+        SessionCommand::Create { name, cwd, json } => {
+            Box::pin(create_session(name, cwd, json)).await?;
+        }
+        SessionCommand::List {
+            cwd,
+            with_status,
+            json,
+        } => Box::pin(list_sessions(cwd, with_status, json)).await?,
+        SessionCommand::Refresh { cwd, sources, json } => {
+            let directory = cwd.map_or_else(std::env::current_dir, std::path::absolute)?;
+            let catalog = BcodeClient::default_endpoint()
+                .refresh_session_catalog_in_working_directory(
+                    directory,
+                    (!sources.is_empty()).then_some(sources),
+                )
+                .await?;
+            write_catalog_refresh(&mut std::io::stdout().lock(), &catalog, json)?;
+        }
         SessionCommand::Rename {
             session_id,
             name,
@@ -12314,36 +12372,130 @@ async fn session_read_client(session_id: SessionId) -> Result<BcodeClient, CliEr
     }
 }
 
-async fn create_session(name: Option<String>, json: bool) -> Result<(), CliError> {
+async fn create_session(
+    name: Option<String>,
+    cwd: Option<PathBuf>,
+    json: bool,
+) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    let session = client.create_session(name).await?;
+    let session = match cwd {
+        Some(directory) => {
+            client
+                .create_session_in_working_directory(name, std::path::absolute(directory)?)
+                .await?
+        }
+        None => client.create_session(name).await?,
+    };
+    write_created_session(&mut std::io::stdout().lock(), &session, json)
+}
+
+fn write_created_session<W: std::io::Write>(
+    output: &mut W,
+    session: &bcode_session_models::SessionSummary,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        print_json_line(&session)?;
-    } else {
-        println!("{}", session.id);
+        return write_json_stream_record(output, session);
     }
+    writeln!(output, "{}", session.id)?;
+    output.flush()?;
     Ok(())
 }
 
-async fn list_sessions(json: bool) -> Result<(), CliError> {
+async fn list_sessions(
+    cwd: Option<PathBuf>,
+    with_status: bool,
+    json: bool,
+) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    let sessions = client.list_sessions().await?;
+    let catalog = match cwd {
+        Some(directory) => {
+            client
+                .list_sessions_in_working_directory(std::path::absolute(directory)?)
+                .await?
+        }
+        None => client.list_sessions_with_status().await?,
+    };
+    let mut output = std::io::stdout().lock();
+    if with_status {
+        write_session_catalog(&mut output, &catalog)
+    } else {
+        write_session_list(&mut output, &catalog.sessions, json)
+    }
+}
+
+fn write_catalog_refresh<W: std::io::Write>(
+    output: &mut W,
+    catalog: &bcode_client::SessionList,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        print_json(&sessions)?;
-        return Ok(());
+        return write_session_catalog(output, catalog);
+    }
+    writeln!(
+        output,
+        "catalog revision {}: {}",
+        catalog.catalog_revision,
+        serde_json::to_string(&catalog.catalog_status)?
+    )?;
+    for source in &catalog.catalog_sources {
+        writeln!(
+            output,
+            "{}\t{}\t{}",
+            source.source_id,
+            source.display_name,
+            serde_json::to_string(&source.status)?
+        )?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn write_session_catalog<W: std::io::Write>(
+    output: &mut W,
+    catalog: &bcode_client::SessionList,
+) -> Result<(), CliError> {
+    #[derive(Serialize)]
+    struct CatalogOutput<'a> {
+        schema_version: u32,
+        sessions: &'a [bcode_session_models::SessionSummary],
+        catalog_status: &'a bcode_session_models::SessionCatalogStatus,
+        catalog_sources: &'a [bcode_session_models::SessionCatalogSourceStatus],
+        catalog_revision: u64,
+    }
+    write_json_result(
+        output,
+        &CatalogOutput {
+            schema_version: 1,
+            sessions: &catalog.sessions,
+            catalog_status: &catalog.catalog_status,
+            catalog_sources: &catalog.catalog_sources,
+            catalog_revision: catalog.catalog_revision,
+        },
+    )
+}
+
+fn write_session_list<W: std::io::Write>(
+    output: &mut W,
+    sessions: &[bcode_session_models::SessionSummary],
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        return write_json_result(output, &sessions);
     }
     if sessions.is_empty() {
-        println!("no sessions");
-        return Ok(());
+        writeln!(output, "no sessions")?;
     }
     for session in sessions {
-        println!(
+        writeln!(
+            output,
             "{}\t{}\t{} clients",
             session.display_title(),
             session.id,
             session.client_count
-        );
+        )?;
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -21126,6 +21278,228 @@ mod worktree_cli_tests {
 mod session_configuration_cli_tests {
     use super::{Cli, CliError, Commands, SessionCommand, delete_session};
     use clap::Parser as _;
+
+    #[test]
+    fn session_create_directory_and_receipt_preserve_existing_contract() {
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "create",
+            "named",
+            "--cwd",
+            "workspace",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Commands::Session {
+            command: SessionCommand::Create { name: Some(name), cwd: Some(cwd), json: true }
+        }) if name == "named" && cwd == std::path::Path::new("workspace")));
+        let session: bcode_session_models::SessionSummary =
+            serde_json::from_value(serde_json::json!({
+                "id": bcode_session_models::SessionId::new(), "name": "created",
+                "client_count": 0, "created_at_ms": 1, "updated_at_ms": 1,
+                "working_directory": "workspace"
+            }))
+            .unwrap();
+        for json in [false, true] {
+            let mut output = Vec::new();
+            super::write_created_session(&mut output, &session, json).unwrap();
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                    serde_json::to_value(&session).unwrap()
+                );
+                assert_eq!(
+                    String::from_utf8(output).unwrap(),
+                    format!("{}\n", serde_json::to_string(&session).unwrap())
+                );
+            } else {
+                assert_eq!(
+                    String::from_utf8(output).unwrap(),
+                    format!("{}\n", session.id)
+                );
+            }
+            assert!(
+                super::write_created_session(
+                    &mut std::io::Cursor::new(&mut [0_u8; 1][..]),
+                    &session,
+                    json
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn session_list_accepts_explicit_directory() {
+        for (args, expected) in [
+            (vec!["bcode", "session", "list", "--json"], None),
+            (
+                vec!["bcode", "session", "list", "--cwd", "other", "--json"],
+                Some(std::path::PathBuf::from("other")),
+            ),
+        ] {
+            let parsed = Cli::try_parse_from(args).expect("list parses");
+            assert!(matches!(parsed.command, Some(Commands::Session {
+                command: SessionCommand::List { cwd, json: true, with_status: false }
+            }) if cwd == expected));
+        }
+    }
+
+    #[test]
+    fn session_refresh_parses_scope_and_preserves_loading_status() {
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "refresh",
+            "--cwd",
+            "workspace",
+            "--source",
+            "native",
+            "--source",
+            "imported",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Commands::Session {
+            command: SessionCommand::Refresh { cwd: Some(cwd), sources, json: true }
+        }) if cwd == std::path::Path::new("workspace") && sources == ["native", "imported"]));
+        let catalog = bcode_client::SessionList {
+            sessions: vec![],
+            catalog_status: bcode_session_models::SessionCatalogStatus::Loading,
+            catalog_sources: vec![],
+            catalog_revision: 7,
+        };
+        let mut output = Vec::new();
+        super::write_catalog_refresh(&mut output, &catalog, false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "catalog revision 7: \"loading\"\n"
+        );
+        let mut output = Vec::new();
+        super::write_catalog_refresh(&mut output, &catalog, true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["catalog_status"], "loading");
+        assert_eq!(value["catalog_revision"], 7);
+        for json in [false, true] {
+            assert!(
+                super::write_catalog_refresh(
+                    &mut std::io::Cursor::new(&mut [0_u8; 1][..]),
+                    &catalog,
+                    json
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn session_catalog_output_preserves_health_and_revision() {
+        use bcode_session_models::{SessionCatalogSourceStatus, SessionCatalogStatus};
+        assert!(Cli::try_parse_from(["bcode", "session", "list", "--with-status"]).is_err());
+        let parsed =
+            Cli::try_parse_from(["bcode", "session", "list", "--with-status", "--json"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::List {
+                    with_status: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        for status in [
+            SessionCatalogStatus::NotStarted,
+            SessionCatalogStatus::Loading,
+            SessionCatalogStatus::Loaded,
+            SessionCatalogStatus::Degraded("partial".into()),
+            SessionCatalogStatus::Failed("unavailable".into()),
+        ] {
+            let catalog = bcode_client::SessionList {
+                sessions: vec![],
+                catalog_status: status.clone(),
+                catalog_revision: 42,
+                catalog_sources: vec![SessionCatalogSourceStatus {
+                    source_id: "native".into(),
+                    display_name: "Native sessions".into(),
+                    status: status.clone(),
+                    updated_at_ms: 123,
+                }],
+            };
+            let mut output = Vec::new();
+            super::write_session_catalog(&mut output, &catalog).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "schema_version": 1, "sessions": [], "catalog_status": status,
+                    "catalog_sources": catalog.catalog_sources, "catalog_revision": 42
+                })
+            );
+            assert!(
+                super::write_session_catalog(
+                    &mut std::io::Cursor::new(&mut [0_u8; 1][..]),
+                    &catalog
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn session_list_output_preserves_rows_and_reports_io_errors() {
+        struct FailingOutput {
+            flush_only: bool,
+        }
+        impl std::io::Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.flush_only {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let session: bcode_session_models::SessionSummary =
+            serde_json::from_value(serde_json::json!({
+                "id": bcode_session_models::SessionId::new(), "name": "listed session",
+                "client_count": 2, "created_at_ms": 0, "updated_at_ms": 0
+            }))
+            .expect("summary");
+        for sessions in [vec![], vec![session.clone()]] {
+            for json in [false, true] {
+                let mut output = Vec::new();
+                super::write_session_list(&mut output, &sessions, json).expect("output");
+                if json {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                        serde_json::to_value(&sessions).unwrap()
+                    );
+                } else {
+                    let expected = if sessions.is_empty() {
+                        "no sessions\n".to_owned()
+                    } else {
+                        format!("listed session\t{}\t2 clients\n", session.id)
+                    };
+                    assert_eq!(String::from_utf8(output).unwrap(), expected);
+                }
+                for flush_only in [false, true] {
+                    assert!(
+                        super::write_session_list(
+                            &mut FailingOutput { flush_only },
+                            &sessions,
+                            json
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn session_discovery_commands_parse_without_a_session_id() {
