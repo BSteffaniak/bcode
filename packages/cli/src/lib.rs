@@ -8532,11 +8532,26 @@ async fn logout_auth_provider(
     .map_err(|error| CliError::LoginProfile(error.to_string()))?
     .delete()
     .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    // Runtime-registered profiles also carry non-secret routing metadata (pool membership,
+    // bindings). Leaving it behind would keep routing turns at a profile with no credentials.
+    let removal = if resolved.source == bcode_provider_auth::AuthProfileSource::Runtime {
+        bcode_config::remove_runtime_auth_profile(&resolved.profile_name, &provider.plugin_id)?
+    } else {
+        bcode_config::RuntimeAuthProfileRemoval::default()
+    };
     let mut writer = std::io::stdout().lock();
     writeln!(
         writer,
         "Local authentication removed for provider '{provider_id}'."
     )?;
+    if !removal.removed_from_pools.is_empty() {
+        writeln!(
+            writer,
+            "Removed profile '{}' from auth pool(s): {}.",
+            resolved.profile_name,
+            removal.removed_from_pools.join(", ")
+        )?;
+    }
     writer.flush()?;
     Ok(())
 }

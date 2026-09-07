@@ -469,12 +469,15 @@ pub fn resolve_auth_provider_profile(
         });
     }
 
-    let runtime_profile = runtime.profiles.get(profile_name).ok_or_else(|| {
-        AuthProfileResolutionError::MissingProfile {
-            provider_id: provider_id.to_string(),
-            profile: profile_name.to_string(),
-        }
-    })?;
+    let Some(runtime_profile) = runtime.profiles.get(profile_name) else {
+        return resolve_runtime_pool_member_profile(
+            runtime,
+            profile_name,
+            provider_id,
+            owner_plugin_id,
+            runtime_binding,
+        );
+    };
     if let Some(binding) = runtime_binding
         && binding.profile == profile_name
         && binding.owner_plugin_id != owner_plugin_id
@@ -526,6 +529,60 @@ pub fn resolve_auth_provider_profile(
                 settings
             },
         },
+        source: AuthProfileSource::Runtime,
+    })
+}
+
+/// Resolve a profile that exists only as a runtime auth-pool member.
+///
+/// Subscription logins register pool members in `pools.*.profiles`; older registrations did
+/// not also write a top-level runtime profile. Pool routing already reads these members, so
+/// lifecycle operations (`status`, `logout`, credential refresh) must resolve them too, or the
+/// member becomes an orphan that routes traffic but cannot be inspected or removed.
+///
+/// Ownership is taken from the member, falling back to its pool's registration identity. A
+/// member without any verifiable owner fails closed.
+fn resolve_runtime_pool_member_profile(
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    profile_name: &str,
+    provider_id: &str,
+    owner_plugin_id: &str,
+    runtime_binding: Option<&bcode_config::RuntimeAuthBinding>,
+) -> Result<ResolvedAuthProfile, AuthProfileResolutionError> {
+    let Some((pool, member)) = runtime.pools.values().find_map(|pool| {
+        pool.profiles
+            .iter()
+            .find(|member| member.auth_profile == profile_name)
+            .map(|member| (pool, member))
+    }) else {
+        return Err(AuthProfileResolutionError::MissingProfile {
+            provider_id: provider_id.to_string(),
+            profile: profile_name.to_string(),
+        });
+    };
+    if let Some(binding) = runtime_binding
+        && binding.profile == profile_name
+        && binding.owner_plugin_id != owner_plugin_id
+    {
+        return Err(AuthProfileResolutionError::OwnerMismatch {
+            profile: profile_name.to_string(),
+            expected: owner_plugin_id.to_string(),
+            actual: binding.owner_plugin_id.clone(),
+        });
+    }
+    let mut profile = runtime_subscription_auth_profile_config(member);
+    if profile.owner_plugin_id.is_none() {
+        profile.owner_plugin_id = pool
+            .owner_plugin_id
+            .clone()
+            .or_else(|| pool.provider_plugin_id.clone());
+    }
+    validate_auth_profile_ownership(profile_name, &profile, provider_id, owner_plugin_id)?;
+    Ok(ResolvedAuthProfile {
+        profile_name: profile_name.to_string(),
+        provider_id: provider_id.to_string(),
+        owner_plugin_id: owner_plugin_id.to_string(),
+        profile,
         source: AuthProfileSource::Runtime,
     })
 }
@@ -1299,6 +1356,108 @@ mod tests {
                 }) if actual == missing
             ));
         }
+    }
+
+    fn pool_member_runtime(
+        member_owner: Option<&str>,
+        pool_owner: Option<&str>,
+    ) -> bcode_config::RuntimeAuthSubscriptions {
+        bcode_config::RuntimeAuthSubscriptions {
+            pools: BTreeMap::from([(
+                "openai".to_owned(),
+                bcode_config::RuntimeAuthSubscriptionPool {
+                    provider_plugin_id: pool_owner.map(str::to_owned),
+                    provider_id: None,
+                    owner_plugin_id: None,
+                    preferred_profile: None,
+                    profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
+                        auth_profile: "openai-2".to_owned(),
+                        storage_profile: "openai-2".to_owned(),
+                        vault: PathBuf::from("/tmp/openai-vault"),
+                        provider: "openai".to_owned(),
+                        scheme: "chatgpt".to_owned(),
+                        owner_plugin_id: member_owner.map(str::to_owned),
+                        map: BTreeMap::new(),
+                        device_seal: None,
+                    }],
+                },
+            )]),
+            ..bcode_config::RuntimeAuthSubscriptions::default()
+        }
+    }
+
+    /// Subscription logins historically registered only a pool member, never a top-level runtime
+    /// profile. Pool routing reads those members, so lifecycle resolution must too; otherwise a
+    /// stale member keeps routing turns while `status`/`logout` report it as not configured.
+    #[test]
+    fn pool_member_only_runtime_profile_resolves_with_pool_ownership() {
+        let config = bcode_config::BcodeConfig::default();
+        let resolved = resolve_auth_provider_profile(
+            &config,
+            "openai",
+            "bcode.openai-compatible",
+            Some("openai-2"),
+            &pool_member_runtime(None, Some("bcode.openai-compatible")),
+        )
+        .expect("pool member resolves");
+        assert_eq!(resolved.profile_name, "openai-2");
+        assert_eq!(resolved.source, AuthProfileSource::Runtime);
+        assert_eq!(resolved.profile.scheme.as_deref(), Some("chatgpt"));
+        assert_eq!(
+            resolved.profile.settings.get("profile").map(String::as_str),
+            Some("openai-2")
+        );
+        assert_eq!(
+            resolved.profile.settings.get("vault").map(String::as_str),
+            Some("/tmp/openai-vault")
+        );
+
+        // A member-level owner takes precedence and still must match the caller.
+        assert!(matches!(
+            resolve_auth_provider_profile(
+                &config,
+                "openai",
+                "bcode.openai-compatible",
+                Some("openai-2"),
+                &pool_member_runtime(Some("bcode.other"), Some("bcode.openai-compatible")),
+            ),
+            Err(AuthProfileResolutionError::OwnerMismatch { actual, .. })
+                if actual == "bcode.other"
+        ));
+        // Provider mismatch fails closed before ownership.
+        assert!(matches!(
+            resolve_auth_provider_profile(
+                &config,
+                "xai",
+                "bcode.openai-compatible",
+                Some("openai-2"),
+                &pool_member_runtime(None, Some("bcode.openai-compatible")),
+            ),
+            Err(AuthProfileResolutionError::ProviderMismatch { .. })
+        ));
+        // No verifiable owner anywhere fails closed rather than trusting the caller.
+        assert!(matches!(
+            resolve_auth_provider_profile(
+                &config,
+                "openai",
+                "bcode.openai-compatible",
+                Some("openai-2"),
+                &pool_member_runtime(None, None),
+            ),
+            Err(AuthProfileResolutionError::OwnershipUnverifiable { .. })
+        ));
+        // Unknown names are still missing.
+        assert!(matches!(
+            resolve_auth_provider_profile(
+                &config,
+                "openai",
+                "bcode.openai-compatible",
+                Some("openai-3"),
+                &pool_member_runtime(None, Some("bcode.openai-compatible")),
+            ),
+            Err(AuthProfileResolutionError::MissingProfile { profile, .. })
+                if profile == "openai-3"
+        ));
     }
 
     #[test]

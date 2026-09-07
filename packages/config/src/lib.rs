@@ -4933,6 +4933,108 @@ pub fn register_runtime_auth_profile(
     Ok(path)
 }
 
+/// Outcome of removing one runtime auth profile's metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeAuthProfileRemoval {
+    /// Whether a top-level runtime profile entry was removed.
+    pub removed_profile: bool,
+    /// Provider IDs whose runtime binding pointed at the profile and was removed.
+    pub removed_bindings: Vec<String>,
+    /// Pools the profile was removed from as a member.
+    pub removed_from_pools: Vec<String>,
+}
+
+impl RuntimeAuthProfileRemoval {
+    /// Return whether any runtime metadata changed.
+    #[must_use]
+    pub const fn changed(&self) -> bool {
+        self.removed_profile
+            || !self.removed_bindings.is_empty()
+            || !self.removed_from_pools.is_empty()
+    }
+}
+
+/// Remove every runtime metadata reference to one auth profile owned by `owner_plugin_id`.
+///
+/// This forgets the profile entry, any provider binding that selects it, its membership in
+/// every runtime pool, and a pool preference that names it. Pools left with no members are
+/// dropped. Declarative configuration is never modified, and vault secrets are not touched;
+/// callers delete credentials through the ownership-checked vault lifecycle first.
+///
+/// Entries recorded under a different plugin owner are left in place and reported as unchanged
+/// so one plugin cannot forget another plugin's registrations.
+///
+/// # Errors
+///
+/// Returns an error when the runtime metadata file cannot be written.
+pub fn remove_runtime_auth_profile(
+    profile_name: &str,
+    owner_plugin_id: &str,
+) -> Result<RuntimeAuthProfileRemoval, ConfigError> {
+    let path = runtime_auth_subscriptions_path();
+    let mut registry = load_runtime_auth_subscriptions();
+    let removal = remove_runtime_auth_profile_from(&mut registry, profile_name, owner_plugin_id);
+    if removal.changed() {
+        write_runtime_auth_subscriptions(&path, &registry)?;
+    }
+    Ok(removal)
+}
+
+fn remove_runtime_auth_profile_from(
+    registry: &mut RuntimeAuthSubscriptions,
+    profile_name: &str,
+    owner_plugin_id: &str,
+) -> RuntimeAuthProfileRemoval {
+    let mut removal = RuntimeAuthProfileRemoval::default();
+    if registry
+        .profiles
+        .get(profile_name)
+        .is_some_and(|profile| profile.owner_plugin_id == owner_plugin_id)
+    {
+        registry.profiles.remove(profile_name);
+        removal.removed_profile = true;
+    }
+    let bound_providers = registry
+        .bindings
+        .iter()
+        .filter(|(_, binding)| {
+            binding.profile == profile_name && binding.owner_plugin_id == owner_plugin_id
+        })
+        .map(|(provider_id, _)| provider_id.clone())
+        .collect::<Vec<_>>();
+    for provider_id in &bound_providers {
+        registry.bindings.remove(provider_id);
+    }
+    removal.removed_bindings = bound_providers;
+    let mut emptied_pools = Vec::new();
+    for (pool_name, pool) in &mut registry.pools {
+        let owned = |member: &RuntimeAuthSubscriptionProfile| {
+            member
+                .owner_plugin_id
+                .as_deref()
+                .or(pool.owner_plugin_id.as_deref())
+                .or(pool.provider_plugin_id.as_deref())
+                == Some(owner_plugin_id)
+        };
+        let before = pool.profiles.len();
+        pool.profiles
+            .retain(|member| member.auth_profile != profile_name || !owned(member));
+        if pool.profiles.len() != before {
+            removal.removed_from_pools.push(pool_name.clone());
+            if pool.preferred_profile.as_deref() == Some(profile_name) {
+                pool.preferred_profile = None;
+            }
+            if pool.profiles.is_empty() {
+                emptied_pools.push(pool_name.clone());
+            }
+        }
+    }
+    for pool_name in emptied_pools {
+        registry.pools.remove(&pool_name);
+    }
+    removal
+}
+
 /// Persist an interactive preferred profile for an auth pool without changing declarative config.
 ///
 /// # Errors
@@ -8476,6 +8578,93 @@ mod tests {
             order.preference_source.as_deref(),
             Some("interactive_state")
         );
+    }
+
+    #[test]
+    fn remove_runtime_auth_profile_forgets_owned_metadata_only() {
+        let member = |name: &str, owner: Option<&str>| super::RuntimeAuthSubscriptionProfile {
+            auth_profile: name.to_owned(),
+            storage_profile: name.to_owned(),
+            vault: PathBuf::from("/tmp/vault"),
+            provider: "openai".to_owned(),
+            scheme: "chatgpt".to_owned(),
+            owner_plugin_id: owner.map(str::to_owned),
+            map: BTreeMap::new(),
+            device_seal: None,
+        };
+        let mut registry = RuntimeAuthSubscriptions {
+            pools: BTreeMap::from([
+                (
+                    "openai".to_owned(),
+                    RuntimeAuthSubscriptionPool {
+                        provider_plugin_id: Some("bcode.openai-compatible".to_owned()),
+                        preferred_profile: Some("openai-2".to_owned()),
+                        profiles: vec![member("openai-2", None), member("openai-3", None)],
+                        ..RuntimeAuthSubscriptionPool::default()
+                    },
+                ),
+                (
+                    "foreign".to_owned(),
+                    RuntimeAuthSubscriptionPool {
+                        provider_plugin_id: Some("bcode.other".to_owned()),
+                        profiles: vec![member("openai-2", None)],
+                        ..RuntimeAuthSubscriptionPool::default()
+                    },
+                ),
+            ]),
+            bindings: BTreeMap::from([(
+                "openai".to_owned(),
+                super::RuntimeAuthBinding {
+                    profile: "openai-2".to_owned(),
+                    owner_plugin_id: "bcode.openai-compatible".to_owned(),
+                },
+            )]),
+            profiles: BTreeMap::from([(
+                "openai-2".to_owned(),
+                super::RuntimeAuthProfile {
+                    provider_id: "openai".to_owned(),
+                    owner_plugin_id: "bcode.openai-compatible".to_owned(),
+                    backend: "sshenv".to_owned(),
+                    scheme: "chatgpt".to_owned(),
+                    storage_profile: "openai-2".to_owned(),
+                    vault: PathBuf::from("/tmp/vault"),
+                    map: BTreeMap::new(),
+                    device_seal: None,
+                },
+            )]),
+        };
+
+        let removal = super::remove_runtime_auth_profile_from(
+            &mut registry,
+            "openai-2",
+            "bcode.openai-compatible",
+        );
+
+        assert!(removal.removed_profile);
+        assert_eq!(removal.removed_bindings, vec!["openai"]);
+        assert_eq!(removal.removed_from_pools, vec!["openai"]);
+        assert!(!registry.profiles.contains_key("openai-2"));
+        assert!(!registry.bindings.contains_key("openai"));
+        let pool = &registry.pools["openai"];
+        assert_eq!(pool.preferred_profile, None);
+        assert_eq!(pool.profiles.len(), 1);
+        assert_eq!(pool.profiles[0].auth_profile, "openai-3");
+        // Another plugin's pool membership under the same name is left alone.
+        assert_eq!(registry.pools["foreign"].profiles.len(), 1);
+
+        // Removing the last member drops the pool entirely.
+        let removal = super::remove_runtime_auth_profile_from(
+            &mut registry,
+            "openai-3",
+            "bcode.openai-compatible",
+        );
+        assert_eq!(removal.removed_from_pools, vec!["openai"]);
+        assert!(!registry.pools.contains_key("openai"));
+
+        // Nothing owned: reports unchanged.
+        let removal =
+            super::remove_runtime_auth_profile_from(&mut registry, "openai-2", "bcode.nobody");
+        assert!(!removal.changed());
     }
 
     #[test]
