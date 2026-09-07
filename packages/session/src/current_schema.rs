@@ -85,6 +85,24 @@ fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
         "CREATE TABLE IF NOT EXISTS session_usage_requests (\n    request_key TEXT PRIMARY KEY NOT NULL,\n    usage_json TEXT NOT NULL,\n    event_seq INTEGER NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
         "DROP TABLE IF EXISTS session_usage_requests",
     );
+    add_sql_migration(
+        source,
+        "038_session_usage_request_timestamp",
+        "ALTER TABLE session_usage_requests ADD COLUMN first_observed_at_ms INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE session_usage_requests DROP COLUMN first_observed_at_ms",
+    );
+    add_sql_migration(
+        source,
+        "039_session_usage_derived_cost",
+        "ALTER TABLE session_usage_requests ADD COLUMN cost_json TEXT",
+        "ALTER TABLE session_usage_requests DROP COLUMN cost_json",
+    );
+    add_sql_migration(
+        source,
+        "040_session_usage_timestamp_index",
+        "CREATE INDEX idx_session_usage_timestamp ON session_usage_requests(first_observed_at_ms, request_key)",
+        "DROP INDEX idx_session_usage_timestamp",
+    );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {

@@ -2312,11 +2312,35 @@ impl BcodeClient {
         }
     }
 
-    /// Return a bounded page of session history.
+    /// Explicitly reprice recorded usage in a time range from a supplied catalog snapshot.
     ///
     /// # Errors
     ///
-    /// Returns an error when the daemon cannot be reached or rejects the request.
+    /// Returns an error if the daemon rejects ownership, the snapshot, or the projection update.
+    pub async fn reprice_session(
+        &self,
+        session_id: SessionId,
+        range: bcode_session_models::SessionCostRange,
+        catalog: bcode_model_catalog_models::CatalogDocument,
+    ) -> Result<bcode_session_models::SessionRepriceReport, ClientError> {
+        match self
+            .send_request(Request::RepriceSession {
+                session_id,
+                range,
+                catalog: Box::new(catalog),
+            })
+            .await?
+        {
+            ResponsePayload::SessionRepriced { report } => Ok(*report),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read a bounded canonical history page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon cannot read the page or rejects the query.
     pub async fn session_history_page(
         &self,
         session_id: SessionId,

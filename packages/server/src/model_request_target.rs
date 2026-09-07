@@ -25,6 +25,7 @@ pub struct ResolvedModelRequestTarget {
     pub max_output_tokens: Option<u32>,
     pub pricing: Option<bcode_model::ModelPricingInfo>,
     pub catalog_provider_id: Option<String>,
+    pub pricing_target: Option<Box<bcode_session_models::SessionPricingTarget>>,
     pub catalog_identity: Option<bcode_model_catalog::ModelCatalogIdentity>,
 }
 
@@ -105,7 +106,21 @@ pub async fn resolve_model_request_target(
     } else {
         None
     };
+    let support_hint = match &models.catalog.policy {
+        bcode_model::ModelCatalogPolicy::ExpandSupported { target, .. } => Some(target),
+        bcode_model::ModelCatalogPolicy::EnrichOnly { target, .. } => target.as_ref(),
+        _ => None,
+    };
+    let pricing_target = support_hint
+        .map(|hint| bcode_session_models::SessionPricingTarget {
+            provider: hint.provider.clone(),
+            auth_mode: hint.auth_mode.clone(),
+            api_surface: hint.api_surface.clone(),
+            integration: hint.integration.clone(),
+        })
+        .map(Box::new);
     Ok(ResolvedModelRequestTarget {
+        pricing_target,
         provider_plugin_id: input.provider_plugin_id.map(ToOwned::to_owned),
         requested_model_id: input.selected_model_id.map(ToOwned::to_owned),
         model_id,
@@ -204,6 +219,7 @@ mod tests {
             pricing: None,
             catalog_provider_id: Some("bedrock".to_string()),
             catalog_identity: None,
+            pricing_target: None,
         };
         let mut context = bcode_model::ProviderRequestContext::default();
 

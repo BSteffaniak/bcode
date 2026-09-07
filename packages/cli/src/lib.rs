@@ -4432,6 +4432,19 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Recalculate derived cost for a request timestamp range from a JSON catalog snapshot.
+    Reprice {
+        session_id: SessionId,
+        /// Inclusive RFC 3339 datetime (with timezone).
+        #[arg(long = "from", value_parser = parse_reprice_datetime)]
+        from_ms: u64,
+        /// Exclusive RFC 3339 datetime (with timezone).
+        #[arg(long = "to", value_parser = parse_reprice_datetime)]
+        to_ms: u64,
+        /// Explicit model catalog snapshot (`CatalogDocument` JSON).
+        #[arg(long)]
+        catalog: PathBuf,
+    },
     /// Rebuild model-context and transcript indexes from canonical history.
     Reindex {
         session_id: SessionId,
@@ -5558,6 +5571,17 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             })
             .await?;
         }
+        SessionCommand::Reprice {
+            session_id,
+            from_ms,
+            to_ms,
+            catalog,
+        } => {
+            Box::pin(reprice_session_command(
+                session_id, from_ms, to_ms, &catalog,
+            ))
+            .await?;
+        }
         SessionCommand::Reindex { session_id } => {
             Box::pin(reindex_session_model_context(session_id)).await?;
         }
@@ -5589,6 +5613,47 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
         }
     }
     Ok(())
+}
+
+async fn reprice_session_command(
+    session_id: SessionId,
+    from_ms: u64,
+    to_ms: u64,
+    catalog: &Path,
+) -> Result<(), CliError> {
+    use std::io::Read as _;
+    let range = bcode_session_models::SessionCostRange {
+        from_timestamp_ms: from_ms,
+        to_timestamp_ms: to_ms,
+    };
+    range.validate().map_err(CliError::InvalidArguments)?;
+    let mut bytes = Vec::new();
+    fs::File::open(catalog)?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(CliError::InvalidArguments(
+            "catalog snapshot exceeds 16 MiB".into(),
+        ));
+    }
+    let snapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    let report = BcodeClient::default_endpoint()
+        .reprice_session(session_id, range, snapshot)
+        .await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?
+    );
+    Ok(())
+}
+
+fn parse_reprice_datetime(value: &str) -> Result<u64, String> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|_| "expected RFC 3339 datetime with timezone".to_owned())?
+        .timestamp_millis();
+    u64::try_from(timestamp).map_err(|_| "datetime must not precede the Unix epoch".to_owned())
 }
 
 /// Resolve the current state location set, or fail closed with an actionable message.
@@ -17906,6 +17971,20 @@ mod session_diagnosis_tests {
         drop(future_db);
         assert_repeated_diagnosis_preserves_bytes(future_root.path(), future, "unsupported_future")
             .await;
+    }
+
+    #[test]
+    fn reprice_datetimes_require_timezone_and_preserve_boundaries() {
+        assert_eq!(
+            super::parse_reprice_datetime("1970-01-01T00:00:01.250Z").unwrap(),
+            1250
+        );
+        assert_eq!(
+            super::parse_reprice_datetime("1970-01-01T01:00:01.250+01:00").unwrap(),
+            1250
+        );
+        assert!(super::parse_reprice_datetime("2026-09-07").is_err());
+        assert!(super::parse_reprice_datetime("1969-12-31T23:59:59Z").is_err());
     }
 
     #[test]

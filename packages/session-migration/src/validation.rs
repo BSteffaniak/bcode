@@ -870,6 +870,7 @@ mod tests {
                 "session-writer-epoch-4-to-5",
                 "session-writer-epoch-5-to-6",
                 "session-writer-epoch-6-to-7",
+                "session-writer-epoch-7-to-8",
             ]
         );
         assert_eq!(receipt.source_event_digest_sha256, "source");

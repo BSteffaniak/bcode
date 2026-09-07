@@ -272,12 +272,12 @@ bounded blocker while later sessions continue. Verified backups and migration re
 per-session evidence; current canonical classification makes explicit re-invocation idempotent.
 Search providers are not consulted or invoked by canonical migration.
 
-Historical usage migration preserves the facts actually recorded by the historical writer. When a
-usage event has no trustworthy fixed estimate or exact request-attempt attribution, migration marks
-its cost explicitly unavailable. It does not resolve the session's current model or consult current
-catalog pricing: doing so would assign a later mutable price to an earlier request and silently
-change history. Token usage remains available, while unavailable historical cost honestly records
-that the original billing context cannot be reconstructed.
+Historical usage migration preserves the facts actually recorded by the historical writer. Existing
+embedded cost observations are retained as evidence and can seed the disposable cost projection.
+Migration does not consult the current catalog or guess missing provider/model attribution. Explicit
+repricing can value any historical request with sufficient recorded facts using a caller-supplied
+snapshot; missing identity or billing context remains unavailable. Repricing changes derived state,
+not canonical history.
 
 Aggregate operation IDs, revisions, cursors, progress, and outcome samples are bounded daemon-local
 notification state. They define no retention, acknowledgment, replay, or conflict protocol and are
@@ -379,7 +379,8 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-writer contract is epoch `7`; epoch `6` sessions migrate exclusively by rebuilding the new cumulative
+writer contract is epoch `8`; epoch `7` adds separated derived cost and first-observed request
+timestamps through exclusive migration. Epoch `6` sessions also rebuild the cumulative
 usage projection alongside every existing required projection. Earlier recognized legacy epochs
 follow the same complete migration chain. That rebuild applies
 terminal tool lifecycle events to the transcript and tool-run projections, so an invocation that
@@ -554,38 +555,46 @@ on the already-open database (shared pager, WAL, and page cache) and cost single
 they are not file opens and are not pooled.
 
 Required projections include current session state, input history, transcript spans, tool runs,
-artifact references, runtime work, cumulative request-deduplicated session usage and fixed
-request-time cost, request-context occupancy, model context, and turn receipts. Normal reads never
+artifact references, runtime work, cumulative request-deduplicated session usage and derived
+cost valuations, request-context occupancy, model context, and turn receipts. Normal reads never
 silently rebuild them. Bounded session attach returns the compact usage summary independently of the
 resident transcript window, so reconnecting or loading older transcript pages cannot change the
 session-wide token or cost totals.
 
-### Incremental cost accounting
+### Usage facts and replaceable cost projections
 
-The session actor owns cumulative cost projection updates. Each usage append atomically reads only
-its request's previous contribution and the compact total, validates duplicate/terminal semantics,
-then replaces that contribution using checked arithmetic. It never enumerates the request ledger on
-the append path. Identical and older deliveries are no-ops; conflicting duplicates fail closed.
+Canonical model-usage events contain request identity, first-observed event time, normalized token
+buckets, and provider billing context. New runtime writes do not embed calculated cost. Older events
+retain their embedded estimates as historical evidence; migration may seed disposable projections
+from that evidence but never rewrites usage or makes the old estimate a pricing authority.
 
-Attach includes a `through_sequence` accounting checkpoint. After each committed usage event the
-actor emits `UsageSummaryChanged` with a complete checkpointed replacement. Attached session views
-consume these replacements, not usage in transcript windows; older or equal checkpoints cannot
-replace a newer one. Live delivery is not durable resume: lag or disconnection requires bounded
-reattach, which recovers the canonical projection. IPC version 33 defines this transfer. The optional
-checkpoint is transport metadata and does not reprice or reinterpret existing stored estimates.
+The session actor owns a request-deduplicated usage projection. Request costs occupy a separate
+`cost_json` column. A new request is initially unpriced; normal execution supplies the catalog-resolved
+tariff and atomically appends usage facts with its derived estimate. Missing usage or prices remain
+unavailable. The model-catalog domain owns conversion from recorded billing facts to normalized
+pricing and never resolves the session's currently selected model to price an earlier request.
 
-Every new provider dispatch records a request-attributed, nonterminal unavailable usage observation
-before starting provider work. Final reported usage replaces that same request contribution exactly
-once. Retries use distinct attempt identities, including retries within a logical round and compaction
-retries. An interrupted dispatch, cancellation without final usage, or daemon loss leaves unavailable
-coverage rather than implying zero cost. Completed observed estimates retain their request-time rates
-and currencies; selection changes and cache plans never reprice them. A currently executing request
-can temporarily make coverage partial. A missing provider report cannot be reconstructed from context
-occupancy, cache expectations, or the selected model.
+`bcode session reprice SESSION_ID --from RFC3339 --to RFC3339 --catalog snapshot.json` is explicit
+maintenance through the owning daemon. It applies exactly the supplied CatalogDocument to requests
+first observed in `[from, to)`. Work pages request rows in one transaction, replaces their costs, and
+adjusts cumulative currency totals; a failure rolls back the operation. This maintenance operation
+serializes with that session's appends until commit; it is not a background job. A client timeout
+alone does not cancel or roll back an already admitted transaction. Repeating it with the same
+snapshot and unchanged usage yields the same amounts. Requests outside the range
+are unchanged. Missing or ambiguous pricing produces unavailable cost, not a fallback to earlier
+prices. The report identifies the snapshot revision and SHA-256 and reports the new totals. No
+historical-tariff archive, automatic repricing, or canonical history mutation is involved.
 
-These changes preserve previously recorded amounts; they do not reconstruct historical unrecorded
-attempts or verify provider invoices. Such reconciliation requires explicit maintenance and trustworthy
-billing evidence, never ordinary attach-time replay or mutable catalog repricing.
+Attach and live `UsageSummaryChanged` transfers include a canonical through-sequence and a derived
+cost revision. Normal appends advance the former; explicit repricing advances the latter even when
+no events were appended. Clients reject older valuation revisions and older checkpoints within a
+revision. Repricing can legitimately lower totals; model switches, transcript paging, and reconnects
+cannot. IPC 34 defines this transfer; it is not a durable-resume protocol.
+
+Writer epoch 8 adds separate cost and request timestamp columns plus the timestamp index. Existing
+stores upgrade through exclusive migration coordination, retaining canonical event bytes. Normal
+attach never scans history or reprices. Explicit reindex discards range-specific valuations; rerun
+repricing with the desired supplied snapshot afterward.
 
 ## Normal bounded reads
 

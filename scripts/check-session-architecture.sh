@@ -389,7 +389,7 @@ if ! diff -u "${current_event_kind_inventory}" "${current_event_kind_mapping}" \
   violations=1
 fi
 
-if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 7' packages/session/models/src/lib.rs \
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 8' packages/session/models/src/lib.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH: u32 = bcode_session_migration_target::CURRENT_WRITER_EPOCH' packages/session-migration/src/inventory.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH.*CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session-migration-target/src/lib.rs \
   || ! rg -q 'RELEASED_HISTORICAL_ROOTS' packages/session-migration/src/inventory.rs \
@@ -1314,7 +1314,7 @@ fi
 if ! rg -q 'pub cost: Option<SessionCostEstimate>' packages/session/models/src/lib.rs \
   || ! rg -q 'pub struct SessionCostSummary' packages/session-view/models/src/lib.rs \
   || ! rg -q 'UsageSummaryChanged' packages/session-view/src/lib.rs; then
-  echo "Session cost architecture violation: canonical usage must own fixed estimates and session-view must consume the checkpointed session accounting projection." >&2
+  echo "Session cost architecture violation: usage is canonical; session-view must consume checkpointed derived accounting." >&2
   violations=1
 fi
 
@@ -1333,6 +1333,14 @@ if ! rg -q 'through_sequence' packages/session/models/src/lib.rs \
   || ! rg -q 'record_pending_request_usage' packages/server/src/lib.rs \
   || ! rg -q 'checkpointed_cost_survives_live_usage_reconnect_and_paging' packages/session-view/src/lib.rs; then
   echo "Session cost architecture violation: accounting needs checkpointed hydration, dispatch coverage, and regression tests." >&2
+  violations=1
+fi
+
+if ! rg -q 'append_priced_model_usage' packages/session/src/mutation.rs \
+  || ! rg -q 'cost_json' packages/session/src/current_schema.rs \
+  || ! rg -q 'reprice_usage' packages/session/src/db.rs \
+  || ! rg -q 'cost: None' packages/server/src/lib.rs; then
+  echo "Session cost architecture violation: canonical usage must remain separate from replaceable derived costs." >&2
   violations=1
 fi
 

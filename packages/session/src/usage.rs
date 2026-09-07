@@ -11,7 +11,11 @@ pub fn accepts(
     let Some(current) = current else {
         return Ok(true);
     };
-    if next == current || next.observation_ordinal < current.observation_ordinal {
+    let mut current_facts = current.clone();
+    let mut next_facts = next.clone();
+    current_facts.cost = None;
+    next_facts.cost = None;
+    if next_facts == current_facts || next.observation_ordinal < current.observation_ordinal {
         return Ok(false);
     }
     if let (Some(current_request), Some(next_request)) = (&current.request, &next.request)
@@ -21,18 +25,6 @@ pub fn accepts(
     }
     if current.terminal || next.observation_ordinal == current.observation_ordinal {
         return Err("conflicting usage observation for an existing request".to_owned());
-    }
-    if let Some(SessionCostEstimate::Estimated {
-        currency,
-        total_micros,
-        ..
-    }) = &current.cost
-        && !matches!(&next.cost, Some(SessionCostEstimate::Estimated { currency: next_currency, total_micros: next_total, .. })
-            if next_currency == currency && next_total >= total_micros)
-    {
-        return Err(
-            "a recorded cost cannot be reduced or removed by a later usage observation".to_owned(),
-        );
     }
     Ok(true)
 }
@@ -48,7 +40,10 @@ pub fn replace(
         contribution(&mut updated, previous, false)?;
     }
     contribution(&mut updated, next, true)?;
-    updated.latest_usage = Some(next.clone());
+    let mut next = next.clone();
+    // The latest-usage snapshot carries facts, not a second cost projection.
+    next.cost = None;
+    updated.latest_usage = Some(next);
     *summary = updated;
     Ok(())
 }
@@ -100,7 +95,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn usage_cannot_reduce_a_recorded_nonterminal_cost() {
+    fn costs_do_not_constrain_usage_fact_lifecycle() {
         let mut current = SessionTokenUsage {
             request_id: Some("request".into()),
             observation_id: Some("request:0".into()),
@@ -116,7 +111,7 @@ mod tests {
         let mut next = current.clone();
         next.observation_ordinal = 1;
         next.cost = None;
-        assert!(accepts(Some(&current), &next).is_err());
+        assert!(accepts(Some(&current), &next).is_ok());
         current.terminal = true;
         next.cost = current.cost.clone();
         assert!(accepts(Some(&current), &next).is_err());

@@ -1537,6 +1537,9 @@ impl RuntimeWorkView {
 /// Renderer-neutral aggregate of fixed canonical session cost estimates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCostSummary {
+    /// Derived cost projection revision (independent of the canonical event checkpoint).
+    #[serde(default)]
+    pub revision: u64,
     /// Estimated totals grouped by ISO 4217 currency code.
     #[serde(default)]
     pub totals_micros: BTreeMap<String, u64>,

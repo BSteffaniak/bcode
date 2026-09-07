@@ -107,7 +107,7 @@ no previous request's cache count is carried into the next request's cost. Missi
 unknown unless the provider contract or complete detailed usage proves a zero. Detailed input and
 output must both reconcile with aggregates. Ambiguous cached-audio splits remain unpriced rather
 than assigning all cached tokens to text. Actual response service tiers override request defaults.
-See [session persistence](session-persistence-architecture.md#incremental-cost-accounting) for
+See [session persistence](session-persistence-architecture.md#usage-facts-and-replaceable-cost-projections) for
 cumulative projection and interruption coverage.
 
 ## End-to-end eval

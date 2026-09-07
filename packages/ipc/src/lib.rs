@@ -99,7 +99,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// field name is unchanged; only its derivation widened, and a stale peer computing
 /// the narrower identity now mismatches and is refused rather than silently sharing
 /// a daemon across config directories.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 33;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 34;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1115,6 +1115,12 @@ pub enum Request {
         note_id: String,
         text: String,
         format: bcode_command::CommandTextFormat,
+    },
+    /// Explicit maintenance: value a session interval using a supplied catalog snapshot.
+    RepriceSession {
+        session_id: SessionId,
+        range: bcode_session_models::SessionCostRange,
+        catalog: Box<bcode_model_catalog_models::CatalogDocument>,
     },
 }
 
@@ -3215,6 +3221,9 @@ pub enum ResponsePayload {
     PresentationNoteAppended,
     /// Compaction has entered the session queue; a terminal response follows on this request.
     SessionCompactionAccepted,
+    SessionRepriced {
+        report: Box<bcode_session_models::SessionRepriceReport>,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -5833,6 +5842,41 @@ mod tests {
 
         assert_eq!(envelope.version, ProtocolVersion::current());
         assert_eq!(ProtocolVersion::current().0, CURRENT_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn reprice_snapshot_and_report_round_trip() {
+        let session_id = SessionId::new();
+        let range = bcode_session_models::SessionCostRange {
+            from_timestamp_ms: 10,
+            to_timestamp_ms: 20,
+        };
+        let request = Request::RepriceSession {
+            session_id,
+            range,
+            catalog: Box::new(bcode_model_catalog_models::CatalogDocument::empty(
+                "snapshot",
+                "2026-09-07T00:00:00Z",
+            )),
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+        let response = Response::Ok(ResponsePayload::SessionRepriced {
+            report: Box::new(bcode_session_models::SessionRepriceReport {
+                session_id,
+                range,
+                repriced_requests: 0,
+                catalog_revision: "snapshot".into(),
+                catalog_digest: "digest".into(),
+                summary: bcode_session_models::SessionUsageSummary::default(),
+            }),
+        });
+        assert_eq!(
+            decode_response(&encode_response(&response).unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]

@@ -160,6 +160,12 @@ pub enum SessionLifecycleRequest {
     SessionHistory {
         session_id: SessionId,
     },
+    /// Explicit cost projection maintenance with a caller-supplied catalog snapshot.
+    RepriceSession {
+        session_id: SessionId,
+        range: bcode_session_models::SessionCostRange,
+        catalog: Box<bcode_model_catalog_models::CatalogDocument>,
+    },
     SessionHistoryPage {
         session_id: SessionId,
         query: SessionHistoryQuery,
@@ -810,6 +816,15 @@ impl RoutedRequest {
                     session_id,
                 }))
             }
+            Request::RepriceSession {
+                session_id,
+                range,
+                catalog,
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RepriceSession {
+                session_id,
+                range,
+                catalog,
+            })),
             Request::SessionHistoryPage { session_id, query } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionHistoryPage {
                     session_id,

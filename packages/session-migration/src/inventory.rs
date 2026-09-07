@@ -2163,7 +2163,7 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 6] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 7] = [
     MigrationStepDescriptor {
         id: "session-writer-epoch-1-to-2",
         source_writer_epoch: 1,
@@ -2193,6 +2193,11 @@ pub const MIGRATION_STEPS: [MigrationStepDescriptor; 6] = [
         id: "session-writer-epoch-6-to-7",
         source_writer_epoch: 6,
         target_writer_epoch: 7,
+    },
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-7-to-8",
+        source_writer_epoch: 7,
+        target_writer_epoch: 8,
     },
 ];
 
@@ -2247,10 +2252,14 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 6,
         event_schema: 46,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 7,
+        event_schema: 47,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
-pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6];
+pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
@@ -2578,7 +2587,7 @@ mod tests {
             released_fixture_writer_coverage(&manifest)
                 .into_keys()
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([1, 2, 3, 4, 5, 6])
+            BTreeSet::from([1, 2, 3, 4, 5, 6, 7])
         );
         assert_eq!(
             released_fixture_schema_coverage(&manifest).get(&28),
@@ -2792,6 +2801,10 @@ mod tests {
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 6,
                     event_schema: 46,
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 7,
+                    event_schema: 47
                 },
             ]
         );

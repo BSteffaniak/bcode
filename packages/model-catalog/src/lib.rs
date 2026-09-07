@@ -35,6 +35,9 @@ const EMBEDDED_PROVIDER_CATALOGS: &[(&str, &str)] = &[
     ),
 ];
 
+mod usage_pricing;
+pub use usage_pricing::{price_session_usage, price_usage_with_tariff};
+
 mod remote;
 mod verification;
 
@@ -3384,6 +3387,8 @@ mod tests {
         let usage = bcode_model::TokenUsage {
             input_tokens: Some(300_000),
             output_tokens: Some(10_000),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             pricing_context: Box::new(bcode_model::ModelPricingContext {
                 request_input_tokens: Some(300_000),
                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
@@ -3411,6 +3416,8 @@ mod tests {
         let usage = bcode_model::TokenUsage {
             input_tokens: Some(300_000),
             output_tokens: Some(10_000),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             pricing_context: Box::new(bcode_model::ModelPricingContext {
                 request_input_tokens: Some(300_000),
                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),

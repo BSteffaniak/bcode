@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 7;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 8;
 
 use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
@@ -29,6 +29,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+mod cost;
+pub use cost::{SessionCostRange, SessionRepriceReport};
 
 mod context_management;
 pub use context_management::{
@@ -3042,7 +3045,7 @@ pub enum ModelTurnOutcome {
     ProviderUnavailable,
 }
 
-/// Durable outcome of estimating one provider request's reported usage.
+/// Derived outcome of valuing one provider request's reported usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SessionCostEstimate {
@@ -3068,7 +3071,7 @@ pub enum SessionCostEstimate {
     },
 }
 
-/// One durable component of an estimated provider-request cost.
+/// One component of a derived provider-request valuation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCostComponent {
     /// Normalized pricing bucket label.
@@ -3096,6 +3099,19 @@ pub enum SessionCostUnavailableReason {
     PricingRuleUnavailableOrAmbiguous,
     UnsupportedPricingUnit,
     ConflictingUsage,
+}
+
+/// Portable catalog deployment identity needed to price recorded usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPricingTarget {
+    /// Catalog provider domain.
+    pub provider: String,
+    /// Normalized auth mode, not credentials or profile secrets.
+    pub auth_mode: String,
+    /// Normalized serving surface.
+    pub api_surface: String,
+    /// Optional integration discriminator.
+    pub integration: Option<String>,
 }
 
 /// Session-owned normalized pricing context for one provider request.
@@ -3136,11 +3152,15 @@ pub struct SessionTokenUsage {
     #[serde(default)]
     pub observation_ordinal: u32,
     /// Whether this observation is authoritative and cannot be superseded.
+    /// Cost is derived independently and may be explicitly repriced without changing this fact.
     #[serde(default)]
     pub terminal: bool,
     /// Exact provider and model attribution for this usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<Box<ModelRequestIdentity>>,
+    /// Request pricing target captured at dispatch, when the catalog selects a deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_target: Option<Box<SessionPricingTarget>>,
     /// Stable catalog provider captured for this request attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_provider_id: Option<String>,
@@ -3174,7 +3194,8 @@ pub struct SessionTokenUsage {
     /// Detailed independently priced normalized usage buckets.
     #[serde(default)]
     pub pricing_usage_details: Vec<SessionPricingUsageDetail>,
-    /// Durable request-time cost outcome, including normalized applied rates.
+    /// Historical estimate evidence retained for format compatibility. New runtime usage
+    /// observations leave this unset; authoritative usage facts are priced in derived state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<SessionCostEstimate>,
     /// Reasoning tokens reported separately by a provider, when available.
@@ -3185,6 +3206,9 @@ pub struct SessionTokenUsage {
 /// Compact canonical accounting state derived from all model-usage events in a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsageSummary {
+    /// Monotonic derived-cost revision. Repricing advances this without appending an event.
+    #[serde(default)]
+    pub cost_revision: u64,
     /// Canonical boundary represented by this snapshot, supplied by the session owner.
     ///
     /// This is a projection checkpoint, not a durable transport resume token.
@@ -3196,7 +3220,7 @@ pub struct SessionUsageSummary {
     /// Estimated totals grouped by ISO 4217 currency code.
     #[serde(default)]
     pub totals_micros: BTreeMap<String, u64>,
-    /// Number of represented usage observations carrying complete fixed estimates.
+    /// Number of represented usage observations with a complete derived estimate.
     #[serde(default)]
     pub estimated_usage_count: u64,
     /// Number of represented usage observations whose estimate is explicitly unavailable.

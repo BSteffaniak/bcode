@@ -753,6 +753,7 @@ struct ModelRequestAttempt {
     catalog_provider_id: Option<String>,
     catalog_entry_id: Option<String>,
     catalog_family: Option<String>,
+    pricing_target: Option<Box<bcode_session_models::SessionPricingTarget>>,
     catalog_api_surface: Option<bcode_model::ModelApiSurface>,
     reuse_key: Option<String>,
     request_message_count: usize,
@@ -4602,6 +4603,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::ReadSessionArtifact { session_id, .. }
         | Request::InvocationInput { session_id, .. }
         | Request::SessionHistory { session_id }
+        | Request::RepriceSession { session_id, .. }
         | Request::SessionHistoryPage { session_id, .. }
         | Request::SessionHistoryAround { session_id, .. }
         | Request::SessionInspection { session_id, .. }
@@ -4660,6 +4662,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
         Request::InvocationInput { .. } => "invocation_input",
         Request::SessionHistory { .. } => "session_history",
+        Request::RepriceSession { .. } => "session_reprice",
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::SessionHistoryAround { .. } => "session_history_around",
         Request::SessionInspection { .. } => "session_inspection",
@@ -5184,6 +5187,11 @@ async fn handle_request_inner(
         SessionLifecycleRequest::SessionHistory { session_id } => {
             handle_session_history(request_id, client_id, state, writer, session_id).await
         }
+        SessionLifecycleRequest::RepriceSession {
+            session_id,
+            range,
+            catalog,
+        } => handle_reprice_session(state, writer, request_id, session_id, range, *catalog).await,
         SessionLifecycleRequest::SessionHistoryPage { session_id, query } => {
             handle_session_history_page(request_id, client_id, state, writer, session_id, query)
                 .await
@@ -5628,9 +5636,9 @@ async fn handle_workflow_mutation_request(
         }
         WorkflowMutationRequest::PublishAndStartWorkflow(request) => {
             let result =
-                workflow_operations::publish_and_start(
+                Box::pin(workflow_operations::publish_and_start(
                     format!("publish-{request_id}"), client_id, state, *request,
-                )
+                ))
                     .await?;
             send_response(
                 writer,
@@ -11474,6 +11482,66 @@ async fn handle_attach_session(
             Ok(())
         }
     }
+}
+
+async fn handle_reprice_session(
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request_id: u64,
+    session_id: SessionId,
+    range: bcode_session_models::SessionCostRange,
+    catalog: bcode_model_catalog_models::CatalogDocument,
+) -> Result<(), ServerError> {
+    use sha2::Digest as _;
+    if let Some(response) = ambiguous_session_location_response(state, session_id).await {
+        return send_response(writer, request_id, response).await;
+    }
+    let result = async {
+        range.validate()?;
+        bcode_model_catalog::validate_catalog(&catalog)
+            .map_err(|error| error.public_message().to_owned())?;
+        if catalog.schema_version != bcode_model_catalog_models::SCHEMA_VERSION {
+            return Err("unsupported catalog snapshot schema".to_owned());
+        }
+        let bytes = serde_json::to_vec(&catalog).map_err(|_| "invalid catalog snapshot")?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err("catalog snapshot exceeds 16 MiB".to_owned());
+        }
+        let revision = catalog.catalog_revision.clone();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let catalog = bcode_model_catalog::ModelCatalog::new(catalog);
+        let (count, summary) = state
+            .sessions
+            .reprice_usage(
+                session_id,
+                range,
+                Arc::new(move |usage| bcode_model_catalog::price_session_usage(&catalog, usage)),
+            )
+            .await
+            .map_err(|_| {
+                "session repricing failed; check session ownership and projection readiness"
+                    .to_owned()
+            })?;
+        Ok(bcode_session_models::SessionRepriceReport {
+            session_id,
+            range,
+            repriced_requests: count,
+            catalog_revision: revision,
+            catalog_digest: digest,
+            summary,
+        })
+    }
+    .await;
+    let response = match result {
+        Ok(report) => Response::Ok(ResponsePayload::SessionRepriced {
+            report: Box::new(report),
+        }),
+        Err(message) => Response::Err(ErrorResponse {
+            code: "session_reprice_failed".to_owned(),
+            message,
+        }),
+    };
+    send_response(writer, request_id, response).await
 }
 
 async fn handle_attach_session_recent(
@@ -17793,6 +17861,10 @@ async fn run_model_turn_round(
         catalog_provider_id: catalog_provider_id.map(ToOwned::to_owned),
         catalog_entry_id: catalog_identity.map(|identity| identity.catalog_entry_id.clone()),
         catalog_family: catalog_identity.and_then(|identity| identity.family.clone()),
+        pricing_target: request
+            .metadata
+            .get("bcode_pricing_target")
+            .and_then(|json| serde_json::from_str(json).ok()),
         catalog_api_surface: catalog_identity.and_then(|identity| identity.api_surface),
         reuse_key: request.conversation_reuse.key.clone(),
         request_message_count: request.messages.len(),
@@ -19900,6 +19972,7 @@ async fn handle_provider_usage_event(
         session_id,
         turn_id.to_owned(),
         session_token_usage(&usage, attempt.as_ref()),
+        attempt.as_ref(),
     )
     .await
     {
@@ -21817,6 +21890,7 @@ async fn build_model_turn_request(
             "failed to resolve model request target: {error}"
         ))
     })?;
+    let pricing_target = target.pricing_target.clone();
     let pricing = target.pricing.clone();
     let catalog_provider_id = target.catalog_provider_id.clone();
     let catalog_identity = target.catalog_identity.clone();
@@ -21900,6 +21974,12 @@ async fn build_model_turn_request(
     );
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
+    if let Some(target) = pricing_target {
+        metadata.insert(
+            "bcode_pricing_target".to_owned(),
+            serde_json::to_string(&target).expect("pricing target serializes"),
+        );
+    }
     metadata.insert(
         "bcode_request_attempt_id".to_owned(),
         uuid::Uuid::new_v4().to_string(),
@@ -31428,12 +31508,17 @@ async fn record_pending_request_usage(
     usage.terminal = false;
     usage.observation_ordinal = 0;
     usage.observation_id = Some(format!("{}:pending", attempt.identity.request_id));
-    usage.cost = Some(bcode_session_models::SessionCostEstimate::Unavailable {
+    let cost = bcode_session_models::SessionCostEstimate::Unavailable {
         reason: bcode_session_models::SessionCostUnavailableReason::ProviderUsageIncomplete,
-    });
+    };
     let event = state
         .sessions
-        .append_model_usage(session_id, attempt.identity.model_turn_id.clone(), usage)
+        .append_priced_model_usage(
+            session_id,
+            attempt.identity.model_turn_id.clone(),
+            usage,
+            cost,
+        )
         .await
         .map_err(|_| "could not persist request accounting before provider dispatch".to_owned())?;
     publish_session_event(state, &event).await;
@@ -31445,10 +31530,21 @@ async fn append_model_usage_event(
     session_id: SessionId,
     turn_id: String,
     usage: SessionTokenUsage,
+    attempt: Option<&ModelRequestAttempt>,
 ) -> Result<(), String> {
+    let cost = attempt
+        .and_then(|attempt| attempt.pricing.as_ref())
+        .map_or_else(
+            || bcode_session_models::SessionCostEstimate::Unavailable {
+                reason:
+                    bcode_session_models::SessionCostUnavailableReason::RequestPricingUnavailable,
+            },
+            |pricing| bcode_model_catalog::price_usage_with_tariff(&usage, pricing),
+        );
+    trace_session_cost_estimate(Some(&cost));
     let event = state
         .sessions
-        .append_model_usage(session_id, turn_id, usage)
+        .append_priced_model_usage(session_id, turn_id, usage, cost)
         .await
         .map_err(|_| {
             "provider usage could not be committed; session cost coverage is incomplete".to_owned()
@@ -31461,33 +31557,6 @@ fn session_token_usage(
     usage: &TokenUsage,
     attempt: Option<&ModelRequestAttempt>,
 ) -> SessionTokenUsage {
-    let cost = attempt.map_or_else(
-        || {
-            Some(bcode_session_models::SessionCostEstimate::Unavailable {
-                reason: bcode_session_models::SessionCostUnavailableReason::RequestIdentityUnavailable,
-            })
-        },
-        |attempt| {
-            attempt.pricing.as_ref().map_or_else(
-                || {
-                    Some(bcode_session_models::SessionCostEstimate::Unavailable {
-                        reason: bcode_session_models::SessionCostUnavailableReason::RequestPricingUnavailable,
-                    })
-                },
-                |pricing| {
-                    pricing.estimate_cost(usage).map_or_else(
-                        || {
-                            Some(bcode_session_models::SessionCostEstimate::Unavailable {
-                                reason: pricing.cost_unavailable_reason(usage),
-                            })
-                        },
-                        |estimate| Some(session_cost_estimate(estimate)),
-                    )
-                },
-            )
-        },
-    );
-    trace_session_cost_estimate(cost.as_ref());
     SessionTokenUsage {
         request_id: attempt.map(|attempt| attempt.identity.request_id.clone()),
         observation_id: attempt.map(|attempt| format!("{}:usage", attempt.identity.request_id)),
@@ -31497,6 +31566,7 @@ fn session_token_usage(
         catalog_provider_id: attempt.and_then(|attempt| attempt.catalog_provider_id.clone()),
         catalog_entry_id: attempt.and_then(|attempt| attempt.catalog_entry_id.clone()),
         catalog_family: attempt.and_then(|attempt| attempt.catalog_family.clone()),
+        pricing_target: attempt.and_then(|attempt| attempt.pricing_target.clone()),
         catalog_api_surface: attempt
             .and_then(|attempt| attempt.catalog_api_surface)
             .map(|surface| format!("{surface:?}").to_ascii_lowercase()),
@@ -31525,7 +31595,7 @@ fn session_token_usage(
                 cache_ttl_seconds: detail.cache_ttl_seconds,
             })
             .collect(),
-        cost,
+        cost: None,
         reasoning_tokens: usage.reasoning_tokens,
     }
 }
@@ -31562,30 +31632,6 @@ fn trace_session_cost_estimate(cost: Option<&bcode_session_models::SessionCostEs
             availability = COST_AVAILABILITY_NOT_OBSERVED,
             "provider request has no cost observation"
         ),
-    }
-}
-
-fn session_cost_estimate(
-    estimate: bcode_model::ModelCostEstimate,
-) -> bcode_session_models::SessionCostEstimate {
-    bcode_session_models::SessionCostEstimate::Estimated {
-        currency: estimate.currency,
-        total_micros: estimate.total_micros,
-        components: estimate
-            .components
-            .into_iter()
-            .map(|component| bcode_session_models::SessionCostComponent {
-                bucket: format!("{:?}", component.bucket).to_ascii_lowercase(),
-                modality: component
-                    .modality
-                    .map(|modality| format!("{modality:?}").to_ascii_lowercase()),
-                tokens: component.tokens,
-                price_micros: component.price.micros,
-                cost_micros: component.cost_micros,
-            })
-            .collect(),
-        source: format!("{:?}", estimate.source).to_ascii_lowercase(),
-        revision: estimate.revision,
     }
 }
 
@@ -36774,7 +36820,7 @@ mod tests {
             sessions, store,
         ));
         let missing_parent = SessionId::new();
-        let result = workflow_operations::publish_and_start(
+        let result = Box::pin(workflow_operations::publish_and_start(
             "publish-test".to_string(),
             ClientId::new(),
             &state,
@@ -36792,7 +36838,7 @@ mod tests {
                 parent_session_id: missing_parent,
                 workspace_snapshot: None,
             },
-        )
+        ))
         .await
         .expect("separated result");
         let bcode_ipc::WorkflowPublishAndStartResult::Published {
@@ -40333,6 +40379,7 @@ library = "test"
             catalog_provider_id: None,
             catalog_entry_id: None,
             catalog_family: None,
+            pricing_target: None,
             catalog_api_surface: None,
             reuse_key: Some("reuse-key".to_owned()),
             request_message_count: 4,
@@ -40376,6 +40423,23 @@ library = "test"
         drop(state);
     }
 
+    fn test_cost_attempt() -> ModelRequestAttempt {
+        ModelRequestAttempt {
+            identity: serde_json::from_value(serde_json::json!({
+                "provider_plugin_id":"provider-one","effective_model_id":"model-one","request_id":"attempt-one",
+                "model_turn_id":"logical-turn","round":0,"request_fingerprint":"fixture","context_epoch":0
+            })).unwrap(),
+            provider_turn_id: "provider-turn".into(), pricing: Some(serde_json::from_value(serde_json::json!({
+                "currency":"USD","unit":"per_million_tokens","source":"user_override","revision":"frozen",
+                "input":{"micros":1_000_000},"cached_input":{"micros":100_000},"output":{"micros":1_000_000}
+            })).unwrap()),
+            catalog_provider_id: Some("provider-one".into()), catalog_entry_id: Some("model-one".into()),
+            catalog_family: None, pricing_target: None, catalog_api_surface: None, reuse_key: None,
+            request_message_count: 1, context_through_sequence: 0, portable_context: String::new(),
+            local_estimate: bcode_session_models::LocalContextEstimate { tokens: 100, algorithm_version: 1 }, managed_compaction_persisted: false,
+        }
+    }
+
     #[tokio::test]
     async fn request_cost_lifecycle_captures_rates_and_preserves_interrupted_coverage() {
         let sessions = SessionManager::default();
@@ -40384,33 +40448,7 @@ library = "test"
             .await
             .unwrap();
         let state = test_server_state(sessions);
-        let identity: bcode_session_models::ModelRequestIdentity = serde_json::from_value(serde_json::json!({
-            "provider_plugin_id":"provider-one","requested_model_id":"alias","effective_model_id":"model-one",
-            "request_id":"attempt-one","model_turn_id":"logical-turn","round":0,"request_fingerprint":"fixture",
-            "context_epoch":0
-        })).unwrap();
-        let pricing: bcode_model::ModelPricingInfo = serde_json::from_value(serde_json::json!({
-            "currency":"USD","unit":"per_million_tokens","source":"user_override","revision":"frozen",
-            "input":{"micros":1_000_000},"cached_input":{"micros":100_000},"output":{"micros":1_000_000}
-        })).unwrap();
-        let mut attempt = ModelRequestAttempt {
-            identity,
-            provider_turn_id: "provider-turn".into(),
-            pricing: Some(pricing),
-            catalog_provider_id: Some("provider-one".into()),
-            catalog_entry_id: Some("model-one".into()),
-            catalog_family: None,
-            catalog_api_surface: None,
-            reuse_key: None,
-            request_message_count: 1,
-            context_through_sequence: 0,
-            portable_context: String::new(),
-            local_estimate: bcode_session_models::LocalContextEstimate {
-                tokens: 100,
-                algorithm_version: 1,
-            },
-            managed_compaction_persisted: false,
-        };
+        let mut attempt = test_cost_attempt();
         record_pending_request_usage(&state, session.id, &attempt)
             .await
             .unwrap();
@@ -40421,12 +40459,24 @@ library = "test"
             ..Default::default()
         };
         let priced = session_token_usage(&cold, Some(&attempt));
-        append_model_usage_event(&state, session.id, "logical-turn".into(), priced.clone())
-            .await
-            .unwrap();
-        append_model_usage_event(&state, session.id, "logical-turn".into(), priced)
-            .await
-            .unwrap();
+        append_model_usage_event(
+            &state,
+            session.id,
+            "logical-turn".into(),
+            priced.clone(),
+            Some(&attempt),
+        )
+        .await
+        .unwrap();
+        append_model_usage_event(
+            &state,
+            session.id,
+            "logical-turn".into(),
+            priced,
+            Some(&attempt),
+        )
+        .await
+        .unwrap();
         attempt.identity.request_id = "attempt-two".into();
         attempt.identity.provider_plugin_id = "provider-two".into();
         // A cancelled/new-provider attempt cannot remove the first provider's charge.
@@ -40450,6 +40500,7 @@ library = "test"
             session.id,
             "logical-turn".into(),
             session_token_usage(&warm, Some(&attempt)),
+            Some(&attempt),
         )
         .await
         .unwrap();
@@ -46849,12 +46900,9 @@ library = "test"
         assert_eq!(usage.reasoning_tokens, Some(2));
         assert_eq!(usage.pricing_context.request_input_tokens, None);
         assert!(usage.pricing_usage_details.is_empty());
-        assert_eq!(
-            usage.cost,
-            Some(bcode_session_models::SessionCostEstimate::Unavailable {
-                reason:
-                    bcode_session_models::SessionCostUnavailableReason::RequestIdentityUnavailable,
-            })
+        assert!(
+            usage.cost.is_none(),
+            "canonical usage must not embed calculated cost"
         );
         assert!(!usage.terminal);
         usage
@@ -50663,6 +50711,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 catalog_provider_id: None,
                 catalog_entry_id: None,
                 catalog_family: None,
+                pricing_target: None,
                 catalog_api_surface: None,
                 reuse_key: None,
                 request_message_count: 1,
@@ -56982,6 +57031,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             input_schema: serde_json::json!({}),
         }];
         let claude_target = |entry: &str| model_request_target::ResolvedModelRequestTarget {
+            pricing_target: None,
             provider_plugin_id: Some("bcode.bedrock".to_string()),
             requested_model_id: Some(format!("us.{entry}-v1:0")),
             model_id: format!("us.{entry}-v1:0"),
@@ -57063,6 +57113,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             input_schema: serde_json::json!({}),
         }];
         let target = model_request_target::ResolvedModelRequestTarget {
+            pricing_target: None,
             provider_plugin_id: Some("bcode.bedrock".to_string()),
             requested_model_id: None,
             model_id: "anthropic.claude-opus-5".to_string(),
@@ -69128,6 +69179,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         // This test covers explicit skill-context preservation, not model-specific prompt
         // profiles, so the target carries no catalog identity and selects no profile layers.
         let model_target = model_request_target::ResolvedModelRequestTarget {
+            pricing_target: None,
             provider_plugin_id: None,
             requested_model_id: None,
             model_id: "model".to_owned(),

@@ -42,6 +42,7 @@ bcode_workflow_store         = { workspace = true }
 bcode_worktree_models        = { workspace = true }
 bmux_keyboard                = { workspace = true }
 bmux_tui                     = { workspace = true, features = ["crossterm"] }
+chrono                       = { workspace = true }
 clap                         = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm                    = { workspace = true, features = ["events"] }
 open                         = { workspace = true, optional = true }

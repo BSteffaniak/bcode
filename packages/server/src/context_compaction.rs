@@ -1082,6 +1082,7 @@ pub async fn collect_compaction_summary_once(
             .catalog_identity
             .as_ref()
             .and_then(|identity| identity.family.clone()),
+        pricing_target: target.pricing_target,
         catalog_api_surface: target
             .catalog_identity
             .as_ref()
@@ -1359,6 +1360,7 @@ async fn stream_compaction_summary(
             session_id,
             attempt.identity.model_turn_id.clone(),
             session_token_usage(&usage, Some(attempt)),
+            Some(attempt),
         )
         .await
     {
@@ -1710,6 +1712,7 @@ pub async fn handle_compaction_events(
                     session_id,
                     attempt.identity.model_turn_id.clone(),
                     session_token_usage(&usage, Some(attempt)),
+                    Some(attempt),
                 )
                 .await
                 {

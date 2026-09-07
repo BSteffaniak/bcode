@@ -463,9 +463,67 @@ impl SessionManager {
         turn_id: String,
         usage: SessionTokenUsage,
     ) -> Result<SessionEvent, SessionError> {
-        usage.validate().map_err(SessionError::EventSerialization)?;
-        self.append_event(session_id, SessionEventKind::ModelUsage { turn_id, usage })
+        let cost = bcode_session_models::SessionCostEstimate::Unavailable {
+            reason: bcode_session_models::SessionCostUnavailableReason::RequestPricingUnavailable,
+        };
+        self.append_priced_model_usage(session_id, turn_id, usage, cost)
             .await
+    }
+
+    /// Explicitly replace derived costs in a timestamp interval without changing history.
+    /// Callers supply a pure, snapshot-bound pricing function; no catalog implementation leaks
+    /// into session storage. Work is serialized with this session's appends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid scope, unverifiable ownership, stale state, or failed commit.
+    pub async fn reprice_usage(
+        &self,
+        session_id: SessionId,
+        range: bcode_session_models::SessionCostRange,
+        price: std::sync::Arc<
+            dyn Fn(&SessionTokenUsage) -> bcode_session_models::SessionCostEstimate + Send + Sync,
+        >,
+    ) -> Result<(u64, bcode_session_models::SessionUsageSummary), SessionError> {
+        range.validate().map_err(SessionError::EventSerialization)?;
+        Box::pin(self.ensure_session_loaded(session_id)).await?;
+        let handle = self.session_handle(session_id).await?;
+        let result = handle.reprice_usage(range, price).await;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        result
+    }
+
+    /// Append immutable usage facts and atomically update the separately derived cost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership, validation, or persistence fails.
+    pub async fn append_priced_model_usage(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        mut usage: SessionTokenUsage,
+        cost: bcode_session_models::SessionCostEstimate,
+    ) -> Result<SessionEvent, SessionError> {
+        usage.cost = Some(cost.clone());
+        usage.validate().map_err(SessionError::EventSerialization)?;
+        usage.cost = None;
+        usage.validate().map_err(SessionError::EventSerialization)?;
+        Box::pin(self.ensure_session_loaded(session_id)).await?;
+        let handle = self.session_handle(session_id).await?;
+        let event = handle
+            .append_usage_with_cost(
+                SessionEventKind::ModelUsage { turn_id, usage },
+                cost,
+                self.next_activity_timestamp_ms(),
+            )
+            .await?;
+        let summary = handle.summary().await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        self.publish_committed_mutation(event.clone(), summary);
+        Ok(event)
     }
 
     /// Append a system message to a session.

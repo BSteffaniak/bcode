@@ -244,6 +244,8 @@ impl SessionHandle {
             ownership_guards: BTreeMap::new(),
             db,
             last_manifest_summary: None,
+            memory_usage_timestamps: BTreeMap::new(),
+            pending_usage_cost: None,
             memory_usage: bcode_session_models::SessionUsageSummary::default(),
             memory_usage_requests: BTreeMap::new(),
             commands: receiver,
@@ -325,6 +327,40 @@ impl SessionHandle {
     pub(crate) async fn health(&self, root: PathBuf) -> Result<super::SessionHealth, SessionError> {
         self.send(|reply| SessionCommand::Health { root, reply })
             .await?
+    }
+
+    /// Session-owned repricing of facts; the caller supplies pure model-catalog valuation.
+    /// The call is explicit maintenance and serialized with canonical writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership, storage, valuation, or commit validation fails.
+    pub async fn reprice_usage(
+        &self,
+        range: bcode_session_models::SessionCostRange,
+        price: UsagePricer,
+    ) -> Result<(u64, bcode_session_models::SessionUsageSummary), SessionError> {
+        self.send(|reply| SessionCommand::RepriceUsage {
+            range,
+            price,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn append_usage_with_cost(
+        &self,
+        kind: SessionEventKind,
+        cost: bcode_session_models::SessionCostEstimate,
+        activity_timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.send(|reply| SessionCommand::AppendUsage {
+            kind,
+            cost,
+            activity_timestamp_ms,
+            reply,
+        })
+        .await?
     }
 
     pub async fn append_event(
@@ -653,7 +689,25 @@ pub struct TurnAdmissionResult {
     pub events: Vec<SessionEvent>,
 }
 
+pub type UsagePricer = Arc<
+    dyn Fn(&bcode_session_models::SessionTokenUsage) -> bcode_session_models::SessionCostEstimate
+        + Send
+        + Sync,
+>;
+
 enum SessionCommand {
+    RepriceUsage {
+        range: bcode_session_models::SessionCostRange,
+        price: UsagePricer,
+        reply:
+            oneshot::Sender<Result<(u64, bcode_session_models::SessionUsageSummary), SessionError>>,
+    },
+    AppendUsage {
+        kind: SessionEventKind,
+        cost: bcode_session_models::SessionCostEstimate,
+        activity_timestamp_ms: u64,
+        reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
+    },
     AppendEvent {
         kind: SessionEventKind,
         provenance: Option<SessionEventProvenance>,
@@ -778,6 +832,8 @@ struct SessionActor {
     /// append path skip rewriting it when a durable event did not change any manifest field.
     last_manifest_summary: Option<ManifestSummaryIdentity>,
     // Only storage-free sessions retain their canonical request contributions here.
+    memory_usage_timestamps: BTreeMap<String, u64>,
+    pending_usage_cost: Option<bcode_session_models::SessionCostEstimate>,
     memory_usage: bcode_session_models::SessionUsageSummary,
     memory_usage_requests: BTreeMap<String, bcode_session_models::SessionTokenUsage>,
     commands: mpsc::Receiver<SessionCommand>,
@@ -831,9 +887,11 @@ impl SessionActor {
             let Some(command) = command else {
                 break;
             };
-            let should_shutdown =
-                bcode_metrics::scope_metrics_context(context.clone(), self.handle_command(command))
-                    .await;
+            let should_shutdown = Box::pin(bcode_metrics::scope_metrics_context(
+                context.clone(),
+                self.handle_command(command),
+            ))
+            .await;
             if should_shutdown {
                 break;
             }
@@ -842,6 +900,24 @@ impl SessionActor {
 
     async fn handle_command(&mut self, command: SessionCommand) -> bool {
         match command {
+            SessionCommand::RepriceUsage {
+                range,
+                price,
+                reply,
+            } => {
+                let _ = reply.send(self.reprice_usage(range, &*price).await);
+            }
+            SessionCommand::AppendUsage {
+                kind,
+                cost,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                self.pending_usage_cost = Some(cost);
+                let result = self.append_event(kind, None, activity_timestamp_ms).await;
+                self.pending_usage_cost = None;
+                let _ = reply.send(result);
+            }
             SessionCommand::AppendEvent {
                 kind,
                 provenance,
@@ -907,7 +983,9 @@ impl SessionActor {
     #[allow(clippy::too_many_lines)]
     async fn handle_read_command(&mut self, command: SessionCommand) -> bool {
         match command {
-            SessionCommand::AppendEvent { .. }
+            SessionCommand::RepriceUsage { .. }
+            | SessionCommand::AppendUsage { .. }
+            | SessionCommand::AppendEvent { .. }
             | SessionCommand::AppendToolInvocationResult { .. }
             | SessionCommand::AppendUserMessage { .. }
             | SessionCommand::Attach { .. }
@@ -1541,7 +1619,73 @@ impl SessionActor {
         .await
     }
 
-    fn project_memory_usage(&mut self, kind: &SessionEventKind) -> Result<(), SessionError> {
+    async fn reprice_usage(
+        &mut self,
+        range: bcode_session_models::SessionCostRange,
+        price: &(
+             dyn Fn(
+            &bcode_session_models::SessionTokenUsage,
+        ) -> bcode_session_models::SessionCostEstimate
+                 + Send
+                 + Sync
+         ),
+    ) -> Result<(u64, bcode_session_models::SessionUsageSummary), SessionError> {
+        self.ensure_ownership()?;
+        range.validate().map_err(SessionError::EventSerialization)?;
+        let result = if let Some(store) = self.store.clone() {
+            let _guard = crate::lease::acquire_session_write_lock(
+                &store.root_path(),
+                self.state.summary.id,
+            )?;
+            self.ensure_session_db_for_write().await?;
+            self.db
+                .as_ref()
+                .ok_or(SessionError::DbUnavailable(self.state.summary.id))?
+                .reprice_usage(range, price)
+                .await?
+        } else {
+            let mut summary = self.memory_usage.clone();
+            let mut contributions = self.memory_usage_requests.clone();
+            let mut count = 0;
+            for (key, usage) in &mut contributions {
+                if !self
+                    .memory_usage_timestamps
+                    .get(key)
+                    .is_some_and(|timestamp| range.contains(*timestamp))
+                {
+                    continue;
+                }
+                let mut next = usage.clone();
+                next.cost = None;
+                next.cost = Some(price(&next));
+                next.validate().map_err(SessionError::EventSerialization)?;
+                crate::usage::replace(&mut summary, Some(usage), &next)
+                    .map_err(SessionError::EventSerialization)?;
+                *usage = next;
+                count += 1;
+            }
+            summary
+                .latest_usage
+                .clone_from(&self.memory_usage.latest_usage);
+            summary.cost_revision = summary.cost_revision.checked_add(1).ok_or_else(|| {
+                SessionError::EventSerialization("cost revision overflow".to_owned())
+            })?;
+            self.memory_usage = summary.clone();
+            self.memory_usage_requests = contributions;
+            summary.through_sequence = Some(self.state.next_sequence.saturating_sub(1));
+            (count, summary)
+        };
+        self.publish_live_event(SessionLiveEventKind::UsageSummaryChanged {
+            summary: Box::new(result.1.clone()),
+        });
+        Ok(result)
+    }
+
+    fn project_memory_usage(
+        &mut self,
+        kind: &SessionEventKind,
+        timestamp_ms: u64,
+    ) -> Result<(), SessionError> {
         if self.store.is_none()
             && let SessionEventKind::ModelUsage { usage, .. } = kind
         {
@@ -1551,9 +1695,16 @@ impl SessionActor {
                 .unwrap_or_else(|| format!("event:{}", self.state.next_sequence));
             let previous = self.memory_usage_requests.get(&key);
             if crate::usage::accepts(previous, usage).map_err(SessionError::EventSerialization)? {
-                crate::usage::replace(&mut self.memory_usage, previous, usage)
+                let mut projected = usage.clone();
+                projected.cost = Some(self.pending_usage_cost.clone().or_else(|| usage.cost.clone()).unwrap_or(bcode_session_models::SessionCostEstimate::Unavailable {
+                    reason: bcode_session_models::SessionCostUnavailableReason::RequestPricingUnavailable,
+                }));
+                crate::usage::replace(&mut self.memory_usage, previous, &projected)
                     .map_err(SessionError::EventSerialization)?;
-                self.memory_usage_requests.insert(key, usage.clone());
+                self.memory_usage_timestamps
+                    .entry(key.clone())
+                    .or_insert(timestamp_ms);
+                self.memory_usage_requests.insert(key, projected);
             }
         }
         Ok(())
@@ -1576,7 +1727,7 @@ impl SessionActor {
             .as_ref()
             .and_then(|provenance| provenance.source_timestamp_ms)
             .unwrap_or(activity_timestamp_ms);
-        self.project_memory_usage(&kind)?;
+        self.project_memory_usage(&kind, event_timestamp_ms)?;
         let event = if let Some(store) = self.store.clone() {
             let lock_started_at = Instant::now();
             let _write_guard = crate::lease::acquire_session_write_lock(
@@ -1606,7 +1757,11 @@ impl SessionActor {
                 .as_ref()
                 .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
             let append_result = db
-                .append_event_with_activity_timestamp(&event, Some(event_timestamp_ms))
+                .append_event_with_cost(
+                    &event,
+                    self.pending_usage_cost.as_ref(),
+                    Some(event_timestamp_ms),
+                )
                 .await;
             if let Some(metrics) = &metrics {
                 record_append_rejection_metrics(metrics, &append_result);

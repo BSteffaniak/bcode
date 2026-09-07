@@ -22,7 +22,7 @@ pub enum MaterializedProjection {
     ArtifactReferences,
     /// Runtime-work lifecycle rows.
     RuntimeWork,
-    /// Authoritative cumulative session usage and fixed request-time cost estimates.
+    /// Cumulative session usage and replaceable derived cost valuations.
     SessionUsage,
     /// Authoritative current context occupancy.
     RequestContextOccupancy,

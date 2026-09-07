@@ -2873,6 +2873,60 @@ mod tests {
     use switchy::database::query::FilterableQuery;
 
     #[tokio::test]
+    async fn repricing_memory_session_changes_valuation_not_usage() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let usage = bcode_session_models::SessionTokenUsage {
+            request_id: Some("request".into()),
+            observation_id: Some("request:final".into()),
+            terminal: true,
+            input_tokens: Some(10),
+            output_tokens: Some(0),
+            ..Default::default()
+        };
+        let estimate = |value| bcode_session_models::SessionCostEstimate::Estimated {
+            currency: "USD".into(),
+            total_micros: value,
+            source: "fixture".into(),
+            revision: None,
+            components: vec![bcode_session_models::SessionCostComponent {
+                bucket: "input".into(),
+                modality: None,
+                tokens: 10,
+                price_micros: value * 100_000,
+                cost_micros: value,
+            }],
+        };
+        manager
+            .append_priced_model_usage(session.id, "turn".into(), usage, estimate(10))
+            .await
+            .unwrap();
+        let before = manager.session_history(session.id).await.unwrap();
+        let range = bcode_session_models::SessionCostRange {
+            from_timestamp_ms: 0,
+            to_timestamp_ms: i64::MAX.cast_unsigned(),
+        };
+        let (count, summary) = manager
+            .reprice_usage(
+                session.id,
+                range,
+                std::sync::Arc::new(move |facts| {
+                    assert!(facts.cost.is_none());
+                    estimate(2)
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(summary.totals_micros["USD"], 2);
+        assert_eq!(summary.cost_revision, 1);
+        assert_eq!(manager.session_history(session.id).await.unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn usage_pending_and_final_commits_publish_checkpointed_totals() {
         let manager = SessionManager::default();
         let session = manager
@@ -2917,7 +2971,12 @@ mod tests {
             }],
         });
         let final_event = manager
-            .append_model_usage(session.id, "turn".into(), usage.clone())
+            .append_priced_model_usage(
+                session.id,
+                "turn".into(),
+                usage.clone(),
+                usage.cost.clone().unwrap(),
+            )
             .await
             .unwrap();
         let bcode_session_models::SessionLiveEventKind::UsageSummaryChanged { summary } =

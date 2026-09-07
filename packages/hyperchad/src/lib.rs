@@ -1012,7 +1012,7 @@ pub fn router_from_state(state: HyperChadAppState) -> Router {
         })
         .with_route("/actions/history-window", move |request| {
             let state = history_state.clone();
-            async move { state.handle_history_window(request).await }
+            async move { Box::pin(state.handle_history_window(request)).await }
         })
         .with_route("/actions/interaction", move |request| {
             let state = interaction_state.clone();

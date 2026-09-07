@@ -436,6 +436,7 @@ pub struct SessionView {
     usage_by_request: BTreeMap<String, bcode_session_models::SessionTokenUsage>,
     unattributed_metered_tokens: u64,
     unattributed_cost: bcode_session_view_models::SessionCostSummary,
+    usage_cost_revision: u64,
     usage_checkpoint: Option<u64>,
 }
 
@@ -465,6 +466,7 @@ impl SessionView {
             usage_by_request: BTreeMap::new(),
             unattributed_metered_tokens: 0,
             unattributed_cost: bcode_session_view_models::SessionCostSummary::default(),
+            usage_cost_revision: 0,
             usage_checkpoint: None,
         }
     }
@@ -589,17 +591,21 @@ impl SessionView {
 
     /// Replace cumulative runtime accounting from the canonical session usage projection.
     pub fn set_usage_summary(&mut self, summary: bcode_session_models::SessionUsageSummary) {
-        if self
-            .usage_checkpoint
-            .is_some_and(|current| summary.through_sequence.is_none_or(|next| next <= current))
-        {
+        if self.usage_checkpoint.is_some_and(|current| {
+            summary.through_sequence.is_none_or(|next| next < current)
+                || summary.cost_revision < self.usage_cost_revision
+                || (summary.cost_revision == self.usage_cost_revision
+                    && summary.through_sequence == Some(current))
+        }) {
             return;
         }
+        self.usage_cost_revision = summary.cost_revision;
         self.usage_checkpoint = summary.through_sequence;
         self.usage_by_request.clear();
         self.unattributed_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cumulative_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cost = bcode_session_view_models::SessionCostSummary {
+            revision: summary.cost_revision,
             totals_micros: summary.totals_micros,
             estimated_usage_count: summary.estimated_usage_count,
             unavailable_usage_count: summary.unavailable_usage_count,
@@ -1006,6 +1012,7 @@ impl SessionView {
         replacement.usage_by_request = self.usage_by_request.clone();
         replacement.unattributed_metered_tokens = self.unattributed_metered_tokens;
         replacement.unattributed_cost = self.unattributed_cost.clone();
+        replacement.usage_cost_revision = self.usage_cost_revision;
         replacement.usage_checkpoint = self.usage_checkpoint;
         replacement.snapshot.session_summary = previous.session_summary;
         replacement.snapshot.transcript.source_start_sequence =
@@ -5734,6 +5741,11 @@ mod tests {
             view.set_usage_summary(summary(sequence, 324_786_953 + sequence));
             assert!(view.usage_by_request.is_empty());
         }
+        let mut repriced = summary(18_768, 50);
+        repriced.cost_revision = 1;
+        view.set_usage_summary(repriced);
+        view.set_usage_summary(summary(18_769, 999));
+        assert_eq!(view.snapshot().runtime.cost.totals_micros["USD"], 50);
     }
 
     #[test]
