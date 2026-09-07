@@ -497,11 +497,6 @@ opt-level = "z"
 inherits  = "dev"
 opt-level = 0
 
-# Development-only upstream integration; replace with a published revision before delivery.
-[patch."https://github.com/MoosicBox/MoosicBox.git"]
-switchy_async = { path = "/Volumes/ehdd/GitHub/MoosicBox/packages/switchy/async" }
-switchy_time  = { path = "/Volumes/ehdd/GitHub/MoosicBox/packages/switchy/time" }
-
 # moosicbox_logging            = { path = "../MoosicBox/packages/logging" }
 # switchy                     = { path = "/Volumes/tinyguy/GitHub/MoosicBox/packages/switchy" }
 # switchy_env                  = { path = "../MoosicBox/packages/switchy/env" }
