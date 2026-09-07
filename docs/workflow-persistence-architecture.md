@@ -364,6 +364,8 @@ damaged or stale.
 
 ## Clean-break schema and explicit reset
 
+The migration safety contract in `INVARIANTS.md` permits known, lossless automatic upgrades through domain-owned coordination with verified exclusive migration ownership, protection against incompatible concurrent access, and interruption-safe recovery. The workflow implementation described below still requires explicit migration; automatic workflow upgrade coordination is not yet implemented. Ordinary reads remain bounded and non-mutating, and destructive or ambiguous conversions still require explicit maintenance.
+
 The workflow database has one supported schema version. A missing database is initialized directly
 at that version. An existing database with an absent, malformed, older, or future contract is
 rejected without writes; normal startup never migrates or reinterprets it.
