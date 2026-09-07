@@ -2413,7 +2413,7 @@ impl AgentRuntime {
                 switchy::unsync::select! {
                     () = request.cancellation.cancelled() => {},
                     () = scope_cancellation.cancelled() => {},
-                    () = sleep(self.poll_interval.min(request.timeout.saturating_sub(start.elapsed()))) => {},
+                    () = sleep(self.poll_interval.min(request.timeout.saturating_sub(instant_now().saturating_duration_since(start)))) => {},
                 }
             }
         }

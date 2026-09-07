@@ -37,6 +37,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use switchy::time::instant_now;
 
 struct InvocationOperationDuration {
     operation: &'static str,
@@ -47,7 +48,7 @@ impl InvocationOperationDuration {
     fn start(operation: &'static str) -> Self {
         Self {
             operation,
-            started: Instant::now(),
+            started: instant_now(),
         }
     }
 }
@@ -56,7 +57,9 @@ impl Drop for InvocationOperationDuration {
     fn drop(&mut self) {
         tracing::debug!(
             operation = self.operation,
-            duration_ms = self.started.elapsed().as_millis(),
+            duration_ms = instant_now()
+                .saturating_duration_since(self.started)
+                .as_millis(),
             "neutral invocation operation completed"
         );
     }
@@ -698,7 +701,7 @@ impl TurnControl {
     ///
     /// Returns `true` only for the caller that transitions this turn from running to cancelling.
     pub fn begin_cancellation(&self) -> bool {
-        let started = Instant::now();
+        let started = instant_now();
         let Some(handles) = self.close_for_cancellation() else {
             return false;
         };
@@ -710,7 +713,7 @@ impl TurnControl {
             running_cancellations = self.running_cancellation_count(),
         );
         tracing::debug!(
-            duration_ms = started.elapsed().as_millis(),
+            duration_ms = instant_now().saturating_duration_since(started).as_millis(),
             queued_cancellations = self.queued_cancellation_count(),
             running_cancellations = self.running_cancellation_count(),
             "neutral turn cancellation signalled"
