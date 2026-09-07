@@ -4913,6 +4913,7 @@ pub(crate) mod tests {
         assert_eq!(response.provider_ids, vec![FAST_PROVIDER_ID.to_owned()]);
         assert!(response.cancelled);
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+        drop(state);
     }
 
     #[tokio::test]
@@ -4960,6 +4961,7 @@ pub(crate) mod tests {
             SessionSearchBackfillOutcome::Incomplete
         );
         assert!(response.sessions[0].error.is_none());
+        drop(state);
     }
 
     #[tokio::test]
@@ -5012,6 +5014,7 @@ pub(crate) mod tests {
         assert!(!response.deadline_reached);
         let error = response.sessions[0].error.as_ref().expect("cancel error");
         assert!(error.retryable);
+        drop(state);
     }
 
     #[tokio::test]
@@ -5077,6 +5080,7 @@ pub(crate) mod tests {
             Some(1),
             "a deferred session must not be re-attempted before its backoff elapses"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -5130,6 +5134,7 @@ pub(crate) mod tests {
                 provider.error.is_none(),
                 "session-local failure is retained"
             );
+            drop(state);
         }
     }
 
@@ -5193,6 +5198,7 @@ pub(crate) mod tests {
                 .contains("ahead of the canonical session tail")
         );
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+        drop(state);
     }
 
     #[tokio::test]
@@ -5254,6 +5260,7 @@ pub(crate) mod tests {
         assert_eq!(error.code, SearchErrorCode::MigrationRequired);
         assert!(!error.retryable);
         assert!(error.message.contains("explicit migration"));
+        drop(state);
     }
 
     #[tokio::test]
@@ -5344,6 +5351,7 @@ pub(crate) mod tests {
             .wait_for(|snapshot| snapshot.outcome.is_some())
             .await
             .expect("migration reaches terminal outcome");
+        drop(state);
     }
 
     #[tokio::test]
@@ -5393,6 +5401,7 @@ pub(crate) mod tests {
         assert!(error.retryable);
         assert!(error.message.contains("maintenance") || error.message.contains("owned"));
         drop(maintenance);
+        drop(state);
     }
 
     #[tokio::test]
@@ -5451,6 +5460,7 @@ pub(crate) mod tests {
         assert!(!response.selection_truncated);
         assert!(response.next_cursor.is_none());
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -5516,6 +5526,7 @@ pub(crate) mod tests {
             elapsed.as_micros(),
             (sessions * events) as u128 * 1_000_000 / elapsed.as_micros().max(1)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -5545,6 +5556,7 @@ pub(crate) mod tests {
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 2);
         assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -5737,6 +5749,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|event| event.sequence == appended.sequence)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -5756,6 +5769,7 @@ pub(crate) mod tests {
             SearchErrorCode::FutureVersion
         );
         assert!(!inventory.failures[0].error.retryable);
+        drop(state);
     }
 
     #[tokio::test]
@@ -5781,6 +5795,7 @@ pub(crate) mod tests {
             SearchErrorCode::FutureVersion
         );
         assert!(!inventory.failures[0].error.retryable);
+        drop(state);
     }
 
     #[tokio::test]
@@ -5815,6 +5830,7 @@ pub(crate) mod tests {
         }));
         assert!(!response.query_complete);
         assert!(!response.coverage_complete);
+        drop(state);
     }
 
     #[tokio::test]
@@ -5859,6 +5875,7 @@ pub(crate) mod tests {
         );
         assert!(!response.query_complete);
         assert!(!response.coverage_complete);
+        drop(state);
     }
 
     #[test]

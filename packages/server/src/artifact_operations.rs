@@ -100,5 +100,6 @@ mod tests {
             assert_eq!(error.code(), "invalid_artifact_range_length");
             assert_eq!(error.to_string(), error.message());
         }
+        drop(state);
     }
 }

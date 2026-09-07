@@ -321,8 +321,7 @@ mod tests {
             .expect("queue bridge request");
         drop(sender);
         let (complete, result) = tokio::sync::oneshot::channel::<u32>();
-        let driver = super::drive_service_bridge(&state, None, requests, result);
-        tokio::pin!(driver);
+        let mut driver = Box::pin(super::drive_service_bridge(&state, None, requests, result));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
         assert_eq!(
@@ -331,6 +330,7 @@ mod tests {
         );
         complete.send(42).expect("complete invocation");
         assert_eq!(driver.await.expect("invocation result"), 42);
+        drop(state);
     }
 
     #[tokio::test]
@@ -339,13 +339,13 @@ mod tests {
         let (bridge, requests) = crate::server_plugin_bridge();
         drop(bridge);
         let (complete, result) = tokio::sync::oneshot::channel::<u32>();
-        let driver = super::drive_service_bridge(&state, None, requests, result);
-        tokio::pin!(driver);
+        let mut driver = Box::pin(super::drive_service_bridge(&state, None, requests, result));
         let waker = std::task::Waker::noop();
         let mut context = std::task::Context::from_waker(waker);
         assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
         complete.send(42).expect("invocation still awaited");
         assert_eq!(driver.await.expect("invocation result"), 42);
+        drop(state);
     }
 
     #[tokio::test]
@@ -354,11 +354,11 @@ mod tests {
         let (bridge, requests) = crate::server_plugin_bridge();
         drop(bridge);
         let (complete, result) = tokio::sync::oneshot::channel::<u32>();
-        let driver = super::drive_service_bridge(&state, None, requests, result);
-        tokio::pin!(driver);
+        let mut driver = Box::pin(super::drive_service_bridge(&state, None, requests, result));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
         drop(complete);
         assert!(driver.await.is_err());
+        drop(state);
     }
 }

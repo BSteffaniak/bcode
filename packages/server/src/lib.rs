@@ -24752,8 +24752,13 @@ async fn execute_model_tool(
         ),
         call.id.clone(),
     );
-    let invoker =
-        ServerToolInvoker::new(state, session_id, &working_directory, cancel_state.as_ref());
+    // Destructuring avoids Clippy's early-drop false positive for this non-owning adapter.
+    let (invoker,) = (ServerToolInvoker::new(
+        state,
+        session_id,
+        &working_directory,
+        cancel_state.as_ref(),
+    ),);
     let result = invoker
         .invoke_tool(&tool, &invocation, &invocation_scope)
         .await
@@ -32873,6 +32878,8 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    // Destructured bindings below avoid significant_drop_tightening false positives on moved
+    // owners and non-owning adapters. Actual resource owners retain explicit teardown drops.
     #[test]
     fn workflow_run_view_collection_limit_bounds_outputs_and_attempts() {
         assert_eq!(workflow_operations::run_view_collection_limit(0), 0);
@@ -33041,6 +33048,7 @@ mod tests {
             bcode_ipc::SessionBulkMigrationState::Cancelled
         );
         assert_eq!(status.visited, 0);
+        drop(state);
     }
 
     #[tokio::test]
@@ -33492,6 +33500,7 @@ mod tests {
             directory_size(tantivy_root.path()),
             directory_size(compressed_root.path()),
         );
+        drop(state);
     }
 
     fn directory_size(path: &Path) -> u64 {
@@ -33636,6 +33645,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(second_facts, first_facts);
+        drop(state);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33721,6 +33731,7 @@ mod tests {
                 .iter()
                 .any(|event| event.sequence == appended.sequence)
         );
+        drop(state);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33797,6 +33808,7 @@ mod tests {
             provider.provider_id == "test.unavailable-session-search"
                 && provider.failed_sessions == 1
         }));
+        drop(state);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33851,6 +33863,7 @@ mod tests {
         let _ = cancel_session_search_backfill(&state, &started.operation_id)
             .await
             .expect("cancel backfill");
+        drop(state);
     }
 
     #[tokio::test]
@@ -33890,6 +33903,7 @@ mod tests {
         ] {
             assert_eq!(status.metrics.gauges.get(gauge), Some(&0), "{gauge}");
         }
+        drop(state);
     }
 
     #[tokio::test]
@@ -33942,6 +33956,7 @@ mod tests {
             .expect("terminal wait");
         assert_eq!(status.revision, 2);
         assert!(started.elapsed() < Duration::from_secs(1));
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -33964,13 +33979,15 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_ipc_backfill_operation_lifecycle_and_restart_loss_are_explicit() {
-        let _guard = session_search::tests::lock_search_tests().await;
-        let state = Arc::new(session_search::tests::state_with_providers(&[(
+    fn slow_backfill_test_state() -> Arc<ServerState> {
+        Arc::new(session_search::tests::state_with_providers(&[(
             "test.slow-session-search",
             session_search::tests::TestProviderBehavior::Slow,
-        )]));
+        )]))
+    }
+
+    #[cfg(unix)]
+    async fn create_ipc_backfill_session(state: &ServerState) -> SessionId {
         let session = state
             .sessions
             .create_session(Some("IPC backfill".to_owned()), test_working_directory())
@@ -33981,6 +33998,15 @@ mod tests {
             .append_context_compacted(session.id, "cancel through IPC".to_owned(), 0)
             .await
             .expect("append event");
+        session.id
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_ipc_backfill_operation_lifecycle_and_restart_loss_are_explicit() {
+        let _guard = session_search::tests::lock_search_tests().await;
+        let state = slow_backfill_test_state();
+        let session_id = create_ipc_backfill_session(&state).await;
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("first.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
@@ -33999,7 +34025,7 @@ mod tests {
             .session_search_complete_backfill_start(
                 bcode_session_search::CompleteSessionSearchBackfillRequest {
                     provider_id: Some("test.slow-session-search".to_owned()),
-                    session_ids: BTreeSet::from([session.id]),
+                    session_ids: BTreeSet::from([session_id]),
                     after_timestamp_ms: None,
                     before_timestamp_ms: None,
                     slice_deadline_ms: 5_000,
@@ -34077,6 +34103,7 @@ mod tests {
             "in-process operation notification state must not survive daemon restart"
         );
         restarted_server.abort();
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -34101,7 +34128,7 @@ mod tests {
             session_search::tests::TestProviderBehavior::Fast,
         )]));
         // Use the same persistent manager the daemon owns, while retaining its lease and DB handles.
-        let mut state = Arc::into_inner(state).expect("unshared test state");
+        let (mut state,) = (Arc::into_inner(state).expect("unshared test state"),);
         state.sessions = sessions.clone();
         let state = Arc::new(state);
         state.session_search_dirty.mark_committed(session.id).await;
@@ -34180,6 +34207,7 @@ mod tests {
         assert!(hydrated.is_empty());
 
         server.abort();
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -35404,6 +35432,7 @@ mod tests {
                 .expect("runs")
                 .is_empty()
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -35535,6 +35564,7 @@ mod tests {
             draft.document.source_digest_sha256().expect("draft digest"),
             created.canonical_digest_sha256
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -35648,6 +35678,7 @@ mod tests {
                 .expect("draft")
                 .is_none()
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -35731,7 +35762,7 @@ mod tests {
         let unavailable_store = bcode_workflow_store::WorkflowStore::open_at_path(&path)
             .expect("reopen workflow store");
         let unavailable_state = Arc::new(test_server_state(sessions));
-        let mut unavailable_state = Arc::try_unwrap(unavailable_state).expect("unique state");
+        let (mut unavailable_state,) = (Arc::try_unwrap(unavailable_state).expect("unique state"),);
         unavailable_state.workflow_store = StdMutex::new(unavailable_store);
         let unavailable_state = Arc::new(unavailable_state);
         let inspection = workflow_operations::revision_requirement_inspection(
@@ -35761,6 +35792,8 @@ mod tests {
             .expect("revision")
             .expect("revision");
         assert_eq!(before, after);
+        drop(unavailable_state);
+        drop(available_state);
     }
 
     #[tokio::test]
@@ -35869,6 +35902,7 @@ mod tests {
             )
             .is_err()
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -36144,6 +36178,7 @@ mod tests {
                 .active_revision,
             Some(2)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -36276,6 +36311,7 @@ mod tests {
                 .expect("runs")
                 .is_empty()
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -36376,6 +36412,7 @@ mod tests {
                 .len(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -36469,6 +36506,7 @@ mod tests {
         );
         assert!(store.list_runs(10).expect("runs").is_empty());
         drop(store);
+        drop(state);
     }
 
     #[test]
@@ -36946,6 +36984,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
         assert_eq!(state.idle_shutdown_blocker().await, None);
+        drop(state);
     }
 
     #[tokio::test]
@@ -36960,6 +36999,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("zero-client daemon should reach idle shutdown")
             .expect("shutdown channel");
+        drop(state);
     }
 
     #[tokio::test]
@@ -37005,6 +37045,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("idle watcher should request shutdown")
             .expect("shutdown channel");
+        drop(state);
     }
 
     #[test]
@@ -37354,18 +37395,21 @@ library = "test"
         NON_RETURNING_SEARCH_RELEASED.store(false, Ordering::SeqCst);
         NON_RETURNING_SEARCH_FINISHED.store(false, Ordering::SeqCst);
         let plugin = non_returning_search_provider_plugin();
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["test.non-returning-search-provider".to_string()]),
-                disabled: BTreeSet::new(),
-            },
-            &[plugin],
-        )
-        .expect("blocking search provider should load");
-        let mut state = test_server_state(SessionManager::default());
+        let (plugins,) = (
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from(["test.non-returning-search-provider".to_string()]),
+                    disabled: BTreeSet::new(),
+                },
+                &[plugin],
+            )
+            .expect("blocking search provider should load"),
+        );
+        let (mut state,) = (test_server_state(SessionManager::default()),);
         state.plugins = plugins;
         state.selected_provider_plugin_id = Some("test.non-returning-search-provider".to_string());
+        let task_state = Arc::new(state);
         let session_id = SessionId::new();
         let call = bcode_model::ToolCall {
             id: "search-call".to_string(),
@@ -37373,7 +37417,6 @@ library = "test"
             arguments: serde_json::Value::Null,
         };
         let cancel_state = Arc::new(TurnCancelState::default());
-        let task_state = Arc::new(state);
         let task_cancel = Arc::clone(&cancel_state);
         let task = tokio::spawn(async move {
             ServerServiceRouter::new(task_state.as_ref(), session_id, &call, task_cancel.as_ref())
@@ -37613,6 +37656,7 @@ library = "test"
         .expect_err("missing artifact must degrade explicitly");
         assert!(missing.contains("not found"));
         remove_session_artifact_dir(&artifact_root).expect("artifact cleanup");
+        drop(state);
     }
 
     #[tokio::test]
@@ -37825,7 +37869,12 @@ library = "test"
             arguments: serde_json::Value::Null,
         };
         let cancel_state = TurnCancelState::default();
-        let broker = ServerExchangeBroker::new(&state, session_id, &call, &cancel_state);
+        let (broker,) = (ServerExchangeBroker::new(
+            &state,
+            session_id,
+            &call,
+            &cancel_state,
+        ),);
         let resolution = broker
             .request(ToolExchangeRequest {
                 invocation_id: "other-call".to_string(),
@@ -37923,6 +37972,7 @@ library = "test"
                 .parallel,
             None
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -37981,6 +38031,7 @@ library = "test"
             "{:?}",
             completion.message
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -38038,6 +38089,7 @@ library = "test"
         .await;
 
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        drop(state);
     }
 
     #[test]
@@ -38087,6 +38139,7 @@ library = "test"
             ..ClientRuntimeContext::default()
         };
         assert!(server_operations::validate_client_effective_config(Some(&oversized)).is_err());
+        drop(state);
     }
 
     #[test]
@@ -38203,6 +38256,7 @@ library = "test"
             Some(ToolExchangeResolution::ConsumerDetached)
         );
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -38216,7 +38270,9 @@ library = "test"
         };
         let cancelled = TurnCancelState::default();
         cancelled.cancel().await;
-        let cancelled_broker = ServerExchangeBroker::new(&state, session_id, &call, &cancelled);
+        let (cancelled_broker,) = (ServerExchangeBroker::new(
+            &state, session_id, &call, &cancelled,
+        ),);
         assert_eq!(
             cancelled_broker
                 .request(ToolExchangeRequest {
@@ -38233,7 +38289,9 @@ library = "test"
         );
 
         let active = TurnCancelState::default();
-        let active_broker = ServerExchangeBroker::new(&state, session_id, &call, &active);
+        let (active_broker,) = (ServerExchangeBroker::new(
+            &state, session_id, &call, &active,
+        ),);
         assert_eq!(
             active_broker
                 .request(ToolExchangeRequest {
@@ -38477,6 +38535,7 @@ library = "test"
                 .is_empty()
         );
         remove_session_artifact_dir(&artifact_dir).expect("artifact cleanup");
+        drop(state);
     }
 
     #[tokio::test]
@@ -38603,6 +38662,7 @@ library = "test"
         assert!(finalized && finalized_event_seq.is_some());
         drop(registration);
         remove_session_artifact_dir(&artifact_dir).expect("cleanup");
+        drop(state);
     }
 
     #[tokio::test]
@@ -38670,6 +38730,7 @@ library = "test"
                 })
         ));
         remove_session_artifact_dir(&artifact_dir).expect("cleanup");
+        drop(state);
     }
 
     #[test]
@@ -39449,6 +39510,7 @@ library = "test"
             .strategy,
             AutomaticCompactionStrategy::ProviderManaged
         );
+        drop(after_restart);
     }
 
     #[tokio::test]
@@ -39530,6 +39592,7 @@ library = "test"
             supported_again.decision.strategy,
             AutomaticCompactionStrategy::ProviderManaged
         );
+        drop(state);
     }
 
     #[test]
@@ -39839,6 +39902,7 @@ library = "test"
             bcode_session_models::RequestContextTokenCount::ProviderExact(84)
         );
         assert_eq!(observation.local_estimate, attempt.local_estimate);
+        drop(state);
     }
 
     #[test]
@@ -40169,6 +40233,7 @@ library = "test"
             .expect_err("second active run should be rejected");
 
         assert!(error.contains("already has an active run"));
+        drop(state);
     }
 
     #[tokio::test]
@@ -40205,6 +40270,7 @@ library = "test"
             .expect("run should remain active while awaiting runner observation");
 
         assert!(active.cancel_requested);
+        drop(state);
     }
 
     #[test]
@@ -40360,6 +40426,7 @@ library = "test"
                     && *status == RuntimeWorkStatus::Completed
                     && message.as_deref() == Some("done")
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -40402,6 +40469,7 @@ library = "test"
                 && kind == "run_finished"
                 && message == "Ralph autonomous runner completed"
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -40468,6 +40536,7 @@ library = "test"
             "audit prompt should be persisted for post-work review"
         );
         let _ = std::fs::remove_dir_all(repo_root);
+        drop(state);
     }
 
     fn ralph_iteration_with_fingerprints(
@@ -40733,6 +40802,7 @@ library = "test"
                             && event.message.as_deref() == Some("awaiting external service")
                 ))
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -40829,6 +40899,7 @@ library = "test"
             active_tool_request_draft_snapshot_events(&state, session_id).len(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -40960,6 +41031,7 @@ library = "test"
                 .len(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -41055,6 +41127,7 @@ library = "test"
         assert_eq!(streamed_history, non_streamed_history);
         assert_eq!(streamed_history.len(), 3);
         assert!(active_tool_request_draft_snapshot_events(&state, streamed.id).is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -41108,6 +41181,7 @@ library = "test"
                 .get("server.live_state.request_draft_redacted_total"),
             Some(&1)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -41156,6 +41230,7 @@ library = "test"
                 assert!(encoded.contains("[REDACTED]"));
             }
         }
+        drop(state);
     }
 
     #[tokio::test]
@@ -41193,6 +41268,7 @@ library = "test"
                 .keys()
                 .all(|key| !key.contains("call-mutex") && !key.contains("bounded"))
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -41379,6 +41455,7 @@ library = "test"
             std::fs::read_to_string(root.path().join(session.id.to_string()).join("session.db"))
                 .unwrap_or_default();
         assert!(!persisted.contains(&secret));
+        drop(state);
     }
 
     #[tokio::test]
@@ -42794,6 +42871,7 @@ library = "test"
             request.provider_context.api_surface,
             Some(bcode_model::ModelApiSurface::Responses)
         );
+        drop(state);
     }
 
     #[test]
@@ -43129,7 +43207,7 @@ library = "test"
             )
             .await
             .expect("append trigger event");
-        let mut state = test_server_state_with_fake_provider(sessions);
+        let (mut state,) = (test_server_state_with_fake_provider(sessions),);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
         state
@@ -43239,6 +43317,7 @@ library = "test"
                 .count(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -43318,6 +43397,7 @@ library = "test"
                 .count(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -43949,6 +44029,7 @@ library = "test"
                 .is_none(),
             "a non-retryable decode error must not match the generic transient policy"
         );
+        drop(state);
     }
 
     #[test]
@@ -43972,6 +44053,7 @@ library = "test"
         assert!(should_retry_after_overload_error(&state, &error, 0));
         assert!(should_retry_after_overload_error(&state, &error, 1));
         assert!(!should_retry_after_overload_error(&state, &error, 2));
+        drop(state);
     }
 
     #[test]
@@ -44099,6 +44181,7 @@ library = "test"
             "custom.bcode.openai-compatible.upstream-retry-buffer-limit"
         );
         assert_eq!(policy.max_retries, None);
+        drop(state);
     }
 
     #[test]
@@ -44159,6 +44242,7 @@ library = "test"
             &unrelated_error,
             &selection
         ));
+        drop(state);
     }
 
     #[test]
@@ -44222,6 +44306,7 @@ library = "test"
             &unrelated_error,
             &selection
         ));
+        drop(state);
     }
 
     #[test]
@@ -44261,6 +44346,7 @@ library = "test"
             )
             .is_none()
         );
+        drop(state);
     }
 
     #[test]
@@ -44438,6 +44524,7 @@ library = "test"
             .id,
             "builtin.transient"
         );
+        drop(state);
     }
 
     #[test]
@@ -44491,6 +44578,7 @@ library = "test"
                 error.code
             );
         }
+        drop(state);
     }
 
     #[test]
@@ -44612,6 +44700,7 @@ library = "test"
             }) if message.contains("filesystem.write") && message.contains("4.0 KiB")
         ));
         assert!(outcome.provider_error.is_some());
+        drop(state);
     }
 
     #[tokio::test]
@@ -44715,6 +44804,7 @@ library = "test"
                 reason: bcode_session_models::ToolRequestDraftTerminalReason::Invalid
             }
         ));
+        drop(state);
     }
 
     #[test]
@@ -44779,6 +44869,7 @@ library = "test"
         assert_eq!(policy.initial_delay_ms, 1_000);
         assert_eq!(policy.max_delay_ms, 600_000);
         assert!(!policy.use_provider_retry_hint);
+        drop(state);
     }
 
     #[test]
@@ -44797,6 +44888,7 @@ library = "test"
             )
             .is_none()
         );
+        drop(state);
     }
 
     #[test]
@@ -44864,6 +44956,7 @@ library = "test"
         assert_eq!(policy.id, "custom.unsupported-content-type");
         assert_eq!(policy.max_retries, Some(2));
         assert_eq!(policy.initial_delay_ms, 500);
+        drop(state);
     }
 
     #[test]
@@ -44904,6 +44997,7 @@ library = "test"
             matching_provider_retry_policy(&state.model_retry, &error, &selection, &[], &[])
                 .is_none()
         );
+        drop(state);
     }
 
     #[test]
@@ -46353,6 +46447,7 @@ library = "test"
                 .map(|presentation| presentation.revision),
             Some(7)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -46420,6 +46515,7 @@ library = "test"
             assert_eq!(record.model_output, output);
             assert!(record.is_error);
             assert_eq!(record.presentation.as_ref(), Some(&update));
+            drop(state);
         }
     }
 
@@ -46484,6 +46580,7 @@ library = "test"
         );
         close_tool_presentation_update_scope(&state, second_session, "call-2");
         assert!(active_presentation_snapshot_events(&state, second_session).is_empty());
+        drop(state);
     }
 
     #[test]
@@ -46648,6 +46745,7 @@ library = "test"
                 .expect("computations")
                 .is_empty()
         );
+        drop(state);
     }
 
     #[test]
@@ -46706,6 +46804,7 @@ library = "test"
                 .is_none(),
             "authorization denial must occur before any store mutation"
         );
+        drop(state);
     }
 
     #[test]
@@ -46759,6 +46858,7 @@ library = "test"
                 )
                 .is_err()
         );
+        drop(state);
     }
 
     #[test]
@@ -46825,6 +46925,7 @@ library = "test"
             facts.actor.kind,
             bcode_workflow::WorkflowApplicationActorKind::LocalClient
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -47381,6 +47482,7 @@ library = "test"
             session_operations::create(&state, None, PathBuf::from("relative")).await,
             Err(session_operations::CreateSessionError::WorkingDirectoryMustBeAbsolute)
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -47451,6 +47553,7 @@ library = "test"
             ipc.id
         );
         server.abort();
+        drop(state);
     }
 
     fn assert_catalog_source_observations(
@@ -47538,6 +47641,7 @@ library = "test"
         drop(connection);
         let _ = shutdown.send(());
         server.await.expect("server shutdown");
+        drop(state);
     }
 
     async fn assert_native_catalog_refresh_completes(
@@ -47683,6 +47787,7 @@ library = "test"
         }
         server.abort();
         assert!(server.await.expect_err("server aborted").is_cancelled());
+        drop(state);
     }
 
     #[tokio::test]
@@ -47753,6 +47858,7 @@ library = "test"
             direct_around
         );
         server.abort();
+        drop(state);
     }
 
     #[test]
@@ -47825,6 +47931,7 @@ library = "test"
         assert!(
             !interaction_operations::resolve_permission(&state, "permission-1", true, false,).await
         );
+        drop(state);
     }
 
     async fn assert_invalid_resolutions_preserve_pending_exchange(
@@ -47982,6 +48089,7 @@ library = "test"
             ToolExchangeResolution::Failed { ref code, .. }
                 if code == "invocation_id_mismatch"
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -48152,6 +48260,7 @@ library = "test"
             operation.await.expect("join").expect("exchange operation"),
             ToolExchangeResolution::Cancelled
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -48224,6 +48333,7 @@ library = "test"
             ToolExchangeResolution::ConsumerDetached
         );
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -48312,6 +48422,7 @@ library = "test"
             ToolExchangeResolution::Cancelled
         );
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -48408,6 +48519,7 @@ library = "test"
             ToolExchangeResolution::Cancelled
         );
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -48476,6 +48588,7 @@ library = "test"
             .await
             .expect("duplicate resolution")
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -48509,6 +48622,7 @@ library = "test"
                 .contains_key("exchange-1")
         );
         assert_eq!(*resolution.lock().await, None);
+        drop(state);
     }
 
     #[test]
@@ -48596,6 +48710,7 @@ library = "test"
         assert_eq!(error.message(), "client configuration is invalid");
         assert!(!error.message().contains("secret-invalid-config"));
         assert!(state.client_runtime_context(client_id).await.is_none());
+        drop(state);
     }
 
     #[test]
@@ -48613,6 +48728,7 @@ library = "test"
         assert_eq!(error.code(), "invalid_client_metrics");
         assert_eq!(error.message(), "client metrics batch is invalid");
         assert!(!error.message().contains("secret.metric.name"));
+        drop(state);
     }
 
     #[tokio::test]
@@ -48661,6 +48777,7 @@ library = "test"
         let public = plugin_operations::normalize_error(&private);
         assert_eq!(public.code, "plugin_error");
         assert!(!public.message.contains("secret-provider-detail"));
+        drop(state);
     }
 
     #[tokio::test]
@@ -48702,6 +48819,7 @@ library = "test"
         }
         shutdown.send(()).expect("stop artifact listener");
         server.await.expect("artifact listener task");
+        drop(state);
     }
 
     #[tokio::test]
@@ -48745,6 +48863,7 @@ library = "test"
         assert_eq!(decoded, actual);
         shutdown.send(()).expect("stop diagnostics listener");
         server.await.expect("diagnostics listener task");
+        drop(state);
     }
 
     #[tokio::test]
@@ -48867,6 +48986,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("plugin test shutdown deadline")
             .expect("plugin test shutdown");
+        drop(state);
     }
 
     async fn assert_successful_plugin_service_parity(
@@ -49026,7 +49146,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SkillRegistryOptions::default(),
         )
         .expect("skill registry");
-        let mut state = test_server_state(SessionManager::default());
+        let (mut state,) = (test_server_state(SessionManager::default()),);
         state.skills = Some(registry);
         let state = Arc::new(state);
         let direct_skills = session_operations::list_skills(&state);
@@ -49087,6 +49207,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             direct_skills
         );
         server.abort();
+        drop(state);
     }
 
     #[tokio::test]
@@ -49132,6 +49253,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("guard drop should release");
+        drop(state);
     }
 
     #[tokio::test]
@@ -49259,6 +49381,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .is_some_and(|histogram| histogram.count >= 1)
         );
         migration_blocker.notify_one();
+        drop(state);
     }
 
     #[tokio::test]
@@ -49300,6 +49423,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .detach_session(session.id, client_id)
             .await
             .expect("detach");
+        drop(state);
     }
 
     #[tokio::test]
@@ -49658,6 +49782,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("dropping queued runtime should release guards");
+        drop(state);
     }
 
     #[tokio::test]
@@ -49901,6 +50026,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("dropping the admitted request should release ownership");
+        drop(state);
     }
 
     #[tokio::test]
@@ -50120,6 +50246,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             steering_receiver.try_recv(),
             Ok(SteeringCommand { text, .. }) if text == "steer before request"
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -50133,27 +50260,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("native search session")
             .id;
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from([
-                    "bcode.fake-provider".to_owned(),
-                    "bcode.web-search".to_owned(),
-                ]),
-                disabled: BTreeSet::new(),
-            },
-            &[
-                bcode_plugin::StaticBundledPlugin::new(
-                    include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                    bcode_fake_provider_plugin::static_plugin(),
-                ),
-                bcode_plugin::StaticBundledPlugin::new(
-                    include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
-                    bcode_web_search_plugin::static_plugin(),
-                ),
-            ],
-        )
-        .expect("load web-search and fake-provider plugins");
+        let (plugins,) = (
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from([
+                        "bcode.fake-provider".to_owned(),
+                        "bcode.web-search".to_owned(),
+                    ]),
+                    disabled: BTreeSet::new(),
+                },
+                &[
+                    bcode_plugin::StaticBundledPlugin::new(
+                        include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+                        bcode_fake_provider_plugin::static_plugin(),
+                    ),
+                    bcode_plugin::StaticBundledPlugin::new(
+                        include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
+                        bcode_web_search_plugin::static_plugin(),
+                    ),
+                ],
+            )
+            .expect("load web-search and fake-provider plugins"),
+        );
         let mut state = test_server_state(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         state.plugins = plugins;
@@ -50199,6 +50328,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(!response.is_error, "{}", response.output);
         assert!(response.output.contains("fake-native"));
         assert!(response.output.contains("Result for rust"));
+        drop(state);
     }
 
     #[tokio::test]
@@ -50224,7 +50354,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             arguments: serde_json::Value::Null,
         };
         let cancel_state = TurnCancelState::default();
-        let router = ServerServiceRouter::new(&state, session_id, &call, &cancel_state);
+        let (router,) = (ServerServiceRouter::new(
+            &state,
+            session_id,
+            &call,
+            &cancel_state,
+        ),);
         let resolution = router
             .invoke(ToolInvocationServiceRequest {
                 invocation_id: call.id.clone(),
@@ -50547,6 +50682,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await;
         assert!(late, "late sibling must inherit the latched batch decision");
         assert_eq!(state.pending_permissions.lock().await.len(), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -50616,6 +50752,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ToolInvocationResultRecorded { record }
                 if record.invocation_id == "permission-cancelled"
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -50732,6 +50869,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             2
         );
+        drop(state);
     }
 
     async fn wait_for_pending_permissions(
@@ -50905,6 +51043,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             std::fs::read(guarded_path).expect("guarded image bytes"),
             png_bytes
         );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -50964,6 +51103,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 bcode_session_models::ToolInvocationLifecycleStage::Completed,
             ]
         );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51059,6 +51199,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     && event.stage
                         == bcode_session_models::ToolInvocationLifecycleStage::Progress
         )));
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51144,6 +51285,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             && presentation.retention
                                 == bcode_tool::ToolPresentationRetention::RetainLatest)
         )));
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51233,6 +51375,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 bcode_session_models::ToolInvocationLifecycleStage::Failed,
             ]
         );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51322,6 +51465,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .active_invocations
                 .is_empty()
         );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51360,7 +51504,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let turn_scope = TurnScope::without_events("server-scope-cancel", TurnGeneration::new(1));
         let invocation_scope = InvocationScope::new(turn_scope, call.id.clone());
-        let invoker = ServerToolInvoker::new(&state, session_id, workspace.path(), &cancel_state);
+        let (invoker,) = (ServerToolInvoker::new(
+            &state,
+            session_id,
+            workspace.path(),
+            &cancel_state,
+        ),);
         let invoke = invoker.invoke_tool(&tool, &invocation, &invocation_scope);
         let cancel = async {
             loop {
@@ -51383,6 +51532,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("scope cancellation must close locally");
         assert!(matches!(response, Err(RuntimeError::Cancelled)));
         assert!(!cancel_state.is_cancelled());
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51465,6 +51615,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     && !record.is_error
                     && record.model_output.contains("entries")
         )));
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51481,7 +51632,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("canonical cancellation session")
             .id;
-        let mut state = test_server_state_with_shell_plugin(sessions);
+        let (mut state,) = (test_server_state_with_shell_plugin(sessions),);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         let state = Arc::new(state);
         let cancel_state = Arc::new(TurnCancelState::default());
@@ -51568,6 +51719,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
             ]
         );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -51585,7 +51737,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("parallel shell session");
         let session_id = summary.id;
-        let mut state = test_server_state_with_shell_plugin(sessions);
+        let (mut state,) = (test_server_state_with_shell_plugin(sessions),);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         state.startup_config.tools.execution.parallel = true;
         let state = Arc::new(state);
@@ -51787,6 +51939,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ]
             );
         }
+        drop(state);
     }
 
     async fn assert_current_session_writer_epoch(session_root: &Path, session_id: SessionId) {
@@ -52304,16 +52457,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("route history");
         }
-        let state = test_server_state_with_fake_provider(sessions);
-        state.session_model_selections.lock().await.insert(
-            session.id,
-            SessionModelSelection {
-                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
-                model_id: Some("fake-echo".to_owned()),
-                ..SessionModelSelection::default()
-            },
-        );
-        let state = Arc::new(state);
+        let state = {
+            let state = test_server_state_with_fake_provider(sessions);
+            state.session_model_selections.lock().await.insert(
+                session.id,
+                SessionModelSelection {
+                    provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                    model_id: Some("fake-echo".to_owned()),
+                    ..SessionModelSelection::default()
+                },
+            );
+            Arc::new(state)
+        };
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
@@ -52781,6 +52936,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(final_render.contains("web-route-message"));
         assert!(final_render.contains("load older history"));
         server.abort();
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -52904,6 +53060,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             );
         }
         server.abort();
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -53362,6 +53519,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(registration);
         drop(keeper);
         server.abort();
+        drop(state);
     }
 
     #[tokio::test]
@@ -53519,6 +53677,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
         drop(keeper);
         server.abort();
+        drop(state);
     }
 
     #[tokio::test]
@@ -53641,6 +53800,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
         drop(keeper);
         server.abort();
+        drop(state);
     }
 
     /// Explicit stack budget for the debug IPC fixture.
@@ -53856,6 +54016,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     && permission.approved == Some(true)
         )));
         server.abort();
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -53874,7 +54035,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session")
             .id;
         let artifact_dir = default_session_artifact_dir(session_id);
-        let mut state = test_server_state_with_shell_plugin(sessions);
+        let (mut state,) = (test_server_state_with_shell_plugin(sessions),);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         state.daemon_status.namespace = bcode_ipc::daemon_namespace();
         state.daemon_status.protocol_version = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
@@ -54055,6 +54216,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(!response.is_error, "{}", response.output);
         server.abort();
         remove_session_artifact_dir(&artifact_dir).expect("remove test artifacts");
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -54068,7 +54230,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("shell input session");
         let session_id = summary.id;
         let trace_dir = tempfile::tempdir().expect("shell trace dir");
-        let mut state = test_server_state_with_shell_plugin(sessions);
+        let (mut state,) = (test_server_state_with_shell_plugin(sessions),);
         state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
         let state = Arc::new(state);
         let call = bcode_model::ToolCall {
@@ -54178,6 +54340,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("active invocation registry")
                 .is_empty()
         );
+        drop(state);
     }
     fn test_server_state_with_question_plugin(sessions: SessionManager) -> ServerState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
@@ -54215,7 +54378,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("other session");
         let trace_dir = tempfile::tempdir().expect("question concurrency trace dir");
-        let mut state = test_server_state_with_question_plugin(sessions);
+        let (mut state,) = (test_server_state_with_question_plugin(sessions),);
         state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
         let state = Arc::new(state);
         state
@@ -54319,6 +54482,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("question task should join")
             .expect("question invocation should succeed");
         assert!(!response.is_error, "{}", response.output);
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -54341,7 +54505,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("assistant context event");
         let trace_dir = tempfile::tempdir().expect("question trace dir");
-        let mut state = test_server_state_with_question_plugin(sessions);
+        let (mut state,) = (test_server_state_with_question_plugin(sessions),);
         state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
         let state = Arc::new(state);
         state
@@ -54637,6 +54801,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     )
         )));
         server.abort();
+        drop(state);
     }
 
     fn registration_state_with_workflow_store(
@@ -54704,6 +54869,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             request_error_response(&error).code,
             "workflow_definition_unsupported"
         );
+        drop(state);
     }
 
     #[test]
@@ -55004,6 +55170,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             request_error_response(&error).code,
             "workflow_capability_unavailable"
         );
+        drop(state);
     }
 
     /// Typed prompt contract for workflow agent nodes in tests.
@@ -55262,6 +55429,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .effective_max_tool_rounds(),
             Some(2)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -55313,6 +55481,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some("client-alias")
         );
         assert_eq!(selection.provider_context, client_provider_context);
+        drop(state);
     }
 
     #[tokio::test]
@@ -55367,6 +55536,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             selection.provider_context.settings,
             user_provider_context.settings
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -55456,6 +55626,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .map(String::as_str),
             Some("secret-token")
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -55527,6 +55698,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             selection.provider_context, sticky_context,
             "foreign-provider client auth must not be overlaid onto a sticky selection"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -55589,6 +55761,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             selection.provider_context, sticky_context,
             "foreign-provider client auth must not be overlaid onto an auto-provider selection"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -55651,6 +55824,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .map(String::as_str),
             Some("secret-token")
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -55719,6 +55893,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             credential.map(|credential| credential.value),
             Some("secret-token".to_owned())
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -55769,6 +55944,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
 
         assert!(workflow_runtime_context(&state, session_id).await.is_none());
+        drop(state);
     }
 
     #[test]
@@ -55797,6 +55973,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|service| { service.interface_id == MODEL_PROVIDER_INTERFACE_ID })
         );
+        drop(state);
     }
 
     #[test]
@@ -55899,6 +56076,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|event| matches!(event, ProviderTurnEvent::TextDelta { .. }))
         );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -55906,15 +56084,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn precancelled_embedded_startup_skips_resource_acquisition() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().to_path_buf());
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::new(),
-                disabled: BTreeSet::new(),
-            },
-            &[],
-        )
-        .expect("empty plugin runtime");
+        let (plugins,) = (
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::new(),
+                    disabled: BTreeSet::new(),
+                },
+                &[],
+            )
+            .expect("empty plugin runtime"),
+        );
         let shutdown = bcode_agent_runtime::CancellationToken::new();
         shutdown.cancel();
         run_embedded_with_services_and_shutdown(
@@ -55944,15 +56124,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
             include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
             vtable,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.prompt-profile".to_owned()]),
-                disabled: BTreeSet::new(),
-            },
-            &[plugin],
-        )
-        .expect("load plugin");
+        let (plugins,) = (
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from(["bcode.prompt-profile".to_owned()]),
+                    disabled: BTreeSet::new(),
+                },
+                &[plugin],
+            )
+            .expect("load plugin"),
+        );
         let directory = tempfile::tempdir().expect("temporary directory");
         let shutdown = bcode_agent_runtime::CancellationToken::new();
         shutdown.cancel();
@@ -56115,6 +56297,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             apply_tool_description_profile(tools.clone(), &unmodified),
             tools
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -56170,6 +56353,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             tools
         );
         assert_eq!(absent.diagnostics.len(), 1);
+        drop(state);
     }
 
     /// Server state whose plugin host serves `bcode.agent-profile/v1`.
@@ -56400,8 +56584,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let mut state =
-            test_server_state_with_fake_provider_and_workflow_store(sessions, workflow_store);
+        let (mut state,) = (test_server_state_with_fake_provider_and_workflow_store(
+            sessions,
+            workflow_store,
+        ),);
         state
             .selected_provider_context
             .settings
@@ -56510,6 +56696,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 1
             );
         }
+        drop(state);
     }
 
     #[tokio::test]
@@ -56591,8 +56778,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let mut state =
-            test_server_state_with_fake_provider_and_workflow_store(sessions, workflow_store);
+        let (mut state,) = (test_server_state_with_fake_provider_and_workflow_store(
+            sessions,
+            workflow_store,
+        ),);
         state
             .selected_provider_context
             .settings
@@ -56670,6 +56859,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .pop()
             .expect("row");
         assert!(attempt.has_receipt);
+        drop(state);
     }
 
     #[tokio::test]
@@ -56724,6 +56914,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("activation session");
             assert_eq!(recovered.id, expected_session_id);
         }
+        drop(state);
     }
 
     #[tokio::test]
@@ -56848,6 +57039,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("missing lookup")
             .is_none()
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -56996,6 +57188,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         let parent_work = state.runtime_work.active_for_session(parent.id).await;
         assert!(parent_work.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -57369,6 +57562,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     "shared loop restoration must not create execution children"
                 );
             }
+            drop(state);
         }
     }
 
@@ -57502,6 +57696,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         assert!(!catalog.contains("model-disabled-skill"));
         assert!(!catalog.contains("config-disabled-skill"));
+        drop(state);
     }
 
     #[tokio::test]
@@ -57549,7 +57744,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
             created_at_ms: 1,
         };
-        let owner = WorkflowPromptTurnOwner { state: &state };
+        let (owner,) = (WorkflowPromptTurnOwner { state: &state },);
         let plan = owner
             .plan(&activation)
             .await
@@ -57758,6 +57953,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -57887,7 +58083,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("receipt");
             drop(store);
         }
-        let observer = WorkflowTurnReceiptObserver { state: &state };
+        let (observer,) = (WorkflowTurnReceiptObserver { state: &state },);
         let store_path = state
             .workflow_store
             .lock()
@@ -58060,7 +58256,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             store.path().to_path_buf()
         };
 
-        let observer = WorkflowTurnReceiptObserver { state: &state };
+        let (observer,) = (WorkflowTurnReceiptObserver { state: &state },);
         let mut store = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
             .expect("scheduler store");
         let summary = store
@@ -58361,6 +58557,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 assert_eq!(retried.attempt, 2);
                 assert_ne!(retried.dispatch_identity, prepared.dispatch_identity);
             }
+            drop(state);
         }
     }
 
@@ -58407,18 +58604,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut store =
             bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
                 .expect("store");
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.test-preparing-workflow-block".to_string()]),
-                disabled: BTreeSet::new(),
-            },
-            &[bcode_plugin::StaticBundledPlugin::new(
-                preparing_workflow_manifest(),
-                preparing_workflow_plugin(),
-            )],
-        )
-        .expect("plugins");
+        let (plugins,) = (
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from(["bcode.test-preparing-workflow-block".to_string()]),
+                    disabled: BTreeSet::new(),
+                },
+                &[bcode_plugin::StaticBundledPlugin::new(
+                    preparing_workflow_manifest(),
+                    preparing_workflow_plugin(),
+                )],
+            )
+            .expect("plugins"),
+        );
         let block = plugins
             .registry()
             .manifests()
@@ -58475,7 +58674,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let mut state = test_server_state(sessions);
+        let (mut state,) = (test_server_state(sessions),);
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(store);
         let state = Arc::new(state);
@@ -58518,6 +58717,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .is_empty(),
             "preparation cancellation must precede attempt admission"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -58621,19 +58821,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
-                disabled: BTreeSet::new(),
-            },
-            &[bcode_plugin::StaticBundledPlugin::new(
-                manifest_toml,
-                delayed_workflow_plugin(),
-            )],
-        )
-        .expect("plugins");
-        let mut state = test_server_state(sessions);
+        let (plugins,) = (
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
+                    disabled: BTreeSet::new(),
+                },
+                &[bcode_plugin::StaticBundledPlugin::new(
+                    manifest_toml,
+                    delayed_workflow_plugin(),
+                )],
+            )
+            .expect("plugins"),
+        );
+        let (mut state,) = (test_server_state(sessions),);
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(store);
         let state = Arc::new(state);
@@ -58644,7 +58846,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "delayed block".to_string(),
         )
         .await;
-        let owner = WorkflowActivationOwner { state: &state };
+        let (owner,) = (WorkflowActivationOwner { state: &state },);
         let store_path = state
             .workflow_store
             .lock()
@@ -58686,6 +58888,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ..
             }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -58789,19 +58992,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
-                disabled: BTreeSet::new(),
-            },
-            &[bcode_plugin::StaticBundledPlugin::new(
-                manifest_toml,
-                delayed_workflow_plugin(),
-            )],
-        )
-        .expect("plugins");
-        let mut state = test_server_state(sessions);
+        let (plugins,) = (
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
+                    disabled: BTreeSet::new(),
+                },
+                &[bcode_plugin::StaticBundledPlugin::new(
+                    manifest_toml,
+                    delayed_workflow_plugin(),
+                )],
+            )
+            .expect("plugins"),
+        );
+        let (mut state,) = (test_server_state(sessions),);
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(store);
         let state = Arc::new(state);
@@ -58848,6 +59053,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(attempts[1].attempt, 1);
         assert_eq!(attempts[1].status, "failed");
         assert_ne!(attempts[0].dispatch_identity, attempts[1].dispatch_identity);
+        drop(state);
     }
 
     #[tokio::test]
@@ -58977,6 +59183,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect_err("wrong preparation input");
         assert!(error.to_string().contains("owner or input checksum"));
+        drop(state);
     }
 
     #[test]
@@ -59050,7 +59257,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
-        let mut state = test_server_state_with_workflow_authorization(sessions, store);
+        let (mut state,) = (test_server_state_with_workflow_authorization(
+            sessions, store,
+        ),);
         state.selected_provider_plugin_id = Some("bcode.fake-provider".to_string());
         state.selected_model_id = Some("fake-echo".to_string());
         state.selected_provider_context.settings.insert(
@@ -59259,6 +59468,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             2
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -59273,7 +59483,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
-        let mut state = test_server_state_with_workflow_authorization(sessions, store);
+        let (mut state,) = (test_server_state_with_workflow_authorization(
+            sessions, store,
+        ),);
         state.selected_provider_plugin_id = Some("bcode.fake-provider".to_string());
         state.selected_model_id = Some("fake-echo".to_string());
         state.selected_provider_context.settings.insert(
@@ -59517,6 +59729,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .len(),
             4
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -59763,6 +59976,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
 
         assert!(workflow_receipt_belongs_to_foreign_daemon(&state, &request));
+        drop(state);
     }
 
     #[test]
@@ -60003,6 +60217,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_workflow_store::AttemptObservation::Failed { message }
                 if message.contains("workflow prompt output failed schema validation")
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -60127,6 +60342,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .status,
             bcode_workflow_store::RunStatus::Cancelled
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -60138,7 +60354,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .create_session(Some("workflow-parent".to_string()), PathBuf::from("."))
             .await
             .expect("parent");
-        let mut state = test_server_state_with_fake_provider(sessions);
+        let (mut state,) = (test_server_state_with_fake_provider(sessions),);
         state
             .selected_provider_context
             .settings
@@ -60237,7 +60453,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .path()
             .to_path_buf();
-        let owner = WorkflowPromptTurnOwner { state: &state };
+        let (owner,) = (WorkflowPromptTurnOwner { state: &state },);
         let summary = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
             .expect("scheduler")
             .dispatch_pending_activations(&owner, 10, 2)
@@ -60319,6 +60535,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             attempt.status.as_str(),
             "cancelling" | "cancelled"
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -60431,7 +60648,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "agent workflow".to_string(),
         )
         .await;
-        let owner = WorkflowPromptTurnOwner { state: &state };
+        let (owner,) = (WorkflowPromptTurnOwner { state: &state },);
         let store_path = state
             .workflow_store
             .lock()
@@ -60485,6 +60702,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 SessionEventKind::RuntimeWorkStarted { work_id, .. } if work_id == &run_work
             )
         }));
+        drop(state);
     }
 
     #[tokio::test]
@@ -60600,6 +60818,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             && *status == RuntimeWorkStatus::Completed
                 ))
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -60703,6 +60922,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             projected.is_empty(),
             "suspended work must leave the canonical active projection"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -60809,6 +61029,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .is_empty(),
             "restart must settle paused-run work inherited from a dead daemon"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -60896,6 +61117,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     } if started == &work_id
                 ))
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -61203,6 +61425,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(terminal.value, serde_json::json!(true));
         drop(stream);
         server.await.expect("server task");
+        drop(state);
     }
 
     #[tokio::test]
@@ -61361,6 +61584,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(terminal.value, serde_json::json!(true));
         drop(stream);
         server.await.expect("server task");
+        drop(state);
     }
 
     #[tokio::test]
@@ -61856,6 +62080,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("pinned start");
         assert_eq!(started.run.parent_session_generation, Some(generation));
+        drop(state);
     }
 
     #[tokio::test]
@@ -61943,6 +62168,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .status,
             bcode_workflow_store::RunStatus::Running
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -62024,6 +62250,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect_err("identity conflict");
         assert!(conflict.to_string().contains("identity conflicts"));
+        drop(state);
     }
 
     async fn receive_correlated_test_response(
@@ -62362,6 +62589,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("parent and node cancellation");
+        drop(state);
     }
 
     #[tokio::test]
@@ -62417,6 +62645,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("limited history");
         assert_eq!(limited, history[1..]);
+        drop(state);
     }
 
     #[tokio::test]
@@ -62464,6 +62693,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("minimum history");
         assert_eq!(latest.as_slice(), &history[maximum - 1..]);
+        drop(state);
     }
 
     #[tokio::test]
@@ -62568,6 +62798,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("test listener shutdown deadline")
             .expect("test listener shutdown");
+        drop(state);
     }
 
     async fn serve_runtime_test_clients(
@@ -63003,6 +63234,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("owner cancellation");
+        drop(state);
     }
 
     #[tokio::test]
@@ -63098,6 +63330,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         if permission_id == &permission.summary.permission_id && *approved
                 ))
         );
+        drop(state);
     }
 
     #[test]
@@ -63292,6 +63525,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .contains_key("model.provider.poll_idle_wait_duration_ms"),
             "push delivery must not accumulate poll idle wait"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -63369,6 +63603,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )),
             "the cancelled turn must reach a terminal persisted outcome"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -63416,6 +63651,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 manifest.id
             );
         }
+        drop(state);
     }
 
     #[tokio::test]
@@ -63474,6 +63710,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     )
                 })
                 .count();
+            drop(state);
             (completion.outcome, assistant_segments)
         }
 
@@ -63554,6 +63791,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             output.contains("pick relevant invariants"),
             "streamed selector must accumulate provider text: {output:?}"
         );
+        drop(runtime);
     }
 
     #[tokio::test]
@@ -63571,6 +63809,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             model_provider_push_route(&state, Some("bcode.absent-provider")).is_none(),
             "compaction must fall back to the poll contract for non-push providers"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -63582,6 +63821,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         assert_eq!(route.0, "bcode.fake-provider");
         assert_eq!(route.1, MODEL_PROVIDER_INTERFACE_ID_V3);
+        drop(state);
     }
 
     #[tokio::test]
@@ -63726,6 +63966,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         == bcode_session_models::ToolContributionOperation::Remove
         ));
         assert!(attachment.live_events.try_recv().is_err());
+        drop(state);
     }
 
     fn report_pending_live_workload(
@@ -64547,6 +64788,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             snapshot.gauges.get("server.live_state.active_bytes"),
             Some(&0)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -64690,6 +64932,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         == bcode_session_models::ToolContributionOperation::Remove
                     && envelope.contribution.sequence == 3
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -64826,6 +65069,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 },
             }]
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -64974,6 +65218,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 && event.stage == terminal_stage
                     ))
             );
+            drop(state);
         }
     }
 
@@ -65133,6 +65378,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .keys()
                 .all(|key| key.session_id != session.id)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -65265,6 +65511,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             metrics.gauges.get("server.live_state.active_bytes"),
             Some(&0)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -65318,6 +65565,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if finished == &work_id && *status == RuntimeWorkStatus::Completed
         )));
         assert!(!sessions.session_is_owned(session.id).await);
+        drop(state);
     }
 
     #[tokio::test]
@@ -65368,6 +65616,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("plugin guard drop should release");
+        drop(state);
     }
 
     #[tokio::test]
@@ -65427,6 +65676,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(registration);
         state.release_session_resources_if_idle(session.id).await;
         assert!(active_tool_request_draft_snapshot_events(&state, session.id).is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -65475,6 +65725,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|event| matches!(event.kind, SessionEventKind::ToolContributionPlaced { .. }))
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -65518,6 +65769,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             }
         });
         assert_eq!(producer_plugin_id, Some(&Some("test.plugin".to_owned())));
+        drop(state);
     }
 
     #[tokio::test]
@@ -65640,6 +65892,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(snapshots[0].request_id.is_some());
         assert!(snapshots[0].request_fingerprint.is_some());
         assert!(!snapshots[0].portable_summary.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -65783,6 +66036,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             event.sequence > trigger_event.sequence
                 && matches!(event.kind, SessionEventKind::AssistantMessage { .. })
         }));
+        drop(state);
     }
 
     #[tokio::test]
@@ -65884,6 +66138,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 )
         )));
         assert_eq!(permit.turn_entries, 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -66078,6 +66333,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("compaction should finish");
         assert!(started < finished, "phases: {compaction_phases:?}");
         assert_eq!(permit.turn_entries, 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -66246,6 +66502,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             1
         );
         assert_eq!(permit.turn_entries, 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -66348,6 +66605,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -66495,6 +66753,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -66576,6 +66835,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -66669,6 +66929,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .max()
                     .unwrap_or_default()
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -66768,6 +67029,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::TraceEvent { trace }
                 if trace.phase == SessionTracePhase::ModelProviderRoundStarted
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -66863,6 +67125,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -66951,6 +67214,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -67022,6 +67286,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             event.kind,
             SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -67097,6 +67362,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             event.kind,
             SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -67232,19 +67498,50 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|block| matches!(block, ContentBlock::ProviderExtension { .. }))
         }));
+        drop(state);
+    }
+
+    async fn append_compaction_test_turn(
+        state: &ServerState,
+        session_id: SessionId,
+        round: u32,
+        turn: u32,
+    ) {
+        state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: format!("round {round} user {turn}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("append user turn");
+        state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::AssistantMessage {
+                    text: format!("round {round} assistant {turn}"),
+                },
+            )
+            .await
+            .expect("append assistant turn");
     }
 
     #[tokio::test]
     async fn multiple_provider_native_compactions_advance_persisted_boundary() {
         let sessions = SessionManager::default();
-        let summary = sessions
+        let session_id = sessions
             .create_session(
                 Some("multiple compactions".to_owned()),
                 test_working_directory(),
             )
             .await
-            .expect("session should be created");
-        let session_id = summary.id;
+            .expect("session should be created")
+            .id;
         let mut state = test_server_state_with_fake_provider(sessions);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend =
@@ -67265,28 +67562,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         for round in 0..2 {
             for turn in 0..3 {
-                state
-                    .sessions
-                    .append_event(
-                        session_id,
-                        SessionEventKind::UserMessage {
-                            client_id: ClientId::new(),
-                            text: format!("round {round} user {turn}"),
-                            admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                        },
-                    )
-                    .await
-                    .expect("append user turn");
-                state
-                    .sessions
-                    .append_event(
-                        session_id,
-                        SessionEventKind::AssistantMessage {
-                            text: format!("round {round} assistant {turn}"),
-                        },
-                    )
-                    .await
-                    .expect("append assistant turn");
+                append_compaction_test_turn(&state, session_id, round, turn).await;
             }
             Box::pin(compact_session_context_with_limit(
                 &state,
@@ -67339,6 +67615,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ))
                 .map(|event| event.sequence)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -67408,6 +67685,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -67456,6 +67734,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 | SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[test]
@@ -67597,6 +67876,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -67772,6 +68052,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             1,
             "the workflow turn must have one terminal outcome: {history:#?}"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -67853,6 +68134,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )),
             "correction must be traced: {history:#?}"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -67939,6 +68221,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if matches!(&trace.payload, bcode_session_models::SessionTracePayload::ProviderEvent { event_type, .. }
                     if event_type == "structured_result_correction_exhausted")
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -68014,6 +68297,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|block| matches!(block, ContentBlock::Text { text } if text == &context))
         }));
+        drop(state);
     }
 
     #[tokio::test]
@@ -68057,6 +68341,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await;
 
         assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        drop(state);
     }
 
     #[tokio::test]
@@ -68186,6 +68471,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if feature.family == "structured_output"
                     && feature.execution == "tool_free_provider_round"
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -68284,6 +68570,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::SystemMessage { text }
                 if text.contains("auto compaction failed")
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -68382,6 +68669,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             1
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -68424,6 +68712,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -68501,6 +68790,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("parent completion should release ownership");
+        drop(state);
     }
 
     #[tokio::test]
@@ -68576,6 +68866,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             }
         });
         assert_eq!(producer_plugin_id, Some(&Some("test.plugin".to_owned())));
+        drop(state);
     }
 
     #[tokio::test]
@@ -68653,6 +68944,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         assert_eq!(record.model_output, canonical_result);
         assert!(serde_json::from_str::<serde_json::Value>(&record.model_output).is_ok());
+        drop(state);
     }
 
     #[tokio::test]
@@ -68732,6 +69024,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ContentBlock::ToolResult { result }
                 if matches!(result.content.as_slice(), [bcode_model::ToolResultContent::ImageRef { image }] if image.path == "/workspace/image.png")
         ))));
+        drop(state);
     }
 
     #[test]
@@ -69356,6 +69649,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 && item.content_bytes <= 4_096
         }));
         remove_session_artifact_dir(&root).expect("session cleanup");
+        drop(state);
     }
 
     #[tokio::test]
@@ -69506,6 +69800,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         assert_eq!(record.model_output, "model fallback text");
         assert_eq!(record.result, Some(semantic_result));
+        drop(state);
     }
 
     #[test]
@@ -69674,6 +69969,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             1
         );
+        drop(state);
     }
 
     #[test]
@@ -69823,6 +70119,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 strict: true,
             })
         );
+        drop(state);
     }
 
     #[test]
@@ -70118,7 +70415,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         };
         let cancel_state = Arc::new(TurnCancelState::default());
-        let coordinator = ServerAuthorizationCoordinator::new(
+        let (coordinator,) = (ServerAuthorizationCoordinator::new(
             &state,
             session.id,
             cancel_state.as_ref(),
@@ -70126,11 +70423,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::TurnToolPolicy::Enabled,
             bcode_session_models::TurnPermissionMode::Bypass,
             &agent_id,
-        );
+        ),);
         assert_eq!(
             coordinator.authorize_one(&request, None).await,
             ToolAuthorizationDecision::Allow
         );
+        let _ = coordinator;
         cancel_state.close();
 
         let result = execute_model_tool(
@@ -70156,6 +70454,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if event.invocation_id == "cancelled-bypass"
                     && event.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
         )));
+        drop(state);
     }
 
     #[tokio::test]
@@ -70176,6 +70475,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await;
 
         assert!(tools.is_empty());
+        drop(state);
     }
 
     #[tokio::test]
@@ -70223,7 +70523,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         };
         let cancel = TurnCancelState::default();
-        let bypass = ServerAuthorizationCoordinator::new(
+        let (bypass,) = (ServerAuthorizationCoordinator::new(
             &state,
             session.id,
             &cancel,
@@ -70231,7 +70531,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::TurnToolPolicy::Enabled,
             bcode_session_models::TurnPermissionMode::Bypass,
             "build",
-        );
+        ),);
         assert_eq!(
             bypass.authorize_one(&request, None).await,
             ToolAuthorizationDecision::Allow
@@ -70261,7 +70561,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .is_empty()
         );
 
-        let disabled = ServerAuthorizationCoordinator::new(
+        let (disabled,) = (ServerAuthorizationCoordinator::new(
             &state,
             session.id,
             &cancel,
@@ -70269,12 +70569,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::TurnToolPolicy::Disabled,
             bcode_session_models::TurnPermissionMode::Bypass,
             "build",
-        );
+        ),);
         assert!(matches!(
             disabled.authorize_one(&request, None).await,
             ToolAuthorizationDecision::Deny(reason) if reason.contains("read-only inspection policy")
         ));
-        let read_only = ServerAuthorizationCoordinator::new(
+        let (read_only,) = (ServerAuthorizationCoordinator::new(
             &state,
             session.id,
             &cancel,
@@ -70282,7 +70582,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::TurnToolPolicy::ReadOnly,
             bcode_session_models::TurnPermissionMode::Bypass,
             "build",
-        );
+        ),);
         assert!(matches!(
             read_only.authorize_one(&request, None).await,
             ToolAuthorizationDecision::Deny(reason) if reason.contains("read-only inspection policy")
@@ -70301,6 +70601,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bypass.authorize_one(&inline, None).await,
             ToolAuthorizationDecision::Deny(reason) if reason.contains("non-plugin tool")
         ));
+        let _ = read_only;
+        let _ = disabled;
+        let _ = bypass;
+        drop(state);
     }
 
     #[test]
@@ -70372,7 +70676,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         store.create_run(&new_run("run-1", 1)).expect("first run");
 
-        let mut state = test_server_state(SessionManager::default());
+        let (mut state,) = (test_server_state(SessionManager::default()),);
         state.workflow_store = StdMutex::new(store);
         let state = Arc::new(state);
 
@@ -70486,7 +70790,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn ingestion_startup_is_single_owner_and_shutdown_fenced() {
-        let mut state = test_server_state(SessionManager::default());
+        let (mut state,) = (test_server_state(SessionManager::default()),);
         state.session_search_enabled = false;
         let mut state = Arc::new(state);
         state.start_session_search_ingestion().await;
@@ -70524,6 +70828,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.start_session_search_ingestion().await;
         assert!(state.session_search_ingestion.lock().await.is_none());
         assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -70546,6 +70851,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             state.stop_catalog_workers().await,
             Err(ServerError::CatalogWorkerShutdown)
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -70564,6 +70870,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.start_catalog_event_forwarder().await;
         assert!(state.catalog_workers.lock().await.is_empty());
         assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -70573,6 +70880,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.start_catalog_event_forwarder().await;
         assert!(!state.catalog_events_started.load(Ordering::SeqCst));
         assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -70584,6 +70892,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("backfill exits after shutdown")
             .expect("backfill does not panic");
         assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -70597,6 +70906,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("backfill exits before processing")
             .expect("backfill does not panic");
         assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -70619,6 +70929,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .stop_workflow_event_forwarder()
             .await
             .expect("already stopped");
+        drop(state);
     }
 
     #[tokio::test]
@@ -70642,6 +70953,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ServerError::WorkflowEventForwarderShutdown.to_string(),
             "workflow event forwarding failed during shutdown"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -70665,6 +70977,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ServerError::SessionSearchIngestionShutdown.to_string(),
             "session search ingestion failed during shutdown"
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -70674,8 +70987,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let owned_resource = Arc::clone(&resource);
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         let worker = tokio::spawn(async move {
-            let _resource = owned_resource;
             let _ = released.await;
+            drop(owned_resource);
         });
         *state.session_search_ingestion.lock().await = Some(worker);
         state.request_shutdown();
@@ -70702,6 +71015,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .stop_session_search_ingestion()
             .await
             .expect("already stopped");
+        drop(state);
     }
 
     #[tokio::test]
@@ -70711,8 +71025,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let owned_resource = Arc::clone(&resource);
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         *state.idle_shutdown_worker.lock().await = Some(tokio::spawn(async move {
-            let _resource = owned_resource;
             let _ = released.await;
+            drop(owned_resource);
         }));
         state.request_shutdown();
         let mut wait = Box::pin(state.stop_idle_shutdown_watcher());
@@ -70753,6 +71067,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             state.stop_idle_shutdown_watcher().await,
             Err(ServerError::IdleWatcherShutdown)
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -70793,6 +71108,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await;
         assert!(state.idle_shutdown_worker.lock().await.is_none());
         assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -70804,6 +71120,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await;
         assert!(!state.idle_shutdown_started.load(Ordering::SeqCst));
         assert_eq!(Arc::strong_count(&state), 1);
+        drop(state);
     }
 
     #[tokio::test]
@@ -70817,8 +71134,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .lock()
             .await
             .push(tokio::spawn(async move {
-                let _resource = owned_resource;
                 let _ = released.await;
+                drop(owned_resource);
             }));
         state.request_shutdown();
         let mut wait = Box::pin(state.stop_catalog_workers());
@@ -70847,8 +71164,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let owned_resource = Arc::clone(&resource);
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         *state.workflow_event_forwarder.lock().await = Some(tokio::spawn(async move {
-            let _resource = owned_resource;
             let _ = released.await;
+            drop(owned_resource);
         }));
         state.request_shutdown();
         let mut wait = Box::pin(state.stop_workflow_event_forwarder());
@@ -70945,6 +71262,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             assert!(state.shutdown_requested.load(Ordering::SeqCst));
             assert!(LocalIpcStream::connect(&endpoint).await.is_err());
             drop(connection);
+            drop(state);
         }
     }
 
@@ -70958,7 +71276,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         options.disabled = false;
         options.base_url = format!("http://{}", listener.local_addr().expect("HTTP address"));
         options.cache_dir = directory.path().to_path_buf();
-        options.timeout = Duration::from_secs(60);
+        options.timeout = Duration::from_mins(1);
         let mut state = test_server_state(SessionManager::default());
         state.model_catalog =
             bcode_model_catalog::ModelCatalogResolver::new(options).expect("catalog resolver");
@@ -70982,6 +71300,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(diagnostics.last_refresh_success.is_none());
         assert!(diagnostics.last_refresh_error.is_none());
         drop(connection);
+        drop(state);
     }
 
     #[tokio::test]
@@ -71008,6 +71327,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let diagnostics = state.model_catalog.diagnostics().await;
         assert!(!diagnostics.refresh_in_progress);
         assert!(diagnostics.last_refresh_attempt.is_none());
+        drop(state);
     }
 
     #[tokio::test]
@@ -71039,6 +71359,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("server cleanup");
         shutdown.try_recv().expect("cleanup notifies subscribers");
         assert!(state.shutdown_requested.load(Ordering::SeqCst));
+        drop(state);
     }
 
     #[tokio::test]
@@ -71078,6 +71399,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             assert!(!state.idle_shutdown_started.load(Ordering::SeqCst));
             assert!(state.shutdown_requested.load(Ordering::SeqCst));
             assert!(LocalIpcStream::connect(&endpoint).await.is_err());
+            drop(state);
         }
     }
 
@@ -71089,9 +71411,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let owned_resource = Arc::clone(&resource);
         let (started, ready) = tokio::sync::oneshot::channel();
         let forwarder = tokio::spawn(async move {
-            let _resource = owned_resource;
             started.send(()).expect("ready receiver");
             std::future::pending::<()>().await;
+            drop(owned_resource);
         });
         ready.await.expect("forwarder started");
         state.register_client_forwarder(client_id, forwarder).await;
@@ -71105,6 +71427,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .contains_key(&client_id)
         );
         state.abort_client_forwarders(client_id).await;
+        drop(state);
     }
 
     #[tokio::test]
@@ -71120,6 +71443,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             early.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+        drop(state);
     }
 
     #[tokio::test]
@@ -71153,6 +71477,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("late handler");
         assert!(state.clients.lock().await.is_empty());
         drop(late_peer);
+        drop(state);
     }
 
     #[tokio::test]
@@ -71180,5 +71505,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("client cleanup");
         assert!(state.clients.lock().await.is_empty());
         drop(peer);
+        drop(state);
     }
 }
