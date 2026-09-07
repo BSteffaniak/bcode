@@ -1268,6 +1268,7 @@ mod tests {
         )
         .await
         .expect("question surface");
+        drop(plugin_runtime);
 
         assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
         assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());
@@ -1326,6 +1327,7 @@ mod tests {
         )
         .await
         .expect("open local question TUI surface");
+        drop(runtime);
 
         assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
         assert!(surface.handle_event(&key(KeyCode::Tab)).is_none());

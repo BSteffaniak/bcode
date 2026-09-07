@@ -705,6 +705,7 @@ fn transcript_selection_scene_reflows_without_changing_logical_source_ranges() {
 
     let narrow_layout = prepare_frame(&mut app, Rect::new(0, 0, 12, 10)).expect("narrow layout");
     let narrow = super::root_program::transcript_selection_scene(&app, narrow_layout.body());
+    drop(app);
     let narrow_ranges = narrow
         .fragments()
         .iter()
@@ -744,6 +745,7 @@ fn ephemeral_markdown_selection_scene_reflows_without_changing_source_ranges() {
 
     let narrow_layout = prepare_frame(&mut app, Rect::new(0, 0, 16, 10)).expect("narrow layout");
     let narrow = super::root_program::transcript_selection_scene(&app, narrow_layout.body());
+    drop(app);
     let narrow_ranges = narrow
         .fragments()
         .iter()
@@ -795,6 +797,7 @@ fn every_supported_ephemeral_notice_format_renders_visible_rows() {
 
     let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 40, 20));
     render(&mut app, &mut Frame::new(&mut buffer));
+    drop(app);
     let text = (0..20)
         .filter_map(|row| buffer.row_symbols(row))
         .collect::<Vec<_>>()
@@ -851,6 +854,7 @@ fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_re
         transcript_markdown_details_ids_for_items(&app, std::iter::once(&replacement), 24);
     app.reconcile_markdown_details(&replacement_ids);
     assert!(!app.markdown_details_open().contains_key(&details_id));
+    drop(app);
 }
 
 #[cfg(test)]
@@ -901,6 +905,7 @@ fn markdown_details_expand_and_collapse() {
 
     assert!(app.activate_markdown_contribution(&details_id));
     let collapsed = render_markdown(source, &markdown_render_options(&app, &item, 80));
+    drop(app);
     let collapsed_text = collapsed
         .lines
         .iter()
@@ -933,6 +938,7 @@ fn local_plain_markdown_and_json_system_notes_keep_distinct_formats() {
         app.transcript()[2].text_format(),
         bcode_session_view_models::TextFormat::Json
     );
+    drop(app);
 }
 
 #[cfg(test)]
@@ -978,6 +984,7 @@ fn ephemeral_markdown_link_produces_actionable_hit_region() {
     let layout = prepare_frame(&mut app, area).expect("frame layout");
 
     let regions = transcript_markdown_regions(&app, layout.body());
+    drop(app);
 
     assert!(regions.iter().any(|region| {
         matches!(
@@ -1001,6 +1008,7 @@ fn transcript_layout_and_semantics_share_one_markdown_projection() {
 
     assert!(std::sync::Arc::ptr_eq(&first, &second));
     assert_eq!(app.transcript_markdown_cache().render_count(), 1);
+    drop(app);
 }
 
 #[cfg(test)]
@@ -1020,6 +1028,7 @@ fn pure_scroll_reuses_markdown_projection_without_rendering() {
     assert!(app.scroll_transcript_up(4));
     prepare_frame(&mut app, area).expect("scrolled frame");
     assert_eq!(app.transcript_markdown_cache().render_count(), 1);
+    drop(app);
 }
 
 #[cfg(test)]
@@ -1032,6 +1041,7 @@ fn bottom_dock_never_overlaps_transcript_and_preserves_one_row() {
     let (layout, dock) =
         prepare_frame_with_bottom_dock(&mut app, terminal, 100).expect("frame layout");
     let transcript = transcript_area_for_body(&app, layout.body);
+    drop(app);
 
     assert_eq!(dock.height, normal_body_height.saturating_sub(1));
     assert_eq!(transcript.height, 1);
@@ -1072,6 +1082,7 @@ fn docked_frame_preserves_anchored_transcript_top_and_latest_indicator() {
 
     prepare_frame_with_bottom_dock(&mut app, terminal, 0).expect("restored frame");
     let restored_top = app.transcript_top_row(transcript_area_for_frame(&app, terminal).height);
+    drop(app);
     assert_eq!(restored_top, normal_top);
 }
 
@@ -1120,6 +1131,7 @@ async fn explanatory_assistant_context_remains_visible_above_question_dock() {
     )
     .await
     .expect("question surface");
+    drop(runtime);
     let terminal = Rect::new(0, 0, 64, 18);
     let preferred_height = surface.preferred_height(terminal.width);
     let (layout, dock) =
@@ -1158,6 +1170,7 @@ fn resolved_canvas_fills_the_normal_frame_without_opaque_terminal_native_fallbac
     let mut opaque_buffer = bmux_tui::buffer::Buffer::empty(area);
     let mut opaque_frame = Frame::new(&mut opaque_buffer);
     render(&mut opaque, &mut opaque_frame);
+    drop(opaque);
     assert_eq!(
         opaque_buffer
             .get(bmux_tui::geometry::Point::new(47, 7))
@@ -1170,6 +1183,7 @@ fn resolved_canvas_fills_the_normal_frame_without_opaque_terminal_native_fallbac
     let mut native_buffer = bmux_tui::buffer::Buffer::empty(area);
     let mut native_frame = Frame::new(&mut native_buffer);
     render(&mut native, &mut native_frame);
+    drop(native);
     assert!(
         native_buffer
             .get(bmux_tui::geometry::Point::new(47, 7))
@@ -1195,6 +1209,7 @@ fn bottom_dock_handles_short_narrow_and_resized_terminals() {
         assert!(dock.bottom() <= terminal.bottom());
         assert!(transcript.height >= 1 || layout.body.height == 0);
     }
+    drop(app);
 }
 
 #[cfg(test)]
@@ -1205,6 +1220,7 @@ fn zero_height_bottom_dock_preserves_normal_layout() {
     let normal = prepare_frame(&mut app, terminal).expect("normal frame layout");
     let (docked, dock) =
         prepare_frame_with_bottom_dock(&mut app, terminal, 0).expect("docked frame layout");
+    drop(app);
 
     assert_eq!(normal, docked);
     assert_eq!(dock.height, 0);
@@ -1500,6 +1516,7 @@ mod header_tests {
     fn header_shows_build_version_when_space_is_available() {
         let app = BmuxApp::new_with_history(None, &[], &[], false);
         let rendered = text(&header_spans(&app, 200, TuiTheme::for_app(&app)));
+        drop(app);
         assert!(rendered.contains("bcode"));
         assert!(rendered.contains(super::super::build_info().display_version()));
     }
@@ -1510,6 +1527,7 @@ mod header_tests {
         let rendered = text(&header_spans(&app, 50, TuiTheme::for_app(&app)));
         assert!(rendered.contains("bcode"));
         assert!(rendered.contains(app.display_agent_id()));
+        drop(app);
         assert!(!rendered.contains(super::super::build_info().display_version()));
         assert!(!rendered.ends_with(" · "));
     }

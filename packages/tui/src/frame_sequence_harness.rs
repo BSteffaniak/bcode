@@ -88,15 +88,17 @@ pub struct TranscriptFrameStep {
     pub input: TranscriptFrameInput,
 }
 
-pub struct TranscriptFrameSequence {
-    app: BmuxApp,
+/// Borrows the application under test; captured frames own their observations so
+/// callers can release plugin/runtime resources immediately after the sequence.
+pub struct TranscriptFrameSequence<'a> {
+    app: &'a mut BmuxApp,
     width: u16,
     height: u16,
     frames: Vec<TranscriptFrameSnapshot>,
 }
 
-impl TranscriptFrameSequence {
-    pub const fn new(app: BmuxApp, width: u16, height: u16) -> Self {
+impl<'a> TranscriptFrameSequence<'a> {
+    pub const fn new(app: &'a mut BmuxApp, width: u16, height: u16) -> Self {
         Self {
             app,
             width,
@@ -169,12 +171,12 @@ impl TranscriptFrameSequence {
             .cloned()
             .collect::<Vec<_>>();
         for item in &markdown_items {
-            let options = render::markdown_render_options(&self.app, item, self.width);
+            let options = render::markdown_render_options(self.app, item, self.width);
             self.app.transcript_markdown_cache().project(item, options);
         }
         let mut buffer = Buffer::empty(Rect::new(0, 0, self.width, self.height));
         let mut frame = Frame::new(&mut buffer);
-        render::render(&mut self.app, &mut frame);
+        render::render(self.app, &mut frame);
         let text = (0..buffer.area().height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()
@@ -185,7 +187,7 @@ impl TranscriptFrameSequence {
             .iter()
             .filter(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
             .all(|item| {
-                let options = render::markdown_render_options(&self.app, item, self.width);
+                let options = render::markdown_render_options(self.app, item, self.width);
                 self.app
                     .transcript_markdown_cache()
                     .get(item.id().get(), item.revision(), &options)
@@ -214,7 +216,7 @@ mod tests {
     #[test]
     fn ephemeral_notice_remains_between_durable_frames_after_resize() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(
+        let mut app = BmuxApp::new_with_history(
             Some(session_id),
             &[durable(
                 session_id,
@@ -226,7 +228,7 @@ mod tests {
             &[],
             false,
         );
-        let frames = TranscriptFrameSequence::new(app, 40, 10).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 40, 10).run([
             TranscriptFrameStep {
                 label: "local issue",
                 input: TranscriptFrameInput::EphemeralPlain("local issue".to_owned()),
@@ -246,6 +248,7 @@ mod tests {
                 input: TranscriptFrameInput::Resize(24, 8),
             },
         ]);
+        drop(app);
 
         let final_frame = frames.last().expect("last frame");
         assert_eq!(
@@ -305,7 +308,7 @@ mod tests {
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         assert!(!app.apply_presentation_config(bcode_config::PresentationConfig::default()));
         let accepted = "cancelled multi-paragraph output\n\nwith an exact final prefix";
-        let frames = TranscriptFrameSequence::new(app, 80, 24).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 24).run([
             TranscriptFrameStep {
                 label: "stream-start",
                 input: live_input(SessionLiveEvent {
@@ -344,6 +347,7 @@ mod tests {
                 input: TranscriptFrameInput::AssertNoPendingStreaming,
             },
         ]);
+        drop(app);
 
         assert_eq!(frames.len(), 3);
         assert!(!frames[0].text.contains("cancelled multi-paragraph output"));
@@ -370,7 +374,7 @@ mod tests {
         let session_id = SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         assert!(!app.apply_presentation_config(bcode_config::PresentationConfig::default()));
-        let frames = TranscriptFrameSequence::new(app, 80, 24).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 24).run([
             TranscriptFrameStep {
                 label: "stream-start",
                 input: live_input(SessionLiveEvent {
@@ -399,6 +403,7 @@ mod tests {
                 )),
             },
         ]);
+        drop(app);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].observation.semantic_items.len(), 1);
         assert_eq!(frames[1].observation.semantic_items.len(), 1);
@@ -424,8 +429,8 @@ mod tests {
     #[allow(clippy::too_many_lines)] // One scenario proves all per-frame observation dimensions together.
     fn frame_sequence_captures_semantic_terminal_damage_and_viewport_state() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([
             TranscriptFrameStep {
                 label: "initial",
                 input: TranscriptFrameInput::Observe,
@@ -485,6 +490,7 @@ mod tests {
                 }),
             },
         ]);
+        drop(app);
 
         assert_eq!(frames.len(), 4);
         assert!(frames[1].text.contains("hello"), "{}", frames[1].text);
@@ -532,7 +538,7 @@ mod tests {
     #[test]
     fn assistant_frames_preserve_every_accepted_cumulative_prefix() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let chunks = ["Leading ", "words and ", "trailing chars ✓"];
         let mut expected_offset = 0_usize;
         let steps = chunks.into_iter().enumerate().map(|(index, text)| {
@@ -565,7 +571,8 @@ mod tests {
             expected_offset = expected_offset.saturating_add(text.len());
             step
         });
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run(steps);
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run(steps);
+        drop(app);
         let mut expected = String::new();
         for (frame, chunk) in frames.iter().zip(chunks) {
             expected.push_str(chunk);
@@ -582,7 +589,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn markdown_stream_scroll_resize_and_terminal_projection_converge_exactly() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let first = format!("# Streaming report\n\n{}", "context row\n\n".repeat(24));
         let second = "- [x] retained projection\n- [ ] final convergence\n\n";
         let final_suffix = "[guide](https://example.com)\n";
@@ -625,7 +632,7 @@ mod tests {
                 },
             },
         });
-        let frames = TranscriptFrameSequence::new(app, 72, 14).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 72, 14).run([
             TranscriptFrameStep {
                 label: "first-formatted-projection",
                 input: update(1, 0, first),
@@ -651,6 +658,7 @@ mod tests {
                 input: terminal,
             },
         ]);
+        drop(app);
 
         assert!(frames[0].text.contains("context row"));
         for frame in &frames[1..] {
@@ -683,7 +691,7 @@ mod tests {
     #[test]
     fn structured_reasoning_is_visible_on_each_live_part_revision() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let update = |revision, expected_offset, text: &str| {
             TranscriptFrameStep {
             label: if revision == 1 {
@@ -715,10 +723,11 @@ mod tests {
             }),
         }
         };
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([
             update(1, 0, "Immediate reasoning"),
             update(2, 19, " continues"),
         ]);
+        drop(app);
         assert!(
             frames[0].text.contains("Immediate reasoning"),
             "{}",
@@ -745,7 +754,7 @@ mod tests {
     #[test]
     fn bedrock_raw_reasoning_streams_and_persists_in_drawn_frames() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let activity_id = "bedrock-messages-reasoning-0";
         let part_id = "raw-0";
         let delta = |label: &'static str, revision: u64, expected_offset: usize, text: &str| {
@@ -775,7 +784,7 @@ mod tests {
                 }),
             }
         };
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([
             delta("thinking-delta-1", 1, 0, "Solving for the ball price"),
             delta("thinking-delta-2", 2, 26, " algebraically"),
             // `content_block_stop` finishes the activity; readable text must remain.
@@ -795,6 +804,7 @@ mod tests {
                 }),
             },
         ]);
+        drop(app);
 
         assert!(
             frames[0].text.contains("Solving for the ball price"),
@@ -830,8 +840,8 @@ mod tests {
     #[test]
     fn replayed_durable_reasoning_renders_without_live_stream_state() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([TranscriptFrameStep {
             label: "durable-reasoning-replay",
             input: durable_input(SessionEvent {
                 schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -857,6 +867,7 @@ mod tests {
                 },
             }),
         }]);
+        drop(app);
 
         assert!(
             frames[0].text.contains("Replayed reasoning detail"),
@@ -872,8 +883,8 @@ mod tests {
     #[test]
     fn opaque_only_reasoning_renders_explanatory_chrome_in_drawn_frames() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([TranscriptFrameStep {
             label: "opaque-only-reasoning",
             input: durable_input(SessionEvent {
                 schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -893,6 +904,7 @@ mod tests {
                 },
             }),
         }]);
+        drop(app);
 
         assert!(
             frames[0].text.contains("did not return readable reasoning"),
@@ -939,10 +951,12 @@ mod tests {
         ] {
             let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
             app.set_reasoning_display_mode(mode);
-            let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
-                label: "reasoning-visible",
-                input: durable_input(reasoning.clone()),
-            }]);
+            let frames =
+                TranscriptFrameSequence::new(&mut app, 100, 40).run([TranscriptFrameStep {
+                    label: "reasoning-visible",
+                    input: durable_input(reasoning.clone()),
+                }]);
+            drop(app);
             assert!(
                 frames[0].text.contains("Raw chain of thought"),
                 "{mode:?} must draw raw reasoning: {}",
@@ -954,10 +968,11 @@ mod tests {
         let mut summary_app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         summary_app.set_reasoning_display_mode(bcode_config::TuiThinkingMode::Summary);
         let frames =
-            TranscriptFrameSequence::new(summary_app, 100, 40).run([TranscriptFrameStep {
+            TranscriptFrameSequence::new(&mut summary_app, 100, 40).run([TranscriptFrameStep {
                 label: "reasoning-filtered-by-summary-mode",
                 input: durable_input(reasoning.clone()),
             }]);
+        drop(summary_app);
         assert!(
             !frames[0].text.contains("Raw chain of thought"),
             "summary mode must not draw raw reasoning: {}",
@@ -972,10 +987,12 @@ mod tests {
         // `/thinking hide` removes the reasoning item entirely.
         let mut hidden_app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         hidden_app.set_reasoning_visible(false);
-        let frames = TranscriptFrameSequence::new(hidden_app, 100, 40).run([TranscriptFrameStep {
-            label: "reasoning-hidden",
-            input: durable_input(reasoning),
-        }]);
+        let frames =
+            TranscriptFrameSequence::new(&mut hidden_app, 100, 40).run([TranscriptFrameStep {
+                label: "reasoning-hidden",
+                input: durable_input(reasoning),
+            }]);
+        drop(hidden_app);
         assert!(
             !frames[0].text.contains("Raw chain of thought"),
             "hidden reasoning must not draw its text: {}",
@@ -1060,7 +1077,7 @@ mod tests {
                 },
             },
         );
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([
             TranscriptFrameStep {
                 label: "draft-first",
                 input: live_input(draft(1, "hello")),
@@ -1078,6 +1095,7 @@ mod tests {
                 input: durable_input(result),
             },
         ]);
+        drop(app);
         assert_no_forbidden_frames(&frames, |frame| {
             let raw_json = frame.text.contains(r#""contents":"hello""#);
             let blank = !frame.text.contains("src/lib.rs") && !frame.text.contains("hello");
@@ -1123,10 +1141,11 @@ mod tests {
             },
         ));
 
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([TranscriptFrameStep {
             label: "final-only",
             input: TranscriptFrameInput::Observe,
         }]);
+        drop(app);
         let frame = &frames[0];
         assert!(
             frame.text.contains("completed immediately"),
@@ -1153,7 +1172,7 @@ mod tests {
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         app.set_plugin_host(Arc::new(shell_plugin_host()));
         let preview = r#"{"command":"cargo check --workspace","cwd":"/tmp/project"}"#;
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([TranscriptFrameStep {
             label: "coalesced-shell-draft",
             input: live_input(SessionLiveEvent {
                 session_id,
@@ -1179,6 +1198,7 @@ mod tests {
                 },
             }),
         }]);
+        drop(app);
 
         assert!(
             frames[0].text.contains("cargo check --workspace"),
@@ -1205,7 +1225,7 @@ mod tests {
         let session_id = SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         app.set_plugin_host(Arc::new(shell_plugin_host()));
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([TranscriptFrameStep {
             label: "atomic-shell-request",
             input: durable_input(durable(
                 session_id,
@@ -1223,6 +1243,7 @@ mod tests {
                 },
             )),
         }]);
+        drop(app);
 
         assert!(frames[0].text.contains("❯ pwd"), "{}", frames[0].text);
         assert!(
@@ -1368,7 +1389,7 @@ mod tests {
             },
         );
 
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([
             draft(1, r#"{"command":"printf 'hello"#),
             draft(
                 2,
@@ -1385,6 +1406,7 @@ mod tests {
                 input: durable_input(result),
             },
         ]);
+        drop(app);
 
         assert!(
             frames[0].text.contains("printf 'hello"),
@@ -1462,7 +1484,7 @@ mod tests {
                 },
             }),
         };
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([
             TranscriptFrameStep {
                 label: "accepted",
                 input: durable_input(durable(
@@ -1496,6 +1518,7 @@ mod tests {
             },
             presentation(2, 128),
         ]);
+        drop(app);
 
         assert_eq!(frames.len(), 4);
         for frame in &frames {
@@ -1585,7 +1608,8 @@ mod tests {
                 },
             }),
         });
-        let frames = TranscriptFrameSequence::new(app, 80, 12).run(steps);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run(steps);
+        drop(app);
         let detached = &frames[frames.len() - 2].observation;
         let updated = &frames[frames.len() - 1].observation;
         assert_eq!(detached.scroll_mode, "manual_detached");
@@ -1601,7 +1625,7 @@ mod tests {
     #[test]
     fn history_prepend_preserves_detached_viewport_and_stable_anchor() {
         let session_id = SessionId::new();
-        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let mut steps = (0..24_u64)
             .map(|index| TranscriptFrameStep {
                 label: "newer-history-row",
@@ -1641,7 +1665,8 @@ mod tests {
                 has_more: false,
             },
         });
-        let frames = TranscriptFrameSequence::new(app, 80, 12).run(steps);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run(steps);
+        drop(app);
         let before = &frames[frames.len() - 2].observation;
         let after = &frames[frames.len() - 1].observation;
         assert_eq!(before.scroll_mode, "manual_detached");
@@ -1661,7 +1686,7 @@ mod tests {
         let turn_id = "turn-positioned";
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         app.set_plugin_host(Arc::new(filesystem_plugin_host()));
-        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+        let frames = TranscriptFrameSequence::new(&mut app, 100, 40).run([
             TranscriptFrameStep {
                 label: "assistant-position-2",
                 input: live_input(SessionLiveEvent {
@@ -1736,6 +1761,7 @@ mod tests {
                 }),
             },
         ]);
+        drop(app);
 
         let positions = |frame: &TranscriptFrameSnapshot| {
             frame
@@ -1782,7 +1808,7 @@ mod tests {
         let session_id = SessionId::new();
         let turn_id = "turn-barrier";
         let frames = TranscriptFrameSequence::new(
-            BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            &mut BmuxApp::new_with_history(Some(session_id), &[], &[], false),
             100,
             40,
         )
@@ -1967,7 +1993,7 @@ mod tests {
         }
 
         let frames = TranscriptFrameSequence::new(
-            BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            &mut BmuxApp::new_with_history(Some(session_id), &[], &[], false),
             100,
             40,
         )

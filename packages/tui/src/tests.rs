@@ -100,6 +100,7 @@ fn composer_submission_carries_launch_execution_defaults() {
         .expect("queued submit execution options");
     assert_eq!(execution.permission_mode, TurnPermissionMode::Bypass);
     assert_eq!(execution.tools, TurnToolPolicy::Disabled);
+    drop(chat);
 }
 
 #[test]
@@ -135,6 +136,7 @@ fn skill_invocation_carries_launch_execution_defaults() {
         .expect("queued skill execution options");
     assert_eq!(execution.permission_mode, TurnPermissionMode::Bypass);
     assert_eq!(execution.tools, TurnToolPolicy::Disabled);
+    drop(chat);
 }
 
 #[test]
@@ -148,6 +150,7 @@ fn execution_mode_indicator_remains_visible_with_transient_status() {
         Some("DANGER: PERMISSION BYPASS ACTIVE")
     );
     assert_eq!(app.status(), "starting daemon…");
+    drop(app);
 }
 
 fn context_occupancy(tokens: u64) -> bcode_session_models::RequestContextOccupancy {
@@ -523,6 +526,7 @@ fn theme_transition_curves_shape_midpoint_progress() {
         linear.animated_accent(target, started_at + Duration::from_millis(50)),
         bmux_tui::style::Color::Rgb(100, 58, 70)
     );
+    drop(linear);
 
     let mut ease_in = BmuxApp::new_with_history(None, &[], &[], false);
     ease_in.apply_tui_config(theme_transition_config(TuiAccentTransitionCurve::EaseIn));
@@ -534,6 +538,7 @@ fn theme_transition_curves_shape_midpoint_progress() {
         ease_in.animated_accent(target, started_at + Duration::from_millis(50)),
         bmux_tui::style::Color::Rgb(100, 102, 122)
     );
+    drop(ease_in);
 
     let mut ease_out = BmuxApp::new_with_history(None, &[], &[], false);
     ease_out.apply_tui_config(theme_transition_config(TuiAccentTransitionCurve::EaseOut));
@@ -545,6 +550,7 @@ fn theme_transition_curves_shape_midpoint_progress() {
         ease_out.animated_accent(target, started_at + Duration::from_millis(50)),
         bmux_tui::style::Color::Rgb(100, 15, 18)
     );
+    drop(ease_out);
 }
 
 #[test]
@@ -564,6 +570,7 @@ fn immediate_theme_transition_ignores_curve() {
         app.animated_accent(bmux_tui::style::Color::Rgb(1, 2, 3), Instant::now()),
         bmux_tui::style::Color::Rgb(1, 2, 3)
     );
+    drop(app);
 }
 
 #[test]
@@ -644,6 +651,7 @@ fn compaction_trace_lifecycle_preserves_status_and_ignores_diagnostics() {
     ));
     assert_eq!(app.activity(), &ActivityState::PreparingModelRequest);
     assert_eq!(app.status(), "existing notice");
+    drop(app);
 }
 
 #[test]
@@ -671,6 +679,7 @@ fn provider_tool_call_delta_trace_does_not_replace_status() {
     });
 
     assert_eq!(app.status(), "existing notice");
+    drop(app);
 }
 
 #[test]
@@ -757,6 +766,7 @@ fn model_turn_progress_uses_specific_activity_phases_without_overwriting_notices
         }
     );
     assert_eq!(app.status(), "existing notice");
+    drop(app);
 }
 
 #[test]
@@ -791,6 +801,7 @@ fn provider_tool_call_progress_status_formats_bytes() {
             detail: "assembling example.write arguments (1.5 KiB received)".to_owned(),
         }
     );
+    drop(app);
 }
 
 #[test]
@@ -815,6 +826,7 @@ fn live_provider_tool_call_progress_updates_status() {
             detail: "assembling example.write arguments (4.0 KiB received)".to_owned(),
         }
     );
+    drop(app);
 }
 
 #[test]
@@ -864,6 +876,7 @@ fn composer_expands_and_scrolls_when_input_exceeds_max_rows() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(buffer.row_symbols(12).unwrap().contains("Message"));
@@ -888,6 +901,7 @@ fn multiline_paste_preserves_line_breaks_in_composer() {
     app.paste_composer_text("first\nsecond\r\nthird\rfourth");
 
     assert_eq!(app.composer().text(), "first\nsecond\nthird\nfourth");
+    drop(app);
 }
 
 #[test]
@@ -903,6 +917,7 @@ fn escape_requires_double_tap_to_interrupt_without_exiting_chat() {
     assert_eq!(app.status(), "hit esc twice to cancel");
     assert_eq!(second.request, KeyRequest::Interrupt);
     assert!(!app.should_exit());
+    drop(app);
 }
 
 #[test]
@@ -930,6 +945,7 @@ fn multi_tap_key_activation_supports_three_taps() {
         &binding,
         now + Duration::from_millis(200),
     );
+    drop(app);
 
     assert_eq!(first, KeyActivationOutcome::Pending);
     assert_eq!(second, KeyActivationOutcome::Pending);
@@ -959,6 +975,7 @@ fn multi_tap_key_activation_resets_after_timeout() {
         &binding,
         now + Duration::from_millis(600),
     );
+    drop(app);
 
     assert_eq!(first, KeyActivationOutcome::Pending);
     assert_eq!(expired_second, KeyActivationOutcome::Pending);
@@ -972,6 +989,7 @@ fn other_key_resets_pending_multi_tap_activation() {
     let escape = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
     let tab = input::handle_key(&mut app, &keymap, key(KeyCode::Tab));
     let escape_again = input::handle_key(&mut app, &keymap, key(KeyCode::Escape));
+    drop(app);
 
     assert_eq!(escape.request, KeyRequest::None);
     assert_eq!(tab.request, KeyRequest::CycleAgent);
@@ -988,6 +1006,7 @@ fn immediate_key_activation_runs_without_pending_state() {
     );
 
     let outcome = app.activate_key_binding_for_test(BmuxScope::Chat, &binding, Instant::now());
+    drop(app);
 
     assert_eq!(
         outcome,
@@ -1003,6 +1022,7 @@ fn configured_interrupt_binding_stays_immediate() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
 
     let outcome = input::handle_key(&mut app, &keymap, ctrl_key('c'));
+    drop(app);
 
     assert_eq!(outcome.request, KeyRequest::Interrupt);
 }
@@ -1027,6 +1047,7 @@ fn configured_ctrl_enter_submits_while_enter_inserts_newline() {
     assert_eq!(app.composer().text(), "draft\n");
 
     let ctrl_enter = input::handle_key(&mut app, &keymap, ctrl_key_code(KeyCode::Enter));
+    drop(app);
     assert_eq!(
         ctrl_enter.request,
         KeyRequest::Submit {
@@ -1071,6 +1092,7 @@ fn shared_composer_control_inserts_text_and_rejects_command_modifiers() {
     );
     assert!(!command.redraw);
     assert_eq!(app.composer().text(), "cA");
+    drop(app);
 }
 
 #[test]
@@ -1090,6 +1112,7 @@ fn default_tab_requests_agent_cycle_in_chat_input() {
     assert_eq!(outcome.request, KeyRequest::CycleAgent);
     assert!(!matches!(outcome.request, KeyRequest::Submit { .. }));
     assert_eq!(app.composer().text(), "draft");
+    drop(app);
 }
 
 #[test]
@@ -1115,6 +1138,7 @@ fn default_shift_tab_requests_thinking_effort_cycle_in_chat_input() {
     assert!(outcome.redraw);
     assert_eq!(outcome.request, KeyRequest::CycleThinkingEffort);
     assert_eq!(app.composer().text(), "draft");
+    drop(app);
 }
 
 #[test]
@@ -1144,6 +1168,7 @@ fn agent_catalog_applies_configured_accent() {
 
     assert_eq!(app.current_agent_id(), "plan");
     assert_eq!(app.current_agent_accent(), Some("#6b7280"));
+    drop(app);
 }
 
 #[test]
@@ -1244,6 +1269,7 @@ fn ctrl_d_clears_input_before_exit() {
     assert!(app.composer().is_empty());
     assert!(second.redraw);
     assert!(app.should_exit());
+    drop(app);
 }
 
 #[test]
@@ -1256,6 +1282,7 @@ fn shift_arrows_extend_composer_selection() {
 
     assert!(outcome.redraw);
     assert_eq!(app.composer().selected_text(), Some("o".to_owned()));
+    drop(app);
 }
 
 #[test]
@@ -1281,6 +1308,7 @@ fn composer_mouse_drag_extends_selection() {
         bmux_tui_components::text_input::TextInputOutcome::Redraw
     ));
     assert_eq!(app.composer().selected_text(), Some("hello".to_owned()));
+    drop(app);
 }
 
 #[test]
@@ -1299,6 +1327,7 @@ fn composer_drag_beyond_visible_edge_scrolls_selection() {
     ));
     assert_eq!(app.composer_scroll_offset_for_render(), 1);
     assert_eq!(app.composer().selected_text(), Some("0\n1\n".to_owned()));
+    drop(app);
 }
 
 #[test]
@@ -1316,6 +1345,7 @@ fn composer_double_click_selects_word_and_triple_click_selects_all() {
         app.composer().selected_text(),
         Some("hello world".to_owned())
     );
+    drop(app);
 }
 
 #[test]
@@ -1350,6 +1380,7 @@ fn input_history_updates_status_and_restores_draft() {
     assert!(app.next_input_history());
     assert_eq!(app.composer().text(), "draft prompt");
     assert_eq!(app.status(), "draft restored");
+    drop(app);
 }
 
 #[test]
@@ -1361,6 +1392,7 @@ fn input_history_empty_and_not_browsing_update_status() {
 
     assert!(app.next_input_history());
     assert_eq!(app.status(), "not browsing input history");
+    drop(app);
 }
 
 #[test]
@@ -1379,6 +1411,7 @@ fn composer_edit_after_history_resets_navigation() {
     assert!(app.next_input_history());
 
     assert_eq!(app.status(), "not browsing input history");
+    drop(app);
 }
 
 #[test]
@@ -1426,6 +1459,7 @@ fn input_history_moves_within_multiline_entry_before_cycling() {
     assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Down)).redraw);
     assert!(app.composer().is_empty());
     assert_eq!(app.status(), "draft restored");
+    drop(app);
 }
 
 #[test]
@@ -1446,6 +1480,7 @@ fn input_history_restores_empty_draft_from_newest_entry_bottom() {
     assert!(input::handle_key(&mut app, &keymap, key(KeyCode::Down)).redraw);
     assert!(app.composer().is_empty());
     assert_eq!(app.status(), "draft restored");
+    drop(app);
 }
 
 #[test]
@@ -1474,6 +1509,7 @@ fn live_user_message_does_not_overwrite_saved_history_draft() {
 
     assert!(app.composer().is_empty());
     assert_eq!(app.status(), "draft restored");
+    drop(app);
 }
 
 #[test]
@@ -1496,6 +1532,7 @@ fn empty_and_slash_submissions_do_not_enter_input_history() {
     assert!(app.previous_input_history());
     assert_eq!(app.composer().text(), "real prompt");
     assert_eq!(app.status(), "input history 1/1");
+    drop(app);
 }
 
 #[test]
@@ -1524,6 +1561,7 @@ fn status_line_includes_scroll_offset_when_scrolled() {
     render::render(&mut app, &mut frame);
 
     assert_eq!(app.scroll_offset(), 1);
+    drop(app);
     assert!(rendered_text(&buffer).contains("1 rows from bottom"));
 }
 
@@ -1556,6 +1594,7 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert!(buffer.row_symbols(0).unwrap().contains("Canonical title"));
     assert!(!buffer.row_symbols(0).unwrap().contains("Untitled session"));
@@ -1611,6 +1650,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let header = buffer.row_symbols(0).unwrap();
 
     assert!(header.contains("bcode"));
@@ -1662,6 +1702,7 @@ fn adaptive_bcode_agent_accent_policy_is_intentional_across_variants() {
         theme_only.set_agent_metadata_hydrated(true);
         theme_only.set_current_agent("build", Some("#22d3ee".to_owned()));
         assert_eq!(theme_only.presented_theme().accent, configured_accent);
+        drop(theme_only);
 
         let mut agent_first = BmuxApp::new_with_history(None, &[], &[], false);
         agent_first.apply_tui_config(TuiConfig {
@@ -1680,6 +1721,7 @@ fn adaptive_bcode_agent_accent_policy_is_intentional_across_variants() {
             agent_first.presented_theme().accent,
             bmux_tui::style::Color::Rgb(34, 211, 238)
         );
+        drop(agent_first);
     }
 }
 
@@ -1693,6 +1735,7 @@ fn header_accent_color_tracks_arbitrary_selected_agent() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_eq!(
         buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg),
@@ -1711,6 +1754,7 @@ fn composer_border_accent_color_tracks_arbitrary_selected_agent() {
 
     render::render(&mut app, &mut frame);
     let border_y = app.composer_content_area().y.saturating_sub(1);
+    drop(app);
 
     assert_eq!(
         buffer
@@ -1731,6 +1775,7 @@ fn same_agent_gets_same_accent_across_chrome() {
     render::render(&mut app, &mut frame);
     let header_accent = buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg);
     let border_y = app.composer_content_area().y.saturating_sub(1);
+    drop(app);
     let composer_accent = buffer
         .get(Point::new(0, border_y))
         .and_then(|cell| cell.style.fg);
@@ -1747,6 +1792,7 @@ fn configured_agent_accent_overrides_fallback_color() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_eq!(
         buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg),
@@ -1763,6 +1809,7 @@ fn invalid_configured_agent_accent_falls_back_to_agent_color() {
     let mut fallback_buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut fallback_frame = Frame::new(&mut fallback_buffer);
     render::render(&mut fallback_app, &mut fallback_frame);
+    drop(fallback_app);
     let fallback_accent = fallback_buffer
         .get(Point::new(0, 0))
         .and_then(|cell| cell.style.fg);
@@ -1774,6 +1821,7 @@ fn invalid_configured_agent_accent_falls_back_to_agent_color() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_eq!(
         buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg),
@@ -1809,6 +1857,7 @@ fn live_session_rename_overrides_attach_summary_title() {
     ));
 
     assert_eq!(app.session_title(), Some("New title"));
+    drop(app);
 }
 
 #[test]
@@ -1880,6 +1929,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(
@@ -1917,6 +1967,7 @@ fn plugin_status_is_rendered_and_atomic_replacement_removes_stale_text() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 160, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
     assert!(!rendered_text(&buffer).contains("Plugin active"));
 }
 
@@ -1972,6 +2023,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(output.contains("512/128k 0%"), "{output}");
@@ -2003,6 +2055,7 @@ fn status_line_includes_unknown_context_before_spent_tokens() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(output.contains("—/— —%"), "{output}");
@@ -2019,6 +2072,7 @@ fn status_line_drops_low_priority_segments_in_narrow_panes() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(output.contains("ready"));
@@ -2036,6 +2090,7 @@ fn draft_agent_selection_updates_header() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert!(buffer.row_symbols(0).unwrap().contains("plan"));
     assert!(!buffer.row_symbols(0).unwrap().contains("agent plan"));
@@ -2076,6 +2131,7 @@ fn migration_stage_families_and_terminal_failure_render_through_status_chrome() 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 12));
         let mut frame = Frame::new(&mut buffer);
         render::render(&mut app, &mut frame);
+        drop(app);
         let output = rendered_text(&buffer);
         assert!(
             output.contains(&status),
@@ -2156,6 +2212,7 @@ fn migration_stage_families_and_terminal_failure_render_through_status_chrome() 
     let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut failed, &mut frame);
+    drop(failed);
     let output = rendered_text(&buffer);
     assert!(output.contains("Verifying retained backup"));
     assert!(output.contains("hash mismatch"));
@@ -2223,6 +2280,7 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
     super::session_flow::start_switch_session(&mut chat, session_id, request);
     assert_eq!(chat.opening_session_id(), Some(session_id));
     assert!(chat.pending_effects.has_open_session(session_id));
+    drop(chat);
 }
 
 #[tokio::test]
@@ -2326,6 +2384,7 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
     assert_eq!(chat.attachment.opening_anchor_sequence(), None);
     assert_eq!(chat.app.status(), "jumped to search result");
     assert!(chat.app.transcript_index_for_sequence(7).is_some());
+    drop(chat);
 }
 
 #[tokio::test]
@@ -2458,6 +2517,7 @@ async fn async_session_open_failure_clears_progress_and_remains_visible() {
     // A failed open must not leave a session-scoped identity the view cannot serve.
     assert_eq!(chat.attached_session_id(), None);
     assert_eq!(chat.viewing_session_id(), None);
+    drop(chat);
 }
 
 #[tokio::test]
@@ -2492,6 +2552,7 @@ async fn racing_session_open_result_does_not_capture_attachment() {
     // The in-flight open must remain authoritative rather than being cleared by a stale result.
     assert_eq!(chat.opening_session_id(), Some(opening_session_id));
     assert_eq!(chat.attached_session_id(), None);
+    drop(chat);
 }
 
 #[test]
@@ -2517,6 +2578,7 @@ fn detached_session_view_still_permits_session_scoped_dispatch() {
 
     chat.mark_attached(session_id);
     assert_eq!(chat.attached_session_id(), Some(session_id));
+    drop(chat);
 }
 
 #[test]
@@ -2540,6 +2602,7 @@ fn opening_session_view_defers_session_scoped_dispatch() {
     // Identity is known for presentation, but session-scoped work must wait for attachment.
     assert_eq!(chat.viewing_session_id(), Some(session_id));
     assert_eq!(chat.attached_session_id(), None);
+    drop(chat);
 }
 
 #[tokio::test]
@@ -2731,6 +2794,7 @@ fn pending_rich_markdown_finalizes_without_layout_drift_or_duplicate_content() {
         None,
         bcode_config::TuiDiffViewerConfig::default(),
     );
+    drop(app);
     assert_eq!(&pending_rows[1..], &finalized_rows[1..]);
 }
 
@@ -2746,6 +2810,7 @@ fn slash_pending_submission_clears_after_take() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 10));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(!output.contains("/plan"));
@@ -2765,6 +2830,7 @@ fn taken_pending_submission_can_be_restored_after_send_failure() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 10));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(!output.contains("[sending]"));
@@ -2832,6 +2898,7 @@ fn assistant_final_replaces_stream_when_usage_is_interleaved() {
     assert_eq!(assistant_items[0].text(), "Fixed.");
     assert!(!assistant_items[0].streaming());
     assert!(app.session_view_snapshot().runtime.latest_usage.is_some());
+    drop(app);
 }
 
 #[test]
@@ -2894,6 +2961,8 @@ fn reconstructed_rich_history_matches_equivalent_live_projection() {
         );
         assert_eq!(reconstructed_rows, live_rows);
     }
+    drop(reconstructed);
+    drop(live);
 }
 
 #[test]
@@ -2936,6 +3005,7 @@ fn history_rebuild_does_not_duplicate_initial_history() {
     assert_eq!(user_items[0].text(), "first");
     assert_eq!(assistant_items.len(), 1);
     assert_eq!(assistant_items[0].text(), "second");
+    drop(app);
 }
 
 #[test]
@@ -3020,6 +3090,7 @@ fn live_assistant_rich_markdown_updates_preserve_stream_and_final_layout() {
         None,
         bcode_config::TuiDiffViewerConfig::default(),
     );
+    drop(app);
     assert_eq!(streaming_body, finalized_rows[1..]);
 }
 
@@ -3052,6 +3123,7 @@ fn rich_markdown_resize_reflows_cached_rows_and_restores_wide_layout() {
     let mut restored_buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
     render::render(&mut app, &mut Frame::new(&mut restored_buffer));
     assert_eq!(app.transcript_layout().total_rows(), wide_rows);
+    drop(app);
     let restored_text = rendered_text(&restored_buffer);
     assert!(restored_text.contains("┌"));
     assert!(restored_text.contains("integration suite"));
@@ -3102,6 +3174,7 @@ fn live_event_overlapping_initial_history_is_ignored() {
         .collect::<Vec<_>>();
     assert_eq!(assistant_items.len(), 1);
     assert_eq!(assistant_items[0].text(), "answer");
+    drop(app);
 }
 
 #[test]
@@ -3131,6 +3204,7 @@ fn newer_live_event_after_initial_history_is_absorbed() {
             .iter()
             .any(|item| item.role() == "Assistant" && item.text() == "answer")
     );
+    drop(app);
 }
 
 #[test]
@@ -3186,6 +3260,7 @@ fn prepended_history_coalesces_assistant_deltas() {
             .count(),
         1
     );
+    drop(app);
 }
 
 #[test]
@@ -3225,6 +3300,7 @@ fn transcript_renders_compact_tool_blocks_without_raw_arguments() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(!output.contains("Tool · shell.run"));
@@ -3260,6 +3336,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(output.contains("tool filesystem_write"));
@@ -3344,6 +3421,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
     assert!(output.contains("finished"), "{output}");
     assert!(!output.contains("confirmation: edited src/lib.rs"));
@@ -3396,6 +3474,7 @@ fn denied_file_permission_marks_preview_failed() {
     let mut frame = Frame::new(&mut buffer);
 
     render::render(&mut app, &mut frame);
+    drop(app);
     let output = rendered_text(&buffer);
 
     assert!(!output.contains("File change preview · filesystem_edit"));
@@ -3547,6 +3626,7 @@ fn scroll_up_requests_older_history_only_after_top() {
 
     assert!(app.scroll_transcript_up(usize::MAX / 2));
     assert!(app.should_load_older_history());
+    drop(app);
 }
 
 #[test]
@@ -3573,6 +3653,7 @@ fn latest_bar_ignores_hidden_continuation_of_visible_message() {
     render::render(&mut app, &mut frame);
 
     assert!(!app.newer_transcript_content_below());
+    drop(app);
     assert!(!rendered_text(&buffer).contains("New messages below"));
 }
 
@@ -3602,6 +3683,7 @@ fn latest_bar_shows_for_distinct_hidden_entry_below_visible_message() {
     render::render(&mut app, &mut frame);
 
     assert!(app.newer_transcript_content_below());
+    drop(app);
     assert!(rendered_text(&buffer).contains("New messages below"));
 }
 
@@ -3632,6 +3714,7 @@ fn scroll_down_at_bottom_enters_virtual_space() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert!(rendered_text(&buffer).contains("4 rows below latest"));
     assert!(output_line_y(&buffer, "message 19").is_some_and(|y| y < 9));
@@ -3687,6 +3770,7 @@ fn appended_rows_consume_virtual_space_until_following_catches_up() {
 
     assert_eq!(app.bottom_overscroll(), 0);
     assert_eq!(app.scroll_offset(), 0);
+    drop(app);
 }
 
 #[test]
@@ -3721,6 +3805,7 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
     render::render(&mut app, &mut frame);
 
     assert!(app.bottom_overscroll() <= 4);
+    drop(app);
 }
 
 #[test]
@@ -3752,6 +3837,7 @@ fn manual_scroll_grace_prevents_virtual_space_catch_up() {
     render::render(&mut app, &mut frame);
 
     assert_eq!(app.bottom_overscroll(), 4);
+    drop(app);
 }
 
 #[test]
@@ -3785,6 +3871,7 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
     render::render(&mut app, &mut frame);
 
     assert_eq!(app.bottom_overscroll(), 4);
+    drop(app);
 }
 
 #[test]
@@ -3816,6 +3903,7 @@ fn staged_user_message_does_not_navigate_before_semantic_acceptance() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 }
@@ -3864,6 +3952,7 @@ fn user_submission_navigation_waits_for_accepted_semantic_message() {
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     render::render(&mut app, &mut Frame::new(&mut buffer));
+    drop(app);
 
     assert_eq!(output_line_y(&buffer, "You"), Some(1));
     assert!(rendered_text(&buffer).contains("accepted prompt"));
@@ -3910,6 +3999,7 @@ fn accepted_markdown_submission_preserves_submitted_user_message_transition() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_ne!(output_line_y(&buffer, "message 11"), Some(1));
 }
@@ -3941,6 +4031,7 @@ fn cleared_submission_does_not_anchor() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_ne!(output_line_y(&buffer, "message 11"), Some(1));
 }
@@ -3999,6 +4090,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert!(rendered_text(&buffer).contains("shell.run"));
     assert_eq!(output_line_y(&buffer, "You"), Some(1));
@@ -4057,6 +4149,7 @@ fn every_utf8_markdown_prefix_streams_without_source_loss() {
             .expect("assistant stream item after render");
         assert_eq!(assistant.text().as_bytes(), expected.as_bytes());
     }
+    drop(app);
     assert_eq!(expected, source);
 }
 
@@ -4116,6 +4209,7 @@ fn assistant_navigation_waits_for_first_nonempty_segment_content_and_runs_once()
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     render::render(&mut app, &mut Frame::new(&mut buffer));
     assert_eq!(app.assistant_stream_anchor_index(), Some(anchor_index));
+    drop(app);
     assert_eq!(output_line_y(&buffer, "Bcode …"), Some(initial_y));
 }
 
@@ -4159,6 +4253,7 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_eq!(output_line_y(&buffer, "Bcode …"), Some(initial_y));
 }
@@ -4211,6 +4306,7 @@ ninth"
     render::render(&mut app, &mut frame);
 
     assert!(app.manually_detached());
+    drop(app);
     assert!(output_line_y(&buffer, "Bcode …").is_some());
 }
 
@@ -4247,6 +4343,7 @@ fn streaming_assistant_response_does_not_anchor_when_scrolled_up() {
     render::render(&mut app, &mut frame);
 
     assert!(app.scroll_offset() > 0);
+    drop(app);
     assert_eq!(output_line_y(&buffer, "Bcode …"), None);
 }
 
@@ -4301,6 +4398,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
 
     assert!(rendered_text(&buffer).contains("shell.run"));
     assert_eq!(app.scroll_offset(), anchored_scroll_offset);
+    drop(app);
 }
 
 #[test]
@@ -4350,6 +4448,7 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
     render::render(&mut app, &mut frame);
 
     assert!(app.bottom_overscroll() > 0);
+    drop(app);
 }
 
 #[test]
@@ -4413,6 +4512,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert!(output_line_y(&buffer, "Bcode …").is_some());
 }
@@ -4528,6 +4628,7 @@ fn screenshot_scale_metadata_events_never_pollute_tool_frames_or_identity() {
         assert_eq!(matching.len(), 1, "one primary row per invocation");
         assert_eq!(matching[0].source_view_item_id(), Some(&source_id));
     }
+    drop(app);
 
     for (index, frame) in frames.iter().enumerate() {
         for forbidden in [
@@ -4582,6 +4683,7 @@ fn structural_insertions_preserve_stable_transcript_anchor() {
     render::render(&mut app, &mut Frame::new(&mut buffer));
 
     assert_eq!(app.stable_transcript_anchor(), Some(anchor_before));
+    drop(app);
 }
 
 #[test]
@@ -4657,6 +4759,7 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
         app.stable_transcript_anchor().map(|(id, _)| id),
         anchor_before.map(|(id, _)| id)
     );
+    drop(app);
 }
 
 #[test]
@@ -4702,6 +4805,7 @@ fn committed_user_echo_triggers_submitted_message_anchor_after_acceptance() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
+    drop(app);
 
     assert_eq!(output_line_y(&buffer, "You"), Some(1));
 }
@@ -4764,6 +4868,7 @@ fn file_change_artifact_live_renders_generic_tool_result() {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("duplicate write result")
     }));
+    drop(app);
 }
 
 fn file_change_semantic_result_events(
@@ -4894,6 +4999,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
         .iter()
         .filter(|item| matches!(item.kind(), TranscriptItemKind::ToolResult { .. }))
         .count();
+    drop(app);
 
     assert_eq!(terminal_count, 0);
     assert_eq!(tool_result_count, 1);
@@ -4959,6 +5065,7 @@ fn live_shell_result_replaces_request_block() {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("Shell run")
     }));
+    drop(app);
 }
 
 #[test]
@@ -5156,6 +5263,7 @@ fn shared_streaming_updates_remain_one_resident_terminal_item() {
     assert!(app.transcript()[0].streaming());
     assert!(app.transcript()[0].text().starts_with("0,1,2,"));
     assert!(app.transcript()[0].text().ends_with("1999,"));
+    drop(app);
 }
 
 #[test]
@@ -5200,6 +5308,7 @@ fn large_rich_history_remains_bounded_in_resident_events_rows_and_payload() {
     assert!(sync[0].entries_scanned <= app.transcript().len().saturating_add(1));
     assert!(sync[0].rows_regenerated <= app.transcript_layout().total_rows());
     assert!(app.has_older_history());
+    drop(app);
 }
 
 #[test]
@@ -5245,6 +5354,7 @@ fn transcript_resident_window_trims_live_bottom_following_turns() {
             .iter()
             .any(|item| item.text().contains("assistant 599"))
     );
+    drop(app);
 }
 
 #[test]
@@ -5291,6 +5401,7 @@ fn transcript_resident_window_trimming_preserves_ephemeral_notice_chronology() {
         .collect::<Vec<_>>();
     assert_eq!(transcript.first().copied(), Some("local issue"));
     assert_eq!(transcript.last().copied(), Some("assistant 599"));
+    drop(app);
 }
 
 #[test]
@@ -5331,6 +5442,7 @@ fn viewport_anchor_on_canonical_entry_survives_structural_insertion() {
         Some(anchor_before),
         "a canonical viewport anchor keeps its identity and row offset across insertion"
     );
+    drop(app);
 }
 
 #[test]
@@ -5389,6 +5501,7 @@ fn viewport_anchor_on_ephemeral_entry_survives_canonical_growth() {
         Some((notice_id, 0)),
         "an ephemeral viewport anchor stays on the same entry as canonical entries arrive"
     );
+    drop(app);
 }
 
 #[test]
@@ -5450,6 +5563,7 @@ fn latest_user_message_anchoring_targets_unified_document_order() {
         Some(expected_row),
         "latest-user-message anchoring resolves through unified visible order past the notice"
     );
+    drop(app);
 }
 
 /// End-to-end walkthrough of the original defect scenario through production entry points.
@@ -5697,6 +5811,7 @@ fn daemon_timeout_diagnostic_holds_its_chronological_place_through_the_whole_pro
         Some(diagnostic_id),
         "the preserved diagnostic keeps its stable presentation identity"
     );
+    drop(reattached);
 
     // Step 10: replace or trim the resident window and verify deterministic fallback placement.
     let mut trimmed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -5707,6 +5822,7 @@ fn daemon_timeout_diagnostic_holds_its_chronological_place_through_the_whole_pro
         vec![diagnostic_text, "much newer".to_owned()],
         "when its anchor leaves the window the diagnostic sorts before newer canonical entries"
     );
+    drop(trimmed);
 
     // Step 14: opening another session does not transfer the diagnostic.
     let other_session = SessionId::new();
@@ -5716,14 +5832,17 @@ fn daemon_timeout_diagnostic_holds_its_chronological_place_through_the_whole_pro
         visible(&other).is_empty(),
         "a different session inherits no process-local notice"
     );
+    drop(other);
 
     // Step 15: a new draft does not inherit session-specific notices.
     let mut draft = BmuxApp::new_with_history(None, &[], &[], false);
     draft.take_same_session_transcript_state_from(&app);
+    drop(app);
     assert!(
         visible(&draft).is_empty(),
         "a new draft inherits no process-local notice"
     );
+    drop(draft);
 
     // Step 16: reconstructing solely from canonical history does not recreate the diagnostic.
     let restarted = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
@@ -5784,6 +5903,7 @@ fn transcript_resident_window_does_not_trim_with_active_tool() {
     }
 
     assert!(app.resident_transcript_event_count() > 1_024);
+    drop(app);
 }
 
 #[test]
@@ -5832,6 +5952,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
 
     assert!(app.resident_transcript_event_count() <= 600);
     assert!(app.session_view_snapshot().tools.len() < 360);
+    drop(app);
 }
 
 #[test]
@@ -5856,6 +5977,7 @@ fn canonical_running_filesystem_write_renders_file_preview() {
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("Filesystem write"), "{rendered}");
     assert!(rendered.contains("fn generated() {}"), "{rendered}");
@@ -5885,6 +6007,7 @@ fn canonical_running_filesystem_edit_renders_diff() {
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("Filesystem edit"), "{rendered}");
     assert!(rendered.contains("before"), "{rendered}");
@@ -6014,6 +6137,7 @@ fn filesystem_read_and_grep_follow_resolved_bundled_themes() {
     assert!(app.apply_theme("nord"));
     let nord_read = filesystem_visual_source_colors(&app, "bcode.filesystem.read", &read);
     let nord_grep = filesystem_visual_source_colors(&app, "bcode.filesystem.grep", &grep);
+    drop(app);
     let nord_keyword = bmux_tui::style::Color::Rgb(129, 161, 193);
     let nord_function = bmux_tui::style::Color::Rgb(136, 192, 208);
     assert!(nord_read.contains(&nord_function));
@@ -6089,6 +6213,7 @@ fn live_filesystem_request_draft_append_events_render_distinct_progressive_frame
     assert!(second.contains("hello world"), "{second}");
     assert_ne!(first, second);
     assert_eq!(app.session_view_snapshot().transcript.items.len(), 1);
+    drop(app);
 }
 
 #[test]
@@ -6150,6 +6275,7 @@ fn live_filesystem_request_draft_renders_updates_and_retains_completed_handoff()
         46,
     ));
     let handed_off = render_app_text(&mut app);
+    drop(app);
     assert!(
         handed_off.contains("Filesystem write · assembling"),
         "{handed_off}"
@@ -6267,6 +6393,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
             .count(),
         1
     );
+    drop(app);
     assert_eq!(
         final_text
             .matches("Tool result · filesystem.write · ok")
@@ -6342,6 +6469,7 @@ fn live_filesystem_edit_request_draft_renders_progressive_diff_and_retains_compl
         65,
     ));
     let handed_off = render_app_text(&mut app);
+    drop(app);
     assert!(
         handed_off.contains("Filesystem edit · assembling"),
         "{handed_off}"
@@ -6441,6 +6569,7 @@ fn live_vim_frames_preserve_scroll_and_render_in_narrow_layout() {
         TranscriptItemKind::ToolContribution { contribution, .. }
             if contribution.payload["context"]["lines"][0] == "first narrow frame"
     )));
+    drop(app);
 }
 
 #[test]
@@ -6514,6 +6643,7 @@ fn live_vim_execution_frames_render_replace_in_place_and_remove() {
         serde_json::Value::Null,
     ));
     let removed = render_app_text(&mut app);
+    drop(app);
     assert!(!removed.contains("nvim live"), "{removed}");
     assert!(!removed.contains("second frame"), "{removed}");
 }
@@ -6584,6 +6714,7 @@ fn live_progress_contribution_renders_replaces_in_place_and_removes() {
         serde_json::Value::Null,
     ));
     let removed = render_app_text(&mut app);
+    drop(app);
     assert!(!removed.contains("Directory entries"), "{removed}");
     assert!(!removed.contains("two.txt"), "{removed}");
 }
@@ -6806,6 +6937,7 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
     responder.await.expect("artifact responder");
 
     let rendered = render_app_text(&mut app);
+    drop(app);
     assert!(rendered.contains("live red"), "{rendered}");
     assert_eq!(rendered.matches("live red").count(), 1, "{rendered}");
     assert!(!rendered.contains("printf red"), "{rendered}");
@@ -6834,6 +6966,7 @@ fn live_question_artifact_renders_outcome_from_raw_metadata() {
     ));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("Question outcome"), "{rendered}");
     assert!(rendered.contains("Proceed?"), "{rendered}");
@@ -6864,6 +6997,7 @@ fn replayed_question_artifact_renders_outcome_from_raw_metadata() {
     app.set_plugin_host(Arc::new(question_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("Question outcome"), "{rendered}");
     assert!(rendered.contains("Proceed?"), "{rendered}");
@@ -6894,6 +7028,7 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
     ));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("Shell run · duration 12ms"), "{rendered}");
     assert!(rendered.contains("exit code 0"), "{rendered}");
@@ -6924,6 +7059,7 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("Shell run · duration 12ms"), "{rendered}");
     assert!(rendered.contains("exit code 0"), "{rendered}");
@@ -6973,6 +7109,7 @@ fn replayed_legacy_shell_artifact_does_not_read_files_during_render() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(!rendered.contains("second"), "{rendered}");
     assert!(!rendered.contains("first"), "{rendered}");
@@ -7031,6 +7168,7 @@ fn canonical_generic_result_record_renders_filesystem_source_viewer() {
     ));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("File contents"), "{rendered}");
     assert!(rendered.contains("pub fn alpha() {}"), "{rendered}");
@@ -7085,6 +7223,7 @@ fn rich_stream_update_reuses_unaffected_markdown_layout_entry() {
         stable_row
     );
     let sync = app.transcript_layout_mut().drain_sync_stats();
+    drop(app);
     assert_eq!(sync.len(), 1);
     assert_eq!(sync[0].signatures_changed, 1);
     assert_eq!(sync[0].entries_rebuilt, 1);
@@ -7156,6 +7295,7 @@ fn compact_to_rich_request_reuses_unrelated_layout_entry() {
             .expect("retained sibling row"),
         sibling_row
     );
+    drop(app);
     assert!(rendered.contains("src/lib.rs"), "{rendered}");
     assert!(!rendered.contains("\"path\""), "{rendered}");
 }
@@ -7216,6 +7356,7 @@ fn durable_request_contribution_replaces_raw_arguments_and_survives_lifecycle() 
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("filesystem.read"), "{rendered}");
     assert!(rendered.contains("src/lib.rs"), "{rendered}");
@@ -7276,6 +7417,7 @@ fn filesystem_write_request_renders_from_contribution() {
             .count(),
         shared_request_count
     );
+    drop(app);
     assert!(rendered.contains("created from raw args"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
 }
@@ -7314,6 +7456,7 @@ fn historical_filesystem_change_request_renders_without_history_rewrite() {
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert_eq!(history, original);
     assert!(rendered.contains("src/lib.rs"), "{rendered}");
@@ -7358,6 +7501,7 @@ fn filesystem_edit_request_renders_from_contribution() {
     ));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("/tmp/raw-edit.txt"), "{rendered}");
     assert!(rendered.contains("old raw args"), "{rendered}");
@@ -7413,7 +7557,9 @@ fn same_raw_filesystem_events_render_same_live_and_replayed_tool_ui() {
     replayed_app.set_plugin_host(plugin_host);
 
     let live_rendered = render_app_text(&mut live_app);
+    drop(live_app);
     let replayed_rendered = render_app_text(&mut replayed_app);
+    drop(replayed_app);
 
     assert_eq!(
         rendered_tool_body(&live_rendered),
@@ -7461,6 +7607,7 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
     ));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
     assert!(rendered.contains("before"), "{rendered}");
@@ -7491,6 +7638,7 @@ fn final_filesystem_artifact_renders_without_stream_fallback() {
     ));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
     assert!(rendered.contains("after"), "{rendered}");
@@ -7522,6 +7670,7 @@ fn replayed_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("/tmp/hello.txt"), "{rendered}");
     assert!(rendered.contains("before"), "{rendered}");
@@ -7581,6 +7730,7 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
         "{rich_rendered}"
     );
     assert_eq!(&before, &app.session_view_snapshot().tools);
+    drop(app);
 }
 
 #[test]
@@ -7771,6 +7921,7 @@ fn thinking_label_uses_effective_values() {
         "display: all · request effort: medium · provider summary: detailed"
     );
     assert_eq!(app.model_header_label(), "default [medium]");
+    drop(app);
 }
 
 #[test]
@@ -8004,6 +8155,7 @@ fn canonical_running_shell_request_uses_owner_visual_adapter() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("❯ cargo check --workspace"), "{rendered}");
     assert!(
@@ -8054,6 +8206,7 @@ fn replayed_shell_request_uses_shell_request_contribution_renderer() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
 
     let rendered = render_app_text(&mut app);
+    drop(app);
 
     assert!(rendered.contains("❯ cargo check --workspace"), "{rendered}");
     assert!(

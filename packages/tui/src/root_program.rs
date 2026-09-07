@@ -2877,6 +2877,7 @@ mod tests {
 
         assert!(model.presentation_damage.is_full());
         assert!(!model.fast_temporal_presentation);
+        drop(model);
     }
 
     #[tokio::test]
@@ -2934,6 +2935,7 @@ mod tests {
                 cursor: newer_cursor,
             }
         ));
+        drop(model);
     }
 
     #[tokio::test]
@@ -3008,6 +3010,7 @@ mod tests {
                 .snapshot(&model.committed_selection)
                 .is_some()
         );
+        drop(model);
     }
 
     #[tokio::test]
@@ -3096,6 +3099,7 @@ mod tests {
                 .intersection(*highlight)
                 == *highlight
         }));
+        drop(model);
     }
 
     #[tokio::test]
@@ -3166,6 +3170,7 @@ mod tests {
             selected_cell.style.bg,
             model.chat.app.presented_theme().selection.bg
         );
+        drop(model);
     }
 
     #[tokio::test]
@@ -3234,6 +3239,7 @@ mod tests {
         );
         assert!(model.presentation_damage.is_full());
         assert!(!model.fast_temporal_presentation);
+        drop(model);
     }
 
     #[tokio::test]
@@ -3273,6 +3279,7 @@ mod tests {
             model.chat.app.status(),
             "copy failed: clipboard unavailable"
         );
+        drop(model);
     }
 
     #[test]
@@ -3402,6 +3409,7 @@ mod tests {
                 ))
                 .is_some()
         );
+        drop(model);
     }
 
     #[tokio::test]
@@ -3454,6 +3462,7 @@ mod tests {
             model.transcript_selection.phase(),
             bmux_tui::selection::SelectionGesturePhase::Dragging
         );
+        drop(model);
     }
 
     #[tokio::test]
@@ -3500,6 +3509,7 @@ mod tests {
             )),
             Some(super::super::invalidation::UiInvalidation::Paint)
         );
+        drop(model);
     }
 
     #[test]
@@ -3781,6 +3791,7 @@ mod tests {
             super::export_plain_transcript_selection(app.transcript(), &snapshot).as_deref(),
             Some("first\n\nlocal issue\n\nsecond")
         );
+        drop(app);
     }
 
     #[test]
@@ -4134,6 +4145,7 @@ mod tests {
             model.transcript_selection.phase(),
             bmux_tui::selection::SelectionGesturePhase::Idle
         );
+        drop(model);
     }
 
     fn root_filesystem_plugin_host() -> bcode_plugin::PluginHost {
@@ -4255,6 +4267,8 @@ mod tests {
         super::BcodeRuntimePresenter::new(&mut full_terminal)
             .present(&mut full_model)
             .expect("full status frame");
+        // Keep teardown (which can join workers) out of the paired frame captures.
+        drop((partial_model, full_model));
 
         assert_eq!(
             partial_terminal.retained_buffer(),
@@ -4325,6 +4339,7 @@ mod tests {
                 .present(&mut full_model)
                 .expect("cursor full frame presents");
         }
+        drop((partial_model, full_model));
 
         assert_eq!(
             partial_terminal.retained_buffer(),
@@ -4400,6 +4415,7 @@ mod tests {
                     .is_full()
             );
         }
+        drop(model);
     }
 
     #[test]
@@ -4799,6 +4815,7 @@ mod tests {
             )),
             None
         );
+        drop(model);
     }
 
     #[tokio::test]
@@ -4817,6 +4834,7 @@ mod tests {
 
         assert_eq!(model.chat.app.status(), "steady");
         assert!(!model.loop_state.has_interactive_surface());
+        drop(model);
     }
 
     #[tokio::test]
@@ -4908,6 +4926,7 @@ mod tests {
                 )
                 .expect("question matrix committed presentation");
             }
+            drop(model);
         }
 
         let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
@@ -4948,22 +4967,24 @@ mod tests {
             sequence: 1,
             text: "previous prompt".to_owned(),
         }];
-        let mut chat = root_test_chat_with_input_history(&history);
-        chat.app.replace_composer_with("draft prompt");
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let mut loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        loop_state.install_interactive_surface_for_test(
-            question_surface_for_root_test(settings.keymap()).await,
-        );
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let mut chat = root_test_chat_with_input_history(&history);
+            chat.app.replace_composer_with("draft prompt");
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let mut loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            loop_state.install_interactive_surface_for_test(
+                question_surface_for_root_test(settings.keymap()).await,
+            );
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
 
         let down = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
             key: bmux_keyboard::KeyCode::Down,
@@ -5005,6 +5026,7 @@ mod tests {
         let outcome = model
             .loop_state
             .handle_interactive_surface_event(&key(bmux_keyboard::KeyCode::Enter));
+        drop(model);
         let super::super::interactive_surface::InteractiveSurfaceEventOutcome::Resolved(
             bcode_session_models::ToolExchangeResolution::Responded { payload },
         ) = outcome
@@ -5058,26 +5080,28 @@ mod tests {
             sequence: 1,
             text: "previous prompt".to_owned(),
         }];
-        let mut chat = root_test_chat_with_input_history(&history);
-        chat.app.replace_composer_with("draft prompt");
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let mut loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        loop_state.install_interactive_surface_for_test(
-            super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
-                "test-interaction",
-                Box::new(ConsumingSurface),
-                settings.keymap(),
-            ),
-        );
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let mut chat = root_test_chat_with_input_history(&history);
+            chat.app.replace_composer_with("draft prompt");
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let mut loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            loop_state.install_interactive_surface_for_test(
+                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                    "test-interaction",
+                    Box::new(ConsumingSurface),
+                    settings.keymap(),
+                ),
+            );
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
         model.invalidation = super::super::invalidation::UiInvalidation::None;
 
         let _update = bmux_tui_runtime::Program::update(
@@ -5097,6 +5121,7 @@ mod tests {
             model.invalidation,
             super::super::invalidation::UiInvalidation::Paint
         );
+        drop(model);
     }
 
     #[tokio::test]
@@ -5201,6 +5226,7 @@ mod tests {
             &mut full,
         )
         .expect("full redraw");
+        drop((partial, full));
 
         assert_eq!(
             partial_terminal.retained_buffer(),
@@ -5286,6 +5312,8 @@ mod tests {
         assert!(short.fast_temporal_presentation);
         assert!(long.fast_temporal_presentation);
         assert_eq!(short.presentation_damage, long.presentation_damage);
+        drop(short);
+        drop(long);
     }
 
     #[tokio::test]
@@ -5365,6 +5393,7 @@ mod tests {
         let work_shape = model
             .loop_state
             .active_interactive_surface_work_shape_for_test();
+        drop(model);
         let summary = latency_summary(&samples);
         let draw_summary = latency_summary(&draw_samples);
         println!(
@@ -5521,6 +5550,7 @@ mod tests {
             changed_cells.push(report.changed_cells);
             full_repaints = full_repaints.saturating_add(usize::from(report.full_repaint));
         }
+        drop(model);
         let total = latency_summary(&total_samples);
         let draw = latency_summary(&draw_samples);
         let within_budget = total["p99_ms"].as_f64().expect("numeric p99")
@@ -5575,25 +5605,27 @@ mod tests {
             }
         }
 
-        let chat = root_test_chat();
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let mut loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        loop_state.install_interactive_surface_for_test(
-            super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
-                "redraw-interaction",
-                Box::new(RedrawSurface),
-                settings.keymap(),
-            ),
-        );
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let mut loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            loop_state.install_interactive_surface_for_test(
+                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                    "redraw-interaction",
+                    Box::new(RedrawSurface),
+                    settings.keymap(),
+                ),
+            );
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
         bmux_tui_runtime::Program::update(
             &mut model,
             bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
@@ -5607,45 +5639,51 @@ mod tests {
 
         assert!(model.presentation_damage.is_full());
         assert!(!model.fast_temporal_presentation);
+        drop(model);
     }
 
     #[tokio::test]
     async fn root_submission_queues_runtime_effect_work() {
-        let mut chat = root_test_chat();
-        chat.app.replace_composer_with("hello root runtime");
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let mut chat = root_test_chat();
+            chat.app.replace_composer_with("hello root runtime");
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
         model.chat.app.stage_submission();
 
         model.stage_root_submission(bcode_ipc::PromptPlacement::Steering);
 
         assert_eq!(model.chat.queued_effect_count(), 1);
         assert_eq!(model.chat.app.composer().text(), "");
+        drop(model);
     }
 
     #[tokio::test]
     async fn root_screen_tracks_owned_routes_and_returns_to_chat() {
-        let chat = root_test_chat();
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
 
         model.loop_state.open_command_palette(&mut model.chat);
         assert!(model.synchronize_screen().needs_render());
@@ -5657,22 +5695,25 @@ mod tests {
         });
         let _damage = model.route_terminal_event(escape);
         assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
+        drop(model);
     }
 
     #[tokio::test]
     async fn root_session_picker_is_a_retained_route_and_escape_returns_to_chat() {
-        let chat = root_test_chat();
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
 
         model.loop_state.open_session_picker(&mut model.chat);
         assert!(model.synchronize_screen().needs_render());
@@ -5685,6 +5726,7 @@ mod tests {
 
         assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
         assert!(!model.loop_state.has_session_picker());
+        drop(model);
     }
 
     #[tokio::test]
@@ -5819,20 +5861,21 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn managed_runtime_commits_progressive_filesystem_write_frames_without_external_wakeup() {
         let session_id = bcode_session_models::SessionId::new();
-        let mut model = root_test_model();
-        model.chat.mark_attached(session_id);
-        model.chat.app =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        model
-            .chat
-            .app
-            .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
-        let config = bmux_tui_runtime::RuntimeConfig {
-            frame_interval: None,
-            ..bmux_tui_runtime::RuntimeConfig::default()
+        let (runtime, handle) = {
+            let mut model = root_test_model();
+            model.chat.mark_attached(session_id);
+            model.chat.app =
+                super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+            model
+                .chat
+                .app
+                .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
+            let config = bmux_tui_runtime::RuntimeConfig {
+                frame_interval: None,
+                ..bmux_tui_runtime::RuntimeConfig::default()
+            };
+            bmux_tui_runtime::Runtime::new(model, RecordingRootPresenter::new(), config)
         };
-        let (runtime, handle) =
-            bmux_tui_runtime::Runtime::new(model, RecordingRootPresenter::new(), config);
         let draft = |revision, text: &str| {
             super::super::history_flow::SessionStreamUpdate::Event(Box::new(
                 bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
@@ -5990,28 +6033,31 @@ mod tests {
             "invocation identity changed across frames"
         );
         assert_eq!(output.stats.frames_presented, 5);
+        drop(output);
     }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn managed_runtime_commits_progressive_filesystem_edit_frames_without_external_wakeup() {
         let session_id = bcode_session_models::SessionId::new();
-        let mut model = root_test_model();
-        model.chat.mark_attached(session_id);
-        model.chat.app =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        model
-            .chat
-            .app
-            .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
-        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
-            model,
-            RecordingRootPresenter::new(),
-            bmux_tui_runtime::RuntimeConfig {
-                frame_interval: None,
-                ..bmux_tui_runtime::RuntimeConfig::default()
-            },
-        );
+        let (runtime, handle) = {
+            let mut model = root_test_model();
+            model.chat.mark_attached(session_id);
+            model.chat.app =
+                super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+            model
+                .chat
+                .app
+                .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
+            bmux_tui_runtime::Runtime::new(
+                model,
+                RecordingRootPresenter::new(),
+                bmux_tui_runtime::RuntimeConfig {
+                    frame_interval: None,
+                    ..bmux_tui_runtime::RuntimeConfig::default()
+                },
+            )
+        };
         let draft = |revision, operation, argument_bytes| {
             super::super::history_flow::SessionStreamUpdate::Event(Box::new(
                 bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
@@ -6204,27 +6250,16 @@ mod tests {
             "invocation identity changed across frames"
         );
         assert_eq!(output.stats.frames_presented, 8);
+        drop(output);
     }
 
     #[tokio::test]
     async fn root_request_draft_handoff_waits_for_committed_paint() {
         let session_id = bcode_session_models::SessionId::new();
-        let mut chat = root_test_chat();
-        chat.mark_attached(session_id);
-        chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let mut model = super::BcodeRuntimeModel::new(
-            chat,
-            settings,
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false),
-        );
+        let mut model = root_test_model();
+        model.chat.mark_attached(session_id);
+        model.chat.app =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let draft = |revision, text: &str| {
             super::super::history_flow::SessionStreamUpdate::Event(Box::new(
                 bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
@@ -6312,20 +6347,22 @@ mod tests {
             }
         }
 
-        let chat = root_test_chat();
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let mut model = super::BcodeRuntimeModel::new(
-            chat,
-            settings,
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false),
-        );
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            super::BcodeRuntimeModel::new(
+                chat,
+                settings,
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false),
+            )
+        };
         bmux_tui_runtime::Program::update(
             &mut model,
             bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
@@ -6341,6 +6378,7 @@ mod tests {
 
         assert!(model.has_plugin_surface());
         assert_eq!(model.screen, super::BcodeRuntimeScreen::PluginSurface);
+        drop(model);
     }
 
     #[tokio::test]
@@ -6372,18 +6410,20 @@ mod tests {
             }
         }
 
-        let chat = root_test_chat();
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
         model.queue_plugin_surface("test.plugin", Box::new(NavigationSurface));
         let session_id = bcode_session_models::SessionId::new();
 
@@ -6402,22 +6442,25 @@ mod tests {
         model.resume_screen_after_session_navigation();
 
         assert_eq!(model.screen, super::BcodeRuntimeScreen::PluginSurface);
+        drop(model);
     }
 
     #[tokio::test]
     async fn standalone_plugin_surface_close_exits_with_owned_outcome() {
-        let chat = root_test_chat();
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
         let expected = serde_json::json!({"selected": "workspace"});
         model.exit_after_plugin_surface = true;
 
@@ -6429,22 +6472,25 @@ mod tests {
             model.take_plugin_surface_result(),
             Some(("test.plugin".to_owned(), Some(expected)))
         );
+        drop(model);
     }
 
     #[tokio::test]
     async fn root_ralph_local_action_returns_to_chat_without_generic_outcome_decode() {
-        let chat = root_test_chat();
-        let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-            std::path::PathBuf::from("."),
-            &[],
-        );
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state =
-            super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let mut model = super::BcodeRuntimeModel::new(chat, settings, loop_state);
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
 
         let invalidation = model.apply_plugin_surface_close(
             "bcode.ralph",
@@ -6453,6 +6499,7 @@ mod tests {
 
         assert!(invalidation.needs_render());
         assert!(model.chat.app.status().contains("no Ralph loops"));
+        drop(model);
     }
 
     #[derive(Default)]
@@ -6725,6 +6772,7 @@ mod tests {
                 .streaming_configurator_deadline(std::time::Instant::now())
                 .is_none()
         );
+        drop(apply);
 
         let mut cancel = root_test_model();
         cancel
@@ -6735,6 +6783,7 @@ mod tests {
             bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Escape),
         ));
         assert_eq!(cancel.chat.queued_effect_count(), 0);
+        drop(cancel);
 
         let mut reset = root_test_model();
         reset
@@ -6760,6 +6809,7 @@ mod tests {
                 .pending_effects
                 .contains_effect(&super::super::effects::TuiEffect::ClearStreamingPresentation,)
         );
+        drop(reset);
     }
 
     #[tokio::test]
@@ -6795,6 +6845,7 @@ mod tests {
                 .streaming_configurator_deadline(now)
                 .is_none()
         );
+        drop(model);
     }
 
     #[tokio::test]

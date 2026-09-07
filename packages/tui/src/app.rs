@@ -4912,6 +4912,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["before", "send failed", "after"]
         );
+        drop(app);
     }
 
     #[test]
@@ -4941,6 +4942,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "notice one", "second", "notice two", "third"]
         );
+        drop(app);
     }
 
     #[test]
@@ -4970,6 +4972,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["earlier", "later", "local issue"]
         );
+        drop(app);
     }
 
     #[test]
@@ -4997,6 +5000,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["local issue", "eight"]
         );
+        drop(before);
 
         let mut after =
             BmuxApp::new_with_history(Some(session_id), &[event(5, "five")], &[], false);
@@ -5010,6 +5014,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["two", "local issue"]
         );
+        drop(after);
     }
 
     #[test]
@@ -5042,6 +5047,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["one", "local issue", "three"]
         );
+        drop(app);
     }
 
     #[test]
@@ -5062,6 +5068,7 @@ mod tests {
         app.absorb_session_event(&event(2, "two"));
 
         assert_eq!(app.transcript_index_for_sequence(2), Some(2));
+        drop(app);
     }
 
     #[test]
@@ -5076,6 +5083,7 @@ mod tests {
                 if source == "bcode.tui"
         ));
         assert!(app.session_view_snapshot().transcript.items.is_empty());
+        drop(app);
     }
 
     #[test]
@@ -5096,6 +5104,7 @@ mod tests {
         let mut reconstructed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
 
         reconstructed.take_same_session_transcript_state_from(&source);
+        drop(source);
 
         assert_eq!(
             reconstructed
@@ -5105,6 +5114,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["before", "local issue"]
         );
+        drop(reconstructed);
     }
 
     #[test]
@@ -5124,8 +5134,10 @@ mod tests {
         );
 
         reconstructed.take_same_session_transcript_state_from(&source);
+        drop(source);
 
         assert!(reconstructed.transcript().is_empty());
+        drop(reconstructed);
     }
 
     #[test]
@@ -5140,8 +5152,10 @@ mod tests {
         );
 
         opened.take_same_session_transcript_state_from(&draft);
+        drop(draft);
 
         assert!(opened.transcript().is_empty());
+        drop(opened);
     }
 
     #[test]
@@ -5159,11 +5173,13 @@ mod tests {
         }];
         let mut live = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
         live.push_ephemeral_system_plain("local issue".to_owned());
+        drop(live);
 
         let reconstructed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
 
         assert_eq!(reconstructed.transcript().len(), 1);
         assert_eq!(reconstructed.transcript()[0].text(), "canonical");
+        drop(reconstructed);
     }
 
     #[test]
@@ -5187,6 +5203,7 @@ mod tests {
         // current session silently drop them even though the final app transfers state.
         let mut intermediate = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         intermediate.take_same_session_transcript_state_from(&attached);
+        drop(attached);
         assert_eq!(
             intermediate
                 .transcript()
@@ -5198,6 +5215,7 @@ mod tests {
 
         let mut completed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
         completed.take_same_session_transcript_state_from(&intermediate);
+        drop(intermediate);
 
         assert_eq!(
             completed
@@ -5208,6 +5226,7 @@ mod tests {
             ["canonical", "local issue"],
             "the notice survives the full reopen chain and reanchors to canonical history"
         );
+        drop(completed);
     }
 
     #[test]
@@ -5251,6 +5270,7 @@ mod tests {
         assert!(notice.source_view_item_id().is_none());
         assert!(notice.event_sequence().is_none());
         assert_eq!(app.transcript_index_for_sequence(1), Some(0));
+        drop(app);
     }
 
     #[test]
@@ -5300,6 +5320,7 @@ mod tests {
             Some(TranscriptPresentationOrigin::Ephemeral { .. })
         ));
         assert_eq!(app.session_view_snapshot().transcript.items.len(), 1);
+        drop(app);
 
         // Replaying the same canonical history reproduces only the durable note.
         let replayed = BmuxApp::new_with_history(
@@ -5316,6 +5337,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["durable note"]
         );
+        drop(replayed);
     }
 
     #[test]
@@ -5352,6 +5374,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             transcript_before
         );
+        drop(app);
     }
 
     #[test]
@@ -5413,6 +5436,7 @@ mod tests {
             ),
             None
         );
+        drop(app);
     }
 
     #[test]
@@ -5462,6 +5486,7 @@ mod tests {
         .expect("corrected revision");
         assert_eq!(app.reload_theme_if_valid(), Some("external"));
         assert_ne!(app.presented_theme().fingerprint, valid.fingerprint);
+        drop(app);
     }
 
     #[test]
@@ -5486,6 +5511,7 @@ mod tests {
 
         app.cancel_theme_preview();
         assert_eq!(app.presented_theme().fingerprint, configured.fingerprint);
+        drop(app);
     }
 
     #[test]
@@ -5515,6 +5541,7 @@ mod tests {
         .expect("next valid theme");
         assert_eq!(app.reload_theme_if_valid(), Some("live"));
         assert_ne!(app.presented_theme().fingerprint, valid.fingerprint);
+        drop(app);
     }
 
     #[test]
@@ -5527,6 +5554,7 @@ mod tests {
         app.apply_tui_config(config);
 
         let catalog = crate::theme::catalog_view(&mut app);
+        drop(app);
 
         assert!(!catalog.entries.is_empty());
         assert_eq!(catalog.diagnostics.len(), 1);
@@ -5548,6 +5576,7 @@ mod tests {
         app.apply_tui_config(config);
 
         let entries = crate::theme::catalog_view(&mut app).entries;
+        drop(app);
         let custom = entries
             .iter()
             .find(|entry| entry.id == "custom")
@@ -5567,6 +5596,7 @@ mod tests {
         assert!(app.preview_theme("terminal-native"));
 
         assert_eq!(app.theme_catalog_discovery_count(), 1);
+        drop(app);
     }
 
     #[test]
@@ -5586,6 +5616,7 @@ mod tests {
         assert!(app.apply_theme("bcode-light"));
         assert_eq!(app.tui_config().theme.name, "bcode-light");
         assert!(!app.preview_theme("does-not-exist"));
+        drop(app);
     }
 
     #[test]
@@ -5658,6 +5689,7 @@ mod tests {
                 .len(),
             fallback
         );
+        drop(app);
     }
 
     #[test]
@@ -5693,6 +5725,7 @@ mod tests {
         );
         assert_ne!(fallback_first, 17);
         let stats = app.transcript_layout_mut().drain_sync_stats();
+        drop(app);
         assert_eq!(stats.len(), 1);
         assert_eq!(
             stats[0].invalidation,
@@ -5723,6 +5756,7 @@ mod tests {
             app.transcript_dirty_items_for_test(),
             &BTreeSet::from([first_id, second_id])
         );
+        drop(app);
     }
 
     #[test]
@@ -5747,6 +5781,7 @@ mod tests {
 
         assert_eq!(app.drain_transcript_dirty_items(), BTreeSet::from([1]));
         assert_eq!(app.transcript()[1].text(), "later");
+        drop(app);
     }
 
     fn interaction(id: &str) -> bcode_session_view_models::InteractionViewSummary {
@@ -5838,6 +5873,7 @@ mod tests {
         assert!(app.activate_markdown_contribution("fragment-link"));
         assert_eq!(app.transcript_viewport_top_row_for_test(80, 10), 24);
         assert_eq!(app.status(), "Navigated to Markdown section");
+        drop(app);
     }
 
     #[test]
@@ -5871,6 +5907,7 @@ mod tests {
         assert_eq!(app.transcript_viewport_top_row_for_test(100, 6), 41);
         assert!(app.activate_markdown_contribution("fragment-link"));
         assert_eq!(app.transcript_viewport_top_row_for_test(100, 6), 38);
+        drop(app);
     }
 
     #[test]
@@ -5897,6 +5934,7 @@ mod tests {
 
         assert!(app.activate_markdown_contribution("fragment-link"));
         assert_eq!(app.status(), "Markdown fragment target was not found");
+        drop(app);
     }
 
     #[test]
@@ -5911,6 +5949,7 @@ mod tests {
 
         assert_eq!(app.transcript_top_row(10), top_row);
         assert_eq!(app.scroll_offset(), 47 - top_row - 10);
+        drop(app);
     }
 
     #[test]
@@ -5924,6 +5963,7 @@ mod tests {
 
         app.apply_tui_config(config);
         assert_eq!(app.markdown_presentation_revision(), initial + 1);
+        drop(app);
     }
 
     #[test]
@@ -5940,6 +5980,7 @@ mod tests {
         assert!(app.activate_focused_markdown_contribution());
         assert_eq!(app.markdown_details_open().get("details"), Some(&true));
         assert_eq!(app.markdown_presentation_revision(), 2);
+        drop(app);
     }
 
     #[test]
@@ -5956,6 +5997,7 @@ mod tests {
         app.reconcile_markdown_details(&BTreeSet::new());
         assert!(app.markdown_details_open().is_empty());
         assert_eq!(app.markdown_presentation_revision(), 2);
+        drop(app);
     }
 
     fn markdown_footnote_reference(
@@ -6016,6 +6058,7 @@ mod tests {
             "definition",
         )]);
         assert_eq!(app.focused_markdown_contribution(), Some("reference"));
+        drop(app);
     }
 
     #[test]
@@ -6032,6 +6075,7 @@ mod tests {
         assert!(app.activate_focused_markdown_contribution());
         assert_eq!(app.focused_markdown_contribution(), Some("reference-2"));
         assert!(app.footnote_return_targets.is_empty());
+        drop(app);
     }
 
     #[test]
@@ -6045,6 +6089,7 @@ mod tests {
 
         assert!(app.activate_markdown_contribution("definition"));
         assert_eq!(app.focused_markdown_contribution(), Some("reference-1"));
+        drop(app);
     }
 
     #[test]
@@ -6061,6 +6106,7 @@ mod tests {
 
         assert!(app.footnote_return_targets.is_empty());
         assert_eq!(app.focused_markdown_contribution(), None);
+        drop(app);
     }
 
     #[test]
@@ -6110,6 +6156,7 @@ mod tests {
         assert_eq!(finished, UiInvalidation::Paint);
         assert_eq!(damage, [TemporalDamage::LatestBar]);
         assert!(app.latest_bar_next_frame_at.is_none());
+        drop(app);
     }
 
     #[test]
@@ -6130,6 +6177,7 @@ mod tests {
             BTreeSet::from(["call-item".to_owned()])
         );
         assert!(app.drain_elapsed_dirty_visuals().is_empty());
+        drop(app);
     }
 
     #[test]
@@ -6150,6 +6198,7 @@ mod tests {
             let advanced = Duration::from_millis(offset);
             registry.reconcile(app.invalidation_requests(now + advanced, now_system + advanced));
         }
+        drop(app);
 
         assert!(
             registry
@@ -6282,6 +6331,7 @@ mod tests {
                 .next()
                 .is_none()
         );
+        drop(app);
     }
 
     #[test]
@@ -6334,6 +6384,7 @@ mod tests {
             SessionEventApplication::Live,
         );
         assert_eq!(app.transcript, before);
+        drop(app);
     }
 
     #[test]
@@ -6379,6 +6430,7 @@ mod tests {
             app.last_transcript_damage,
             TranscriptDocumentDamage::Items(ref ids) if ids.contains(&item_id)
         ));
+        drop(app);
     }
 
     #[test]
@@ -6406,6 +6458,7 @@ mod tests {
             app.last_transcript_damage,
             TranscriptDocumentDamage::Items(_)
         ));
+        drop(app);
     }
 
     #[test]
@@ -6436,6 +6489,7 @@ mod tests {
             },
         });
         assert_eq!(app.transcript, before);
+        drop(app);
     }
 
     #[test]
@@ -6470,6 +6524,7 @@ mod tests {
             TranscriptDocumentDamage::FullReset
         );
         assert!(app.transcript.source_index_is_consistent());
+        drop(app);
     }
 
     #[test]
@@ -6490,6 +6545,7 @@ mod tests {
         app.absorb_session_live_event(&live(" second"));
         assert_eq!(app.transcript()[0].id(), render_id);
         assert_eq!(app.transcript()[0].text(), "first second");
+        drop(app);
     }
 
     #[test]
@@ -6544,6 +6600,7 @@ mod tests {
                 .iter()
                 .all(|item| item.source_view_item_id() != Some(&id))
         );
+        drop(app);
     }
 
     #[test]
@@ -6557,6 +6614,7 @@ mod tests {
         let second = app.drain_elapsed_dirty_visuals_bounded(64);
         assert_eq!(second.len(), 36);
         assert!(app.drain_elapsed_dirty_visuals_bounded(64).is_empty());
+        drop(app);
     }
 
     #[test]
@@ -6614,6 +6672,7 @@ mod tests {
         )));
         assert_eq!(app.timeline_entries().len(), 1);
         assert!(app.has_older_history());
+        drop(app);
     }
 
     #[test]
@@ -6672,6 +6731,7 @@ mod tests {
             bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
                 if message.text == "live"
         ));
+        drop(app);
     }
 
     #[test]
@@ -6707,6 +6767,7 @@ mod tests {
         assert!(item.text().contains("context compaction"));
         assert!(!item.text().contains(secret));
         assert!(!item.text().contains("portable summary"));
+        drop(app);
     }
 
     #[test]
@@ -6728,6 +6789,7 @@ mod tests {
 
         assert_eq!(app.active_skill_count(), 1);
         assert!(app.session_view_snapshot().active_skills.contains("review"));
+        drop(app);
     }
 
     #[test]
@@ -6773,6 +6835,7 @@ mod tests {
                 .contains("event-skill")
         );
         assert_eq!(app.status(), "deactivated skill: event-skill");
+        drop(app);
     }
 
     #[test]
@@ -6796,6 +6859,7 @@ mod tests {
         assert!(app.session_view_snapshot().runtime_work.is_empty());
         assert!(app.session_view_snapshot().transcript.items.is_empty());
         assert!(app.transcript().is_empty());
+        drop(app);
     }
 
     #[test]
@@ -6833,6 +6897,7 @@ mod tests {
             bcode_session_models::ToolInvocationLifecycleStage::Completed,
         ));
         assert!(matches!(app.activity(), ActivityState::Idle));
+        drop(app);
     }
 
     #[test]
@@ -6858,6 +6923,7 @@ mod tests {
         app.apply_runtime_work_snapshots(&[]);
         assert!(matches!(app.activity(), ActivityState::Idle));
         assert!(app.session_view_snapshot().runtime_work.is_empty());
+        drop(app);
     }
 
     #[test]
@@ -6880,6 +6946,7 @@ mod tests {
 
         assert_eq!(app.reasoning_effort(), Some("high"));
         assert_eq!(app.reasoning_summary(), Some("detailed"));
+        drop(app);
     }
 
     #[test]
@@ -6926,6 +6993,7 @@ mod tests {
             },
         ));
         assert_eq!(app.active_skill_count(), 0);
+        drop(app);
     }
 
     #[test]
@@ -6972,6 +7040,7 @@ mod tests {
             actual.text(),
             "Ralph started\n* Loop: loop\n* running\n* State: .bcode/ralph/loop"
         );
+        drop(app);
     }
 
     #[test]
@@ -7052,6 +7121,7 @@ mod tests {
                 .map(|item| (item.role(), item.text().to_owned(), item.kind().clone()))
                 .collect::<Vec<_>>()
         );
+        drop(app);
     }
 
     #[test]
@@ -7102,6 +7172,7 @@ mod tests {
                 .footer_summary(None, 0, &app.session_view_snapshot().runtime.cost)
                 .ends_with("spent 0 tok · ~$0.02")
         );
+        drop(app);
     }
 
     #[test]
@@ -7163,6 +7234,7 @@ mod tests {
                 .as_deref(),
             Some("detailed")
         );
+        drop(app);
     }
 
     #[test]
@@ -7221,6 +7293,7 @@ mod tests {
 
         assert!(hydrated.observation.context_tokens.is_estimated());
         assert_eq!(meter.context_summary(Some(hydrated)), "~2,500/10k 25%");
+        drop(app);
     }
 
     #[test]
@@ -7250,6 +7323,7 @@ mod tests {
 
         assert!(!live.observation.context_tokens.is_estimated());
         assert_eq!(meter.context_summary(Some(live)), "2,500/10k 25%");
+        drop(app);
     }
 
     #[test]
@@ -7323,6 +7397,7 @@ mod tests {
                 .context_occupancy
                 .is_none()
         );
+        drop(app);
     }
 
     #[test]
@@ -7351,6 +7426,7 @@ mod tests {
         assert_eq!(app.scroll_offset(), before_scroll);
         assert_eq!(app.reasoning_visible(), before_visible);
         assert_eq!(app.reasoning_effort(), Some("high"));
+        drop(app);
     }
 
     #[test]
@@ -7379,6 +7455,7 @@ mod tests {
 
         assert_eq!(app.frame_observation(), before);
         assert_eq!(app.reasoning_effort(), Some("high"));
+        drop(app);
     }
 
     #[test]
@@ -7428,6 +7505,7 @@ mod tests {
 
         assert_eq!(app.frame_observation(), before);
         assert_eq!(app.reasoning_effort(), Some("high"));
+        drop(app);
     }
 
     #[test]
@@ -7449,6 +7527,7 @@ mod tests {
             app.transcript().iter().cloned().collect::<Vec<_>>(),
             before_items
         );
+        drop(app);
     }
 
     #[test]
@@ -7478,6 +7557,7 @@ mod tests {
             assert_eq!(app.cycle_pending_reasoning_effort(), Some(expected));
             assert_eq!(app.frame_observation(), frame);
         }
+        drop(app);
     }
 
     #[test]
@@ -7489,6 +7569,7 @@ mod tests {
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("high"));
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("low"));
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("high"));
+        drop(app);
     }
 
     #[test]
@@ -7502,6 +7583,7 @@ mod tests {
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("none"));
         assert_eq!(app.cycle_pending_reasoning_effort(), Some("low"));
         assert_eq!(app.reasoning_effort_generation, 4);
+        drop(app);
     }
 
     #[test]
@@ -7513,6 +7595,7 @@ mod tests {
 
         assert_eq!(app.pending_reasoning_effort_generation(), None);
         assert_eq!(app.reasoning_effort(), None);
+        drop(app);
     }
 
     #[test]
@@ -7524,6 +7607,7 @@ mod tests {
 
         app.reconcile_pending_reasoning_effort("high");
         assert_eq!(app.reasoning_effort(), None);
+        drop(app);
     }
 
     #[test]
@@ -7538,6 +7622,7 @@ mod tests {
 
         app.clear_pending_reasoning_effort(newer);
         assert_eq!(app.reasoning_effort(), None);
+        drop(app);
     }
 
     #[test]
@@ -7576,6 +7661,7 @@ mod tests {
         assert!(runtime.cancelling);
         assert!(matches!(app.activity(), ActivityState::Cancelling));
         assert_eq!(app.status(), "cancellation requested");
+        drop(app);
     }
 
     #[test]
@@ -7627,6 +7713,7 @@ mod tests {
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
+        drop(app);
     }
 
     #[test]
@@ -7644,6 +7731,7 @@ mod tests {
 
         assert_eq!(app.session_title(), Some("renamed session"));
         assert_eq!(app.status(), "session: renamed session");
+        drop(app);
     }
 
     #[test]
@@ -7685,6 +7773,7 @@ mod tests {
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
+        drop(app);
     }
 
     #[test]
@@ -7730,6 +7819,7 @@ mod tests {
         assert_eq!(terminal.role(), expected.role());
         assert_eq!(terminal.text(), expected.text());
         assert_eq!(terminal.kind(), expected.kind());
+        drop(app);
     }
 
     #[test]
@@ -7781,6 +7871,7 @@ mod tests {
         assert_eq!(terminal.role(), expected.role());
         assert_eq!(terminal.text(), expected.text());
         assert_eq!(terminal.kind(), expected.kind());
+        drop(app);
     }
 
     #[test]
@@ -7816,6 +7907,7 @@ mod tests {
         assert_eq!(actual.role(), "You");
         assert_eq!(actual.text(), "shared user");
         assert_eq!(actual.event_sequence(), Some(1));
+        drop(app);
     }
 
     #[test]
@@ -7848,6 +7940,7 @@ mod tests {
         assert_eq!(actual.text(), "shared stream");
         assert!(actual.streaming());
         assert_eq!(app.transcript().len(), 1);
+        drop(app);
     }
 
     #[test]
@@ -7877,6 +7970,7 @@ mod tests {
         assert_eq!(actual.role(), "Assistant");
         assert_eq!(actual.text(), "final shared");
         assert!(!actual.streaming());
+        drop(app);
     }
 
     #[test]
@@ -7944,6 +8038,7 @@ mod tests {
                 .and_then(bcode_session_models::SessionTokenUsage::metered_total_tokens),
             Some(6_176)
         );
+        drop(app);
     }
 
     #[test]
@@ -8013,6 +8108,7 @@ mod tests {
             bcode_config::TuiDiffViewerConfig::default(),
         );
         assert_eq!(streaming_body, finalized_rows[1..]);
+        drop(app);
     }
 
     #[test]
@@ -8043,6 +8139,7 @@ mod tests {
         assert_eq!(actual.role(), "Reasoning summary");
         assert_eq!(actual.text(), "final reasoning");
         assert!(!actual.streaming());
+        drop(app);
     }
 
     #[test]
@@ -8099,6 +8196,7 @@ mod tests {
                 .map(|item| (item.role(), item.text().to_owned(), item.streaming()))
                 .collect::<Vec<_>>()
         );
+        drop(app);
     }
 
     #[test]
@@ -8168,6 +8266,7 @@ mod tests {
                 .status,
             bcode_session_view_models::ToolInvocationViewStatus::Finished
         ));
+        drop(app);
     }
 
     #[test]
@@ -8207,6 +8306,7 @@ mod tests {
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
+        drop(app);
     }
 
     #[test]
@@ -8258,6 +8358,7 @@ mod tests {
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
+        drop(app);
     }
 
     #[test]
@@ -8309,6 +8410,7 @@ mod tests {
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
         assert_eq!(actual.event_sequence(), shared.sequence);
+        drop(app);
     }
 
     #[test]
@@ -8346,6 +8448,7 @@ mod tests {
         assert_eq!(actual.role(), expected.role());
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
+        drop(app);
     }
 
     #[test]
@@ -8386,6 +8489,7 @@ mod tests {
         assert_eq!(actual.text(), expected.text());
         assert_eq!(actual.kind(), expected.kind());
         assert_eq!(actual.event_sequence(), shared.sequence);
+        drop(app);
     }
 
     fn shared_projection_terminal_adapter_events(session_id: SessionId) -> Vec<SessionEvent> {
@@ -8524,6 +8628,7 @@ mod tests {
             },
         });
         assert!(app.transcript().is_empty());
+        drop(app);
     }
 
     #[test]
@@ -8578,6 +8683,7 @@ mod tests {
             "stale",
         ));
         assert!(app.transcript().is_empty());
+        drop(app);
     }
 
     #[test]
@@ -8605,5 +8711,6 @@ mod tests {
             },
         });
         assert!(app.transcript().is_empty());
+        drop(app);
     }
 }

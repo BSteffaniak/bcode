@@ -339,6 +339,7 @@ mod tests {
                 .contains("daemon did not respond")
         );
         assert!(app.session_view_snapshot().transcript.items.is_empty());
+        drop(app);
     }
 
     #[test]
@@ -372,6 +373,7 @@ mod tests {
             app.session_view_snapshot().transcript.items.is_empty(),
             "the diagnostic never becomes canonical history"
         );
+        drop(app);
     }
 
     #[test]

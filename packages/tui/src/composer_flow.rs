@@ -158,5 +158,6 @@ mod tests {
                 .map(|status| status.text.as_str()),
             Some("Loop active")
         );
+        drop(app);
     }
 }

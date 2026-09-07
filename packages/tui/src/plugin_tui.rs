@@ -1456,6 +1456,7 @@ library = "libdynamic_visual_test.dylib"
             dynamic_test_visual_with_context(&presentation, "call-theme", &context(1)).is_some()
         );
         let changed = dynamic_test_visual_with_context(&presentation, "call-theme", &context(2));
+        drop(presentation);
         if let Some(visual) = changed {
             assert_eq!(visual.route.plugin_id, "bcode.shell");
         }
@@ -1642,6 +1643,7 @@ library = "libdynamic_visual_test.dylib"
                 format!("hello dynamic {invocation_id}")
             );
         }
+        drop(presentation);
     }
 
     #[test]
@@ -1676,6 +1678,7 @@ library = "libdynamic_visual_test.dylib"
         assert_eq!(routed.header.title.as_deref(), Some("Dynamic shell"));
         assert_eq!(routed.header.timeout_ms, Some(321));
         assert_eq!(routed_text(&routed), "dynamic:success:artifact-0");
+        drop(presentation);
     }
 
     #[test]
@@ -1697,6 +1700,7 @@ library = "libdynamic_visual_test.dylib"
 
             let fallback = dynamic_test_visual(&presentation, &format!("call-{adapter_id}"))
                 .expect("native fallback after dynamic failure");
+            drop(presentation);
             assert_eq!(fallback.route.plugin_id, "bcode.shell", "{adapter_id}");
         }
     }
@@ -1784,6 +1788,7 @@ library = "libdynamic_visual_test.dylib"
         assert_eq!(routed_text(&refreshed), "dynamic:success:artifact-1");
         let unchanged =
             dynamic_test_visual(&presentation, "call-other").expect("unaffected cached visual");
+        drop(presentation);
         assert_eq!(routed_text(&unchanged), "dynamic:success:artifact-0");
     }
 
@@ -1907,6 +1912,7 @@ library = "libdynamic_visual_test.dylib"
         assert_eq!(second.first().map(String::as_str), Some("call-064"));
         assert_eq!(second.last().map(String::as_str), Some("call-099"));
         assert!(presentation.drain_dirty_visuals_bounded(64).is_empty());
+        drop(presentation);
     }
 
     #[test]
@@ -1937,6 +1943,7 @@ library = "libdynamic_visual_test.dylib"
             crate::transcript_projection::test_layout_signature(&first, 80, Some(&presentation));
         let second_after =
             crate::transcript_projection::test_layout_signature(&second, 80, Some(&presentation));
+        drop(presentation);
         assert_ne!(first_before, first_after);
         assert_eq!(second_before, second_after);
     }
@@ -2003,6 +2010,7 @@ library = "libdynamic_visual_test.dylib"
                 },
                 |index| vec![Line::from(format!("row-{index}"))].into(),
             );
+            drop(presentation);
             println!(
                 "BCODE_PERF_CASE {}",
                 serde_json::json!({
@@ -2079,6 +2087,7 @@ library = "libdynamic_visual_test.dylib"
                 },
                 |index| vec![Line::from(format!("row-{index}"))].into(),
             );
+            drop(presentation);
             assert_eq!(updated.entries_scanned, 1);
             assert_eq!(updated.signatures_changed, 1);
             assert_eq!(updated.entries_rebuilt, 1);
@@ -2105,6 +2114,7 @@ library = "libdynamic_visual_test.dylib"
             .expect("Git contribution route");
         assert_eq!(route.plugin_id, "bcode.git");
         let registry = presentation.registry("bcode.git").expect("Git registry");
+        drop(presentation);
         let rows = registry
             .visual_rows(
                 &route.adapter_id,
@@ -2205,6 +2215,7 @@ library = "libdynamic_visual_test.dylib"
             presentation.drain_timings().len(),
             usize::try_from(delivered_revisions).expect("revisions")
         );
+        drop(presentation);
     }
 
     #[test]
@@ -2269,6 +2280,7 @@ library = "libdynamic_visual_test.dylib"
             presentation.drain_dirty_visuals(),
             BTreeSet::from(["call-owner".to_owned()])
         );
+        drop(presentation);
     }
 
     #[test]
@@ -2328,6 +2340,7 @@ library = "libdynamic_visual_test.dylib"
         );
 
         let second = presentation.registry("bcode.shell").expect("registry");
+        drop(presentation);
         assert!(Arc::ptr_eq(&first, &second));
         let rows = second
             .visual_rows(
