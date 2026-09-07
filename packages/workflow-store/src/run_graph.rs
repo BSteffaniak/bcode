@@ -370,6 +370,109 @@ fn edge_cursor(after_edge_id: Option<u64>) -> Result<i64, WorkflowStoreError> {
 }
 
 impl WorkflowStore {
+    /// Read the immutable executable node selected when an activation was admitted.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identities, missing or malformed revision bindings,
+    /// missing executable data, or database failures. An absent activation returns `None`.
+    pub fn activation_graph_node(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+    ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+        super::validate_id("run_id", run_id)?;
+        super::validate_id("node_id", node_id)?;
+        super::validate_id("activation_id", activation_id)?;
+        let revision = self
+            .connection
+            .query_row(
+                "SELECT node_revision FROM workflow_activations
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+                (run_id, node_id, activation_id),
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
+        let Some(revision) = revision else {
+            return Ok(None);
+        };
+        self.run_graph_node_revision(run_id, node_id, revision)?
+            .map(Some)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "activation executable revision is missing".to_string(),
+                )
+            })
+    }
+
+    /// Read an exact immutable node revision rather than the current graph topology.
+    ///
+    /// This does not authorize execution or resolve an activation's binding. Missing
+    /// runs or node revisions return `None`; an uncommitted revision is rejected.
+    /// # Errors
+    /// Returns an error for invalid identities/revisions, damaged graph metadata,
+    /// malformed or oversized node payloads, or database failures.
+    pub fn run_graph_node_revision(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        revision: u64,
+    ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+        super::validate_id("node_id", node_id)?;
+        if revision == 0 || i64::try_from(revision).is_err() {
+            return Err(WorkflowStoreError::InvalidData(
+                "node revision must be a positive storage integer".to_string(),
+            ));
+        }
+        let Some(current) = graph_revision(&self.connection, run_id)? else {
+            return Ok(None);
+        };
+        if revision > current {
+            return Err(WorkflowStoreError::InvalidData(
+                "node revision exceeds committed graph revision".to_string(),
+            ));
+        }
+        let row = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN typeof(node_json) = 'text'
+                         AND length(CAST(node_json AS BLOB)) <= ?4
+                         AND is_entry IN (0, 1) AND is_exit IN (0, 1)
+                         THEN node_json END, is_entry, is_exit
+             FROM workflow_run_graph_nodes
+             WHERE run_id = ?1 AND node_id = ?2 AND revision = ?3",
+                rusqlite::params![run_id, node_id, revision, super::MAX_INLINE_JSON_BYTES],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((payload, entry, exit)) = row else {
+            return Ok(None);
+        };
+        let payload = payload.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow graph node payload is invalid or oversized".to_string(),
+            )
+        })?;
+        let node: NodeDefinition = serde_json::from_str(&payload)?;
+        if node.id != node_id {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow graph node identity mismatch".to_string(),
+            ));
+        }
+        Ok(Some(RunGraphNode {
+            revision,
+            node,
+            entry,
+            exit,
+        }))
+    }
+
     /// Read one initial node revision with its admitted entry and exit roles.
     ///
     /// Missing runs or nodes return `None`. This bounded lookup never repairs state.

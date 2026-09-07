@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 17;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 18;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1579,7 +1579,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=16),
+                                actual: Some(14..=17),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1609,7 +1609,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=16),
+                                actual: Some(14..=17),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1758,7 +1758,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=16) {
+        if !matches!(previous_schema_version, 14..=17) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -1795,9 +1795,12 @@ impl WorkflowStore {
         }
         if previous_schema_version < 16 {
             run_graph::migrate(&transaction)?;
-        } else {
+        } else if previous_schema_version == 16 {
             run_graph::initialize_source_index(&transaction)?;
         }
+        transaction.execute_batch(
+            "ALTER TABLE workflow_activations ADD COLUMN node_revision INTEGER NOT NULL DEFAULT 1 CHECK (node_revision > 0);",
+        )?;
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
             [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -9370,11 +9373,21 @@ impl WorkflowStore {
                     input_json,
                     created_at_ms,
                 ) = row?;
-                let node = self.run_graph_node(&run_id, &node_id)?.ok_or_else(|| {
+                // Revised topology is not dispatchable until readiness and settlement
+                // also consume revision-aware graph semantics.
+                self.run_graph_node(&run_id, &node_id)?.ok_or_else(|| {
                     WorkflowStoreError::InvalidData(format!(
                         "workflow activation references missing run-graph node: {node_id}"
                     ))
                 })?;
+                let node = self
+                    .activation_graph_node(&run_id, &node_id, &activation_id)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "pending activation executable binding is missing".to_string(),
+                        )
+                    })?
+                    .node;
                 Ok(PendingActivation {
                     run_id,
                     node_id,
@@ -12942,8 +12955,8 @@ fn insert_activation_with_status(
     )?;
     transaction.execute(
         "INSERT INTO workflow_activations \
-         (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms, node_revision) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
         (
             &activation.run_id,
             &activation.node_id,
@@ -14820,6 +14833,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              status TEXT NOT NULL,\
              output_id TEXT,\
              created_at_ms INTEGER NOT NULL,\
+             node_revision INTEGER NOT NULL DEFAULT 1 CHECK (node_revision > 0),\
              PRIMARY KEY (run_id, node_id, activation_id),\
              FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id)\
          );\
@@ -17627,7 +17641,7 @@ mod tests {
                     "DROP TABLE workflow_run_graph_edges;
                  DROP TABLE workflow_run_graph_nodes;
                  DROP TABLE workflow_run_graphs;
-                 UPDATE workflow_store_contract SET schema_version = 15;",
+                 ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;",
                 )
                 .expect("historical repeat fixture");
             drop(store);
@@ -18611,6 +18625,27 @@ mod tests {
             )
             .expect("activation");
         assert_eq!(activation_status, "completed");
+    }
+
+    #[test]
+    fn pending_work_rejects_inconsistent_executable_binding_without_writes() {
+        let (_temp, store) = initialized_store();
+        assert!(
+            !store
+                .pending_activations_for_run("run-1", 10)
+                .expect("pending work")
+                .is_empty()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("invalid binding fixture");
+        let before = store.connection.total_changes();
+        assert!(store.pending_activations_for_run("run-1", 10).is_err());
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
@@ -19819,7 +19854,7 @@ mod tests {
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_daemon_instance_id;\
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_generation;\
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_fencing_token;\
-                 UPDATE workflow_store_contract SET schema_version = 14 WHERE contract_id = 1;",
+                 ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 14 WHERE contract_id = 1;",
             )
             .expect("schema 14 fixture");
         drop(connection);
@@ -19914,7 +19949,7 @@ mod tests {
                 "DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15;",
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;",
             )
             .expect("schema 15 fixture");
         drop(store);
@@ -19972,6 +20007,10 @@ mod tests {
                     .execute_batch("DROP INDEX workflow_run_graph_edges_source;")
                     .expect("schema 16");
             }
+            store
+                .connection
+                .execute_batch("ALTER TABLE workflow_activations DROP COLUMN node_revision;")
+                .expect("historical activations");
             store
                 .connection
                 .execute(
@@ -20143,7 +20182,7 @@ mod tests {
                 "DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15;",
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;",
             )
             .expect("historical fixture");
         let checksum: String = connection.query_row(
@@ -20237,7 +20276,7 @@ mod tests {
                 "DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15;",
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;",
             )
             .expect("schema 15");
         drop(connection);
@@ -20297,7 +20336,7 @@ mod tests {
                 "DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15;",
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;",
             )
             .expect("schema 15");
         let checksum: String = connection.query_row(
@@ -20369,7 +20408,7 @@ mod tests {
              DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15;
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;
              DELETE FROM workflow_definitions;",
             )
             .expect("historical damaged fixture");
@@ -20413,7 +20452,7 @@ mod tests {
             "DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15;
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;
              UPDATE workflow_definitions SET checksum_sha256 = 'damaged' WHERE definition_id = 'second';"
         ).expect("historical fixture");
         drop(connection);
@@ -20563,7 +20602,7 @@ mod tests {
                 "DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15 WHERE contract_id = 1;",
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15 WHERE contract_id = 1;",
             )
             .expect("historical fixture");
         let expected_checksum: String = connection.query_row(
@@ -20662,7 +20701,7 @@ mod tests {
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_daemon_instance_id;\
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_generation;\
                  ALTER TABLE workflow_runs DROP COLUMN coordinator_fencing_token;\
-                 UPDATE workflow_store_contract SET schema_version = 14 WHERE contract_id = 1;",
+                 ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 14 WHERE contract_id = 1;",
             )
             .expect("damaged historical fixture");
         drop(connection);
@@ -20699,6 +20738,90 @@ mod tests {
         assert!(!root.join(MIGRATION_RECEIPT_FILE).exists());
         assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
         assert_eq!(detected_store_schema(&connection), Some(14));
+    }
+
+    #[test]
+    fn schema_17_upgrade_preserves_activation_executable_binding() {
+        let (temp, store) = initialized_store();
+        let original = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("binding")
+            .expect("executable");
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE workflow_activations DROP COLUMN node_revision;
+             UPDATE workflow_store_contract SET schema_version = 17;",
+            )
+            .expect("schema 17 fixture");
+        drop(store);
+        let store = WorkflowStore::initialize_in_state_dir(temp.path(), 900).expect("upgrade");
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("migrated binding"),
+            Some(original)
+        );
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", "absent")
+                .expect("missing activation")
+                .is_none()
+        );
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("durable binding")
+                .expect("node")
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn exact_node_revision_preserves_historical_executable_after_reopen() {
+        let (temp, store) = initialized_store();
+        let original = store
+            .run_graph_node_revision("run-1", "review", 1)
+            .expect("lookup")
+            .expect("initial node");
+        // Model two committed revisions; production graph mutation remains unavailable.
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, 0, 0 FROM workflow_run_graph_nodes
+             WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1;
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
+            )
+            .expect("revision fixture");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let changes = store.connection.total_changes();
+        assert_eq!(
+            store
+                .run_graph_node_revision("run-1", "review", 1)
+                .expect("historical node"),
+            Some(original)
+        );
+        let current = store
+            .run_graph_node_revision("run-1", "review", 2)
+            .expect("exact node")
+            .expect("second revision");
+        assert_eq!(current.revision, 2);
+        assert!(!current.entry && !current.exit);
+        assert!(store.run_graph_node_revision("run-1", "review", 3).is_err());
+        assert!(store.run_graph_node_revision("run-1", "review", 0).is_err());
+        assert!(
+            store
+                .run_graph_node_revision("run-1", "absent", 1)
+                .expect("absent node")
+                .is_none()
+        );
+        assert!(store.run_graph_node("run-1", "review").is_err());
+        assert_eq!(store.connection.total_changes(), changes);
     }
 
     #[test]
@@ -20751,7 +20874,7 @@ mod tests {
                 "DROP TABLE workflow_run_graph_edges;
              DROP TABLE workflow_run_graph_nodes;
              DROP TABLE workflow_run_graphs;
-             UPDATE workflow_store_contract SET schema_version = 15;",
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 15;",
             )
             .expect("schema 15");
         drop(connection);
@@ -21142,7 +21265,7 @@ mod tests {
             .connection
             .execute_batch(
                 "DROP INDEX workflow_run_graph_edges_source;
-             UPDATE workflow_store_contract SET schema_version = 16 WHERE contract_id = 1;
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 16 WHERE contract_id = 1;
              PRAGMA foreign_keys = OFF;
              DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
             )
@@ -21490,7 +21613,7 @@ mod tests {
             .connection
             .execute_batch(
                 "DROP INDEX workflow_run_graph_edges_source;
-             UPDATE workflow_store_contract SET schema_version = 16 WHERE contract_id = 1;",
+             ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 16 WHERE contract_id = 1;",
             )
             .expect("schema 16 fixture");
         drop(store);
