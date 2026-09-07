@@ -4472,8 +4472,14 @@ fn spawn_exclusive_plugin_executor(
                 }
             }
         }
-        if let Some(plugin) = plugin {
-            let _ = plugin.deactivate();
+        if let Some(plugin) = plugin
+            && plugin.deactivate().is_err()
+        {
+            tracing::warn!(
+                target: "bcode_plugin::runtime",
+                plugin_id = %plugin_id,
+                "exclusive plugin executor stopped with incomplete deactivation"
+            );
         }
     });
 }
