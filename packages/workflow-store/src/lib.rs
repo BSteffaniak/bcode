@@ -4265,13 +4265,14 @@ impl WorkflowStore {
     /// Idempotently create one durable workflow run using a caller-stable identity.
     ///
     /// Returns `true` when the run was created and `false` when the exact immutable request was
-    /// already present. Identity reuse with different definition, snapshot, parent, input, or
-    /// limits fails closed.
+    /// already present with a supported run-graph header. Identity reuse with different
+    /// definition, snapshot, parent, input, or limits fails closed. Duplicate acknowledgement
+    /// validates the graph header only; it does not verify all graph payloads or repair state.
     ///
     /// # Errors
     ///
     /// Returns an error for malformed input, missing definition, conflicting identity, malformed
-    /// stored input, or database failure.
+    /// stored input, a missing, malformed, or unsupported run-graph header, or database failure.
     #[allow(clippy::too_many_lines)]
     pub fn create_run_idempotent(
         &mut self,
@@ -4283,11 +4284,18 @@ impl WorkflowStore {
             .connection
             .query_row(
                 "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, parent_session_generation, \
-                 input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
+                 CASE WHEN input_json IS NULL THEN NULL
+                      WHEN typeof(input_json) = 'text' AND length(CAST(input_json AS BLOB)) <= ?2
+                      THEN input_json ELSE '' END,
+                 deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
                  owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-                 authored_provenance_json, authorization_profile_json, authorization_ceiling \
+                 CASE WHEN authored_provenance_json IS NULL THEN NULL
+                      WHEN typeof(authored_provenance_json) = 'text' AND length(CAST(authored_provenance_json AS BLOB)) <= ?2
+                      THEN authored_provenance_json ELSE '' END,
+                 CASE WHEN typeof(authorization_profile_json) = 'text' AND length(CAST(authorization_profile_json AS BLOB)) <= ?2
+                      THEN authorization_profile_json ELSE '' END, authorization_ceiling \
                  FROM workflow_runs WHERE run_id = ?1",
-                [&run.run_id],
+                rusqlite::params![&run.run_id, MAX_INLINE_JSON_BYTES],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -4305,7 +4313,7 @@ impl WorkflowStore {
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
                         row.get::<_, Option<String>>(14)?,
-                        row.get::<_, bool>(15)?,
+                        row.get::<_, i64>(15)?,
                         row.get::<_, Option<String>>(16)?,
                         row.get::<_, String>(17)?,
                         row.get::<_, String>(18)?,
@@ -4338,12 +4346,30 @@ impl WorkflowStore {
             self.create_run(run)?;
             return Ok(true);
         };
+        if input_json.as_deref() == Some("")
+            || authored_provenance_json.as_deref() == Some("")
+            || existing_authorization_profile_json.is_empty()
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "stored workflow run JSON is invalid or oversized".to_string(),
+            ));
+        }
         let input = input_json
             .map(|value| serde_json::from_str(&value))
-            .transpose()?;
+            .transpose()
+            .map_err(|_| {
+                WorkflowStoreError::InvalidData(
+                    "stored workflow run input JSON is malformed".to_string(),
+                )
+            })?;
         let authored_provenance = authored_provenance_json
             .map(|value| serde_json::from_str(&value))
-            .transpose()?;
+            .transpose()
+            .map_err(|_| {
+                WorkflowStoreError::InvalidData(
+                    "stored workflow run authored provenance JSON is malformed".to_string(),
+                )
+            })?;
         let limits = WorkflowRunLimits {
             deadline_at_ms,
             node_execution_cap,
@@ -4351,23 +4377,13 @@ impl WorkflowStore {
             cycle_cap,
             retry_cap,
         };
-        let existing_binding = match (owner_plugin_id, workflow_kind, scope_key) {
-            (Some(owner_plugin_id), Some(workflow_kind), Some(scope_key)) => {
-                Some(WorkflowRunBinding {
-                    owner_plugin_id,
-                    workflow_kind,
-                    scope_key,
-                    display_label,
-                    single_active,
-                })
-            }
-            (None, None, None) => None,
-            _ => {
-                return Err(WorkflowStoreError::InvalidData(
-                    "stored workflow run has an incomplete binding".to_string(),
-                ));
-            }
-        };
+        let existing_binding = parse_run_binding(
+            owner_plugin_id,
+            workflow_kind,
+            scope_key,
+            display_label,
+            single_active,
+        )?;
         if definition_id == run.definition_id
             && definition_version == run.definition_version
             && workspace_snapshot == run.workspace_snapshot
@@ -4380,6 +4396,11 @@ impl WorkflowStore {
             && input == run.input
             && limits == run.limits
         {
+            if run_graph::graph_revision(&self.connection, &run.run_id)? != Some(1) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "idempotent workflow start requires a supported run graph revision".to_string(),
+                ));
+            }
             return Ok(false);
         }
         Err(WorkflowStoreError::InvalidData(format!(
@@ -10135,9 +10156,16 @@ impl WorkflowStore {
 
     /// Return a keyset-paged bounded attempt history for one run.
     ///
+    /// Reads do not repair or mutate stored attempts. Invalid data in the selected
+    /// page fails the entire request rather than returning a partial history.
+    ///
     /// # Errors
     ///
-    /// Returns an error when `limit` is invalid, the cursor is malformed, or the query fails.
+    /// Returns an error when:
+    /// * The run ID, limit, or cursor is invalid.
+    /// * A selected attempt has an invalid identity, zero attempt number, or an
+    ///   unsupported status or side-effect value.
+    /// * A selected row cannot be decoded or the database query fails.
     pub fn attempt_history(
         &self,
         run_id: &str,
@@ -10148,6 +10176,11 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         if let Some(cursor) = cursor {
             validate_id("cursor.dispatch_identity", &cursor.dispatch_identity)?;
+            i64::try_from(cursor.prepared_at_ms).map_err(|_| {
+                WorkflowStoreError::InvalidData(
+                    "attempt history cursor timestamp exceeds storage range".to_string(),
+                )
+            })?;
         }
         let mut statement = self.connection.prepare(
             "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
@@ -12533,7 +12566,7 @@ type RawRunSummary = (
     Option<String>,
     Option<String>,
     Option<String>,
-    bool,
+    i64,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -12545,6 +12578,28 @@ type RawRunSummary = (
     u64,
 );
 
+// Empty text is rejected by the field's domain parser; SQL NULL stays absent.
+fn bounded_run_text_from_row(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+    max_bytes: usize,
+) -> rusqlite::Result<Option<String>> {
+    match row.get_ref(column)? {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        rusqlite::types::ValueRef::Text(bytes) if bytes.len() <= max_bytes => Ok(Some(
+            std::str::from_utf8(bytes).unwrap_or_default().to_string(),
+        )),
+        _ => Ok(Some(String::new())),
+    }
+}
+
+fn bounded_run_json_from_row(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<String>> {
+    bounded_run_text_from_row(row, column, MAX_INLINE_JSON_BYTES)
+}
+
 fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRunSummary> {
     run_summary_from_row_offset(row, 0)
 }
@@ -12554,27 +12609,62 @@ fn run_summary_from_row_offset(
     offset: usize,
 ) -> rusqlite::Result<RawRunSummary> {
     Ok((
-        row.get(offset)?,
-        row.get(offset + 1)?,
+        bounded_run_text_from_row(row, offset, MAX_ID_BYTES)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, offset + 1, MAX_ID_BYTES)?.unwrap_or_default(),
         row.get(offset + 2)?,
-        row.get(offset + 3)?,
-        row.get(offset + 4)?,
+        bounded_run_text_from_row(row, offset + 3, MAX_ID_BYTES)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, offset + 4, MAX_ID_BYTES)?,
         row.get(offset + 5)?,
-        row.get(offset + 6)?,
-        row.get(offset + 7)?,
-        row.get(offset + 8)?,
-        row.get(offset + 9)?,
+        bounded_run_text_from_row(row, offset + 6, MAX_ID_BYTES)?,
+        bounded_run_text_from_row(row, offset + 7, MAX_ID_BYTES)?,
+        bounded_run_text_from_row(row, offset + 8, MAX_ID_BYTES)?,
+        bounded_run_text_from_row(row, offset + 9, MAX_DISPLAY_LABEL_BYTES)?,
         row.get(offset + 10)?,
-        row.get(offset + 11)?,
+        bounded_run_json_from_row(row, offset + 11)?,
         row.get(offset + 12)?,
         row.get(offset + 13)?,
-        row.get(offset + 14)?,
-        row.get(offset + 15)?,
-        row.get(offset + 16)?,
+        bounded_run_json_from_row(row, offset + 14)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, offset + 15, MAX_ID_BYTES)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, offset + 16, MAX_ID_BYTES)?.unwrap_or_default(),
         row.get(offset + 17)?,
         row.get(offset + 18)?,
         row.get(offset + 19)?,
     ))
+}
+
+fn parse_run_binding(
+    owner_plugin_id: Option<String>,
+    workflow_kind: Option<String>,
+    scope_key: Option<String>,
+    display_label: Option<String>,
+    single_active: i64,
+) -> Result<Option<WorkflowRunBinding>, WorkflowStoreError> {
+    let single_active = match single_active {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(WorkflowStoreError::InvalidData(
+                "stored workflow run single-active flag is invalid".to_string(),
+            ));
+        }
+    };
+    match (owner_plugin_id, workflow_kind, scope_key) {
+        (Some(owner_plugin_id), Some(workflow_kind), Some(scope_key)) => {
+            let binding = WorkflowRunBinding {
+                owner_plugin_id,
+                workflow_kind,
+                scope_key,
+                display_label,
+                single_active,
+            };
+            validate_binding(&binding)?;
+            Ok(Some(binding))
+        }
+        (None, None, None) if display_label.is_none() && !single_active => Ok(None),
+        _ => Err(WorkflowStoreError::InvalidData(
+            "stored workflow run has an incomplete binding".to_string(),
+        )),
+    }
 }
 
 fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowStoreError> {
@@ -12600,24 +12690,37 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         created_at_ms,
         updated_at_ms,
     ) = raw;
+    validate_id("run_id", &run_id)?;
+    validate_id("definition_id", &definition_id)?;
+    validate_id("workspace_snapshot", &workspace_snapshot)?;
+    if definition_version == 0 {
+        return Err(WorkflowStoreError::InvalidData(
+            "stored workflow run definition version must be positive".to_string(),
+        ));
+    }
+    if let Some(parent_session_id) = &parent_session_id {
+        validate_id("parent_session_id", parent_session_id)?;
+    }
+    if parent_session_generation.is_some() && parent_session_id.is_none() {
+        return Err(WorkflowStoreError::InvalidData(
+            "stored workflow run parent session generation requires parent_session_id".to_string(),
+        ));
+    }
     let authored_provenance: Option<AuthoredWorkflowRunProvenance> = authored_provenance_json
         .map(|value| serde_json::from_str(&value))
-        .transpose()?;
-    let binding = match (owner_plugin_id, workflow_kind, scope_key) {
-        (Some(owner_plugin_id), Some(workflow_kind), Some(scope_key)) => Some(WorkflowRunBinding {
-            owner_plugin_id,
-            workflow_kind,
-            scope_key,
-            display_label,
-            single_active,
-        }),
-        (None, None, None) => None,
-        _ => {
-            return Err(WorkflowStoreError::InvalidData(
-                "stored workflow run has an incomplete binding".to_string(),
-            ));
-        }
-    };
+        .transpose()
+        .map_err(|_| {
+            WorkflowStoreError::InvalidData(
+                "stored workflow run authored provenance JSON is malformed".to_string(),
+            )
+        })?;
+    let binding = parse_run_binding(
+        owner_plugin_id,
+        workflow_kind,
+        scope_key,
+        display_label,
+        single_active,
+    )?;
     if let Some(provenance) = &authored_provenance
         && (provenance.version != AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION
             || provenance.revision == 0
@@ -12634,6 +12737,17 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
             "stored authored workflow run provenance is inconsistent".to_string(),
         ));
     }
+    let authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity =
+        serde_json::from_str(&authorization_profile_json).map_err(|_| {
+            WorkflowStoreError::InvalidData(
+                "stored workflow run authorization profile JSON is malformed".to_string(),
+            )
+        })?;
+    authorization_profile.validate().map_err(|_| {
+        WorkflowStoreError::InvalidData(
+            "stored workflow run authorization profile is invalid".to_string(),
+        )
+    })?;
     Ok(WorkflowRunSummary {
         run_id,
         definition_id,
@@ -12645,7 +12759,7 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         authored_provenance,
         terminal_output_id,
         terminal_output_checksum_sha256,
-        authorization_profile: serde_json::from_str(&authorization_profile_json)?,
+        authorization_profile,
         authorization_ceiling: parse_workflow_capability(&authorization_ceiling)?,
         status: parse_run_status(&status)?,
         cancellation_requested_at_ms,
@@ -12671,9 +12785,9 @@ fn parse_workflow_capability(
         "disabled" => Ok(bcode_workflow::WorkflowToolCapability::Disabled),
         "read_only" => Ok(bcode_workflow::WorkflowToolCapability::ReadOnly),
         "mutating" => Ok(bcode_workflow::WorkflowToolCapability::Mutating),
-        _ => Err(WorkflowStoreError::InvalidData(format!(
-            "unknown workflow authorization ceiling: {capability}"
-        ))),
+        _ => Err(WorkflowStoreError::InvalidData(
+            "unknown workflow authorization ceiling".to_string(),
+        )),
     }
 }
 
@@ -12685,9 +12799,9 @@ fn parse_run_status(status: &str) -> Result<RunStatus, WorkflowStoreError> {
         "failed" => Ok(RunStatus::Failed),
         "cancelled" => Ok(RunStatus::Cancelled),
         "repair_required" => Ok(RunStatus::RepairRequired),
-        _ => Err(WorkflowStoreError::InvalidData(format!(
-            "unknown workflow run status: {status}"
-        ))),
+        _ => Err(WorkflowStoreError::InvalidData(
+            "unknown workflow run status".to_string(),
+        )),
     }
 }
 
@@ -12707,13 +12821,13 @@ type RawAttemptSummary = (
 
 fn attempt_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAttemptSummary> {
     Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
+        bounded_run_text_from_row(row, 0, MAX_ID_BYTES)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, 1, MAX_ID_BYTES)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, 2, MAX_ID_BYTES)?.unwrap_or_default(),
         row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
+        bounded_run_text_from_row(row, 4, MAX_ID_BYTES)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, 5, MAX_ID_BYTES)?.unwrap_or_default(),
+        bounded_run_text_from_row(row, 6, MAX_ID_BYTES)?.unwrap_or_default(),
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
@@ -12725,9 +12839,9 @@ fn parse_side_effect(side_effect: &str) -> Result<DispatchSideEffect, WorkflowSt
     match side_effect {
         "read_only" => Ok(DispatchSideEffect::ReadOnly),
         "mutating" => Ok(DispatchSideEffect::Mutating),
-        _ => Err(WorkflowStoreError::InvalidData(format!(
-            "unknown workflow side effect: {side_effect}"
-        ))),
+        _ => Err(WorkflowStoreError::InvalidData(
+            "unknown workflow side effect".to_string(),
+        )),
     }
 }
 
@@ -12745,7 +12859,34 @@ fn parse_attempt_summary(raw: RawAttemptSummary) -> Result<AttemptSummary, Workf
         admitted_at_ms,
         terminal_at_ms,
     ) = raw;
+    validate_id("run_id", &run_id)?;
+    validate_id("node_id", &node_id)?;
+    validate_id("activation_id", &activation_id)?;
+    validate_id("dispatch_identity", &dispatch_identity)?;
+    if attempt == 0 {
+        return Err(WorkflowStoreError::InvalidData(
+            "stored workflow attempt number must be positive".to_string(),
+        ));
+    }
     let side_effect = parse_side_effect(&side_effect)?;
+    if !matches!(
+        status.as_str(),
+        "prepared"
+            | "admitted"
+            | "running"
+            | "cancelling"
+            | "sibling_cancelling"
+            | "succeeded"
+            | "failed"
+            | "cancelled"
+            | "repair_required"
+            | "paused"
+            | "abandoned"
+    ) {
+        return Err(WorkflowStoreError::InvalidData(
+            "unknown workflow attempt status".to_string(),
+        ));
+    }
     Ok(AttemptSummary {
         run_id,
         node_id,
@@ -13637,9 +13778,12 @@ fn create_run_in_transaction(
         ));
     }
     for node_id in &definition.entries {
-        let node = definition.nodes.get(node_id).ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!("workflow entry node is missing: {node_id}"))
-        })?;
+        let node =
+            run_graph::initial_node(transaction, &run.run_id, node_id)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow entry node is missing: {node_id}"
+                ))
+            })?;
         let entry_input = run.input.clone().unwrap_or(serde_json::Value::Null);
         validate_json_schema(
             &format!("workflow entry input for node {node_id}"),
@@ -13655,7 +13799,7 @@ fn create_run_in_transaction(
             created_at_ms: run.created_at_ms,
         };
         validate_activation(&activation)?;
-        insert_activation_with_status(transaction, &activation, activation_status_for_node(node))?;
+        insert_activation_with_status(transaction, &activation, activation_status_for_node(&node))?;
     }
     Ok(())
 }
@@ -17239,6 +17383,7 @@ mod tests {
             "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'review'",
             "UPDATE workflow_run_graphs SET revision = 2",
             "DELETE FROM workflow_run_graph_nodes WHERE node_id = 'review'",
+            "PRAGMA foreign_keys = OFF; DELETE FROM workflow_run_graphs WHERE run_id = 'run-1'; PRAGMA foreign_keys = ON;",
         ] {
             store
                 .connection
@@ -17246,16 +17391,62 @@ mod tests {
                 .expect("damage fixture");
             let before = store.connection.total_changes();
             assert!(prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10).is_err());
+            assert!(prepared_read_only_dispatches(&store.connection, 10).is_err());
             assert_eq!(store.connection.total_changes(), before);
             store
                 .connection
-                .execute_batch("UPDATE workflow_run_graphs SET revision = 1")
+                .execute_batch("INSERT INTO workflow_run_graphs (run_id, revision) VALUES ('run-1', 1) ON CONFLICT(run_id) DO UPDATE SET revision = 1")
                 .expect("restore revision");
             store.connection.execute(
                 "INSERT OR REPLACE INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 1, ?1, 1, 1)",
                 [serde_json::to_string(&definition("example").nodes["review"]).expect("node")],
             ).expect("restore node fixture");
         }
+    }
+
+    #[test]
+    fn prepared_recovery_preserves_missing_graph_header_after_reopen() {
+        let (temp, mut store) = initialized_store();
+        store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        store.connection.execute_batch(
+            "PRAGMA foreign_keys = OFF; DELETE FROM workflow_run_graphs WHERE run_id = 'run-1'; PRAGMA foreign_keys = ON;"
+        ).expect("missing header fixture");
+        drop(store);
+        let store =
+            WorkflowStore::open_in_state_dir(temp.path()).expect("reopen damaged current store");
+        let before = store.connection.total_changes();
+        assert!(prepared_read_only_dispatches(&store.connection, 10).is_err());
+        assert!(prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10).is_err());
+        let headers: u64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("header count");
+        assert_eq!(headers, 0);
+        let attempt_status: String = store.connection.query_row(
+            "SELECT status FROM workflow_attempts WHERE run_id = 'run-1' AND node_id = 'review'",
+            [], |row| row.get(0),
+        ).expect("preserved attempt");
+        let activation_status: String = store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'review'",
+            [], |row| row.get(0),
+        ).expect("preserved activation");
+        assert_eq!(attempt_status, "prepared");
+        assert_eq!(activation_status, "running");
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
@@ -20307,6 +20498,16 @@ mod tests {
     }
 
     #[test]
+    fn graph_migration_preserves_malformed_checksums() {
+        let plan = definition("example");
+        let payload = serde_json::to_string(&plan).expect("definition payload");
+        let uppercase = sha256_hex(payload.as_bytes()).to_ascii_uppercase();
+        for checksum in ["", "abc", &"g".repeat(64), &uppercase] {
+            verify_graph_migration_rejects_definition_checksum(&plan, true, Some(checksum));
+        }
+    }
+
+    #[test]
     fn graph_migration_preserves_oversized_checksums() {
         verify_graph_migration_rejects_definition_checksum(
             &definition("example"),
@@ -20665,32 +20866,134 @@ mod tests {
     }
 
     #[test]
-    fn graph_materialization_rejects_dangling_edges_atomically() {
+    fn graph_materialization_rejects_unsupported_versions_before_writes() {
         let (_temp, mut store) = initialized_store();
-        let mut plan = definition("broken");
-        plan.edges.push(bcode_workflow::EdgeDefinition {
-            from: plan.nodes.keys().next().expect("node").clone(),
-            to: "missing".to_string(),
-            kind: bcode_workflow::EdgeKind::Direct,
-            transform: None,
-        });
-        let before: u64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM workflow_run_graphs", [], |row| {
-                row.get(0)
-            })
-            .expect("count");
-        let transaction = store.connection.transaction().expect("transaction");
-        assert!(run_graph::materialize(&transaction, "run-1", &plan).is_err());
-        transaction.rollback().expect("rollback");
+        for version in [0, bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION + 1] {
+            let mut plan = definition("example");
+            plan.schema_version = version;
+            let transaction = store.connection.transaction().expect("transaction");
+            let before = transaction.total_changes();
+            assert!(
+                run_graph::materialize(&transaction, "run-1", &plan)
+                    .expect_err("unsupported version")
+                    .to_string()
+                    .contains("unsupported workflow definition schema version")
+            );
+            assert_eq!(transaction.total_changes(), before);
+            transaction.rollback().expect("rollback");
+        }
         assert_eq!(
             store
-                .connection
-                .query_row("SELECT COUNT(*) FROM workflow_run_graphs", [], |row| row
-                    .get::<_, u64>(0))
-                .expect("count"),
-            before
+                .run_graph_revision("run-1")
+                .expect("preserved revision"),
+            Some(1)
         );
+    }
+
+    #[test]
+    fn graph_materialization_rejects_mismatched_node_identity_before_writes() {
+        let (_temp, mut store) = initialized_store();
+        let mut plan = definition("example");
+        plan.nodes.values_mut().next().expect("node").id = "different-node".to_string();
+        let transaction = store.connection.transaction().expect("transaction");
+        let before = transaction.total_changes();
+        assert!(
+            run_graph::materialize(&transaction, "run-1", &plan)
+                .expect_err("mismatched identity")
+                .to_string()
+                .contains("node identity mismatch")
+        );
+        assert_eq!(transaction.total_changes(), before);
+        transaction.rollback().expect("rollback");
+    }
+
+    #[test]
+    fn graph_materialization_rejects_missing_boundaries_before_writes() {
+        let (_temp, mut store) = initialized_store();
+        for missing_entry in [true, false] {
+            let mut plan = definition("example");
+            if missing_entry {
+                plan.entries.push("missing".to_string());
+            } else {
+                plan.exits.push("missing".to_string());
+            }
+            let transaction = store.connection.transaction().expect("transaction");
+            let before = transaction.total_changes();
+            assert!(
+                run_graph::materialize(&transaction, "run-1", &plan)
+                    .expect_err("missing boundary")
+                    .to_string()
+                    .contains("boundary references a missing node")
+            );
+            assert_eq!(transaction.total_changes(), before);
+            transaction.rollback().expect("rollback");
+        }
+    }
+
+    #[test]
+    fn graph_materialization_rejects_dangling_edges_atomically() {
+        let (_temp, mut store) = initialized_store();
+        for missing_source in [true, false] {
+            let mut plan = definition("broken");
+            let existing = plan.nodes.keys().next().expect("node").clone();
+            let (from, to) = if missing_source {
+                ("missing".to_string(), existing)
+            } else {
+                (existing, "missing".to_string())
+            };
+            plan.edges.push(bcode_workflow::EdgeDefinition {
+                from,
+                to,
+                kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
+            });
+            let transaction = store.connection.transaction().expect("transaction");
+            let before = transaction.total_changes();
+            assert!(
+                run_graph::materialize(&transaction, "run-1", &plan)
+                    .expect_err("dangling edge")
+                    .to_string()
+                    .contains("edge references a missing node")
+            );
+            assert_eq!(transaction.total_changes(), before);
+            transaction.rollback().expect("rollback");
+        }
+    }
+
+    #[test]
+    fn graph_inspection_rejects_mismatched_payload_identity_without_mutation() {
+        let (temp, store) = initialized_store();
+        let record = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("initial node")
+            .remove(0);
+        let node_id = record.node.id.clone();
+        let mut node = record.node;
+        node.id = "different-node".to_string();
+        let payload = serde_json::to_string(&node).expect("encode node");
+        store.connection.execute(
+            "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'run-1' AND node_id = ?2",
+            rusqlite::params![payload, node_id],
+        ).expect("corrupt identity fixture");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen damaged graph");
+        let before = store.connection.total_changes();
+        let paged = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect_err("paged mismatch");
+        let exact = store
+            .run_graph_node_record("run-1", &node_id)
+            .expect_err("exact mismatch");
+        for error in [paged, exact] {
+            assert!(error.to_string().contains("node identity mismatch"));
+        }
+        assert_eq!(store.connection.total_changes(), before);
+        let preserved: String = store.connection.query_row(
+            "SELECT node_json FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = ?1",
+            [&node_id],
+            |row| row.get(0),
+        ).expect("preserved payload");
+        assert_eq!(preserved, payload);
     }
 
     #[test]
@@ -21009,6 +21312,43 @@ mod tests {
     }
 
     #[test]
+    fn graph_reads_reject_invalid_header_revisions_without_mutation() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("allow damaged fixture");
+        for revision in [
+            rusqlite::types::Value::Integer(0),
+            rusqlite::types::Value::Integer(-1),
+            rusqlite::types::Value::Real(1.5),
+            rusqlite::types::Value::Text("future".to_string()),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_run_graphs SET revision = ?1 WHERE run_id = 'run-1'",
+                    [&revision],
+                )
+                .expect("damage revision");
+            let before = store.connection.total_changes();
+            assert!(store.run_graph_revision("run-1").is_err());
+            assert!(store.run_graph_nodes("run-1", None, 1).is_err());
+            assert!(store.run_graph_edges("run-1", None, 1).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+            let preserved: rusqlite::types::Value = store
+                .connection
+                .query_row(
+                    "SELECT revision FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved revision");
+            assert_eq!(preserved, revision);
+        }
+    }
+
+    #[test]
     fn exact_graph_node_record_rejects_missing_or_future_graph_without_mutation() {
         for missing in [true, false] {
             let (_temp, store) = initialized_store();
@@ -21023,6 +21363,19 @@ mod tests {
             }).expect("damage graph header");
             let changes = store.connection.total_changes();
             assert!(store.run_graph_node_record("run-1", &node.node.id).is_err());
+            assert!(store.run_graph_nodes("run-1", None, 1).is_err());
+            assert!(store.run_graph_edges("run-1", None, 1).is_err());
+            assert!(store.run_graph_edge("run-1", 0).is_err());
+            assert!(
+                store
+                    .run_graph_incoming_edges("run-1", &node.node.id, None, 1)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .run_graph_outgoing_edges("run-1", &node.node.id, None, 1)
+                    .is_err()
+            );
             assert_eq!(store.connection.total_changes(), changes);
             let revision: Option<u64> = store
                 .connection
@@ -21301,7 +21654,7 @@ mod tests {
 
     #[test]
     fn outgoing_edge_pages_filter_sources_and_preserve_storage() {
-        let (_temp, store) = initialized_store();
+        let (temp, store) = initialized_store();
         let node = store
             .run_graph_nodes("run-1", None, 1)
             .expect("node")
@@ -21327,14 +21680,39 @@ mod tests {
             "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 205, 1, 'unrelated', ?1, 'invalid')",
             [&node.id],
         ).expect("unrelated source damage");
+        let first = store
+            .run_graph_outgoing_edges("run-1", &node.id, None, 100)
+            .expect("first page before reopen");
+        assert_eq!(first.len(), 100);
+        let mut cursor = first.last().map(|edge| edge.edge_id);
+        let mut ids = first
+            .into_iter()
+            .map(|record| {
+                assert_eq!(record.edge, edge);
+                record.edge_id
+            })
+            .collect::<Vec<_>>();
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen paged graph");
         let before = store.connection.total_changes();
-        let mut cursor = None;
-        let mut ids = Vec::new();
-        loop {
+        let resumed = store
+            .run_graph_outgoing_edges("run-1", &node.id, cursor, 100)
+            .expect("resumed page");
+        assert_eq!(resumed.len(), 100);
+        assert_eq!(resumed.first().expect("first resumed edge").edge_id, 100);
+        assert_eq!(resumed.last().expect("last resumed edge").edge_id, 199);
+        assert_eq!(
+            store
+                .run_graph_outgoing_edges("run-1", &node.id, cursor, 100)
+                .expect("retried page"),
+            resumed
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        for expected_len in [100, 5, 0] {
             let page = store
                 .run_graph_outgoing_edges("run-1", &node.id, cursor, usize::MAX)
                 .expect("page");
-            assert!(page.len() <= 100);
+            assert_eq!(page.len(), expected_len);
             if page.is_empty() {
                 break;
             }
@@ -21370,38 +21748,29 @@ mod tests {
     }
 
     #[test]
-    fn incoming_edge_pages_validate_inputs_even_for_missing_runs() {
+    fn edge_pages_validate_inputs_even_for_missing_runs() {
         let (_temp, store) = initialized_store();
         let before = store.connection.total_changes();
-        for run_id in ["run-1", "missing"] {
-            assert!(
-                store
-                    .run_graph_incoming_edges(run_id, "", None, 10)
-                    .is_err()
-            );
-            assert!(
-                store
-                    .run_graph_incoming_edges(run_id, "review", Some(u64::MAX), 10)
-                    .is_err()
-            );
-            assert!(
-                store
-                    .run_graph_incoming_edges(run_id, "missing", None, usize::MAX)
-                    .expect("absent target")
-                    .is_empty()
-            );
-            assert!(
-                store
-                    .run_graph_incoming_edges(run_id, "review", Some(i64::MAX as u64), 10)
-                    .expect("valid final cursor")
-                    .is_empty()
-            );
+        for query in [
+            WorkflowStore::run_graph_incoming_edges,
+            WorkflowStore::run_graph_outgoing_edges,
+        ] {
+            for run_id in ["run-1", "missing"] {
+                assert!(query(&store, run_id, "", None, 10).is_err());
+                assert!(query(&store, run_id, "review", Some(u64::MAX), 10).is_err());
+                assert!(
+                    query(&store, run_id, "missing", None, usize::MAX)
+                        .expect("absent endpoint")
+                        .is_empty()
+                );
+                assert!(
+                    query(&store, run_id, "review", Some(i64::MAX as u64), 10)
+                        .expect("valid final cursor")
+                        .is_empty()
+                );
+            }
+            assert!(query(&store, "", "review", None, 10).is_err());
         }
-        assert!(
-            store
-                .run_graph_incoming_edges("", "review", None, 10)
-                .is_err()
-        );
         assert_eq!(store.connection.total_changes(), before);
     }
 
@@ -21619,6 +21988,13 @@ mod tests {
             let before = store.connection.total_changes();
             assert!(store.run_graph_edge("run-1", 0).is_err());
             assert!(store.run_graph_edges("run-1", None, 1).is_err());
+            for limit in [1, 10] {
+                assert!(
+                    store
+                        .run_graph_outgoing_edges("run-1", &node.id, None, limit)
+                        .is_err()
+                );
+            }
             assert!(
                 store
                     .run_graph_incoming_edges("run-1", &node.id, None, 1)
@@ -21635,6 +22011,11 @@ mod tests {
         drop(store);
         let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen damaged edges");
         let before = reopened.connection.total_changes();
+        assert!(
+            reopened
+                .run_graph_outgoing_edges("run-1", &node.id, None, 1)
+                .is_err()
+        );
         assert!(reopened.run_graph_edge("run-1", 0).is_err());
         assert!(reopened.run_graph_edges("run-1", None, 1).is_err());
         assert!(
@@ -21953,16 +22334,29 @@ mod tests {
         assert!(store.run_graph_edge("run-1", 5).expect("gap").is_none());
         assert!(store.run_graph_edge("run-1", 0).is_err());
         assert_eq!(store.connection.total_changes(), before);
-        store
-            .connection
-            .execute(
-                "UPDATE workflow_run_graph_edges SET source_node_id = 'missing' WHERE edge_id = 10",
-                [],
-            )
-            .expect("damage requested relationship");
-        let before = store.connection.total_changes();
-        assert!(store.run_graph_edge("run-1", 10).is_err());
-        assert_eq!(store.connection.total_changes(), before);
+        for missing_source in [true, false] {
+            let (source, target) = if missing_source {
+                ("missing", node.id.as_str())
+            } else {
+                (node.id.as_str(), "missing")
+            };
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_run_graph_edges SET source_node_id = ?1, target_node_id = ?2 WHERE run_id = 'run-1' AND edge_id = 10",
+                    rusqlite::params![source, target],
+                )
+                .expect("damage requested relationship");
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .run_graph_edge("run-1", 10)
+                    .expect_err("inconsistent relationship")
+                    .to_string()
+                    .contains("edge relationships are inconsistent")
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
     }
 
     #[test]
@@ -22555,6 +22949,264 @@ mod tests {
             None
         );
         assert_eq!(transaction.total_changes(), before);
+
+        transaction
+            .execute(
+                "UPDATE workflow_run_graph_edges SET edge_json = 'invalid' \
+                 WHERE run_id = 'run-1' AND edge_id = 101",
+                [],
+            )
+            .expect("damage second page");
+        let before = transaction.total_changes();
+        assert!(
+            run_graph::initial_edge_between(&transaction, "run-1", "review", "absent").is_err()
+        );
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn exact_node_lookup_rejects_additional_future_revision_without_mutation() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes \
+                 (run_id, node_id, revision, node_json, is_entry, is_exit) \
+                 SELECT run_id, node_id, 2, node_json, is_entry, is_exit \
+                 FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review'",
+                [],
+            )
+            .expect("additional future revision");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.run_graph_node("run-1", "review"),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(matches!(
+            store.run_graph_nodes("run-1", Some("reviev"), 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn exact_node_lookup_rejects_future_node_revision_without_mutation() {
+        let (_temp, store) = initialized_store();
+        assert!(
+            store
+                .run_graph_node("run-1", "review")
+                .expect("node")
+                .is_some()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_nodes SET revision = 2 \
+                 WHERE run_id = 'run-1' AND node_id = 'review'",
+                [],
+            )
+            .expect("future node revision");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.run_graph_node("run-1", "review"),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(matches!(
+            store.run_graph_node_record("run-1", "review"),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(matches!(
+            store.run_graph_nodes("run-1", None, 100),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn edge_between_distinguishes_missing_graph_from_unknown_run() {
+        let (_temp, mut store) = initialized_store();
+        let transaction = store.connection.transaction().expect("transaction");
+        transaction
+            .execute_batch(
+                "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1';
+                 DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1';
+                 DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
+            )
+            .expect("remove graph");
+        let before = transaction.total_changes();
+        assert!(matches!(
+            run_graph::initial_edge_between(&transaction, "run-1", "review", "absent"),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(
+            run_graph::initial_edge_between(&transaction, "unknown-run", "review", "absent")
+                .expect("unknown run"),
+            None
+        );
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
+    fn edge_between_rejects_unsupported_revision_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        let transaction = store.connection.transaction().expect("transaction");
+        transaction
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("unsupported graph revision");
+        let before = transaction.total_changes();
+        for target in ["review", "absent"] {
+            assert!(matches!(
+                run_graph::initial_edge_between(&transaction, "run-1", "review", target),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        assert_eq!(transaction.total_changes(), before);
+        let revision: u64 = transaction
+            .query_row(
+                "SELECT revision FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved revision");
+        assert_eq!(revision, 2);
+    }
+
+    #[test]
+    fn edge_lookup_rejects_additional_endpoint_revision_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        let mut plan = definition("example");
+        let mut target = plan.nodes["review"].clone();
+        target.id = "target".to_string();
+        plan.nodes.insert(target.id.clone(), target);
+        plan.edges = vec![bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "target".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        }];
+        let transaction = store.connection.transaction().expect("transaction");
+        transaction
+            .execute_batch(
+                "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
+            )
+            .expect("replace graph");
+        run_graph::materialize(&transaction, "run-1", &plan).expect("materialize");
+        transaction.commit().expect("commit");
+        for endpoint in ["review", "target"] {
+            assert!(
+                store
+                    .run_graph_edge("run-1", 0)
+                    .expect("intact edge")
+                    .is_some()
+            );
+            let transaction = store.connection.transaction().expect("transaction");
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO workflow_run_graph_nodes \
+                 (run_id, node_id, revision, node_json, is_entry, is_exit) \
+                 SELECT run_id, node_id, 2, node_json, is_entry, is_exit \
+                 FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = ?1",
+                    [endpoint],
+                )
+                .expect("additional endpoint revision");
+            assert_eq!(inserted, 1);
+            let before = transaction.total_changes();
+            assert!(matches!(
+                run_graph::initial_edge_between(&transaction, "run-1", "review", "target"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                run_graph::initial_incoming_edges(&transaction, "run-1", "target", None),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                run_graph::initial_outgoing_edges(&transaction, "run-1", "review", None),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(transaction.total_changes(), before);
+            transaction.rollback().expect("restore endpoint");
+        }
+    }
+
+    #[test]
+    fn edge_lookup_rejects_additional_future_revision_at_page_boundary() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_edges \
+             (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) \
+             VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+                [serde_json::to_string(&edge).expect("edge payload")],
+            )
+            .expect("fixture edge");
+        let first = store.run_graph_edges("run-1", None, 1).expect("edge page");
+        let edge = first.first().expect("fixture edge");
+        let inserted = store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_edges \
+             (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) \
+             SELECT run_id, edge_id, 2, source_node_id, target_node_id, edge_json \
+             FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = ?1",
+                [edge.edge_id],
+            )
+            .expect("additional revision");
+        assert_eq!(inserted, 1);
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.run_graph_edges("run-1", None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(matches!(
+            store.run_graph_edge("run-1", edge.edge_id),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn edge_readers_reject_future_only_revision_without_mutation() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_edges \
+             (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) \
+             VALUES ('run-1', 0, 2, 'review', 'review', ?1)",
+                [serde_json::to_string(&edge).expect("edge payload")],
+            )
+            .expect("future-only edge");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.run_graph_edge("run-1", 0),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        for result in [
+            store.run_graph_edges("run-1", None, 1),
+            store.run_graph_incoming_edges("run-1", "review", None, 1),
+            store.run_graph_outgoing_edges("run-1", "review", None, 1),
+        ] {
+            assert!(matches!(result, Err(WorkflowStoreError::InvalidData(_))));
+        }
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
@@ -24598,6 +25250,59 @@ mod tests {
                 ..attempt
             })
             .expect("explicit retry");
+        let before = store.connection.total_changes();
+        let newest = store.attempt_history("run-1", None, 1).expect("retry page");
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].attempt, 2);
+        assert_eq!(newest[0].status, "prepared");
+        let cursor = super::AttemptCursor {
+            prepared_at_ms: newest[0].prepared_at_ms,
+            dispatch_identity: newest[0].dispatch_identity.clone(),
+        };
+        let older = store
+            .attempt_history("run-1", Some(&cursor), 1)
+            .expect("abandoned page");
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].dispatch_identity, identity);
+        assert_eq!(older[0].attempt, 1);
+        assert_eq!(older[0].status, "abandoned");
+        assert_eq!(older[0].terminal_at_ms, Some(22));
+        let end_cursor = super::AttemptCursor {
+            prepared_at_ms: older[0].prepared_at_ms,
+            dispatch_identity: older[0].dispatch_identity.clone(),
+        };
+        assert!(
+            store
+                .attempt_history("run-1", Some(&end_cursor), 1)
+                .expect("end of attempt history")
+                .is_empty()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store.connection.execute(
+            "UPDATE workflow_attempts SET status = 'unsupported_future_status' WHERE dispatch_identity = ?1",
+            [&newest[0].dispatch_identity],
+        ).expect("damaged newest attempt");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.attempt_history("run-1", None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        let preserved = store
+            .attempt_history("run-1", Some(&cursor), 1)
+            .expect("older page remains accessible");
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].dispatch_identity, identity);
+        assert_eq!(preserved[0].status, "abandoned");
+        let stored_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+                [&newest[0].dispatch_identity],
+                |row| row.get(0),
+            )
+            .expect("preserved unsupported status");
+        assert_eq!(stored_status, "unsupported_future_status");
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
@@ -26179,6 +26884,12 @@ mod tests {
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         let mut definition = definition("entry-validation");
         definition.input.schema = serde_json::json!({});
+        let mut first = definition.nodes["review"].clone();
+        first.id = "first".to_string();
+        first.input.schema = serde_json::json!({});
+        definition.nodes.insert(first.id.clone(), first);
+        definition.entries = vec!["first".to_string(), "review".to_string()];
+        definition.exits.push("first".to_string());
         definition
             .nodes
             .get_mut("review")
@@ -26223,6 +26934,1002 @@ mod tests {
                 .pending_activations(10)
                 .expect("activations")
                 .is_empty()
+        );
+        for table in [
+            "workflow_run_graphs",
+            "workflow_run_graph_nodes",
+            "workflow_run_graph_edges",
+        ] {
+            let count: u64 = store
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1"),
+                    ["entry-validation-run"],
+                    |row| row.get(0),
+                )
+                .expect("rolled-back graph rows");
+            assert_eq!(count, 0, "entry validation left rows in {table}");
+        }
+        let mut retry = new_run();
+        retry.run_id = "entry-validation-run".to_string();
+        retry.definition_id = "entry-validation".to_string();
+        retry.input = Some(serde_json::json!("valid"));
+        store.create_run(&retry).expect("retry after rollback");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen retry");
+        let activations = store.pending_activations(10).expect("retry activations");
+        assert_eq!(activations.len(), 2);
+        for activation in &activations {
+            assert_eq!(activation.input, retry.input);
+            assert_eq!(activation.run_id, retry.run_id);
+            assert_eq!(activation.dependency_generation, 0);
+        }
+        assert_eq!(
+            activations
+                .iter()
+                .map(|activation| activation.node_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["first", "review"])
+        );
+        assert_eq!(
+            store
+                .run_graph_nodes(&retry.run_id, None, 10)
+                .expect("retry graph")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejected_run_preserves_existing_run_and_graph_across_reopen() {
+        let (temp, mut store) = initialized_store();
+        let summary = store.run_summary("run-1").expect("existing run");
+        let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
+        let activations = store.pending_activations(100).expect("activations");
+        let mut plan = definition("invalid-entry");
+        plan.input.schema = serde_json::json!({});
+        let mut first = plan.nodes["review"].clone();
+        first.id = "first".to_string();
+        first.input.schema = serde_json::json!({});
+        plan.nodes.insert(first.id.clone(), first);
+        plan.entries = vec!["first".to_string(), "review".to_string()];
+        plan.exits.push("first".to_string());
+        plan.nodes.get_mut("review").expect("review").input.schema =
+            serde_json::json!({"type": "string"});
+        store
+            .persist_definition("invalid-entry", 1, &plan)
+            .expect("definition");
+        let mut rejected = new_run();
+        rejected.run_id = "rejected-run".to_string();
+        rejected.definition_id = "invalid-entry".to_string();
+        rejected.input = Some(serde_json::json!(42));
+        let error = store
+            .create_run(&rejected)
+            .expect_err("entry input must fail schema validation");
+        assert!(
+            matches!(&error, WorkflowStoreError::InvalidData(_)),
+            "unexpected rejection: {error}"
+        );
+        assert!(
+            error.to_string().contains("workflow entry input"),
+            "unexpected rejection: {error}"
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(store.run_summary("run-1").expect("existing run"), summary);
+        assert_eq!(
+            store.run_graph_nodes("run-1", None, 100).expect("nodes"),
+            nodes
+        );
+        assert_eq!(
+            store.pending_activations(100).expect("activations"),
+            activations
+        );
+        assert!(
+            store
+                .run_summary(&rejected.run_id)
+                .expect("rejected run")
+                .is_none()
+        );
+        assert!(
+            store
+                .run_graph_nodes(&rejected.run_id, None, 100)
+                .expect("rejected graph")
+                .is_empty()
+        );
+        rejected.input = Some(serde_json::json!("valid"));
+        store.create_run(&rejected).expect("retry after reopen");
+        let pending = store.pending_activations(100).expect("pending after retry");
+        assert_eq!(pending.len(), activations.len() + 2);
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|activation| activation.run_id == "run-1")
+                .cloned()
+                .collect::<Vec<_>>(),
+            activations
+        );
+        let retried = pending
+            .iter()
+            .filter(|activation| activation.run_id == rejected.run_id)
+            .collect::<Vec<_>>();
+        assert_eq!(retried.len(), 2);
+        assert_eq!(
+            retried
+                .iter()
+                .map(|activation| activation.node_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["first", "review"])
+        );
+        for activation in retried {
+            assert_eq!(activation.input, rejected.input);
+            assert_eq!(activation.dependency_generation, 0);
+        }
+    }
+
+    #[test]
+    fn idempotent_start_rejects_oversized_stored_json_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        for column in [
+            "input_json",
+            "authored_provenance_json",
+            "authorization_profile_json",
+        ] {
+            let original: Option<String> = store
+                .connection
+                .query_row(
+                    &format!("SELECT {column} FROM workflow_runs WHERE run_id = 'run-1'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("original value");
+            store.connection.execute(
+                &format!("UPDATE workflow_runs SET {column} = CAST(zeroblob(?1) AS TEXT) WHERE run_id = 'run-1'"),
+                [MAX_INLINE_JSON_BYTES + 1],
+            ).expect("oversized value");
+            let before = store.connection.total_changes();
+            assert!(
+                matches!(
+                    store.create_run_idempotent(&new_run()),
+                    Err(WorkflowStoreError::InvalidData(_))
+                ),
+                "accepted or misclassified {column}"
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    [b"null".as_slice()],
+                )
+                .expect("blob JSON fixture");
+            let before = store.connection.total_changes();
+            assert!(
+                matches!(
+                    store.create_run_idempotent(&new_run()),
+                    Err(WorkflowStoreError::InvalidData(_))
+                ),
+                "accepted blob {column}"
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    [original],
+                )
+                .expect("restore fixture");
+        }
+        assert!(
+            !store
+                .create_run_idempotent(&new_run())
+                .expect("valid duplicate")
+        );
+    }
+
+    #[test]
+    fn attempt_history_rejects_unrepresentable_cursor_timestamp() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        for prepared_at_ms in [0, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            let cursor = super::AttemptCursor {
+                prepared_at_ms,
+                dispatch_identity: "dispatch".to_string(),
+            };
+            let result = store.attempt_history("run-1", Some(&cursor), 1);
+            if i64::try_from(prepared_at_ms).is_ok() {
+                assert!(result.expect("representable cursor").is_empty());
+            } else {
+                assert!(matches!(result, Err(WorkflowStoreError::InvalidData(_))));
+            }
+        }
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn attempt_summary_validates_attempt_number_boundaries() {
+        let connection = rusqlite::Connection::open_in_memory().expect("connection");
+        for number in [0, 1, i64::from(u32::MAX)] {
+            let raw = connection.query_row(
+                "SELECT 'run', 'node', 'activation', ?1, 'dispatch', 'read_only', 'prepared', 0, 1, NULL, NULL",
+                [number],
+                super::attempt_summary_from_row,
+            ).expect("representable attempt fixture");
+            let result = super::parse_attempt_summary(raw);
+            if number == 0 {
+                assert!(matches!(result, Err(WorkflowStoreError::InvalidData(_))));
+            } else {
+                assert_eq!(i64::from(result.expect("positive attempt").attempt), number);
+            }
+        }
+        for number in [Some(-1), Some(i64::from(u32::MAX) + 1), None] {
+            assert!(connection.query_row(
+                "SELECT 'run', 'node', 'activation', ?1, 'dispatch', 'read_only', 'prepared', 0, 1, NULL, NULL",
+                [number],
+                super::attempt_summary_from_row,
+            ).is_err());
+        }
+        assert_eq!(connection.total_changes(), 0);
+    }
+
+    #[test]
+    fn attempt_summary_preserves_supported_statuses() {
+        let connection = rusqlite::Connection::open_in_memory().expect("connection");
+        for status in [
+            "prepared",
+            "admitted",
+            "running",
+            "cancelling",
+            "sibling_cancelling",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "repair_required",
+            "paused",
+            "abandoned",
+        ] {
+            let raw = connection.query_row(
+                "SELECT 'run', 'node', 'activation', 1, 'dispatch', 'read_only', ?1, 0, 1, NULL, NULL",
+                [status],
+                super::attempt_summary_from_row,
+            ).expect("supported status fixture");
+            let summary = super::parse_attempt_summary(raw).expect("supported status");
+            assert_eq!(summary.status, status);
+            assert_eq!(connection.total_changes(), 0);
+        }
+    }
+
+    #[test]
+    fn attempt_summary_rejects_unknown_status_without_exposing_payload() {
+        let connection = rusqlite::Connection::open_in_memory().expect("connection");
+        for value in [
+            rusqlite::types::Value::Text("secret-bearing-future-status".to_string()),
+            rusqlite::types::Value::Text("x".repeat(MAX_ID_BYTES + 1)),
+            rusqlite::types::Value::Blob(b"prepared".to_vec()),
+            rusqlite::types::Value::Null,
+        ] {
+            let raw = connection.query_row(
+                "SELECT 'run', 'node', 'activation', 1, 'dispatch', 'read_only', ?1, 0, 1, NULL, NULL",
+                [value],
+                super::attempt_summary_from_row,
+            ).expect("status fixture");
+            let error = super::parse_attempt_summary(raw).expect_err("reject status");
+            assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
+            assert!(!error.to_string().contains("secret-bearing"));
+            assert_eq!(connection.total_changes(), 0);
+        }
+    }
+
+    #[test]
+    fn attempt_summary_validates_stored_identities() {
+        let connection = rusqlite::Connection::open_in_memory().expect("connection");
+        for column in [0, 1, 2, 4] {
+            for value in [
+                rusqlite::types::Value::Text(String::new()),
+                rusqlite::types::Value::Text("x".repeat(MAX_ID_BYTES + 1)),
+                rusqlite::types::Value::Blob(b"identity".to_vec()),
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Text("x".repeat(MAX_ID_BYTES)),
+            ] {
+                let valid = matches!(&value, rusqlite::types::Value::Text(text) if text.len() == MAX_ID_BYTES);
+                let mut fields = [
+                    "'run'",
+                    "'node'",
+                    "'activation'",
+                    "1",
+                    "'dispatch'",
+                    "'read_only'",
+                    "'prepared'",
+                    "0",
+                    "1",
+                    "NULL",
+                    "NULL",
+                ];
+                fields[column] = "?1";
+                let raw = connection
+                    .query_row(
+                        &format!("SELECT {}", fields.join(", ")),
+                        [value],
+                        super::attempt_summary_from_row,
+                    )
+                    .expect("identity fixture");
+                let result = super::parse_attempt_summary(raw);
+                if valid {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(result, Err(WorkflowStoreError::InvalidData(_))));
+                }
+                assert_eq!(connection.total_changes(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn attempt_summary_rejects_invalid_side_effect_storage() {
+        let connection = rusqlite::Connection::open_in_memory().expect("connection");
+        for value in [
+            rusqlite::types::Value::Text("x".repeat(MAX_ID_BYTES + 1)),
+            rusqlite::types::Value::Blob(b"read_only".to_vec()),
+            rusqlite::types::Value::Null,
+        ] {
+            let raw = connection
+                .query_row(
+                    "SELECT 'run', 'node', 'activation', 1, 'dispatch', ?1, 'prepared', 0, 1, NULL, NULL",
+                    [value],
+                    super::attempt_summary_from_row,
+                )
+                .expect("read invalid fixture");
+            assert!(matches!(
+                super::parse_attempt_summary(raw),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(connection.total_changes(), 0);
+        }
+    }
+
+    #[test]
+    fn side_effect_parser_rejects_unknown_values_without_exposing_payload() {
+        let payload = "secret-bearing-untrusted-side-effect";
+        let error = super::parse_side_effect(payload).expect_err("reject unknown side effect");
+        assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
+        assert!(!error.to_string().contains(payload));
+        assert!(matches!(
+            super::parse_side_effect("read_only"),
+            Ok(DispatchSideEffect::ReadOnly)
+        ));
+        assert!(matches!(
+            super::parse_side_effect("mutating"),
+            Ok(DispatchSideEffect::Mutating)
+        ));
+    }
+
+    #[test]
+    fn run_summary_rejects_unknown_enums_without_exposing_payload() {
+        for column in ["status", "authorization_ceiling"] {
+            let (_temp, store) = initialized_store();
+            let payload = "secret-bearing-untrusted-enum";
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    [payload],
+                )
+                .expect("unknown enum fixture");
+            let before = store.connection.total_changes();
+            let error = store.run_summary("run-1").expect_err("reject unknown enum");
+            assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
+            assert!(!error.to_string().contains(payload));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_oversized_enums_without_mutation() {
+        for column in ["status", "authorization_ceiling"] {
+            let (_temp, store) = initialized_store();
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    ["x".repeat(MAX_ID_BYTES + 1)],
+                )
+                .expect("oversized enum fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.run_summary("run-1"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_blob_enums_without_mutation() {
+        for (column, value) in [
+            ("status", "pending"),
+            ("authorization_ceiling", "read_only"),
+        ] {
+            let (_temp, store) = initialized_store();
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    [value.as_bytes()],
+                )
+                .expect("blob enum fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.run_summary("run-1"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_blob_workspace_identity_without_mutation() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET workspace_snapshot = ?1 WHERE run_id = 'run-1'",
+                [b"valid-looking-workspace".as_slice()],
+            )
+            .expect("blob identity fixture");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.run_summary("run-1"),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_summary_preserves_maximum_length_workspace_and_parent_ids() {
+        let (temp, mut store) = initialized_store();
+        let mut request = new_run();
+        request.run_id = "maximum-identity-run".to_string();
+        request.workspace_snapshot = "w".repeat(MAX_ID_BYTES);
+        request.parent_session_id = Some("p".repeat(MAX_ID_BYTES));
+        request.parent_session_generation = Some(1);
+        store
+            .create_run(&request)
+            .expect("maximum-length identities");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen identities");
+        let before = store.connection.total_changes();
+        let summary = store
+            .run_summary(&request.run_id)
+            .expect("summary")
+            .expect("stored run");
+        assert_eq!(summary.workspace_snapshot, request.workspace_snapshot);
+        assert_eq!(summary.parent_session_id, request.parent_session_id);
+        assert_eq!(
+            summary.parent_session_generation,
+            request.parent_session_generation
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_summary_rejects_invalid_identity_without_mutation() {
+        for assignment in [
+            "workspace_snapshot = ''".to_string(),
+            "parent_session_id = ''".to_string(),
+            "workspace_snapshot = ' '".to_string(),
+            "parent_session_id = ' '".to_string(),
+            format!("workspace_snapshot = '{}'", "x".repeat(MAX_ID_BYTES + 1)),
+            format!("parent_session_id = '{}'", "x".repeat(MAX_ID_BYTES + 1)),
+        ] {
+            let (_temp, store) = initialized_store();
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {assignment} WHERE run_id = 'run-1'"),
+                    [],
+                )
+                .expect("invalid identity fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.run_summary("run-1"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_orphaned_parent_generation_without_mutation() {
+        let (_temp, store) = initialized_store();
+        store.connection.execute(
+            "UPDATE workflow_runs SET parent_session_id = NULL, parent_session_generation = 1 WHERE run_id = 'run-1'",
+            [],
+        ).expect("orphaned generation fixture");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.run_summary("run-1"),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_summary_rejects_invalid_authorization_identity_without_mutation() {
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("provider_id", serde_json::json!("")),
+            ("profile_id", serde_json::json!("")),
+            ("policy_digest_sha256", serde_json::json!("invalid")),
+        ] {
+            let (_temp, store) = initialized_store();
+            let mut profile =
+                serde_json::to_value(new_run().authorization_profile).expect("profile");
+            profile[field] = value;
+            store.connection.execute(
+                "UPDATE workflow_runs SET authorization_profile_json = ?1 WHERE run_id = 'run-1'",
+                [profile.to_string()],
+            ).expect("invalid identity fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.run_summary("run-1"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_oversized_valid_authorization_profile() {
+        let (_temp, store) = initialized_store();
+        let original: String = store
+            .connection
+            .query_row(
+                "SELECT authorization_profile_json FROM workflow_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valid profile JSON");
+        let at_limit = format!(
+            "{original}{}",
+            " ".repeat(MAX_INLINE_JSON_BYTES - original.len())
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET authorization_profile_json = ?1 WHERE run_id = 'run-1'",
+                [&at_limit],
+            )
+            .expect("profile at limit");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_summary("run-1")
+                .expect("exact-limit summary")
+                .is_some()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        let payload = format!("{at_limit} ");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET authorization_profile_json = ?1 WHERE run_id = 'run-1'",
+                [&payload],
+            )
+            .expect("padded profile");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.run_summary("run-1"),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET authorization_profile_json = ?1 WHERE run_id = 'run-1'",
+                [&original],
+            )
+            .expect("restore profile fixture");
+        assert!(
+            store
+                .run_summary("run-1")
+                .expect("restored summary")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn run_summary_rejects_oversized_json_without_mutation() {
+        for column in ["authored_provenance_json", "authorization_profile_json"] {
+            let (_temp, store) = initialized_store();
+            let payload = format!("\"{}\"", "x".repeat(MAX_INLINE_JSON_BYTES));
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    [&payload],
+                )
+                .expect("oversized JSON fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.run_summary("run-1"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_malformed_json_without_exposing_payload() {
+        for (column, message) in [
+            (
+                "authored_provenance_json",
+                "stored workflow run authored provenance JSON is malformed",
+            ),
+            (
+                "authorization_profile_json",
+                "stored workflow run authorization profile JSON is malformed",
+            ),
+        ] {
+            let (_temp, store) = initialized_store();
+            let payload = "{private-fixture-value";
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    [payload],
+                )
+                .expect("malformed JSON fixture");
+            let before = store.connection.total_changes();
+            let error = store
+                .run_summary("run-1")
+                .expect_err("malformed stored JSON");
+            assert!(matches!(error, WorkflowStoreError::InvalidData(actual) if actual == message));
+            assert_eq!(store.connection.total_changes(), before);
+            let preserved: String = store
+                .connection
+                .query_row(
+                    &format!("SELECT {column} FROM workflow_runs WHERE run_id = 'run-1'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved JSON");
+            assert_eq!(preserved, payload);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_invalid_complete_binding_without_mutation() {
+        for assignment in [
+            "owner_plugin_id = ''".to_string(),
+            "workflow_kind = ''".to_string(),
+            "scope_key = ''".to_string(),
+            "display_label = ' '".to_string(),
+            format!("owner_plugin_id = '{}'", "x".repeat(MAX_ID_BYTES + 1)),
+            format!("workflow_kind = '{}'", "x".repeat(MAX_ID_BYTES + 1)),
+            format!("scope_key = '{}'", "x".repeat(MAX_ID_BYTES + 1)),
+            format!(
+                "display_label = '{}'",
+                "x".repeat(MAX_DISPLAY_LABEL_BYTES + 1)
+            ),
+        ] {
+            let (_temp, mut store) = initialized_store();
+            let mut request = new_run();
+            request.run_id = "binding-validation".to_string();
+            request.binding = Some(WorkflowRunBinding {
+                owner_plugin_id: "test-plugin".to_string(),
+                workflow_kind: "test-kind".to_string(),
+                scope_key: "test-scope".to_string(),
+                display_label: Some("Valid label".to_string()),
+                single_active: false,
+            });
+            store.create_run(&request).expect("valid binding");
+            assert_eq!(
+                store
+                    .run_summary(&request.run_id)
+                    .expect("valid summary")
+                    .expect("stored run")
+                    .binding,
+                request.binding
+            );
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {assignment} WHERE run_id = ?1"),
+                    [&request.run_id],
+                )
+                .expect("invalid complete binding");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.run_summary(&request.run_id),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn run_summary_rejects_damaged_binding_without_mutation() {
+        for assignment in [
+            "single_active = -1",
+            "single_active = 2",
+            "single_active = 1",
+            "display_label = 'orphan'",
+        ] {
+            let (_temp, store) = initialized_store();
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {assignment} WHERE run_id = 'run-1'"),
+                    [],
+                )
+                .expect("damaged binding fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.run_summary("run-1"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn idempotent_start_rejects_invalid_single_active_values_without_mutation() {
+        for value in [-1_i64, 2, i64::MAX] {
+            let (_temp, mut store) = initialized_store();
+            let mut request = new_run();
+            request.run_id = "bound-flag-run".to_string();
+            request.binding = Some(WorkflowRunBinding {
+                owner_plugin_id: "test-plugin".to_string(),
+                workflow_kind: "test-kind".to_string(),
+                scope_key: "test-scope".to_string(),
+                display_label: None,
+                single_active: true,
+            });
+            assert!(
+                store
+                    .create_run_idempotent(&request)
+                    .expect("create bound run")
+            );
+            assert!(
+                !store
+                    .create_run_idempotent(&request)
+                    .expect("valid bound duplicate")
+            );
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET single_active = ?1 WHERE run_id = 'bound-flag-run'",
+                    [value],
+                )
+                .expect("invalid flag fixture");
+            let before = store.connection.total_changes();
+            let error = store
+                .create_run_idempotent(&request)
+                .expect_err("invalid flag");
+            assert!(matches!(error, WorkflowStoreError::InvalidData(message)
+                if message == "stored workflow run single-active flag is invalid"));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn idempotent_start_rejects_orphaned_binding_metadata_without_mutation() {
+        for assignment in ["display_label = 'orphan'", "single_active = 1"] {
+            let (temp, store) = initialized_store();
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {assignment} WHERE run_id = 'run-1'"),
+                    [],
+                )
+                .expect("orphaned binding fixture");
+            drop(store);
+            let mut store =
+                WorkflowStore::open_in_state_dir(temp.path()).expect("reopen damaged binding");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.create_run_idempotent(&new_run()),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+            let preserved: bool = store
+                .connection
+                .query_row(
+                    &format!("SELECT {assignment} FROM workflow_runs WHERE run_id = 'run-1'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved binding metadata");
+            assert!(preserved);
+            store.connection.execute(
+                "UPDATE workflow_runs SET display_label = NULL, single_active = 0 WHERE run_id = 'run-1'",
+                [],
+            ).expect("restore fixture");
+            assert!(
+                !store
+                    .create_run_idempotent(&new_run())
+                    .expect("restored duplicate")
+            );
+        }
+    }
+
+    #[test]
+    fn idempotent_start_rejects_malformed_json_text_without_mutation() {
+        for column in ["input_json", "authored_provenance_json"] {
+            let (_temp, mut store) = initialized_store();
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE workflow_runs SET {column} = ?1 WHERE run_id = 'run-1'"),
+                    ["{broken"],
+                )
+                .expect("malformed fixture");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.create_run_idempotent(&new_run()),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn idempotent_start_rejects_future_graph_revision_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        let summary = store.run_summary("run-1").expect("summary");
+        let pending = store.pending_activations(100).expect("pending");
+        for revision in [2_u64, i64::MAX.unsigned_abs()] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_run_graphs SET revision = ?1 WHERE run_id = 'run-1'",
+                    [revision],
+                )
+                .expect("future revision");
+            let before = store.connection.total_changes();
+            let error = store
+                .create_run_idempotent(&new_run())
+                .expect_err("future graph");
+            assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
+            assert_eq!(store.connection.total_changes(), before);
+            assert_eq!(
+                run_graph::graph_revision(&store.connection, "run-1").expect("preserved revision"),
+                Some(revision)
+            );
+            assert_eq!(store.run_summary("run-1").expect("summary"), summary);
+            assert!(store.pending_activations(100).is_err());
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 1 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("restore fixture revision");
+        assert_eq!(store.pending_activations(100).expect("pending"), pending);
+    }
+
+    #[test]
+    fn idempotent_start_rejects_malformed_graph_revision_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        let summary = store.run_summary("run-1").expect("summary");
+        // Simulate externally damaged storage, including values excluded by current constraints.
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("allow damaged fixture");
+        for revision in [
+            rusqlite::types::Value::Integer(0),
+            rusqlite::types::Value::Integer(-1),
+            rusqlite::types::Value::Real(1.5),
+            rusqlite::types::Value::Text("unknown".to_string()),
+            rusqlite::types::Value::Blob(vec![1]),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_run_graphs SET revision = ?1 WHERE run_id = 'run-1'",
+                    [&revision],
+                )
+                .expect("damage header");
+            let before = store.connection.total_changes();
+            assert!(matches!(
+                store.create_run_idempotent(&new_run()),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_revision("run-1"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_nodes("run-1", None, 10),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_node("run-1", "review"),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_edges("run-1", None, 10),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_edge("run-1", 0),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_incoming_edges("run-1", "review", None, 10),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_outgoing_edges("run-1", "review", None, 10),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert_eq!(store.connection.total_changes(), before);
+            let preserved: rusqlite::types::Value = store
+                .connection
+                .query_row(
+                    "SELECT revision FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved header");
+            assert_eq!(preserved, revision);
+            assert_eq!(store.run_summary("run-1").expect("summary"), summary);
+        }
+    }
+
+    #[test]
+    fn idempotent_start_rejects_missing_graph_without_repair() {
+        let (_temp, mut store) = initialized_store();
+        let run = new_run();
+        assert!(!store.create_run_idempotent(&run).expect("duplicate"));
+        store
+            .connection
+            .execute_batch(
+                "DELETE FROM workflow_run_graph_edges WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
+            )
+            .expect("damage graph");
+        let before = store.connection.total_changes();
+        let error = store
+            .create_run_idempotent(&run)
+            .expect_err("missing graph");
+        assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .run_summary(&run.run_id)
+                .expect("run preserved")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn conflicting_start_preserves_admitted_run_across_reopen() {
+        let (temp, mut store) = initialized_store();
+        let pending = store.pending_activations(100).expect("pending");
+        let mut rejected = new_run();
+        let admitted_nodes = store
+            .run_graph_nodes(&rejected.run_id, None, 100)
+            .expect("admitted graph");
+        assert!(!admitted_nodes.is_empty());
+        let admitted_summary = store.run_summary(&rejected.run_id).expect("admitted run");
+        rejected.input = Some(serde_json::json!("conflicting duplicate"));
+        assert!(store.create_run(&rejected).is_err());
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen duplicate");
+        assert_eq!(store.pending_activations(100).expect("pending"), pending);
+        assert_eq!(
+            store.run_summary(&rejected.run_id).expect("admitted run"),
+            admitted_summary
+        );
+        assert_eq!(
+            store
+                .run_graph_nodes(&rejected.run_id, None, 100)
+                .expect("admitted graph"),
+            admitted_nodes
         );
     }
 

@@ -4909,11 +4909,11 @@ pub(crate) mod tests {
         )
         .await
         .expect("cancelled complete backfill");
+        drop(state);
 
         assert_eq!(response.provider_ids, vec![FAST_PROVIDER_ID.to_owned()]);
         assert!(response.cancelled);
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
-        drop(state);
     }
 
     #[tokio::test]
@@ -4950,6 +4950,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("backfill returns terminal cancellation progress");
+        drop(state);
 
         assert!(SLOW_APPLY_STARTED.load(Ordering::SeqCst));
         assert!(SLOW_APPLY_CANCELLED.load(Ordering::SeqCst));
@@ -4961,7 +4962,6 @@ pub(crate) mod tests {
             SessionSearchBackfillOutcome::Incomplete
         );
         assert!(response.sessions[0].error.is_none());
-        drop(state);
     }
 
     #[tokio::test]
@@ -5007,6 +5007,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("backfill returns terminal caller-cancellation progress");
+        drop(state);
         cancel_task.await.expect("cancellation task");
 
         assert!(SLOW_APPLY_CANCELLED.load(Ordering::SeqCst));
@@ -5014,7 +5015,6 @@ pub(crate) mod tests {
         assert!(!response.deadline_reached);
         let error = response.sessions[0].error.as_ref().expect("cancel error");
         assert!(error.retryable);
-        drop(state);
     }
 
     #[tokio::test]
@@ -5126,6 +5126,7 @@ pub(crate) mod tests {
             )
             .await
             .expect("failure remains a typed aggregate result");
+            drop(state);
             let provider = &response.providers[0];
             assert_eq!(provider.completed_sessions, 0, "{expected}");
             assert_eq!(provider.incomplete_sessions, 0, "{expected}");
@@ -5134,7 +5135,6 @@ pub(crate) mod tests {
                 provider.error.is_none(),
                 "session-local failure is retained"
             );
-            drop(state);
         }
     }
 
@@ -5190,6 +5190,7 @@ pub(crate) mod tests {
         )
         .await
         .expect_err("checkpoint ahead of canonical tail must fail closed");
+        drop(state);
 
         assert!(!error.retryable_error());
         assert!(
@@ -5198,7 +5199,6 @@ pub(crate) mod tests {
                 .contains("ahead of the canonical session tail")
         );
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
-        drop(state);
     }
 
     #[tokio::test]
@@ -5250,6 +5250,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("backfill returns categorized historical result");
+        drop(state);
 
         assert_eq!(response.failed_sessions, 1);
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
@@ -5260,7 +5261,6 @@ pub(crate) mod tests {
         assert_eq!(error.code, SearchErrorCode::MigrationRequired);
         assert!(!error.retryable);
         assert!(error.message.contains("explicit migration"));
-        drop(state);
     }
 
     #[tokio::test]
@@ -5394,6 +5394,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("backfill returns explicit per-session repair overlap result");
+        drop(state);
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
         assert_eq!(response.failed_sessions, 1);
@@ -5401,7 +5402,6 @@ pub(crate) mod tests {
         assert!(error.retryable);
         assert!(error.message.contains("maintenance") || error.message.contains("owned"));
         drop(maintenance);
-        drop(state);
     }
 
     #[tokio::test]
@@ -5450,6 +5450,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("selected backfill");
+        drop(state);
 
         assert_eq!(response.selected_sessions, 1);
         assert_eq!(response.sessions.len(), 1);
@@ -5460,7 +5461,6 @@ pub(crate) mod tests {
         assert!(!response.selection_truncated);
         assert!(response.next_cursor.is_none());
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
-        drop(state);
     }
 
     #[tokio::test]
@@ -5517,6 +5517,7 @@ pub(crate) mod tests {
         process_dirty_sessions(&state).await;
         let elapsed = started.elapsed();
         let pending = state.session_search_dirty.snapshot().await.0;
+        drop(state);
         assert!(pending.is_empty());
         let calls = APPLY_BATCH_CALLS.load(Ordering::SeqCst);
         assert!(calls >= sessions);
@@ -5526,7 +5527,6 @@ pub(crate) mod tests {
             elapsed.as_micros(),
             (sessions * events) as u128 * 1_000_000 / elapsed.as_micros().max(1)
         );
-        drop(state);
     }
 
     #[tokio::test]
@@ -5743,13 +5743,13 @@ pub(crate) mod tests {
             )
             .await
             .expect("structured inspection");
+        drop(state);
         assert!(
             inspection
                 .events
                 .iter()
                 .any(|event| event.sequence == appended.sequence)
         );
-        drop(state);
     }
 
     #[tokio::test]
@@ -5760,6 +5760,7 @@ pub(crate) mod tests {
             (FUTURE_PROVIDER_ID, TestProviderBehavior::FutureStatus),
         ]);
         let inventory = list_providers(&state).await;
+        drop(state);
         assert_eq!(inventory.providers.len(), 1);
         assert_eq!(inventory.providers[0].plugin_id, FAST_PROVIDER_ID);
         assert_eq!(inventory.failures.len(), 1);
@@ -5769,7 +5770,6 @@ pub(crate) mod tests {
             SearchErrorCode::FutureVersion
         );
         assert!(!inventory.failures[0].error.retryable);
-        drop(state);
     }
 
     #[tokio::test]
@@ -5783,6 +5783,7 @@ pub(crate) mod tests {
             ),
         ]);
         let inventory = list_providers(&state).await;
+        drop(state);
         assert_eq!(inventory.providers.len(), 1);
         assert_eq!(inventory.providers[0].plugin_id, FAST_PROVIDER_ID);
         assert_eq!(inventory.failures.len(), 1);
@@ -5795,7 +5796,6 @@ pub(crate) mod tests {
             SearchErrorCode::FutureVersion
         );
         assert!(!inventory.failures[0].error.retryable);
-        drop(state);
     }
 
     #[tokio::test]
@@ -5821,6 +5821,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("federated search");
+        drop(state);
         assert_eq!(response.hits.len(), 1);
         assert_eq!(response.hits[0].provider_id, FAST_PROVIDER_ID);
         assert!(response.failures.iter().any(|failure| {
@@ -5830,7 +5831,6 @@ pub(crate) mod tests {
         }));
         assert!(!response.query_complete);
         assert!(!response.coverage_complete);
-        drop(state);
     }
 
     #[tokio::test]
@@ -5859,6 +5859,7 @@ pub(crate) mod tests {
         let terminal = serde_json::to_vec(&response).expect("terminal response encodes");
 
         wait_for_slow_provider_to_finish().await;
+        drop(state);
 
         assert!(SLOW_SEARCH_CANCELLED.load(Ordering::SeqCst));
         assert!(SLOW_SEARCH_FINISHED.load(Ordering::SeqCst));
@@ -5875,7 +5876,6 @@ pub(crate) mod tests {
         );
         assert!(!response.query_complete);
         assert!(!response.coverage_complete);
-        drop(state);
     }
 
     #[test]
