@@ -2236,12 +2236,98 @@ pub enum ModelResponseCacheStatus {
     },
 }
 
+/// Opaque ownership identity for one cache miss. Clones identify the same acquisition.
+#[derive(Debug, Clone)]
+pub struct ModelResponseCacheReservation(Arc<()>);
+
+impl ModelResponseCacheReservation {
+    /// Allocate a distinct reservation identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    /// Whether both tokens identify the same acquisition.
+    #[must_use]
+    pub fn same_acquisition(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Default for ModelResponseCacheReservation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Future returned by a cache adapter's nonblocking lookup path.
+pub type ModelResponseCacheLookupFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<GenerateTextResponse>>> + Send + 'a>,
+>;
+
 /// Application-owned cache adapter for completed non-streaming model responses.
 ///
 /// The adapter owns cache-key construction, expiration, capacity, and storage. It receives the
 /// complete post-middleware request, so keys can include provider/model selection, messages,
 /// parameters, tools, structured-output schema, and metadata as appropriate.
+///
+/// SDK generation uses the reservation-aware methods. Their defaults preserve legacy adapter
+/// behavior; adapters requiring stale-owner protection must implement all three reserved methods.
+/// Unreserved `get`/`put`/`abort` calls retain legacy semantics and must not be mixed with
+/// reservation-aware operations for the same key.
 pub trait ModelResponseCache: Send + Sync {
+    /// Optionally perform reservation-aware lookup without a blocking worker.
+    ///
+    /// The SDK prefers this path when provided. Returning `None` preserves the legacy
+    /// blocking adapter. The SDK owns a reservation guard before polling and calls
+    /// `abort_reserved` if lookup fails or is abandoned. Adapters must make that abort
+    /// safe when no miss was acquired, and must not retain a reservation on a hit.
+    /// Direct callers own the same cleanup obligation.
+    /// Errors returned by the future describe lookup or ownership failures.
+    fn get_reserved_async<'a>(
+        &'a self,
+        _request: &'a AgentTurnRequest,
+        _reservation: &'a ModelResponseCacheReservation,
+    ) -> Option<ModelResponseCacheLookupFuture<'a>> {
+        None
+    }
+
+    /// Look up a response, associating a miss with the supplied ownership token.
+    ///
+    /// Legacy adapters delegate to `get` and retain their existing unfenced semantics.
+    /// # Errors
+    /// Returns cache lookup errors.
+    fn get_reserved(
+        &self,
+        request: &AgentTurnRequest,
+        _reservation: &ModelResponseCacheReservation,
+    ) -> Result<Option<GenerateTextResponse>> {
+        self.get(request)
+    }
+
+    /// Complete an owned miss. Fenced adapters reject revoked or replaced owners.
+    ///
+    /// Legacy adapters delegate to `put`.
+    /// # Errors
+    /// Returns storage or reservation ownership errors.
+    fn put_reserved(
+        &self,
+        request: &AgentTurnRequest,
+        response: &GenerateTextResponse,
+        _reservation: &ModelResponseCacheReservation,
+    ) -> Result<()> {
+        self.put(request, response)
+    }
+
+    /// Release only the supplied acquisition. Legacy adapters delegate to `abort`.
+    fn abort_reserved(
+        &self,
+        request: &AgentTurnRequest,
+        _reservation: &ModelResponseCacheReservation,
+    ) {
+        self.abort(request);
+    }
+
     /// Return a cached response for this request, or `None` on a cache miss.
     ///
     /// # Errors
@@ -2303,12 +2389,14 @@ pub struct InMemoryModelResponseCache {
     allow_tool_responses: bool,
     state: Mutex<InMemoryCacheState>,
     changed: Condvar,
+    changed_async: tokio::sync::Notify,
 }
 
 #[derive(Debug, Default)]
 struct InMemoryCacheState {
     entries: BTreeMap<ModelResponseCacheKey, InMemoryCacheEntry>,
     in_flight: BTreeMap<ModelResponseCacheKey, Instant>,
+    reservations: BTreeMap<ModelResponseCacheKey, ModelResponseCacheReservation>,
     next_sequence: u64,
 }
 
@@ -2337,6 +2425,7 @@ impl InMemoryModelResponseCache {
             allow_tool_responses: false,
             state: Mutex::new(InMemoryCacheState::default()),
             changed: Condvar::new(),
+            changed_async: tokio::sync::Notify::new(),
         }
     }
 
@@ -2370,8 +2459,10 @@ impl InMemoryModelResponseCache {
             .map_err(|error| BcodeError::Cache(error.to_string()))?;
         state.entries.clear();
         state.in_flight.clear();
+        state.reservations.clear();
         drop(state);
         self.changed.notify_all();
+        self.changed_async.notify_waiters();
         Ok(())
     }
 
@@ -2381,11 +2472,140 @@ impl InMemoryModelResponseCache {
 }
 
 impl ModelResponseCache for InMemoryModelResponseCache {
+    fn get_reserved_async<'a>(
+        &'a self,
+        request: &'a AgentTurnRequest,
+        reservation: &'a ModelResponseCacheReservation,
+    ) -> Option<ModelResponseCacheLookupFuture<'a>> {
+        Some(Box::pin(async move {
+            loop {
+                // Register before inspecting state so completion cannot be lost between
+                // observing a leader and awaiting its notification.
+                let notified = self.changed_async.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                match self.lookup_step(request, Some(reservation), false)? {
+                    CacheLookupStep::Ready(response) => {
+                        return Ok(response.map(|response| *response));
+                    }
+                    CacheLookupStep::Wait(wait) => {
+                        switchy::unsync::select! {
+                            biased;
+                            () = request.cancellation.cancelled() => return Err(BcodeError::Runtime(RuntimeError::Cancelled)),
+                            () = notified => {},
+                            () = switchy::unsync::time::sleep(wait) => {},
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
     fn allow_tool_responses(&self) -> bool {
         self.allow_tool_responses
     }
 
     fn get(&self, request: &AgentTurnRequest) -> Result<Option<GenerateTextResponse>> {
+        self.lookup(request, None)
+    }
+
+    fn get_reserved(
+        &self,
+        request: &AgentTurnRequest,
+        reservation: &ModelResponseCacheReservation,
+    ) -> Result<Option<GenerateTextResponse>> {
+        self.lookup(request, Some(reservation))
+    }
+
+    fn put_reserved(
+        &self,
+        request: &AgentTurnRequest,
+        response: &GenerateTextResponse,
+        reservation: &ModelResponseCacheReservation,
+    ) -> Result<()> {
+        self.store_response(request, response, Some(reservation))
+    }
+
+    fn abort_reserved(
+        &self,
+        request: &AgentTurnRequest,
+        reservation: &ModelResponseCacheReservation,
+    ) {
+        let Ok(key) = Self::key(request) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock()
+            && state
+                .reservations
+                .get(&key)
+                .is_some_and(|owner| owner.same_acquisition(reservation))
+        {
+            state.reservations.remove(&key);
+            state.in_flight.remove(&key);
+            drop(state);
+            self.changed.notify_all();
+            self.changed_async.notify_waiters();
+        }
+    }
+
+    fn put(&self, request: &AgentTurnRequest, response: &GenerateTextResponse) -> Result<()> {
+        self.store_response(request, response, None)
+    }
+
+    fn abort(&self, request: &AgentTurnRequest) {
+        let Ok(key) = Self::key(request) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            // Unowned legacy operations cannot release an owned acquisition.
+            if !state.reservations.contains_key(&key) {
+                state.in_flight.remove(&key);
+                drop(state);
+                self.changed.notify_all();
+                self.changed_async.notify_waiters();
+            }
+        }
+    }
+
+    fn invalidate(&self, request: &AgentTurnRequest) -> Result<()> {
+        let key = Self::key(request)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| BcodeError::Cache(error.to_string()))?;
+        state.entries.remove(&key);
+        state.in_flight.remove(&key);
+        state.reservations.remove(&key);
+        drop(state);
+        self.changed.notify_all();
+        self.changed_async.notify_waiters();
+        Ok(())
+    }
+}
+
+enum CacheLookupStep {
+    Ready(Option<Box<GenerateTextResponse>>),
+    Wait(Duration),
+}
+
+impl InMemoryModelResponseCache {
+    fn lookup(
+        &self,
+        request: &AgentTurnRequest,
+        reservation: Option<&ModelResponseCacheReservation>,
+    ) -> Result<Option<GenerateTextResponse>> {
+        match self.lookup_step(request, reservation, true)? {
+            CacheLookupStep::Ready(response) => Ok(response.map(|response| *response)),
+            CacheLookupStep::Wait(_) => unreachable!("blocking lookup waits internally"),
+        }
+    }
+
+    fn lookup_step(
+        &self,
+        request: &AgentTurnRequest,
+        reservation: Option<&ModelResponseCacheReservation>,
+        blocking: bool,
+    ) -> Result<CacheLookupStep> {
         let key = Self::key(request)?;
         let mut state = self
             .state
@@ -2398,7 +2618,9 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             let now = switchy::time::instant_now();
             if let Some(entry) = state.entries.get(&key) {
                 if entry.expires_at > now {
-                    return Ok(Some(entry.response.clone()));
+                    return Ok(CacheLookupStep::Ready(Some(Box::new(
+                        entry.response.clone(),
+                    ))));
                 }
                 state.entries.remove(&key);
             }
@@ -2411,18 +2633,34 @@ impl ModelResponseCache for InMemoryModelResponseCache {
                     state.in_flight.remove(&key);
                 }
                 if state.in_flight.len() >= self.capacity.get() {
-                    state.in_flight.retain(|_, deadline| *deadline > now);
+                    let revoked: Vec<_> = state
+                        .in_flight
+                        .iter()
+                        .filter(|(_, deadline)| **deadline <= now)
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    for expired_key in revoked {
+                        state.in_flight.remove(&expired_key);
+                        state.reservations.remove(&expired_key);
+                    }
                 }
                 if state.in_flight.len() >= self.capacity.get() {
                     return Err(BcodeError::Cache("cache miss capacity exhausted".into()));
                 }
+                state.reservations.remove(&key);
+                if let Some(reservation) = reservation {
+                    state.reservations.insert(key.clone(), reservation.clone());
+                }
                 state.in_flight.insert(key, expires);
-                return Ok(None);
+                return Ok(CacheLookupStep::Ready(None));
             }
             let wait = lease_expires
                 .expect("checked in-flight lease")
                 .saturating_duration_since(now)
                 .min(Duration::from_millis(50));
+            if !blocking {
+                return Ok(CacheLookupStep::Wait(wait));
+            }
             let (next_state, _) = self
                 .changed
                 .wait_timeout(state, wait)
@@ -2431,7 +2669,12 @@ impl ModelResponseCache for InMemoryModelResponseCache {
         }
     }
 
-    fn put(&self, request: &AgentTurnRequest, response: &GenerateTextResponse) -> Result<()> {
+    fn store_response(
+        &self,
+        request: &AgentTurnRequest,
+        response: &GenerateTextResponse,
+        reservation: Option<&ModelResponseCacheReservation>,
+    ) -> Result<()> {
         let key = Self::key(request)?;
         let mut state = self
             .state
@@ -2439,6 +2682,24 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             .map_err(|error| BcodeError::Cache(error.to_string()))?;
         if request.cancellation.is_cancelled() {
             return Err(BcodeError::Runtime(RuntimeError::Cancelled));
+        }
+        let owns_reservation = reservation.map_or_else(
+            || !state.reservations.contains_key(&key),
+            |reservation| {
+                state
+                    .reservations
+                    .get(&key)
+                    .is_some_and(|owner| owner.same_acquisition(reservation))
+                    && state
+                        .in_flight
+                        .get(&key)
+                        .is_some_and(|expiry| *expiry > switchy::time::instant_now())
+            },
+        );
+        if !owns_reservation {
+            return Err(BcodeError::Cache(
+                "cache reservation is no longer owned".into(),
+            ));
         }
         let expires_at = switchy::time::instant_now()
             .checked_add(self.ttl)
@@ -2454,6 +2715,7 @@ impl ModelResponseCache for InMemoryModelResponseCache {
             },
         );
         state.in_flight.remove(&key);
+        state.reservations.remove(&key);
         while state.entries.len() > self.capacity.get() {
             let oldest = state
                 .entries
@@ -2466,30 +2728,7 @@ impl ModelResponseCache for InMemoryModelResponseCache {
         }
         drop(state);
         self.changed.notify_all();
-        Ok(())
-    }
-
-    fn abort(&self, request: &AgentTurnRequest) {
-        let Ok(key) = Self::key(request) else {
-            return;
-        };
-        if let Ok(mut state) = self.state.lock() {
-            state.in_flight.remove(&key);
-            drop(state);
-            self.changed.notify_all();
-        }
-    }
-
-    fn invalidate(&self, request: &AgentTurnRequest) -> Result<()> {
-        let key = Self::key(request)?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|error| BcodeError::Cache(error.to_string()))?;
-        state.entries.remove(&key);
-        state.in_flight.remove(&key);
-        drop(state);
-        self.changed.notify_all();
+        self.changed_async.notify_waiters();
         Ok(())
     }
 }
@@ -2570,6 +2809,7 @@ const fn pricing_source_label(source: ModelPricingSource) -> &'static str {
 struct ResponseCacheMiss {
     cache: Arc<dyn ModelResponseCache>,
     request: AgentTurnRequest,
+    reservation: ModelResponseCacheReservation,
     completed: bool,
 }
 
@@ -2579,7 +2819,8 @@ impl ResponseCacheMiss {
             return Err(BcodeError::Runtime(RuntimeError::Cancelled));
         }
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.cache.put(&self.request, response)
+            self.cache
+                .put_reserved(&self.request, response, &self.reservation)
         }))
         .map_err(|_| BcodeError::Cache("cache storage task failed".into()))??;
         self.completed = true;
@@ -2591,7 +2832,7 @@ impl Drop for ResponseCacheMiss {
     fn drop(&mut self) {
         if !self.completed
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.cache.abort(&self.request);
+                self.cache.abort_reserved(&self.request, &self.reservation);
             }))
             .is_err()
         {
@@ -2612,17 +2853,52 @@ async fn response_cache_get(
     if cancellation.is_cancelled() {
         return Err(BcodeError::Runtime(RuntimeError::Cancelled));
     }
+    let reservation = ModelResponseCacheReservation::new();
+    // Own cleanup before polling: a custom asynchronous adapter can acquire work
+    // and subsequently yield, fail, or panic.
+    let mut miss = ResponseCacheMiss {
+        cache: Arc::clone(&cache),
+        request: request.clone(),
+        reservation: reservation.clone(),
+        completed: false,
+    };
+    {
+        use futures::FutureExt as _;
+        let asynchronous = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.get_reserved_async(&request, &reservation)
+        }))
+        .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))?;
+        if let Some(lookup) = asynchronous {
+            let response = switchy::unsync::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(BcodeError::Runtime(RuntimeError::Cancelled)),
+                result = std::panic::AssertUnwindSafe(lookup).catch_unwind() => result
+                    .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))??,
+            };
+            if response.is_some() {
+                miss.completed = true;
+                return Ok((response, None));
+            }
+            return Ok((response, Some(miss)));
+        }
+    }
+    // No async operation was admitted. The blocking path owns its own miss guard.
+    miss.completed = true;
+    drop(miss);
     let lookup = switchy::unsync::task::spawn_blocking(move || {
         // The request may have been cancelled while this task waited for a worker.
         if request.cancellation.is_cancelled() {
             return Err(BcodeError::Runtime(RuntimeError::Cancelled));
         }
-        let response =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.get(&request)))
-                .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))??;
+        let reservation = ModelResponseCacheReservation::new();
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.get_reserved(&request, &reservation)
+        }))
+        .map_err(|_| BcodeError::Cache("cache lookup task failed".into()))??;
         let miss = response.is_none().then(|| ResponseCacheMiss {
             cache,
             request,
+            reservation,
             completed: false,
         });
         Ok((response, miss))

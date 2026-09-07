@@ -1951,14 +1951,131 @@ fn cancelled_cache_follower_exits_within_bounded_wait() {
     cache.abort(&leader);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_cache_follower_yields_and_wakes_on_owner_release() {
+    use futures::FutureExt as _;
+
+    for invalidate in [false, true] {
+        let cache = InMemoryModelResponseCache::new(
+            Duration::from_secs(60),
+            NonZeroUsize::new(2).expect("capacity"),
+        );
+        let request = AgentTurnRequest::new("model", "async follower");
+        let leader = bcode::ModelResponseCacheReservation::new();
+        let follower = bcode::ModelResponseCacheReservation::new();
+        assert!(
+            cache
+                .get_reserved_async(&request, &leader)
+                .expect("async lookup")
+                .await
+                .expect("leader miss")
+                .is_none()
+        );
+        let mut lookup = cache
+            .get_reserved_async(&request, &follower)
+            .expect("async follower");
+        assert!(
+            lookup.as_mut().now_or_never().is_none(),
+            "follower must yield on one-thread runtime"
+        );
+        if invalidate {
+            cache.invalidate(&request).expect("invalidate");
+        } else {
+            cache.abort_reserved(&request, &leader);
+        }
+        assert!(
+            lookup
+                .as_mut()
+                .now_or_never()
+                .expect("notification makes progress without advancing time")
+                .expect("replacement miss")
+                .is_none()
+        );
+        cache.abort_reserved(&request, &follower);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_cache_follower_cancellation_preserves_leader() {
+    use futures::FutureExt as _;
+
+    let cache = InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(2).expect("capacity"),
+    );
+    let request = AgentTurnRequest::new("model", "cancel follower");
+    let leader = bcode::ModelResponseCacheReservation::new();
+    assert!(
+        cache
+            .get_reserved_async(&request, &leader)
+            .expect("async lookup")
+            .await
+            .expect("miss")
+            .is_none()
+    );
+    let mut cancelled = request.clone();
+    cancelled.cancellation = bcode::CancellationToken::new();
+    let follower = bcode::ModelResponseCacheReservation::new();
+    let mut lookup = cache
+        .get_reserved_async(&cancelled, &follower)
+        .expect("async lookup");
+    assert!(lookup.as_mut().now_or_never().is_none());
+    cancelled.cancellation.cancel();
+    assert!(matches!(
+        lookup.await,
+        Err(bcode::BcodeError::Runtime(bcode::RuntimeError::Cancelled))
+    ));
+    cache.abort_reserved(&cancelled, &follower);
+    let next = bcode::ModelResponseCacheReservation::new();
+    let mut lookup = cache
+        .get_reserved_async(&request, &next)
+        .expect("async lookup");
+    assert!(
+        lookup.as_mut().now_or_never().is_none(),
+        "leader still owns reservation"
+    );
+    cache.abort_reserved(&request, &leader);
+    assert!(lookup.await.expect("replacement miss").is_none());
+    cache.abort_reserved(&request, &next);
+}
+
+#[tokio::test]
+async fn expired_owned_cache_completion_is_rejected() {
+    let cache = InMemoryModelResponseCache::new(
+        Duration::from_secs(60),
+        NonZeroUsize::new(2).expect("positive capacity"),
+    )
+    .with_single_flight_timeout(Duration::ZERO);
+    let request = AgentTurnRequest::new("model", "expired owner");
+    let old = bcode::ModelResponseCacheReservation::new();
+    let replacement = bcode::ModelResponseCacheReservation::new();
+    assert!(old.same_acquisition(&old.clone()));
+    assert!(!old.same_acquisition(&replacement));
+    assert!(cache.get_reserved(&request, &old).expect("miss").is_none());
+    let mut provider = CountingProvider::default();
+    let response = Agent::builder()
+        .build()
+        .generate_text_with_provider(&mut provider, "fixture response")
+        .await
+        .expect("response fixture");
+    assert!(cache.put_reserved(&request, &response, &old).is_err());
+    assert!(
+        cache
+            .get_reserved(&request, &replacement)
+            .expect("replacement")
+            .is_none()
+    );
+    cache.abort_reserved(&request, &old);
+    assert!(cache.put_reserved(&request, &response, &old).is_err());
+    cache.abort_reserved(&request, &replacement);
+}
+
 #[test]
-#[ignore = "known defect: key-only cache abort is not fenced across invalidation"]
 fn stale_cache_abort_cannot_release_replacement_reservation() {
     assert_replacement_reservation_retained(true, true);
 }
 
 #[test]
-#[ignore = "known defect: key-only cache abort is not fenced across exact invalidation"]
 fn stale_cache_abort_cannot_release_exact_invalidation_replacement() {
     assert_replacement_reservation_retained(true, false);
 }
@@ -1976,7 +2093,14 @@ fn assert_replacement_reservation_retained(abort_stale: bool, invalidate_all: bo
         NonZeroUsize::new(2).expect("positive capacity"),
     ));
     let request = AgentTurnRequest::new("model", "abort ownership");
-    assert!(cache.get(&request).expect("old miss").is_none());
+    let old = bcode::ModelResponseCacheReservation::new();
+    let replacement = bcode::ModelResponseCacheReservation::new();
+    assert!(
+        cache
+            .get_reserved(&request, &old)
+            .expect("old miss")
+            .is_none()
+    );
     if invalidate_all {
         cache.invalidate_all().expect("invalidate old reservation");
     } else {
@@ -1984,10 +2108,15 @@ fn assert_replacement_reservation_retained(abort_stale: bool, invalidate_all: bo
             .invalidate(&request)
             .expect("invalidate exact reservation");
     }
-    assert!(cache.get(&request).expect("replacement miss").is_none());
+    assert!(
+        cache
+            .get_reserved(&request, &replacement)
+            .expect("replacement miss")
+            .is_none()
+    );
     if abort_stale {
         // The abandoned old operation must not release its replacement.
-        cache.abort(&request);
+        cache.abort_reserved(&request, &old);
     }
 
     let mut follower_request = request.clone();
@@ -2010,7 +2139,7 @@ fn assert_replacement_reservation_retained(abort_stale: bool, invalidate_all: bo
             .expect("cancelled follower exits within cleanup watchdog")
     });
     follower.join().expect("follower exits");
-    cache.abort(&request);
+    cache.abort_reserved(&request, &replacement);
     assert!(
         remained_reserved,
         "stale abort released the replacement reservation"
@@ -2024,13 +2153,11 @@ fn assert_replacement_reservation_retained(abort_stale: bool, invalidate_all: bo
 }
 
 #[tokio::test]
-#[ignore = "known defect: key-only cache completion is not fenced across invalidation"]
 async fn stale_cache_completion_cannot_overwrite_post_invalidation_response() {
     assert_replacement_completion_retained(true, true).await;
 }
 
 #[tokio::test]
-#[ignore = "known defect: key-only cache completion is not fenced across exact invalidation"]
 async fn stale_cache_completion_cannot_overwrite_post_exact_invalidation_response() {
     assert_replacement_completion_retained(false, true).await;
 }
@@ -2058,7 +2185,14 @@ async fn assert_replacement_completion_retained(invalidate_all: bool, write_stal
     let mut fresh = stale.clone();
     fresh.text = "fresh".into();
 
-    assert!(cache.get(&request).expect("old miss").is_none());
+    let old = bcode::ModelResponseCacheReservation::new();
+    let replacement = bcode::ModelResponseCacheReservation::new();
+    assert!(
+        cache
+            .get_reserved(&request, &old)
+            .expect("old miss")
+            .is_none()
+    );
     if invalidate_all {
         cache.invalidate_all().expect("invalidate old reservation");
     } else {
@@ -2066,10 +2200,17 @@ async fn assert_replacement_completion_retained(invalidate_all: bool, write_stal
             .invalidate(&request)
             .expect("invalidate exact reservation");
     }
-    assert!(cache.get(&request).expect("replacement miss").is_none());
-    cache.put(&request, &fresh).expect("replacement completes");
+    assert!(
+        cache
+            .get_reserved(&request, &replacement)
+            .expect("replacement miss")
+            .is_none()
+    );
+    cache
+        .put_reserved(&request, &fresh, &replacement)
+        .expect("replacement completes");
     if write_stale {
-        cache.put(&request, &stale).expect("old completion handled");
+        assert!(cache.put_reserved(&request, &stale, &old).is_err());
     }
     assert_eq!(
         cache
