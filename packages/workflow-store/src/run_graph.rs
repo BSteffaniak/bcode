@@ -214,6 +214,14 @@ pub fn initial_node(
     run_id: &str,
     node_id: &str,
 ) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
+    initial_node_record(connection, run_id, node_id).map(|record| record.map(|record| record.node))
+}
+
+fn initial_node_record(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
     super::validate_id("node_id", node_id)?;
     match graph_revision(connection, run_id)? {
         None => return Ok(None),
@@ -229,14 +237,21 @@ pub fn initial_node(
             "SELECT CASE WHEN typeof(node_json) = 'text'
                      AND length(CAST(node_json AS BLOB)) <= ?3
                      AND revision = 1
-                     AND is_entry IN (0, 1) AND is_exit IN (0, 1) THEN node_json END
+                     AND is_entry IN (0, 1) AND is_exit IN (0, 1) THEN node_json END,
+                     is_entry, is_exit
          FROM workflow_run_graph_nodes WHERE run_id = ?1 AND node_id = ?2 AND revision <= 1
          ORDER BY revision LIMIT 1",
             rusqlite::params![run_id, node_id, super::MAX_INLINE_JSON_BYTES],
-            |row| row.get::<_, Option<String>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let Some(payload) = payload else {
+    let Some((payload, entry, exit)) = payload else {
         return Ok(None);
     };
     let payload = payload.ok_or_else(|| {
@@ -250,10 +265,30 @@ pub fn initial_node(
             "workflow graph node identity mismatch".to_string(),
         ));
     }
-    Ok(Some(node))
+    Ok(Some(RunGraphNode {
+        revision: 1,
+        node,
+        entry,
+        exit,
+    }))
 }
 
 impl WorkflowStore {
+    /// Read one initial node revision with its admitted entry and exit roles.
+    ///
+    /// Missing runs or nodes return `None`. This bounded lookup never repairs state.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identities, missing or unsupported graph state,
+    /// corrupt node data, oversized payloads, or database failures.
+    pub fn run_graph_node_record(
+        &self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+        initial_node_record(&self.connection, run_id, node_id)
+    }
+
     /// Read one exact node from the initial admitted run graph.
     ///
     /// # Errors

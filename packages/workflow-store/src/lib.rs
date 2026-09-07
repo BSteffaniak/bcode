@@ -19990,22 +19990,204 @@ mod tests {
         );
     }
 
+    fn assert_backup_nodes(backup: &Connection, expected: &[RunGraphNode]) {
+        let mut statement = backup.prepare(
+            "SELECT node_id, revision, node_json, is_entry, is_exit FROM workflow_run_graph_nodes WHERE run_id = 'run-1' ORDER BY node_id",
+        ).expect("backup node query");
+        let actual = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })
+            .expect("backup nodes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode backup nodes");
+        assert_eq!(actual.len(), expected.len());
+        for ((id, revision, payload, entry, exit), node) in actual.iter().zip(expected) {
+            assert_eq!(id, &node.node.id);
+            assert_eq!(*revision, node.revision);
+            assert_eq!((*entry, *exit), (node.entry, node.exit));
+            assert_eq!(
+                serde_json::from_str::<bcode_workflow::NodeDefinition>(payload)
+                    .expect("node payload"),
+                node.node
+            );
+        }
+    }
+
+    fn assert_schema_16_backup_edge(backup: &Connection, edge: &bcode_workflow::EdgeDefinition) {
+        assert_eq!(detected_store_schema(backup), Some(16));
+        let revision: u64 = backup
+            .query_row(
+                "SELECT revision FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("backed up graph revision");
+        assert_eq!(revision, 1);
+        let (edge_id, revision, source, target, payload): (u64, u64, String, String, String) = backup.query_row(
+            "SELECT edge_id, revision, source_node_id, target_node_id, edge_json FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = 42",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).expect("backed up edge");
+        assert_eq!((edge_id, revision), (42, 1));
+        assert_eq!((&source, &target), (&edge.from, &edge.to));
+        assert_eq!(
+            &serde_json::from_str::<bcode_workflow::EdgeDefinition>(&payload)
+                .expect("edge payload"),
+            edge
+        );
+    }
+
+    fn add_migration_exit_node(
+        store: &WorkflowStore,
+        source: &bcode_workflow::NodeDefinition,
+    ) -> bcode_workflow::NodeDefinition {
+        let mut target = source.clone();
+        target.id = "migration-target".to_owned();
+        store.connection.execute(
+            "UPDATE workflow_run_graph_nodes SET is_entry = 1, is_exit = 0 WHERE run_id = 'run-1' AND node_id = ?1",
+            [&source.id],
+        ).expect("entry-only source");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', ?1, 1, ?2, 0, 1)",
+                rusqlite::params![
+                    target.id,
+                    serde_json::to_string(&target).expect("serialize target")
+                ],
+            )
+            .expect("persist target");
+        target
+    }
+
+    #[test]
+    fn exact_graph_node_record_rejects_missing_or_future_graph_without_mutation() {
+        for missing in [true, false] {
+            let (_temp, store) = initialized_store();
+            let node = store
+                .run_graph_nodes("run-1", None, 1)
+                .expect("node")
+                .remove(0);
+            store.connection.execute_batch(if missing {
+                "PRAGMA foreign_keys = OFF; DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';"
+            } else {
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';"
+            }).expect("damage graph header");
+            let changes = store.connection.total_changes();
+            assert!(store.run_graph_node_record("run-1", &node.node.id).is_err());
+            assert_eq!(store.connection.total_changes(), changes);
+            let revision: Option<u64> = store
+                .connection
+                .query_row(
+                    "SELECT revision FROM workflow_run_graphs WHERE run_id = 'run-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .expect("preserved header");
+            assert_eq!(revision, if missing { None } else { Some(2) });
+        }
+    }
+
+    #[test]
+    fn exact_graph_node_record_rejects_invalid_boundary_flags_without_mutation() {
+        for column in ["is_entry", "is_exit"] {
+            let (_temp, store) = initialized_store();
+            let node = store
+                .run_graph_nodes("run-1", None, 1)
+                .expect("node")
+                .remove(0);
+            store
+                .connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("damage fixture constraints");
+            store.connection.execute(
+                &format!("UPDATE workflow_run_graph_nodes SET {column} = 2 WHERE run_id = 'run-1' AND node_id = ?1"),
+                [&node.node.id],
+            ).expect("damage flag");
+            let changes = store.connection.total_changes();
+            assert!(store.run_graph_node_record("run-1", &node.node.id).is_err());
+            assert!(store.run_graph_node("run-1", &node.node.id).is_err());
+            assert_eq!(store.connection.total_changes(), changes);
+            let value: i64 = store.connection.query_row(
+                &format!("SELECT {column} FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = ?1"),
+                [&node.node.id], |row| row.get(0),
+            ).expect("preserved flag");
+            assert_eq!(value, 2);
+        }
+    }
+
+    #[test]
+    fn exact_graph_node_record_preserves_roles_and_rejects_damage() {
+        let (_temp, store) = initialized_store();
+        let source = store
+            .run_graph_nodes("run-1", None, 1)
+            .expect("nodes")
+            .remove(0);
+        add_migration_exit_node(&store, &source.node);
+        for expected in store.run_graph_nodes("run-1", None, 100).expect("nodes") {
+            assert_eq!(
+                store
+                    .run_graph_node_record("run-1", &expected.node.id)
+                    .expect("record"),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            store
+                .run_graph_node_record("run-1", "missing")
+                .expect("missing node"),
+            None
+        );
+        assert_eq!(
+            store
+                .run_graph_node_record("missing", &source.node.id)
+                .expect("missing run"),
+            None
+        );
+        store.connection.execute(
+            "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE run_id = 'run-1' AND node_id = ?1",
+            [&source.node.id],
+        ).expect("damage payload");
+        let changes = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_node_record("run-1", &source.node.id)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), changes);
+    }
+
     #[test]
     fn schema_16_migration_adds_source_index_without_rebuilding_graph() {
         let (temp, store) = initialized_store();
         let nodes = store.run_graph_nodes("run-1", None, 100).expect("nodes");
         let node_id = &nodes[0].node.id;
+        let target = add_migration_exit_node(&store, &nodes[0].node);
+        let expected_nodes = store
+            .run_graph_nodes("run-1", None, 100)
+            .expect("all nodes");
         let edge = bcode_workflow::EdgeDefinition {
             from: node_id.clone(),
-            to: node_id.clone(),
+            to: target.id.clone(),
             kind: bcode_workflow::EdgeKind::Direct,
             transform: None,
         };
         store
             .connection
             .execute(
-                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 42, 1, ?1, ?1, ?2)",
-                rusqlite::params![node_id, serde_json::to_string(&edge).expect("serialize")],
+                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 42, 1, ?1, ?2, ?3)",
+                rusqlite::params![
+                    node_id,
+                    target.id,
+                    serde_json::to_string(&edge).expect("serialize")
+                ],
             )
             .expect("persist edge");
         let edges = store.run_graph_edges("run-1", None, 100).expect("edges");
@@ -20030,12 +20212,35 @@ mod tests {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .expect("inspect pre-migration backup");
-        assert_eq!(detected_store_schema(&backup), Some(16));
+        assert_schema_16_backup_edge(&backup, &edge);
+        assert_backup_nodes(&backup, &expected_nodes);
         drop(backup);
         let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
         assert_eq!(
+            store.run_graph_revision("run-1").expect("graph revision"),
+            Some(1)
+        );
+        assert_eq!(
             store.run_graph_nodes("run-1", None, 100).expect("nodes"),
-            nodes
+            expected_nodes
+        );
+        assert_eq!(
+            store
+                .run_graph_incoming_edges("run-1", &target.id, None, 100)
+                .expect("incoming"),
+            edges
+        );
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", &target.id, None, 100)
+                .expect("target outgoing")
+                .is_empty()
+        );
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", node_id, None, 100)
+                .expect("source incoming")
+                .is_empty()
         );
         assert_eq!(
             store
