@@ -223,6 +223,32 @@ pub fn initial_node(
     initial_node_record(connection, run_id, node_id).map(|record| record.map(|record| record.node))
 }
 
+pub fn initial_activation_node(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
+    super::validate_id("activation_id", activation_id)?;
+    let Some(record) = initial_node_record(connection, run_id, node_id)? else {
+        return Ok(None);
+    };
+    let revision = connection
+        .query_row(
+            "SELECT node_revision FROM workflow_activations
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            (run_id, node_id, activation_id),
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?;
+    if revision != Some(record.revision) {
+        return Err(WorkflowStoreError::InvalidData(
+            "activation executable binding does not match the initial graph".to_string(),
+        ));
+    }
+    Ok(Some(record.node))
+}
+
 pub fn initial_exit(
     connection: &Connection,
     run_id: &str,
@@ -471,6 +497,43 @@ impl WorkflowStore {
             entry,
             exit,
         }))
+    }
+
+    /// Read the latest committed representation of a run-owned node.
+    ///
+    /// Unlike an activation binding, this lookup follows node revisions. It does not
+    /// authorize dispatch. Missing runs or nodes return `None`.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identities, uncommitted revisions, damaged graph
+    /// metadata, malformed or oversized executable data, or database failures.
+    pub fn current_run_graph_node(
+        &self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+        super::validate_id("node_id", node_id)?;
+        let Some(current) = graph_revision(&self.connection, run_id)? else {
+            return Ok(None);
+        };
+        let revision = self
+            .connection
+            .query_row(
+                "SELECT revision FROM workflow_run_graph_nodes
+             WHERE run_id = ?1 AND node_id = ?2 ORDER BY revision DESC LIMIT 1",
+                (run_id, node_id),
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
+        let Some(revision) = revision else {
+            return Ok(None);
+        };
+        if revision > current {
+            return Err(WorkflowStoreError::InvalidData(
+                "node revision exceeds committed graph revision".to_string(),
+            ));
+        }
+        self.run_graph_node_revision(run_id, node_id, revision)
     }
 
     /// Read one initial node revision with its admitted entry and exit roles.

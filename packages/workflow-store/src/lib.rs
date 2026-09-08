@@ -7433,13 +7433,20 @@ impl WorkflowStore {
                 "workflow child receipt conflicts with the canonical link".to_string(),
             ));
         }
-        let node = self
-            .run_graph_node(&request.run_id, &request.node_id)?
+        self.run_graph_node(&request.run_id, &request.node_id)?
             .ok_or_else(|| {
                 WorkflowStoreError::InvalidData(
                     "workflow child parent call is missing from run graph".to_string(),
                 )
             })?;
+        let node = self
+            .activation_graph_node(&request.run_id, &request.node_id, &request.activation_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow child parent executable binding is missing".to_string(),
+                )
+            })?
+            .node;
         if node.kind != bcode_workflow::NodeKind::WorkflowCall {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow child parent node is not an admitted workflow call".to_string(),
@@ -9411,7 +9418,7 @@ impl WorkflowStore {
         let mut statement = self.connection.prepare(
             "SELECT member.run_id, member.controller_node_id, member.member_node_id, \
              member.member_activation_id, member.member_index, member.input_json, \
-             member.created_at_ms \
+             member.created_at_ms, member.controller_activation_id \
              FROM workflow_fan_out_members member \
              JOIN workflow_runs run ON run.run_id = member.run_id \
              WHERE member.status = 'pending' AND run.status = 'running' \
@@ -9429,6 +9436,7 @@ impl WorkflowStore {
                     row.get::<_, u32>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             })?
             .map(|row| {
@@ -9440,14 +9448,22 @@ impl WorkflowStore {
                     index,
                     input_json,
                     created_at_ms,
+                    controller_activation_id,
                 ) = row?;
-                let controller = self
-                    .run_graph_node(&run_id, &controller_node_id)?
+                self.run_graph_node(&run_id, &controller_node_id)?
                     .ok_or_else(|| {
                         WorkflowStoreError::InvalidData(
                             "fan-out run-graph controller node is missing".to_string(),
                         )
                     })?;
+                let controller = self
+                    .activation_graph_node(&run_id, &controller_node_id, &controller_activation_id)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "fan-out controller executable binding is missing".to_string(),
+                        )
+                    })?
+                    .node;
                 let configuration: bcode_workflow::WorkflowFanOutConfiguration =
                     serde_json::from_value(controller.configuration)?;
                 let mut node = *configuration.member_node;
@@ -10079,11 +10095,13 @@ impl WorkflowStore {
                 kind.as_str()
             )));
         }
-        let node = run_graph::initial_node(&transaction, run_id, node_id)?.ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!(
-                "workflow waiting run-graph node not found: {node_id}"
-            ))
-        })?;
+        let node =
+            run_graph::initial_activation_node(&transaction, run_id, node_id, activation_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "workflow waiting run-graph node not found: {node_id}"
+                    ))
+                })?;
         let expected_kind = match kind {
             WorkflowWaitKind::Input => bcode_workflow::NodeKind::Input,
             WorkflowWaitKind::Approval => bcode_workflow::NodeKind::Approval,
@@ -10811,6 +10829,15 @@ where
         (&output.run_id, &output.node_id, &output.activation_id),
         |row| row.get(0),
     )?;
+    let completed_node = run_graph::initial_activation_node(
+        transaction,
+        &output.run_id,
+        &output.node_id,
+        &output.activation_id,
+    )?
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData("completed activation executable is missing".to_string())
+    })?;
     let mut completed_is_exit =
         run_graph::initial_exit(transaction, &output.run_id, &output.node_id)?;
     let mut targets = Vec::new();
@@ -10861,9 +10888,8 @@ where
             validate_parallel_run_topology(transaction, &output.run_id, &node)?;
         }
     }
-    if let Some(branch) = run_graph::initial_node(transaction, &output.run_id, &output.node_id)?
-        .filter(|node| node.kind == bcode_workflow::NodeKind::Branch)
-    {
+    if completed_node.kind == bcode_workflow::NodeKind::Branch {
+        let branch = completed_node;
         let expression: bcode_workflow::PredicateExpression =
             serde_json::from_value(branch.configuration.get("predicate").cloned().ok_or_else(
                 || {
@@ -11530,13 +11556,18 @@ fn schedule_retry_for_observation_transaction(
         [&request.run_id],
         |row| row.get(0),
     )?;
-    let node = run_graph::initial_node(transaction, &request.run_id, &request.node_id)?
-        .ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!(
-                "retry observation references missing run-graph node: {}",
-                request.node_id
-            ))
-        })?;
+    let node = run_graph::initial_activation_node(
+        transaction,
+        &request.run_id,
+        &request.node_id,
+        &request.activation_id,
+    )?
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData(format!(
+            "retry observation references missing run-graph node: {}",
+            request.node_id
+        ))
+    })?;
     if node.kind != bcode_workflow::NodeKind::PluginBlock {
         return Ok(None);
     }
@@ -11580,7 +11611,15 @@ fn schedule_retry_for_observation_transaction(
         next_attempt_at_ms,
         scheduled_at_ms,
     };
-    let failure_json = serde_json::to_string(&failure_kind)?;
+    persist_automatic_retry_schedule(transaction, &schedule)?;
+    Ok(Some(schedule))
+}
+
+fn persist_automatic_retry_schedule(
+    transaction: &Transaction<'_>,
+    schedule: &AutomaticRetrySchedule,
+) -> Result<(), WorkflowStoreError> {
+    let failure_json = serde_json::to_string(&schedule.failure_kind)?;
     let inserted = transaction.execute(
         "INSERT INTO workflow_retry_schedules \
          (run_id, node_id, activation_id, failed_attempt, next_attempt, failure_kind, \
@@ -11601,14 +11640,14 @@ fn schedule_retry_for_observation_transaction(
     )?;
     let stored = automatic_retry_schedule(
         transaction,
-        &request.run_id,
-        &request.node_id,
-        &request.activation_id,
+        &schedule.run_id,
+        &schedule.node_id,
+        &schedule.activation_id,
     )?
     .ok_or_else(|| {
         WorkflowStoreError::InvalidData("automatic retry schedule was not persisted".to_string())
     })?;
-    if stored != schedule {
+    if stored != *schedule {
         return Err(WorkflowStoreError::InvalidData(
             "automatic retry schedule conflicts with persisted state".to_string(),
         ));
@@ -11616,13 +11655,13 @@ fn schedule_retry_for_observation_transaction(
     if inserted == 1 {
         append_event(
             transaction,
-            &request.run_id,
+            &schedule.run_id,
             "automatic_retry_scheduled",
-            &serde_json::to_string(&schedule)?,
-            scheduled_at_ms,
+            &serde_json::to_string(schedule)?,
+            schedule.scheduled_at_ms,
         )?;
     }
-    Ok(Some(schedule))
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -11922,12 +11961,15 @@ fn settle_fan_out_member_failure(
         fan_out_member_controller(transaction, request)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData("fan-out member controller is missing".to_string())
         })?;
-    let controller = run_graph::initial_node(transaction, &request.run_id, &controller_node_id)?
-        .ok_or_else(|| {
-            WorkflowStoreError::InvalidData(
-                "fan-out controller run-graph node is missing".to_string(),
-            )
-        })?;
+    let controller = run_graph::initial_activation_node(
+        transaction,
+        &request.run_id,
+        &controller_node_id,
+        &controller_activation_id,
+    )?
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData("fan-out controller run-graph node is missing".to_string())
+    })?;
     let configuration: bcode_workflow::WorkflowFanOutConfiguration =
         serde_json::from_value(controller.configuration)?;
     let changed = transaction.execute(
@@ -12093,12 +12135,15 @@ fn settle_fan_out_member_success(
         fan_out_member_controller(transaction, request)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData("fan-out member controller is missing".to_string())
         })?;
-    let controller = run_graph::initial_node(transaction, &request.run_id, &controller_node_id)?
-        .ok_or_else(|| {
-            WorkflowStoreError::InvalidData(
-                "fan-out controller run-graph node is missing".to_string(),
-            )
-        })?;
+    let controller = run_graph::initial_activation_node(
+        transaction,
+        &request.run_id,
+        &controller_node_id,
+        &controller_activation_id,
+    )?
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData("fan-out controller run-graph node is missing".to_string())
+    })?;
     let configuration: bcode_workflow::WorkflowFanOutConfiguration =
         serde_json::from_value(controller.configuration.clone())?;
     validate_output(output)?;
@@ -12358,11 +12403,12 @@ fn pending_activation_by_identity(
         )
         .optional()?;
     row.map(|(dependency_generation, input_json, created_at_ms)| {
-        let node = run_graph::initial_node(connection, run_id, node_id)?.ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!(
-                "workflow activation references missing run-graph node: {node_id}"
-            ))
-        })?;
+        let node = run_graph::initial_activation_node(connection, run_id, node_id, activation_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow activation references missing run-graph node: {node_id}"
+                ))
+            })?;
         Ok(PendingActivation {
             run_id: run_id.to_string(),
             node_id: node_id.to_string(),
@@ -12387,7 +12433,7 @@ fn pending_fan_out_member_by_identity(
     let row = connection
         .query_row(
             "SELECT member.controller_node_id, member.member_index, member.input_json, \
-             member.created_at_ms \
+             member.created_at_ms, member.controller_activation_id \
              FROM workflow_fan_out_members member \
              JOIN workflow_runs run ON run.run_id = member.run_id \
              WHERE member.run_id = ?1 AND member.member_node_id = ?2 \
@@ -12400,31 +12446,39 @@ fn pending_fan_out_member_by_identity(
                     row.get::<_, u32>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(controller_node_id, index, input_json, created_at_ms)| {
-        let controller = run_graph::initial_node(connection, run_id, &controller_node_id)?
+    row.map(
+        |(controller_node_id, index, input_json, created_at_ms, controller_activation_id)| {
+            let controller = run_graph::initial_activation_node(
+                connection,
+                run_id,
+                &controller_node_id,
+                &controller_activation_id,
+            )?
             .ok_or_else(|| {
                 WorkflowStoreError::InvalidData(
                     "fan-out run-graph controller node is missing".to_string(),
                 )
             })?;
-        let configuration: bcode_workflow::WorkflowFanOutConfiguration =
-            serde_json::from_value(controller.configuration)?;
-        let mut node = *configuration.member_node;
-        node.id = node_id.to_string();
-        Ok(PendingActivation {
-            run_id: run_id.to_string(),
-            node_id: node_id.to_string(),
-            activation_id: activation_id.to_string(),
-            dependency_generation: u64::from(index),
-            input: Some(serde_json::from_str(&input_json)?),
-            node,
-            created_at_ms,
-        })
-    })
+            let configuration: bcode_workflow::WorkflowFanOutConfiguration =
+                serde_json::from_value(controller.configuration)?;
+            let mut node = *configuration.member_node;
+            node.id = node_id.to_string();
+            Ok(PendingActivation {
+                run_id: run_id.to_string(),
+                node_id: node_id.to_string(),
+                activation_id: activation_id.to_string(),
+                dependency_generation: u64::from(index),
+                input: Some(serde_json::from_str(&input_json)?),
+                node,
+                created_at_ms,
+            })
+        },
+    )
     .transpose()
 }
 
@@ -14374,14 +14428,18 @@ fn validate_output_against_node_schema(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
 ) -> Result<(), WorkflowStoreError> {
-    let node = run_graph::initial_node(transaction, &output.run_id, &output.node_id)?.ok_or_else(
-        || {
-            WorkflowStoreError::InvalidData(format!(
-                "validated output references missing run-graph node: {}",
-                output.node_id
-            ))
-        },
-    )?;
+    let node = run_graph::initial_activation_node(
+        transaction,
+        &output.run_id,
+        &output.node_id,
+        &output.activation_id,
+    )?
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData(format!(
+            "validated output references missing run-graph node: {}",
+            output.node_id
+        ))
+    })?;
     validate_output_schema(output, &node.output)
 }
 
@@ -17142,6 +17200,30 @@ mod tests {
     }
 
     #[test]
+    fn preparation_rejects_binding_changed_after_pending_selection() {
+        let (_temp, mut store) = initialized_store();
+        let pending = store.pending_activations(1).expect("selection").remove(0);
+        store
+            .connection
+            .execute("UPDATE workflow_activations SET node_revision = 2", [])
+            .expect("changed binding");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .prepare_pending_activation(
+                    &pending.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({}),
+                    20,
+                )
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
     fn pending_activation_admission_rolls_back_when_intent_is_oversized() {
         let (_temp, mut store) = initialized_store();
         let error = store
@@ -18649,6 +18731,50 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_work_rejects_inconsistent_controller_binding_without_writes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("fan-out", 1, &fan_out_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "fan-out".to_string();
+        run.input = Some(serde_json::json!([3, 1, 2]));
+        store.create_run(&run).expect("run");
+        store
+            .settle_pending_control_nodes("run-1", 10, 20)
+            .expect("materialize");
+        let members = store
+            .pending_activations_for_run("run-1", 10)
+            .expect("members");
+        assert_eq!(members.len(), 2);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("invalid binding");
+        let before = store.connection.total_changes();
+        assert!(store.pending_activations_for_run("run-1", 10).is_err());
+        for member in members {
+            assert!(
+                store
+                    .prepare_pending_activation(
+                        &member.run_id,
+                        &member.node_id,
+                        &member.activation_id,
+                        DispatchSideEffect::ReadOnly,
+                        serde_json::json!({}),
+                        21,
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
     fn pending_fan_out_requires_run_owned_controller_and_does_not_repair() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -19223,6 +19349,16 @@ mod tests {
         );
         assert_eq!(transaction.total_changes(), before);
         output.schema_id = schema_id;
+        transaction
+            .execute("UPDATE workflow_activations SET node_revision = 2", [])
+            .expect("invalid controller binding");
+        let before = transaction.total_changes();
+        assert!(settle_fan_out_member_success(&transaction, &request, &output, 40).is_err());
+        assert!(settle_fan_out_member_failure(&transaction, &request, "failure", 40).is_err());
+        assert_eq!(transaction.total_changes(), before);
+        transaction
+            .execute("UPDATE workflow_activations SET node_revision = 1", [])
+            .expect("restore bindings");
         settle_fan_out_member_success(&transaction, &request, &output, 40).expect("valid member");
         transaction.commit().expect("commit");
         drop(store);
@@ -19421,6 +19557,7 @@ mod tests {
     #[test]
     fn automatic_retry_observation_rejects_graph_damage_before_writes() {
         for damage in [
+            "UPDATE workflow_activations SET node_revision = 2 WHERE node_id = 'review'",
             "DELETE FROM workflow_run_graph_nodes WHERE node_id = 'review'",
             "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE node_id = 'review'",
             "UPDATE workflow_run_graphs SET revision = 2",
@@ -20812,6 +20949,18 @@ mod tests {
             .expect("second revision");
         assert_eq!(current.revision, 2);
         assert!(!current.entry && !current.exit);
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("current node"),
+            Some(current)
+        );
+        assert!(
+            store
+                .current_run_graph_node("run-1", "absent")
+                .expect("absent")
+                .is_none()
+        );
         assert!(store.run_graph_node_revision("run-1", "review", 3).is_err());
         assert!(store.run_graph_node_revision("run-1", "review", 0).is_err());
         assert!(
@@ -20822,6 +20971,22 @@ mod tests {
         );
         assert!(store.run_graph_node("run-1", "review").is_err());
         assert_eq!(store.connection.total_changes(), changes);
+    }
+
+    #[test]
+    fn current_node_rejects_uncommitted_revision_without_writes() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';",
+            )
+            .expect("future node");
+        let before = store.connection.total_changes();
+        assert!(store.current_run_graph_node("run-1", "review").is_err());
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
@@ -23498,6 +23663,33 @@ mod tests {
     }
 
     #[test]
+    fn successor_materialization_rejects_inconsistent_source_binding() {
+        let (_temp, mut store) = initialized_store();
+        let activation = store.pending_activations(1).expect("pending").remove(0);
+        let output = ValidatedOutput {
+            output_id: "binding-output".to_string(),
+            run_id: activation.run_id,
+            node_id: activation.node_id,
+            activation_id: activation.activation_id,
+            schema_id: activation.node.output.type_name,
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        store
+            .connection
+            .execute("UPDATE workflow_activations SET node_revision = 2", [])
+            .expect("invalid binding");
+        let transaction = store.connection.transaction().expect("transaction");
+        let before = transaction.total_changes();
+        assert!(
+            materialize_direct_successors(&transaction, &output, &NoopWorkflowOutputFault).is_err()
+        );
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
     fn output_validation_requires_run_graph_node_before_persistence() {
         let (_temp, mut store) = initialized_store();
         let activation = store.pending_activations(1).expect("pending").remove(0);
@@ -23512,6 +23704,17 @@ mod tests {
             artifact_reference: None,
             created_at_ms: 20,
         };
+        store.connection.execute(
+            "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = ?1 AND activation_id = ?2",
+            rusqlite::params![activation.run_id, activation.activation_id],
+        ).expect("invalid binding");
+        let before = store.connection.total_changes();
+        assert!(store.persist_validated_output(&output).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        store.connection.execute(
+            "UPDATE workflow_activations SET node_revision = 1 WHERE run_id = ?1 AND activation_id = ?2",
+            rusqlite::params![activation.run_id, activation.activation_id],
+        ).expect("restore binding");
         store
             .connection
             .execute(
@@ -23947,6 +24150,7 @@ mod tests {
         for damage in [
             "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE run_id = 'parent-run' AND node_id = 'call'",
             "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'parent-run'",
+            "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'parent-run' AND node_id = 'call'",
         ] {
             store
                 .connection
@@ -23962,7 +24166,8 @@ mod tests {
             store
                 .connection
                 .execute_batch(
-                    "UPDATE workflow_run_graphs SET revision = 1 WHERE run_id = 'parent-run'",
+                    "UPDATE workflow_run_graphs SET revision = 1 WHERE run_id = 'parent-run';
+                     UPDATE workflow_activations SET node_revision = 1 WHERE run_id = 'parent-run' AND node_id = 'call';",
                 )
                 .expect("restore revision");
         }
@@ -25517,6 +25722,33 @@ mod tests {
                 )
                 .is_err()
         );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'input-run'",
+                [],
+            )
+            .expect("invalid binding");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .provide_input(
+                    "input-run",
+                    "input",
+                    &wait.activation_id,
+                    serde_json::json!(7),
+                    20
+                )
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET node_revision = 1 WHERE run_id = 'input-run'",
+                [],
+            )
+            .expect("restore binding");
         let result = store
             .provide_input(
                 "input-run",
