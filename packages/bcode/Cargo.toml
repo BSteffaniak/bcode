@@ -28,8 +28,9 @@ required-features = ["embedded-plugins", "static-bundled-fake-provider-plugin"]
 name              = "daemon_client"
 required-features = ["daemon-client"]
 
-[[example]]
-name              = "scripted_provider"
+[[bin]]
+name              = "bcode-sdk-simulation"
+path              = "src/bin/sdk_simulation.rs"
 required-features = ["testing"]
 
 [[example]]
