@@ -2929,6 +2929,31 @@ mod tests {
                 .entries
                 .is_empty()
         );
+        let mut valid = exchange.clone();
+        valid.payload = serde_json::json!({
+            "questions": [{
+                "header": null,
+                "question": "Proceed?",
+                "options": [{"label": "Yes", "value": "yes", "description": null}],
+                "control": "radio",
+                "selection_mode": "single",
+                "custom": false,
+                "custom_mode": "additional",
+                "required": false
+            }]
+        });
+        let snapshot = local_interaction_snapshot(&valid, &app.interaction_controllers).unwrap();
+        assert_ne!(snapshot, serde_json::Value::Null);
+        assert_eq!(app.interaction_controllers.lock().unwrap().entries.len(), 1);
+        assert!(matches!(
+            local_interaction_snapshot(&exchange, &app.interaction_controllers),
+            Err(ClientError::Protocol(message))
+                if message == "interaction request changed for an existing controller"
+        ));
+        assert_eq!(
+            local_interaction_snapshot(&valid, &app.interaction_controllers).unwrap(),
+            snapshot
+        );
     }
 
     #[cfg(feature = "static-bundled-question-plugin")]
