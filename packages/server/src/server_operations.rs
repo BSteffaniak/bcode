@@ -196,13 +196,11 @@ pub fn validate_client_interaction_adapters(
             adapter.platform_id.as_str(),
             adapter.interaction_kind.as_str(),
         ];
-        if identifiers
-            .iter()
-            .any(|value| value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES)
-            || adapter.tui_surface_kind.as_deref().is_some_and(|value| {
-                value.is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES
-            })
-        {
+        if identifiers.iter().any(|value| {
+            value.trim().is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES
+        }) || adapter.tui_surface_kind.as_deref().is_some_and(|value| {
+            value.trim().is_empty() || value.len() > MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES
+        }) {
             return Err(UpdateClientContextError::InvalidInteractionAdapters);
         }
         if adapter.min_schema_version == 0

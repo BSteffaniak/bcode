@@ -446,7 +446,11 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             )
             .await?;
         }
-        Commands::ArtifactId => println!("{}", bcode_ipc::ArtifactId::current()),
+        Commands::ArtifactId => {
+            let mut output = std::io::stdout().lock();
+            writeln!(output, "{}", bcode_ipc::ArtifactId::current())?;
+            output.flush()?;
+        }
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(Box::new(command)).await?,
         Commands::State { command } => handle_state_command(command)?,
@@ -2267,6 +2271,12 @@ async fn handle_interaction_command(command: InteractionCommand) -> Result<(), C
                 .await?;
             write_invocation_input_receipt(&mut std::io::stdout().lock(), json)?;
         }
+        InteractionCommand::Inspect { exchange_id } => {
+            ensure_server_running().await?;
+            let exchange =
+                find_pending_exchange(&BcodeClient::default_endpoint(), &exchange_id).await?;
+            print_json(&exchange)?;
+        }
         InteractionCommand::List { session_id, json } => {
             ensure_server_running().await?;
             let client = BcodeClient::default_endpoint();
@@ -2325,18 +2335,23 @@ fn write_invocation_input_receipt(
     Ok(())
 }
 
+async fn find_pending_exchange(
+    client: &BcodeClient,
+    exchange_id: &str,
+) -> Result<bcode_session_models::PendingToolExchangeSummary, CliError> {
+    client
+        .inspect_pending_tool_exchange(exchange_id)
+        .await?
+        .ok_or_else(|| {
+            CliError::InvalidArguments(format!("pending interaction not found: {exchange_id}"))
+        })
+}
+
 async fn compatible_interaction_client(
     client: &BcodeClient,
     exchange_id: &str,
 ) -> Result<BcodeClient, CliError> {
-    let exchange = client
-        .list_pending_tool_exchanges()
-        .await?
-        .into_iter()
-        .find(|exchange| exchange.request.exchange_id == exchange_id)
-        .ok_or_else(|| {
-            CliError::InvalidArguments(format!("pending interaction not found: {exchange_id}"))
-        })?;
+    let exchange = find_pending_exchange(client, exchange_id).await?;
     Ok(client.clone().with_interaction_adapter(
         bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
             producer_id: exchange.request.producer_id,
@@ -5179,6 +5194,11 @@ enum PermissionCommand {
 
 #[derive(Debug, Subcommand)]
 enum InteractionCommand {
+    /// Print one pending exchange as JSON, preserving its producer schema and payload.
+    Inspect {
+        /// Pending exchange identifier.
+        exchange_id: String,
+    },
     /// Enqueue schema-aware input for an active invocation; acceptance is not completion.
     Input {
         /// Canonical session owning the active invocation.
@@ -5747,17 +5767,14 @@ async fn reprice_session_command(
             "catalog snapshot exceeds 16 MiB".into(),
         ));
     }
-    let snapshot = serde_json::from_slice(&bytes)
-        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    let snapshot = serde_json::from_slice(&bytes).map_err(|_| {
+        CliError::InvalidArguments("catalog snapshot is not a valid catalog document".to_owned())
+    })?;
+    drop(bytes);
     let report = BcodeClient::default_endpoint()
         .reprice_session(session_id, range, snapshot)
         .await?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report)
-            .map_err(|error| CliError::InvalidArguments(error.to_string()))?
-    );
-    Ok(())
+    print_json(&report)
 }
 
 fn parse_reprice_datetime(value: &str) -> Result<u64, String> {
@@ -6690,13 +6707,15 @@ fn auth_resets_use(
         credit_id: credit_id.map(str::to_string),
     };
     let mut host = load_cli_plugin_host()?;
-    let mut response = host.invoke_service_json::<_, bcode_model::AuthResetCreditConsumeResponse>(
+    let response = host.invoke_service_json::<_, bcode_model::AuthResetCreditConsumeResponse>(
         &plan.provider_plugin_id,
         bcode_model::MODEL_PROVIDER_INTERFACE_ID,
         bcode_model::OP_AUTH_RESET_CREDIT_CONSUME,
         &request,
-    )?;
-    host.deactivate_all()?;
+    );
+    let deactivation = host.deactivate_all();
+    let mut response = response?;
+    deactivation?;
     print_auth_reset_consume_report(
         &AuthResetConsumeReport {
             pool: plan.pool,
@@ -6774,14 +6793,33 @@ const fn auth_reset_consume_status_label(
 }
 
 fn confirm_auth_reset_use(profile: &str, credit_id: Option<&str>) -> Result<bool, CliError> {
+    read_auth_reset_confirmation(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr().lock(),
+        profile,
+        credit_id,
+    )
+}
+
+fn read_auth_reset_confirmation(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    profile: &str,
+    credit_id: Option<&str>,
+) -> Result<bool, CliError> {
+    use std::io::BufRead as _;
+    const MAX_CONFIRMATION_BYTES: u16 = 64;
     let credit = credit_id.unwrap_or("provider-selected credit");
-    print!(
+    write!(
+        output,
         "Consume one banked rate-limit reset for auth profile '{profile}' ({credit})? Type 'yes' to continue: "
-    );
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    Ok(input.trim() == "yes")
+    )?;
+    output.flush()?;
+    let mut line = String::new();
+    input
+        .take(u64::from(MAX_CONFIRMATION_BYTES) + 1)
+        .read_line(&mut line)?;
+    Ok(line.len() <= usize::from(MAX_CONFIRMATION_BYTES) && line.trim() == "yes")
 }
 
 fn auth_usage_status(
@@ -7734,52 +7772,73 @@ fn print_auth_reset_consume_report(
     report: &AuthResetConsumeReport,
     json: bool,
 ) -> Result<(), CliError> {
+    write_auth_reset_consume_report(&mut std::io::stdout().lock(), report, json)
+}
+
+fn write_auth_reset_consume_report(
+    output: &mut impl std::io::Write,
+    report: &AuthResetConsumeReport,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        return print_json(report);
+        return write_json_result(output, report);
     }
     if report.dry_run {
-        println!("Dry run: no reset was consumed.");
-        println!();
-        println!("Would use:");
-        println!("  Profile: {}", report.profile);
-        println!(
+        writeln!(output, "Dry run: no reset was consumed.")?;
+        writeln!(output)?;
+        writeln!(output, "Would use:")?;
+        writeln!(output, "  Profile: {}", report.profile)?;
+        writeln!(
+            output,
             "  Credit: {}",
             report.credit_id.as_deref().unwrap_or("provider-selected")
-        );
-        return Ok(());
-    }
-
-    match report.status.as_str() {
-        "reset" => {
-            println!("Used one banked Codex reset for {}.", report.profile);
-            println!();
-            if let Some(windows_reset) = report.windows_reset {
-                println!("Windows reset: {windows_reset}");
+        )?;
+    } else {
+        match report.status.as_str() {
+            "reset" => {
+                writeln!(
+                    output,
+                    "Used one banked Codex reset for {}.",
+                    report.profile
+                )?;
+                writeln!(output)?;
+                if let Some(windows_reset) = report.windows_reset {
+                    writeln!(output, "Windows reset: {windows_reset}")?;
+                }
+                writeln!(output, "Provider result: reset")?;
             }
-            println!("Provider result: reset");
-        }
-        "nothing_to_reset" => {
-            println!("No reset was used.");
-            println!();
-            println!("Reason: no current rate-limit window is eligible for reset.");
-            println!("Your banked reset should still be available.");
-        }
-        "no_credit" => {
-            println!("No banked reset is available for {}.", report.profile);
-        }
-        "already_redeemed" => {
-            println!(
-                "This reset request already completed successfully for {}.",
-                report.profile
-            );
-        }
-        _ => {
-            println!("Reset consume status: {}", report.status);
-            if let Some(message) = &report.message {
-                println!("Detail: {message}");
+            "nothing_to_reset" => {
+                writeln!(output, "No reset was used.")?;
+                writeln!(output)?;
+                writeln!(
+                    output,
+                    "Reason: no current rate-limit window is eligible for reset."
+                )?;
+                writeln!(output, "Your banked reset should still be available.")?;
+            }
+            "no_credit" => {
+                writeln!(
+                    output,
+                    "No banked reset is available for {}.",
+                    report.profile
+                )?;
+            }
+            "already_redeemed" => {
+                writeln!(
+                    output,
+                    "This reset request already completed successfully for {}.",
+                    report.profile
+                )?;
+            }
+            _ => {
+                writeln!(output, "Reset consume status: {}", report.status)?;
+                if let Some(message) = &report.message {
+                    writeln!(output, "Detail: {message}")?;
+                }
             }
         }
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -10093,6 +10152,7 @@ async fn invoke_plugin_service(
     daemon: bool,
     json: bool,
 ) -> Result<(), CliError> {
+    validate_plugin_service_route(Some(plugin_id), interface_id, operation)?;
     let payload = payload.unwrap_or_default().into_bytes();
     if daemon {
         let response = BcodeClient::default_endpoint()
@@ -10111,8 +10171,10 @@ async fn invoke_plugin_service(
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
-    let response = host.invoke_service(plugin_id, interface_id, operation, payload)?;
-    host.deactivate_all()?;
+    let response = host.invoke_service(plugin_id, interface_id, operation, payload);
+    let deactivation = host.deactivate_all();
+    let response = response?;
+    deactivation?;
     print_service_response(response, json)
 }
 
@@ -10124,6 +10186,7 @@ async fn call_plugin_service(
     daemon: bool,
     json: bool,
 ) -> Result<(), CliError> {
+    validate_plugin_service_route(None, interface_id, operation)?;
     let payload = payload.unwrap_or_default().into_bytes();
     if daemon {
         let response = BcodeClient::default_endpoint()
@@ -10137,9 +10200,30 @@ async fn call_plugin_service(
     let plugins =
         bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
     let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
-    let response = host.invoke_service_by_interface(interface_id, operation, payload)?;
-    host.deactivate_all()?;
+    let response = host.invoke_service_by_interface(interface_id, operation, payload);
+    let deactivation = host.deactivate_all();
+    let response = response?;
+    deactivation?;
     print_service_response(response, json)
+}
+
+fn validate_plugin_service_route(
+    plugin_id: Option<&str>,
+    interface_id: &str,
+    operation: &str,
+) -> Result<(), CliError> {
+    for (name, value) in [
+        ("plugin id", plugin_id),
+        ("interface id", Some(interface_id)),
+        ("operation", Some(operation)),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(CliError::InvalidArguments(format!(
+                "plugin service {name} must not be empty"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn print_service_response(
@@ -18085,6 +18169,256 @@ mod session_diagnosis_tests {
     }
 
     #[test]
+    fn auth_reset_confirmation_output_failure_does_not_consume_input() {
+        struct FailingOutput {
+            fail_write: bool,
+        }
+        impl std::io::Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_write {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for fail_write in [true, false] {
+            let mut input = std::io::Cursor::new(b"yes\n");
+            let error = super::read_auth_reset_confirmation(
+                &mut input,
+                &mut FailingOutput { fail_write },
+                "test",
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, CliError::Signal(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+            );
+            assert_eq!(input.position(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_service_empty_routes_fail_before_host_work() {
+        for daemon in [false, true] {
+            for (plugin, interface, operation) in [
+                ("", "interface", "operation"),
+                ("plugin", " ", "operation"),
+                ("plugin", "interface", ""),
+            ] {
+                assert!(matches!(
+                    super::invoke_plugin_service(
+                        &[],
+                        plugin,
+                        interface,
+                        operation,
+                        None,
+                        daemon,
+                        true
+                    )
+                    .await,
+                    Err(CliError::InvalidArguments(_))
+                ));
+            }
+            for (interface, operation) in [("", "operation"), ("interface", "\t")] {
+                assert!(matches!(
+                    super::call_plugin_service(&[], interface, operation, None, daemon, true).await,
+                    Err(CliError::InvalidArguments(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn auth_reset_report_preserves_output_and_propagates_failures() {
+        struct FailedOutput(bool);
+        impl std::io::Write for FailedOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let report = super::AuthResetConsumeReport {
+            pool: "pool".to_owned(),
+            provider_plugin_id: "provider".to_owned(),
+            profile: "test".to_owned(),
+            dry_run: false,
+            credit_id: None,
+            redeem_request_id: "request".to_owned(),
+            status: "reset".to_owned(),
+            provider_code: None,
+            windows_reset: Some(2),
+            message: None,
+            debug: BTreeMap::new(),
+        };
+        for json in [false, true] {
+            let mut output = Vec::new();
+            super::write_auth_reset_consume_report(&mut output, &report, json).unwrap();
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                    serde_json::to_value(&report).unwrap()
+                );
+            } else {
+                assert_eq!(
+                    String::from_utf8(output).unwrap(),
+                    "Used one banked Codex reset for test.\n\nWindows reset: 2\nProvider result: reset\n"
+                );
+            }
+            for fail_write in [false, true] {
+                assert!(matches!(
+                    super::write_auth_reset_consume_report(&mut FailedOutput(fail_write), &report, json),
+                    Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn auth_reset_confirmation_rejects_read_failure_after_yes() {
+        struct FailedInput;
+        impl std::io::Read for FailedInput {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::ConnectionReset.into())
+            }
+        }
+        let reader = std::io::Read::chain(std::io::Cursor::new(b"yes"), FailedInput);
+        let mut input = std::io::BufReader::new(reader);
+        let error = super::read_auth_reset_confirmation(&mut input, &mut Vec::new(), "test", None)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Signal(error) if error.kind() == std::io::ErrorKind::ConnectionReset
+        ));
+    }
+
+    #[test]
+    fn auth_reset_confirmation_rejects_invalid_utf8() {
+        let mut input = std::io::Cursor::new(b"yes\xff\nno\n");
+        let error = super::read_auth_reset_confirmation(&mut input, &mut Vec::new(), "test", None)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Signal(error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(input.position(), 5);
+    }
+
+    #[test]
+    fn auth_reset_confirmation_is_bounded_and_requires_yes() {
+        for (line, accepted) in [("yes\n", true), (" no\n", false), ("", false)] {
+            assert_eq!(
+                super::read_auth_reset_confirmation(
+                    &mut line.as_bytes(),
+                    &mut Vec::new(),
+                    "test",
+                    None,
+                )
+                .unwrap(),
+                accepted
+            );
+        }
+        let mut input = std::io::Cursor::new(b"yes\nno\n");
+        assert!(
+            super::read_auth_reset_confirmation(&mut input, &mut Vec::new(), "test", None).unwrap()
+        );
+        assert_eq!(input.position(), 4);
+        for (size, accepted) in [(64, true), (65, false), (128, false)] {
+            let mut line = b"yes".to_vec();
+            line.resize(size, b' ');
+            let mut input = std::io::Cursor::new(line);
+            assert_eq!(
+                super::read_auth_reset_confirmation(&mut input, &mut Vec::new(), "test", None)
+                    .unwrap(),
+                accepted
+            );
+            assert_eq!(input.position(), u64::try_from(size.min(65)).unwrap());
+        }
+        let mut endless = std::io::BufReader::new(std::io::repeat(b' '));
+        assert!(
+            !super::read_auth_reset_confirmation(&mut endless, &mut Vec::new(), "test", None,)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reprice_exact_size_catalog_reaches_document_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = directory.path().join("catalog.json");
+        // A JSON string is not a catalog document. Padding to the exact limit
+        // distinguishes document rejection from an off-by-one size rejection
+        // without dispatching a request to the daemon.
+        let mut contents = br#""private-catalog-value""#.to_vec();
+        contents.resize(16 * 1024 * 1024, b' ');
+        std::fs::write(&catalog, &contents).unwrap();
+        let error = super::reprice_session_command(SessionId::new(), 0, 1, &catalog)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments(message)
+                if message == "catalog snapshot is not a valid catalog document"
+        ));
+        assert_eq!(std::fs::read(&catalog).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn reprice_rejects_oversized_catalog_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = directory.path().join("catalog.json");
+        let file = std::fs::File::create(&catalog).unwrap();
+        let size = 16 * 1024 * 1024 + 1;
+        file.set_len(size).unwrap();
+        drop(file);
+        let error = super::reprice_session_command(SessionId::new(), 0, 1, &catalog)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments(message) if message == "catalog snapshot exceeds 16 MiB"
+        ));
+        assert_eq!(std::fs::metadata(&catalog).unwrap().len(), size);
+    }
+
+    #[tokio::test]
+    async fn reprice_rejects_invalid_range_before_opening_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = directory.path().join("missing.json");
+        let error = super::reprice_session_command(SessionId::new(), 2, 1, &catalog)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CliError::InvalidArguments(_)));
+        assert!(!catalog.exists());
+    }
+
+    #[tokio::test]
+    async fn reprice_rejects_invalid_catalog_without_exposing_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = directory.path().join("catalog.json");
+        let contents = br#""private-catalog-value""#;
+        std::fs::write(&catalog, contents).unwrap();
+        let error = super::reprice_session_command(SessionId::new(), 0, 1, &catalog)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::InvalidArguments(message)
+                if message == "catalog snapshot is not a valid catalog document"
+        ));
+        assert_eq!(std::fs::read(&catalog).unwrap(), contents);
+    }
+
+    #[test]
     fn reprice_datetimes_require_timezone_and_preserve_boundaries() {
         assert_eq!(
             super::parse_reprice_datetime("1970-01-01T00:00:01.250Z").unwrap(),
@@ -23022,6 +23356,16 @@ mod json_stream_output_tests {
         assert_eq!(output.flushes, 1);
         let decoded: bcode_session_models::SessionEvent = serde_json::from_str(&text).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn interaction_inspect_selects_without_reinterpreting_schema() {
+        use clap::Parser as _;
+        let cli =
+            super::Cli::try_parse_from(["bcode", "interaction", "inspect", "target"]).unwrap();
+        assert!(matches!(cli.command, Some(super::Commands::Interaction {
+            command: super::InteractionCommand::Inspect { exchange_id }
+        }) if exchange_id == "target"));
     }
 
     #[test]

@@ -740,6 +740,20 @@ fn local_interaction_validation_error(
         .map(ToOwned::to_owned)
 }
 
+fn release_interaction_controller(
+    interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
+    exchange_id: &str,
+) -> Result<(), ClientError> {
+    let controller = interaction_controllers
+        .lock()
+        .map_err(|_| {
+            ClientError::Protocol("interaction controller state is unavailable".to_owned())
+        })?
+        .release(exchange_id);
+    drop(controller);
+    Ok(())
+}
+
 fn retire_stale_interaction_controllers(
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
     pending_ids: &BTreeSet<&str>,
@@ -1524,12 +1538,12 @@ impl HyperChadAppState {
         };
         match result {
             Ok(resolved) => {
-                let controller = self
-                    .interaction_controllers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .release(&exchange.exchange_id);
-                drop(controller);
+                if let Err(error) = release_interaction_controller(
+                    &self.interaction_controllers,
+                    &exchange.exchange_id,
+                ) {
+                    return error_page(&client_error_message(&error));
+                }
                 let status = if resolved {
                     status
                 } else {
@@ -2875,6 +2889,71 @@ mod tests {
     }
 
     #[test]
+    fn stale_controller_cleanup_rejects_poisoned_state() {
+        use bcode_plugin_sdk::interaction::{
+            PluginInteractionController, PluginInteractionSnapshotError,
+        };
+        struct Controller;
+        impl PluginInteractionController for Controller {
+            fn kind(&self) -> &'static str {
+                "example.preserved"
+            }
+            fn snapshot_json(&self) -> Result<serde_json::Value, PluginInteractionSnapshotError> {
+                Ok(serde_json::json!({"draft": "preserved"}))
+            }
+            fn handle_input(
+                &mut self,
+                _: bcode_tool::InteractionInput,
+            ) -> bcode_tool::InteractionOutput {
+                panic!("cleanup must not dispatch input")
+            }
+        }
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "preserved".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"request": "original"}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let controllers = Arc::new(Mutex::new(LocalInteractionControllers::default()));
+        controllers.lock().unwrap().entries.insert(
+            request.exchange_id.clone(),
+            (request.clone(), Box::new(Controller)),
+        );
+        let worker_controllers = Arc::clone(&controllers);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = worker_controllers.lock().unwrap();
+                panic!("simulate interrupted controller mutation");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            retire_stale_interaction_controllers(&controllers, &BTreeSet::new()),
+            Err(ClientError::Protocol(message))
+                if message == "interaction controller state is unavailable"
+        ));
+        assert!(matches!(
+            release_interaction_controller(&controllers, "preserved"),
+            Err(ClientError::Protocol(message))
+                if message == "interaction controller state is unavailable"
+        ));
+        assert!(controllers.is_poisoned());
+        let state = controllers.lock().unwrap_err().into_inner();
+        assert_eq!(state.entries.len(), 1);
+        let (original, controller) = state.entries.get("preserved").unwrap();
+        assert_eq!(original, &request);
+        assert_eq!(
+            controller.snapshot_json().unwrap(),
+            serde_json::json!({"draft": "preserved"})
+        );
+        drop(state);
+    }
+
+    #[test]
     fn stale_controller_cleanup_runs_destructors_outside_map_lock() {
         use bcode_plugin_sdk::interaction::{
             PluginInteractionController, PluginInteractionSnapshotError,
@@ -2947,10 +3026,15 @@ mod tests {
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct Controller(Arc<AtomicUsize>);
+        struct Controller {
+            controllers: std::sync::Weak<Mutex<LocalInteractionControllers>>,
+            drops: Arc<AtomicUsize>,
+        }
         impl Drop for Controller {
             fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                let controllers = self.controllers.upgrade().unwrap();
+                assert!(controllers.try_lock().is_ok());
+                self.drops.fetch_add(1, Ordering::SeqCst);
             }
         }
         impl PluginInteractionController for Controller {
@@ -2968,7 +3052,7 @@ mod tests {
             }
         }
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut controllers = LocalInteractionControllers::default();
+        let controllers = Arc::new(Mutex::new(LocalInteractionControllers::default()));
         for id in ["first", "second"] {
             let request = bcode_session_models::ToolExchangeRequest {
                 invocation_id: "call-1".to_owned(),
@@ -2979,22 +3063,27 @@ mod tests {
                 payload: serde_json::Value::Null,
                 response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
             };
-            controllers.entries.insert(
+            controllers.lock().unwrap().entries.insert(
                 id.to_owned(),
-                (request, Box::new(Controller(Arc::clone(&drops)))),
+                (
+                    request,
+                    Box::new(Controller {
+                        controllers: Arc::downgrade(&controllers),
+                        drops: Arc::clone(&drops),
+                    }),
+                ),
             );
         }
-        let released = controllers.release("first");
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        drop(released);
+        release_interaction_controller(&controllers, "first").unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(!controllers.entries.contains_key("first"));
-        assert!(controllers.entries.contains_key("second"));
-        assert!(controllers.release("first").is_none());
-        assert!(controllers.release("missing").is_none());
+        assert!(!controllers.lock().unwrap().entries.contains_key("first"));
+        assert!(controllers.lock().unwrap().entries.contains_key("second"));
+        release_interaction_controller(&controllers, "first").unwrap();
+        release_interaction_controller(&controllers, "missing").unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        drop(controllers);
+        release_interaction_controller(&controllers, "second").unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(controllers.lock().unwrap().entries.is_empty());
     }
 
     #[test]

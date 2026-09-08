@@ -4889,6 +4889,21 @@ impl BcodeClient {
         }
     }
 
+    /// Inspect one pending exchange without interpreting its producer-owned payload.
+    ///
+    /// Returns `None` when the exchange is no longer pending. This observation does
+    /// not reserve the exchange or establish that a later resolution will succeed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing fails or multiple exchanges claim the identifier.
+    pub async fn inspect_pending_tool_exchange(
+        &self,
+        exchange_id: &str,
+    ) -> Result<Option<PendingToolExchangeSummary>, ClientError> {
+        select_pending_tool_exchange(self.list_pending_tool_exchanges().await?, exchange_id)
+    }
+
     /// Resolve a pending renderer-neutral tool exchange.
     ///
     /// Returns `true` when this request resolves the pending exchange, or `false` when
@@ -6180,8 +6195,71 @@ mod message_acceptance_tests {
     }
 }
 
+fn select_pending_tool_exchange(
+    exchanges: Vec<PendingToolExchangeSummary>,
+    exchange_id: &str,
+) -> Result<Option<PendingToolExchangeSummary>, ClientError> {
+    let mut matches = exchanges
+        .into_iter()
+        .filter(|exchange| exchange.request.exchange_id == exchange_id);
+    let exchange = matches.next();
+    if matches.next().is_some() {
+        return Err(ClientError::Protocol(
+            "ambiguous pending interaction identifier".to_owned(),
+        ));
+    }
+    Ok(exchange)
+}
+
 #[cfg(test)]
 mod client_timeout_tests {
+    #[test]
+    fn pending_exchange_selection_preserves_schema_and_rejects_ambiguity() {
+        let exchange = bcode_session_models::PendingToolExchangeSummary {
+            session_id: bcode_session_models::SessionId::new(),
+            request: bcode_session_models::ToolExchangeRequest {
+                invocation_id: "invocation".to_owned(),
+                exchange_id: "target".to_owned(),
+                producer_id: "producer".to_owned(),
+                schema: "future.schema".to_owned(),
+                schema_version: u32::MAX,
+                payload: serde_json::json!({ "opaque": [1, "value"] }),
+                response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+            },
+        };
+        let mut other = exchange.clone();
+        other.request.exchange_id = "other".to_owned();
+        let selected = super::select_pending_tool_exchange(vec![other, exchange.clone()], "target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(selected).unwrap(),
+            serde_json::to_value(exchange.clone()).unwrap()
+        );
+        for conflicting_session in [false, true] {
+            let mut duplicate = exchange.clone();
+            if conflicting_session {
+                duplicate.session_id = bcode_session_models::SessionId::new();
+                duplicate.request.payload = serde_json::json!({ "secret": "must-not-leak" });
+            }
+            let error =
+                super::select_pending_tool_exchange(vec![exchange.clone(), duplicate], "target")
+                    .unwrap_err();
+            assert!(matches!(error, super::ClientError::Protocol(ref message)
+                if message == "ambiguous pending interaction identifier"));
+        }
+        assert!(
+            super::select_pending_tool_exchange(vec![exchange], "missing")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::select_pending_tool_exchange(vec![], "target")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     use super::{
         BcodeClient, ClientError, resolve_path_from, session_open_attach_readiness,
         terminal_session_open_error_message,

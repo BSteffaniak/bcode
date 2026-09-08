@@ -38700,6 +38700,65 @@ library = "test"
         };
         assert!(server_operations::validate_client_interaction_adapters(Some(&context)).is_ok());
 
+        for extra in [0, 1] {
+            let context = ClientRuntimeContext {
+                interaction_adapters: (0..64 + extra)
+                    .map(|index| {
+                        let mut entry = adapter.clone();
+                        entry.producer_id = format!("producer-{index}");
+                        entry
+                    })
+                    .collect(),
+                ..ClientRuntimeContext::default()
+            };
+            assert_eq!(
+                server_operations::validate_client_interaction_adapters(Some(&context)).is_ok(),
+                extra == 0,
+                "adapter count boundary"
+            );
+            for field in 0..5 {
+                let value =
+                    "x".repeat(server_operations::MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES + extra);
+                let mut entry = adapter.clone();
+                match field {
+                    0 => entry.producer_id = value,
+                    1 => entry.exchange_schema = value,
+                    2 => entry.platform_id = value,
+                    3 => entry.interaction_kind = value,
+                    _ => entry.tui_surface_kind = Some(value),
+                }
+                let context = ClientRuntimeContext {
+                    interaction_adapters: vec![entry],
+                    ..ClientRuntimeContext::default()
+                };
+                assert_eq!(
+                    server_operations::validate_client_interaction_adapters(Some(&context)).is_ok(),
+                    extra == 0,
+                    "identifier byte boundary for field {field}"
+                );
+            }
+        }
+
+        for blank in ["", " ", "\t\n", "\u{2003}"] {
+            for field in 0..5 {
+                let mut invalid_adapter = adapter.clone();
+                match field {
+                    0 => invalid_adapter.producer_id = blank.to_owned(),
+                    1 => invalid_adapter.exchange_schema = blank.to_owned(),
+                    2 => invalid_adapter.platform_id = blank.to_owned(),
+                    3 => invalid_adapter.interaction_kind = blank.to_owned(),
+                    _ => invalid_adapter.tui_surface_kind = Some(blank.to_owned()),
+                }
+                let invalid = ClientRuntimeContext {
+                    interaction_adapters: vec![invalid_adapter],
+                    ..ClientRuntimeContext::default()
+                };
+                let error = server_operations::validate_client_interaction_adapters(Some(&invalid))
+                    .expect_err("blank adapter identifier must be rejected");
+                assert_eq!(error.code(), "invalid_interaction_adapters");
+            }
+        }
+
         let duplicate = ClientRuntimeContext {
             interaction_adapters: vec![adapter.clone(), adapter.clone()],
             ..ClientRuntimeContext::default()
@@ -55592,19 +55651,109 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 && pending.request.schema_version == 1
         }));
         let interaction_id = pending.summary.request.exchange_id.clone();
-        let incompatible = bcode_client::BcodeClient::new(endpoint.clone());
-        let error = incompatible
-            .resolve_tool_exchange(
-                interaction_id.clone(),
-                bcode_session_models::ToolExchangeResolution::Cancelled,
-            )
+        let inspected = client
+            .inspect_pending_tool_exchange(&interaction_id)
             .await
-            .expect_err("unadvertised client must not resolve an exchange");
-        assert!(matches!(
-            error,
-            bcode_client::ClientError::Server { code, .. }
-                if code == "incompatible_exchange_consumer"
-        ));
+            .expect("inspect pending exchange")
+            .expect("question remains pending");
+        assert_eq!(
+            serde_json::to_value(&inspected).expect("inspection JSON"),
+            serde_json::to_value(&pending.summary).expect("pending summary JSON")
+        );
+        assert!(
+            client
+                .inspect_pending_tool_exchange("missing-exchange")
+                .await
+                .expect("inspect missing exchange")
+                .is_none()
+        );
+        let mut incompatible_clients = vec![(
+            bcode_client::BcodeClient::new(endpoint.clone()),
+            "incompatible_exchange_consumer",
+        )];
+        for mismatch in 0..10 {
+            let mut adapters = bcode_bundled_plugins::interaction_adapters("tui");
+            for adapter in &mut adapters {
+                match mismatch {
+                    0 => adapter.producer_id = "other.producer".to_owned(),
+                    1 => adapter.exchange_schema = "other.schema".to_owned(),
+                    2 => {
+                        adapter.min_schema_version = 2;
+                        adapter.max_schema_version = 2;
+                    }
+                    3 => {
+                        adapter.min_schema_version = 0;
+                        adapter.max_schema_version = 0;
+                    }
+                    4 => {
+                        adapter.min_schema_version = 2;
+                        adapter.max_schema_version = 1;
+                    }
+                    5 => adapter.producer_id = " \t".to_owned(),
+                    6 => adapter.exchange_schema = "\u{2003}".to_owned(),
+                    7 => adapter.platform_id = "\n".to_owned(),
+                    8 => adapter.interaction_kind = " ".to_owned(),
+                    _ => adapter.tui_surface_kind = Some("\t".to_owned()),
+                }
+            }
+            incompatible_clients.push((
+                bcode_client::BcodeClient::new(endpoint.clone())
+                    .with_interaction_adapters(adapters),
+                if mismatch < 3 {
+                    "incompatible_exchange_consumer"
+                } else {
+                    "invalid_interaction_adapters"
+                },
+            ));
+        }
+        for count in [2, 65] {
+            let adapter = bcode_bundled_plugins::interaction_adapters("tui")
+                .into_iter()
+                .find(|adapter| adapter.producer_id == "bcode.question")
+                .expect("question adapter");
+            let adapters = (0..count)
+                .map(|index| {
+                    let mut entry = adapter.clone();
+                    if count > 2 {
+                        entry.interaction_kind = format!("test.interaction-{index}");
+                        entry.platform_id = format!("test.platform-{index}");
+                    }
+                    entry
+                })
+                .collect();
+            incompatible_clients.push((
+                bcode_client::BcodeClient::new(endpoint.clone())
+                    .with_interaction_adapters(adapters),
+                "invalid_interaction_adapters",
+            ));
+        }
+        for (incompatible, expected_code) in incompatible_clients {
+            for resolution in [
+                bcode_session_models::ToolExchangeResolution::Cancelled,
+                bcode_session_models::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({ "answers": [] }),
+                },
+            ] {
+                let error = incompatible
+                    .resolve_tool_exchange(interaction_id.clone(), resolution)
+                    .await
+                    .expect_err("incompatible client must not resolve an exchange");
+                assert!(matches!(
+                    error,
+                    bcode_client::ClientError::Server { code, .. }
+                        if code == expected_code
+                ));
+                let observed = client
+                    .inspect_pending_tool_exchange(&interaction_id)
+                    .await
+                    .expect("inspect after incompatible resolution")
+                    .expect("incompatible resolution must leave the exchange pending");
+                assert_eq!(
+                    serde_json::to_value(observed).expect("observed exchange JSON"),
+                    serde_json::to_value(&pending.summary).expect("pending exchange JSON")
+                );
+            }
+        }
         assert!(
             state
                 .pending_tool_exchanges
@@ -55693,11 +55842,37 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(!response.is_error);
         assert!(response.output.contains("Answered"));
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        for resolution in [
+            bcode_session_models::ToolExchangeResolution::Cancelled,
+            bcode_session_models::ToolExchangeResolution::Responded {
+                payload: serde_json::json!({ "conflicting": "late response" }),
+            },
+        ] {
+            assert!(
+                !client
+                    .resolve_tool_exchange(interaction_id.clone(), resolution)
+                    .await
+                    .expect("stale resolution returns a terminal observation"),
+                "a completed response must not be replaced by a stale resolution"
+            );
+        }
         let history = state
             .sessions
             .session_history(session_id)
             .await
             .expect("question history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::ToolExchangeResolved { event }
+                        if event.exchange_id == interaction_id
+                ))
+                .count(),
+            1,
+            "stale resolutions must not append another terminal event"
+        );
         let assistant_sequence = history
             .iter()
             .find_map(|event| {
@@ -55771,6 +55946,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         bcode_session_models::ToolExchangeResolution::Responded { .. }
                     )
         )));
+        assert!(
+            client
+                .inspect_pending_tool_exchange(&interaction_id)
+                .await
+                .expect("inspect resolved exchange")
+                .is_none()
+        );
         server.abort();
         drop(state);
     }
