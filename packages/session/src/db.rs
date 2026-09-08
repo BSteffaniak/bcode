@@ -2229,6 +2229,63 @@ impl SessionDb {
         Ok(())
     }
 
+    /// Append a canonical usage event with private billing evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid evidence, writer ownership, or atomic commit failure.
+    pub async fn append_event_with_original(
+        &self,
+        event: &SessionEvent,
+        cost: Option<&bcode_session_models::SessionCostEstimate>,
+        original: Option<&bcode_session_models::OriginalUsage>,
+        activity_timestamp_ms: Option<u64>,
+    ) -> SessionDbResult<()> {
+        if original.is_none() {
+            return self
+                .append_event_with_cost(event, cost, activity_timestamp_ms)
+                .await;
+        }
+        if let SessionEventKind::ModelUsage { usage, .. } = &event.kind {
+            let mut validation = usage.clone();
+            if let Some(cost) = cost {
+                validation.cost = Some(cost.clone());
+            }
+            validation
+                .validate()
+                .map_err(|column| SessionDbError::InvalidRow { column })?;
+        }
+        // Evidence is retained only in this canonical private envelope. Public event projections
+        // deliberately exclude it, including `latest_usage` and ordinary export/history.
+        let payload = crate::persisted::encode_session_event_with_original(event, original)
+            .map_err(|column| SessionDbError::InvalidRow { column })?;
+        let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
+        validate_storage_writer_contract(&*tx).await?;
+        validate_append_preconditions_without_writer(&*tx, event).await?;
+        if matches!(event.kind, SessionEventKind::ModelUsage { .. }) {
+            validate_original_usage_duplicate(&*tx, event, original).await?;
+        }
+        crate::db_event_store::insert_event_payload(&*tx, event, activity_timestamp_ms, payload)
+            .await?;
+        project_appended_event(&*tx, event).await?;
+        if let Some(cost) = cost {
+            set_projected_request_cost(&*tx, event, cost).await?;
+        }
+        if let Some(original) = original {
+            let mut summary = read_session_usage_summary(&*tx).await?;
+            summary.original_usage_capture_issue = original.capture_issue;
+            tx.update("session_usage_projection")
+                .value("summary_json", serde_json::to_string(&summary)?)
+                .where_eq("projection_id", 1)
+                .execute(&*tx)
+                .await?;
+        }
+        validate_append_postconditions(&*tx, event).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Validate that the next canonical append can begin without mutating the database.
     ///
     /// # Errors
@@ -2410,6 +2467,176 @@ impl SessionDb {
             .await?;
         tx.commit().await?;
         summary.through_sequence = self.last_event_sequence().await?;
+        Ok((count, summary))
+    }
+
+    /// Stage revised normalization outside a write transaction, then atomically publish it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if normalization fails, ownership changes, or usage changes before commit.
+    pub async fn renormalize_usage(
+        &self,
+        range: bcode_session_models::SessionCostRange,
+        normalize: crate::actor::UsageNormalizer,
+    ) -> SessionDbResult<(u64, SessionUsageSummary)> {
+        range
+            .validate()
+            .map_err(|column| SessionDbError::InvalidRow { column })?;
+        let initial = self.session_usage_summary().await?;
+        self.db
+            .exec_raw("DELETE FROM usage_valuation_staging")
+            .await?;
+        let mut cursor = String::new();
+        let mut count = 0;
+        loop {
+            let rows = self
+                .db
+                .select("session_usage_requests")
+                .columns(&["request_key", "usage_json", "event_seq"])
+                .where_gte(
+                    "first_observed_at_ms",
+                    seq_to_value(range.from_timestamp_ms),
+                )
+                .where_lt("first_observed_at_ms", seq_to_value(range.to_timestamp_ms))
+                .where_gt("request_key", cursor.clone())
+                .sort("request_key", SortDirection::Asc)
+                .limit(128)
+                .execute(&**self.db)
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                cursor = required_string(&row, "request_key")?;
+                let sequence = required_i64(&row, "event_seq")?.cast_unsigned();
+                let usage: SessionTokenUsage =
+                    serde_json::from_str(&required_string(&row, "usage_json")?)?;
+                let canonical = self
+                    .db
+                    .select("events")
+                    .columns(&["payload"])
+                    .where_eq("event_seq", seq_to_value(sequence))
+                    .execute_first(&**self.db)
+                    .await?
+                    .ok_or_else(|| SessionDbError::InvalidRow {
+                        column: "missing usage event".into(),
+                    })?;
+                let original =
+                    crate::persisted::original_usage(&required_string(&canonical, "payload")?)
+                        .map_err(|column| SessionDbError::InvalidRow { column })?;
+                let valuation = normalize(bcode_session_models::SessionUsageSource {
+                    sequence,
+                    usage: usage.clone(),
+                    original,
+                })
+                .await
+                .map_err(|column| SessionDbError::InvalidRow { column })?;
+                validate_renormalized_usage(&usage, &valuation)?;
+                self.db
+                    .insert("usage_valuation_staging")
+                    .value("request_key", cursor.clone())
+                    .value("usage_json", serde_json::to_string(&valuation.usage)?)
+                    .value("cost_json", serde_json::to_string(&valuation.cost)?)
+                    .execute(&**self.db)
+                    .await?;
+                count += 1;
+            }
+        }
+        self.publish_staged_usage(initial, count).await
+    }
+
+    /// Explicitly discard incomplete staging after an unsuccessful normalization pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the disposable staging table cannot be cleared.
+    pub async fn clear_usage_staging(&self) -> SessionDbResult<()> {
+        self.db
+            .exec_raw("DELETE FROM usage_valuation_staging")
+            .await?;
+        Ok(())
+    }
+
+    async fn publish_staged_usage(
+        &self,
+        initial: SessionUsageSummary,
+        count: u64,
+    ) -> SessionDbResult<(u64, SessionUsageSummary)> {
+        let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
+        validate_storage_writer_contract(&*tx).await?;
+        let mut summary = read_session_usage_summary(&*tx).await?;
+        if last_sequence(&*tx).await? != initial.through_sequence
+            || summary.cost_revision != initial.cost_revision
+        {
+            return Err(SessionDbError::InvalidRow {
+                column: "usage changed during repricing".into(),
+            });
+        }
+        let latest_request = summary
+            .latest_usage
+            .as_ref()
+            .and_then(|usage| usage.request_id.clone());
+        let mut cursor = String::new();
+        loop {
+            let rows = tx
+                .select("usage_valuation_staging")
+                .columns(&["request_key", "usage_json", "cost_json"])
+                .where_gt("request_key", cursor.clone())
+                .sort("request_key", SortDirection::Asc)
+                .limit(128)
+                .execute(&*tx)
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                cursor = required_string(&row, "request_key")?;
+                let current = tx
+                    .select("session_usage_requests")
+                    .columns(&["usage_json", "cost_json"])
+                    .where_eq("request_key", cursor.clone())
+                    .execute_first(&*tx)
+                    .await?
+                    .ok_or_else(|| SessionDbError::InvalidRow {
+                        column: "request missing during repricing".into(),
+                    })?;
+                let mut previous: SessionTokenUsage =
+                    serde_json::from_str(&required_string(&current, "usage_json")?)?;
+                previous.cost = serde_json::from_str(&required_string(&current, "cost_json")?)?;
+                let mut next: SessionTokenUsage =
+                    serde_json::from_str(&required_string(&row, "usage_json")?)?;
+                next.cost = Some(serde_json::from_str(&required_string(&row, "cost_json")?)?);
+                let latest = summary.latest_usage.clone();
+                crate::usage::replace(&mut summary, Some(&previous), &next)
+                    .map_err(|column| SessionDbError::InvalidRow { column })?;
+                if next.request_id != latest_request {
+                    summary.latest_usage = latest;
+                }
+                tx.update("session_usage_requests")
+                    .value("usage_json", required_string(&row, "usage_json")?)
+                    .value("cost_json", required_string(&row, "cost_json")?)
+                    .where_eq("request_key", cursor.clone())
+                    .execute(&*tx)
+                    .await?;
+            }
+        }
+        summary.cost_revision =
+            summary
+                .cost_revision
+                .checked_add(1)
+                .ok_or_else(|| SessionDbError::InvalidRow {
+                    column: "cost revision overflow".into(),
+                })?;
+        tx.update("session_usage_projection")
+            .value("summary_json", serde_json::to_string(&summary)?)
+            .where_eq("projection_id", 1)
+            .execute(&*tx)
+            .await?;
+        tx.exec_raw("DELETE FROM usage_valuation_staging").await?;
+        tx.commit().await?;
+        summary.through_sequence = initial.through_sequence;
         Ok((count, summary))
     }
 
@@ -3394,7 +3621,7 @@ async fn rebuild_migration_projections(
                 sequence: event_seq,
                 event_kind: row.event_kind,
                 schema_version: row.schema_version,
-                payload,
+                payload: payload.clone(),
             })
             .map_err(|reason| SessionDbError::MigrationHistoryIncompatible { reason })?;
             metrics.record_histogram(
@@ -3414,7 +3641,11 @@ async fn rebuild_migration_projections(
             }
             validate_canonical_event_identity(&current_row.event, event_seq, session_id)?;
             let event = current_row.event;
-            let current_payload = encode_session_event(&event)?;
+            let original = crate::persisted::original_usage(&payload)
+                .map_err(|column| SessionDbError::InvalidRow { column })?;
+            let current_payload =
+                crate::persisted::encode_session_event_with_original(&event, original.as_ref())
+                    .map_err(|column| SessionDbError::InvalidRow { column })?;
             target
                 .replace_canonical_row(bcode_session_migration_target::CanonicalRow {
                     sequence: event_seq,
@@ -4247,6 +4478,10 @@ async fn append_event_projections(
     activity_timestamp_ms: Option<u64>,
 ) -> SessionDbResult<()> {
     insert_event(db, event, activity_timestamp_ms).await?;
+    project_appended_event(db, event).await
+}
+
+async fn project_appended_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
     project_event(db, event, true).await?;
     project_model_context_event(db, event).await?;
     project_context_occupancy_row(db, event).await?;
@@ -4815,6 +5050,84 @@ async fn project_event(
     Ok(())
 }
 
+async fn validate_original_usage_duplicate(
+    db: &dyn Database,
+    event: &SessionEvent,
+    original: Option<&bcode_session_models::OriginalUsage>,
+) -> SessionDbResult<()> {
+    let SessionEventKind::ModelUsage { usage, .. } = &event.kind else {
+        return Ok(());
+    };
+    let Some(request_id) = &usage.request_id else {
+        return Ok(());
+    };
+    let Some(row) = db
+        .select("session_usage_requests")
+        .columns(&["event_seq"])
+        .where_eq("request_key", request_id.clone())
+        .execute_first(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    let canonical = db
+        .select("events")
+        .columns(&["payload"])
+        .where_eq("event_seq", required_i64(&row, "event_seq")?)
+        .execute_first(db)
+        .await?
+        .ok_or_else(|| SessionDbError::InvalidRow {
+            column: "missing usage source".into(),
+        })?;
+    let payload = required_string(&canonical, "payload")?;
+    let previous = decode_session_event(&payload)?;
+    if let SessionEventKind::ModelUsage {
+        usage: previous, ..
+    } = previous.kind
+        && previous.observation_ordinal == usage.observation_ordinal
+        && crate::persisted::original_usage(&payload)
+            .map_err(|column| SessionDbError::InvalidRow { column })?
+            .as_ref()
+            != original
+    {
+        return Err(SessionDbError::InvalidRow {
+            column: "conflicting duplicate original billing evidence".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_renormalized_usage(
+    previous: &SessionTokenUsage,
+    next: &bcode_session_models::SessionUsageValuation,
+) -> SessionDbResult<()> {
+    if previous.catalog_family != next.usage.catalog_family
+        || previous.catalog_api_surface != next.usage.catalog_api_surface
+    {
+        return Err(SessionDbError::InvalidRow {
+            column: "normalization changed catalog attribution".into(),
+        });
+    }
+    if previous.request != next.usage.request
+        || previous.request_id != next.usage.request_id
+        || previous.observation_id != next.usage.observation_id
+        || previous.terminal != next.usage.terminal
+        || previous.observation_ordinal != next.usage.observation_ordinal
+        || previous.catalog_provider_id != next.usage.catalog_provider_id
+        || previous.catalog_entry_id != next.usage.catalog_entry_id
+        || previous.pricing_target != next.usage.pricing_target
+    {
+        return Err(SessionDbError::InvalidRow {
+            column: "normalization changed request attribution".into(),
+        });
+    }
+    let mut usage = next.usage.clone();
+    usage.cost = Some(next.cost.clone());
+    usage
+        .validate()
+        .map_err(|column| SessionDbError::InvalidRow { column })
+}
+
 async fn project_session_usage(
     db: &dyn Database,
     event: &SessionEvent,
@@ -4826,7 +5139,12 @@ async fn project_session_usage(
         .unwrap_or_else(|| format!("event:{}", event.sequence));
     let existing = db
         .select("session_usage_requests")
-        .columns(&["usage_json", "cost_json", "first_observed_at_ms"])
+        .columns(&[
+            "usage_json",
+            "cost_json",
+            "first_observed_at_ms",
+            "event_seq",
+        ])
         .where_eq("request_key", request_key.clone())
         .execute_first(db)
         .await?;
@@ -4843,7 +5161,27 @@ async fn project_session_usage(
     let accounting_error = |message: String| SessionDbError::InvalidRow {
         column: format!("session_usage: {message}"),
     };
-    if !crate::usage::accepts(current.as_ref(), usage).map_err(accounting_error)? {
+    let canonical_current = if let Some(row) = &existing {
+        let canonical = db
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", required_i64(row, "event_seq")?)
+            .execute_first(db)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidRow {
+                column: "missing canonical usage".into(),
+            })?;
+        let event = decode_session_event(&required_string(&canonical, "payload")?)?;
+        let SessionEventKind::ModelUsage { usage, .. } = event.kind else {
+            return Err(SessionDbError::InvalidRow {
+                column: "invalid canonical usage kind".into(),
+            });
+        };
+        Some(usage)
+    } else {
+        None
+    };
+    if !crate::usage::accepts(canonical_current.as_ref(), usage).map_err(accounting_error)? {
         return Ok(());
     }
     let mut summary = read_session_usage_summary(db).await?;
@@ -8464,6 +8802,182 @@ mod tests {
         .unwrap()
     }
 
+    fn corrected_usage_normalizer() -> crate::actor::UsageNormalizer {
+        Arc::new(|source| {
+            Box::pin(async move {
+                let raw = &source.original.as_ref().unwrap().reports[0].usage_json;
+                assert!(raw.contains("123456789012345678901234567890"));
+                let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let mut usage = source.usage;
+                usage.cache_write_input_tokens = parsed
+                    .pointer("/input_tokens_details/cache_write_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|tokens| u32::try_from(tokens).unwrap());
+                usage.input_tokens = Some(120);
+                Ok(bcode_session_models::SessionUsageValuation {
+                    usage,
+                    cost: bcode_session_models::SessionCostEstimate::Estimated {
+                        currency: "USD".into(),
+                        total_micros: 42,
+                        source: "corrected".into(),
+                        revision: None,
+                        components: vec![bcode_session_models::SessionCostComponent {
+                            bucket: "input".into(),
+                            modality: None,
+                            tokens: 42,
+                            price_micros: 1_000_000,
+                            cost_micros: 42,
+                        }],
+                    },
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn original_usage_evidence_is_preserved_by_current_migration_codec() {
+        let id = SessionId::new();
+        let usage = SessionTokenUsage {request_id:Some("r".into()),observation_id:Some("r:usage".into()),request:Some(Box::new(serde_json::from_value(serde_json::json!({"provider_plugin_id":"provider","effective_model_id":"model","request_id":"r","model_turn_id":"t","round":0,"request_fingerprint":"f"})).unwrap())),..Default::default()};
+        let event = event(
+            id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "t".into(),
+                usage,
+            },
+        );
+        let evidence = bcode_session_models::OriginalUsage {
+            provider_id: "provider".into(),
+            api_shape: "responses".into(),
+            reports: vec![bcode_session_models::OriginalUsageReport {
+                source: "usage".into(),
+                usage_json: r#"{"future":123456789012345678901234567890}"#.into(),
+                confirmed: BTreeMap::new(),
+            }],
+            ..Default::default()
+        };
+        let encoded =
+            crate::persisted::encode_session_event_with_original(&event, Some(&evidence)).unwrap();
+        let decoded = decode_session_event(&encoded).unwrap();
+        let retained = crate::persisted::original_usage(&encoded).unwrap();
+        assert_eq!(
+            crate::persisted::encode_session_event_with_original(&decoded, retained.as_ref())
+                .unwrap(),
+            encoded
+        );
+        assert!(!serde_json::to_string(&decoded).unwrap().contains("future"));
+    }
+
+    #[tokio::test]
+    async fn original_usage_survives_reopen_and_corrected_normalization() {
+        let root = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .unwrap();
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().into(),
+            },
+        ))
+        .await
+        .unwrap();
+        let original = bcode_session_models::OriginalUsage {
+            provider_id:"provider".into(),api_shape:"responses".into(),complete:true,
+            reports:vec![bcode_session_models::OriginalUsageReport { source:"response.completed".into(),usage_json:r#"{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cache_write_tokens":80},"future":123456789012345678901234567890}"#.into(),confirmed:BTreeMap::new() }],..Default::default()
+        };
+        let mut usage_event = event(
+            id,
+            1,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn".into(),
+                usage: SessionTokenUsage {
+                    request: Some(Box::new(serde_json::from_value(serde_json::json!({"provider_plugin_id":"provider","effective_model_id":"model","request_id":"r","model_turn_id":"turn","round":0,"request_fingerprint":"f"})).unwrap())),
+                    request_id: Some("r".into()),
+                    observation_id: Some("r:final".into()),
+                    terminal: true,
+                    input_tokens: Some(100),
+                    output_tokens: Some(10),
+                    ..Default::default()
+                },
+            },
+        );
+        usage_event.timestamp_ms = 100;
+        db.append_event_with_original(&usage_event, None, Some(&original), None)
+            .await
+            .unwrap();
+        let before = usage_fixture_payload(&db).await;
+        assert!(
+            !serde_json::to_string(&db.events_range(0, 1, 2).await.unwrap())
+                .unwrap()
+                .contains("future")
+        );
+        drop(db);
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .unwrap();
+        let prior_summary = db.session_usage_summary().await.unwrap();
+        let rejected: crate::actor::UsageNormalizer =
+            Arc::new(|_| Box::pin(async { Err("normalizer unavailable".into()) }));
+        assert!(
+            db.renormalize_usage(
+                bcode_session_models::SessionCostRange {
+                    from_timestamp_ms: 100,
+                    to_timestamp_ms: 101
+                },
+                rejected
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(db.session_usage_summary().await.unwrap(), prior_summary);
+        let normalizer = corrected_usage_normalizer();
+        let (count, summary) = db
+            .renormalize_usage(
+                bcode_session_models::SessionCostRange {
+                    from_timestamp_ms: 100,
+                    to_timestamp_ms: 101,
+                },
+                normalizer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(summary.cumulative_metered_tokens, 130);
+        assert_eq!(summary.totals_micros["USD"], 42);
+        assert_eq!(
+            summary.latest_usage.unwrap().cache_write_input_tokens,
+            Some(80)
+        );
+        assert_eq!(usage_fixture_payload(&db).await, before);
+        assert_eq!(
+            crate::persisted::original_usage(&before).unwrap(),
+            Some(original.clone())
+        );
+        let mut duplicate = usage_event;
+        duplicate.sequence = 2;
+        db.append_event_with_original(&duplicate, None, Some(&original), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.session_usage_summary()
+                .await
+                .unwrap()
+                .cumulative_metered_tokens,
+            130
+        );
+    }
+
+    async fn remove_usage_staging_fixture(db: &SessionDb) {
+        db.database()
+            .exec_raw("DROP TABLE usage_valuation_staging")
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn epoch_seven_upgrade_preserves_usage_and_seeds_separate_cost() {
         let dir = tempfile::tempdir().unwrap();
@@ -8521,6 +9035,7 @@ mod tests {
             .exec_raw("ALTER TABLE session_usage_requests DROP COLUMN first_observed_at_ms")
             .await
             .unwrap();
+        remove_usage_staging_fixture(&db).await;
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
             .where_gte("id", "038")

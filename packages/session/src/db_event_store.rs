@@ -19,6 +19,21 @@ pub async fn insert_event(
     event: &SessionEvent,
     activity_timestamp_ms: Option<u64>,
 ) -> SessionDbResult<()> {
+    insert_event_payload(
+        db,
+        event,
+        activity_timestamp_ms,
+        encode_session_event(event)?,
+    )
+    .await
+}
+
+pub async fn insert_event_payload(
+    db: &dyn Database,
+    event: &SessionEvent,
+    activity_timestamp_ms: Option<u64>,
+    payload: String,
+) -> SessionDbResult<()> {
     db.insert("events")
         .value("event_seq", seq_to_value(event.sequence))
         .value("event_type", event_kind_name(&event.kind))
@@ -30,7 +45,7 @@ pub async fn insert_event(
             "created_at_ms",
             seq_to_value(activity_timestamp_ms.unwrap_or_else(|| event_created_at_ms(event))),
         )
-        .value("payload", encode_session_event(event)?)
+        .value("payload", payload)
         .execute(db)
         .await?;
     Ok(())

@@ -1537,6 +1537,9 @@ impl RuntimeWorkView {
 /// Renderer-neutral aggregate of fixed canonical session cost estimates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCostSummary {
+    /// Whether the last original-usage capture was explicitly incomplete.
+    #[serde(default)]
+    pub original_usage_incomplete: bool,
     /// Derived cost projection revision (independent of the canonical event checkpoint).
     #[serde(default)]
     pub revision: u64,

@@ -605,6 +605,7 @@ impl SessionView {
         self.unattributed_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cumulative_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cost = bcode_session_view_models::SessionCostSummary {
+            original_usage_incomplete: summary.original_usage_capture_issue.is_some(),
             revision: summary.cost_revision,
             totals_micros: summary.totals_micros,
             estimated_usage_count: summary.estimated_usage_count,

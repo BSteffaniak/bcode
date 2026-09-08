@@ -389,7 +389,7 @@ if ! diff -u "${current_event_kind_inventory}" "${current_event_kind_mapping}" \
   violations=1
 fi
 
-if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 8' packages/session/models/src/lib.rs \
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 9' packages/session/models/src/lib.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH: u32 = bcode_session_migration_target::CURRENT_WRITER_EPOCH' packages/session-migration/src/inventory.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH.*CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session-migration-target/src/lib.rs \
   || ! rg -q 'RELEASED_HISTORICAL_ROOTS' packages/session-migration/src/inventory.rs \
@@ -1341,6 +1341,17 @@ if ! rg -q 'append_priced_model_usage' packages/session/src/mutation.rs \
   || ! rg -q 'reprice_usage' packages/session/src/db.rs \
   || ! rg -q 'cost: None' packages/server/src/lib.rs; then
   echo "Session cost architecture violation: canonical usage must remain separate from replaceable derived costs." >&2
+  violations=1
+fi
+
+if ! rg -q 'original_usage_survives_reopen_and_corrected_normalization' packages/session/src/db.rs \
+  || ! rg -q 'OP_NORMALIZE_USAGE' plugins/openai-compatible-provider-plugin/src/lib.rs \
+  || ! rg -q 'OP_NORMALIZE_USAGE' plugins/bedrock-provider-plugin/src/lib.rs; then
+  echo "Original usage architecture violation: capture must support offline normalization and canonical round-trip coverage." >&2
+  violations=1
+fi
+if rg -n 'pub original_usage:|usage_json' packages/session-view/models/src --glob '*.rs'; then
+  echo "Original usage architecture violation: frontend snapshots must not expose provider billing payloads." >&2
   violations=1
 fi
 

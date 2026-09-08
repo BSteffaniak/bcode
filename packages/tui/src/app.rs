@@ -4652,6 +4652,9 @@ impl TokenUsageMeter {
             "spent {} tok",
             compact_u64(cumulative_metered_tokens)
         ));
+        if cost.original_usage_incomplete {
+            parts.push("usage capture partial".into());
+        }
         if cost.revision > 0 {
             parts.push(format!("cost rev {}", cost.revision));
         }
@@ -7367,6 +7370,7 @@ mod tests {
     fn footer_renders_cost_currency_coverage_and_zero_semantics() {
         let meter = TokenUsageMeter::default();
         let complete = bcode_session_view_models::SessionCostSummary {
+            original_usage_incomplete: false,
             revision: 0,
             totals_micros: BTreeMap::from([("USD".to_string(), 0), ("EUR".to_string(), 2_000_000)]),
             estimated_usage_count: 2,

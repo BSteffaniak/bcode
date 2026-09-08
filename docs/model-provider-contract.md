@@ -234,13 +234,42 @@ blocks, preserving call IDs and provider order. The provider must accept success
 model-visible error results and continue the conversation without inventing new IDs for those
 results. With tool choice `None`, a valid continuation completes without another tool call.
 
+## Original billing observations
+
+Providers emit private `OriginalUsage` observations only when the host requests
+`bcode_capture_original_usage=true` in request metadata. Hosts that do not opt in continue receiving
+the existing normalized stream. Opted-in hosts retain
+these billing-only reports with the request's canonical usage record; they never become agent events,
+model context, frontend usage, or ordinary debug output. There is no nested evidence version. The
+existing provider contract and session writer compatibility define the enclosing boundaries.
+
+JSON surfaces capture the usage subtree before typed deserialization, retaining unknown numeric
+fields and original number spellings. Exact numbers stay in raw JSON strings; global JSON numeric
+semantics are unchanged. Request billing settings and confirmed response labels are
+separate. Only usage data (numbers, booleans, null, nested objects/arrays) and selected non-secret
+billing labels are eligible; arbitrary response content and credentials are not retained. Capture
+has a 64 KiB/64 report/depth-32 budget. Exceeding it or encountering unsafe data records an explicit
+incomplete marker, never a silently truncated complete report. Bedrock Converse captures SDK-exposed
+fields and marks `sdk_fields_only`: it does not claim to preserve unknown wire fields discarded by
+AWS's SDK.
+
+The capture is retained when the host commits the usage observation, including failed normalization.
+It cannot recover reports lost with the daemon before that commit. Normalized-only SDK runs and
+providers that do not emit original evidence remain supported; they cannot promise raw-field recovery.
+
+The optional `normalize_usage` operation accepts `OriginalUsage` and returns `TokenUsage`, without
+credentials, network access, provider startup, or new model invocation. OpenAI and Bedrock implement
+it with their live usage parsing helpers. Unknown API shapes and unsafe/incomplete captures are
+rejected rather than guessed. Older providers without this operation remain usable, but cannot
+renormalize private evidence they do not understand.
+
 ## Usage and stop reasons
 
-Every successfully completed generation or tool-call round emits at least one `Usage` event before
-`TurnFinished`. Usage may be incremental; hosts aggregate all events. Known fields are
-non-negative. When input, output, and total are all reported, total is not smaller than input plus
-output. Cache and reasoning fields refine usage and do not increase the meaning of total unless the
-upstream provider defines them that way.
+Every successfully completed generation or tool-call round emits one final cumulative `Usage`
+event before `TurnFinished`. Provider adapters merge intermediate reports before normalized emission;
+original reports retain their provider order separately. Known fields are non-negative. When input,
+output, and total are all reported, total is not smaller than input plus output. Cache and reasoning
+fields refine usage; cache read/write are subsets of complete input, not additional context.
 
 Failed or cancelled rounds emit usage when the upstream provider made it available, but absence is
 allowed because work may stop before metering exists. `ExactRequestInputTokens` is emitted only for

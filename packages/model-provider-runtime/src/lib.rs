@@ -4,6 +4,9 @@
 
 //! Shared turn lifecycle support for native model provider plugins.
 
+mod usage_capture;
+pub use usage_capture::{append_usage_capture, capture_usage_json, finalize_usage_capture};
+
 mod conformance;
 pub use conformance::{
     ProviderConformanceCase, ProviderConformanceError, ProviderConformanceOptions,
@@ -528,6 +531,7 @@ impl ProviderOutputPositionAllocator {
 pub struct TurnState {
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
+    original_usage_enabled: Arc<AtomicBool>,
     positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
@@ -540,6 +544,11 @@ impl TurnState {
     /// Events published after `TurnFinished` are ignored, even after the terminal
     /// event has been drained. Terminal publication does not acknowledge worker release.
     pub fn push(&self, event: ProviderTurnEvent) {
+        if matches!(event, ProviderTurnEvent::OriginalUsage { .. })
+            && !self.original_usage_enabled.load(Ordering::Acquire)
+        {
+            return;
+        }
         let Ok(mut events) = self.events.lock() else {
             return;
         };
@@ -558,6 +567,11 @@ impl TurnState {
             event
         };
         events.push_back(event);
+    }
+
+    /// Opt in to private billing evidence on this provider turn.
+    pub fn enable_original_usage(&self) {
+        self.original_usage_enabled.store(true, Ordering::Release);
     }
 
     /// Enable positioned v2 semantic output for this turn.

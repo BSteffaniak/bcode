@@ -301,6 +301,11 @@ impl ProviderEventValidator {
             ProviderTurnEvent::ToolCallFinished { call } => {
                 self.observe_tool_call_finished(call)?;
             }
+            ProviderTurnEvent::OriginalUsage { original } => {
+                if original.validate().is_err() {
+                    return violation(BASE_TURN, "invalid original billing evidence");
+                }
+            }
             ProviderTurnEvent::Usage { usage } => self.observe_usage(usage)?,
             ProviderTurnEvent::ProviderMetadata { key, .. } if key.is_empty() => {
                 return violation(BASE_TURN, "provider metadata key must be non-empty");

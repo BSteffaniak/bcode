@@ -4333,6 +4333,7 @@ fn normalize_provider_event(
         ProviderTurnEvent::ToolCallFinished { call } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::ToolCallFinished(call),
         )),
+        ProviderTurnEvent::OriginalUsage { .. } => Ok(EventDisposition::PrivateMetadata),
         ProviderTurnEvent::Usage { usage } => {
             *usage_buffer = Some(usage.clone());
             Ok(EventDisposition::Continue(AgentRuntimeEvent::Usage(usage)))
@@ -8136,6 +8137,18 @@ mod tests {
     async fn provider_continuation_state_does_not_cross_runtime_public_events() {
         let sentinel = "encrypted-sentinel-do-not-expose";
         let provider = FakeProvider::new([
+            ProviderTurnEvent::OriginalUsage {
+                original: Box::new(bcode_session_models::OriginalUsage {
+                    provider_id: "provider".into(),
+                    api_shape: "responses".into(),
+                    reports: vec![bcode_session_models::OriginalUsageReport {
+                        source: "usage".into(),
+                        usage_json: format!(r#"{{"{sentinel}":42}}"#),
+                        confirmed: std::collections::BTreeMap::new(),
+                    }],
+                    ..Default::default()
+                }),
+            },
             ProviderTurnEvent::ProviderMetadata {
                 key: "provider_state".to_owned(),
                 value: sentinel.to_owned(),

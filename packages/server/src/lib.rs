@@ -761,6 +761,7 @@ struct ModelRequestAttempt {
     context_through_sequence: u64,
     portable_context: String,
     local_estimate: bcode_session_models::LocalContextEstimate,
+    original_usage: Option<bcode_session_models::OriginalUsage>,
     managed_compaction_persisted: bool,
 }
 
@@ -11519,17 +11520,54 @@ async fn handle_reprice_session(
         }
         let revision = catalog.catalog_revision.clone();
         let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
-        let catalog = bcode_model_catalog::ModelCatalog::new(catalog);
+        let catalog = Arc::new(bcode_model_catalog::ModelCatalog::new(catalog));
+        let plugins = state.plugins.clone();
         let (count, summary) = state
             .sessions
-            .reprice_usage(
+            .renormalize_usage(
                 session_id,
                 range,
-                Arc::new(move |usage| bcode_model_catalog::price_session_usage(&catalog, usage)),
+                Arc::new(move |source| {
+                    let plugins = plugins.clone();
+                    let catalog = Arc::clone(&catalog);
+                    Box::pin(async move {
+                        let mut facts = source.usage;
+                        if let Some(original) = source.original {
+                            let provider = facts
+                                .request
+                                .as_ref()
+                                .ok_or("missing provider attribution")?
+                                .provider_plugin_id
+                                .clone();
+                            if provider != original.provider_id {
+                                return Err("original usage provider mismatch".into());
+                            }
+                            let normalized: TokenUsage = plugins
+                                .invoke_service_json_scoped_with_timeout(
+                                    &provider,
+                                    bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+                                    bcode_model::OP_NORMALIZE_USAGE,
+                                    &original,
+                                    // Offline decoding must not acquire/reenter the session actor
+                                    // that is coordinating this explicit maintenance operation.
+                                    PluginInvocationScope::Global,
+                                    Duration::from_secs(5),
+                                )
+                                .await
+                                .map_err(|_| {
+                                    "provider usage normalizer unavailable or rejected evidence"
+                                        .to_owned()
+                                })?;
+                            replace_normalized_usage(&mut facts, &normalized);
+                        }
+                        let cost = bcode_model_catalog::price_session_usage(&catalog, &facts);
+                        Ok(bcode_session_models::SessionUsageValuation { usage: facts, cost })
+                    })
+                }),
             )
             .await
             .map_err(|_| {
-                "session repricing failed; check session ownership and projection readiness"
+                "session repricing failed; check session ownership, projection readiness, original capture completeness, and provider normalize_usage availability"
                     .to_owned()
             })?;
         Ok(bcode_session_models::SessionRepriceReport {
@@ -16526,13 +16564,13 @@ async fn run_model_turn_inner(
             phase,
             compaction_decision,
         };
-        match maybe_retry_after_provider_error(
+        match Box::pin(maybe_retry_after_provider_error(
             state,
             session_id,
             &outcome,
             &mut recovery,
             retry_context,
-        )
+        ))
         .await
         {
             ModelTurnRetry::Continue => {
@@ -17881,6 +17919,7 @@ async fn run_model_turn_round(
         context_through_sequence: context_projection.context_through_sequence,
         portable_context: bounded_portable_context(&request.messages),
         local_estimate: context_projection.local_estimate,
+        original_usage: None,
         managed_compaction_persisted: false,
     };
     // A durable unknown-cost observation fences the billing attempt before dispatch.
@@ -18132,6 +18171,19 @@ async fn run_model_turn_round(
 
     service_runtime_priority_commands(state, session_id, command_context).await;
     let active_turn = finish_provider_round(command_context).await;
+    if outcome.reported_usage.is_none()
+        && let Some(attempt) = active_turn
+            .as_ref()
+            .filter(|attempt| attempt.original_usage.is_some())
+    {
+        let usage = session_token_usage(&TokenUsage::default(), Some(attempt));
+        if let Err(error) =
+            append_model_usage_event(state, session_id, turn_id.to_owned(), usage, Some(attempt))
+                .await
+        {
+            append_system_event(state, session_id, error).await;
+        }
+    }
     append_model_provider_round_finished_trace(
         state,
         session_id,
@@ -18243,6 +18295,7 @@ const fn provider_turn_event_kind(event: &ProviderTurnEvent) -> &'static str {
         ProviderTurnEvent::ToolCallStarted { .. } => "tool_call_started",
         ProviderTurnEvent::ToolCallDelta { .. } => "tool_call_delta",
         ProviderTurnEvent::ToolCallFinished { .. } => "tool_call_finished",
+        ProviderTurnEvent::OriginalUsage { .. } => "original_usage",
         ProviderTurnEvent::Usage { .. } => "usage",
         ProviderTurnEvent::ExactRequestInputTokens { .. } => "exact_request_input_tokens",
         ProviderTurnEvent::RequestProjection { .. } => "request_projection",
@@ -18846,7 +18899,11 @@ async fn drain_interrupted_request_usage(
     invocation: &mut bcode_plugin::StreamingServiceInvocation,
     outcome: &mut ModelPollOutcome,
 ) {
-    let received_usage = receive_final_billing_usage(invocation).await;
+    let mut original = None;
+    let received_usage = receive_final_billing_usage(invocation, &mut original).await;
+    if let Some(original) = original {
+        retain_original_usage(state, session_id, provider_turn_id, original).await;
+    }
     // The timeout bounds provider waiting, never cancellation of a canonical commit.
     if let Some(usage) = received_usage {
         let terminal_completion = outcome.completion.clone();
@@ -18861,6 +18918,7 @@ async fn drain_interrupted_request_usage(
 
 async fn receive_final_billing_usage(
     invocation: &mut bcode_plugin::StreamingServiceInvocation,
+    original: &mut Option<bcode_session_models::OriginalUsage>,
 ) -> Option<TokenUsage> {
     invocation.cancel.cancel();
     tokio::time::timeout(Duration::from_millis(250), async {
@@ -18869,8 +18927,12 @@ async fn receive_final_billing_usage(
                 Ok(StreamingServiceInvocationEvent::Event(payload)) => payload,
                 Ok(StreamingServiceInvocationEvent::Response(_)) | Err(_) => break,
             };
-            if let Ok(ProviderTurnEvent::Usage { usage }) = serde_json::from_slice(&payload) {
-                return Some(usage);
+            match serde_json::from_slice(&payload) {
+                Ok(ProviderTurnEvent::Usage { usage }) => return Some(usage),
+                Ok(ProviderTurnEvent::OriginalUsage { original: report }) => {
+                    bcode_model_provider_runtime::append_usage_capture(original, *report);
+                }
+                _ => {}
             }
         }
         None
@@ -19126,6 +19188,7 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         ProviderTurnEvent::RequestProjection { .. }
         | ProviderTurnEvent::ContextCompacted { .. }
         | ProviderTurnEvent::TurnStarted
+        | ProviderTurnEvent::OriginalUsage { .. }
         | ProviderTurnEvent::Usage { .. }
         | ProviderTurnEvent::ExactRequestInputTokens { .. }
         | ProviderTurnEvent::Warning { .. }
@@ -19616,6 +19679,9 @@ async fn handle_provider_turn_event(
             )
             .await;
         }
+        ProviderTurnEvent::OriginalUsage { original } => {
+            retain_original_usage(state, session_id, provider_turn_id, *original).await;
+        }
         ProviderTurnEvent::Usage { usage } => {
             handle_provider_usage_event(
                 state,
@@ -19915,6 +19981,33 @@ async fn publish_reasoning_activity_live(
         .sessions
         .publish_live_event(session_id, stream_event)
         .await;
+}
+
+async fn retain_original_usage(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_turn_id: &str,
+    original: bcode_session_models::OriginalUsage,
+) {
+    let runtime = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    if let Some(runtime) = runtime {
+        let mut current = runtime.current_turn.lock().await;
+        if let Some(attempt) = current.as_mut().and_then(|turn| turn.model.as_mut())
+            && attempt.provider_turn_id == provider_turn_id
+            && attempt.identity.provider_plugin_id == original.provider_id
+            && original.validate().is_ok()
+        {
+            bcode_model_provider_runtime::append_usage_capture(
+                &mut attempt.original_usage,
+                original,
+            );
+        }
+    }
 }
 
 async fn handle_provider_usage_event(
@@ -21984,6 +22077,10 @@ async fn build_model_turn_request(
     );
     let metadata_timer = state.metrics.timer();
     let mut metadata = projection.metadata();
+    metadata.insert(
+        bcode_model::CAPTURE_ORIGINAL_USAGE_METADATA_KEY.into(),
+        "true".into(),
+    );
     if let Some(target) = pricing_target {
         metadata.insert(
             "bcode_pricing_target".to_owned(),
@@ -31554,13 +31651,32 @@ async fn append_model_usage_event(
     trace_session_cost_estimate(Some(&cost));
     let event = state
         .sessions
-        .append_priced_model_usage(session_id, turn_id, usage, cost)
+        .append_model_usage_with_original(
+            session_id,
+            turn_id,
+            usage,
+            cost,
+            attempt.and_then(|attempt| attempt.original_usage.clone()),
+        )
         .await
         .map_err(|_| {
             "provider usage could not be committed; session cost coverage is incomplete".to_owned()
         })?;
     publish_session_event(state, &event).await;
     Ok(())
+}
+
+fn replace_normalized_usage(facts: &mut SessionTokenUsage, usage: &TokenUsage) {
+    let normalized = session_token_usage(usage, None);
+    facts.input_tokens = normalized.input_tokens;
+    facts.output_tokens = normalized.output_tokens;
+    facts.total_tokens = normalized.total_tokens;
+    facts.cached_input_tokens = normalized.cached_input_tokens;
+    facts.cache_write_input_tokens = normalized.cache_write_input_tokens;
+    facts.reasoning_tokens = normalized.reasoning_tokens;
+    facts.pricing_context = normalized.pricing_context;
+    facts.pricing_usage_details = normalized.pricing_usage_details;
+    facts.cost = None;
 }
 
 fn session_token_usage(
@@ -40622,6 +40738,7 @@ library = "test"
                 tokens: 90,
                 algorithm_version: LOCAL_CONTEXT_ESTIMATOR_VERSION,
             },
+            original_usage: None,
             managed_compaction_persisted: false,
         };
 
@@ -40669,7 +40786,7 @@ library = "test"
             catalog_provider_id: Some("provider-one".into()), catalog_entry_id: Some("model-one".into()),
             catalog_family: None, pricing_target: None, catalog_api_surface: None, reuse_key: None,
             request_message_count: 1, context_through_sequence: 0, portable_context: String::new(),
-            local_estimate: bcode_session_models::LocalContextEstimate { tokens: 100, algorithm_version: 1 }, managed_compaction_persisted: false,
+            local_estimate: bcode_session_models::LocalContextEstimate { tokens: 100, algorithm_version: 1 }, original_usage: None, managed_compaction_persisted: false,
         }
     }
 
@@ -40751,7 +40868,7 @@ library = "test"
         let _ = context_compaction::handle_compaction_events(
             &state,
             session.id,
-            &attempt,
+            &mut attempt,
             &mut String::new(),
             vec![ProviderTurnEvent::Usage { usage: warm }],
         )
@@ -50959,6 +51076,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     tokens: 0,
                     algorithm_version: 1,
                 },
+                original_usage: None,
                 managed_compaction_persisted: false,
             }),
         });

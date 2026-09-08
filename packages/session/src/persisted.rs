@@ -25,6 +25,13 @@ use thiserror::Error;
 /// shape or cannot be converted into the current domain model.
 pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
     let value = serde_json::from_str::<serde_json::Value>(payload)?;
+    if let Some(raw) = value.get("original_usage") {
+        let original: bcode_session_models::OriginalUsage = serde_json::from_value(raw.clone())
+            .map_err(|_| PersistedSessionEventError::InvalidOriginalUsage)?;
+        original
+            .validate()
+            .map_err(|_| PersistedSessionEventError::InvalidOriginalUsage)?;
+    }
     reject_unsupported_future_shape(&value)?;
     let persisted = serde_json::from_value::<PersistedSessionEvent>(value)?;
     persisted.into_domain()
@@ -37,6 +44,56 @@ pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSess
 /// Returns an error when the event cannot be serialized as JSON.
 pub fn encode_session_event(event: &SessionEvent) -> Result<String, serde_json::Error> {
     serde_json::to_string(&PersistedSessionEvent::from(event))
+}
+
+/// Encode canonical billing evidence alongside the public normalized event. Decoding the public
+/// event intentionally omits evidence; maintenance reads it explicitly with `original_usage`.
+///
+/// # Errors
+///
+/// Returns an error for invalid evidence or serialization failure.
+pub fn encode_session_event_with_original(
+    event: &SessionEvent,
+    original: Option<&bcode_session_models::OriginalUsage>,
+) -> Result<String, String> {
+    let Some(original) = original else {
+        return encode_session_event(event).map_err(|_| "event encoding failed".into());
+    };
+    original.validate()?;
+    let SessionEventKind::ModelUsage { usage, .. } = &event.kind else {
+        return Err("original usage requires a usage event".into());
+    };
+    if usage
+        .request
+        .as_ref()
+        .is_none_or(|request| request.provider_plugin_id != original.provider_id)
+    {
+        return Err("original usage provider mismatch".into());
+    }
+    let mut value = serde_json::to_value(PersistedSessionEvent::from(event))
+        .map_err(|_| "event encoding failed")?;
+    value["original_usage"] =
+        serde_json::to_value(original).map_err(|_| "original usage encoding failed")?;
+    serde_json::to_string(&value).map_err(|_| "event encoding failed".into())
+}
+
+/// Read private billing evidence without exposing it in ordinary history.
+///
+/// # Errors
+///
+/// Returns an error if evidence is malformed or exceeds the capture contract.
+pub fn original_usage(
+    payload: &str,
+) -> Result<Option<bcode_session_models::OriginalUsage>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|_| "invalid canonical payload")?;
+    let Some(raw) = value.get("original_usage") else {
+        return Ok(None);
+    };
+    let original: bcode_session_models::OriginalUsage =
+        serde_json::from_value(raw.clone()).map_err(|_| "invalid original usage")?;
+    original.validate()?;
+    Ok(Some(original))
 }
 
 fn reject_unsupported_future_shape(
@@ -81,6 +138,9 @@ fn first_persisted_event_kind_name(kind: &serde_json::Value) -> String {
 /// Errors returned when decoding persisted session events.
 #[derive(Debug, Error)]
 pub enum PersistedSessionEventError {
+    /// Private original usage is malformed; ordinary reads must not conceal damaged evidence.
+    #[error("invalid original billing usage in canonical event")]
+    InvalidOriginalUsage,
     /// Persisted JSON was malformed or incompatible with known DTOs.
     #[error(transparent)]
     Json(#[from] serde_json::Error),

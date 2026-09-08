@@ -238,6 +238,7 @@ impl BedrockProviderPlugin {
         }
         match context.request.operation.as_str() {
             OP_CAPABILITIES => Self::capabilities_response(&context.request),
+            bcode_model::OP_NORMALIZE_USAGE => normalize_original_usage_service(&context.request),
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => self.validate_config_response(&context.request),
             OP_START_TURN => self.start_turn(
@@ -283,6 +284,13 @@ impl BedrockProviderPlugin {
             turn: turn.clone(),
             transferred: false,
         };
+        if request
+            .metadata
+            .get(bcode_model::CAPTURE_ORIGINAL_USAGE_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+        {
+            turn.enable_original_usage();
+        }
         if positioned_output {
             turn.enable_positioned_output();
         }
@@ -326,6 +334,13 @@ impl BedrockProviderPlugin {
             turn: turn.clone(),
             transferred: false,
         };
+        if request
+            .metadata
+            .get(bcode_model::CAPTURE_ORIGINAL_USAGE_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+        {
+            turn.enable_original_usage();
+        }
         turn.enable_positioned_output();
         if let Ok(route) = resolve_bedrock_route(&request, &Settings::resolve(Some(&request))) {
             turn.push(ProviderTurnEvent::RequestProjection {
@@ -1364,6 +1379,36 @@ fn process_mantle_openai_line(
 ) -> Result<Option<StreamOutcome>, ProviderError> {
     use bcode_openai_responses as responses;
 
+    if let Some(data) = line.strip_prefix("data:")
+        && let Some(mut original) = bcode_model_provider_runtime::capture_usage_json(
+            PROVIDER_ID,
+            "responses",
+            data.trim(),
+            "usage",
+        )
+    {
+        original.complete = matches!(
+            original
+                .reports
+                .last()
+                .map_or("usage", |report| report.source.as_str()),
+            "response.completed" | "response.done" | "response.incomplete" | "response.failed"
+        );
+        if let Some(tier) = requested_service_tier {
+            original
+                .requested
+                .insert("service_tier".into(), tier.into());
+        }
+        if let Some(ttl) = requested_cache_retention {
+            original
+                .requested
+                .insert("prompt_cache_retention".into(), ttl.into());
+        }
+        bcode_model_provider_runtime::finalize_usage_capture(&mut original);
+        sink.push(ProviderTurnEvent::OriginalUsage {
+            original: Box::new(original),
+        });
+    }
     let event = match responses::classify_responses_stream_line(line)? {
         responses::ResponsesStreamLine::Ignored => return Ok(None),
         responses::ResponsesStreamLine::Done => {
@@ -1375,7 +1420,8 @@ fn process_mantle_openai_line(
         }
         responses::ResponsesStreamLine::Event(event) => event,
     };
-    match responses::responses_event_type(&event) {
+    let event_type = responses::responses_event_type(&event);
+    match event_type {
         "response.output_text.delta" | "response.refusal.delta" => {
             if let Some(delta) = responses::responses_text_delta(&event) {
                 sink.push(ProviderTurnEvent::TextDelta {
@@ -1915,13 +1961,14 @@ impl MantleSseDecoder {
         if data == "[DONE]" {
             return Ok(());
         }
-        events.push(serde_json::from_str(&data).map_err(|error| {
+        let _: Box<serde_json::value::RawValue> = serde_json::from_str(&data).map_err(|_| {
             provider_error(
                 "bedrock_mantle_stream_decode_failed",
                 ProviderErrorCategory::ProviderInternal,
-                format!("failed to decode Bedrock Mantle SSE event: {error}"),
+                "invalid Mantle event JSON",
             )
-        })?);
+        })?;
+        events.push(serde_json::Value::String(data));
         Ok(())
     }
 }
@@ -1976,13 +2023,13 @@ async fn read_mantle_anthropic_stream(
             chunk = response.chunk() => {
                 if let Some(chunk) = chunk.map_err(|error| mantle_network_error("stream_failed", &error))? {
                     for event in decoder.push(&chunk)? {
-                        if let Some(outcome) = accumulator.process(&event, turn)? {
+                        if let Some(outcome) = accumulator.process_json(event.as_str().ok_or_else(|| provider_error("bedrock_decode",ProviderErrorCategory::ProviderInternal,"expected Messages JSON"))?, turn)? {
                             return Ok(outcome);
                         }
                     }
                 } else {
                     for event in decoder.finish()? {
-                        if let Some(outcome) = accumulator.process(&event, turn)? {
+                        if let Some(outcome) = accumulator.process_json(event.as_str().ok_or_else(|| provider_error("bedrock_decode",ProviderErrorCategory::ProviderInternal,"expected Messages JSON"))?, turn)? {
                             return Ok(outcome);
                         }
                     }
@@ -2338,20 +2385,136 @@ async fn read_anthropic_messages_stream(
                 if let ResponseStream::Chunk(chunk) = event
                     && let Some(bytes) = chunk.bytes()
                 {
-                    let event = serde_json::from_slice::<serde_json::Value>(bytes.as_ref()).map_err(|error| {
-                        provider_error(
-                            "bedrock_messages_stream_decode_failed",
-                            ProviderErrorCategory::ProviderInternal,
-                            format!("failed to decode Bedrock Messages stream event: {error}"),
-                        )
-                    })?;
-                    if let Some(outcome) = accumulator.process(&event, turn)? {
+                    let json = std::str::from_utf8(bytes.as_ref()).map_err(|_| provider_error("bedrock_decode",ProviderErrorCategory::ProviderInternal,"invalid Messages encoding"))?;
+                    if let Some(outcome) = accumulator.process_json(json, turn)? {
                         return Ok(outcome);
                     }
                 }
             }
             () = turn.cancelled() => return Ok(StreamOutcome::Cancelled),
         }
+    }
+}
+
+fn normalize_original_usage_service(request: &ServiceRequest) -> ServiceResponse {
+    let result = request
+        .payload_json::<bcode_session_models::OriginalUsage>()
+        .map_err(|_| "invalid original usage".to_owned())
+        .and_then(|original| normalize_original_usage(&original));
+    result.map_or_else(
+        |_| {
+            ServiceResponse::error(
+                "usage_normalization_failed",
+                "original usage is incomplete, unsupported, or invalid",
+            )
+        },
+        |usage| {
+            ServiceResponse::json(&usage).unwrap_or_else(|_| {
+                ServiceResponse::error("usage_encode_failed", "usage encoding failed")
+            })
+        },
+    )
+}
+fn normalize_original_usage(
+    original: &bcode_session_models::OriginalUsage,
+) -> Result<TokenUsage, String> {
+    original.validate()?;
+    if original.provider_id != PROVIDER_ID
+        || original
+            .capture_issue
+            .is_some_and(|issue| issue != bcode_session_models::UsageCaptureIssue::SdkFieldsOnly)
+    {
+        return Err("unsupported billing evidence".into());
+    }
+    match original.api_shape.as_str() {
+        "converse_sdk" => {
+            let report = original.reports.last().ok_or("missing SDK usage")?;
+            let value: serde_json::Value =
+                serde_json::from_str(&report.usage_json).map_err(|_| "invalid SDK usage")?;
+            let read = |key| value.get(key).and_then(json_u32);
+            let ordinary = read("inputTokens");
+            let cached = read("cacheReadInputTokens");
+            let written = read("cacheWriteInputTokens");
+            let output = read("outputTokens");
+            let input = ordinary.and_then(|input| {
+                input
+                    .checked_add(cached.unwrap_or_default())?
+                    .checked_add(written.unwrap_or_default())
+            });
+            Ok(TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+                total_tokens: input
+                    .zip(output)
+                    .and_then(|(input, output)| input.checked_add(output)),
+                cached_input_tokens: cached,
+                cache_write_input_tokens: written,
+                details: converse_pricing_details(ordinary, output, cached, written),
+                pricing_context: Box::new(bcode_model::ModelPricingContext {
+                    service_tier: Some("standard".into()),
+                    invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                    request_input_tokens: input.map(u64::from),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+        "messages" => {
+            let mut accumulator = AnthropicMessagesAccumulator::new_with_pricing_context(
+                BTreeMap::new(),
+                None,
+                original
+                    .requested
+                    .get("cache_ttl_seconds")
+                    .and_then(|ttl| ttl.parse().ok()),
+                original.requested.get("billing_scope").cloned(),
+            );
+            for report in &original.reports {
+                if !matches!(report.source.as_str(), "message_start" | "message_delta") {
+                    return Err("unsupported Messages usage report".into());
+                }
+                let value =
+                    serde_json::from_str(&report.usage_json).map_err(|_| "invalid usage JSON")?;
+                accumulator.record_usage(Some(&value));
+            }
+            let mut usage = accumulator.usage.take().ok_or("no billing observations")?;
+            if !original.complete {
+                usage.output_tokens = None;
+                usage.total_tokens = None;
+                usage.details = usage
+                    .details
+                    .into_vec()
+                    .into_iter()
+                    .filter(|detail| detail.bucket != bcode_model::ModelPricingBucket::Output)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+            }
+            Ok(usage)
+        }
+        "responses" => {
+            let report = original.reports.last().ok_or("no billing reports")?;
+            let usage: serde_json::Value =
+                serde_json::from_str(&report.usage_json).map_err(|_| "invalid usage JSON")?;
+            let mut event = serde_json::json!({"response":{"usage":usage}});
+            for (key, value) in &report.confirmed {
+                event["response"][key] = value.clone().into();
+            }
+            let mut usage = mantle_openai_usage(
+                &event,
+                original.requested.get("service_tier").map(String::as_str),
+                original
+                    .requested
+                    .get("prompt_cache_retention")
+                    .map(String::as_str),
+            )
+            .ok_or("invalid billing observations")?;
+            if !original.complete {
+                usage.output_tokens = None;
+                usage.total_tokens = None;
+            }
+            Ok(usage)
+        }
+        _ => Err("unsupported billing API shape".into()),
     }
 }
 
@@ -2401,6 +2564,7 @@ struct AnthropicMessagesAccumulator {
     cache_ttl_seconds: Option<u64>,
     /// Billing scope derived from the exact effective Bedrock model identifier.
     billing_scope: Option<String>,
+    original_usage: Option<bcode_session_models::OriginalUsage>,
     usage_state: UsageEmissionState,
     name_map: BTreeMap<String, String>,
 }
@@ -2413,6 +2577,15 @@ struct UsageEmissionState {
 
 impl Drop for AnthropicMessagesAccumulator {
     fn drop(&mut self) {
+        if !self.usage_state.final_usage
+            && self.usage.is_none()
+            && let (Some(turn), Some(original)) =
+                (self.usage_sink.as_ref(), self.original_usage.take())
+        {
+            turn.push(ProviderTurnEvent::OriginalUsage {
+                original: Box::new(original),
+            });
+        }
         if !self.usage_state.final_usage
             && let (Some(turn), Some(mut usage)) = (self.usage_sink.take(), self.usage.take())
         {
@@ -2427,6 +2600,12 @@ impl Drop for AnthropicMessagesAccumulator {
                     .filter(|detail| detail.bucket != bcode_model::ModelPricingBucket::Output)
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
+            }
+            if let Some(mut original) = self.original_usage.take() {
+                original.complete = self.saw_terminal_stop_reason();
+                turn.push(ProviderTurnEvent::OriginalUsage {
+                    original: Box::new(original),
+                });
             }
             turn.push(ProviderTurnEvent::Usage { usage });
         }
@@ -2461,6 +2640,7 @@ impl AnthropicMessagesAccumulator {
             usage_sink: None,
             cache_ttl_seconds,
             billing_scope,
+            original_usage: None,
             usage_state: UsageEmissionState {
                 final_usage: false,
                 exact_input: false,
@@ -2469,12 +2649,67 @@ impl AnthropicMessagesAccumulator {
         }
     }
 
+    fn capture_original(&mut self, json: &str, source: &str) {
+        if let Some(mut original) =
+            bcode_model_provider_runtime::capture_usage_json(PROVIDER_ID, "messages", json, source)
+        {
+            if let Some(ttl) = self.cache_ttl_seconds {
+                original
+                    .requested
+                    .insert("cache_ttl_seconds".into(), ttl.to_string());
+            }
+            if let Some(scope) = &self.billing_scope {
+                original
+                    .requested
+                    .insert("billing_scope".into(), scope.clone());
+            }
+            bcode_model_provider_runtime::append_usage_capture(&mut self.original_usage, original);
+        }
+    }
+
+    fn process_json(
+        &mut self,
+        json: &str,
+        turn: &TurnState,
+    ) -> Result<Option<StreamOutcome>, ProviderError> {
+        self.usage_sink = Some(turn.clone());
+        let envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_str(json).map_err(|_| {
+                provider_error(
+                    "bedrock_usage_decode_failed",
+                    ProviderErrorCategory::ProviderInternal,
+                    "invalid Messages event",
+                )
+            })?;
+        let source = envelope
+            .get("type")
+            .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+            .unwrap_or_else(|| "unknown".into());
+        self.capture_original(json, &source);
+        let event: serde_json::Value = serde_json::from_str(json).map_err(|_| {
+            provider_error(
+                "bedrock_messages_stream_decode_failed",
+                ProviderErrorCategory::ProviderInternal,
+                "invalid Messages event",
+            )
+        })?;
+        self.process_event(&event, turn)
+    }
+
+    #[cfg(test)]
     fn process(
         &mut self,
         event: &serde_json::Value,
         turn: &TurnState,
     ) -> Result<Option<StreamOutcome>, ProviderError> {
-        self.usage_sink = Some(turn.clone());
+        self.process_json(&event.to_string(), turn)
+    }
+
+    fn process_event(
+        &mut self,
+        event: &serde_json::Value,
+        turn: &TurnState,
+    ) -> Result<Option<StreamOutcome>, ProviderError> {
         match event.get("type").and_then(serde_json::Value::as_str) {
             Some("message_start") => {
                 self.record_usage(
@@ -2836,6 +3071,12 @@ impl AnthropicMessagesAccumulator {
         let Some(usage) = self.usage.take() else {
             return;
         };
+        if let Some(mut original) = self.original_usage.take() {
+            original.complete = true;
+            turn.push(ProviderTurnEvent::OriginalUsage {
+                original: Box::new(original),
+            });
+        }
         turn.push(ProviderTurnEvent::Usage { usage });
         self.usage_state.final_usage = true;
     }
@@ -2900,6 +3141,19 @@ fn required_event_string(value: &serde_json::Value, key: &str) -> Result<String,
 
 fn json_u32(value: &serde_json::Value) -> Option<u32> {
     value.as_u64().and_then(|value| u32::try_from(value).ok())
+}
+
+fn capture_converse_sdk_usage(
+    usage: &aws_sdk_bedrockruntime::types::TokenUsage,
+) -> bcode_session_models::OriginalUsage {
+    bcode_session_models::OriginalUsage {
+        provider_id: PROVIDER_ID.into(), api_shape:"converse_sdk".into(), complete:true,
+        capture_issue:Some(bcode_session_models::UsageCaptureIssue::SdkFieldsOnly),
+        reports:vec![bcode_session_models::OriginalUsageReport {
+            source:"metadata".into(), confirmed:BTreeMap::new(),
+            usage_json:serde_json::json!({"inputTokens":usage.input_tokens(),"outputTokens":usage.output_tokens(),"totalTokens":usage.total_tokens(),"cacheReadInputTokens":usage.cache_read_input_tokens(),"cacheWriteInputTokens":usage.cache_write_input_tokens()}).to_string(),
+        }], ..Default::default()
+    }
 }
 
 async fn read_bedrock_stream(
@@ -2995,6 +3249,9 @@ impl StreamAccumulator {
             },
             ConverseStreamOutput::Metadata(event) => {
                 if let Some(usage) = event.usage() {
+                    turn.push(ProviderTurnEvent::OriginalUsage {
+                        original: Box::new(capture_converse_sdk_usage(usage)),
+                    });
                     let native_input_tokens = nonnegative_u32(usage.input_tokens());
                     let cache_read_input_tokens =
                         usage.cache_read_input_tokens().and_then(nonnegative_u32);
@@ -9111,7 +9368,10 @@ mod tests {
             .push(b"\"message_start\",\r\ndata: \"message\":{}}\r\n\r\n")
             .expect("fragmented event should decode");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["type"], "message_start");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(events[0].as_str().unwrap()).unwrap()["type"],
+            "message_start"
+        );
     }
 
     #[test]
@@ -9563,6 +9823,84 @@ mod tests {
                             && detail.tokens == 80
                             && detail.cache_ttl_seconds == Some(300))
         )));
+    }
+
+    /// SDK evidence remains available but cannot promise unknown field recovery.
+    #[test]
+    fn converse_capture_is_explicitly_sdk_limited_and_replays_known_usage() {
+        let usage = aws_sdk_bedrockruntime::types::TokenUsage::builder()
+            .input_tokens(10)
+            .output_tokens(2)
+            .total_tokens(12)
+            .cache_read_input_tokens(20)
+            .cache_write_input_tokens(30)
+            .build()
+            .unwrap();
+        let original = capture_converse_sdk_usage(&usage);
+        assert_eq!(
+            original.capture_issue,
+            Some(bcode_session_models::UsageCaptureIssue::SdkFieldsOnly)
+        );
+        let normalized = normalize_original_usage(&original).unwrap();
+        assert_eq!(normalized.input_tokens, Some(60));
+        assert_eq!(normalized.cache_write_input_tokens, Some(30));
+    }
+
+    #[test]
+    fn messages_wire_capture_preserves_large_unknown_numbers() {
+        let turn = TurnState::default();
+        turn.enable_original_usage();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        accumulator.process_json(r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0,"unknown_counter":123456789012345678901234567890,"fraction":1.2300}}}"#,&turn).unwrap();
+        accumulator
+            .process_json(r#"{"type":"message_stop"}"#, &turn)
+            .unwrap();
+        let events = turn.drain();
+        let original = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderTurnEvent::OriginalUsage { original } => Some(original),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            original.reports[0]
+                .usage_json
+                .contains("123456789012345678901234567890")
+        );
+        assert!(original.reports[0].usage_json.contains("1.2300"));
+    }
+
+    #[test]
+    fn original_messages_reports_replay_without_merging_away_unknown_fields() {
+        let turn = TurnState::default();
+        turn.enable_original_usage();
+        let mut accumulator = AnthropicMessagesAccumulator::new(BTreeMap::new(), None);
+        for event in [
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"future_count":17}}}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}),
+            serde_json::json!({"type":"message_stop"}),
+        ] {
+            accumulator.process(&event, &turn).unwrap();
+        }
+        let events = turn.drain();
+        let original = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderTurnEvent::OriginalUsage { original } => Some(original),
+                _ => None,
+            })
+            .unwrap();
+        let live = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderTurnEvent::Usage { usage } => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(original.reports.len(), 2);
+        assert!(original.reports[0].usage_json.contains("future_count"));
+        assert_eq!(&normalize_original_usage(original).unwrap(), live);
     }
 
     #[test]

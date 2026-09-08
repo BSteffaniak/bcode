@@ -65,6 +65,12 @@ pub const OP_CONTEXT_MANAGEMENT_CAPABILITIES: &str = "context_management_capabil
 pub const OP_COMPACT_CONTEXT: &str = "compact_context";
 
 /// Operation for model listing.
+/// Host opt-in for private original billing events on otherwise compatible provider interfaces.
+pub const CAPTURE_ORIGINAL_USAGE_METADATA_KEY: &str = "bcode_capture_original_usage";
+
+/// Offline provider-owned normalization of retained billing evidence. No credentials or network.
+pub const OP_NORMALIZE_USAGE: &str = "normalize_usage";
+
 pub const OP_MODELS: &str = "models";
 
 /// Operation for validating provider configuration.
@@ -243,6 +249,13 @@ pub const MODEL_PROVIDER_OPERATIONS: &[ProviderOperationContract] = &[
         response_type: "AuthResetCreditsResponse",
         requirement: ProviderOperationRequirement::Optional,
         behavior: "list normalized auth reset-credit state",
+    },
+    ProviderOperationContract {
+        operation: OP_NORMALIZE_USAGE,
+        request_type: "OriginalUsage",
+        response_type: "TokenUsage",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "normalize retained provider billing evidence offline without credentials or network",
     },
     ProviderOperationContract {
         operation: OP_AUTH_RESET_CREDIT_CONSUME,
@@ -3139,6 +3152,10 @@ pub enum ProviderTurnEvent {
         stop_reason: StopReason,
     },
     Cancelled,
+    /// Private billing data, consumed by the session host rather than frontend/model events.
+    OriginalUsage {
+        original: Box<bcode_session_models::OriginalUsage>,
+    },
 }
 
 impl ProviderTurnEvent {
@@ -3161,6 +3178,7 @@ impl ProviderTurnEvent {
 impl fmt::Debug for ProviderTurnEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OriginalUsage { original } => fmt::Debug::fmt(original, formatter),
             Self::ProviderMetadata { key, value } => formatter
                 .debug_struct("ProviderMetadata")
                 .field("key", key)
@@ -3817,6 +3835,7 @@ mod tests {
             super::OP_AUTH_USAGE,
             super::OP_AUTH_PRIME,
             super::OP_AUTH_RESET_CREDITS,
+            super::OP_NORMALIZE_USAGE,
             super::OP_AUTH_RESET_CREDIT_CONSUME,
         ];
         let actual = super::MODEL_PROVIDER_OPERATIONS

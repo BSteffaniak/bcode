@@ -1054,7 +1054,7 @@ pub async fn collect_compaction_summary_once(
         return Err(CompactionError::Cancelled);
     }
 
-    let attempt = ModelRequestAttempt {
+    let mut attempt = ModelRequestAttempt {
         identity: bcode_session_models::ModelRequestIdentity {
             provider_plugin_id: selection
                 .provider_plugin_id
@@ -1092,6 +1092,7 @@ pub async fn collect_compaction_summary_once(
         context_through_sequence: transcript.compacted_through_sequence,
         portable_context: String::new(),
         local_estimate: local_request_estimate(&request),
+        original_usage: None,
         managed_compaction_persisted: false,
     };
     record_pending_request_usage(state, session_id, &attempt)
@@ -1108,7 +1109,7 @@ pub async fn collect_compaction_summary_once(
         return stream_compaction_summary(
             state,
             session_id,
-            &attempt,
+            &mut attempt,
             state
                 .plugins
                 .invoke_service_with_events(
@@ -1190,7 +1191,7 @@ pub async fn collect_compaction_summary_once(
             session_id,
             selection,
             &provider_turn_id,
-            &attempt,
+            &mut attempt,
             context,
             cancel_state,
         )
@@ -1201,7 +1202,7 @@ pub async fn collect_compaction_summary_once(
             session_id,
             selection,
             &provider_turn_id,
-            &attempt,
+            &mut attempt,
             cancel_state,
         )
         .await
@@ -1242,7 +1243,13 @@ pub fn build_compaction_request(
         parameters: ModelParameters::default(),
         prompt_cache: bcode_model::PromptCacheHints::default(),
         conversation_reuse: bcode_model::ConversationReuseHints::default(),
-        metadata: BTreeMap::from([("bcode_request_kind".to_string(), "compaction".to_string())]),
+        metadata: BTreeMap::from([
+            ("bcode_request_kind".to_string(), "compaction".to_string()),
+            (
+                bcode_model::CAPTURE_ORIGINAL_USAGE_METADATA_KEY.into(),
+                "true".into(),
+            ),
+        ]),
     }
 }
 
@@ -1339,7 +1346,7 @@ pub fn compaction_error_detail(error: CompactionError) -> String {
 async fn stream_compaction_summary(
     state: &ServerState,
     session_id: SessionId,
-    attempt: &ModelRequestAttempt,
+    attempt: &mut ModelRequestAttempt,
     mut invocation: bcode_plugin::StreamingServiceInvocation,
     command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
@@ -1354,7 +1361,8 @@ async fn stream_compaction_summary(
     )
     .await;
     if result.is_err()
-        && let Some(usage) = receive_final_billing_usage(&mut invocation).await
+        && let Some(usage) =
+            receive_final_billing_usage(&mut invocation, &mut attempt.original_usage).await
         && let Err(error) = append_model_usage_event(
             state,
             session_id,
@@ -1372,7 +1380,7 @@ async fn stream_compaction_summary(
 async fn stream_compaction_summary_inner(
     state: &ServerState,
     session_id: SessionId,
-    attempt: &ModelRequestAttempt,
+    attempt: &mut ModelRequestAttempt,
     invocation: &mut bcode_plugin::StreamingServiceInvocation,
     mut command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
@@ -1485,7 +1493,7 @@ pub async fn poll_compaction_summary_actor_aware(
     session_id: SessionId,
     selection: &SessionModelSelection,
     provider_turn_id: &str,
-    attempt: &ModelRequestAttempt,
+    attempt: &mut ModelRequestAttempt,
     command_context: &mut RuntimeCommandContext<'_>,
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
@@ -1602,7 +1610,7 @@ pub async fn poll_compaction_summary(
     session_id: SessionId,
     selection: &SessionModelSelection,
     provider_turn_id: &str,
-    attempt: &ModelRequestAttempt,
+    attempt: &mut ModelRequestAttempt,
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
@@ -1688,7 +1696,7 @@ pub enum CompactionPollStatus {
 pub async fn handle_compaction_events(
     state: &ServerState,
     session_id: SessionId,
-    attempt: &ModelRequestAttempt,
+    attempt: &mut ModelRequestAttempt,
     summary: &mut String,
     events: Vec<ProviderTurnEvent>,
 ) -> CompactionPollStatus {
@@ -1706,6 +1714,12 @@ pub async fn handle_compaction_events(
                 bcode_model::ProviderOutputEvent::ReasoningActivity { .. } => {}
             },
             ProviderTurnEvent::TextDelta { text } => summary.push_str(&text),
+            ProviderTurnEvent::OriginalUsage { original } => {
+                bcode_model_provider_runtime::append_usage_capture(
+                    &mut attempt.original_usage,
+                    *original,
+                );
+            }
             ProviderTurnEvent::Usage { usage } => {
                 if let Err(error) = append_model_usage_event(
                     state,

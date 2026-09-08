@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 8;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 9;
 
 use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
@@ -30,8 +30,14 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod original_usage;
+pub use original_usage::{
+    MAX_ORIGINAL_USAGE_BYTES, MAX_ORIGINAL_USAGE_REPORTS, OriginalUsage, OriginalUsageReport,
+    UsageCaptureIssue,
+};
+
 mod cost;
-pub use cost::{SessionCostRange, SessionRepriceReport};
+pub use cost::{SessionCostRange, SessionRepriceReport, SessionUsageSource, SessionUsageValuation};
 
 mod context_management;
 pub use context_management::{
@@ -3206,6 +3212,9 @@ pub struct SessionTokenUsage {
 /// Compact canonical accounting state derived from all model-usage events in a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsageSummary {
+    /// Published billing capture status from the latest request, without raw provider data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_usage_capture_issue: Option<UsageCaptureIssue>,
     /// Monotonic derived-cost revision. Repricing advances this without appending an event.
     #[serde(default)]
     pub cost_revision: u64,

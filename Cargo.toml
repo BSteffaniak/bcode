@@ -381,6 +381,7 @@ semver = { version = "1.0.28", default-features = false, features = ["std"] }
 serde = { version = "1.0.219", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
+    "raw_value",
 ] }
 # `sha2`'s `asm-aarch64` feature enables the `sha2-asm` build dependency on
 # every target, including MSVC where its GNU `.S` sources cannot be compiled.

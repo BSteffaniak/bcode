@@ -103,6 +103,12 @@ fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
         "CREATE INDEX idx_session_usage_timestamp ON session_usage_requests(first_observed_at_ms, request_key)",
         "DROP INDEX idx_session_usage_timestamp",
     );
+    add_sql_migration(
+        source,
+        "041_usage_valuation_staging",
+        "CREATE TABLE usage_valuation_staging (request_key TEXT PRIMARY KEY, usage_json TEXT NOT NULL, cost_json TEXT NOT NULL)",
+        "DROP TABLE usage_valuation_staging",
+    );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {

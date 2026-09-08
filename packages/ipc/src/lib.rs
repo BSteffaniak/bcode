@@ -101,7 +101,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// a daemon across config directories.
 /// Version 35 includes the selected edge revision in workflow graph inspection.
 /// Older positional payloads are rejected rather than assigned a guessed revision.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 35;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 36;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =

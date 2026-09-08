@@ -379,7 +379,8 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-writer contract is epoch `8`; epoch `7` adds separated derived cost and first-observed request
+writer contract is epoch `9`; epoch `8` adds private original billing capture and disposable staging
+through exclusive migration. Epoch `7` adds separated derived cost and first-observed request
 timestamps through exclusive migration. Epoch `6` sessions also rebuild the cumulative
 usage projection alongside every existing required projection. Earlier recognized legacy epochs
 follow the same complete migration chain. That rebuild applies
@@ -561,6 +562,25 @@ silently rebuild them. Bounded session attach returns the compact usage summary 
 resident transcript window, so reconnecting or loading older transcript pages cannot change the
 session-wide token or cost totals.
 
+### Original provider billing data
+
+Writer epoch 9 retains optional `original_usage` privately in the canonical event JSON envelope,
+not in `SessionEvent`, `SessionTokenUsage`, or frontend snapshots. Normal reads validate but omit it;
+the explicit normalization path reads it directly through the session owner. Migration preserves
+this envelope field alongside the event. Existing normalized-only events need no invented backfill.
+The evidence has no separate version field; the existing writer/IPC boundaries protect older code
+from dropping it. Raw report contents are absent from debug formatting and model-context projection.
+The normal history/export CLI remains a normalized event export, not an evidence backup.
+
+Repricing now stages offline provider normalization in bounded pages before the write transaction.
+`usage_valuation_staging` is disposable and never a read authority. Successful publication verifies
+the source event checkpoint and cost revision, then atomically replaces normalized usage and costs
+and updates token/currency totals together. Failed normalization leaves the prior projection intact;
+failed/interrupted staging is discarded on the next attempt. Canonical events are never rewritten by
+renormalization. An unavailable provider normalizer produces a maintenance failure rather than a
+fallback to potentially buggy normalized facts. Records without original evidence continue using
+recorded normalized facts.
+
 ### Usage facts and replaceable cost projections
 
 Canonical model-usage events contain request identity, first-observed event time, normalized token
@@ -576,8 +596,9 @@ pricing and never resolves the session's currently selected model to price an ea
 
 `bcode session reprice SESSION_ID --from RFC3339 --to RFC3339 --catalog snapshot.json` is explicit
 maintenance through the owning daemon. It applies exactly the supplied CatalogDocument to requests
-first observed in `[from, to)`. Work pages request rows in one transaction, replaces their costs, and
-adjusts cumulative currency totals; a failure rolls back the operation. This maintenance operation
+first observed in `[from, to)`. It stages corrected normalization before opening the publication
+transaction, then adjusts cumulative currency and token totals; publication failure rolls back the
+operation. This maintenance operation
 serializes with that session's appends until commit; it is not a background job. A client timeout
 alone does not cancel or roll back an already admitted transaction. Repeating it with the same
 snapshot and unchanged usage yields the same amounts. Requests outside the range
@@ -589,7 +610,7 @@ Attach and live `UsageSummaryChanged` transfers include a canonical through-sequ
 cost revision. Normal appends advance the former; explicit repricing advances the latter even when
 no events were appended. Clients reject older valuation revisions and older checkpoints within a
 revision. Repricing can legitimately lower totals; model switches, transcript paging, and reconnects
-cannot. IPC 34 defines this transfer; it is not a durable-resume protocol.
+cannot. IPC 36 defines this transfer; it is not a durable-resume protocol.
 
 Writer epoch 8 adds separate cost and request timestamp columns plus the timestamp index. Existing
 stores upgrade through exclusive migration coordination, retaining canonical event bytes. Normal

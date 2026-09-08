@@ -35,6 +35,26 @@ impl SessionCostRange {
 
 /// Result of atomically repricing a session's derived request contributions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsageValuation {
+    /// Corrected normalized facts, or the originally recorded facts for older records.
+    pub usage: super::SessionTokenUsage,
+    /// Derived catalog valuation.
+    pub cost: super::SessionCostEstimate,
+}
+
+/// Request projection plus private canonical billing evidence, used only by maintenance.
+#[derive(Debug, Clone)]
+pub struct SessionUsageSource {
+    /// Canonical row sequence selecting this request contribution.
+    pub sequence: u64,
+    /// Latest normalized projection.
+    pub usage: super::SessionTokenUsage,
+    /// Original provider evidence; never included in frontend snapshots.
+    pub original: Option<super::OriginalUsage>,
+}
+
+/// Result of atomically repricing a session's derived request contributions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRepriceReport {
     /// Session whose usage was valued.
     pub session_id: super::SessionId,

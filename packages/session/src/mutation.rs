@@ -494,6 +494,27 @@ impl SessionManager {
         result
     }
 
+    /// Renormalize retained billing evidence with the owning provider and revalue the range.
+    /// Provider work occurs before the atomic projection update, never under its transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid scope, unavailable normalizer, or projection conflict.
+    pub async fn renormalize_usage(
+        &self,
+        session_id: SessionId,
+        range: bcode_session_models::SessionCostRange,
+        normalize: crate::actor::UsageNormalizer,
+    ) -> Result<(u64, bcode_session_models::SessionUsageSummary), SessionError> {
+        range.validate().map_err(SessionError::EventSerialization)?;
+        Box::pin(self.ensure_session_loaded(session_id)).await?;
+        let handle = self.session_handle(session_id).await?;
+        let result = handle.renormalize_usage(range, normalize).await;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        result
+    }
+
     /// Append immutable usage facts and atomically update the separately derived cost.
     ///
     /// # Errors
@@ -503,9 +524,40 @@ impl SessionManager {
         &self,
         session_id: SessionId,
         turn_id: String,
-        mut usage: SessionTokenUsage,
+        usage: SessionTokenUsage,
         cost: bcode_session_models::SessionCostEstimate,
     ) -> Result<SessionEvent, SessionError> {
+        self.append_model_usage_with_original(session_id, turn_id, usage, cost, None)
+            .await
+    }
+
+    /// Append usage and private original provider evidence atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe evidence, mismatched provider identity or storage failure.
+    pub async fn append_model_usage_with_original(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        mut usage: SessionTokenUsage,
+        cost: bcode_session_models::SessionCostEstimate,
+        original: Option<bcode_session_models::OriginalUsage>,
+    ) -> Result<SessionEvent, SessionError> {
+        if let Some(original) = &original {
+            original
+                .validate()
+                .map_err(SessionError::EventSerialization)?;
+            if usage
+                .request
+                .as_ref()
+                .is_none_or(|request| request.provider_plugin_id != original.provider_id)
+            {
+                return Err(SessionError::EventSerialization(
+                    "original usage provider mismatch".into(),
+                ));
+            }
+        }
         usage.cost = Some(cost.clone());
         usage.validate().map_err(SessionError::EventSerialization)?;
         usage.cost = None;
@@ -516,6 +568,7 @@ impl SessionManager {
             .append_usage_with_cost(
                 SessionEventKind::ModelUsage { turn_id, usage },
                 cost,
+                original,
                 self.next_activity_timestamp_ms(),
             )
             .await?;
