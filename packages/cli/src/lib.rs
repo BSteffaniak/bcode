@@ -8506,92 +8506,20 @@ fn resolve_or_prepare_auth_profile_from(
     recipient_key: Option<&str>,
 ) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
     let profile_hint = registered_auth_profile_hint(config, runtime, provider, explicit_profile);
-    match bcode_provider_auth::resolve_auth_provider_profile(
+    let prepared = bcode_provider_auth::enrollment::prepare(
         config,
-        &provider.contribution.provider_id,
-        &provider.plugin_id,
-        profile_hint.as_deref(),
         runtime,
-    ) {
-        Ok(mut resolved) => {
-            if let Some(vault) = explicit_vault {
-                resolved
-                    .profile
-                    .settings
-                    .insert("vault".to_owned(), vault.display().to_string());
-            }
-            if let Some(recipient_key) = recipient_key {
-                resolved
-                    .profile
-                    .settings
-                    .insert("recipient_key".to_owned(), recipient_key.to_owned());
-            }
-            Ok((resolved, false))
-        }
-        Err(bcode_provider_auth::AuthProfileResolutionError::MissingProfile { .. }) => {
-            let profile_name = profile_hint
-                .as_deref()
-                .unwrap_or(&provider.contribution.provider_id)
-                .to_owned();
-            let vault = explicit_vault.unwrap_or_else(bcode_config::default_auth_vault_path);
-            let mut settings = BTreeMap::from([
-                ("profile".to_owned(), profile_name.clone()),
-                ("vault".to_owned(), vault.display().to_string()),
-            ]);
-            if let Some(recipient_key) = recipient_key {
-                settings.insert("recipient_key".to_owned(), recipient_key.to_owned());
-            }
-            let map = match method {
-                bcode_provider_auth_models::AuthMethodContribution::SecretFields {
-                    fields, ..
-                } => fields
-                    .iter()
-                    .map(|field| {
-                        (
-                            field.credential_id.clone(),
-                            bcode_config::AuthCredentialMapping {
-                                env: None,
-                                key: Some(field.storage_key.clone()),
-                            },
-                        )
-                    })
-                    .collect(),
-                bcode_provider_auth_models::AuthMethodContribution::Interactive {
-                    credentials,
-                    ..
-                } => credentials
-                    .iter()
-                    .map(|credential| {
-                        (
-                            credential.credential_id.clone(),
-                            bcode_config::AuthCredentialMapping {
-                                env: None,
-                                key: Some(credential.storage_key.clone()),
-                            },
-                        )
-                    })
-                    .collect(),
-            };
-            Ok((
-                bcode_provider_auth::ResolvedAuthProfile {
-                    profile_name,
-                    provider_id: provider.contribution.provider_id.clone(),
-                    owner_plugin_id: provider.plugin_id.clone(),
-                    profile: bcode_config::AuthProfileConfig {
-                        backend: "sshenv".to_owned(),
-                        provider_id: Some(provider.contribution.provider_id.clone()),
-                        owner_plugin_id: Some(provider.plugin_id.clone()),
-                        scheme: Some(method.method_id().to_owned()),
-                        map,
-                        settings,
-                    },
-                    source: bcode_provider_auth::AuthProfileSource::Runtime,
-                },
-                true,
-            ))
-        }
-        Err(error) => Err(CliError::LoginProfile(error.to_string())),
-    }
+        &provider.contribution,
+        &provider.plugin_id,
+        method.method_id(),
+        bcode_provider_auth::enrollment::EnrollmentDestination {
+            profile: profile_hint,
+            vault: explicit_vault,
+            recipient_key: recipient_key.map(str::to_owned),
+        },
+    )
+    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    Ok((prepared.resolved, prepared.publish_runtime))
 }
 
 fn resolve_or_prepare_auth_profile(
@@ -8651,30 +8579,7 @@ fn persist_runtime_pool_profile(
 fn persist_prepared_runtime_profile(
     resolved: &bcode_provider_auth::ResolvedAuthProfile,
 ) -> Result<(), CliError> {
-    let storage_profile = resolved
-        .profile
-        .settings
-        .get("profile")
-        .cloned()
-        .unwrap_or_else(|| resolved.profile_name.clone());
-    let vault = resolved
-        .profile
-        .settings
-        .get("vault")
-        .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
-    bcode_config::register_runtime_auth_profile(
-        &resolved.profile_name,
-        bcode_config::RuntimeAuthProfile {
-            provider_id: resolved.provider_id.clone(),
-            owner_plugin_id: resolved.owner_plugin_id.clone(),
-            backend: resolved.profile.backend.clone(),
-            scheme: resolved.profile.scheme.clone().unwrap_or_default(),
-            storage_profile,
-            vault,
-            map: resolved.profile.map.clone(),
-            device_seal: resolved.profile.settings.get("device_seal").cloned(),
-        },
-    )?;
+    bcode_provider_auth::enrollment::publish(resolved)?;
     Ok(())
 }
 

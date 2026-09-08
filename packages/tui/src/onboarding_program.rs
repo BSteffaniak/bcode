@@ -28,6 +28,7 @@ pub struct OnboardingProgram {
     theme: super::theme::PresentedTheme,
     area: Rect,
     continuation: bcode_settings::SetupContinuation,
+    settings_form: Option<super::setup_settings_form::SetupSettingsForm>,
 }
 
 impl OnboardingProgram {
@@ -48,6 +49,7 @@ impl OnboardingProgram {
             theme: *theme,
             area,
             continuation: bcode_settings::SetupContinuation::Close,
+            settings_form: None,
         })
     }
 
@@ -66,8 +68,11 @@ impl OnboardingProgram {
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
         match code {
             KeyCode::Char('r' | 'g' | 'x') if !self.shell.has_pending_confirmation() => {
-                self.continuation = bcode_settings::SetupContinuation::Settings;
-                Ok(Lifecycle::Exit)
+                self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::new(
+                    &bcode_config::default_config_dir().join("bcode.toml"),
+                    "model/profile",
+                ));
+                Ok(Lifecycle::Continue)
             }
             KeyCode::Char('p' | 'a' | 'm') if !self.shell.has_pending_confirmation() => {
                 self.continuation = match code {
@@ -123,6 +128,21 @@ impl Program for OnboardingProgram {
         &mut self,
         event: RuntimeEvent<Self::Message>,
     ) -> Result<Update<Self::Message>, Self::Error> {
+        if let RuntimeEvent::Terminal(ref terminal_event) = event
+            && !matches!(terminal_event, Event::Resize(_))
+            && let Some(form) = &mut self.settings_form
+        {
+            if matches!(
+                form.handle_event(terminal_event),
+                super::setup_settings_form::SettingsFormOutcome::Close
+            ) {
+                self.settings_form = None;
+            }
+            return Ok(Update {
+                invalidation: Invalidation::Redraw,
+                ..Update::none()
+            });
+        }
         let mut lifecycle = Lifecycle::Continue;
         let invalidation = match event {
             RuntimeEvent::Terminal(Event::Resize(size)) => {
@@ -208,6 +228,10 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
 
     fn present(&mut self, program: &mut OnboardingProgram) -> Result<PresentReport, Self::Error> {
         let stats = self.terminal.draw_damage(Damage::Full, |frame| {
+            if let Some(form) = &mut program.settings_form {
+                form.render(frame, &program.theme);
+                return;
+            }
             onboarding_render::render_onboarding(
                 &program.shell,
                 frame,
