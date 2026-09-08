@@ -5193,6 +5193,49 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Admit an activation against an exact current graph under durable execution authority.
+    ///
+    /// Input validation, revision selection, ownership verification, and insertion share one
+    /// transaction. Existing activation bindings are never changed. Legacy scheduling continues
+    /// to use [`Self::create_activation`] until it supports revision-aware reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale ownership or graph revision, missing or malformed executable
+    /// data, invalid input, activation limits, duplicate identity, or persistence failure.
+    pub fn create_activation_at_graph_revision(
+        &mut self,
+        activation: &NewActivation,
+        expected_revision: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_activation(activation)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(&activation.run_id, authority)?;
+        if self.run_graph_revision(&activation.run_id)? != Some(expected_revision) {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow graph revision conflict".to_string(),
+            ));
+        }
+        enforce_activation_limits(&transaction, activation)?;
+        let record = self
+            .current_run_graph_node(&activation.run_id, &activation.node_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow activation references missing run-graph node".to_string(),
+                )
+            })?;
+        insert_activation_bound_to_node(
+            &transaction,
+            activation,
+            activation_status_for_node(&record.node),
+            &record.node,
+            record.revision,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Persist an immutable workflow decision.
     ///
     /// Re-persisting byte-equivalent content is idempotent. Conflicting content at one decision
@@ -13061,7 +13104,7 @@ fn insert_activation_with_status(
     activation: &NewActivation,
     status: &str,
 ) -> Result<(), WorkflowStoreError> {
-    let input = activation.input.as_ref().ok_or_else(|| {
+    activation.input.as_ref().ok_or_else(|| {
         WorkflowStoreError::InvalidData(format!(
             "workflow activation input is required: {}/{}/{}",
             activation.run_id, activation.node_id, activation.activation_id
@@ -13074,6 +13117,19 @@ fn insert_activation_with_status(
                 activation.node_id
             ))
         })?;
+    insert_activation_bound_to_node(transaction, activation, status, &node, 1)
+}
+
+fn insert_activation_bound_to_node(
+    transaction: &Transaction<'_>,
+    activation: &NewActivation,
+    status: &str,
+    node: &bcode_workflow::NodeDefinition,
+    node_revision: u64,
+) -> Result<(), WorkflowStoreError> {
+    let input = activation.input.as_ref().ok_or_else(|| {
+        WorkflowStoreError::InvalidData("workflow activation input is required".to_string())
+    })?;
     validate_json_schema(
         &format!("workflow activation input for node {}", activation.node_id),
         &node.input.schema,
@@ -13082,7 +13138,7 @@ fn insert_activation_with_status(
     transaction.execute(
         "INSERT INTO workflow_activations \
          (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms, node_revision) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             &activation.run_id,
             &activation.node_id,
@@ -13095,6 +13151,7 @@ fn insert_activation_with_status(
                 .transpose()?,
             status,
             activation.created_at_ms,
+            node_revision,
         ),
     )?;
     let event_type = if status == "pending" {
@@ -21466,6 +21523,81 @@ mod tests {
         assert!(!root.join(MIGRATION_RECEIPT_FILE).exists());
         assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
         assert_eq!(detected_store_schema(&connection), Some(14));
+    }
+
+    #[test]
+    fn revision_aware_admission_fences_and_preserves_bindings() {
+        let (temp, mut store) = initialized_store();
+        let original = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("original binding")
+            .expect("original node");
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';
+             INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE run_id = 'run-1';
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
+            )
+            .expect("admitted revision fixture");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let activation = NewActivation {
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_identity("run-1", "review", 1),
+            dependency_generation: 1,
+            input: Some(serde_json::json!(42)),
+            created_at_ms: 20,
+        };
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .create_activation_at_graph_revision(&activation, 2, &stale)
+                .is_err()
+        );
+        assert!(
+            store
+                .create_activation_at_graph_revision(&activation, 1, &authority)
+                .is_err()
+        );
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", &activation.activation_id)
+                .expect("no failed admission")
+                .is_none()
+        );
+        store
+            .create_activation_at_graph_revision(&activation, 2, &authority)
+            .expect("admit revised activation");
+        assert!(
+            store
+                .create_activation_at_graph_revision(&activation, 2, &authority)
+                .is_err()
+        );
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("old binding"),
+            Some(original.clone())
+        );
+        let mut revised = original;
+        revised.revision = 2;
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation.activation_id)
+                .expect("new binding"),
+            Some(revised)
+        );
     }
 
     #[test]
