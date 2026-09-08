@@ -2018,7 +2018,7 @@ struct OpenAiUsage {
     #[serde(default)]
     total_tokens: Option<u32>,
     #[serde(default)]
-    prompt_tokens_details: Option<OpenAiPromptTokenDetails>,
+    prompt_tokens_details: Option<OpenAiInputTokenDetails>,
     #[serde(default)]
     completion_tokens_details: Option<OpenAiCompletionTokenDetails>,
     #[serde(default)]
@@ -2029,14 +2029,6 @@ struct OpenAiUsage {
     input_tokens_details: Option<OpenAiInputTokenDetails>,
     #[serde(default)]
     output_tokens_details: Option<OpenAiOutputTokenDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiPromptTokenDetails {
-    #[serde(default)]
-    cached_tokens: Option<u32>,
-    #[serde(default)]
-    audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2051,6 +2043,13 @@ struct OpenAiCompletionTokenDetails {
 struct OpenAiInputTokenDetails {
     #[serde(default)]
     cached_tokens: Option<u32>,
+    /// Separately billed input written to the prompt cache, not additional input.
+    #[serde(
+        default,
+        rename = "cache_write_tokens",
+        alias = "cache_creation_tokens"
+    )]
+    cache_write: Option<u32>,
     #[serde(default)]
     audio_tokens: Option<u32>,
 }
@@ -5399,6 +5398,16 @@ fn token_usage_from_openai_usage_with_context(
                 .as_ref()
                 .and_then(|details| details.cached_tokens)
         });
+    let cache_write_input_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cache_write)
+        .or_else(|| {
+            usage
+                .input_tokens_details
+                .as_ref()
+                .and_then(|details| details.cache_write)
+        });
     let reasoning_tokens = usage
         .completion_tokens_details
         .as_ref()
@@ -5434,46 +5443,20 @@ fn token_usage_from_openai_usage_with_context(
     // include cached tokens. Cached details are a billed subset, not additional model-visible
     // input, across both native OpenAI and compatible surfaces using this contract.
     let output_tokens = usage.completion_tokens.or(usage.output_tokens);
-    let ambiguous_modality = input_audio_tokens.is_some_and(|audio| {
-        audio > input_tokens.unwrap_or_default()
-            || (audio > 0 && cached_input_tokens.is_none_or(|cached| cached > 0))
-    }) || output_audio_tokens
-        .is_some_and(|audio| audio > output_tokens.unwrap_or_default());
-    let details = if ambiguous_modality {
-        // Preserve evidence without inventing a cached-audio allocation. Incomplete
-        // details intentionally make pricing unavailable.
-        [
-            (bcode_model::ModelPricingBucket::Input, input_audio_tokens),
-            (bcode_model::ModelPricingBucket::Output, output_audio_tokens),
-        ]
-        .into_iter()
-        .filter_map(|(bucket, tokens)| {
-            tokens
-                .filter(|tokens| *tokens > 0)
-                .map(|tokens| bcode_model::ModelTokenUsageDetail {
-                    bucket,
-                    modality: bcode_model::ModelTokenModality::Audio,
-                    tokens,
-                    cache_ttl_seconds: None,
-                })
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
-    } else {
-        openai_modality_usage_details(
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-            input_audio_tokens,
-            output_audio_tokens,
-        )
-    };
+    let details = openai_modality_usage_details(
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        input_audio_tokens,
+        output_audio_tokens,
+    );
     TokenUsage {
         input_tokens,
         output_tokens,
         total_tokens: usage.total_tokens,
         cached_input_tokens,
-        cache_write_input_tokens: None,
+        cache_write_input_tokens,
         details,
         pricing_context: Box::new(bcode_model::ModelPricingContext {
             service_tier: service_tier.map(|tier| bcode_model::normalize_model_service_tier(&tier)),
@@ -5499,13 +5482,42 @@ fn openai_modality_usage_details(
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     cached_input_tokens: Option<u32>,
+    cache_write_input_tokens: Option<u32>,
     input_audio_tokens: Option<u32>,
     output_audio_tokens: Option<u32>,
 ) -> Box<[bcode_model::ModelTokenUsageDetail]> {
+    let ambiguous_modality = input_audio_tokens.is_some_and(|audio| {
+        audio > input_tokens.unwrap_or_default()
+            || (audio > 0
+                && (cached_input_tokens.is_none_or(|cached| cached > 0)
+                    || cache_write_input_tokens.is_some_and(|written| written > 0)))
+    }) || output_audio_tokens
+        .is_some_and(|audio| audio > output_tokens.unwrap_or_default());
+    if ambiguous_modality {
+        // Preserve evidence without inventing cached/written audio allocations.
+        return [
+            (bcode_model::ModelPricingBucket::Input, input_audio_tokens),
+            (bcode_model::ModelPricingBucket::Output, output_audio_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(bucket, tokens)| {
+            tokens
+                .filter(|tokens| *tokens > 0)
+                .map(|tokens| bcode_model::ModelTokenUsageDetail {
+                    bucket,
+                    modality: bcode_model::ModelTokenModality::Audio,
+                    tokens,
+                    cache_ttl_seconds: None,
+                })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    }
     if input_audio_tokens.is_none() && output_audio_tokens.is_none() {
         return Box::default();
     }
     let cached = cached_input_tokens.unwrap_or_default();
+    let written = cache_write_input_tokens.unwrap_or_default();
     let input_audio = input_audio_tokens.unwrap_or_default();
     let output_audio = output_audio_tokens.unwrap_or_default();
     let mut details = Vec::new();
@@ -5516,6 +5528,7 @@ fn openai_modality_usage_details(
             input_tokens
                 .unwrap_or_default()
                 .saturating_sub(cached)
+                .saturating_sub(written)
                 .saturating_sub(input_audio),
         ),
         (
@@ -5527,6 +5540,11 @@ fn openai_modality_usage_details(
             bcode_model::ModelPricingBucket::CacheReadInput,
             bcode_model::ModelTokenModality::Text,
             cached,
+        ),
+        (
+            bcode_model::ModelPricingBucket::CacheWriteInput,
+            bcode_model::ModelTokenModality::Text,
+            written,
         ),
         (
             bcode_model::ModelPricingBucket::Output,
@@ -11640,6 +11658,132 @@ mod tests {
     }
 
     #[test]
+    fn usage_preserves_cache_write_subsets_across_openai_surfaces() {
+        for dialect in [
+            OpenAiCompatibleDialect::ChatCompletions,
+            OpenAiCompatibleDialect::ResponsesApi,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        ] {
+            for details_key in ["prompt_tokens_details", "input_tokens_details"] {
+                for write_key in ["cache_write_tokens", "cache_creation_tokens"] {
+                    for written in [None, Some(0), Some(30)] {
+                        let mut details = serde_json::json!({"cached_tokens": 50});
+                        if let Some(written) = written {
+                            details[write_key] = serde_json::json!(written);
+                        }
+                        let payload = serde_json::json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 110, (details_key): details});
+                        let usage = token_usage_from_openai_usage(
+                            serde_json::from_value(payload).unwrap(),
+                            dialect,
+                        );
+                        assert_eq!(usage.cache_write_input_tokens, written);
+                        assert_eq!(usage.input_tokens, Some(100));
+                        assert_eq!(usage.metered_total_tokens(), Some(110));
+                        assert_eq!(
+                            usage.uncached_input_tokens(),
+                            Some(50 - written.unwrap_or_default())
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_cache_write_counts_are_not_invented() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+            serde_json::json!("100"),
+        ] {
+            let payload = serde_json::json!({"input_tokens":100,"output_tokens":1,
+                "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":value}});
+            let decoded = serde_json::from_value::<OpenAiUsage>(payload);
+            if value.is_null() {
+                assert_eq!(
+                    token_usage_from_openai_usage(
+                        decoded.unwrap(),
+                        OpenAiCompatibleDialect::ResponsesApi
+                    )
+                    .cache_write_input_tokens,
+                    None
+                );
+            } else {
+                assert!(
+                    decoded.is_err(),
+                    "malformed cache writes must not price as zero"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_writes_survive_response_stream_and_incomplete_outcomes() {
+        for terminal in [
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        ] {
+            let turn = TurnState::default();
+            let name_map = BTreeMap::new();
+            let processor = test_responses_stream_processor(&turn, &name_map);
+            let event = serde_json::json!({"type":terminal,"response":{
+                "usage":{"input_tokens":11331,"output_tokens":13,"total_tokens":11344,
+                    "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":11331}}
+            }});
+            let _outcome = process_responses_stream_line(
+                &format!("data: {event}"),
+                &processor,
+                &mut BTreeMap::new(),
+                &mut BTreeMap::new(),
+                &mut false,
+            );
+            let events = turn.drain();
+            let usage = events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderTurnEvent::Usage { usage } => Some(usage),
+                    _ => None,
+                })
+                .expect("terminal usage");
+            assert_eq!(usage.cache_write_input_tokens, Some(11_331));
+            assert_eq!(usage.input_tokens, Some(11_331));
+            assert_eq!(usage.uncached_input_tokens(), Some(0));
+        }
+    }
+
+    #[test]
+    fn modality_details_do_not_charge_cache_writes_as_ordinary_input() {
+        let usage = token_usage_from_openai_usage(serde_json::from_value(serde_json::json!({
+            "input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":50,"cache_write_tokens":30},
+            "output_tokens_details":{"audio_tokens":4}
+        })).unwrap(), OpenAiCompatibleDialect::ResponsesApi);
+        let bucket = |bucket| {
+            usage
+                .details
+                .iter()
+                .filter(|detail| detail.bucket == bucket)
+                .map(|detail| detail.tokens)
+                .sum::<u32>()
+        };
+        assert_eq!(bucket(bcode_model::ModelPricingBucket::Input), 20);
+        assert_eq!(bucket(bcode_model::ModelPricingBucket::CacheReadInput), 50);
+        assert_eq!(bucket(bcode_model::ModelPricingBucket::CacheWriteInput), 30);
+        assert_eq!(bucket(bcode_model::ModelPricingBucket::Output), 10);
+        let ambiguous = token_usage_from_openai_usage(serde_json::from_value(serde_json::json!({
+            "input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":30,"audio_tokens":40}
+        })).unwrap(), OpenAiCompatibleDialect::ResponsesApi);
+        assert!(
+            !ambiguous
+                .details
+                .iter()
+                .any(|detail| detail.bucket == bcode_model::ModelPricingBucket::CacheWriteInput),
+            "do not invent cache-write modality"
+        );
+    }
+
+    #[test]
     fn responses_completed_usage_maps_to_provider_neutral_usage() {
         let event = serde_json::json!({
             "type": "response.completed",
@@ -12566,7 +12710,7 @@ mod tests {
         let turn = TurnState::default();
         let mut buffer = concat!(
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49,\"prompt_tokens_details\":{\"cached_tokens\":10,\"cache_write_tokens\":20}}}\n\n",
             "data: [DONE]\n\n",
         )
         .to_string();
@@ -12590,6 +12734,9 @@ mod tests {
                 if usage.input_tokens == Some(42)
                     && usage.output_tokens == Some(7)
                     && usage.total_tokens == Some(49)
+                    && usage.cached_input_tokens == Some(10)
+                    && usage.cache_write_input_tokens == Some(20)
+                    && usage.uncached_input_tokens() == Some(12)
         )));
     }
 

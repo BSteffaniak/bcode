@@ -107,6 +107,13 @@ no previous request's cache count is carried into the next request's cost. Missi
 unknown unless the provider contract or complete detailed usage proves a zero. Detailed input and
 output must both reconcile with aggregates. Ambiguous cached-audio splits remain unpriced rather
 than assigning all cached tokens to text. Actual response service tiers override request defaults.
+OpenAI usage normalization preserves `input_tokens_details.cache_write_tokens` (and the compatible
+`prompt_tokens_details` shape / `cache_creation_tokens` spelling). Cache writes are disjoint billed
+subsets of input, alongside reads—not extra tokens added to input. Missing or null write counts stay
+unknown rather than becoming zero. Models with separately priced writes therefore remain unpriced
+when the provider omits that field; historical observations produced before the adapter preserved it
+cannot recover the lost count from input/cache-read totals alone. Repricing requires those facts.
+
 See [session persistence](session-persistence-architecture.md#usage-facts-and-replaceable-cost-projections) for
 cumulative projection and interruption coverage.
 
