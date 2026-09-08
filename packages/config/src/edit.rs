@@ -97,7 +97,9 @@ pub fn plan_field_edit(
                     "profile" | "model_id" | "provider_plugin_id" | "auth_profile" | "auth_pool"
                 )
         }
-        "onboarding" => keys.len() == 2 && keys[1] == "credential_discovery",
+        "onboarding" => {
+            keys.len() == 2 && matches!(keys[1].as_str(), "credential_discovery" | "open_browser")
+        }
         "plugins" | "skills" => {
             keys.len() == 2 && matches!(keys[1].as_str(), "enabled" | "disabled")
         }

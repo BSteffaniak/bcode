@@ -117,17 +117,12 @@ fn flow(
         },
     )
     .map_err(|_| "Authentication profile is inconsistent.")?;
-    let mut request = AuthFlowRequest {
-        schema_version: bcode_provider_auth_models::AUTH_FLOW_SCHEMA_VERSION,
-        provider_id: provider_id.to_owned(),
-        method_id: method_id.to_owned(),
-        profile: prepared.resolved.profile_name.clone(),
-        operation: AuthFlowOperation::Begin,
-        state: None,
-        input: None,
-        verify: false,
-        revoke: false,
-    };
+    let mut request = begin_request(provider_id, method_id, &prepared.resolved.profile_name);
+    let mut browser = super::auth_browser::AuthBrowser::new(
+        config
+            .onboarding
+            .browser_opening_enabled(&bcode_config::ProcessConfigEnvironment),
+    );
     let mut display = vec!["Waiting for sign-in… Esc cancels.".to_owned()];
     loop {
         if cancel.load(Ordering::Acquire) {
@@ -182,12 +177,45 @@ fn flow(
             AuthFlowStatus::Cancelled => return Err("Sign-in cancelled."),
             AuthFlowStatus::Pending => {}
         }
-        let wait = present_effects(response.effects, &mut display)?;
+        let wait = adapt_effects(response.effects, &mut display, &mut browser)?;
         let _ = send.try_send((display.clone(), false));
         wait_or_cancel(wait, cancel);
         request.operation = AuthFlowOperation::Continue;
         request.state = response.state;
     }
+}
+
+fn begin_request(provider_id: &str, method_id: &str, profile: &str) -> AuthFlowRequest {
+    AuthFlowRequest {
+        schema_version: bcode_provider_auth_models::AUTH_FLOW_SCHEMA_VERSION,
+        provider_id: provider_id.to_owned(),
+        method_id: method_id.to_owned(),
+        profile: profile.to_owned(),
+        operation: AuthFlowOperation::Begin,
+        state: None,
+        input: None,
+        verify: false,
+        revoke: false,
+    }
+}
+
+fn open_effect_urls(
+    effects: &[AuthFlowEffect],
+    browser: &mut super::auth_browser::AuthBrowser,
+) -> bool {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            AuthFlowEffect::OpenBrowser { url } => Some(url.as_str()),
+            AuthFlowEffect::DisplayDeviceCode {
+                verification_url, ..
+            } => Some(verification_url.as_str()),
+            _ => None,
+        })
+        .map(|url| !browser.open(url))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .any(|failed| failed)
 }
 
 fn present_effects(
@@ -239,6 +267,21 @@ fn wait_or_cancel(wait: u64, cancel: &AtomicBool) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn adapt_effects(
+    effects: Vec<AuthFlowEffect>,
+    display: &mut Vec<String>,
+    browser: &mut super::auth_browser::AuthBrowser,
+) -> Result<u64, &'static str> {
+    let browser_failed = open_effect_urls(&effects, browser);
+    let wait = present_effects(effects, display)?;
+    if browser_failed {
+        display.push(
+            "Browser could not open. Copy the URL above; sign-in is still waiting.".to_owned(),
+        );
+    }
+    Ok(wait)
 }
 
 #[cfg(test)]

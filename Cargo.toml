@@ -459,6 +459,9 @@ url = { version = "2.5.7", default-features = false, features = ["std"] }
 uuid = { version = "1.21.0", default-features = false }
 vte = { version = "0.15.0", default-features = false, features = ["std"] }
 wait-timeout = { version = "0.2.1", default-features = false }
+webbrowser = { version = "1.2.4", default-features = false, features = [
+    "hardened",
+] }
 windows-sys = { version = "0.61.2", default-features = false }
 worktree_setup_config = { version = "0.4.0", default-features = false }
 worktree_setup_git = { version = "0.4.0", default-features = false }

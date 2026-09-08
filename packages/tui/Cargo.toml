@@ -87,6 +87,7 @@ tracing = { workspace = true }
 unicode-segmentation = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+webbrowser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

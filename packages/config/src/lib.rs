@@ -1168,17 +1168,30 @@ pub struct OnboardingConfig {
     /// Discover external credentials automatically. Does not disable configured authentication.
     #[serde(default = "default_true")]
     pub credential_discovery: bool,
+    /// Open authentication URLs automatically. Disable to copy URLs manually.
+    #[serde(default = "default_true")]
+    pub open_browser: bool,
 }
 
 impl Default for OnboardingConfig {
     fn default() -> Self {
         Self {
             credential_discovery: true,
+            open_browser: true,
         }
     }
 }
 
 impl OnboardingConfig {
+    /// Resolve browser launch policy. Environment opt-out wins over configuration.
+    #[must_use]
+    pub fn browser_opening_enabled(&self, environment: &impl ConfigEnvironment) -> bool {
+        self.open_browser
+            && environment
+                .var_os("BCODE_NO_BROWSER")
+                .is_none_or(|value| value == "0" || value == "false")
+    }
+
     /// Resolve automatic discovery before accessing any credential source.
     ///
     /// Any explicit opt-out wins. Environment presence is interpreted conservatively:
@@ -6447,8 +6460,20 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_model_toml(&mut output, &config.model);
     write_agents_toml(&mut output, &config.agent);
     write_auth_toml(&mut output, &config.auth);
-    if !config.onboarding.credential_discovery {
-        output.push_str("[onboarding]\ncredential_discovery = false\n\n");
+    if config.onboarding != OnboardingConfig::default() {
+        output.push_str("[onboarding]\n");
+        writeln!(
+            output,
+            "credential_discovery = {}",
+            config.onboarding.credential_discovery
+        )
+        .expect("write string");
+        writeln!(
+            output,
+            "open_browser = {}\n",
+            config.onboarding.open_browser
+        )
+        .expect("write string");
     }
     write_observability_toml(&mut output, &config.observability);
     write_skills_toml(&mut output, &config.skills);
@@ -8353,12 +8378,28 @@ mod tests {
         let config = super::BcodeConfig {
             onboarding: super::OnboardingConfig {
                 credential_discovery: false,
+                ..super::OnboardingConfig::default()
             },
             ..super::BcodeConfig::default()
         };
         let encoded = super::config_to_toml(&config);
         let decoded: super::BcodeConfig = toml::from_str(&encoded).expect("config parses");
         assert!(!decoded.onboarding.credential_discovery);
+    }
+
+    #[test]
+    fn browser_opt_out_survives_config_serialization() {
+        let mut config = super::BcodeConfig::default();
+        let mut environment = super::ConfigEnvironmentSnapshot::isolated("/tmp/browser-policy");
+        assert!(config.onboarding.browser_opening_enabled(&environment));
+        environment.set_var("BCODE_NO_BROWSER", "1");
+        assert!(!config.onboarding.browser_opening_enabled(&environment));
+        environment.set_var("BCODE_NO_BROWSER", "0");
+        config.onboarding.open_browser = false;
+        assert!(!config.onboarding.browser_opening_enabled(&environment));
+        let decoded: super::BcodeConfig =
+            toml::from_str(&super::config_to_toml(&config)).expect("config");
+        assert!(!decoded.onboarding.open_browser);
     }
 
     #[test]
