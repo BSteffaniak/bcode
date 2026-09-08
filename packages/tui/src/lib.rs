@@ -230,10 +230,25 @@ pub enum TuiError {
 ///
 /// Returns I/O, settings, or config errors.
 pub async fn run_onboarding() -> Result<(), TuiError> {
+    run_onboarding_with_discovery_policy(true).await.map(|_| ())
+}
+
+/// Run setup with a caller-supplied automatic credential discovery allowance.
+///
+/// Config and environment opt-outs still take precedence over this allowance.
+/// Returns whether the user explicitly requested session launch.
+///
+/// # Errors
+/// Returns I/O, settings, or configuration errors.
+pub async fn run_onboarding_with_discovery_policy(allow_discovery: bool) -> Result<bool, TuiError> {
     let store = bcode_settings::SettingsStore::default();
-    let detection = bcode_settings::detect_setup_environment(current_time_ms());
-    store.save_setup_detection_snapshot(&detection)?;
     let config = bcode_config::load_config()?;
+    let discovery_enabled = config
+        .onboarding
+        .credential_discovery_enabled(!allow_discovery, &bcode_config::ProcessConfigEnvironment);
+    let detection =
+        bcode_settings::detect_setup_environment_with_policy(discovery_enabled, current_time_ms());
+    store.save_setup_detection_snapshot(&detection)?;
     let auth_detection = bcode_settings::detect_auth_security_from_config(&config);
     let secure_import_plans =
         bcode_settings::secure_import_plans_from_detection(&detection.entries);
@@ -252,8 +267,13 @@ pub async fn run_onboarding() -> Result<(), TuiError> {
         current_time_ms(),
     )?;
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
-    let shell = onboarding::OnboardingShell::load(&store, &summary)?;
-    let recommendations = store.setup_recommendations()?;
+    let mut shell = onboarding::OnboardingShell::load(&store, &summary)?;
+    shell.set_credential_discovery_enabled(discovery_enabled);
+    let recommendations = if discovery_enabled {
+        store.setup_recommendations()?
+    } else {
+        Vec::new()
+    };
     let readiness = bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
     store.save_readiness_report(&readiness, current_time_ms())?;
     let stdout = io::stdout();
@@ -276,7 +296,7 @@ async fn run_onboarding_runtime<W: io::Write>(
     store: bcode_settings::SettingsStore,
     shell: onboarding::OnboardingShell,
     tui_config: &bcode_config::TuiConfig,
-) -> Result<(), TuiError> {
+) -> Result<bool, TuiError> {
     let area = terminal.area();
     let theme = theme::resolve_configured_theme(tui_config, std::path::Path::new("."));
     let program = onboarding_program::OnboardingProgram::new(store, shell, &theme, area)?;
@@ -293,7 +313,7 @@ async fn run_onboarding_runtime<W: io::Write>(
     let result = runtime.run().await;
     input.request_shutdown();
     match result {
-        Ok(_output) => Ok(()),
+        Ok(output) => Ok(output.program.launch_requested()),
         Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
         Err(bmux_tui_runtime::RuntimeError::Presenter { error, .. }) => Err(error.into()),
     }

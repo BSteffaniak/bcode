@@ -27,6 +27,7 @@ pub struct OnboardingProgram {
     readiness: Option<bcode_settings::SetupReadinessReport>,
     theme: super::theme::PresentedTheme,
     area: Rect,
+    launch_requested: bool,
 }
 
 impl OnboardingProgram {
@@ -46,7 +47,14 @@ impl OnboardingProgram {
             readiness,
             theme: *theme,
             area,
+            launch_requested: false,
         })
+    }
+
+    /// Whether setup explicitly requested a session after leaving terminal mode.
+    #[must_use]
+    pub const fn launch_requested(&self) -> bool {
+        self.launch_requested
     }
 
     fn refresh_persisted_state(&mut self) -> Result<(), TuiError> {
@@ -58,12 +66,17 @@ impl OnboardingProgram {
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
         match code {
             KeyCode::Escape | KeyCode::Char('q') => {
+                let was_confirming = self.shell.has_pending_confirmation();
                 self.shell.handle_action(
                     onboarding::OnboardingInputAction::CancelConfirmation,
                     &self.store,
                     current_time_ms(),
                 )?;
-                Ok(Lifecycle::Abort)
+                Ok(if was_confirming {
+                    Lifecycle::Continue
+                } else {
+                    Lifecycle::Abort
+                })
             }
             KeyCode::Right | KeyCode::Down | KeyCode::Char('j') => {
                 self.shell.focus_next();
@@ -74,9 +87,15 @@ impl OnboardingProgram {
                 Ok(Lifecycle::Continue)
             }
             _ => {
-                if let Some(action) = onboarding_action_for_key(code) {
-                    self.shell
-                        .handle_action(action, &self.store, current_time_ms())?;
+                let Some(action) = onboarding_action_for_key(code) else {
+                    return Ok(Lifecycle::Continue);
+                };
+                let outcome = self
+                    .shell
+                    .handle_action(action, &self.store, current_time_ms())?;
+                if outcome == onboarding::OnboardingActionOutcome::LaunchReady {
+                    self.launch_requested = true;
+                    return Ok(Lifecycle::Exit);
                 }
                 Ok(Lifecycle::Continue)
             }
@@ -102,9 +121,17 @@ impl Program for OnboardingProgram {
                 lifecycle = self.handle_key(key.key)?;
                 Invalidation::Redraw
             }
-            RuntimeEvent::Terminal(event @ Event::Mouse(_)) => {
-                let board_area = onboarding_render::onboarding_board_area(self.area);
-                let _outcome = self.shell.handle_board_event(board_area, &event);
+            RuntimeEvent::Terminal(Event::Mouse(mouse)) => {
+                let area = onboarding_render::onboarding_board_area(self.area);
+                if area.contains(mouse.position)
+                    && matches!(
+                        mouse.kind,
+                        bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left)
+                    )
+                {
+                    self.shell
+                        .focus_section_index(usize::from(mouse.position.y - area.y));
+                }
                 Invalidation::Redraw
             }
             RuntimeEvent::Terminal(

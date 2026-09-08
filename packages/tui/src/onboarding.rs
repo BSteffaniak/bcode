@@ -19,6 +19,7 @@ pub struct OnboardingShell {
     status_message: Option<String>,
     pending_confirmation: Option<OnboardingPendingConfirmation>,
     board_state: SetupBoardState,
+    credential_discovery_enabled: bool,
 }
 
 /// Automated onboarding walkthrough smoke-test report.
@@ -220,7 +221,19 @@ impl OnboardingShell {
             status_message: None,
             pending_confirmation: None,
             board_state: SetupBoardState::new(focused_section_id),
+            credential_discovery_enabled: false,
         }
+    }
+
+    /// Return whether a confirmation is currently being reviewed.
+    #[must_use]
+    pub const fn has_pending_confirmation(&self) -> bool {
+        self.pending_confirmation.is_some()
+    }
+
+    /// Set the resolved allowance for presenting automatic credential discoveries.
+    pub const fn set_credential_discovery_enabled(&mut self, enabled: bool) {
+        self.credential_discovery_enabled = enabled;
     }
 
     /// Return reconciled setup sections.
@@ -543,7 +556,11 @@ impl OnboardingShell {
         at_ms: u64,
     ) -> Result<OnboardingActionOutcome, SettingsError> {
         let draft = store.onboarding_draft_setup()?;
-        let detection_entries = store.detection_cache_entries()?;
+        let detection_entries = if self.credential_discovery_enabled {
+            store.detection_cache_entries()?
+        } else {
+            Vec::new()
+        };
         let secure_import_plans =
             bcode_settings::secure_import_plans_from_detection(&detection_entries);
         apply_draft_to_user_config(&draft)?;
@@ -554,7 +571,8 @@ impl OnboardingShell {
             &bcode_settings::SetupConfigSummary::from_config(&config),
         );
         let applied = store.apply_setup_plan(&plan, at_ms)?;
-        let reconciliation = store.reconcile_setup_apply(&config)?;
+        let reconciliation = store
+            .reconcile_setup_apply_with_discovery(&config, self.credential_discovery_enabled)?;
         store.put_control_state(
             "setup.last_apply_reconciliation",
             &serde_json::to_value(&reconciliation)?,
@@ -590,6 +608,15 @@ impl OnboardingShell {
                 Ok(OnboardingActionOutcome::LaunchReady)
             }
             _ => Ok(OnboardingActionOutcome::Ignored),
+        }
+    }
+
+    /// Focus one visible setup-list row without interpreting board geometry.
+    pub fn focus_section_index(&mut self, index: usize) {
+        if index < self.sections.len() {
+            self.focused_index = index;
+            self.mark_current_focus();
+            self.board_state.focused = self.sections[index].section_id;
         }
     }
 
@@ -825,17 +852,7 @@ fn onboarding_board_connections() -> Vec<BoardConnection> {
 }
 
 const fn setup_section_label(section_id: SetupSectionId) -> &'static str {
-    match section_id {
-        SetupSectionId::Welcome => "Base Camp",
-        SetupSectionId::Detection => "Scout Tower",
-        SetupSectionId::SecureVault => "Secure Vault",
-        SetupSectionId::Providers => "Signal Station",
-        SetupSectionId::Models => "Engine Room",
-        SetupSectionId::Permissions => "Control Room",
-        SetupSectionId::Imports => "Archive Gate",
-        SetupSectionId::Plugins => "Workshop",
-        SetupSectionId::Launch => "Launch",
-    }
+    setup_section_title(section_id)
 }
 
 /// Return the story copy for a setup section.
@@ -843,31 +860,31 @@ const fn setup_section_label(section_id: SetupSectionId) -> &'static str {
 pub const fn setup_section_story(section_id: SetupSectionId) -> &'static str {
     match section_id {
         SetupSectionId::Welcome => {
-            "Start at Base Camp: Bcode learns enough about your setup to get you coding without busywork."
+            "Connect a provider and choose a model to get started. Optional settings can be revisited later."
         }
         SetupSectionId::Detection => {
-            "Scout Tower checks existing config, providers, models, plugins, sessions, and environment hints before asking questions."
+            "Review existing configuration and, when enabled, detected credential sources. Detection does not verify connectivity."
         }
         SetupSectionId::SecureVault => {
             "Secure Vault keeps provider secrets out of plaintext config and guides them into sshenv-backed encrypted storage."
         }
         SetupSectionId::Providers => {
-            "Signal Station connects the AI providers and subscriptions you want Bcode to use."
+            "Connect the AI providers and subscriptions you want Bcode to use."
         }
         SetupSectionId::Models => {
-            "Engine Room chooses the model profile that balances speed, cost, and capability for your workflow."
+            "Choose a model profile that balances speed, cost, and capability for your workflow."
         }
         SetupSectionId::Permissions => {
-            "Control Room sets how cautious or autonomous Bcode should be when using tools."
+            "Review what Bcode may do with tools and which operations require your approval."
         }
         SetupSectionId::Imports => {
-            "Archive Gate can safely review importable session history without repairing or replaying logs on the normal path."
+            "Session import is optional. Review supported sources without repairing or replaying history."
         }
         SetupSectionId::Plugins => {
-            "Workshop reviews bundled plugins so powerful behavior stays visible and disableable."
+            "Review enabled plugins and disable capabilities you do not need."
         }
         SetupSectionId::Launch => {
-            "Launch Pad reviews the plan, applies selected setup safely, and starts Bcode when everything is ready."
+            "Review your configuration and resolve required setup before starting a session."
         }
     }
 }
@@ -1099,7 +1116,7 @@ mod tests {
             render
                 .map_lines
                 .iter()
-                .any(|line| line.contains("Scout Tower"))
+                .any(|line| line.contains("Detection"))
         );
         assert!(
             render
@@ -1132,8 +1149,8 @@ mod tests {
         let audit = render.secret_audit();
 
         assert!(audit.safe);
-        assert!(render.snapshot_text().contains("Base Camp"));
-        assert!(render.focused_detail.story.contains("Base Camp"));
+        assert!(render.snapshot_text().contains("Welcome"));
+        assert!(setup_section_story(SetupSectionId::Welcome).contains("Optional settings"));
         assert!(!render.focused_detail.actions.is_empty());
     }
 

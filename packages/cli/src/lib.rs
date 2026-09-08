@@ -410,12 +410,12 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Box::pin(run_new_session_tui(cli.worktree, launch_options)).await?;
         return Ok(());
     }
-    if cli.onboard {
-        handle_onboard_command(&OnboardOptions::default()).await?;
-        return Ok(());
-    }
-    if cli.command.is_none() && should_auto_start_onboarding()? {
-        handle_onboard_command(&OnboardOptions::default()).await?;
+    if cli.onboard || (cli.command.is_none() && should_auto_start_onboarding()?) {
+        handle_onboard_command(&OnboardOptions {
+            no_credential_discovery: cli.no_credential_discovery,
+            ..OnboardOptions::default()
+        })
+        .await?;
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
@@ -443,6 +443,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
                     OnboardExperienceMode::FirstRun
                 },
                 secure_import_env,
+                cli.no_credential_discovery,
             )
             .await?;
         }
@@ -2521,6 +2522,7 @@ async fn handle_onboard_flags(
     launch_mode: OnboardLaunchMode,
     experience_mode: OnboardExperienceMode,
     secure_import_env: Option<String>,
+    no_credential_discovery: bool,
 ) -> Result<(), CliError> {
     handle_onboard_command(&OnboardOptions {
         reset,
@@ -2529,6 +2531,7 @@ async fn handle_onboard_flags(
         launch_mode,
         experience_mode,
         secure_import_env,
+        no_credential_discovery,
     })
     .await
 }
@@ -2590,6 +2593,7 @@ struct OnboardOptions {
     launch_mode: OnboardLaunchMode,
     experience_mode: OnboardExperienceMode,
     secure_import_env: Option<String>,
+    no_credential_discovery: bool,
 }
 
 fn import_onboarding_env_credential(
@@ -2637,8 +2641,42 @@ fn import_onboarding_env_credential(
     Ok(())
 }
 
+fn print_onboarding_preview(
+    config: &bcode_config::BcodeConfig,
+    store: &bcode_settings::SettingsStore,
+    discovery_enabled: bool,
+    options: &OnboardOptions,
+) {
+    let summary = bcode_settings::SetupConfigSummary::from_config(config);
+    let shell = bcode_tui::onboarding::OnboardingShell::from_reconciliation(
+        &[],
+        &summary.reconciliation_input(),
+    );
+    let readiness = bcode_settings::setup_readiness_report(shell.sections(), &[]);
+    println!("Bcode setup\n");
+    println!(
+        "{}",
+        shell
+            .render_model(&store.health(), Some(readiness))
+            .snapshot_text()
+    );
+    println!("Automatic credential discovery: {discovery_enabled}");
+    if options.reset || options.secure_import_env.is_some() {
+        println!("Preview only: reset and credential import were not performed.");
+    }
+}
+
 async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError> {
     let store = bcode_settings::SettingsStore::default();
+    let config = bcode_config::load_config()?;
+    let discovery_enabled = config.onboarding.credential_discovery_enabled(
+        options.no_credential_discovery,
+        &bcode_config::ProcessConfigEnvironment,
+    );
+    if options.output_mode != OnboardOutputMode::Preview {
+        print_onboarding_preview(&config, &store, discovery_enabled, options);
+        return Ok(());
+    }
     if options.reset {
         store.reset_database()?;
     }
@@ -2649,7 +2687,7 @@ async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError
             .as_millis(),
     )
     .unwrap_or(u64::MAX);
-    let detection = bcode_settings::detect_setup_environment(now_ms);
+    let detection = bcode_settings::detect_setup_environment_with_policy(discovery_enabled, now_ms);
     store.put_control_state(
         "onboarding.experience_mode",
         &serde_json::json!({
@@ -2667,7 +2705,16 @@ async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError
     let secure_import_plans =
         bcode_settings::secure_import_plans_from_detection(&detection.entries);
     if let Some(env_var) = options.secure_import_env.as_deref() {
-        import_onboarding_env_credential(env_var, &secure_import_plans, now_ms)?;
+        // Explicit import selects exactly one supported source, independently of
+        // automatic discovery. Do not enumerate the environment to plan it.
+        let selected = bcode_settings::detect_setup_environment_from_vars(
+            &std::collections::BTreeMap::from([(env_var.to_owned(), "present".to_owned())]),
+            now_ms,
+        );
+        let plans = bcode_settings::secure_import_plans_from_detection(&selected.entries);
+        if options.output_mode == OnboardOutputMode::Preview {
+            import_onboarding_env_credential(env_var, &plans, now_ms)?;
+        }
     }
     let secure_story =
         bcode_settings::secure_credential_story_panel(&secure_import_plans, &auth_detection);
@@ -2698,22 +2745,27 @@ async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError
         .as_deref()
         .and_then(onboard_section_from_str);
     let persisted_sections = store.onboarding_sections()?;
-    let recommendations = store.setup_recommendations()?;
+    let recommendations = if discovery_enabled {
+        store.setup_recommendations()?
+    } else {
+        Vec::new()
+    };
     let shell =
         bcode_tui::onboarding::OnboardingShell::from_reconciliation(&persisted_sections, &input);
     let readiness_report =
         bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
     store.save_readiness_report(&readiness_report, now_ms)?;
-    let render = shell.render_model(&store.health(), Some(readiness_report));
-    if options.output_mode != OnboardOutputMode::Preview {
-        println!("Bcode onboarding setup map\n");
-        println!("{}", render.snapshot_text());
-        if options.launch_mode == OnboardLaunchMode::SkipLaunch {
-            println!("\nlaunch will be skipped after onboarding");
-        }
-        return Ok(());
+    let launch = Box::pin(bcode_tui::run_onboarding_with_discovery_policy(
+        discovery_enabled,
+    ))
+    .await?;
+    if launch && options.launch_mode == OnboardLaunchMode::LaunchWhenReady {
+        Box::pin(run_new_session_tui(
+            None,
+            bcode_tui::TuiLaunchOptions::default(),
+        ))
+        .await?;
     }
-    bcode_tui::run_onboarding().await?;
     Ok(())
 }
 
@@ -3018,6 +3070,9 @@ struct Cli {
     /// Select a named `[state.profile.<name>]` durable state location.
     #[arg(long = "state-profile", global = true, value_name = "PROFILE")]
     state_profile: Option<String>,
+    /// Do not automatically discover external credentials or suggest cached discoveries.
+    #[arg(long, global = true)]
+    no_credential_discovery: bool,
     /// Force the onboarding/setup-map flow.
     #[arg(long = "onboard", global = true)]
     onboard: bool,
@@ -16896,6 +16951,24 @@ fn print_model_usage_event(
 
 #[cfg(test)]
 mod auth_cli_tests {
+    #[test]
+    fn credential_discovery_flag_is_global() {
+        use clap::Parser as _;
+        for args in [
+            vec!["bcode", "--no-credential-discovery"],
+            vec!["bcode", "onboard", "--no-credential-discovery"],
+            vec!["bcode", "--no-credential-discovery", "onboard", "--dry-run"],
+        ] {
+            let cli = super::Cli::try_parse_from(args).expect("discovery opt-out parses");
+            assert!(cli.no_credential_discovery);
+        }
+        assert!(
+            !super::Cli::try_parse_from(["bcode"])
+                .expect("default parses")
+                .no_credential_discovery
+        );
+    }
+
     use super::*;
 
     fn parse_auth_command(arguments: &[&str]) -> AuthCommand {

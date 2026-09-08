@@ -220,6 +220,9 @@ pub struct BcodeConfig {
     pub agent: BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// First-run setup and automatic credential discovery preferences.
+    #[serde(default)]
+    pub onboarding: OnboardingConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
@@ -267,6 +270,7 @@ impl Default for BcodeConfig {
             model: ModelConfig::default(),
             agent: BTreeMap::new(),
             auth: AuthConfig::default(),
+            onboarding: OnboardingConfig::default(),
             observability: ObservabilityConfig::default(),
             metrics: MetricsConfig::default(),
             skills: SkillsConfig::default(),
@@ -316,6 +320,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<AuthConfig>(
                 "auth",
                 "Provider authentication profiles, pools, and runtime subscription behavior.",
+            ),
+            schema_section_doc::<OnboardingConfig>(
+                "onboarding",
+                "First-run setup and automatic external credential discovery preferences.",
             ),
             schema_section_doc::<ObservabilityConfig>(
                 "observability",
@@ -1149,6 +1157,42 @@ pub fn bedrock_environment_is_configured_with_environment(
         .iter()
         .find(|spec| spec.plugin_id == "bcode.bedrock")
         .is_some_and(|spec| first_env_value_from_slice(environment, spec.signal_env_vars).is_some())
+}
+
+/// First-run setup preferences, also respected when reopening Settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "onboarding")]
+pub struct OnboardingConfig {
+    /// Discover external credentials automatically. Does not disable configured authentication.
+    #[serde(default = "default_true")]
+    pub credential_discovery: bool,
+}
+
+impl Default for OnboardingConfig {
+    fn default() -> Self {
+        Self {
+            credential_discovery: true,
+        }
+    }
+}
+
+impl OnboardingConfig {
+    /// Resolve automatic discovery before accessing any credential source.
+    ///
+    /// Any explicit opt-out wins. Environment presence is interpreted conservatively:
+    /// only `0` and `false` are false; unknown values disable discovery.
+    #[must_use]
+    pub fn credential_discovery_enabled(
+        &self,
+        cli_disabled: bool,
+        environment: &impl ConfigEnvironment,
+    ) -> bool {
+        self.credential_discovery
+            && !cli_disabled
+            && environment
+                .var_os("BCODE_NO_CREDENTIAL_DISCOVERY")
+                .is_none_or(|value| value == "0" || value == "false")
+    }
 }
 
 /// Repository invariant guidance configuration.
@@ -8299,6 +8343,34 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_discovery_opt_out_is_disable_wins() {
+        let mut environment =
+            super::ConfigEnvironmentSnapshot::isolated("/tmp/bcode-discovery-test");
+        let mut config = super::OnboardingConfig::default();
+        assert!(config.credential_discovery_enabled(false, &environment));
+        assert!(!config.credential_discovery_enabled(true, &environment));
+        for value in ["1", "true", "", "unknown"] {
+            environment.set_var("BCODE_NO_CREDENTIAL_DISCOVERY", value);
+            assert!(!config.credential_discovery_enabled(false, &environment));
+        }
+        for value in ["0", "false"] {
+            environment.set_var("BCODE_NO_CREDENTIAL_DISCOVERY", value);
+            assert!(config.credential_discovery_enabled(false, &environment));
+            assert!(!config.credential_discovery_enabled(true, &environment));
+        }
+        config.credential_discovery = false;
+        assert!(!config.credential_discovery_enabled(false, &environment));
+        environment.remove_var("BCODE_NO_CREDENTIAL_DISCOVERY");
+        assert!(!config.credential_discovery_enabled(false, &environment));
+        let parsed: super::BcodeConfig =
+            toml::from_str("[onboarding]\ncredential_discovery = false\n")
+                .expect("onboarding config parses");
+        assert!(!parsed.onboarding.credential_discovery);
+        let defaults: super::BcodeConfig = toml::from_str("").expect("empty config parses");
+        assert!(defaults.onboarding.credential_discovery);
+    }
+
     #[test]
     fn model_ignore_parse_errors_do_not_echo_file_contents() {
         let root = tempfile::tempdir().unwrap();

@@ -251,8 +251,24 @@ impl SettingsStore {
         &self,
         config: &bcode_config::BcodeConfig,
     ) -> SettingsResult<SetupApplyReconciliation> {
+        self.reconcile_setup_apply_with_discovery(config, false)
+    }
+
+    /// Reconcile setup without reading cached credential discoveries when disabled.
+    ///
+    /// # Errors
+    /// Returns an error when setup state cannot be read.
+    pub fn reconcile_setup_apply_with_discovery(
+        &self,
+        config: &bcode_config::BcodeConfig,
+        discovery_enabled: bool,
+    ) -> SettingsResult<SetupApplyReconciliation> {
         let draft = self.onboarding_draft_setup()?;
-        let detection_entries = self.detection_cache_entries()?;
+        let detection_entries = if discovery_enabled {
+            self.detection_cache_entries()?
+        } else {
+            Vec::new()
+        };
         let secure_import_plans = secure_import_plans_from_detection(&detection_entries);
         let auth_detection = detect_auth_security_from_config(config);
         Ok(SetupApplyReconciliation {
@@ -2537,6 +2553,27 @@ pub fn detect_setup_environment_from_vars(
 /// Detect setup-relevant environment state from the current process environment.
 #[must_use]
 pub fn detect_setup_environment(detected_at_ms: u64) -> SetupDetectionSnapshot {
+    let enabled = bcode_config::load_config().is_ok_and(|config| {
+        config
+            .onboarding
+            .credential_discovery_enabled(false, &bcode_config::ProcessConfigEnvironment)
+    });
+    detect_setup_environment_with_policy(enabled, detected_at_ms)
+}
+
+/// Detect external credentials only when the caller's resolved policy permits it.
+/// Disabled discovery does not enumerate environment variables or access sources.
+#[must_use]
+pub fn detect_setup_environment_with_policy(
+    enabled: bool,
+    detected_at_ms: u64,
+) -> SetupDetectionSnapshot {
+    if !enabled {
+        return SetupDetectionSnapshot {
+            entries: Vec::new(),
+            recommendations: Vec::new(),
+        };
+    }
     detect_setup_environment_from_vars(&std::env::vars().collect(), detected_at_ms)
 }
 
@@ -2903,6 +2940,13 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disabled_discovery_returns_no_sources_or_recommendations() {
+        let snapshot = super::detect_setup_environment_with_policy(false, 42);
+        assert!(snapshot.entries.is_empty());
+        assert!(snapshot.recommendations.is_empty());
+    }
+
     use super::*;
     use serde_json::json;
 

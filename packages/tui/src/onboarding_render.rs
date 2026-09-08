@@ -102,7 +102,7 @@ fn render_hero_panel(area: Rect, frame: &mut Frame<'_>, theme: &PresentedTheme) 
         area.width.saturating_sub(2),
         HERO_HEIGHT,
     );
-    render_box(hero, "Base Camp", theme.focused, frame);
+    render_box(hero, "Welcome to Bcode", theme.focused, frame);
     frame.write_line_with_fallback_style(
         Rect::new(
             hero.x.saturating_add(2),
@@ -112,7 +112,7 @@ fn render_hero_panel(area: Rect, frame: &mut Frame<'_>, theme: &PresentedTheme) 
         ),
         &Line::from_spans(vec![
             Span::styled(
-                "Bcode Setup Map",
+                "Set up your workspace",
                 theme.focused.add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -130,7 +130,7 @@ fn render_hero_panel(area: Rect, frame: &mut Frame<'_>, theme: &PresentedTheme) 
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            "Move through the quest board, review what will change, then launch when ready.",
+            "Connect a provider, choose a model, and review permissions. Optional settings can wait.",
             theme.text,
         )]),
         Style::new(),
@@ -144,13 +144,31 @@ fn render_setup_map_panel(
     frame: &mut Frame<'_>,
     theme: &PresentedTheme,
 ) {
-    render_box(
-        panel_area,
-        "Quest Board · drag / arrows to pan",
-        theme.border,
-        frame,
-    );
-    shell.render_board(board_area, frame, theme);
+    render_box(panel_area, "Setup", theme.border, frame);
+    for (index, section) in shell.sections().iter().enumerate() {
+        let Ok(offset) = u16::try_from(index) else {
+            break;
+        };
+        if offset >= board_area.height {
+            break;
+        }
+        let selected = section.section_id == shell.board_state().focused;
+        let label = section.section_id.as_str().replace('_', " ");
+        let text = format!("{} {}", if selected { ">" } else { " " }, label);
+        frame.write_line_with_fallback_style(
+            Rect::new(
+                board_area.x,
+                board_area.y.saturating_add(offset),
+                board_area.width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                text,
+                if selected { theme.focused } else { theme.text },
+            )]),
+            Style::new(),
+        );
+    }
 }
 
 fn render_confirmation_modal(
