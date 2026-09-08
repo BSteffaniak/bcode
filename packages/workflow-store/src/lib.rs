@@ -25136,6 +25136,48 @@ mod tests {
             "UPDATE workflow_runs SET cancellation_requested_at_ms = NULL WHERE run_id = 'rollback-parent'",
             [],
         ).expect("restore parent fixture");
+        for definition_id in ["parent", request.run.definition_id.as_str()] {
+            let original: String = store
+                .connection
+                .query_row(
+                    "SELECT definition_json FROM workflow_definitions WHERE definition_id = ?1",
+                    [definition_id],
+                    |row| row.get(0),
+                )
+                .expect("original definition");
+            let oversized = format!("{original}{}", " ".repeat(MAX_INLINE_JSON_BYTES));
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_definitions SET definition_json = ?2 WHERE definition_id = ?1",
+                    (definition_id, &oversized),
+                )
+                .expect("oversized valid JSON fixture");
+            let before = store.connection.total_changes();
+            assert!(
+                matches!(
+                    store.create_child_run_idempotent(&request),
+                    Err(WorkflowStoreError::Database(
+                        rusqlite::Error::InvalidColumnType(..)
+                    ))
+                ),
+                "oversized definition must be rejected at the query boundary"
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            assert!(
+                store
+                    .run_summary(&child_id)
+                    .expect("no child on oversized definition")
+                    .is_none()
+            );
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_definitions SET definition_json = ?2 WHERE definition_id = ?1",
+                    (definition_id, original),
+                )
+                .expect("restore definition fixture");
+        }
         assert!(
             store
                 .create_child_run_idempotent(&request)
