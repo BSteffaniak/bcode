@@ -4660,10 +4660,10 @@ impl TokenUsageMeter {
         }
         for (currency, cost_micros) in &cost.totals_micros {
             if currency == "USD" {
-                parts.push(format!("~{}", format_usd_micros(*cost_micros)));
+                parts.push(format_usd_micros(*cost_micros));
             } else {
                 parts.push(format!(
-                    "~{currency} {}",
+                    "{currency} {}",
                     format_decimal_micros(*cost_micros)
                 ));
             }
@@ -7212,7 +7212,7 @@ mod tests {
         assert!(
             TokenUsageMeter::default()
                 .footer_summary(None, 0, &cost)
-                .ends_with("spent 0 tok · ~$0.02")
+                .ends_with("spent 0 tok · $0.02")
         );
     }
 
@@ -7388,8 +7388,9 @@ mod tests {
         };
 
         let complete_text = meter.footer_summary(None, 0, &complete);
-        assert!(complete_text.contains("~$0.00"));
-        assert!(complete_text.contains("~EUR 2.000000"));
+        assert!(complete_text.contains("$0.00"));
+        assert!(complete_text.contains("EUR 2.000000"));
+        assert!(!complete_text.contains('~'));
         assert!(
             meter
                 .footer_summary(None, 0, &partial)
