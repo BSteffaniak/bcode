@@ -109,7 +109,9 @@ pub fn select_interaction_adapter<'a>(
 }
 
 /// Errors returned by plugin interaction registries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Display and debug diagnostics omit payloads, which may contain untrusted data.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PluginInteractionRegistryError {
     /// No factory is registered for this interaction kind.
     UnsupportedKind(String),
@@ -121,15 +123,24 @@ pub enum PluginInteractionRegistryError {
     ConflictingFactories,
 }
 
+impl fmt::Debug for PluginInteractionRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedKind(_) => "UnsupportedKind",
+            Self::OpenFailed(_) => "OpenFailed",
+            Self::InvalidKind => "InvalidKind",
+            Self::ConflictingFactories => "ConflictingFactories",
+        })
+    }
+}
+
 impl fmt::Display for PluginInteractionRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedKind(kind) => {
-                write!(formatter, "unsupported interaction kind: {kind}")
-            }
+            Self::UnsupportedKind(_) => formatter.write_str("unsupported interaction kind"),
             Self::InvalidKind => formatter.write_str("invalid interaction kind"),
             Self::ConflictingFactories => formatter.write_str("conflicting controller factories"),
-            Self::OpenFailed(message) => write!(formatter, "failed to open interaction: {message}"),
+            Self::OpenFailed(_) => formatter.write_str("failed to open interaction"),
         }
     }
 }
@@ -190,10 +201,7 @@ impl fmt::Debug for PluginInteractionRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PluginInteractionRegistry")
-            .field(
-                "interaction_kinds",
-                &self.factories.keys().collect::<Vec<_>>(),
-            )
+            .field("registered_kind_count", &self.factories.len())
             .finish()
     }
 }
@@ -422,6 +430,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unsupported_kind_display_does_not_echo_untrusted_input() {
+        let registry = PluginInteractionRegistry::default();
+        let kind = "private-token\n\u{1b}[2J";
+        let Err(error) = registry.open(kind, Value::Null) else {
+            panic!("unknown kind must not open")
+        };
+        assert_eq!(
+            error,
+            PluginInteractionRegistryError::UnsupportedKind(kind.to_owned())
+        );
+        assert_eq!(error.to_string(), "unsupported interaction kind");
+    }
+
+    #[test]
+    fn registry_error_diagnostics_omit_untrusted_payloads() {
+        let private = "private-token\n\u{1b}[2J";
+        for (error, display, debug) in [
+            (
+                PluginInteractionRegistryError::UnsupportedKind(private.to_owned()),
+                "unsupported interaction kind",
+                "UnsupportedKind",
+            ),
+            (
+                PluginInteractionRegistryError::OpenFailed(private.to_owned()),
+                "failed to open interaction",
+                "OpenFailed",
+            ),
+            (
+                PluginInteractionRegistryError::InvalidKind,
+                "invalid interaction kind",
+                "InvalidKind",
+            ),
+            (
+                PluginInteractionRegistryError::ConflictingFactories,
+                "conflicting controller factories",
+                "ConflictingFactories",
+            ),
+        ] {
+            assert_eq!(error.to_string(), display);
+            assert_eq!(format!("{error:?}"), debug);
+            assert_eq!(format!("{error:#?}"), debug);
+            assert!(error.source().is_none());
+        }
+    }
+
+    #[test]
     fn typed_snapshot_failure_is_explicit_and_secret_safe() {
         struct Snapshot;
         impl Serialize for Snapshot {
@@ -457,6 +511,72 @@ mod tests {
             "interaction snapshot serialization failed"
         );
         assert!(!format!("{error:?}").contains("private snapshot content"));
+    }
+
+    #[test]
+    fn json_adapter_distinguishes_null_from_snapshot_failure() {
+        struct Snapshot(bool);
+        impl Serialize for Snapshot {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if self.0 {
+                    Err(serde::ser::Error::custom("private snapshot content"))
+                } else {
+                    serializer.serialize_unit()
+                }
+            }
+        }
+        struct Controller(bool);
+        impl InteractionController for Controller {
+            type Snapshot = Snapshot;
+
+            fn kind(&self) -> &'static str {
+                "example.snapshot"
+            }
+
+            fn snapshot(&self) -> Snapshot {
+                Snapshot(self.0)
+            }
+
+            fn handle_input(&mut self, _: InteractionInput) -> InteractionOutput {
+                panic!("snapshot access must not dispatch input")
+            }
+        }
+        let mut controller = JsonInteractionController::new(Controller(false));
+        assert_eq!(controller.snapshot_json(), Ok(Value::Null));
+        controller.inner_mut().0 = true;
+        let error = controller.snapshot_json().unwrap_err();
+        assert_eq!(error, PluginInteractionSnapshotError);
+        assert_eq!(
+            error.to_string(),
+            "interaction snapshot serialization failed"
+        );
+        assert!(!format!("{error:?}").contains("private snapshot content"));
+        controller.inner_mut().0 = false;
+        assert_eq!(controller.snapshot_json(), Ok(Value::Null));
+    }
+
+    #[test]
+    fn registry_debug_omits_factory_kinds() {
+        struct Factory;
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                "private-plugin-kind"
+            }
+
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                panic!("debug formatting must not open controllers")
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.try_register_factory(Box::new(Factory)).unwrap();
+        assert_eq!(
+            format!("{registry:?}"),
+            "PluginInteractionRegistry { registered_kind_count: 1 }"
+        );
+        assert!(!format!("{registry:#?}").contains("private-plugin-kind"));
     }
 
     #[test]

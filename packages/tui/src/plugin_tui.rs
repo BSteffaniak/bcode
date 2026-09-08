@@ -2010,6 +2010,7 @@ library = "libdynamic_visual_test.dylib"
                 },
                 |index| vec![Line::from(format!("row-{index}"))].into(),
             );
+            drop(presentation);
             println!(
                 "BCODE_PERF_CASE {}",
                 serde_json::json!({

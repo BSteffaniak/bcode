@@ -93,6 +93,32 @@ struct LocalInteractionControllers {
     >,
 }
 
+impl LocalInteractionControllers {
+    fn controller_for(
+        &mut self,
+        exchange: &bcode_session_models::ToolExchangeRequest,
+    ) -> Result<
+        Option<&mut bcode_plugin_sdk::interaction::BoxedPluginInteractionController>,
+        ClientError,
+    > {
+        let (original, controller) = match self.entries.entry(exchange.exchange_id.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let Some(controller) = local_interaction_controller(exchange)? else {
+                    return Ok(None);
+                };
+                entry.insert((exchange.clone(), controller))
+            }
+        };
+        if original != exchange {
+            return Err(ClientError::Protocol(
+                "interaction request changed for an existing controller".to_owned(),
+            ));
+        }
+        Ok(Some(controller))
+    }
+}
+
 struct InteractionSubmissionGuard {
     interaction_id: String,
     submissions: Arc<Mutex<BTreeSet<String>>>,
@@ -681,29 +707,15 @@ fn local_interaction_snapshot(
     exchange: &bcode_session_models::ToolExchangeRequest,
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<serde_json::Value, ClientError> {
-    let interaction_id = &exchange.exchange_id;
     let mut controllers = interaction_controllers.lock().map_err(|_| {
         ClientError::Protocol("interaction controller state is unavailable".to_owned())
     })?;
-    if !controllers.entries.contains_key(interaction_id)
-        && let Some(controller) = local_interaction_controller(exchange)?
-    {
-        controllers
-            .entries
-            .insert(interaction_id.clone(), (exchange.clone(), controller));
-    }
-    controllers.entries.get(interaction_id).map_or_else(
+    controllers.controller_for(exchange)?.map_or_else(
         || Ok(exchange.payload.clone()),
-        |(original, controller)| {
-            if original == exchange {
-                controller
-                    .snapshot_json()
-                    .map_err(|error| ClientError::Protocol(error.to_string()))
-            } else {
-                Err(ClientError::Protocol(
-                    "interaction request changed for an existing controller".to_owned(),
-                ))
-            }
+        |controller| {
+            controller
+                .snapshot_json()
+                .map_err(|error| ClientError::Protocol(error.to_string()))
         },
     )
 }
@@ -1365,28 +1377,14 @@ impl HyperChadAppState {
         exchange: &bcode_session_models::ToolExchangeRequest,
         input: bcode_tool::InteractionInput,
     ) -> Result<Option<bcode_tool::InteractionOutput>, ClientError> {
-        let interaction_id = &exchange.exchange_id;
         let mut controllers = self.interaction_controllers.lock().map_err(|_| {
             ClientError::Protocol("interaction controller state is unavailable".to_owned())
         })?;
-        if !controllers.entries.contains_key(interaction_id)
-            && let Some(controller) = local_interaction_controller(exchange)?
-        {
-            controllers
-                .entries
-                .insert(interaction_id.clone(), (exchange.clone(), controller));
-        }
-        let Some((original, controller)) = controllers.entries.get_mut(interaction_id) else {
-            return Ok(None);
-        };
-        if original != exchange {
-            return Err(ClientError::Protocol(
-                "interaction request changed for an existing controller".to_owned(),
-            ));
-        }
-        let output = controller.handle_input(input);
+        let output = controllers
+            .controller_for(exchange)?
+            .map(|controller| controller.handle_input(input));
         drop(controllers);
-        Ok(Some(output))
+        Ok(output)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2790,6 +2788,7 @@ mod tests {
         assert!(!error.to_string().contains("different request"));
         let mut app = HyperChadAppState::new(BcodeClient::default_endpoint(), "test-token");
         app.interaction_controllers = Arc::clone(&controllers);
+        assert_controller_identity_rejected(&app, &exchange, &initial);
         assert!(matches!(
             app.apply_local_interaction_input(&conflicting, bcode_tool::InteractionInput::Submit),
             Err(ClientError::Protocol(_))
@@ -2815,6 +2814,41 @@ mod tests {
             app.apply_local_interaction_input(&exchange, bcode_tool::InteractionInput::Submit),
             Err(ClientError::Protocol(message)) if message == "interaction controller state is unavailable"
         ));
+    }
+
+    #[cfg(feature = "static-bundled-question-plugin")]
+    fn assert_controller_identity_rejected(
+        app: &HyperChadAppState,
+        exchange: &bcode_session_models::ToolExchangeRequest,
+        initial: &serde_json::Value,
+    ) {
+        for field in 0..5 {
+            let mut changed = exchange.clone();
+            match field {
+                0 => changed.invocation_id = "other-invocation".to_owned(),
+                1 => changed.producer_id = "other-producer".to_owned(),
+                2 => changed.schema = "other-schema".to_owned(),
+                3 => changed.schema_version = u32::MAX,
+                _ => {
+                    changed.response_policy =
+                        bcode_session_models::ToolExchangeResponsePolicy::Optional;
+                }
+            }
+            assert!(matches!(
+                local_interaction_snapshot(&changed, &app.interaction_controllers),
+                Err(ClientError::Protocol(message))
+                    if message == "interaction request changed for an existing controller"
+            ));
+            assert!(matches!(
+                app.apply_local_interaction_input(&changed, bcode_tool::InteractionInput::Submit),
+                Err(ClientError::Protocol(message))
+                    if message == "interaction request changed for an existing controller"
+            ));
+            assert_eq!(
+                &local_interaction_snapshot(exchange, &app.interaction_controllers).unwrap(),
+                initial
+            );
+        }
     }
 
     #[test]
