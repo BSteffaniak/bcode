@@ -2794,7 +2794,7 @@ where
             ).await;
             Err(RuntimeError::Timeout { timeout: context.request.timeout })
         }
-        poll = provider.poll_turn_events(context.provider_plugin_id, context.poll_request) => {
+        poll = poll_provider_safely(provider, context.provider_plugin_id, context.poll_request) => {
             match poll {
                 Ok(response) => Ok(response),
                 Err(error) => {
@@ -2812,6 +2812,27 @@ where
     }
     .instrument(provider_span)
     .await
+}
+
+async fn poll_provider_safely<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    request: &PollTurnEventsRequest,
+) -> Result<PollTurnEventsResponse>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    use futures::FutureExt as _;
+    std::panic::AssertUnwindSafe(async {
+        provider.poll_turn_events(provider_plugin_id, request).await
+    })
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|_| {
+        Err(RuntimeError::ProviderInvocation(
+            "provider event polling panicked".into(),
+        ))
+    })
 }
 
 // Custom providers can panic either while constructing or polling a cleanup
@@ -8176,6 +8197,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_poll_panic_cancels_and_finishes_acquired_turn() {
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle.release_poll.notify_one();
+        let runtime = AgentRuntime::new();
+        let mut provider = LifecyclePollProvider {
+            lifecycle: Arc::clone(&lifecycle),
+            outcome: LifecyclePollOutcome::Panic,
+        };
+        let result = runtime
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "panic"))
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::ProviderInvocation(message))
+            if message == "provider event polling panicked")
+        );
+        assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
+        assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
     async fn provider_cancelled_event_preserves_outcome_when_finish_panics() {
         for panic in 1..=2 {
             let lifecycle = Arc::new(ProviderLifecycle::default());
@@ -8953,11 +8995,8 @@ mod tests {
             while let Some(item) = stream.next().await {
                 assert_eq!(errors, 0, "terminal error must be last");
                 match item {
-                    AgentRuntimeStreamItem::Error(RuntimeError::HostExtension(message)) => {
-                        assert_eq!(
-                            message,
-                            "agent stream worker interrupted; provider cleanup is unverified"
-                        );
+                    AgentRuntimeStreamItem::Error(RuntimeError::ProviderInvocation(message)) => {
+                        assert_eq!(message, "provider event polling panicked");
                         errors += 1;
                     }
                     AgentRuntimeStreamItem::Event(_) => {}
@@ -9001,11 +9040,8 @@ mod tests {
             while let Some(item) = stream.next().await {
                 assert_eq!(errors, 0, "terminal error must be last");
                 match item {
-                    AgentLoopStreamItem::Error(RuntimeError::HostExtension(message)) => {
-                        assert_eq!(
-                            message,
-                            "agent stream worker interrupted; provider cleanup is unverified"
-                        );
+                    AgentLoopStreamItem::Error(RuntimeError::ProviderInvocation(message)) => {
+                        assert_eq!(message, "provider event polling panicked");
                         errors += 1;
                     }
                     AgentLoopStreamItem::Event(_) => {}
