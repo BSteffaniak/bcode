@@ -1502,17 +1502,18 @@ impl HyperChadAppState {
             Box::pin(client.resolve_tool_exchange(exchange.exchange_id.clone(), resolution)).await
         };
         match result {
-            Ok(true) => {
+            Ok(resolved) => {
                 self.interaction_controllers
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .entries
                     .remove(&exchange.exchange_id);
+                let status = if resolved {
+                    status
+                } else {
+                    "interaction is no longer pending"
+                };
                 self.render_session_or_initial(Some(session_id), status)
-                    .await
-            }
-            Ok(false) => {
-                self.render_session_or_initial(Some(session_id), "interaction is no longer pending")
                     .await
             }
             Err(error) => {
