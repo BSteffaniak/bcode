@@ -696,7 +696,9 @@ fn local_interaction_snapshot(
         || Ok(exchange.payload.clone()),
         |(original, controller)| {
             if original == exchange {
-                Ok(controller.snapshot_json())
+                controller
+                    .snapshot_json()
+                    .map_err(|error| ClientError::Protocol(error.to_string()))
             } else {
                 Err(ClientError::Protocol(
                     "interaction request changed for an existing controller".to_owned(),
@@ -2749,7 +2751,7 @@ mod tests {
             }),
             bcode_tool::InteractionOutput::Redraw
         );
-        let snapshot = controller.snapshot_json();
+        let snapshot = controller.snapshot_json().unwrap();
 
         assert_eq!(snapshot["revision"], 1);
         assert_eq!(snapshot["layout_revision"], 0);
@@ -2813,6 +2815,56 @@ mod tests {
             app.apply_local_interaction_input(&exchange, bcode_tool::InteractionInput::Submit),
             Err(ClientError::Protocol(message)) if message == "interaction controller state is unavailable"
         ));
+    }
+
+    #[test]
+    fn controller_snapshot_failure_does_not_fall_back_to_request() {
+        use bcode_plugin_sdk::interaction::{
+            PluginInteractionController, PluginInteractionSnapshotError,
+        };
+
+        struct FailingController;
+        impl PluginInteractionController for FailingController {
+            fn kind(&self) -> &'static str {
+                "example.failing"
+            }
+
+            fn snapshot_json(&self) -> Result<serde_json::Value, PluginInteractionSnapshotError> {
+                Err(PluginInteractionSnapshotError)
+            }
+
+            fn handle_input(
+                &mut self,
+                _: bcode_tool::InteractionInput,
+            ) -> bcode_tool::InteractionOutput {
+                panic!("snapshot failure must not dispatch input")
+            }
+        }
+
+        let exchange = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "call-1".to_owned(),
+            exchange_id: "failing-snapshot".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            schema: "example.request".to_owned(),
+            schema_version: 1,
+            payload: serde_json::json!({"private": "request content"}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let controllers = Arc::new(Mutex::new(LocalInteractionControllers::default()));
+        controllers.lock().unwrap().entries.insert(
+            exchange.exchange_id.clone(),
+            (exchange.clone(), Box::new(FailingController)),
+        );
+        for _ in 0..2 {
+            let error = local_interaction_snapshot(&exchange, &controllers).unwrap_err();
+            assert!(matches!(
+                &error,
+                ClientError::Protocol(message)
+                    if message == "interaction snapshot serialization failed"
+            ));
+            assert!(!error.to_string().contains("request content"));
+        }
+        assert_eq!(controllers.lock().unwrap().entries.len(), 1);
     }
 
     #[cfg(feature = "static-bundled-question-plugin")]

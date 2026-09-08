@@ -136,13 +136,29 @@ impl fmt::Display for PluginInteractionRegistryError {
 
 impl Error for PluginInteractionRegistryError {}
 
+/// Snapshot serialization failed. Details are withheld because they may contain secrets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PluginInteractionSnapshotError;
+
+impl fmt::Display for PluginInteractionSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("interaction snapshot serialization failed")
+    }
+}
+
+impl Error for PluginInteractionSnapshotError {}
+
 /// Renderer-neutral plugin interaction controller using JSON snapshots.
 pub trait PluginInteractionController: Send {
     /// Stable interaction kind.
     fn kind(&self) -> &'static str;
 
     /// Return the current domain snapshot as JSON.
-    fn snapshot_json(&self) -> Value;
+    ///
+    /// # Errors
+    ///
+    /// Returns a normalized error if the snapshot cannot be serialized.
+    fn snapshot_json(&self) -> Result<Value, PluginInteractionSnapshotError>;
 
     /// Handle semantic input from any renderer/client.
     fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput;
@@ -225,6 +241,19 @@ impl PluginInteractionRegistry {
         T: PluginInteraction,
     {
         self.register_factory(Box::new(TypedInteractionFactory::<T>::new()));
+    }
+
+    /// Register a typed interaction and report invalid or conflicting registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginInteractionRegistryError::InvalidKind`] for blank kinds or
+    /// [`PluginInteractionRegistryError::ConflictingFactories`] for duplicate kinds.
+    pub fn try_register_interaction<T>(&mut self) -> Result<(), PluginInteractionRegistryError>
+    where
+        T: PluginInteraction,
+    {
+        self.try_register_factory(Box::new(TypedInteractionFactory::<T>::new()))
     }
 
     /// Return whether this registry supports `kind`.
@@ -337,8 +366,8 @@ where
         T::KIND
     }
 
-    fn snapshot_json(&self) -> Value {
-        serde_json::to_value(self.inner.snapshot()).unwrap_or(Value::Null)
+    fn snapshot_json(&self) -> Result<Value, PluginInteractionSnapshotError> {
+        serde_json::to_value(self.inner.snapshot()).map_err(|_| PluginInteractionSnapshotError)
     }
 
     fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
@@ -379,8 +408,8 @@ where
         self.inner.kind()
     }
 
-    fn snapshot_json(&self) -> Value {
-        serde_json::to_value(self.inner.snapshot()).unwrap_or(Value::Null)
+    fn snapshot_json(&self) -> Result<Value, PluginInteractionSnapshotError> {
+        serde_json::to_value(self.inner.snapshot()).map_err(|_| PluginInteractionSnapshotError)
     }
 
     fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
@@ -391,6 +420,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_snapshot_failure_is_explicit_and_secret_safe() {
+        struct Snapshot;
+        impl Serialize for Snapshot {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("private snapshot content"))
+            }
+        }
+        struct Interaction;
+        impl PluginInteraction for Interaction {
+            const KIND: &'static str = "failing-snapshot";
+            type Request = ();
+            type Snapshot = Snapshot;
+
+            fn new((): ()) -> Self {
+                Self
+            }
+
+            fn snapshot(&self) -> Snapshot {
+                Snapshot
+            }
+
+            fn handle_input(&mut self, _: InteractionInput) -> InteractionOutput {
+                panic!("snapshot access must not dispatch input")
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.try_register_interaction::<Interaction>().unwrap();
+        let controller = registry.open(Interaction::KIND, Value::Null).unwrap();
+        let error = controller.snapshot_json().unwrap_err();
+        assert_eq!(error, PluginInteractionSnapshotError);
+        assert_eq!(
+            error.to_string(),
+            "interaction snapshot serialization failed"
+        );
+        assert!(!format!("{error:?}").contains("private snapshot content"));
+    }
 
     #[test]
     fn registry_does_not_register_blank_kinds() {
@@ -432,8 +499,8 @@ mod tests {
             fn kind(&self) -> &'static str {
                 " example "
             }
-            fn snapshot_json(&self) -> Value {
-                self.0.clone()
+            fn snapshot_json(&self) -> Result<Value, PluginInteractionSnapshotError> {
+                Ok(self.0.clone())
             }
             fn handle_input(&mut self, _: InteractionInput) -> InteractionOutput {
                 panic!("no input expected")
@@ -458,7 +525,14 @@ mod tests {
         let request = serde_json::json!({"opaque": [null, 42, "original"]});
         let controller = registry.open(" example ", request.clone()).unwrap();
         assert_eq!(controller.kind(), " example ");
-        assert_eq!(controller.snapshot_json(), request);
+        assert_eq!(controller.snapshot_json(), Ok(request.clone()));
+        let other_request = serde_json::json!({"opaque": ["different"]});
+        let other = registry.open(" example ", other_request.clone()).unwrap();
+        assert_eq!(other.snapshot_json(), Ok(other_request.clone()));
+        assert_eq!(controller.snapshot_json(), Ok(request.clone()));
+        drop(registry);
+        assert_eq!(controller.snapshot_json(), Ok(request));
+        assert_eq!(other.snapshot_json(), Ok(other_request));
     }
 
     #[test]
@@ -493,6 +567,84 @@ mod tests {
             };
             assert_eq!(error, PluginInteractionRegistryError::ConflictingFactories);
         }
+    }
+
+    #[test]
+    fn typed_factory_rejects_malformed_request_without_disabling_kind() {
+        struct Interaction(u32);
+        impl PluginInteraction for Interaction {
+            const KIND: &'static str = "typed";
+            type Request = u32;
+            type Snapshot = u32;
+
+            fn new(request: u32) -> Self {
+                Self(request)
+            }
+
+            fn snapshot(&self) -> u32 {
+                self.0
+            }
+
+            fn handle_input(&mut self, _: InteractionInput) -> InteractionOutput {
+                panic!("request validation must not dispatch input")
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.try_register_interaction::<Interaction>().unwrap();
+        for request in [
+            Value::Null,
+            serde_json::json!("private-request"),
+            serde_json::json!(-1),
+        ] {
+            let Err(error) = registry.open("typed", request) else {
+                panic!("malformed typed request opened")
+            };
+            assert_eq!(
+                error,
+                PluginInteractionRegistryError::OpenFailed(
+                    "controller initialization failed".to_owned()
+                )
+            );
+            assert!(registry.supports("typed"));
+        }
+        let controller = registry.open("typed", serde_json::json!(42)).unwrap();
+        assert_eq!(controller.kind(), "typed");
+        assert_eq!(controller.snapshot_json(), Ok(serde_json::json!(42)));
+        assert_eq!(
+            registry.try_register_interaction::<Interaction>(),
+            Err(PluginInteractionRegistryError::ConflictingFactories)
+        );
+        assert!(!registry.supports("typed"));
+    }
+
+    #[test]
+    fn registry_unknown_kind_does_not_invoke_registered_factory() {
+        struct Factory;
+        impl PluginInteractionControllerFactory for Factory {
+            fn interaction_kind(&self) -> &'static str {
+                "known"
+            }
+
+            fn open(
+                &self,
+                _: Value,
+            ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
+                panic!("an unknown kind must not invoke another factory")
+            }
+        }
+        let mut registry = PluginInteractionRegistry::default();
+        registry.try_register_factory(Box::new(Factory)).unwrap();
+        for kind in ["unknown", "", " known", "known ", "KNOWN"] {
+            assert!(!registry.supports(kind));
+            let Err(error) = registry.open(kind, Value::Null) else {
+                panic!("unknown controller kind opened")
+            };
+            assert_eq!(
+                error,
+                PluginInteractionRegistryError::UnsupportedKind(kind.to_owned())
+            );
+        }
+        assert!(registry.supports("known"));
     }
 
     #[test]
@@ -597,19 +749,29 @@ mod tests {
 
     #[test]
     fn registry_rejects_factory_controller_kind_mismatch() {
-        struct WrongController;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct WrongController(Arc<AtomicUsize>);
+        impl Drop for WrongController {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         impl PluginInteractionController for WrongController {
             fn kind(&self) -> &'static str {
                 "wrong"
             }
-            fn snapshot_json(&self) -> Value {
-                Value::Null
+            fn snapshot_json(&self) -> Result<Value, PluginInteractionSnapshotError> {
+                panic!("mismatched controller must never expose a snapshot")
             }
             fn handle_input(&mut self, _: InteractionInput) -> InteractionOutput {
                 panic!("mismatched controller must never receive input")
             }
         }
-        struct Factory;
+        struct Factory(Arc<AtomicUsize>);
         impl PluginInteractionControllerFactory for Factory {
             fn interaction_kind(&self) -> &'static str {
                 "expected"
@@ -618,12 +780,14 @@ mod tests {
                 &self,
                 _: Value,
             ) -> Result<BoxedPluginInteractionController, PluginInteractionError> {
-                Ok(Box::new(WrongController))
+                Ok(Box::new(WrongController(Arc::clone(&self.0))))
             }
         }
+        let dropped = Arc::new(AtomicUsize::new(0));
         let mut registry = PluginInteractionRegistry::default();
-        registry.register_factory(Box::new(Factory));
+        registry.register_factory(Box::new(Factory(Arc::clone(&dropped))));
         let result = registry.open("expected", Value::Null);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert!(
             matches!(result, Err(PluginInteractionRegistryError::OpenFailed(message))
             if message == "controller kind does not match the registered factory")
@@ -695,6 +859,38 @@ mod tests {
     }
 
     #[test]
+    fn adapter_selection_ignores_conflicts_outside_winning_route() {
+        let winner = adapter("winner", 1, 3, "web", 10);
+        let lower = adapter("lower", 1, 3, "web", 1);
+        let mut lower_conflict = lower.clone();
+        lower_conflict.tui_surface_kind = Some("different".to_owned());
+        let mut unrelated = adapter("unrelated", 1, 3, "web", 100);
+        unrelated.producer_id = "other.plugin".to_owned();
+        let mut unrelated_conflict = unrelated.clone();
+        unrelated_conflict.tui_surface_kind = Some("different".to_owned());
+        let mut adapters = vec![
+            lower,
+            unrelated,
+            winner.clone(),
+            lower_conflict,
+            unrelated_conflict,
+        ];
+        for _ in 0..adapters.len() {
+            assert_eq!(
+                select_interaction_adapter(
+                    &adapters,
+                    "example.plugin",
+                    "example.request",
+                    2,
+                    "web",
+                ),
+                Some(&winner)
+            );
+            adapters.rotate_left(1);
+        }
+    }
+
+    #[test]
     fn adapter_selection_rejects_empty_route_identifiers() {
         for empty in ["", " \t\n"] {
             for field in 0..4 {
@@ -741,6 +937,12 @@ mod tests {
         let valid = adapter("valid", 1, 3, "web", 10);
         assert!(valid.supports("example.request", 1));
         assert!(valid.supports("example.request", 3));
+        assert!(!valid.supports("example.request", 0));
+        assert!(!valid.supports("example.request", 4));
+        assert!(!valid.supports("example.request", u32::MAX));
+        let full_range = adapter("full-range", 1, u32::MAX, "web", 10);
+        assert!(full_range.supports("example.request", u32::MAX));
+        assert!(!full_range.supports("example.request", 0));
         assert!(!valid.supports("example.request", 0));
         assert!(!valid.supports("example.request", 4));
     }
