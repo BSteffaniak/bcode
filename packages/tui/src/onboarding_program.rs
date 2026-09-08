@@ -16,6 +16,8 @@ use super::{TuiError, current_time_ms, onboarding, onboarding_render};
 /// Runtime-owned onboarding messages.
 pub enum OnboardingMessage {
     /// Terminal input backend failure.
+    /// Poll background authentication progress without blocking input.
+    AuthProgress,
     InputFailed(std::io::Error),
 }
 
@@ -65,6 +67,13 @@ impl OnboardingProgram {
         self.health = self.store.health();
         self.readiness = self.store.readiness_report()?;
         Ok(())
+    }
+
+    fn auth_progress_command() -> bmux_tui_runtime::Command<OnboardingMessage> {
+        bmux_tui_runtime::Command::concurrent(async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Some(OnboardingMessage::AuthProgress)
+        })
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
@@ -135,6 +144,21 @@ impl Program for OnboardingProgram {
         &mut self,
         event: RuntimeEvent<Self::Message>,
     ) -> Result<Update<Self::Message>, Self::Error> {
+        if matches!(
+            event,
+            RuntimeEvent::Message(OnboardingMessage::AuthProgress)
+        ) {
+            return Ok(Update {
+                invalidation: Invalidation::Redraw,
+                commands: if self.connection_form.is_some() {
+                    vec![Self::auth_progress_command()]
+                } else {
+                    Vec::new()
+                },
+                ..Update::none()
+            });
+        }
+        let had_connection = self.connection_form.is_some();
         if let RuntimeEvent::Terminal(ref terminal_event) = event
             && !matches!(terminal_event, Event::Resize(_))
             && let Some(form) = &mut self.connection_form
@@ -189,12 +213,18 @@ impl Program for OnboardingProgram {
                 Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_),
             )
             | RuntimeEvent::Timer(_) => Invalidation::None,
+            RuntimeEvent::Message(OnboardingMessage::AuthProgress) => Invalidation::Redraw,
             RuntimeEvent::Message(OnboardingMessage::InputFailed(error)) => {
                 return Err(error.into());
             }
         };
         self.refresh_persisted_state()?;
         Ok(Update {
+            commands: if !had_connection && self.connection_form.is_some() {
+                vec![Self::auth_progress_command()]
+            } else {
+                Vec::new()
+            },
             invalidation,
             lifecycle,
             ..Update::none()

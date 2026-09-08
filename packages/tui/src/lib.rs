@@ -76,6 +76,7 @@ pub mod session_search;
 pub mod session_search_effect;
 pub(crate) mod setup_board;
 mod setup_connection_form;
+mod setup_device_login;
 mod setup_settings_form;
 pub(crate) mod skill_flow;
 pub(crate) mod skill_picker;

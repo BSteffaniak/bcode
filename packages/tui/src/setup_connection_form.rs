@@ -12,6 +12,7 @@ use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInp
 use std::collections::BTreeMap;
 
 pub struct ConnectionForm {
+    device: Option<super::setup_device_login::DeviceLogin>,
     importing: bool,
     fields: [TextInputState; 4],
     focus: usize,
@@ -23,6 +24,7 @@ pub struct ConnectionForm {
 impl ConnectionForm {
     pub fn new(importing: bool) -> Self {
         Self {
+            device: None,
             importing,
             fields: [String::new(), "api_key".to_owned(), String::new(), bcode_config::default_auth_vault_path().display().to_string()]
                 .map(|text| TextInputState::new(TextEditBuffer::from_text(text))),
@@ -32,6 +34,17 @@ impl ConnectionForm {
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
+        if let Some(device) = &mut self.device {
+            device.refresh();
+            if matches!(event, Event::Key(key) if key.key == KeyCode::Escape) {
+                if device.terminal {
+                    self.device = None;
+                } else {
+                    device.cancel();
+                }
+            }
+            return false;
+        }
         match event {
             Event::Key(key) if key.key == KeyCode::Escape => {
                 if self.review {
@@ -44,7 +57,15 @@ impl ConnectionForm {
                 self.focus = (self.focus + 1) % 5;
             }
             Event::Key(key) if key.key == KeyCode::Enter => {
-                if self.review {
+                if self.review && !self.importing && self.fields[1].buffer().text() != "api_key" {
+                    self.device = Some(super::setup_device_login::DeviceLogin::start(
+                        self.fields[0].buffer().text().to_owned(),
+                        self.fields[1].buffer().text().to_owned(),
+                        self.fields[2].buffer().text().to_owned(),
+                        self.fields[3].buffer().text().to_owned(),
+                    ));
+                    self.review = false;
+                } else if self.review {
                     self.status = self.save().map_or_else(
                         |message| message,
                         |()| "Credentials saved. Esc returns to setup.".to_owned(),
@@ -179,6 +200,20 @@ impl ConnectionForm {
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
+        if let Some(device) = &mut self.device {
+            device.refresh();
+            let area = frame.area();
+            for (index, text) in device.lines.iter().enumerate() {
+                write(
+                    frame,
+                    area,
+                    u16::try_from(index).unwrap_or(0).saturating_add(2),
+                    text,
+                    theme.text,
+                );
+            }
+            return;
+        }
         let area = frame.area();
         let labels = [
             "Provider",
