@@ -4457,7 +4457,10 @@ impl WorkflowStore {
                         CASE WHEN typeof(definition.definition_json) = 'text'
                           AND length(CAST(definition.definition_json AS BLOB)) <= ?4
                           THEN definition.definition_json END, \
-                        run.authorization_ceiling, run.authorization_profile_json \
+                        run.authorization_ceiling,
+                        CASE WHEN typeof(run.authorization_profile_json) = 'text'
+                          AND length(CAST(run.authorization_profile_json AS BLOB)) <= ?4
+                          THEN run.authorization_profile_json END \
                  FROM workflow_runs run \
                  JOIN workflow_activations activation ON activation.run_id = run.run_id \
                  JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
@@ -25136,6 +25139,30 @@ mod tests {
             "UPDATE workflow_runs SET cancellation_requested_at_ms = NULL WHERE run_id = 'rollback-parent'",
             [],
         ).expect("restore parent fixture");
+        let original_profile = serde_json::to_string(&request.run.authorization_profile)
+            .expect("authorization profile");
+        store.connection.execute(
+            "UPDATE workflow_runs SET authorization_profile_json = ?1 WHERE run_id = 'rollback-parent'",
+            [format!("{original_profile}{}", " ".repeat(MAX_INLINE_JSON_BYTES))],
+        ).expect("oversized authorization fixture");
+        let before = store.connection.total_changes();
+        assert!(matches!(
+            store.create_child_run_idempotent(&request),
+            Err(WorkflowStoreError::Database(
+                rusqlite::Error::InvalidColumnType(..)
+            ))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .run_summary(&child_id)
+                .expect("no child on oversized authorization")
+                .is_none()
+        );
+        store.connection.execute(
+            "UPDATE workflow_runs SET authorization_profile_json = ?1 WHERE run_id = 'rollback-parent'",
+            [original_profile],
+        ).expect("restore authorization fixture");
         for definition_id in ["parent", request.run.definition_id.as_str()] {
             let original: String = store
                 .connection
