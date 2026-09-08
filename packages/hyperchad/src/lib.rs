@@ -740,6 +740,24 @@ fn local_interaction_validation_error(
         .map(ToOwned::to_owned)
 }
 
+fn retire_stale_interaction_controllers(
+    interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
+    pending_ids: &BTreeSet<&str>,
+) -> Result<(), ClientError> {
+    let retired = interaction_controllers
+        .lock()
+        .map_err(|_| {
+            ClientError::Protocol("interaction controller state is unavailable".to_owned())
+        })?
+        .entries
+        .extract_if(.., |interaction_id, _| {
+            !pending_ids.contains(interaction_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    drop(retired);
+    Ok(())
+}
+
 async fn hydrate_pending_interactions(
     client: &BcodeClient,
     session_id: SessionId,
@@ -751,13 +769,7 @@ async fn hydrate_pending_interactions(
         .iter()
         .map(|pending| pending.request.exchange_id.as_str())
         .collect::<BTreeSet<_>>();
-    interaction_controllers
-        .lock()
-        .map_err(|_| {
-            ClientError::Protocol("interaction controller state is unavailable".to_owned())
-        })?
-        .entries
-        .retain(|interaction_id, _| pending_ids.contains(interaction_id.as_str()));
+    retire_stale_interaction_controllers(interaction_controllers, &pending_ids)?;
     for request in exchanges
         .into_iter()
         .filter(|request| request.session_id == session_id)
@@ -2860,6 +2872,72 @@ mod tests {
                 initial
             );
         }
+    }
+
+    #[test]
+    fn stale_controller_cleanup_runs_destructors_outside_map_lock() {
+        use bcode_plugin_sdk::interaction::{
+            PluginInteractionController, PluginInteractionSnapshotError,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Controller {
+            controllers: std::sync::Weak<Mutex<LocalInteractionControllers>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Controller {
+            fn drop(&mut self) {
+                let controllers = self.controllers.upgrade().unwrap();
+                assert!(controllers.try_lock().is_ok());
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl PluginInteractionController for Controller {
+            fn kind(&self) -> &'static str {
+                "example.cleanup"
+            }
+            fn snapshot_json(&self) -> Result<serde_json::Value, PluginInteractionSnapshotError> {
+                panic!("cleanup must not inspect snapshots")
+            }
+            fn handle_input(
+                &mut self,
+                _: bcode_tool::InteractionInput,
+            ) -> bcode_tool::InteractionOutput {
+                panic!("cleanup must not dispatch input")
+            }
+        }
+        let controllers = Arc::new(Mutex::new(LocalInteractionControllers::default()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        for id in ["stale", "pending"] {
+            let request = bcode_session_models::ToolExchangeRequest {
+                invocation_id: "call-1".to_owned(),
+                exchange_id: id.to_owned(),
+                producer_id: "example.plugin".to_owned(),
+                schema: "example.request".to_owned(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+                response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+            };
+            controllers.lock().unwrap().entries.insert(
+                id.to_owned(),
+                (
+                    request,
+                    Box::new(Controller {
+                        controllers: Arc::downgrade(&controllers),
+                        drops: Arc::clone(&drops),
+                    }),
+                ),
+            );
+        }
+        let pending = BTreeSet::from(["pending"]);
+        retire_stale_interaction_controllers(&controllers, &pending).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(controllers.lock().unwrap().entries.contains_key("pending"));
+        retire_stale_interaction_controllers(&controllers, &pending).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        retire_stale_interaction_controllers(&controllers, &BTreeSet::new()).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(controllers.lock().unwrap().entries.is_empty());
     }
 
     #[test]
