@@ -748,7 +748,17 @@ impl TurnControl {
 
     fn signal_cancellation_handles(handles: Vec<Arc<dyn InvocationCancellation>>) {
         for handle in handles {
-            handle.request_cancel();
+            Self::signal_cancellation_handle(handle.as_ref());
+        }
+    }
+
+    fn signal_cancellation_handle(handle: &dyn InvocationCancellation) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.request_cancel()))
+            .is_err()
+        {
+            tracing::warn!(
+                "invocation cancellation callback panicked; resource release is unverified"
+            );
         }
     }
 
@@ -790,28 +800,33 @@ impl TurnControl {
         handle: Arc<dyn InvocationCancellation>,
     ) -> bool {
         let invocation_id = invocation_id.into();
-        let _gate = self
+        let gate = self
             .publication_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.lifecycle() != TurnLifecycle::Running {
-            handle.request_cancel();
+            drop(gate);
+            Self::signal_cancellation_handle(handle.as_ref());
             return false;
         }
-        self.cancellations
+        let replaced = self
+            .cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(invocation_id, handle);
+        drop(gate);
+        drop(replaced);
         true
     }
 
     /// Remove a completed invocation's cancellation handle.
     pub fn unregister_cancellation(&self, invocation_id: &str) -> bool {
-        self.cancellations
+        let removed = self
+            .cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(invocation_id)
-            .is_some()
+            .remove(invocation_id);
+        removed.is_some()
     }
 
     fn cancellation_count(&self) -> usize {
@@ -1380,6 +1395,90 @@ mod tests {
         fn request_cancel(&self) {
             self.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct PanickingCancellation;
+
+    impl InvocationCancellation for PanickingCancellation {
+        fn request_cancel(&self) {
+            panic!("private cancellation payload");
+        }
+    }
+
+    #[test]
+    fn cancellation_callback_panic_does_not_skip_remaining_handles() {
+        let control = TurnControl::new();
+        let remaining = Arc::new(AtomicUsize::new(0));
+        assert!(control.register_cancellation("a", Arc::new(PanickingCancellation)));
+        assert!(control.register_cancellation("b", remaining.clone()));
+        assert!(control.begin_cancellation());
+        assert_eq!(remaining.load(Ordering::SeqCst), 1);
+        assert!(!control.begin_cancellation());
+        assert!(!control.register_cancellation("late", Arc::new(PanickingCancellation)));
+        assert_eq!(control.lifecycle(), TurnLifecycle::Cancelling);
+    }
+
+    struct ReentrantCancellation(Arc<TurnControl>, Arc<AtomicUsize>);
+
+    impl InvocationCancellation for ReentrantCancellation {
+        fn request_cancel(&self) {
+            assert!(self.0.publication_gate.try_lock().is_ok());
+            assert!(
+                !self
+                    .0
+                    .register_cancellation("nested", Arc::new(AtomicUsize::new(0)))
+            );
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn late_cancellation_callback_runs_outside_publication_gate() {
+        let control = Arc::new(TurnControl::new());
+        let completed = Arc::new(AtomicUsize::new(0));
+        assert!(control.begin_cancellation());
+        assert!(!control.register_cancellation(
+            "late",
+            Arc::new(ReentrantCancellation(control.clone(), completed.clone()))
+        ));
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    struct ReentrantRelease {
+        control: Arc<TurnControl>,
+        released: Arc<AtomicUsize>,
+    }
+
+    impl InvocationCancellation for ReentrantRelease {
+        fn request_cancel(&self) {}
+    }
+
+    impl Drop for ReentrantRelease {
+        fn drop(&mut self) {
+            assert!(self.control.publication_gate.try_lock().is_ok());
+            assert!(self.control.cancellations.try_lock().is_ok());
+            assert!(!self.control.unregister_cancellation("unrelated"));
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cancellation_handle_replacement_and_removal_release_outside_locks() {
+        let control = Arc::new(TurnControl::new());
+        let released = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            assert!(control.register_cancellation(
+                "owned",
+                Arc::new(ReentrantRelease {
+                    control: control.clone(),
+                    released: released.clone(),
+                })
+            ));
+        }
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(control.unregister_cancellation("owned"));
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+        assert!(!control.unregister_cancellation("owned"));
     }
 
     struct OrderedPublication {

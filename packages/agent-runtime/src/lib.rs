@@ -2328,9 +2328,15 @@ impl AgentRuntime {
         let model_request =
             model_turn_request(request, self.provider_request_identity_source.as_deref())?;
         let provider_plugin_id = request.provider_plugin_id.as_deref();
-        let start_response =
-            start_provider_turn(provider, provider_plugin_id, &model_request, request, scope)
-                .await?;
+        let start_response = start_provider_turn(
+            provider,
+            provider_plugin_id,
+            &model_request,
+            request,
+            scope,
+            start,
+        )
+        .await?;
         let _provider_cleanup =
             provider.turn_cleanup_handle(provider_plugin_id, &start_response.provider_turn_id);
         let poll_request = PollTurnEventsRequest {
@@ -2412,12 +2418,7 @@ impl AgentRuntime {
                 }
             }
             if should_sleep {
-                let scope_cancellation = scope.control().cancellation();
-                switchy::unsync::select! {
-                    () = request.cancellation.cancelled() => {},
-                    () = scope_cancellation.cancelled() => {},
-                    () = sleep(self.poll_interval.min(request.timeout.saturating_sub(instant_now().saturating_duration_since(start)))) => {},
-                }
+                wait_provider_poll_interval(request, scope, start, self.poll_interval).await;
             }
         }
     }
@@ -2682,12 +2683,30 @@ where
     }
 }
 
+async fn wait_provider_poll_interval(
+    request: &AgentTurnRequest,
+    scope: &TurnScope,
+    start: Instant,
+    interval: Duration,
+) {
+    let scope_cancellation = scope.control().cancellation();
+    let remaining = request
+        .timeout
+        .saturating_sub(instant_now().saturating_duration_since(start));
+    switchy::unsync::select! {
+        () = request.cancellation.cancelled() => {},
+        () = scope_cancellation.cancelled() => {},
+        () = sleep(interval.min(remaining)) => {},
+    }
+}
+
 async fn start_provider_turn<P>(
     provider: &mut P,
     provider_plugin_id: Option<&str>,
     model_request: &ModelTurnRequest,
     request: &AgentTurnRequest,
     scope: &TurnScope,
+    start: Instant,
 ) -> Result<StartTurnResponse>
 where
     P: ModelProviderInvoker + ?Sized,
@@ -2707,11 +2726,19 @@ where
         if request.cancellation.is_cancelled() || !scope.accepts_work() {
             return Err(RuntimeError::Cancelled);
         }
+        let remaining = request
+            .timeout
+            .saturating_sub(instant_now().saturating_duration_since(start));
+        if remaining.is_zero() {
+            return Err(RuntimeError::Timeout {
+                timeout: request.timeout,
+            });
+        }
         switchy::unsync::select! {
             biased;
             () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
             () = scope_cancellation.cancelled() => Err(RuntimeError::Cancelled),
-            () = sleep(request.timeout) => {
+            () = sleep(remaining) => {
                 Err(RuntimeError::Timeout { timeout: request.timeout })
             }
             response = provider.start_turn(provider_plugin_id, model_request) => response,
@@ -2738,11 +2765,21 @@ async fn poll_provider_events<P>(
 where
     P: ModelProviderInvoker + ?Sized,
 {
-    let Some(remaining) = context
+    if context.request.cancellation.is_cancelled() || !context.scope.accepts_work() {
+        cancel_and_finish(
+            provider,
+            context.provider_plugin_id,
+            context.cancel_request,
+            context.finish_request,
+        )
+        .await;
+        return Err(RuntimeError::Cancelled);
+    }
+    let remaining = context
         .request
         .timeout
-        .checked_sub(instant_now().saturating_duration_since(context.start))
-    else {
+        .saturating_sub(instant_now().saturating_duration_since(context.start));
+    if remaining.is_zero() {
         cancel_and_finish(
             provider,
             context.provider_plugin_id,
@@ -2753,7 +2790,7 @@ where
         return Err(RuntimeError::Timeout {
             timeout: context.request.timeout,
         });
-    };
+    }
     let request_cancellation = context.request.cancellation.clone();
     let scope_cancellation = context.scope.control().cancellation();
     let provider_span = tracing::info_span!(
@@ -4421,6 +4458,90 @@ mod tests {
             );
             assert!(!lifecycle.started.load(Ordering::Acquire));
             assert_eq!(runtime.active_turn_generation(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_start_budget_does_not_construct_provider_future() {
+        for elapsed in [Duration::from_secs(1), Duration::from_secs(2)] {
+            let runtime = AgentRuntime::new();
+            let scope = runtime.begin_turn_scope(
+                "expired",
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+            );
+            let mut request = AgentTurnRequest::new("model", "expired");
+            request.timeout = Duration::from_secs(1);
+            let model_request = model_turn_request(&request, None).expect("request");
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Pending,
+            };
+            let result = start_provider_turn(
+                &mut provider,
+                None,
+                &model_request,
+                &request,
+                &scope,
+                instant_now().checked_sub(elapsed).expect("past instant"),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(RuntimeError::Timeout { timeout }) if timeout == request.timeout)
+            );
+            assert!(!lifecycle.started.load(Ordering::Acquire));
+            assert!(runtime.complete_turn_scope(&scope));
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_admission_preserves_cancellation_and_rejects_expired_budget() {
+        for cancelled in [false, true] {
+            let runtime = AgentRuntime::new();
+            let scope = runtime.begin_turn_scope(
+                "poll-admission",
+                Arc::new(RuntimeStreamEventSink::default()),
+                InvocationCapabilities::default(),
+            );
+            let mut request = AgentTurnRequest::new("model", "poll");
+            request.timeout = Duration::from_secs(1);
+            if cancelled {
+                request.cancellation.cancel();
+            }
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Pending,
+            };
+            let result = poll_provider_events(
+                &mut provider,
+                &ProviderPollContext {
+                    provider_plugin_id: None,
+                    poll_request: &PollTurnEventsRequest {
+                        provider_turn_id: "acquired".into(),
+                    },
+                    cancel_request: &CancelTurnRequest {
+                        provider_turn_id: "acquired".into(),
+                    },
+                    finish_request: &FinishTurnRequest {
+                        provider_turn_id: "acquired".into(),
+                    },
+                    request: &request,
+                    scope: &scope,
+                    start: instant_now().checked_sub(Duration::from_secs(2)).unwrap(),
+                },
+            )
+            .await;
+            if cancelled {
+                assert!(matches!(result, Err(RuntimeError::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(RuntimeError::Timeout { .. })));
+            }
+            assert_eq!(lifecycle.poll_count.load(Ordering::Acquire), 0);
+            assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
+            assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+            assert!(runtime.complete_turn_scope(&scope));
         }
     }
 
