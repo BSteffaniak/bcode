@@ -94,6 +94,15 @@ struct LocalInteractionControllers {
 }
 
 impl LocalInteractionControllers {
+    fn release(
+        &mut self,
+        exchange_id: &str,
+    ) -> Option<bcode_plugin_sdk::interaction::BoxedPluginInteractionController> {
+        self.entries
+            .remove(exchange_id)
+            .map(|(_, controller)| controller)
+    }
+
     fn controller_for(
         &mut self,
         exchange: &bcode_session_models::ToolExchangeRequest,
@@ -1503,11 +1512,12 @@ impl HyperChadAppState {
         };
         match result {
             Ok(resolved) => {
-                self.interaction_controllers
+                let controller = self
+                    .interaction_controllers
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entries
-                    .remove(&exchange.exchange_id);
+                    .release(&exchange.exchange_id);
+                drop(controller);
                 let status = if resolved {
                     status
                 } else {
@@ -2850,6 +2860,63 @@ mod tests {
                 initial
             );
         }
+    }
+
+    #[test]
+    fn releasing_controller_drops_only_the_matching_entry() {
+        use bcode_plugin_sdk::interaction::{
+            PluginInteractionController, PluginInteractionSnapshotError,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Controller(Arc<AtomicUsize>);
+        impl Drop for Controller {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl PluginInteractionController for Controller {
+            fn kind(&self) -> &'static str {
+                "example.release"
+            }
+            fn snapshot_json(&self) -> Result<serde_json::Value, PluginInteractionSnapshotError> {
+                panic!("release must not inspect snapshots")
+            }
+            fn handle_input(
+                &mut self,
+                _: bcode_tool::InteractionInput,
+            ) -> bcode_tool::InteractionOutput {
+                panic!("release must not dispatch input")
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut controllers = LocalInteractionControllers::default();
+        for id in ["first", "second"] {
+            let request = bcode_session_models::ToolExchangeRequest {
+                invocation_id: "call-1".to_owned(),
+                exchange_id: id.to_owned(),
+                producer_id: "example.plugin".to_owned(),
+                schema: "example.request".to_owned(),
+                schema_version: 1,
+                payload: serde_json::Value::Null,
+                response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+            };
+            controllers.entries.insert(
+                id.to_owned(),
+                (request, Box::new(Controller(Arc::clone(&drops)))),
+            );
+        }
+        let released = controllers.release("first");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(released);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!controllers.entries.contains_key("first"));
+        assert!(controllers.entries.contains_key("second"));
+        assert!(controllers.release("first").is_none());
+        assert!(controllers.release("missing").is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(controllers);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
