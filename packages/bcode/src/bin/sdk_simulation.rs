@@ -7,6 +7,10 @@ use std::time::Duration;
 
 #[cfg(not(feature = "simulation-example"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !validate_native_arguments(std::env::args().skip(1))? {
+        print_runner_help();
+        return Ok(());
+    }
     let runtime = switchy::unsync::Builder::new().build()?;
     let result = runtime.block_on(run());
     runtime.wait()?;
@@ -16,7 +20,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "simulation-example")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let budgets = SimulationBudgets::parse(std::env::args().skip(1))?;
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--help"] {
+        print_runner_help();
+        return Ok(());
+    }
+    let budgets = SimulationBudgets::parse(args)?;
     // Validate before initializing any simulator globals or admitting application work.
     let seed = simulation_input("SIMULATOR_SEED")?;
     let epoch = simulation_input("SIMULATOR_EPOCH_OFFSET")?;
@@ -31,6 +40,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is an explicit exploration policy, not a claim of exhaustive schedule coverage.
     switchy::time::simulator::reset_step();
     run_simulated(run(), budgets.execution, budgets.drain)
+}
+
+fn print_runner_help() {
+    println!("bcode-sdk-simulation: diagnostic SDK runner, not a certified DST profile");
+    #[cfg(not(feature = "simulation-example"))]
+    println!(
+        "Native build: no execution options. Build with simulation-example for step controls."
+    );
+    #[cfg(feature = "simulation-example")]
+    println!(
+        "Simulator build: [--execution-steps N] [--drain-steps N] (positive; default 10000 each)\nRequired environment: SIMULATOR_SEED, SIMULATOR_EPOCH_OFFSET, SIMULATOR_STEP_MULTIPLIER (positive)\nStep budgets do not bound wall-clock time or constitute replay artifacts."
+    );
+}
+
+#[cfg(any(test, not(feature = "simulation-example")))]
+fn validate_native_arguments(args: impl IntoIterator<Item = String>) -> Result<bool, &'static str> {
+    let mut args = args.into_iter();
+    match (args.next(), args.next()) {
+        (None, None) => Ok(true),
+        (Some(arg), None) if arg == "--help" => Ok(false),
+        _ => {
+            Err("native runner accepts only --help; simulation options require simulation-example")
+        }
+    }
 }
 
 #[cfg(any(test, feature = "simulation-example"))]
@@ -74,6 +107,22 @@ impl SimulationBudgets {
 #[cfg(test)]
 mod budget_tests {
     use super::SimulationBudgets;
+
+    #[test]
+    fn native_arguments_do_not_silently_ignore_simulator_controls() {
+        assert_eq!(super::validate_native_arguments([]), Ok(true));
+        assert_eq!(
+            super::validate_native_arguments(["--help".into()]),
+            Ok(false)
+        );
+        for args in [
+            vec!["--execution-steps", "3"],
+            vec!["--help", "extra"],
+            vec!["unknown"],
+        ] {
+            assert!(super::validate_native_arguments(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
 
     #[test]
     fn budgets_accept_defaults_and_explicit_values() {
