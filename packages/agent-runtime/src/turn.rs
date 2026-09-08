@@ -1789,6 +1789,47 @@ mod tests {
     }
 
     #[test]
+    fn presentation_updates_require_active_matching_invocation() {
+        let sink = Arc::new(CountingSink::default());
+        let turn = TurnScope::new("turn", TurnGeneration::new(5), sink.clone());
+        let scope = InvocationScope::new(turn.clone(), "invoke");
+        let mut update = bcode_tool::ToolPresentationUpdate {
+            invocation_id: "other".to_owned(),
+            producer_id: "producer".to_owned(),
+            generation: 0,
+            revision: 1,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+            schema: "example.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::Value::Null,
+        };
+        assert!(!scope.emit_presentation_update(update.clone()));
+        assert_eq!(sink.0.load(Ordering::SeqCst), 0);
+        update.invocation_id = "invoke".to_owned();
+        assert!(scope.emit_presentation_update(update.clone()));
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+        assert!(turn.control().begin_cancellation());
+        update.revision = 2;
+        assert!(!scope.emit_presentation_update(update.clone()));
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+
+        let owner = TurnScopeOwner::new();
+        let first = owner.begin_turn("first", sink.clone(), InvocationCapabilities::default());
+        let first_invocation = InvocationScope::new(first, "invoke");
+        assert!(first_invocation.emit_presentation_update(update.clone()));
+        let second = owner.begin_turn("second", sink.clone(), InvocationCapabilities::default());
+        let second_invocation = InvocationScope::new(second.clone(), "invoke");
+        assert!(!first_invocation.emit_presentation_update(update.clone()));
+        assert!(second_invocation.emit_presentation_update(update.clone()));
+        assert_eq!(sink.0.load(Ordering::SeqCst), 3);
+        assert!(owner.complete_turn(&second));
+        assert!(!second_invocation.emit_presentation_update(update));
+        assert_eq!(sink.0.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn invocation_scope_rejects_mismatched_event_identity() {
         let sink = Arc::new(CountingSink::default());
         let scope = InvocationScope::new(

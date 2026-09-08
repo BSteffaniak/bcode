@@ -118,6 +118,96 @@ async fn agent_step_tool_restrictions_narrow_provider_exposure() {
 }
 
 #[tokio::test]
+async fn cancelled_agent_work_does_not_acquire_provider() {
+    let acquisitions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = std::sync::Arc::clone(&acquisitions);
+    let step = agent::<ReviewTask, Review, _, _>("review", move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        bcode::testing::ScriptedProvider::new([])
+    })
+    .build();
+    let workflow = WorkflowBuilder::new("cancel-before-acquisition", step)
+        .build()
+        .expect("workflow");
+    let cancellation = bcode::workflow::WorkflowCancellation::new();
+    cancellation.cancel();
+    let result = workflow
+        .run_with_cancellation(
+            ReviewTask {
+                diff: String::new(),
+            },
+            cancellation,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(bcode::workflow::WorkflowError::Cancelled { .. })
+    ));
+    assert_eq!(acquisitions.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancellation_during_prompt_prevents_provider_acquisition() {
+    let cancellation = bcode::workflow::WorkflowCancellation::new();
+    let cancel_from_prompt = cancellation.clone();
+    let step =
+        agent::<ReviewTask, Review, _, _>("review", || -> bcode::testing::ScriptedProvider {
+            panic!("cancelled prompt must not acquire provider");
+        })
+        .prompt_with(move |_| {
+            cancel_from_prompt.cancel();
+            "cancelled".into()
+        })
+        .build();
+    let workflow = WorkflowBuilder::new("cancel-in-prompt", step)
+        .build()
+        .expect("workflow");
+    let result = workflow
+        .run_with_cancellation(
+            ReviewTask {
+                diff: String::new(),
+            },
+            cancellation,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(bcode::workflow::WorkflowError::Cancelled { .. })
+    ));
+}
+
+#[tokio::test]
+async fn agent_step_uses_explicit_agent_initialization() {
+    let provider = bcode::testing::ScriptedProvider::new([ScriptedProviderTurn::complete_text(
+        r#"{"approved":true}"#,
+    )]);
+    let probe = provider.probe();
+    let builder = bcode::AgentBuilder::from_context(
+        bcode::SessionId::default(),
+        std::path::PathBuf::from("/explicit-workspace"),
+    )
+    .model("explicit-model");
+    let step = bcode::workflow::AgentStep::<ReviewTask, Review>::with_agent_builder(
+        "review",
+        move || provider.clone(),
+        builder,
+    );
+    let workflow = WorkflowBuilder::new("explicit-initialization", step.build())
+        .build()
+        .expect("workflow");
+    let review = workflow
+        .run(ReviewTask {
+            diff: "+ safe".into(),
+        })
+        .await
+        .expect("review");
+    assert!(review.approved);
+    probe
+        .assert_requests(&[ScriptedRequestExpectation::new().model_id("explicit-model")])
+        .expect("caller model reaches provider");
+}
+
+#[tokio::test]
 async fn agent_step_requests_and_validates_structured_output() {
     let workflow = WorkflowBuilder::new(
         "agent-review",
@@ -206,13 +296,13 @@ fn shared_parent_agent_target_is_explicit_and_changes_definition_identity() {
         "shared_parent_sequential"
     );
     assert_ne!(
-        bcode_workflow::WorkflowDefinitionIdentity::from_definition(
+        bcode_workflow::WorkflowDefinitionIdentity::for_definition(
             "targeted-agent",
             isolated.definition()
         )
         .expect("isolated identity")
         .definition_id,
-        bcode_workflow::WorkflowDefinitionIdentity::from_definition(
+        bcode_workflow::WorkflowDefinitionIdentity::for_definition(
             "targeted-agent",
             shared.definition()
         )
@@ -304,7 +394,10 @@ async fn mutating_agent_step_requires_profile_and_bounded_grant() {
             None,
         )
         .expect_err("implicit build profile cannot authorize mutation");
-    assert!(error.to_string().contains("configured agent profile"));
+    assert!(matches!(
+        error,
+        bcode::workflow::WorkflowError::Build { ref path, .. } if path == "commit"
+    ));
 
     let configured = agent::<ReviewTask, Review, _, _>("commit", || {
         bcode::testing::ScriptedProvider::new([ScriptedProviderTurn::complete_text(

@@ -14,6 +14,178 @@ use bcode_model::{
 };
 use std::collections::BTreeSet;
 
+#[tokio::test]
+async fn explicit_sdk_inputs_materialize_auth_pool_and_model_defaults() {
+    let mut config = BcodeConfig::default();
+    config.model.provider_plugin_id = Some("example.provider".into());
+    config.model.model_id = Some("example-model".into());
+    config.model.auth_pool = Some("explicit-pool".into());
+    let environment = ConfigEnvironmentSnapshot::isolated("explicit-sdk-inputs");
+    let subscriptions = bcode_config::RuntimeAuthSubscriptions {
+        pools: std::collections::BTreeMap::from([(
+            "explicit-pool".into(),
+            bcode_config::RuntimeAuthSubscriptionPool {
+                preferred_profile: Some("explicit-profile".into()),
+                profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
+                    auth_profile: "explicit-profile".into(),
+                    storage_profile: "stored-profile".into(),
+                    vault: "/fixture/auth.vault".into(),
+                    provider: "openai".into(),
+                    scheme: "api_key".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let mut acquisitions = Vec::new();
+    let sdk = Bcode::builder().provider_defaults_with_auth_resolver(
+        &config,
+        &environment,
+        &subscriptions,
+        |name, profile| {
+            acquisitions.push(name.to_owned());
+            assert_eq!(name, "explicit-profile");
+            assert_eq!(profile.backend, "sshenv");
+            bcode_provider_auth::ResolvedProviderAuth {
+                auth: bcode_model::ProviderAuthContext {
+                    scheme: Some("api_key".into()),
+                    ..bcode_model::ProviderAuthContext::default()
+                },
+                env: std::collections::BTreeMap::new(),
+            }
+        },
+    );
+    let sdk = sdk.build();
+    assert_eq!(acquisitions, ["explicit-profile"]);
+    let context = sdk.provider_context().clone();
+    assert_eq!(
+        sdk.default_model_selector(),
+        Some(&ModelSelector::with_provider(
+            "example.provider",
+            "example-model"
+        ))
+    );
+    assert_eq!(
+        sdk.provider_context().auth_pool.as_deref(),
+        Some("explicit-pool")
+    );
+    assert_eq!(
+        sdk.provider_context().auth_profile.as_deref(),
+        Some("explicit-profile")
+    );
+    assert_eq!(sdk.provider_context().auth_candidates.len(), 1);
+    let session_id = "00000000-0000-4000-8000-000000000025"
+        .parse()
+        .expect("fixture ID");
+    let agent = sdk
+        .agent_from_context(session_id, "/fixture".into())
+        .build();
+    assert_eq!(agent.provider_context(), sdk.provider_context());
+    struct ContextProvider(bcode::ProviderRequestContext);
+    impl bcode::InProcessModelProvider for ContextProvider {
+        fn run_turn(
+            &self,
+            request: ModelTurnRequest,
+            _context: bcode::InProcessProviderContext,
+        ) -> bcode::InProcessProviderFuture<'_> {
+            assert_eq!(request.provider_context, self.0);
+            assert_eq!(request.model_id, "example-model");
+            Box::pin(async { Ok(bcode::InProcessProviderOutcome::EndTurn) })
+        }
+    }
+    let mut provider =
+        bcode::InProcessModelProviderAdapter::new(ContextProvider(sdk.provider_context().clone()));
+    let response = agent
+        .generate_text_with_provider(&mut provider, "context propagation")
+        .await
+        .expect("explicit context reaches provider execution");
+    assert_eq!(
+        response.runtime.stop_reason,
+        Some(bcode::StopReason::EndTurn)
+    );
+    provider.shutdown_wait().await.expect("provider released");
+    let override_context = bcode::ProviderRequestContext {
+        auth_profile: Some("caller-profile".into()),
+        ..bcode::ProviderRequestContext::default()
+    };
+    let overridden = Bcode::builder()
+        .provider_defaults_from_config_environment(&config, &environment)
+        .provider_context(context)
+        .provider_context(override_context.clone())
+        .build();
+    assert_eq!(overridden.provider_context(), &override_context);
+    assert_eq!(
+        overridden
+            .agent_from_context(session_id, "/fixture".into())
+            .build()
+            .provider_context(),
+        &override_context
+    );
+    let empty = Bcode::builder()
+        .provider_defaults_with_auth_resolver(
+            &config,
+            &environment,
+            &bcode_config::RuntimeAuthSubscriptions::default(),
+            |_, _| panic!("empty pool must not acquire credentials"),
+        )
+        .build();
+    assert!(empty.provider_context().auth_candidates.is_empty());
+    assert!(empty.provider_context().auth.is_none());
+}
+
+#[test]
+fn explicit_sdk_inputs_share_one_selection_with_auth_context() {
+    struct ChangingEnvironment(std::cell::Cell<usize>);
+    impl bcode_config::ConfigEnvironment for ChangingEnvironment {
+        fn var(&self, name: &str) -> Option<String> {
+            if name != "BCODE_MODEL_PROVIDER" {
+                return None;
+            }
+            let reads = self.0.get();
+            self.0.set(reads + 1);
+            Some(
+                if reads == 0 {
+                    "example.provider"
+                } else {
+                    "other.provider"
+                }
+                .into(),
+            )
+        }
+
+        fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
+            self.var(name).map(Into::into)
+        }
+
+        fn current_dir(&self) -> std::path::PathBuf {
+            "/fixture".into()
+        }
+    }
+    let mut config = BcodeConfig::default();
+    config.model.provider_plugin_id = Some("example.provider".into());
+    config.model.model_id = Some("example-model".into());
+    config.model.auth_profile = Some("selected-profile".into());
+    let environment = ChangingEnvironment(std::cell::Cell::new(0));
+    let sdk = Bcode::builder()
+        .provider_defaults_from_inputs(
+            &config,
+            &environment,
+            &bcode_config::RuntimeAuthSubscriptions::default(),
+        )
+        .build();
+    assert_eq!(environment.0.get(), 1);
+    assert_eq!(
+        sdk.default_model_selector().unwrap().provider_plugin_id(),
+        Some("example.provider")
+    );
+    assert_eq!(
+        sdk.provider_context().auth_profile.as_deref(),
+        Some("selected-profile")
+    );
+}
+
 #[test]
 fn provider_defaults_resolve_from_explicit_config() {
     let mut config = BcodeConfig::default();

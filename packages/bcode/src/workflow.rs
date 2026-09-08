@@ -18,7 +18,7 @@ pub use bcode_workflow::{
     WorkflowRunSnapshot, WorkflowSourceFormat, WorkflowSourceLoweringResult, WorkflowSourceMap,
     WorkflowSourceMapEntry, WorkflowSourceProfile, WorkflowSpec, WorkflowToolCapability,
     authorize_workflow_policy, decode_workflow_authoring_source, fan_out, field,
-    lower_workflow_authoring_source, parallel, parallel_named_with_policy,
+    lower_workflow_authoring_source, parallel, parallel_named, parallel_named_with_policy,
     preflight_workflow_policy, workflow_event_channel,
 };
 use schemars::JsonSchema;
@@ -97,13 +97,35 @@ where
         F: Fn() -> P + Send + Sync + 'static,
         P: ModelProviderInvoker + 'static,
     {
+        Self::with_agent_builder(name, provider, Agent::builder())
+    }
+
+    /// Create a typed agent step using caller-owned agent initialization.
+    ///
+    /// This constructor does not acquire a session identity or working directory. Use
+    /// [`AgentBuilder::from_context`] to supply those inputs explicitly. Selecting a builder
+    /// does not assert a configured workflow prompt profile; use [`Self::agent_id`] for that.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a future input value cannot be serialized despite implementing `Serialize`.
+    #[must_use]
+    pub fn with_agent_builder<F, P>(
+        name: impl Into<String>,
+        provider: F,
+        agent: AgentBuilder,
+    ) -> Self
+    where
+        F: Fn() -> P + Send + Sync + 'static,
+        P: ModelProviderInvoker + 'static,
+    {
         Self {
             name: name.into(),
             prompt: Arc::new(|input| {
                 serde_json::to_string_pretty(input)
                     .expect("workflow prompt input should serialize to JSON")
             }),
-            agent: Agent::builder(),
+            agent,
             provider: Arc::new(move || Box::new(provider())),
             agent_id: None,
             provider_plugin_id: None,
@@ -289,14 +311,15 @@ where
         let execution_target = self.execution_target;
         let resources = self.resources;
         let timeout = self.timeout;
-        let agent = {
-            let mut agent = self.agent;
-            if let Some(tools) = &tool_restriction {
-                agent = agent.restrict_tools(tools.iter().cloned());
-            }
-            if read_only_tools {
-                agent = agent.read_only_tools();
-            }
+        let agent = self.agent;
+        let agent = if let Some(tools) = &tool_restriction {
+            agent.restrict_tools(tools.iter().cloned())
+        } else {
+            agent
+        };
+        let agent = if read_only_tools {
+            agent.read_only_tools().build()
+        } else {
             agent.build()
         };
         let configuration = json!({
@@ -319,32 +342,38 @@ where
             NodeKind::Agent,
             configuration,
             move |input: I, context: StepContext| {
-                let prompt = prompt(&input);
+                let prompt = Arc::clone(&prompt);
                 let agent = agent.clone();
-                let mut provider = provider();
+                let provider = Arc::clone(&provider);
                 let step_name = step_name.clone();
                 async move {
                     context.ensure_active(step_name.clone())?;
+                    let prompt = prompt(&input);
+                    context.ensure_active(step_name.clone())?;
+                    let mut provider = provider();
                     let cancellation = CancellationToken::new();
                     let workflow_cancellation = context.cancellation();
                     let cancellation_signal = cancellation.clone();
-                    let _cancellation_task = AbortTaskOnDrop::new(tokio::spawn(async move {
+                    let cancellation_forwarding = async move {
                         workflow_cancellation.cancelled().await;
                         cancellation_signal.cancel();
-                    }));
+                        std::future::pending::<()>().await;
+                    };
                     let options = StructuredOutputOptions::for_type::<O>()
                         .with_strict(strict)
                         .with_max_repairs(max_repairs);
-                    agent
+                    let execution = agent
                         .generate_object_with_provider_and_request_options(
                             &mut provider,
                             prompt,
                             options,
                             Vec::new(),
                             cancellation,
-                        )
-                        .await
-                        .map_err(|error| map_agent_error(&step_name, &error))
+                        );
+                    switchy::unsync::select! {
+                        result = execution => result.map_err(|error| map_agent_error(&step_name, &error)),
+                        () = cancellation_forwarding => unreachable!("forwarding remains pending"),
+                    }
                 }
             },
         )
@@ -358,6 +387,11 @@ where
 }
 
 fn map_agent_error(step: &str, error: &BcodeError) -> WorkflowError {
+    if matches!(error, BcodeError::Runtime(crate::RuntimeError::Cancelled)) {
+        return WorkflowError::Cancelled {
+            step: step.to_owned(),
+        };
+    }
     WorkflowError::step(step, error.to_string())
 }
 
@@ -378,6 +412,15 @@ mod tests {
     use super::{
         WorkflowAuthoringDocument, WorkflowSourceFormat, decode_workflow_authoring_source,
     };
+
+    #[test]
+    fn agent_cancellation_retains_workflow_terminal_kind() {
+        let error = super::map_agent_error(
+            "review",
+            &crate::BcodeError::Runtime(crate::RuntimeError::Cancelled),
+        );
+        assert!(matches!(error, super::WorkflowError::Cancelled { step } if step == "review"));
+    }
 
     #[test]
     fn sdk_facade_decodes_checked_in_workflow_sources() {

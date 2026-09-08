@@ -203,24 +203,12 @@ fn dynamic_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
-    let profile_library = target_profile.join(&exact_library_name);
-    let library = if profile_library.is_file() {
-        profile_library
-    } else {
-        let prefix = format!("{}bcode_shell_plugin", std::env::consts::DLL_PREFIX);
-        std::fs::read_dir(directory)
-            .expect("test dependency directory should be readable")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
-                    })
-            })
-            .expect("shell plugin dynamic library should be built before adapter conformance")
-    };
+    let library = target_profile.join(&exact_library_name);
+    assert!(
+        library.is_file(),
+        "build the standalone shell plugin with `cargo build -p bcode_shell_plugin` before adapter conformance; expected {}",
+        library.display(),
+    );
     let root =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/shell-plugin");
     let mut registered = bcode_plugin::discover_plugins_in_roots(&[root])
@@ -428,24 +416,24 @@ async fn assert_reentrant_shell_batch_overlaps(plugins: bcode_plugin::PluginRunt
 
 #[derive(Debug, Default)]
 struct ContributionObserver {
-    contributions: Mutex<Vec<bcode_tool::ToolContributionEvent>>,
+    updates: Mutex<Vec<bcode_tool::ToolPresentationUpdate>>,
     lifecycle: Mutex<Vec<bcode_tool::ToolInvocationLifecycleEvent>>,
 }
 
 impl TurnEventObservability for ContributionObserver {
     fn observe(&self, event: &bcode::ScopedTurnEvent) {
         match event {
-            bcode::ScopedTurnEvent::Contribution(contribution) => self
-                .contributions
+            bcode::ScopedTurnEvent::PresentationUpdate(update) => self
+                .updates
                 .lock()
-                .expect("contribution observation lock")
-                .push(contribution.clone()),
+                .expect("presentation observation lock")
+                .push(update.clone()),
             bcode::ScopedTurnEvent::InvocationLifecycle(lifecycle) => self
                 .lifecycle
                 .lock()
                 .expect("lifecycle observation lock")
                 .push(lifecycle.clone()),
-            bcode::ScopedTurnEvent::Runtime(_) => {}
+            bcode::ScopedTurnEvent::Runtime(_) | bcode::ScopedTurnEvent::Contribution(_) => {}
         }
     }
 }
@@ -470,39 +458,23 @@ async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
             .await
             .expect("shell contribution invocation");
         assert!(!output.invocation.is_error, "{}", output.invocation.output);
-        let contributions = observer
-            .contributions
-            .lock()
-            .expect("contribution observations");
-        assert_eq!(contributions.len(), 2);
-        let request = contributions
-            .iter()
-            .find(|event| event.schema == "bcode.tool.request.shell.run")
-            .expect("shell request contribution");
-        assert_eq!(request.invocation_id, "shell-contribution");
-        assert_eq!(request.producer_id, "bcode.shell");
-        assert_eq!(
-            request.persistence,
-            bcode_tool::ToolContributionPersistence::Durable
-        );
-        let contribution = contributions
-            .iter()
-            .find(|event| event.schema == "bcode.shell.run.summary")
-            .expect("shell summary contribution");
-        assert_eq!(contribution.invocation_id, "shell-contribution");
-        assert_eq!(contribution.producer_id, "bcode.shell");
-        assert_eq!(contribution.schema, "bcode.shell.run.summary");
-        assert_eq!(
-            contribution.persistence,
-            bcode_tool::ToolContributionPersistence::Durable
-        );
-        assert!(
-            contribution
-                .payload
-                .to_string()
-                .contains("shell-contribution")
-        );
-        drop(contributions);
+        let updates = observer.updates.lock().expect("presentation observations");
+        let request = updates.first().expect("shell request presentation");
+        assert_eq!(request.schema, "bcode.tool.request.shell.run");
+        assert_eq!(request.revision, 1);
+        // This SDK path supplies workspace context but no artifact root, so shell
+        // publishes its request without recording-artifact revisions.
+        assert_eq!(updates.len(), 1);
+        assert!(updates.iter().all(|update| {
+            update.invocation_id == "shell-contribution"
+                && update.producer_id == "bcode.shell"
+                && update.generation == 0
+                && update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                && update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        }));
+        assert!(request.artifact.is_none());
+        assert!(request.payload.to_string().contains("shell-contribution"));
+        drop(updates);
         let lifecycle = observer.lifecycle.lock().expect("lifecycle observations");
         assert!(lifecycle.iter().any(|event| {
             event.invocation_id == "shell-contribution"

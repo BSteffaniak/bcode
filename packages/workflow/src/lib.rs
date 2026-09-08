@@ -9,6 +9,7 @@
 //! Execution is intentionally host-neutral: agent, plugin, and application behavior enters through
 //! ordinary typed steps instead of scheduler-specific branches.
 
+use futures::{StreamExt as _, stream::FuturesUnordered};
 use schemars::JsonSchema;
 use serde::{
     Deserialize, Serialize,
@@ -27,7 +28,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
 /// Boxed asynchronous workflow operation.
 pub type StepFuture<T> = Pin<Box<dyn Future<Output = Result<T, WorkflowError>> + Send>>;
@@ -390,6 +391,12 @@ pub enum WorkflowError {
         step: String,
         /// Step-owned failure message.
         message: String,
+    },
+    /// A step panicked; its side effects are ambiguous and must not be retried automatically.
+    #[error("workflow step '{step}' panicked")]
+    Panicked {
+        /// Stable step name. Panic payloads are never included.
+        step: String,
     },
     /// A typed durable run input could not be serialized or did not match its schema.
     #[error("workflow '{workflow}' received invalid input: {message}")]
@@ -910,7 +917,7 @@ impl ConcurrencyCoordinator {
                 context.emit(WorkflowEvent::StepWaitingForConcurrency {
                     step: node.to_string(),
                 });
-                tokio::select! {
+                switchy::unsync::select! {
                     result = Arc::clone(&self.permits).acquire_owned() => {
                         result.expect("workflow concurrency semaphore remains open")
                     }
@@ -978,7 +985,7 @@ impl ResourceCoordinator {
                 step: node.to_string(),
                 resources: claims.to_vec(),
             });
-            tokio::select! {
+            switchy::unsync::select! {
                 () = notified => {}
                 () = context.cancellation.cancelled() => {
                     return Err(WorkflowError::Cancelled { step: node.to_string() });
@@ -13307,6 +13314,11 @@ where
     }
 
     /// Create an asynchronous typed application step.
+    ///
+    /// Unwinding panics during operation creation, polling, or output validation become
+    /// [`WorkflowError::Panicked`] and mark the step failed. Panic payloads are not included
+    /// in workflow errors or events. The process panic hook still runs; aborting panics
+    /// cannot be caught. A panic does not roll back side effects.
     #[must_use]
     pub fn task<F, Fut>(name: impl Into<String>, operation: F) -> Self
     where
@@ -13379,10 +13391,18 @@ where
                 context.emit(WorkflowEvent::StepStarted {
                     step: step_id.clone(),
                 });
-                let result = operation(input, context.clone()).await.and_then(|output| {
-                    validate_output(&step_id, &output)?;
-                    Ok(output)
-                });
+                let result =
+                    futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+                        let output = operation(input, context.clone()).await?;
+                        validate_output(&step_id, &output)?;
+                        Ok(output)
+                    }))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(WorkflowError::Panicked {
+                            step: step_id.clone(),
+                        })
+                    });
                 match &result {
                     Ok(_) => {
                         context.transition(&step_id, NodeRunState::Succeeded);
@@ -13683,6 +13703,7 @@ where
                             if !expression.evaluate(&output)? {
                                 return Ok(output);
                             }
+                            switchy::unsync::task::yield_now().await;
                             context.ensure_active(repeat_id.clone())?;
                             context.emit(WorkflowEvent::IterationStarted {
                                 step: repeat_id.clone(),
@@ -13853,8 +13874,9 @@ where
 
     /// Retry this composed step after failures, up to `max_attempts` total attempts.
     ///
-    /// A zero attempt limit is rejected when the workflow is built. Cancellation and timeout
-    /// failures are terminal and are never retried.
+    /// A zero attempt limit is rejected when the workflow is built. Cancellation, timeout,
+    /// and panic failures are terminal and are never retried. Other failures may be retried;
+    /// callers must ensure repeating the composed operation is safe.
     #[must_use]
     pub fn retry(self, name: impl Into<String>, max_attempts: u32) -> Self
     where
@@ -13864,6 +13886,8 @@ where
     }
 
     /// Retry this composed step using an explicit bounded policy.
+    ///
+    /// Like [`Self::retry`], this never retries cancellation, timeout, or panic failures.
     #[must_use]
     pub fn retry_with_policy(self, name: impl Into<String>, policy: RetryPolicy) -> Self
     where
@@ -13931,15 +13955,21 @@ where
                                 Ok(output) => return Ok(output),
                                 Err(
                                     error @ (WorkflowError::Cancelled { .. }
-                                    | WorkflowError::TimedOut { .. }),
+                                    | WorkflowError::TimedOut { .. }
+                                    | WorkflowError::Panicked { .. }),
                                 ) => return Err(error),
                                 Err(error) => {
                                     errors.push(error.to_string());
                                     if attempt < max_attempts {
                                         if backoff.is_zero() {
-                                            tokio::task::yield_now().await;
+                                            switchy::unsync::task::yield_now().await;
                                         } else {
-                                            tokio::time::sleep(backoff).await;
+                                            switchy::unsync::select! {
+                                                () = context.cancellation.cancelled() => {
+                                                    return Err(WorkflowError::Cancelled { step: retry_id.clone() });
+                                                },
+                                                () = switchy::unsync::time::sleep(backoff) => {},
+                                            }
                                         }
                                     }
                                 }
@@ -13977,7 +14007,7 @@ where
                 let run = Arc::clone(&run);
                 let step = step.clone();
                 Box::pin(async move {
-                    tokio::time::timeout(timeout, run(input, context))
+                    switchy::unsync::time::timeout(timeout, run(input, context))
                         .await
                         .map_err(|_| WorkflowError::TimedOut { step, timeout })?
                 })
@@ -14002,8 +14032,10 @@ pub enum ParallelFailurePolicy {
 
 /// Execute a homogeneous collection through one cloned step with bounded concurrency.
 ///
-/// Results preserve input order regardless of completion order. The first observed failure aborts
-/// unfinished sibling tasks.
+/// Results preserve input order regardless of completion order. Members are polled concurrently
+/// within the owning operation, not spawned as independent tasks. The first observed failure
+/// drops unfinished sibling futures before returning. Dropping the operation also drops its
+/// members; work independently spawned by a member remains that member's responsibility.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn fan_out<I, O>(
@@ -14068,47 +14100,43 @@ where
                     }
                     context.ensure_active(fan_out_id.clone())?;
                     let mut inputs = inputs.into_iter().enumerate();
-                    let mut tasks = JoinSet::new();
+                    let mut tasks = FuturesUnordered::new();
                     for _ in 0..max_concurrency {
                         let Some((index, input)) = inputs.next() else {
                             break;
                         };
-                        spawn_fan_out_task(
-                            &mut tasks,
-                            Arc::clone(&run),
-                            context.clone(),
-                            index,
-                            input,
-                        );
+                        tasks.push(futures::FutureExt::catch_unwind(
+                            std::panic::AssertUnwindSafe(fan_out_member(
+                                Arc::clone(&run),
+                                context.clone(),
+                                index,
+                                input,
+                            )),
+                        ));
                     }
                     let mut outputs = BTreeMap::new();
-                    while let Some(result) = tasks.join_next().await {
-                        match result {
-                            Ok(Ok((index, output))) => {
-                                outputs.insert(index, output);
-                                if let Some((next_index, input)) = inputs.next() {
-                                    spawn_fan_out_task(
-                                        &mut tasks,
-                                        Arc::clone(&run),
-                                        context.clone(),
-                                        next_index,
-                                        input,
-                                    );
-                                }
+                    loop {
+                        let result = switchy::unsync::select! {
+                            result = tasks.next() => result,
+                            () = context.cancellation.cancelled() => {
+                                return Err(WorkflowError::Cancelled { step: fan_out_id.clone() });
                             }
-                            Ok(Err(error)) => {
-                                tasks.abort_all();
-                                while tasks.join_next().await.is_some() {}
-                                return Err(error);
-                            }
-                            Err(error) => {
-                                tasks.abort_all();
-                                while tasks.join_next().await.is_some() {}
-                                return Err(WorkflowError::step(
-                                    &fan_out_id,
-                                    format!("fan-out task failed to join: {error}"),
-                                ));
-                            }
+                        };
+                        context.ensure_active(fan_out_id.clone())?;
+                        let Some(result) = result else { break };
+                        let (index, output) = result.map_err(|_| WorkflowError::Panicked {
+                            step: fan_out_id.clone(),
+                        })??;
+                        outputs.insert(index, output);
+                        if let Some((next_index, input)) = inputs.next() {
+                            tasks.push(futures::FutureExt::catch_unwind(
+                                std::panic::AssertUnwindSafe(fan_out_member(
+                                    Arc::clone(&run),
+                                    context.clone(),
+                                    next_index,
+                                    input,
+                                )),
+                            ));
                         }
                     }
                     Ok(outputs.into_values().collect())
@@ -14124,17 +14152,17 @@ where
     }
 }
 
-fn spawn_fan_out_task<I, O>(
-    tasks: &mut JoinSet<Result<(usize, O), WorkflowError>>,
+async fn fan_out_member<I, O>(
     run: Arc<StepFn<I, O>>,
     context: StepContext,
     index: usize,
     input: I,
-) where
+) -> Result<(usize, O), WorkflowError>
+where
     I: Send + 'static,
     O: Send + 'static,
 {
-    tasks.spawn(async move { run(input, context).await.map(|output| (index, output)) });
+    run(input, context).await.map(|output| (index, output))
 }
 
 /// Compose two independent typed steps and join their outputs as a tuple.
@@ -14238,7 +14266,7 @@ where
                 context.controller_started(&join_id);
                 let result = match failure_policy {
                     ParallelFailurePolicy::WaitAll => {
-                        let (left, right) = tokio::join!(
+                        let (left, right) = switchy::unsync::join!(
                             left_run(input, context.clone()),
                             right_run(right_input, right_context)
                         );
@@ -14248,10 +14276,11 @@ where
                         let sibling_cancellation = WorkflowCancellation::new();
                         let parent_cancellation = context.cancellation();
                         let sibling_signal = sibling_cancellation.clone();
-                        let _parent_bridge = AbortTaskOnDrop::new(tokio::spawn(async move {
+                        let parent_bridge = async move {
                             parent_cancellation.cancelled().await;
                             sibling_signal.cancel();
-                        }));
+                            std::future::pending::<()>().await;
+                        };
                         let branch_context = StepContext {
                             cancellation: sibling_cancellation.clone(),
                             events: context.events.clone(),
@@ -14262,21 +14291,27 @@ where
                         };
                         let mut left = Box::pin(left_run(input, branch_context.clone()));
                         let mut right = Box::pin(right_run(right_input, branch_context));
-                        tokio::select! {
-                            left_result = &mut left => match left_result {
-                                Ok(left_output) => Ok((left_output, right.await?)),
-                                Err(error) => {
-                                    sibling_cancellation.cancel();
-                                    Err(error)
-                                }
-                            },
-                            right_result = &mut right => match right_result {
-                                Ok(right_output) => Ok((left.await?, right_output)),
-                                Err(error) => {
-                                    sibling_cancellation.cancel();
-                                    Err(error)
-                                }
-                            },
+                        let branches = async {
+                            switchy::unsync::select! {
+                                left_result = &mut left => match left_result {
+                                    Ok(left_output) => Ok((left_output, right.await?)),
+                                    Err(error) => {
+                                        sibling_cancellation.cancel();
+                                        Err(error)
+                                    }
+                                },
+                                right_result = &mut right => match right_result {
+                                    Ok(right_output) => Ok((left.await?, right_output)),
+                                    Err(error) => {
+                                        sibling_cancellation.cancel();
+                                        Err(error)
+                                    }
+                                },
+                            }
+                        };
+                        switchy::unsync::select! {
+                            result = branches => result,
+                            () = parent_bridge => unreachable!("parent bridge remains pending"),
                         }
                     }
                 };
@@ -22860,6 +22895,193 @@ steps:
     }
 
     #[tokio::test]
+    async fn synchronous_repeat_yields_to_cancellation() {
+        let started = Arc::new(Notify::new());
+        let child_started = Arc::clone(&started);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let step = Step::map("work", move |input: Input| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            child_started.notify_one();
+            Ok(input)
+        })
+        .repeat_while("repeat", field::<Input>("value").eq(1), 100);
+        let workflow = WorkflowBuilder::new("repeat-cancellation", step)
+            .build()
+            .expect("workflow");
+        let cancellation = WorkflowCancellation::new();
+        let signal = cancellation.clone();
+        let cancel = async {
+            started.notified().await;
+            signal.cancel();
+        };
+        let (result, ()) = tokio::join!(
+            workflow.run_with_cancellation(Input { value: 1 }, cancellation),
+            cancel
+        );
+        assert!(matches!(result, Err(WorkflowError::Cancelled { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn panicking_steps_are_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let step: Step<Input, Input> = Step::map("panic", move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            panic!("ambiguous side effect");
+        });
+        let workflow = WorkflowBuilder::new("panic-retry", step.retry("retry", 3))
+            .build()
+            .expect("workflow builds");
+        assert!(matches!(workflow.run(Input { value: 1 }).await,
+            Err(WorkflowError::Panicked { step }) if step == "panic"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fan_out_task_panics_are_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let mut child = Step::map("child", |input: Input| Ok(input));
+        // Inject a failure outside the leaf operation's unwind boundary.
+        child.run = Arc::new(move |_, _| {
+            let observed = Arc::clone(&observed);
+            Box::pin(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                panic!("private task failure");
+            })
+        });
+        let workflow = WorkflowBuilder::new(
+            "task-panic-retry",
+            fan_out("fan", child, 1).retry("retry", 3),
+        )
+        .build()
+        .expect("workflow builds");
+        assert!(matches!(workflow.run(vec![Input { value: 1 }]).await,
+            Err(WorkflowError::Panicked { step }) if step == "fan"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fan_out_panic_payload_is_not_exposed() {
+        let child: Step<Input, Input> = Step::task("panic-child", |_: Input, _| async {
+            panic!("fixture-secret-panic-payload");
+        });
+        let workflow = WorkflowBuilder::new("panic-fan-out", fan_out("fan", child, 1))
+            .build()
+            .expect("workflow builds");
+        let (events, mut receiver) = workflow_event_channel(32);
+        let observer = workflow.observer();
+        let result = workflow
+            .run_with_observer(
+                vec![Input { value: 1 }],
+                WorkflowCancellation::new(),
+                Some(events),
+                observer.clone(),
+            )
+            .await;
+        let error = result.expect_err("panic is a workflow failure");
+        assert!(matches!(&error, WorkflowError::Panicked { step }
+            if step == "panic-child"));
+        assert!(!error.to_string().contains("fixture-secret-panic-payload"));
+        let mut outcomes = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            assert!(!format!("{event:?}").contains("fixture-secret-panic-payload"));
+            if let WorkflowEvent::WorkflowFinished { outcome } = event {
+                outcomes.push(outcome);
+            }
+        }
+        assert_eq!(outcomes, vec![WorkflowOutcome::Failed]);
+        let snapshot = observer.snapshot();
+        assert!(snapshot.running.is_empty());
+        assert!(snapshot.waiting.is_empty());
+        assert_eq!(snapshot.nodes["panic-child"], NodeRunState::Failed);
+        assert_eq!(snapshot.nodes["fan"], NodeRunState::Failed);
+    }
+
+    #[tokio::test]
+    async fn fan_out_completion_does_not_hide_cancellation() {
+        // Exercise both the final-member and queued-member completion paths.
+        for count in [1, 3] {
+            let cancellation = WorkflowCancellation::new();
+            let signal = cancellation.clone();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&attempts);
+            let child = Step::map("cancel-on-completion", move |input: Input| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                signal.cancel();
+                Ok(input)
+            });
+            let workflow = WorkflowBuilder::new("cancel-completion", fan_out("fan", child, 1))
+                .build()
+                .expect("workflow builds");
+            let result = workflow
+                .run_with_cancellation(vec![Input { value: 1 }; count], cancellation)
+                .await;
+            assert!(matches!(result, Err(WorkflowError::Cancelled { .. })));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fan_out_cancellation_joins_pending_children() {
+        struct Released(Arc<AtomicUsize>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let started = Arc::new(Semaphore::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let child_started = Arc::clone(&started);
+        let child_released = Arc::clone(&released);
+        let child = Step::task("pending", move |_: Input, _| {
+            let started = Arc::clone(&child_started);
+            let released = Arc::clone(&child_released);
+            async move {
+                let _guard = Released(released);
+                started.add_permits(1);
+                std::future::pending::<Result<Input, WorkflowError>>().await
+            }
+        })
+        .resources([ResourceClaim::read("repository")]);
+        let workflow = WorkflowBuilder::new("cancel-fan-out", fan_out("fan", child, 2))
+            .build()
+            .expect("workflow builds");
+        let cancellation = WorkflowCancellation::new();
+        let signal = cancellation.clone();
+        let observer = workflow.observer();
+        let execution = workflow.run_with_observer(
+            vec![Input { value: 1 }, Input { value: 2 }, Input { value: 3 }],
+            cancellation,
+            None,
+            observer.clone(),
+        );
+        let cancel = async {
+            let _permit = started.acquire_many(2).await.expect("children start");
+            assert_eq!(
+                observer.snapshot().resource_holders.get("repository"),
+                Some(&2)
+            );
+            signal.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(execution, cancel)
+        })
+        .await
+        .expect("cancellation joins children without waiting for their completion");
+        assert!(matches!(result, Err(WorkflowError::Cancelled { .. })));
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+        let snapshot = observer.snapshot();
+        assert!(snapshot.running.is_empty());
+        assert!(snapshot.waiting.is_empty());
+        assert!(snapshot.resource_holders.is_empty());
+        assert_eq!(snapshot.nodes["pending"], NodeRunState::Cancelled);
+        assert_eq!(snapshot.nodes["fan"], NodeRunState::Cancelled);
+    }
+
+    #[tokio::test]
     async fn cancellation_interrupts_resource_wait() {
         let left_started = Arc::new(Notify::new());
         let release_left = Arc::new(Notify::new());
@@ -22991,14 +23213,111 @@ steps:
         );
     }
 
+    #[test]
+    fn fan_out_runs_without_a_spawn_runtime() {
+        let step = Step::task("member", |input: Input, _| async move {
+            let mut yielded = false;
+            std::future::poll_fn(move |context| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    context.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Ok(Doubled {
+                value: input.value * 2,
+            })
+        });
+        let workflow = WorkflowBuilder::new("owned-fan-out", fan_out("members", step, 2))
+            .build()
+            .expect("workflow builds");
+        let output = futures::executor::block_on(workflow.run(vec![
+            Input { value: 3 },
+            Input { value: 1 },
+            Input { value: 2 },
+        ]))
+        .expect("fan-out must not require a task-spawning runtime");
+        assert_eq!(
+            output
+                .into_iter()
+                .map(|item| item.value)
+                .collect::<Vec<_>>(),
+            [6, 2, 4]
+        );
+    }
+
+    #[test]
+    fn fan_out_cancels_without_a_spawn_runtime() {
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicUsize::new(0));
+        let member_released = Arc::clone(&released);
+        let cancellation = WorkflowCancellation::new();
+        let signal = cancellation.clone();
+        let started = Arc::new(AtomicUsize::new(0));
+        let member_started = Arc::clone(&started);
+        let step = Step::task("member", move |input: Input, _| {
+            let signal = signal.clone();
+            let started = Arc::clone(&member_started);
+            let released = Arc::clone(&member_released);
+            async move {
+                let _guard = Release(released);
+                started.fetch_add(1, Ordering::SeqCst);
+                signal.cancel();
+                std::future::pending::<()>().await;
+                Ok(input)
+            }
+        });
+        let workflow = WorkflowBuilder::new("cancel-fan-out", fan_out("members", step, 1))
+            .build()
+            .expect("workflow builds");
+        let result = futures::executor::block_on(
+            workflow
+                .run_with_cancellation(vec![Input { value: 1 }, Input { value: 2 }], cancellation),
+        );
+        assert!(matches!(result, Err(WorkflowError::Cancelled { .. })));
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fan_out_normalizes_panics_without_a_spawn_runtime() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let member_started = Arc::clone(&started);
+        let step = Step::task("member", move |input: Input, _| {
+            member_started.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(input.value, 1, "private member panic");
+            async move { Ok(input) }
+        });
+        let workflow = WorkflowBuilder::new("panic-fan-out", fan_out("members", step, 1))
+            .build()
+            .expect("workflow builds");
+        let error =
+            futures::executor::block_on(workflow.run(vec![Input { value: 1 }, Input { value: 2 }]))
+                .expect_err("member panics during future construction");
+        assert!(matches!(error, WorkflowError::Panicked { .. }));
+        assert!(!error.to_string().contains("private member panic"));
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn fan_out_failure_does_not_admit_more_work() {
         let started = Arc::new(AtomicUsize::new(0));
         let started_for_step = Arc::clone(&started);
+        let admitted = Arc::new(tokio::sync::Barrier::new(2));
         let step = Step::task("worker", move |input: Input, _| {
             let started = Arc::clone(&started_for_step);
+            let admitted = Arc::clone(&admitted);
             async move {
                 started.fetch_add(1, Ordering::SeqCst);
+                admitted.wait().await;
                 if input.value == 0 {
                     Err(WorkflowError::step("worker", "failed"))
                 } else {

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 #[cfg(not(feature = "simulation-example"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_runner_panic_hook();
     if !validate_native_arguments(std::env::args().skip(1))? {
         print_runner_help();
         return Ok(());
@@ -36,32 +37,30 @@ fn finish_native_run(
     if runtime_stopped {
         return outcome;
     }
-    Err(Box::new(NativeShutdownFailure {
+    Err(Box::new(ShutdownFailure {
+        message: "native runtime shutdown failed; resource release is unverified",
         scenario: outcome.err(),
     }))
 }
 
-#[cfg(not(feature = "simulation-example"))]
-struct NativeShutdownFailure {
+struct ShutdownFailure {
+    message: &'static str,
     scenario: Option<Box<dyn std::error::Error>>,
 }
 
-#[cfg(not(feature = "simulation-example"))]
-impl std::fmt::Debug for NativeShutdownFailure {
+impl std::fmt::Debug for ShutdownFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
 }
 
-#[cfg(not(feature = "simulation-example"))]
-impl std::fmt::Display for NativeShutdownFailure {
+impl std::fmt::Display for ShutdownFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("native runtime shutdown failed; resource release is unverified")
+        f.write_str(self.message)
     }
 }
 
-#[cfg(not(feature = "simulation-example"))]
-impl std::error::Error for NativeShutdownFailure {
+impl std::error::Error for ShutdownFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.scenario.as_deref()
     }
@@ -69,6 +68,7 @@ impl std::error::Error for NativeShutdownFailure {
 
 #[cfg(feature = "simulation-example")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_runner_panic_hook();
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] {
         print_runner_help();
@@ -89,6 +89,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is an explicit exploration policy, not a claim of exhaustive schedule coverage.
     switchy::time::simulator::reset_step();
     run_simulated(run(), budgets.execution, budgets.drain)
+}
+
+// Only the standalone executable owns this process-wide policy. Caught fixture
+// panics still invoke Rust's hook, so never print their potentially private payloads.
+fn install_runner_panic_hook() {
+    std::panic::set_hook(Box::new(|_| {
+        eprintln!(
+            "SDK runner panic observed; payload omitted (the scenario determines the outcome)"
+        );
+    }));
 }
 
 fn print_runner_help() {
@@ -153,9 +163,43 @@ impl SimulationBudgets {
     }
 }
 
+#[cfg(test)]
+mod shutdown_diagnostic_tests {
+    use super::ShutdownFailure;
+    use std::error::Error as _;
+
+    #[test]
+    fn simulation_drain_failure_preserves_source_without_exposing_it() {
+        for scenario in [None, Some("private scenario detail".into())] {
+            let error = ShutdownFailure {
+                message: "simulation drain step budget exhausted; cleanup is unverified",
+                scenario,
+            };
+            assert_eq!(error.to_string(), error.message);
+            assert_eq!(format!("{error:?}"), error.message);
+            assert_eq!(format!("{error:#?}"), error.message);
+            assert_eq!(
+                error.source().map(ToString::to_string),
+                error.scenario.as_ref().map(ToString::to_string),
+            );
+        }
+    }
+}
+
 #[cfg(all(test, not(feature = "simulation-example")))]
 mod native_lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn workflow_cancellation_and_deadlines_release_native_resources() {
+        run_native(async {
+            run_workflow_repeat_cancellation().await;
+            run_workflow_cancellation(false).await?;
+            run_workflow_cancellation(true).await?;
+            Ok(())
+        })
+        .expect("native workflow termination acknowledges resource release");
+    }
 
     #[test]
     fn shutdown_failure_preserves_scenario_source_without_displaying_it() {
@@ -271,6 +315,13 @@ fn run_simulated(
     drain_steps: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use futures::FutureExt as _;
+    // Simulator clocks and scheduler state are process-global. Keep test runs
+    // exclusive even when libtest uses its default parallel execution.
+    #[cfg(test)]
+    let _simulation_guard = {
+        static SIMULATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SIMULATION.lock().expect("previous simulator test panicked")
+    };
     let runtime = switchy::unsync::Builder::new().build()?;
     // Catch root panics inside the task so scenario-owned work is released first.
     let mut task = runtime.spawn(std::panic::AssertUnwindSafe(scenario).catch_unwind());
@@ -300,13 +351,10 @@ fn run_simulated(
             let _ = switchy::time::simulator::next_step();
         }
     }
-    if let Err(error) = outcome {
-        return Err(format!(
-            "{error}; simulation drain step budget exhausted; cleanup is unverified"
-        )
-        .into());
-    }
-    Err("simulation drain step budget exhausted; cleanup is unverified".into())
+    Err(Box::new(ShutdownFailure {
+        message: "simulation drain step budget exhausted; cleanup is unverified",
+        scenario: outcome.err(),
+    }))
 }
 
 #[cfg(feature = "simulation-example")]
@@ -328,6 +376,31 @@ mod lifecycle_tests {
     fn sdk_scenario_completes_and_drains_under_simulation() {
         run_simulated(run(), 10_000, 10_000)
             .expect("SDK scenario completes with acknowledged simulator drain");
+    }
+
+    #[test]
+    fn sequential_sdk_runs_complete_after_acknowledged_drain() {
+        for _ in 0..2 {
+            // Each run constructs fresh SDK services and request identity sources.
+            // Time remains monotonic across runs; no process-global reset escapes
+            // the runner's exclusive test lifetime.
+            run_simulated(run(), 10_000, 10_000)
+                .expect("fresh SDK scenario completes after prior runtime drain");
+        }
+    }
+
+    #[test]
+    fn exhausted_sdk_run_drains_before_fresh_run() {
+        let error = run_simulated(run(), 10, 10_000)
+            .expect_err("the full SDK scenario exceeds ten scheduling steps");
+        assert_eq!(
+            error.to_string(),
+            "simulation harness step budget exhausted (not a product timeout)"
+        );
+        // A shutdown failure would replace this error, so the next run follows
+        // acknowledged drain rather than merely dropping the root task handle.
+        run_simulated(run(), 10_000, 10_000)
+            .expect("fresh SDK run completes after budget-exhausted predecessor");
     }
 
     #[test]
@@ -369,7 +442,18 @@ mod lifecycle_tests {
                 async move {
                     let mut provider =
                         bcode::InProcessModelProviderAdapter::new(PanickingProvider(construction));
-                    let error = bcode::Agent::builder()
+                    let session_id = "00000000-0000-4000-8000-000000000024"
+                        .parse()
+                        .expect("fixture ID");
+                    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+                        session_id,
+                        turn_id: "provider-panic".into(),
+                    }])?;
+                    let error = AgentBuilder::from_context(session_id, "/".into())
+                        .runtime(
+                            AgentRuntime::new()
+                                .with_provider_request_identity_source(Arc::new(identities)),
+                        )
                         .build()
                         .generate_text_with_provider(&mut provider, "panic")
                         .await
@@ -405,6 +489,34 @@ mod lifecycle_tests {
             100,
         )
         .expect("host-bounded shutdown wait releases provider worker");
+    }
+
+    #[test]
+    fn scenario_error_drains_admitted_work_before_returning() {
+        let released = bcode::CancellationToken::new();
+        let release = WorkerRelease(released.clone());
+        let result = run_simulated(
+            async move {
+                switchy::unsync::task::spawn(async move {
+                    switchy::unsync::time::sleep(Duration::from_millis(10)).await;
+                    drop(release);
+                });
+                Err(bcode::BcodeError::ToolExecution(
+                    "fixture scenario error".to_owned(),
+                ))
+            },
+            100,
+            100,
+        );
+        assert!(matches!(
+            result.expect_err("scenario failure must survive successful drain")
+                .downcast_ref::<bcode::BcodeError>(),
+            Some(bcode::BcodeError::ToolExecution(message)) if message == "fixture scenario error"
+        ));
+        assert!(
+            released.is_cancelled(),
+            "admitted worker must release before return"
+        );
     }
 
     #[test]
@@ -524,7 +636,21 @@ async fn run_in_process_cleanup(mode: InProcessCleanup) -> bcode::Result<()> {
         context: context.clone(),
     });
     let timeout = Duration::from_secs(3);
-    let agent = bcode::Agent::builder().timeout(timeout).build();
+    let session_id = "00000000-0000-4000-8000-000000000022"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new(
+        ["cleanup-active", "cleanup-next", "cleanup-after-shutdown"].map(|turn_id| {
+            ProviderRequestIdentity {
+                session_id,
+                turn_id: turn_id.into(),
+            }
+        }),
+    )?;
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .timeout(timeout)
+        .build();
     let cancellation = bcode::CancellationToken::new();
     let generation_started = switchy::time::instant_now();
     let mut generation = Box::pin(agent.generate_text_with_provider_and_cancellation(
@@ -642,7 +768,843 @@ async fn run_in_process_cleanup(mode: InProcessCleanup) -> bcode::Result<()> {
     Ok(())
 }
 
+async fn run_explicit_workflow() -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000020"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+        session_id,
+        turn_id: "workflow-review-0".into(),
+    }])?;
+    let builder = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .model("workflow-model");
+    let provider =
+        ScriptedProvider::new([ScriptedProviderTurn::complete_text(r#"{"approved":true}"#)]);
+    let probe = provider.probe();
+    let mut owner = provider.clone();
+    let step =
+        bcode::workflow::AgentStep::<serde_json::Value, serde_json::Value>::with_agent_builder(
+            "review",
+            move || provider.clone(),
+            builder,
+        )
+        .read_only()
+        .build();
+    let workflow = bcode::workflow::WorkflowBuilder::new("sdk-controlled-review", step)
+        .build()
+        .expect("workflow definition");
+    let result = workflow.run(serde_json::json!({"diff": "+ safe"})).await;
+    owner.shutdown_wait().await?;
+    assert_eq!(
+        result.expect("workflow succeeds"),
+        serde_json::json!({"approved": true})
+    );
+    probe
+        .assert_requests(&[ScriptedRequestExpectation::new().model_id("workflow-model")])
+        .expect("workflow uses configured model exactly once");
+    probe
+        .assert_finish_count(1)
+        .expect("workflow releases provider turn");
+    Ok(())
+}
+
+async fn run_workflow_cancellation(timeout: bool) -> bcode::Result<()> {
+    let session_id = "00000000-0000-4000-8000-000000000021"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+        session_id,
+        turn_id: "workflow-cancel-0".into(),
+    }])?;
+    let builder = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)));
+    let provider = ScriptedProvider::new([ScriptedProviderTurn::new().pending()]);
+    let probe = provider.probe();
+    let mut owner = provider.clone();
+    let step =
+        bcode::workflow::AgentStep::<serde_json::Value, serde_json::Value>::with_agent_builder(
+            "cancel-review",
+            move || provider.clone(),
+            builder,
+        )
+        .read_only()
+        .build()
+        .resources([bcode::workflow::ResourceClaim::write("review-slot")]);
+    let step = if timeout {
+        step.timeout(Duration::from_millis(20))
+    } else {
+        step
+    };
+    let workflow = bcode::workflow::WorkflowBuilder::new("sdk-cancel-review", step)
+        .build()
+        .expect("workflow definition");
+    let cancellation = bcode::workflow::WorkflowCancellation::new();
+    let observer = workflow.observer();
+    let execution = workflow.run_with_observer(
+        serde_json::json!({}),
+        cancellation.clone(),
+        None,
+        observer.clone(),
+    );
+    let cancel_after_start = async {
+        while probe.requests().is_empty() {
+            switchy::unsync::time::sleep(Duration::from_millis(1)).await;
+        }
+        if !timeout {
+            cancellation.cancel();
+        }
+        std::future::pending::<()>().await;
+    };
+    let result = switchy::unsync::select! {
+        result = execution => result,
+        () = cancel_after_start => unreachable!("cancellation driver stays pending"),
+    };
+    if timeout {
+        assert!(matches!(
+            result,
+            Err(bcode::workflow::WorkflowError::TimedOut { .. })
+        ));
+    } else {
+        assert!(matches!(
+            result,
+            Err(bcode::workflow::WorkflowError::Cancelled { .. })
+        ));
+    }
+    probe
+        .assert_cancellation_count(1)
+        .expect("provider cancelled once");
+    probe
+        .assert_finish_count(1)
+        .expect("provider released once");
+    let snapshot = observer.snapshot();
+    assert_eq!(
+        snapshot.nodes["cancel-review"],
+        if timeout {
+            bcode::workflow::NodeRunState::TimedOut
+        } else {
+            bcode::workflow::NodeRunState::Cancelled
+        }
+    );
+    assert!(snapshot.running.is_empty());
+    assert!(snapshot.resource_holders.is_empty());
+    owner.shutdown_wait().await?;
+    Ok(())
+}
+
+async fn run_workflow_retry() {
+    for delay in [Duration::ZERO, Duration::from_millis(5)] {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let step = bcode::workflow::Step::map("retry-operation", move |input: u32| {
+            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(bcode::workflow::WorkflowError::step(
+                    "retry-operation",
+                    "transient fixture failure",
+                ))
+            } else {
+                Ok(input + 1)
+            }
+        })
+        .retry_with_policy(
+            "retry-controller",
+            bcode::workflow::RetryPolicy::new(2).backoff(delay),
+        );
+        let workflow = bcode::workflow::WorkflowBuilder::new("sdk-retry", step)
+            .build()
+            .expect("retry workflow");
+        assert_eq!(workflow.run(41).await.expect("retry succeeds"), 42);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+}
+
+async fn run_retry_cancellation() {
+    let cancellation = bcode::workflow::WorkflowCancellation::new();
+    let signal = cancellation.clone();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&attempts);
+    let step = bcode::workflow::Step::map("cancel-retry", move |_: u32| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        signal.cancel();
+        Err::<u32, _>(bcode::workflow::WorkflowError::step(
+            "cancel-retry",
+            "fixture failure",
+        ))
+    })
+    .retry_with_policy(
+        "retry",
+        bcode::workflow::RetryPolicy::new(2).backoff(Duration::from_secs(3600)),
+    );
+    let workflow = bcode::workflow::WorkflowBuilder::new("cancel-backoff", step)
+        .build()
+        .expect("workflow");
+    let result = switchy::unsync::time::timeout(
+        Duration::from_secs(1),
+        workflow.run_with_cancellation(0, cancellation),
+    )
+    .await
+    .expect("cancellation does not wait for backoff");
+    assert!(matches!(
+        result,
+        Err(bcode::workflow::WorkflowError::Cancelled { .. })
+    ));
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+async fn run_workflow_repeat_cancellation() {
+    let started = bcode::workflow::WorkflowCancellation::new();
+    let signal = started.clone();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&attempts);
+    let step = bcode::workflow::Step::map("work", move |input: serde_json::Value| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        signal.cancel();
+        Ok(input)
+    })
+    .resources([bcode::workflow::ResourceClaim::write("repository")])
+    .repeat_while(
+        "repeat",
+        bcode::workflow::field::<serde_json::Value>("again").eq(true),
+        100,
+    )
+    .then(bcode::workflow::Step::map(
+        "after-repeat",
+        |_: serde_json::Value| -> Result<serde_json::Value, bcode::workflow::WorkflowError> {
+            panic!("downstream work must not execute after repeat cancellation")
+        },
+    ));
+    let workflow = bcode::workflow::WorkflowBuilder::new("repeat-cancellation", step)
+        .build()
+        .expect("workflow");
+    let cancellation = bcode::workflow::WorkflowCancellation::new();
+    let cancel_signal = cancellation.clone();
+    let cancel_task = switchy::unsync::task::spawn(async move {
+        started.cancelled().await;
+        cancel_signal.cancel();
+    });
+    let observer = workflow.observer();
+    let result = workflow
+        .run_with_observer(
+            serde_json::json!({"again": true}),
+            cancellation,
+            None,
+            observer.clone(),
+        )
+        .await;
+    cancel_task.await.expect("cancellation task joins");
+    let snapshot = observer.snapshot();
+    assert_eq!(
+        snapshot.nodes["repeat"],
+        bcode::workflow::NodeRunState::Cancelled
+    );
+    assert_eq!(
+        snapshot.nodes["after-repeat"],
+        bcode::workflow::NodeRunState::Cancelled
+    );
+    assert!(snapshot.running.is_empty());
+    assert!(snapshot.resource_holders.is_empty());
+    assert!(matches!(
+        result,
+        Err(bcode::workflow::WorkflowError::Cancelled { .. })
+    ));
+    let count = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        count > 0 && count < 100,
+        "cancellation must run before iteration exhaustion"
+    );
+}
+
+async fn run_workflow_panic() {
+    for asynchronous in [false, true] {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let step: bcode::workflow::Step<u32, u32> = if asynchronous {
+            bcode::workflow::Step::task("panic", move |_: u32, _| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    switchy::unsync::task::yield_now().await;
+                    panic!("fixture-private-workflow-panic");
+                }
+            })
+        } else {
+            bcode::workflow::Step::map("panic", move |_: u32| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("fixture-private-workflow-panic");
+            })
+        };
+        let workflow = bcode::workflow::WorkflowBuilder::new(
+            "sdk-panic",
+            step.resources([bcode::workflow::ResourceClaim::write("repository")])
+                .retry("retry-panic", 3)
+                .retry("outer-retry", 2)
+                .then(bcode::workflow::Step::<u32, u32>::map(
+                    "unreachable",
+                    |_: u32| {
+                        panic!("downstream step must not execute after panic");
+                    },
+                )),
+        )
+        .build()
+        .expect("workflow");
+        let observer = workflow.observer();
+        let result = workflow
+            .run_with_observer(
+                0,
+                bcode::workflow::WorkflowCancellation::new(),
+                None,
+                observer.clone(),
+            )
+            .await;
+        assert!(matches!(result,
+            Err(bcode::workflow::WorkflowError::Panicked { step })
+                if step == "panic"
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let snapshot = observer.snapshot();
+        assert_eq!(
+            snapshot.nodes["outer-retry"],
+            bcode::workflow::NodeRunState::Failed
+        );
+        assert_eq!(
+            snapshot.nodes["unreachable"],
+            bcode::workflow::NodeRunState::Skipped
+        );
+        assert_eq!(
+            snapshot.nodes["retry-panic"],
+            bcode::workflow::NodeRunState::Failed
+        );
+        assert_eq!(
+            snapshot.nodes["panic"],
+            bcode::workflow::NodeRunState::Failed
+        );
+        assert!(snapshot.running.is_empty());
+        assert!(snapshot.resource_holders.is_empty());
+    }
+}
+
+async fn run_workflow_contention(resource_claim: bool, cancel_waiter: bool) {
+    let cancellation = bcode::workflow::WorkflowCancellation::new();
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let make_step = |name| {
+        let active = Arc::clone(&active);
+        let completed = Arc::clone(&completed);
+        let signal = cancellation.clone();
+        let step = bcode::workflow::Step::task(name, move |input: u32, _context| {
+            let signal = signal.clone();
+            let active = Arc::clone(&active);
+            let completed = Arc::clone(&completed);
+            async move {
+                assert_eq!(active.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                switchy::unsync::time::sleep(Duration::from_millis(5)).await;
+                if cancel_waiter {
+                    signal.cancel();
+                }
+                assert_eq!(active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst), 1);
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(input + 1)
+            }
+        });
+        if resource_claim {
+            step.resources([bcode::workflow::ResourceClaim::write("repository")])
+        } else {
+            step
+        }
+    };
+    let step = bcode::workflow::parallel(make_step("left"), make_step("right"));
+    let workflow = bcode::workflow::WorkflowBuilder::new("workflow-contention", step)
+        .build()
+        .expect("workflow");
+    let execution = async {
+        if resource_claim {
+            workflow.run_with_cancellation(41, cancellation).await
+        } else {
+            workflow
+                .run_with_concurrency_limit(41, cancellation, 1)
+                .await
+        }
+    };
+    let result = switchy::unsync::time::timeout(Duration::from_secs(1), execution)
+        .await
+        .expect("waiter wakes after release");
+    if cancel_waiter {
+        assert!(matches!(
+            result,
+            Err(bcode::workflow::WorkflowError::Cancelled { .. })
+        ));
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    } else {
+        assert_eq!(result.expect("workflow succeeds"), (42, 42));
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+async fn run_parallel_wait_all() {
+    for failing_left in [false, true] {
+        let completed = bcode::workflow::WorkflowCancellation::new();
+        let signal = completed.clone();
+        let delayed = bcode::workflow::Step::task("delayed", move |(): (), _context| {
+            let signal = signal.clone();
+            async move {
+                switchy::unsync::time::sleep(Duration::from_millis(5)).await;
+                signal.cancel();
+                Ok(())
+            }
+        });
+        let failure = bcode::workflow::Step::map("failure", |(): ()| {
+            Err::<(), _>(bcode::workflow::WorkflowError::step(
+                "failure",
+                "fixture failure",
+            ))
+        });
+        let (left, right) = if failing_left {
+            (failure, delayed)
+        } else {
+            (delayed, failure)
+        };
+        let step = bcode::workflow::parallel_named_with_policy(
+            "join",
+            bcode::workflow::ParallelFailurePolicy::WaitAll,
+            left,
+            right,
+        );
+        let workflow = bcode::workflow::WorkflowBuilder::new("parallel-wait-all", step)
+            .build()
+            .expect("workflow");
+        let result = switchy::unsync::time::timeout(Duration::from_secs(1), workflow.run(()))
+            .await
+            .expect("both branches finish");
+        assert!(matches!(result,
+            Err(bcode::workflow::WorkflowError::Step { step, message })
+                if step == "failure" && message == "fixture failure"
+        ));
+        assert!(
+            completed.is_cancelled(),
+            "wait-all must not drop the delayed sibling"
+        );
+    }
+}
+
+async fn run_fan_out_cancellation(drop_execution: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Active(Arc<AtomicUsize>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let parent = bcode::workflow::WorkflowCancellation::new();
+    let signal = parent.clone();
+    let active = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let ready = bcode::workflow::WorkflowCancellation::new();
+    let member_ready = ready.clone();
+    let member_active = Arc::clone(&active);
+    let member_started = Arc::clone(&started);
+    let step = bcode::workflow::Step::task("member", move |input: u32, _| {
+        let active = Arc::clone(&member_active);
+        let started = Arc::clone(&member_started);
+        let signal = signal.clone();
+        let ready = member_ready.clone();
+        async move {
+            active.fetch_add(1, Ordering::SeqCst);
+            let _guard = Active(active);
+            if started.fetch_add(1, Ordering::SeqCst) == 1 {
+                ready.cancel();
+                if !drop_execution {
+                    signal.cancel();
+                }
+            }
+            std::future::pending::<()>().await;
+            Ok(input)
+        }
+    });
+    let workflow = bcode::workflow::WorkflowBuilder::new(
+        "sdk-fan-out-cancellation",
+        bcode::workflow::fan_out("members", step, 2),
+    )
+    .build()
+    .expect("fan-out workflow");
+    let pre_cancelled = bcode::workflow::WorkflowCancellation::new();
+    pre_cancelled.cancel();
+    assert!(matches!(
+        workflow
+            .run_with_cancellation(vec![0, 1, 2, 3], pre_cancelled)
+            .await,
+        Err(bcode::workflow::WorkflowError::Cancelled { .. })
+    ));
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    let mut execution = Box::pin(workflow.run_with_cancellation(vec![0, 1, 2, 3], parent));
+    if drop_execution {
+        switchy::unsync::select! {
+            _ = &mut execution => panic!("pending members must not finish"),
+            () = ready.cancelled() => {}
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        drop(execution);
+    } else {
+        assert!(matches!(
+            execution.await,
+            Err(bcode::workflow::WorkflowError::Cancelled { .. })
+        ));
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+async fn run_fan_out_failure(panic: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Released(bcode::workflow::WorkflowCancellation);
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let started = Arc::new(AtomicUsize::new(0));
+    let member_started = Arc::clone(&started);
+    let sibling_ready = bcode::workflow::WorkflowCancellation::new();
+    let released = bcode::workflow::WorkflowCancellation::new();
+    let member_released = released.clone();
+    let step = bcode::workflow::Step::task("member", move |input: u32, _| {
+        let started = Arc::clone(&member_started);
+        let sibling_ready = sibling_ready.clone();
+        let released = member_released.clone();
+        async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            if input == 0 {
+                sibling_ready.cancelled().await;
+                assert!(!panic, "fixture fan-out panic");
+                return Err(bcode::workflow::WorkflowError::step(
+                    "member",
+                    "expected failure",
+                ));
+            }
+            let _guard = Released(released);
+            sibling_ready.cancel();
+            std::future::pending::<()>().await;
+            Ok(input)
+        }
+    });
+    let workflow = bcode::workflow::WorkflowBuilder::new(
+        "sdk-fan-out-failure",
+        bcode::workflow::fan_out("members", step, 2),
+    )
+    .build()
+    .expect("fan-out workflow");
+    let error = workflow
+        .run(vec![0, 1, 2, 3])
+        .await
+        .expect_err("member fails");
+    if panic {
+        assert!(matches!(
+            error,
+            bcode::workflow::WorkflowError::Panicked { .. }
+        ));
+    } else {
+        assert!(error.to_string().contains("expected failure"));
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert!(
+        released.is_cancelled(),
+        "pending sibling released before return"
+    );
+}
+
+async fn run_fan_out_workflow() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ActiveMember(Arc<AtomicUsize>);
+    impl Drop for ActiveMember {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let member_completed = Arc::clone(&completed);
+    let second_finished = bcode::workflow::WorkflowCancellation::new();
+    let member_active = Arc::clone(&active);
+    let member_peak = Arc::clone(&peak);
+    let step = bcode::workflow::Step::task("member", move |input: u32, _| {
+        let active = Arc::clone(&member_active);
+        let peak = Arc::clone(&member_peak);
+        let completed = Arc::clone(&member_completed);
+        let second_finished = second_finished.clone();
+        async move {
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = ActiveMember(active);
+            peak.fetch_max(count, Ordering::SeqCst);
+            if input == 0 {
+                second_finished.cancelled().await;
+            }
+            switchy::unsync::time::sleep(Duration::from_millis(u64::from(6 - input))).await;
+            completed.lock().expect("completion recorder").push(input);
+            if input == 1 {
+                second_finished.cancel();
+            }
+            Ok(input * 2)
+        }
+    });
+    let workflow = bcode::workflow::WorkflowBuilder::new(
+        "sdk-fan-out",
+        bcode::workflow::fan_out("members", step, 2),
+    )
+    .build()
+    .expect("fan-out workflow");
+    assert_eq!(
+        workflow
+            .run(vec![0, 1, 2, 3, 4])
+            .await
+            .expect("fan-out result"),
+        [0, 2, 4, 6, 8]
+    );
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    let completion_order = completed.lock().expect("completion recorder");
+    assert_eq!(completion_order.first(), Some(&1));
+    assert_eq!(completion_order.len(), 5);
+}
+
+async fn run_parallel_workflow() {
+    let left = bcode::workflow::Step::map("left", |input: u32| Ok(input + 1));
+    let right = bcode::workflow::Step::map("right", |input: u32| Ok(input + 2));
+    let step = bcode::workflow::parallel_named_with_policy(
+        "join",
+        bcode::workflow::ParallelFailurePolicy::FailFast,
+        left,
+        right,
+    );
+    let workflow = bcode::workflow::WorkflowBuilder::new("sdk-parallel", step)
+        .build()
+        .expect("parallel workflow");
+    assert_eq!(workflow.run(40).await.expect("parallel result"), (41, 42));
+}
+
+async fn run_parallel_cancellation() {
+    let parent = bcode::workflow::WorkflowCancellation::new();
+    let signal = parent.clone();
+    let left_finished = bcode::workflow::WorkflowCancellation::new();
+    let finished = left_finished.clone();
+    let left = bcode::workflow::Step::map("left", move |(): ()| {
+        finished.cancel();
+        Ok(())
+    });
+    let right = bcode::workflow::Step::task("right", move |(): (), context| {
+        let signal = signal.clone();
+        let left_finished = left_finished.clone();
+        async move {
+            left_finished.cancelled().await;
+            // Let the join consume the successful branch before cancelling its parent.
+            switchy::unsync::task::yield_now().await;
+            signal.cancel();
+            context.cancellation().cancelled().await;
+            Err::<(), _>(bcode::workflow::WorkflowError::Cancelled {
+                step: "right".to_owned(),
+            })
+        }
+    });
+    let step = bcode::workflow::parallel_named_with_policy(
+        "join",
+        bcode::workflow::ParallelFailurePolicy::FailFast,
+        left,
+        right,
+    );
+    let workflow = bcode::workflow::WorkflowBuilder::new("parallel-cancellation", step)
+        .build()
+        .expect("workflow");
+    let result = switchy::unsync::time::timeout(
+        Duration::from_secs(1),
+        workflow.run_with_cancellation((), parent),
+    )
+    .await
+    .expect("parent cancellation reaches remaining branch");
+    assert!(matches!(
+        result,
+        Err(bcode::workflow::WorkflowError::Cancelled { .. })
+    ));
+}
+
+async fn run_parallel_failure() {
+    struct Release(bcode::workflow::WorkflowCancellation);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    for failing_left in [false, true] {
+        let started = bcode::workflow::WorkflowCancellation::new();
+        let released = bcode::workflow::WorkflowCancellation::new();
+        let start = started.clone();
+        let release = released.clone();
+        let pending = bcode::workflow::Step::task("pending", move |(): (), _context| {
+            let start = start.clone();
+            let guard = Release(release.clone());
+            async move {
+                let _guard = guard;
+                start.cancel();
+                std::future::pending::<Result<(), bcode::workflow::WorkflowError>>().await
+            }
+        });
+        let failure = bcode::workflow::Step::task("failure", move |(): (), _context| {
+            let started = started.clone();
+            async move {
+                started.cancelled().await;
+                Err::<(), _>(bcode::workflow::WorkflowError::step(
+                    "failure",
+                    "fixture failure",
+                ))
+            }
+        });
+        let (left, right) = if failing_left {
+            (failure, pending)
+        } else {
+            (pending, failure)
+        };
+        let step = bcode::workflow::parallel_named_with_policy(
+            "join",
+            bcode::workflow::ParallelFailurePolicy::FailFast,
+            left,
+            right,
+        );
+        let workflow = bcode::workflow::WorkflowBuilder::new("parallel-failure", step)
+            .build()
+            .expect("workflow");
+        let result = switchy::unsync::time::timeout(Duration::from_secs(1), workflow.run(()))
+            .await
+            .expect("failure does not wait for pending sibling");
+        assert!(matches!(result,
+            Err(bcode::workflow::WorkflowError::Step { step, message })
+                if step == "failure" && message == "fixture failure"
+        ));
+        assert!(
+            released.is_cancelled(),
+            "pending sibling future released before return"
+        );
+    }
+}
+
+#[cfg(feature = "config")]
+async fn run_controlled_provider_context() -> bcode::Result<()> {
+    use std::collections::BTreeMap;
+
+    let mut config = bcode_config::BcodeConfig::default();
+    config.model.provider_plugin_id = Some("context-provider".into());
+    config.model.model_id = Some("context-model".into());
+    config.model.auth_pool = Some("context-pool".into());
+    let environment = bcode_config::ConfigEnvironmentSnapshot::isolated("sdk-simulation");
+    let subscriptions = bcode_config::RuntimeAuthSubscriptions {
+        pools: BTreeMap::from([(
+            "context-pool".into(),
+            bcode_config::RuntimeAuthSubscriptionPool {
+                preferred_profile: Some("context-profile".into()),
+                profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
+                    auth_profile: "context-profile".into(),
+                    storage_profile: "stored-profile".into(),
+                    vault: "/fixture/not-a-real-vault".into(),
+                    provider: "openai".into(),
+                    scheme: "api_key".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let mut acquisitions = Vec::new();
+    let sdk = bcode::Bcode::builder().provider_defaults_with_auth_resolver(
+        &config,
+        &environment,
+        &subscriptions,
+        |name, profile| {
+            acquisitions.push(name.to_owned());
+            assert_eq!(profile.backend, "sshenv");
+            bcode_provider_auth::ResolvedProviderAuth {
+                auth: bcode_model::ProviderAuthContext {
+                    scheme: profile.scheme.clone(),
+                    ..Default::default()
+                },
+                env: BTreeMap::new(),
+            }
+        },
+    );
+    let sdk = sdk.build();
+    let context = sdk.provider_context().clone();
+    assert_eq!(acquisitions, ["context-profile"]);
+    assert_eq!(context.auth_pool.as_deref(), Some("context-pool"));
+    assert_eq!(context.auth_profile.as_deref(), Some("context-profile"));
+    assert_eq!(context.auth_candidates.len(), 1);
+    assert_eq!(
+        context
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.scheme.as_deref()),
+        Some("api_key")
+    );
+    let session_id = "00000000-0000-4000-8000-000000000026"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new([ProviderRequestIdentity {
+        session_id,
+        turn_id: "controlled-context".into(),
+    }])?;
+    let agent = sdk
+        .agent_from_context(session_id, "/fixture".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .build();
+    struct ContextProvider(bcode::ProviderRequestContext);
+    impl bcode::InProcessModelProvider for ContextProvider {
+        fn run_turn(
+            &self,
+            request: bcode_model::ModelTurnRequest,
+            _context: bcode::InProcessProviderContext,
+        ) -> bcode::InProcessProviderFuture<'_> {
+            assert_eq!(request.provider_context, self.0);
+            assert_eq!(request.model_id, "context-model");
+            Box::pin(async { Ok(bcode::InProcessProviderOutcome::EndTurn) })
+        }
+    }
+    let mut provider = bcode::InProcessModelProviderAdapter::new(ContextProvider(context));
+    let response = agent
+        .generate_text_with_provider(&mut provider, "controlled context")
+        .await;
+    provider.shutdown_wait().await?;
+    assert_eq!(
+        response?.runtime.stop_reason,
+        Some(bcode::StopReason::EndTurn)
+    );
+    Ok(())
+}
+
 async fn run() -> bcode::Result<()> {
+    #[cfg(feature = "config")]
+    run_controlled_provider_context().await?;
+    run_workflow_repeat_cancellation().await;
+    run_workflow_panic().await;
+    for resource_claim in [false, true] {
+        for cancel_waiter in [false, true] {
+            run_workflow_contention(resource_claim, cancel_waiter).await;
+        }
+    }
+    run_parallel_wait_all().await;
+    run_parallel_cancellation().await;
+    run_parallel_failure().await;
+    run_fan_out_cancellation(false).await;
+    run_fan_out_cancellation(true).await;
+    run_fan_out_failure(false).await;
+    run_fan_out_failure(true).await;
+    run_fan_out_workflow().await;
+    run_parallel_workflow().await;
+    run_retry_cancellation().await;
+    run_workflow_retry().await;
+    run_workflow_cancellation(false).await?;
+    run_workflow_cancellation(true).await?;
+    run_explicit_workflow().await?;
     run_cache_lookup_panic().await?;
     run_cache_storage_panic().await?;
     run_cache_clock_errors().await?;
@@ -656,7 +1618,18 @@ async fn run() -> bcode::Result<()> {
         run_in_process_cleanup(mode).await?;
     }
     let mut in_process = bcode::InProcessModelProviderAdapter::new(InProcessEcho);
-    let agent = bcode::Agent::builder().build();
+    let session_id = "00000000-0000-4000-8000-000000000023"
+        .parse()
+        .expect("fixture ID");
+    let identities = ScriptedRequestIdentities::new(["echo-first", "echo-reuse"].map(|turn_id| {
+        ProviderRequestIdentity {
+            session_id,
+            turn_id: turn_id.into(),
+        }
+    }))?;
+    let agent = AgentBuilder::from_context(session_id, "/".into())
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .build();
     for prompt in ["in-process smoke", "in-process reuse"] {
         let response = agent
             .generate_text_with_provider(&mut in_process, prompt)

@@ -133,6 +133,41 @@ pub struct ProviderRequestContextResolution<'a> {
 pub fn resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> bcode_model::ProviderRequestContext {
+    let registry = if request.selection.auth_pool.is_some() {
+        bcode_config::load_runtime_auth_subscriptions()
+    } else {
+        bcode_config::RuntimeAuthSubscriptions::default()
+    };
+    resolve_provider_request_context_with_subscriptions(request, &registry)
+}
+
+/// Resolve provider context using caller-supplied runtime auth subscriptions.
+///
+/// This avoids loading the runtime subscription registry from disk. It uses the same
+/// profile and pool materialization rules as [`resolve_provider_request_context`].
+/// It does not isolate profile effects: `sshenv` materialization may reconcile vault
+/// security, read vault credentials, and consult process environment. Supplying a
+/// registry alone does not make authentication resolution deterministic or read-only.
+#[must_use]
+pub fn resolve_provider_request_context_with_subscriptions(
+    request: ProviderRequestContextResolution<'_>,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+) -> bcode_model::ProviderRequestContext {
+    resolve_provider_request_context_with_resolver(request, registry, resolve_auth_profile)
+}
+
+/// Resolve provider context with caller-owned profile materialization.
+///
+/// Pool ordering and candidate selection remain canonical. The resolver receives both
+/// configured profiles and profiles derived from runtime subscriptions. No native profile
+/// resolver or subscription discovery is invoked by this function; effects and credential
+/// custody of the supplied resolver remain the caller's responsibility.
+#[must_use]
+pub fn resolve_provider_request_context_with_resolver(
+    request: ProviderRequestContextResolution<'_>,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+    mut resolve: impl FnMut(&str, &bcode_config::AuthProfileConfig) -> ResolvedProviderAuth,
+) -> bcode_model::ProviderRequestContext {
     let selected_profile = request.selection.auth_profile.clone();
     let mut context = bcode_model::ProviderRequestContext {
         model_profile: request.selection.model_profile,
@@ -154,7 +189,7 @@ pub fn resolve_provider_request_context(
     if let Some(auth_profile_name) = request.selection.auth_profile.as_deref()
         && let Some(auth_profile) = request.config.auth.profiles.get(auth_profile_name)
     {
-        let resolved = resolve_auth_profile(auth_profile_name, auth_profile);
+        let resolved = resolve(auth_profile_name, auth_profile);
         context.env = resolved.env;
         context.auth = Some(resolved.auth);
     }
@@ -162,10 +197,9 @@ pub fn resolve_provider_request_context(
     if let Some(auth_pool_name) = request.selection.auth_pool.as_deref() {
         let mut candidates = Vec::new();
         let mut seen = BTreeSet::new();
-        let registry = bcode_config::load_runtime_auth_subscriptions();
         let order = bcode_config::effective_auth_pool_order(
             request.config,
-            &registry,
+            registry,
             auth_pool_name,
             selected_profile.as_deref(),
         );
@@ -176,6 +210,7 @@ pub fn resolve_provider_request_context(
                     profile_name,
                     &mut candidates,
                     &mut seen,
+                    &mut resolve,
                 );
                 continue;
             }
@@ -190,7 +225,7 @@ pub fn resolve_provider_request_context(
                     continue;
                 }
                 let auth_profile = runtime_subscription_auth_profile_config(profile);
-                let resolved = resolve_auth_profile(&profile.auth_profile, &auth_profile);
+                let resolved = resolve(&profile.auth_profile, &auth_profile);
                 candidates.push(bcode_model::ProviderAuthCandidate {
                     profile: Some(profile.auth_profile.clone()),
                     auth: resolved.auth,
@@ -219,7 +254,7 @@ pub fn resolve_provider_request_context(
         && legacy_auth.backend == "sshenv"
     {
         let profile = legacy_openai_profile(legacy_auth);
-        let resolved = resolve_auth_profile(&legacy_auth.profile, &profile);
+        let resolved = resolve(&legacy_auth.profile, &profile);
         context.auth_profile = Some(legacy_auth.profile.clone());
         context.env = resolved.env;
         context.auth = Some(resolved.auth);
@@ -289,12 +324,13 @@ fn push_config_auth_candidate(
     auth_profile_name: &str,
     candidates: &mut Vec<bcode_model::ProviderAuthCandidate>,
     seen: &mut BTreeSet<String>,
+    resolve: &mut impl FnMut(&str, &bcode_config::AuthProfileConfig) -> ResolvedProviderAuth,
 ) {
     if !seen.insert(auth_profile_name.to_string()) {
         return;
     }
     if let Some(auth_profile) = config.auth.profiles.get(auth_profile_name) {
-        let resolved = resolve_auth_profile(auth_profile_name, auth_profile);
+        let resolved = resolve(auth_profile_name, auth_profile);
         candidates.push(bcode_model::ProviderAuthCandidate {
             profile: Some(auth_profile_name.to_string()),
             auth: resolved.auth,
@@ -1251,6 +1287,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("custody-two"), Some("custody-one")]
         );
+    }
+
+    #[test]
+    fn request_context_uses_supplied_runtime_subscriptions() {
+        let config = bcode_config::BcodeConfig::default();
+        let request = || ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection {
+                auth_pool: Some("explicit-pool".into()),
+                ..Default::default()
+            },
+        };
+        let registry = bcode_config::RuntimeAuthSubscriptions {
+            pools: BTreeMap::from([(
+                "explicit-pool".into(),
+                bcode_config::RuntimeAuthSubscriptionPool {
+                    preferred_profile: Some("explicit-profile".into()),
+                    profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
+                        auth_profile: "explicit-profile".into(),
+                        storage_profile: "stored-profile".into(),
+                        vault: PathBuf::from("/fixture/auth.vault"),
+                        provider: "openai".into(),
+                        scheme: "api_key".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let mut resolved_profiles = Vec::new();
+        let controlled = resolve_provider_request_context_with_resolver(
+            request(),
+            &registry,
+            |name, profile| {
+                resolved_profiles.push(name.to_owned());
+                assert_eq!(profile.backend, "sshenv");
+                ResolvedProviderAuth {
+                    auth: bcode_model::ProviderAuthContext {
+                        scheme: profile.scheme.clone(),
+                        ..bcode_model::ProviderAuthContext::default()
+                    },
+                    env: BTreeMap::from([("fixture".into(), "controlled".into())]),
+                }
+            },
+        );
+        assert_eq!(resolved_profiles, ["explicit-profile"]);
+        assert_eq!(
+            controlled.env.get("fixture").map(String::as_str),
+            Some("controlled")
+        );
+        assert_eq!(controlled.auth_candidates.len(), 1);
+        assert_eq!(controlled.auth_profile.as_deref(), Some("explicit-profile"));
+        assert_eq!(
+            controlled
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.scheme.as_deref()),
+            Some("api_key")
+        );
+        let empty = resolve_provider_request_context_with_resolver(
+            request(),
+            &bcode_config::RuntimeAuthSubscriptions::default(),
+            |_, _| panic!("empty pool must not acquire profile credentials"),
+        );
+        assert!(empty.auth_candidates.is_empty());
+        assert!(empty.auth.is_none());
     }
 
     #[test]

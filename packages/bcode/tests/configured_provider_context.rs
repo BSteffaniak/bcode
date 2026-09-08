@@ -9,21 +9,23 @@ use bcode_config::{
 
 #[test]
 fn configured_builder_materializes_selected_provider_context() {
-    let mut config = BcodeConfig::default();
-    config.model = ModelConfig {
-        provider_plugin_id: Some("provider".to_owned()),
-        model_id: Some("model".to_owned()),
-        profile: Some("default".to_owned()),
-        profiles: BTreeMap::from([(
-            "default".to_owned(),
-            ModelProfileConfig {
-                provider_plugin_id: "provider".to_owned(),
-                model_id: Some("model".to_owned()),
-                auth_profile: Some("work".to_owned()),
-                ..ModelProfileConfig::default()
-            },
-        )]),
-        ..ModelConfig::default()
+    let mut config = BcodeConfig {
+        model: ModelConfig {
+            provider_plugin_id: Some("provider".to_owned()),
+            model_id: Some("model".to_owned()),
+            profile: Some("default".to_owned()),
+            profiles: BTreeMap::from([(
+                "default".to_owned(),
+                ModelProfileConfig {
+                    provider_plugin_id: "provider".to_owned(),
+                    model_id: Some("model".to_owned()),
+                    auth_profile: Some("work".to_owned()),
+                    ..ModelProfileConfig::default()
+                },
+            )]),
+            ..ModelConfig::default()
+        },
+        ..BcodeConfig::default()
     };
     config.auth.profiles.insert(
         "work".to_owned(),

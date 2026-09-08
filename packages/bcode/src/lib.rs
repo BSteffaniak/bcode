@@ -1032,7 +1032,9 @@ impl StreamTextBuilder {
             self.messages,
             self.cancellation,
         );
-        TextStream::start(&agent, provider, request)
+        let stream = TextStream::start(&agent, provider, request);
+        drop(agent);
+        stream
     }
 }
 
@@ -1764,6 +1766,7 @@ impl<T> StreamObjectBuilder<T> {
             != bcode_model::CapabilityExecution::ToolFreeProviderRound
             || request.tools.is_empty();
         let stream = TextStream::start(&agent, provider, request);
+        drop(agent);
         ObjectStream {
             stream: Some(stream),
             schema,
@@ -4076,6 +4079,10 @@ async fn prepare_plugin_tool(
         tool_name: request.invocation.tool_name.clone(),
         message: "embedded plugin runtime is not configured".to_string(),
     })?;
+    tokio::runtime::Handle::try_current().map_err(|_| RuntimeError::ToolPreparation {
+        tool_name: request.invocation.tool_name.clone(),
+        message: "embedded plugin preparation requires a native Tokio runtime; no compatible execution host is configured".to_owned(),
+    })?;
     plugins
         .invoke_service_json_scoped(
             plugin_id,
@@ -4119,7 +4126,10 @@ async fn execute_plugin_tool(
         .with_turn_id(scope.turn().turn_id())
         .with_work_id(scope.invocation_id());
     let invocation_scope = scope.clone();
-    let handle = tokio::runtime::Handle::current();
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| RuntimeError::ToolExecution {
+        tool_name: descriptor.tool_name.clone(),
+        message: "embedded plugin bridge requires a native Tokio runtime; no compatible execution host is configured".to_owned(),
+    })?;
     let bridge = bcode_plugin::PluginInvocationBridge::new(move |request, _| {
         handle.block_on(route_plugin_bridge_request(&invocation_scope, request))
     });
@@ -4156,6 +4166,10 @@ async fn execute_plugin_tool(
                     serde_json::from_slice::<bcode_tool::ToolInvocationLifecycleEvent>(&payload)
                 {
                     let _ = scope.emit_lifecycle(event);
+                } else if let Ok(update) =
+                    serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(&payload)
+                {
+                    let _ = scope.emit_presentation_update(update);
                 } else if let Ok(event) =
                     serde_json::from_slice::<bcode_tool::ToolContributionEvent>(&payload)
                 {
@@ -5402,7 +5416,8 @@ impl Bcode {
 
     #[cfg(feature = "embedded-plugins")]
     async fn register_discovered_tools(&self, mut builder: AgentBuilder) -> Result<AgentBuilder> {
-        for tool in self.discover_tools().await? {
+        let tools = self.discover_tools().await?;
+        for tool in tools {
             builder = builder.plugin_tool(tool.definition, tool.plugin_id);
         }
         Ok(builder)
@@ -5420,11 +5435,10 @@ impl Bcode {
     /// be invoked or decoded.
     #[cfg(feature = "embedded-plugins")]
     pub async fn discover_tools(&self) -> Result<Vec<DiscoveredPluginTool>> {
-        let plugins = self
+        let plugin_ids = self
             .plugins
             .as_ref()
-            .ok_or(BcodeError::MissingPluginRuntime)?;
-        let plugin_ids = plugins
+            .ok_or(BcodeError::MissingPluginRuntime)?
             .registry()
             .manifests()
             .values()
@@ -5438,7 +5452,10 @@ impl Bcode {
             .collect::<Vec<_>>();
         let mut discovered = Vec::new();
         for plugin_id in plugin_ids {
-            let list = plugins
+            let list = self
+                .plugins
+                .as_ref()
+                .ok_or(BcodeError::MissingPluginRuntime)?
                 .invoke_service_json::<_, ToolList>(
                     &plugin_id,
                     TOOL_SERVICE_INTERFACE_ID,
@@ -5598,12 +5615,10 @@ impl BcodeBuilder {
     #[cfg(feature = "config")]
     #[must_use]
     pub fn provider_defaults_from_config(mut self, config: &bcode_config::BcodeConfig) -> Self {
-        self.provider_registry = ProviderRegistry::from_config(config);
+        let selection = config.resolved_model_selection();
+        self.provider_registry = ProviderRegistry::from_resolved_model_selection(&selection);
         self.provider_context = bcode_provider_auth::resolve_provider_request_context(
-            bcode_provider_auth::ProviderRequestContextResolution {
-                config,
-                selection: config.resolved_model_selection(),
-            },
+            bcode_provider_auth::ProviderRequestContextResolution { config, selection },
         );
         self
     }
@@ -5617,6 +5632,59 @@ impl BcodeBuilder {
         environment: &impl bcode_config::ConfigEnvironment,
     ) -> Self {
         self.provider_registry = ProviderRegistry::from_config_environment(config, environment);
+        self
+    }
+
+    /// Configure provider/model and auth defaults from explicit initialization inputs.
+    ///
+    /// Model selection uses the supplied environment, and auth pool ordering uses the
+    /// supplied subscription registry instead of discovering that registry on disk.
+    /// Auth profile materialization still uses native effects: `sshenv` profiles may
+    /// reconcile vault security, read credentials, and consult process environment.
+    /// This is not an effect-free or fully simulated initialization path. Callers with
+    /// already-resolved auth can use [`Self::provider_context`] instead. This does not
+    /// load plugins; later builder calls may override the resulting defaults.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn provider_defaults_from_inputs(
+        self,
+        config: &bcode_config::BcodeConfig,
+        environment: &impl bcode_config::ConfigEnvironment,
+        subscriptions: &bcode_config::RuntimeAuthSubscriptions,
+    ) -> Self {
+        self.provider_defaults_with_auth_resolver(
+            config,
+            environment,
+            subscriptions,
+            bcode_provider_auth::resolve_auth_profile,
+        )
+    }
+
+    /// Configure model and auth defaults with caller-owned credential acquisition.
+    ///
+    /// One canonical model selection supplies both registry defaults and auth resolution.
+    /// Subscription discovery and native credential acquisition are not invoked; effects
+    /// and credential custody of the supplied resolver remain the caller's responsibility.
+    /// Later builder calls may override these defaults. No plugins are loaded.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn provider_defaults_with_auth_resolver(
+        mut self,
+        config: &bcode_config::BcodeConfig,
+        environment: &impl bcode_config::ConfigEnvironment,
+        subscriptions: &bcode_config::RuntimeAuthSubscriptions,
+        resolve: impl FnMut(
+            &str,
+            &bcode_config::AuthProfileConfig,
+        ) -> bcode_provider_auth::ResolvedProviderAuth,
+    ) -> Self {
+        let selection = config.resolved_model_selection_with_environment(environment);
+        self.provider_registry = ProviderRegistry::from_resolved_model_selection(&selection);
+        self.provider_context = bcode_provider_auth::resolve_provider_request_context_with_resolver(
+            bcode_provider_auth::ProviderRequestContextResolution { config, selection },
+            subscriptions,
+            resolve,
+        );
         self
     }
 
@@ -8185,7 +8253,8 @@ impl Agent {
             .as_deref()
             .unwrap_or(&policy_authorization);
         let host_context = self.tool_host_context()?;
-        self.runtime
+        let result = self
+            .runtime
             .execute_prepared_tool_batch_with_host_context(
                 &self.tool_catalog,
                 authorization,
@@ -8197,8 +8266,9 @@ impl Agent {
                 self.execution_options,
                 scope,
             )
-            .await
-            .map_err(Into::into)
+            .await;
+        drop(default_invoker);
+        result.map_err(Into::into)
     }
 
     /// Execute an ordered tool-call batch using this agent's configured round budget.
@@ -8310,6 +8380,7 @@ impl Agent {
                 self.provider_round_planner.as_ref(),
             )
             .await;
+        drop(default_invoker);
         if let Some(error) = observer.take_error() {
             return Err(error);
         }
@@ -8321,9 +8392,10 @@ impl Agent {
         &self,
         request: &AgentTurnRequest,
     ) -> Option<bcode_model::ToolCallRequestPolicy> {
-        let plugins = self.plugins.as_ref()?;
         let provider_plugin_id = self.provider_plugin_id.as_deref()?;
-        let provider = plugins
+        let provider = self
+            .plugins
+            .as_ref()?
             .invoke_service_json_scoped::<ProviderCapabilitiesRequest, ProviderCapabilities>(
                 provider_plugin_id,
                 MODEL_PROVIDER_INTERFACE_ID,
@@ -8336,7 +8408,9 @@ impl Agent {
             )
             .await
             .ok()?;
-        let model = plugins
+        let model = self
+            .plugins
+            .as_ref()?
             .invoke_service_json_scoped::<bcode_model::ModelListRequest, ModelList>(
                 provider_plugin_id,
                 MODEL_PROVIDER_INTERFACE_ID,
