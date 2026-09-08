@@ -489,6 +489,48 @@ async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn explicit_artifact_root_enables_shell_recording_updates() {
+    for plugins in [static_shell_runtime(), dynamic_shell_runtime()] {
+        let artifacts = tempfile::tempdir().expect("artifact root");
+        let root = artifacts
+            .path()
+            .canonicalize()
+            .expect("absolute artifact root");
+        let observer = Arc::new(ContributionObserver::default());
+        let agent = Agent::builder()
+            .plugin_runtime(plugins)
+            .plugin_tool(shell_definition(), "bcode.shell")
+            .tool_artifact_root(&root)
+            .authorization_coordinator(Arc::new(AllowAuthorization))
+            .event_observability(observer.clone())
+            .build();
+        let output = agent
+            .execute_tool_call(&ToolCall {
+                id: "recording-context".to_owned(),
+                name: "shell.run".to_owned(),
+                arguments: serde_json::json!({"command": "printf recording-context"}),
+            })
+            .await
+            .expect("shell invocation");
+        assert!(!output.invocation.is_error, "{}", output.invocation.output);
+        let updates = observer.updates.lock().expect("updates");
+        assert!(updates.len() >= 2);
+        assert!(
+            updates
+                .windows(2)
+                .all(|pair| pair[0].revision < pair[1].revision)
+        );
+        let artifact = updates
+            .last()
+            .and_then(|update| update.artifact.as_ref())
+            .expect("final recording artifact");
+        assert!(artifact.finalized);
+        assert!(artifact.committed_bytes > 0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn direct_static_dynamic_and_future_remote_adapters_share_scheduler_semantics() {
     assert_direct_batch_overlaps().await;
     assert_reentrant_shell_batch_overlaps(static_shell_runtime()).await;

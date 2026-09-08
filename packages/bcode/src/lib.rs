@@ -7334,6 +7334,7 @@ pub struct Agent {
     profile_id: String,
     session_id: SessionId,
     cwd: Option<PathBuf>,
+    tool_artifact_root: Option<PathBuf>,
     provider_plugin_id: Option<String>,
     model_id: String,
     selection_provenance: Box<ModelSelectionProvenance>,
@@ -7386,6 +7387,7 @@ impl fmt::Debug for Agent {
             .field("profile_id", &self.profile_id)
             .field("session_id", &self.session_id)
             .field("cwd", &self.cwd)
+            .field("tool_artifact_root", &self.tool_artifact_root)
             .field("provider_plugin_id", &self.provider_plugin_id)
             .field("model_id", &self.model_id)
             .field("selection_provenance", &self.selection_provenance)
@@ -8462,13 +8464,26 @@ impl Agent {
                 .map_err(|error| BcodeError::ToolExecution(error.to_string()))?
                 .join(configured)
         };
-        Ok(vec![bcode_tool::ToolHostContextEntry {
+        let mut context = vec![bcode_tool::ToolHostContextEntry {
             schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
             schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
             payload: serde_json::json!({
                 "working_directory": working_directory,
             }),
-        }])
+        }];
+        if let Some(root) = &self.tool_artifact_root {
+            if !root.is_absolute() {
+                return Err(BcodeError::ToolExecution(
+                    "tool artifact root must be absolute".to_owned(),
+                ));
+            }
+            context.push(bcode_tool::ToolHostContextEntry {
+                schema: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA.to_owned(),
+                schema_version: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+                payload: serde_json::json!({ "root": root }),
+            });
+        }
+        Ok(context)
     }
 
     fn effective_tool_catalog(&self) -> UnifiedToolCatalog {
@@ -8709,6 +8724,7 @@ pub struct AgentBuilder {
     profile_id: String,
     session_id: SessionId,
     cwd: Option<PathBuf>,
+    tool_artifact_root: Option<PathBuf>,
     provider_plugin_id: Option<String>,
     model_id: Option<String>,
     selection_provenance: Box<ModelSelectionProvenance>,
@@ -8764,6 +8780,7 @@ impl fmt::Debug for AgentBuilder {
             .field("profile_id", &self.profile_id)
             .field("session_id", &self.session_id)
             .field("cwd", &self.cwd)
+            .field("tool_artifact_root", &self.tool_artifact_root)
             .field("provider_plugin_id", &self.provider_plugin_id)
             .field("model_id", &self.model_id)
             .field("selection_provenance", &self.selection_provenance)
@@ -8861,6 +8878,7 @@ impl AgentBuilder {
             profile_id: bcode_agent_policy::BUILD_AGENT.to_string(),
             session_id,
             cwd,
+            tool_artifact_root: None,
             provider_plugin_id: None,
             model_id: None,
             selection_provenance: Box::default(),
@@ -9555,6 +9573,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Supply a caller-owned absolute root for tool artifacts.
+    ///
+    /// No directory is created by this setter. Tool execution rejects relative roots;
+    /// tool owners remain responsible for confining artifact writes to this root.
+    /// The caller owns retention and cleanup. By default no artifact root is supplied.
+    #[must_use]
+    pub fn tool_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.tool_artifact_root = Some(root.into());
+        self
+    }
+
     /// Configure a resolved agent policy from the shared Bcode permission model.
     #[must_use]
     pub fn agent_config(mut self, config: AgentConfig) -> Self {
@@ -9695,6 +9724,7 @@ impl AgentBuilder {
             profile_id: self.profile_id,
             session_id: self.session_id,
             cwd: self.cwd,
+            tool_artifact_root: self.tool_artifact_root,
             provider_plugin_id: self.provider_plugin_id,
             model_id: self.model_id.unwrap_or_default(),
             selection_provenance: self.selection_provenance,
