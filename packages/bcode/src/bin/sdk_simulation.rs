@@ -16,6 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "simulation-example")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let budgets = SimulationBudgets::parse(std::env::args().skip(1))?;
     // Validate before initializing any simulator globals or admitting application work.
     let seed = simulation_input("SIMULATOR_SEED")?;
     let epoch = simulation_input("SIMULATOR_EPOCH_OFFSET")?;
@@ -29,7 +30,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The harness, not application code, advances simulated time. One poll per step
     // is an explicit exploration policy, not a claim of exhaustive schedule coverage.
     switchy::time::simulator::reset_step();
-    run_simulated(run(), 10_000, 10_000)
+    run_simulated(run(), budgets.execution, budgets.drain)
+}
+
+#[cfg(any(test, feature = "simulation-example"))]
+#[derive(Debug, PartialEq, Eq)]
+struct SimulationBudgets {
+    execution: usize,
+    drain: usize,
+}
+
+#[cfg(any(test, feature = "simulation-example"))]
+impl SimulationBudgets {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, &'static str> {
+        let mut execution = None;
+        let mut drain = None;
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let slot = match flag.as_str() {
+                "--execution-steps" => &mut execution,
+                "--drain-steps" => &mut drain,
+                _ => return Err("expected --execution-steps or --drain-steps"),
+            };
+            if slot.is_some() {
+                return Err("duplicate simulation budget option");
+            }
+            let value = args.next().ok_or("missing simulation budget value")?;
+            let value = value
+                .parse::<usize>()
+                .map_err(|_| "invalid simulation step budget")?;
+            if value == 0 {
+                return Err("simulation step budgets must be positive");
+            }
+            *slot = Some(value);
+        }
+        Ok(Self {
+            execution: execution.unwrap_or(10_000),
+            drain: drain.unwrap_or(10_000),
+        })
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::SimulationBudgets;
+
+    #[test]
+    fn budgets_accept_defaults_and_explicit_values() {
+        assert_eq!(
+            SimulationBudgets::parse([]).unwrap(),
+            SimulationBudgets {
+                execution: 10_000,
+                drain: 10_000
+            }
+        );
+        assert_eq!(
+            SimulationBudgets::parse(
+                ["--drain-steps", "2", "--execution-steps", "3"].map(str::to_owned)
+            )
+            .unwrap(),
+            SimulationBudgets {
+                execution: 3,
+                drain: 2
+            }
+        );
+    }
+
+    #[test]
+    fn budgets_reject_ambiguous_or_invalid_inputs() {
+        for args in [
+            vec!["--unknown"],
+            vec!["--drain-steps"],
+            vec!["--execution-steps", "0"],
+            vec!["--drain-steps", "-1"],
+            vec!["--drain-steps", "secret"],
+            vec!["--drain-steps", "1", "--drain-steps", "2"],
+            vec!["--execution-steps", "99999999999999999999999999999999"],
+        ] {
+            assert!(SimulationBudgets::parse(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
 }
 
 #[cfg(feature = "simulation-example")]
