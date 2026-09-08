@@ -24983,7 +24983,11 @@ mod tests {
             .persist_definition("parent", 1, &parent_definition)
             .expect("parent");
         store
-            .persist_definition(&identity.definition_id, 1, &child_definition)
+            .persist_definition(
+                &identity.definition_id,
+                identity.definition_version,
+                &child_definition,
+            )
             .expect("child");
         store
             .create_run(&NewWorkflowRun {
@@ -25049,7 +25053,7 @@ mod tests {
             run: NewWorkflowRun {
                 run_id: child_id.clone(),
                 definition_id: identity.definition_id,
-                definition_version: 1,
+                definition_version: identity.definition_version,
                 workspace_snapshot: "wrong".to_string(),
                 parent_session_id: None,
                 parent_session_generation: None,
@@ -25083,9 +25087,32 @@ mod tests {
             "child limits must not exceed the inherited parent envelope"
         );
         request.run.limits = WorkflowRunLimits::default();
+        store.connection.execute(
+            "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'rollback-parent'",
+            [],
+        ).expect("invalid parent binding");
+        let before = store.connection.total_changes();
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .run_summary(&child_id)
+                .expect("no child on binding error")
+                .is_none()
+        );
+        store.connection.execute(
+            "UPDATE workflow_activations SET node_revision = 1 WHERE run_id = 'rollback-parent'",
+            [],
+        ).expect("restore parent binding");
         request.link.depth = MAX_WORKFLOW_RUN_DEPTH + 1;
         assert!(store.create_child_run_idempotent(&request).is_err());
         assert!(store.run_summary(&child_id).expect("child").is_none());
+        request.link.depth = 2;
+        assert!(
+            store
+                .create_child_run_idempotent(&request)
+                .expect("valid binding admits child")
+        );
     }
 
     #[test]
