@@ -662,6 +662,95 @@ impl WorkflowStore {
         Ok(Self::graph_edge_page(&self.connection, run_id, None, None, Some(edge_id), 1)?.pop())
     }
 
+    /// Read an immutable edge revision from a committed run graph.
+    ///
+    /// This inspection does not authorize dispatch. Missing runs or revisions
+    /// return `None`; endpoint identities must exist in the same read snapshot.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identities or revisions, uncommitted data,
+    /// malformed or oversized payloads, inconsistent endpoints, or database failures.
+    pub fn run_graph_edge_revision(
+        &self,
+        run_id: &str,
+        edge_id: u64,
+        revision: u64,
+    ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
+        let edge_id = i64::try_from(edge_id).map_err(|_| {
+            WorkflowStoreError::InvalidData("edge identity exceeds storage range".to_string())
+        })?;
+        if revision == 0 || i64::try_from(revision).is_err() {
+            return Err(WorkflowStoreError::InvalidData(
+                "invalid edge revision".to_string(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(current) = graph_revision(&transaction, run_id)? else {
+            return Ok(None);
+        };
+        if revision > current {
+            return Err(WorkflowStoreError::InvalidData(
+                "edge revision exceeds committed graph revision".to_string(),
+            ));
+        }
+        let row = transaction
+            .query_row(
+                "SELECT CASE WHEN typeof(edge_json) = 'text'
+             AND length(CAST(edge_json AS BLOB)) <= ?4 THEN edge_json END,
+             source_node_id, target_node_id FROM workflow_run_graph_edges
+             WHERE run_id = ?1 AND edge_id = ?2 AND revision = ?3",
+                rusqlite::params![run_id, edge_id, revision, super::MAX_INLINE_JSON_BYTES],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((payload, source, target)) = row else {
+            return Ok(None);
+        };
+        let payload = payload.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("invalid or oversized edge payload".to_string())
+        })?;
+        let edge: EdgeDefinition = serde_json::from_str(&payload)?;
+        if edge.from != source || edge.to != target {
+            return Err(WorkflowStoreError::InvalidData(
+                "edge endpoint identity mismatch".to_string(),
+            ));
+        }
+        for id in [&source, &target] {
+            super::validate_id("edge endpoint", id)?;
+            let endpoint_revision = transaction
+                .query_row(
+                    "SELECT revision FROM workflow_run_graph_nodes
+                 WHERE run_id = ?1 AND node_id = ?2 AND revision <= ?3
+                 ORDER BY revision DESC LIMIT 1",
+                    (run_id, id, revision),
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "edge endpoint is missing at revision".to_string(),
+                    )
+                })?;
+            self.run_graph_node_revision(run_id, id, endpoint_revision)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("edge endpoint is missing".to_string())
+                })?;
+        }
+        transaction.commit()?;
+        Ok(Some(RunGraphEdge {
+            edge_id: u64::try_from(edge_id).map_err(|_| {
+                WorkflowStoreError::InvalidData("invalid edge identity".to_string())
+            })?,
+            edge,
+        }))
+    }
+
     /// Read a bounded page of initial edges targeting one node, ordered by edge identity.
     ///
     /// Missing runs or targets with no incoming edges return an empty page.

@@ -21040,6 +21040,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_edge_revision_preserves_history_after_reopen() {
+        let (temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::default(),
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("json")],
+        ).expect("edge fixture");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("revision fixture");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .run_graph_edge_revision("run-1", 0, 1)
+                .expect("historical")
+                .expect("edge")
+                .edge,
+            edge
+        );
+        assert!(
+            store
+                .run_graph_edge_revision("run-1", 0, 2)
+                .expect("absent")
+                .is_none()
+        );
+        assert!(store.run_graph_edge_revision("run-1", 0, 3).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
     fn current_node_rejects_uncommitted_revision_without_writes() {
         let (_temp, store) = initialized_store();
         store
