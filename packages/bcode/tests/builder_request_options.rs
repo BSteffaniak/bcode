@@ -92,6 +92,84 @@ impl ModelProviderInvoker for RecordingProvider {
     }
 }
 
+fn explicit_agent() -> bcode::AgentBuilder {
+    bcode::AgentBuilder::from_context(
+        "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("session ID"),
+        std::env::temp_dir(),
+    )
+    .model("model")
+    .system("explicit system")
+    .metadata("initialization", "explicit")
+}
+
+#[tokio::test]
+async fn explicitly_initialized_request_builders_preserve_agent_configuration() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let response = bcode::GenerateTextBuilder::from_agent(explicit_agent())
+        .prompt("text")
+        .run(&mut RecordingProvider::new(
+            Arc::clone(&requests),
+            "generated",
+        ))
+        .await
+        .expect("text generation");
+    assert_eq!(response.text, "generated");
+
+    let mut stream = bcode::StreamTextBuilder::from_agent(explicit_agent())
+        .prompt("stream")
+        .run(RecordingProvider::new(Arc::clone(&requests), "streamed"));
+    let mut finished = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            TextStreamItem::Finished(response) => {
+                assert_eq!(response.text, "streamed");
+                finished = true;
+            }
+            TextStreamItem::Error(error) => panic!("text stream failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(finished);
+
+    let object = bcode::GenerateObjectBuilder::<Output>::from_agent(explicit_agent())
+        .prompt("object")
+        .run(&mut RecordingProvider::new(
+            Arc::clone(&requests),
+            r#"{"value":"generated"}"#,
+        ))
+        .await
+        .expect("object generation");
+    assert_eq!(object.value, "generated");
+
+    let mut stream = bcode::StreamObjectBuilder::<Output>::from_agent(explicit_agent())
+        .prompt("object stream")
+        .run(RecordingProvider::new(
+            Arc::clone(&requests),
+            r#"{"value":"streamed"}"#,
+        ));
+    let mut finished = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            ObjectStreamItem::Finished { .. } => finished = true,
+            ObjectStreamItem::Error(error) => panic!("object stream failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(finished);
+    let requests = requests.lock().expect("requests lock");
+    assert_eq!(requests.len(), 4);
+    for request in requests.iter() {
+        assert_eq!(request.model_id, "model");
+        assert_eq!(request.system_prompt.as_deref(), Some("explicit system"));
+        assert_eq!(
+            request.metadata.get("initialization").map(String::as_str),
+            Some("explicit")
+        );
+    }
+}
+
 fn history() -> ModelMessage {
     ModelMessage {
         role: MessageRole::Assistant,

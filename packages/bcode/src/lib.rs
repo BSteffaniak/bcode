@@ -583,16 +583,26 @@ pub struct GenerateTextBuilder {
 
 impl Default for GenerateTextBuilder {
     fn default() -> Self {
+        Self::from_agent(Agent::builder())
+    }
+}
+
+impl GenerateTextBuilder {
+    /// Create a request builder using an already initialized agent builder.
+    ///
+    /// This preserves its configuration without allocating a default session identity or
+    /// reading the process working directory. Use [`AgentBuilder::from_context`] for explicit
+    /// initialization; provider request identities and execution effects remain separately configured.
+    #[must_use]
+    pub fn from_agent(agent: AgentBuilder) -> Self {
         Self {
-            agent: Agent::builder(),
+            agent,
             prompt: String::new(),
             messages: Vec::new(),
             cancellation: CancellationToken::new(),
         }
     }
-}
 
-impl GenerateTextBuilder {
     /// Create a text-generation builder with default agent settings.
     #[must_use]
     pub fn new() -> Self {
@@ -816,16 +826,24 @@ pub struct StreamTextBuilder {
 
 impl Default for StreamTextBuilder {
     fn default() -> Self {
+        Self::from_agent(Agent::builder())
+    }
+}
+
+impl StreamTextBuilder {
+    /// Create a streaming request builder using an already initialized agent builder.
+    ///
+    /// Like [`GenerateTextBuilder::from_agent`], this avoids default agent initialization.
+    #[must_use]
+    pub fn from_agent(agent: AgentBuilder) -> Self {
         Self {
-            agent: Agent::builder(),
+            agent,
             prompt: String::new(),
             messages: Vec::new(),
             cancellation: CancellationToken::new(),
         }
     }
-}
 
-impl StreamTextBuilder {
     /// Create a streaming text builder with default agent settings.
     #[must_use]
     pub fn new() -> Self {
@@ -1157,8 +1175,18 @@ pub struct GenerateObjectBuilder<T> {
 
 impl<T> Default for GenerateObjectBuilder<T> {
     fn default() -> Self {
+        Self::from_agent(Agent::builder())
+    }
+}
+
+impl<T> GenerateObjectBuilder<T> {
+    /// Create an object request builder using an already initialized agent builder.
+    ///
+    /// Like [`GenerateTextBuilder::from_agent`], this avoids default agent initialization.
+    #[must_use]
+    pub fn from_agent(agent: AgentBuilder) -> Self {
         Self {
-            agent: Agent::builder(),
+            agent,
             prompt: String::new(),
             messages: Vec::new(),
             options: None,
@@ -1166,9 +1194,7 @@ impl<T> Default for GenerateObjectBuilder<T> {
             _output: std::marker::PhantomData,
         }
     }
-}
 
-impl<T> GenerateObjectBuilder<T> {
     /// Create a structured object generation builder with default agent settings.
     #[must_use]
     pub fn new() -> Self {
@@ -1545,8 +1571,18 @@ pub struct StreamObjectBuilder<T> {
 
 impl<T> Default for StreamObjectBuilder<T> {
     fn default() -> Self {
+        Self::from_agent(Agent::builder())
+    }
+}
+
+impl<T> StreamObjectBuilder<T> {
+    /// Create an object streaming builder using an already initialized agent builder.
+    ///
+    /// Like [`GenerateTextBuilder::from_agent`], this avoids default agent initialization.
+    #[must_use]
+    pub fn from_agent(agent: AgentBuilder) -> Self {
         Self {
-            agent: Agent::builder(),
+            agent,
             prompt: String::new(),
             messages: Vec::new(),
             options: None,
@@ -1554,9 +1590,7 @@ impl<T> Default for StreamObjectBuilder<T> {
             _output: std::marker::PhantomData,
         }
     }
-}
 
-impl<T> StreamObjectBuilder<T> {
     /// Create a structured object streaming builder with default agent settings.
     #[must_use]
     pub fn new() -> Self {
