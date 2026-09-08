@@ -4460,7 +4460,8 @@ impl WorkflowStore {
                  JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
                    AND definition.version = run.definition_version \
                  WHERE run.run_id = ?1 AND activation.node_id = ?2 \
-                   AND activation.activation_id = ?3",
+                   AND activation.activation_id = ?3 \
+                   AND run.status = 'running' AND run.cancellation_requested_at_ms IS NULL",
                 (
                     &request.link.parent_run_id,
                     &request.link.parent_node_id,
@@ -25108,6 +25109,23 @@ mod tests {
         assert!(store.create_child_run_idempotent(&request).is_err());
         assert!(store.run_summary(&child_id).expect("child").is_none());
         request.link.depth = 2;
+        store.connection.execute(
+            "UPDATE workflow_runs SET cancellation_requested_at_ms = 3 WHERE run_id = 'rollback-parent'",
+            [],
+        ).expect("cancel parent fixture");
+        let before = store.connection.total_changes();
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .run_summary(&child_id)
+                .expect("no child after cancellation")
+                .is_none()
+        );
+        store.connection.execute(
+            "UPDATE workflow_runs SET cancellation_requested_at_ms = NULL WHERE run_id = 'rollback-parent'",
+            [],
+        ).expect("restore parent fixture");
         assert!(
             store
                 .create_child_run_idempotent(&request)
