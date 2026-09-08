@@ -4512,18 +4512,22 @@ impl WorkflowStore {
                 "workflow child cannot inherit or introduce an ambient product binding".to_string(),
             ));
         }
-        let parent_node = parent_definition
-            .node(&request.link.parent_node_id)
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData("parent call node is missing".to_string())
-            })?;
+        let parent_node = run_graph::initial_activation_node(
+            &transaction,
+            &request.link.parent_run_id,
+            &request.link.parent_node_id,
+            &request.link.parent_activation_id,
+        )?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("parent call executable binding is missing".to_string())
+        })?;
         if parent_node.kind != bcode_workflow::NodeKind::WorkflowCall {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow child parent node is not a workflow call".to_string(),
             ));
         }
         let configuration: bcode_workflow::WorkflowCallConfiguration =
-            serde_json::from_value(parent_node.configuration.clone())?;
+            serde_json::from_value(parent_node.configuration)?;
         configuration
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
