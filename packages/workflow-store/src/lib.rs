@@ -4282,10 +4282,21 @@ impl WorkflowStore {
         run: &NewWorkflowRun,
     ) -> Result<bool, WorkflowStoreError> {
         validate_run(run)?;
-        let authorization_profile_json = serde_json::to_string(&run.authorization_profile)?;
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let created = Self::create_or_verify_run(&transaction, run, true)?;
+        transaction.commit()?;
+        Ok(created)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn create_or_verify_run(
+        transaction: &Transaction<'_>,
+        run: &NewWorkflowRun,
+        allow_creation: bool,
+    ) -> Result<bool, WorkflowStoreError> {
+        let authorization_profile_json = serde_json::to_string(&run.authorization_profile)?;
         let existing = transaction
             .query_row(
                 "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, parent_session_generation, \
@@ -4348,8 +4359,12 @@ impl WorkflowStore {
             authorization_ceiling,
         )) = existing
         else {
-            create_run_in_transaction(&transaction, run)?;
-            transaction.commit()?;
+            if !allow_creation {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow child link references a missing run".to_string(),
+                ));
+            }
+            create_run_in_transaction(transaction, run)?;
             return Ok(true);
         };
         if input_json.as_deref() == Some("")
@@ -4402,7 +4417,7 @@ impl WorkflowStore {
             && input == run.input
             && limits == run.limits
         {
-            if run_graph::graph_revision(&transaction, &run.run_id)? != Some(1) {
+            if run_graph::graph_revision(transaction, &run.run_id)? != Some(1) {
                 return Err(WorkflowStoreError::InvalidData(
                     "idempotent workflow start requires a supported run graph revision".to_string(),
                 ));
@@ -4546,7 +4561,7 @@ impl WorkflowStore {
         }
         if let Some(existing) = child_link_for_parent_attempt(&transaction, &request.link)? {
             if existing == request.link {
-                return Ok(false);
+                return Self::create_or_verify_run(&transaction, &request.run, false);
             }
             return Err(WorkflowStoreError::InvalidData(
                 "workflow child parent attempt conflicts with an existing link".to_string(),
@@ -14059,8 +14074,27 @@ fn child_link_for_parent_attempt_connection(
 }
 
 fn decode_run_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRunLink> {
-    let target_json = row.get::<_, String>(7)?;
-    let target = serde_json::from_str(&target_json).map_err(|error| {
+    let version: u32 = row.get(6)?;
+    if version != WORKFLOW_RUN_LINK_VERSION {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Integer,
+            Box::new(WorkflowStoreError::InvalidData(
+                "unsupported workflow run link version".to_string(),
+            )),
+        ));
+    }
+    let target_json = row.get_ref(7)?.as_str()?;
+    if target_json.len() > MAX_INLINE_JSON_BYTES {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            Box::new(WorkflowStoreError::InvalidData(
+                "workflow run link target exceeds the inline byte limit".to_string(),
+            )),
+        ));
+    }
+    let target = serde_json::from_str(target_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(WorkflowRunLink {
@@ -14070,7 +14104,7 @@ fn decode_run_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRunLink>
         parent_activation_id: row.get(3)?,
         parent_attempt: row.get(4)?,
         child_run_id: row.get(5)?,
-        version: row.get(6)?,
+        version,
         target,
         depth: row.get(8)?,
         created_at_ms: row.get(9)?,
@@ -16764,6 +16798,70 @@ mod tests {
                 .expect("latest")
                 .run_id,
             "run-2"
+        );
+    }
+
+    #[test]
+    fn run_link_decoder_rejects_oversized_target_before_deserialization() {
+        let (_temp, store) = initialized_store();
+        let target = " ".repeat(MAX_INLINE_JSON_BYTES + 1);
+        let before = store.connection.total_changes();
+        let result = store.connection.query_row(
+            "SELECT 'root', 'parent', 'call', 'activation', 1, 'child', ?1, ?2, 2, 0",
+            (WORKFLOW_RUN_LINK_VERSION, target),
+            decode_run_link,
+        );
+        let error = result.expect_err("oversized target");
+        assert!(error.to_string().contains("inline byte limit"));
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_link_decoder_rejects_future_version_before_target_decoding() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        let result = store.connection.query_row(
+            "SELECT 'root', 'parent', 'call', 'activation', 1, 'child', ?1, 'not-json', 2, 0",
+            [WORKFLOW_RUN_LINK_VERSION + 1],
+            decode_run_link,
+        );
+        assert!(matches!(
+            result,
+            Err(rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                _
+            ))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn duplicate_run_verification_never_creates_missing_run() {
+        let (_temp, mut store) = initialized_store();
+        let mut request = new_run();
+        request.run_id = "missing-linked-child".to_string();
+        let before = store.connection.total_changes();
+        let transaction = store
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("verification transaction");
+        assert!(matches!(
+            WorkflowStore::create_or_verify_run(&transaction, &request, false),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        transaction.commit().expect("commit verification");
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .run_summary(&request.run_id)
+                .expect("missing run")
+                .is_none()
+        );
+        assert!(
+            store
+                .create_run_idempotent(&request)
+                .expect("explicit creation still works")
         );
     }
 
@@ -25210,6 +25308,15 @@ mod tests {
                 .create_child_run_idempotent(&request)
                 .expect("valid binding admits child")
         );
+        assert!(
+            !store
+                .create_child_run_idempotent(&request)
+                .expect("exact duplicate")
+        );
+        request.run.input = Some(serde_json::json!(2));
+        let before = store.connection.total_changes();
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
