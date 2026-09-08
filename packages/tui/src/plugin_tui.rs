@@ -2010,6 +2010,7 @@ library = "libdynamic_visual_test.dylib"
                 },
                 |index| vec![Line::from(format!("row-{index}"))].into(),
             );
+            let elapsed = started.elapsed();
             drop(presentation);
             println!(
                 "BCODE_PERF_CASE {}",
@@ -2021,7 +2022,7 @@ library = "libdynamic_visual_test.dylib"
                     "entries_rebuilt": stats.entries_rebuilt,
                     "rows_regenerated": stats.rows_regenerated,
                     "sync_us": stats.duration_micros,
-                    "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    "wall_us": u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
                 })
             );
         }
