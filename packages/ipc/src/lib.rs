@@ -99,7 +99,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// field name is unchanged; only its derivation widened, and a stale peer computing
 /// the narrower identity now mismatches and is refused rather than silently sharing
 /// a daemon across config directories.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 34;
+/// Version 35 includes the selected edge revision in workflow graph inspection.
+/// Older positional payloads are rejected rather than assigned a guessed revision.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 35;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -2589,6 +2591,8 @@ pub struct WorkflowRunGraphNodeInspection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowRunGraphEdgeInspection {
+    /// Revision that admitted this representation, not necessarily the graph revision.
+    pub revision: u64,
     pub edge_id: u64,
     pub edge: bcode_workflow::EdgeDefinition,
 }
@@ -6870,6 +6874,46 @@ mod tests {
                 assert_eq!(decoded, response);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn graph_inspection_preserves_selected_edge_revision_across_frames() {
+        let graph = WorkflowRunGraphInspection {
+            revision: 3,
+            nodes: Vec::new(),
+            edges: vec![WorkflowRunGraphEdgeInspection {
+                revision: 2,
+                edge_id: 7,
+                edge: bcode_workflow::EdgeDefinition {
+                    from: "source".to_string(),
+                    to: "target".to_string(),
+                    kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
+                },
+            }],
+            nodes_complete: false,
+            edges_complete: true,
+        };
+        let response = Response::Ok(ResponsePayload::WorkflowRunGraphInspection {
+            graph: graph.clone(),
+        });
+        let envelope = response_envelope(1, &response).expect("encode graph");
+        let received = round_trip_envelope(envelope).await;
+        let Response::Ok(ResponsePayload::WorkflowRunGraphInspection { graph: decoded }) =
+            decode_response(&received.payload).expect("decode graph")
+        else {
+            panic!("unexpected response");
+        };
+        assert_eq!(decoded, graph);
+        assert_ne!(decoded.edges[0].revision, decoded.revision);
+        let mut missing_revision = serde_json::to_value(&graph.edges[0]).expect("edge JSON");
+        missing_revision
+            .as_object_mut()
+            .expect("object")
+            .remove("revision");
+        assert!(
+            serde_json::from_value::<WorkflowRunGraphEdgeInspection>(missing_revision).is_err()
+        );
     }
 
     #[test]

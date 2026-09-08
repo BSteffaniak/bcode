@@ -27,9 +27,11 @@ pub struct RunGraphNode {
     pub exit: bool,
 }
 
-/// One immutable edge in the initial admitted run graph.
+/// One immutable edge representation in an admitted run graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunGraphEdge {
+    /// Revision at which this edge representation was admitted.
+    pub revision: u64,
     /// Stable identity assigned during initial materialization.
     pub edge_id: u64,
     /// Exact admitted edge, including transforms and control flow.
@@ -229,6 +231,25 @@ pub fn initial_activation_node(
     node_id: &str,
     activation_id: &str,
 ) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
+    validate_activation_node_request(run_id, node_id, activation_id)?;
+    let transaction = connection
+        .is_autocommit()
+        .then(|| connection.unchecked_transaction())
+        .transpose()?;
+    let node = initial_activation_node_in_snapshot(connection, run_id, node_id, activation_id)?;
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(node)
+}
+
+fn initial_activation_node_in_snapshot(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
+    super::validate_id("activation_id", activation_id)?;
     let Some(record) = initial_node_record(connection, run_id, node_id)? else {
         return Ok(None);
     };
@@ -254,15 +275,41 @@ pub fn bound_activation_node(
         })
 }
 
+fn validate_activation_node_request(
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<(), WorkflowStoreError> {
+    super::validate_id("activation_id", activation_id)?;
+    super::validate_id("node_id", node_id)?;
+    super::validate_id("run_id", run_id)
+}
+
 fn activation_node_record(
     connection: &Connection,
     run_id: &str,
     node_id: &str,
     activation_id: &str,
 ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
-    super::validate_id("activation_id", activation_id)?;
-    super::validate_id("node_id", node_id)?;
-    super::validate_id("run_id", run_id)?;
+    validate_activation_node_request(run_id, node_id, activation_id)?;
+    let transaction = connection
+        .is_autocommit()
+        .then(|| connection.unchecked_transaction())
+        .transpose()?;
+    let node = activation_node_record_in_snapshot(connection, run_id, node_id, activation_id)?;
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(node)
+}
+
+fn activation_node_record_in_snapshot(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+    validate_activation_node_request(run_id, node_id, activation_id)?;
     let revision = connection
         .query_row(
             "SELECT node_revision FROM workflow_activations
@@ -361,6 +408,24 @@ fn initial_node_record(
     run_id: &str,
     node_id: &str,
 ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+    super::validate_id("run_id", run_id)?;
+    super::validate_id("node_id", node_id)?;
+    let transaction = connection
+        .is_autocommit()
+        .then(|| connection.unchecked_transaction())
+        .transpose()?;
+    let node = initial_node_record_in_snapshot(connection, run_id, node_id)?;
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(node)
+}
+
+fn initial_node_record_in_snapshot(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
     super::validate_id("node_id", node_id)?;
     match graph_revision(connection, run_id)? {
         None => return Ok(None),
@@ -443,7 +508,38 @@ pub struct RunGraphPage {
 }
 
 impl WorkflowStore {
+    fn validate_graph_page_request(
+        run_id: &str,
+        expected_revision: Option<u64>,
+        after_node_id: Option<&str>,
+        after_edge_id: Option<u64>,
+        limit: usize,
+    ) -> Result<(), WorkflowStoreError> {
+        super::validate_id("run_id", run_id)?;
+        if limit == 0
+            || expected_revision
+                .is_some_and(|revision| revision == 0 || i64::try_from(revision).is_err())
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "invalid graph page limit or revision".to_string(),
+            ));
+        }
+        if let Some(cursor) = after_node_id {
+            super::validate_id("node cursor", cursor)?;
+        }
+        edge_cursor(after_edge_id)?;
+        if expected_revision.is_none() && (after_node_id.is_some() || after_edge_id.is_some()) {
+            return Err(WorkflowStoreError::InvalidData(
+                "graph continuation requires an expected revision".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Read nodes, edges, and continuation status from one read snapshot.
+    ///
+    /// First-page discovery may omit the expected revision. Continuation cursors
+    /// require the revision returned by the preceding page to avoid mixing plans.
     ///
     /// # Errors
     /// Returns an error for missing graphs, revision conflicts, invalid cursors or
@@ -456,8 +552,19 @@ impl WorkflowStore {
         after_edge_id: Option<u64>,
         limit: usize,
     ) -> Result<RunGraphPage, WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let revision = graph_revision(&transaction, run_id)?.ok_or_else(|| {
+        Self::validate_graph_page_request(
+            run_id,
+            expected_revision,
+            after_node_id,
+            after_edge_id,
+            limit,
+        )?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let revision = graph_revision(&self.connection, run_id)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData("workflow run graph not found".to_string())
         })?;
         if expected_revision.is_some_and(|expected| expected != revision) {
@@ -481,7 +588,9 @@ impl WorkflowStore {
                 .is_empty(),
             None => true,
         };
-        transaction.commit()?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(RunGraphPage {
             revision,
             nodes,
@@ -505,22 +614,17 @@ impl WorkflowStore {
         node_id: &str,
         activation_id: &str,
     ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
-        let transaction = self
-            .connection
-            .is_autocommit()
-            .then(|| self.connection.unchecked_transaction())
-            .transpose()?;
-        let node = activation_node_record(&self.connection, run_id, node_id, activation_id)?;
-        if let Some(transaction) = transaction {
-            transaction.commit()?;
-        }
-        Ok(node)
+        activation_node_record(&self.connection, run_id, node_id, activation_id)
     }
 
     /// Read an exact immutable node revision rather than the current graph topology.
     ///
     /// This does not authorize execution or resolve an activation's binding. Missing
     /// runs or node revisions return `None`; an uncommitted revision is rejected.
+    /// Graph metadata and executable data are read from one snapshot. An existing
+    /// caller-owned transaction is reused and is neither committed nor rolled back
+    /// by this method, including when the read fails.
+    ///
     /// # Errors
     /// Returns an error for invalid identities/revisions, damaged graph metadata,
     /// malformed or oversized node payloads, or database failures.
@@ -530,7 +634,32 @@ impl WorkflowStore {
         node_id: &str,
         revision: u64,
     ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
-        Self::node_revision(&self.connection, run_id, node_id, revision)
+        Self::validate_node_revision_request(run_id, node_id, revision)?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let node = Self::node_revision(&self.connection, run_id, node_id, revision)?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(node)
+    }
+
+    fn validate_node_revision_request(
+        run_id: &str,
+        node_id: &str,
+        revision: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        super::validate_id("run_id", run_id)?;
+        super::validate_id("node_id", node_id)?;
+        if revision == 0 || i64::try_from(revision).is_err() {
+            return Err(WorkflowStoreError::InvalidData(
+                "node revision must be a positive storage integer".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn node_revision(
@@ -539,12 +668,7 @@ impl WorkflowStore {
         node_id: &str,
         revision: u64,
     ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
-        super::validate_id("node_id", node_id)?;
-        if revision == 0 || i64::try_from(revision).is_err() {
-            return Err(WorkflowStoreError::InvalidData(
-                "node revision must be a positive storage integer".to_string(),
-            ));
-        }
+        Self::validate_node_revision_request(run_id, node_id, revision)?;
         let Some(current) = graph_revision(connection, run_id)? else {
             return Ok(None);
         };
@@ -597,6 +721,9 @@ impl WorkflowStore {
     ///
     /// Unlike an activation binding, this lookup follows node revisions. It does not
     /// authorize dispatch. Missing runs or nodes return `None`.
+    /// Revision selection and executable data are read from one snapshot. An
+    /// existing caller-owned transaction is reused; its completion remains the
+    /// caller's responsibility on both success and failure.
     ///
     /// # Errors
     /// Returns an error for invalid identities, uncommitted revisions, damaged graph
@@ -606,9 +733,17 @@ impl WorkflowStore {
         run_id: &str,
         node_id: &str,
     ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        super::validate_id("run_id", run_id)?;
+        super::validate_id("node_id", node_id)?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
         let node = self.current_run_graph_node_in_snapshot(run_id, node_id)?;
-        transaction.commit()?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(node)
     }
 
@@ -657,14 +792,27 @@ impl WorkflowStore {
         after_node_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RunGraphNode>, WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        Self::validate_graph_page_request(
+            run_id,
+            Some(expected_revision),
+            after_node_id,
+            None,
+            limit,
+        )?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
         let nodes = self.current_run_graph_nodes_in_snapshot(
             run_id,
             expected_revision,
             after_node_id,
             limit,
         )?;
-        transaction.commit()?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(nodes)
     }
 
@@ -690,14 +838,29 @@ impl WorkflowStore {
             ));
         }
         let mut nodes = Vec::new();
-        let mut cursor = after_node_id.unwrap_or("").to_string();
+        let mut cursor = after_node_id.map(str::to_string);
         for _ in 0..limit.min(GRAPH_PAGE_LIMIT) {
             let id = transaction
                 .query_row(
-                    "SELECT node_id FROM workflow_run_graph_nodes
-                 WHERE run_id = ?1 AND node_id > ?2 ORDER BY node_id LIMIT 1",
-                    (run_id, &cursor),
-                    |row| row.get::<_, String>(0),
+                    if cursor.is_some() {
+                        "SELECT node_id FROM workflow_run_graph_nodes
+                         WHERE run_id = ?1 AND node_id > ?2 ORDER BY node_id LIMIT 1"
+                    } else {
+                        "SELECT node_id FROM workflow_run_graph_nodes
+                         WHERE run_id = ?1 AND node_id >= ?2 ORDER BY node_id LIMIT 1"
+                    },
+                    (run_id, cursor.as_deref().unwrap_or("")),
+                    |row| {
+                        let id = row.get_ref(0)?.as_str()?;
+                        super::validate_id("node_id", id).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                        Ok(id.to_string())
+                    },
                 )
                 .optional()?;
             let Some(id) = id else {
@@ -709,7 +872,7 @@ impl WorkflowStore {
                         WorkflowStoreError::InvalidData("graph page node is missing".to_string())
                     })?,
             );
-            cursor = id;
+            cursor = Some(id);
         }
         Ok(nodes)
     }
@@ -746,7 +909,7 @@ impl WorkflowStore {
     ///
     /// # Errors
     /// Returns an error for unsupported revisions, invalid graph relationships or payloads,
-    /// invalid identities, or database failures. Missing runs return an empty page.
+    /// invalid identities, zero limits, or database failures. Missing runs return an empty page.
     pub fn run_graph_edges(
         &self,
         run_id: &str,
@@ -777,6 +940,8 @@ impl WorkflowStore {
     ///
     /// This inspection does not authorize dispatch. Missing runs or revisions
     /// return `None`; endpoint identities must exist in the same read snapshot.
+    /// An existing caller-owned transaction is reused and remains owned by the
+    /// caller on both success and failure.
     ///
     /// # Errors
     /// Returns an error for invalid identities or revisions, uncommitted data,
@@ -787,18 +952,25 @@ impl WorkflowStore {
         edge_id: u64,
         revision: u64,
     ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        Self::validate_edge_revision_request(run_id, edge_id, revision)?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
         let edge = self.run_graph_edge_revision_in_snapshot(run_id, edge_id, revision)?;
-        transaction.commit()?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(edge)
     }
 
-    fn run_graph_edge_revision_in_snapshot(
-        &self,
+    fn validate_edge_revision_request(
         run_id: &str,
         edge_id: u64,
         revision: u64,
-    ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
+    ) -> Result<i64, WorkflowStoreError> {
+        super::validate_id("run_id", run_id)?;
         let edge_id = i64::try_from(edge_id).map_err(|_| {
             WorkflowStoreError::InvalidData("edge identity exceeds storage range".to_string())
         })?;
@@ -807,6 +979,16 @@ impl WorkflowStore {
                 "invalid edge revision".to_string(),
             ));
         }
+        Ok(edge_id)
+    }
+
+    fn run_graph_edge_revision_in_snapshot(
+        &self,
+        run_id: &str,
+        edge_id: u64,
+        revision: u64,
+    ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
+        let edge_id = Self::validate_edge_revision_request(run_id, edge_id, revision)?;
         let transaction = &self.connection;
         let Some(current) = graph_revision(transaction, run_id)? else {
             return Ok(None);
@@ -824,6 +1006,16 @@ impl WorkflowStore {
              WHERE run_id = ?1 AND edge_id = ?2 AND revision = ?3",
                 rusqlite::params![run_id, edge_id, revision, super::MAX_INLINE_JSON_BYTES],
                 |row| {
+                    for column in [1, 2] {
+                        super::validate_id("edge endpoint", row.get_ref(column)?.as_str()?)
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    column,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?;
+                    }
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, String>(1)?,
@@ -866,11 +1058,84 @@ impl WorkflowStore {
                 })?;
         }
         Ok(Some(RunGraphEdge {
+            revision,
             edge_id: u64::try_from(edge_id).map_err(|_| {
                 WorkflowStoreError::InvalidData("invalid edge identity".to_string())
             })?,
             edge,
         }))
+    }
+
+    /// Read the latest committed edge and validate its current endpoints.
+    ///
+    /// Missing runs or edges return `None`. This bounded read does not authorize
+    /// dispatch. Caller-owned transactions are reused and left to the caller.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identities, uncommitted revisions, damaged
+    /// graph metadata, malformed payloads, invalid endpoints, or database failures.
+    pub fn current_run_graph_edge(
+        &self,
+        run_id: &str,
+        edge_id: u64,
+    ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
+        super::validate_id("run_id", run_id)?;
+        i64::try_from(edge_id).map_err(|_| {
+            WorkflowStoreError::InvalidData("edge identity exceeds storage range".to_string())
+        })?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let edge =
+            self.current_run_graph_edge_in_snapshot(run_id, edge_id, &mut BTreeSet::new())?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(edge)
+    }
+
+    fn current_run_graph_edge_in_snapshot(
+        &self,
+        run_id: &str,
+        edge_id: u64,
+        validated_endpoints: &mut BTreeSet<String>,
+    ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
+        let id = i64::try_from(edge_id).map_err(|_| {
+            WorkflowStoreError::InvalidData("edge identity exceeds storage range".to_string())
+        })?;
+        let Some(current) = graph_revision(&self.connection, run_id)? else {
+            return Ok(None);
+        };
+        let revision = self.connection.query_row(
+            "SELECT revision FROM workflow_run_graph_edges WHERE run_id = ?1 AND edge_id = ?2 ORDER BY revision DESC LIMIT 1",
+            (run_id, id), |row| row.get::<_, u64>(0),
+        ).optional()?;
+        let Some(revision) = revision else {
+            return Ok(None);
+        };
+        if revision > current {
+            return Err(WorkflowStoreError::InvalidData(
+                "edge revision exceeds committed graph revision".to_string(),
+            ));
+        }
+        let edge = self
+            .run_graph_edge_revision_in_snapshot(run_id, edge_id, revision)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("graph edge is missing".to_string()))?;
+        for endpoint in [&edge.edge.from, &edge.edge.to] {
+            if validated_endpoints.contains(endpoint) {
+                continue;
+            }
+            self.current_run_graph_node_in_snapshot(run_id, endpoint)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "current graph edge endpoint is missing".to_string(),
+                    )
+                })?;
+            validated_endpoints.insert(endpoint.clone());
+        }
+        Ok(Some(edge))
     }
 
     /// Read current edges in bounded identity order at an expected graph revision.
@@ -885,14 +1150,27 @@ impl WorkflowStore {
         after_edge_id: Option<u64>,
         limit: usize,
     ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        Self::validate_graph_page_request(
+            run_id,
+            Some(expected_revision),
+            None,
+            after_edge_id,
+            limit,
+        )?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
         let edges = self.current_run_graph_edges_in_snapshot(
             run_id,
             expected_revision,
             after_edge_id,
             limit,
         )?;
-        transaction.commit()?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(edges)
     }
 
@@ -916,12 +1194,20 @@ impl WorkflowStore {
             ));
         }
         let mut edges = Vec::new();
+        // Current endpoint validity is shared only within this bounded read snapshot.
+        let mut validated_endpoints = BTreeSet::new();
         for _ in 0..limit.min(GRAPH_PAGE_LIMIT) {
             let row = transaction
                 .query_row(
-                    "SELECT edge_id FROM workflow_run_graph_edges
-                 WHERE run_id = ?1 AND edge_id > ?2
-                 ORDER BY edge_id LIMIT 1",
+                    if after_edge_id.is_none() && edges.is_empty() {
+                        "SELECT edge_id FROM workflow_run_graph_edges
+                         WHERE run_id = ?1 AND edge_id >= ?2
+                         ORDER BY edge_id LIMIT 1"
+                    } else {
+                        "SELECT edge_id FROM workflow_run_graph_edges
+                         WHERE run_id = ?1 AND edge_id > ?2
+                         ORDER BY edge_id LIMIT 1"
+                    },
                     (run_id, cursor),
                     |row| row.get::<_, u64>(0),
                 )
@@ -929,25 +1215,11 @@ impl WorkflowStore {
             let Some(id) = row else {
                 break;
             };
-            let revision = transaction.query_row(
-                "SELECT revision FROM workflow_run_graph_edges
-                 WHERE run_id = ?1 AND edge_id = ?2 ORDER BY revision DESC LIMIT 1",
-                (run_id, id),
-                |row| row.get::<_, u64>(0),
-            )?;
             let edge = self
-                .run_graph_edge_revision_in_snapshot(run_id, id, revision)?
+                .current_run_graph_edge_in_snapshot(run_id, id, &mut validated_endpoints)?
                 .ok_or_else(|| {
                     WorkflowStoreError::InvalidData("graph edge is missing".to_string())
                 })?;
-            for endpoint in [&edge.edge.from, &edge.edge.to] {
-                self.current_run_graph_node_in_snapshot(run_id, endpoint)?
-                    .ok_or_else(|| {
-                        WorkflowStoreError::InvalidData(
-                            "current graph edge endpoint is missing".to_string(),
-                        )
-                    })?;
-            }
             edges.push(edge);
             cursor = i64::try_from(id).map_err(|_| {
                 WorkflowStoreError::InvalidData("invalid edge identity".to_string())
@@ -960,7 +1232,7 @@ impl WorkflowStore {
     ///
     /// Missing runs or targets with no incoming edges return an empty page.
     /// # Errors
-    /// Returns an error for invalid identities or cursors, unsupported graph revisions,
+    /// Returns an error for invalid identities or cursors, zero limits, unsupported graph revisions,
     /// damaged edge relationships or payloads, or database failures.
     pub fn run_graph_incoming_edges(
         &self,
@@ -984,7 +1256,7 @@ impl WorkflowStore {
     ///
     /// Missing runs or sources with no outgoing edges return an empty page.
     /// # Errors
-    /// Returns an error for invalid identities or cursors, unsupported graph revisions,
+    /// Returns an error for invalid identities or cursors, zero limits, unsupported graph revisions,
     /// damaged edge relationships or payloads, or database failures.
     pub fn run_graph_outgoing_edges(
         &self,
@@ -1012,6 +1284,33 @@ impl WorkflowStore {
         exact_edge_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+        Self::validate_graph_page_request(run_id, Some(1), None, after_edge_id, limit)?;
+        let transaction = connection
+            .is_autocommit()
+            .then(|| connection.unchecked_transaction())
+            .transpose()?;
+        let edges = Self::graph_edge_page_in_snapshot(
+            connection,
+            run_id,
+            endpoint,
+            after_edge_id,
+            exact_edge_id,
+            limit,
+        )?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(edges)
+    }
+
+    fn graph_edge_page_in_snapshot(
+        connection: &Connection,
+        run_id: &str,
+        endpoint: Option<EdgeEndpoint<'_>>,
+        after_edge_id: Option<u64>,
+        exact_edge_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
         let cursor_operator = if after_edge_id.is_some() { ">" } else { ">=" };
         let after_edge_id = edge_cursor(after_edge_id)?;
         let Some(revision) = graph_revision(connection, run_id)? else {
@@ -1027,11 +1326,7 @@ impl WorkflowStore {
         } else {
             "AND ?6 IS NULL"
         };
-        let endpoint_index = match endpoint {
-            Some(EdgeEndpoint::Source(_)) => "INDEXED BY workflow_run_graph_edges_source",
-            Some(EdgeEndpoint::Target(_)) => "INDEXED BY workflow_run_graph_edges_target",
-            None => "",
-        };
+        let endpoint_index = Self::initial_edge_endpoint_index(endpoint);
         let (target_filter, endpoint_id) = match endpoint {
             Some(EdgeEndpoint::Source(id)) => ("AND edge.source_node_id = ?5", Some(id)),
             Some(EdgeEndpoint::Target(id)) => ("AND edge.target_node_id = ?5", Some(id)),
@@ -1053,13 +1348,13 @@ impl WorkflowStore {
                              SELECT 1 FROM workflow_run_graph_nodes other
                              WHERE other.run_id = source.run_id AND other.node_id = source.node_id
                              AND other.revision > 1
-                         ) THEN source.node_id END,
+                         ) THEN 1 END,
                     CASE WHEN target.is_entry IN (0, 1) AND target.is_exit IN (0, 1)
                          AND NOT EXISTS (
                              SELECT 1 FROM workflow_run_graph_nodes other
                              WHERE other.run_id = target.run_id AND other.node_id = target.node_id
                              AND other.revision > 1
-                         ) THEN target.node_id END, edge.revision
+                         ) THEN 1 END, edge.revision
              FROM workflow_run_graph_edges edge {endpoint_index}
              LEFT JOIN workflow_run_graph_nodes source ON source.run_id = edge.run_id
                  AND source.node_id = edge.source_node_id AND source.revision = 1
@@ -1079,6 +1374,8 @@ impl WorkflowStore {
             exact_edge_id
         ])?;
         let mut edges = Vec::new();
+        // Snapshot-local and bounded by at most two endpoint identities per edge.
+        let mut validated_endpoints = BTreeSet::new();
         while let Some(row) = rows.next()? {
             if row.get::<_, i64>(6)? != 1 {
                 return Err(WorkflowStoreError::InvalidData(
@@ -1093,21 +1390,56 @@ impl WorkflowStore {
             let edge: EdgeDefinition = serde_json::from_str(&json)?;
             super::validate_id("source_node_id", &edge.from)?;
             super::validate_id("target_node_id", &edge.to)?;
-            if row.get::<_, String>(2)? != edge.from
-                || row.get::<_, String>(3)? != edge.to
-                || row.get::<_, Option<String>>(4)?.is_none()
-                || row.get::<_, Option<String>>(5)?.is_none()
+            if row.get_ref(2)?.as_str().map_err(rusqlite::Error::from)? != edge.from
+                || row.get_ref(3)?.as_str().map_err(rusqlite::Error::from)? != edge.to
+                || row.get::<_, Option<i64>>(4)? != Some(1)
+                || row.get::<_, Option<i64>>(5)? != Some(1)
             {
                 return Err(WorkflowStoreError::InvalidData(
                     "workflow graph edge relationships are inconsistent".to_string(),
                 ));
             }
+            Self::validate_initial_edge_endpoints(
+                connection,
+                run_id,
+                &edge,
+                &mut validated_endpoints,
+            )?;
             edges.push(RunGraphEdge {
+                revision: 1,
                 edge_id: row.get(0)?,
                 edge,
             });
         }
         Ok(edges)
+    }
+
+    const fn initial_edge_endpoint_index(endpoint: Option<EdgeEndpoint<'_>>) -> &'static str {
+        match endpoint {
+            Some(EdgeEndpoint::Source(_)) => "INDEXED BY workflow_run_graph_edges_source",
+            Some(EdgeEndpoint::Target(_)) => "INDEXED BY workflow_run_graph_edges_target",
+            None => "",
+        }
+    }
+
+    fn validate_initial_edge_endpoints(
+        connection: &Connection,
+        run_id: &str,
+        edge: &EdgeDefinition,
+        validated: &mut BTreeSet<String>,
+    ) -> Result<(), WorkflowStoreError> {
+        for endpoint in [&edge.from, &edge.to] {
+            if validated.contains(endpoint) {
+                continue;
+            }
+            initial_node_record_in_snapshot(connection, run_id, endpoint)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "initial graph edge endpoint is missing".to_string(),
+                )
+            })?;
+            validated.insert(endpoint.clone());
+        }
+        Ok(())
     }
 
     /// Read the admitted graph revision without replay or repair.
@@ -1123,13 +1455,37 @@ impl WorkflowStore {
     ///
     /// This initial materialization API does not authorize graph edits or change scheduling.
     /// # Errors
-    /// Returns an error for invalid identities, missing/corrupt graph data, or database failure.
+    /// Returns an error for invalid identities, zero limits, missing/corrupt graph data, or database failure.
     pub fn run_graph_nodes(
         &self,
         run_id: &str,
         after_node_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RunGraphNode>, WorkflowStoreError> {
+        Self::validate_graph_page_request(run_id, Some(1), after_node_id, None, limit)?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let nodes = self.initial_graph_nodes_in_snapshot(run_id, after_node_id, limit)?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(nodes)
+    }
+
+    fn initial_graph_nodes_in_snapshot(
+        &self,
+        run_id: &str,
+        after_node_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphNode>, WorkflowStoreError> {
+        if limit == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "graph page limit must be positive".to_string(),
+            ));
+        }
         if let Some(id) = after_node_id {
             super::validate_id("after_node_id", id)?;
         }
@@ -1164,8 +1520,8 @@ impl WorkflowStore {
         ])?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            super::validate_id("node_id", &id)?;
+            let id = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+            super::validate_id("node_id", id)?;
             let json = row.get::<_, Option<String>>(2)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(
                     "workflow graph node payload is invalid or oversized".to_string(),

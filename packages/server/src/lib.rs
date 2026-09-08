@@ -62901,6 +62901,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("inspection");
         let graph = inspection.graph.as_ref().expect("run-owned graph");
         assert_eq!(graph.revision, 1);
+        assert!(!graph.edges.is_empty());
+        assert!(graph.edges.iter().all(|edge| edge.revision == 1));
         assert!(graph.nodes_complete);
         assert!(graph.edges_complete);
         assert!(
@@ -62944,6 +62946,58 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(page.revision, graph.revision);
         assert_eq!(page.nodes, graph.nodes[1..2]);
         assert_eq!(page.nodes_complete, graph.nodes.len() == 2);
+        let mut invalid_page_requests = Vec::new();
+        let mut invalid = page_request.clone();
+        invalid.limit = 0;
+        invalid_page_requests.push(invalid);
+        let mut invalid = page_request.clone();
+        invalid.expected_revision += 1;
+        invalid_page_requests.push(invalid);
+        let mut invalid = page_request.clone();
+        invalid.after_node_id = Some(String::new());
+        invalid_page_requests.push(invalid);
+        let mut invalid = page_request.clone();
+        invalid.after_edge_id = Some(u64::MAX);
+        invalid_page_requests.push(invalid);
+        for (index, invalid_page_request) in invalid_page_requests.into_iter().enumerate() {
+            let request_id = 3 + u64::try_from(index).expect("request index") * 2;
+            let invalid_envelope = bcode_ipc::request_envelope(
+                request_id,
+                &Request::InspectWorkflowRunGraph {
+                    request: invalid_page_request,
+                },
+            )
+            .expect("invalid page request");
+            bcode_ipc::send_envelope(&mut stream, &invalid_envelope)
+                .await
+                .expect("send invalid page");
+            let invalid_response = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("invalid page response");
+            assert!(matches!(
+                bcode_ipc::decode_response(&invalid_response.payload).expect("decode invalid page"),
+                Response::Err(_)
+            ));
+            let retry_envelope = bcode_ipc::request_envelope(
+                request_id + 1,
+                &Request::InspectWorkflowRunGraph {
+                    request: page_request.clone(),
+                },
+            )
+            .expect("retry page request");
+            bcode_ipc::send_envelope(&mut stream, &retry_envelope)
+                .await
+                .expect("send valid retry");
+            let retry_response = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("retry response");
+            let Response::Ok(ResponsePayload::WorkflowRunGraphInspection { graph: retry_page }) =
+                bcode_ipc::decode_response(&retry_response.payload).expect("decode retry")
+            else {
+                panic!("valid graph request failed after rejected request");
+            };
+            assert_eq!(retry_page, page);
+        }
         page_request.expected_revision += 1;
         assert!(workflow_operations::inspect_graph_page(&state, &page_request).is_err());
         let terminal = inspection.terminal_output.expect("terminal output");

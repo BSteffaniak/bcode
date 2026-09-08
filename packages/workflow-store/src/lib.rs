@@ -4631,10 +4631,10 @@ impl WorkflowStore {
                 "workflow root node-execution cap reached before child admission".to_string(),
             ));
         }
-        let descendant_count: u32 = transaction.query_row(
-            "SELECT COUNT(*) FROM workflow_run_links WHERE root_run_id = ?1",
-            [&request.link.root_run_id],
-            |row| row.get(0),
+        let descendant_count = bounded_descendant_count(
+            &transaction,
+            &request.link.root_run_id,
+            MAX_WORKFLOW_RUN_DESCENDANTS,
         )?;
         if descendant_count >= MAX_WORKFLOW_RUN_DESCENDANTS {
             return Err(WorkflowStoreError::InvalidData(
@@ -4799,29 +4799,21 @@ impl WorkflowStore {
              r.single_active, r.authored_provenance_json, r.terminal_output_id, \
              r.terminal_output_checksum_sha256, r.authorization_profile_json, r.authorization_ceiling, r.status, \
              r.cancellation_requested_at_ms, r.created_at_ms, r.updated_at_ms \
-             FROM workflow_run_links l JOIN workflow_runs r ON r.run_id = l.child_run_id \
+             FROM workflow_run_links l LEFT JOIN workflow_runs r ON r.run_id = l.child_run_id \
              WHERE l.root_run_id = ?1 ORDER BY l.created_at_ms, l.child_run_id LIMIT ?2",
         )?;
         statement
             .query_map((root_run_id, limit), |row| {
-                let link = WorkflowRunLink {
-                    root_run_id: row.get(0)?,
-                    parent_run_id: row.get(1)?,
-                    parent_node_id: row.get(2)?,
-                    parent_activation_id: row.get(3)?,
-                    parent_attempt: row.get(4)?,
-                    child_run_id: row.get(5)?,
-                    version: row.get(6)?,
-                    target: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            7,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    depth: row.get(8)?,
-                    created_at_ms: row.get(9)?,
-                };
+                let link = decode_run_link(row)?;
+                if row.get_ref(10)?.data_type() == rusqlite::types::Type::Null {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Null,
+                        Box::new(WorkflowStoreError::InvalidData(
+                            "workflow run link references a missing child run".to_string(),
+                        )),
+                    ));
+                }
                 let run = run_summary_from_row_offset(row, 10)?;
                 Ok((link, run))
             })?
@@ -5194,8 +5186,8 @@ impl WorkflowStore {
         activation: &NewActivation,
     ) -> Result<(), WorkflowStoreError> {
         validate_activation(activation)?;
-        enforce_activation_limits(&self.connection, activation)?;
         let transaction = self.connection.transaction()?;
+        enforce_activation_limits(&transaction, activation)?;
         insert_activation(&transaction, activation)?;
         transaction.commit()?;
         Ok(())
@@ -8463,11 +8455,16 @@ impl WorkflowStore {
                     "workflow repeat configuration is missing max_iterations".to_string(),
                 )
             })?;
-        let cycle_cap: u64 = transaction.query_row(
+        let cycle_cap = u64::from(transaction.query_row(
             "SELECT cycle_cap FROM workflow_runs WHERE run_id = ?1",
             [&activation.run_id],
-            |row| row.get(0),
-        )?;
+            |row| row.get::<_, u32>(0),
+        )?);
+        if cycle_cap == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "cycle_cap must be positive".to_string(),
+            ));
+        }
         let effective_iteration_bound = max_iterations.min(cycle_cap);
         let exhaustion_policy = activation
             .node
@@ -12518,22 +12515,55 @@ fn pending_fan_out_member_by_identity(
     .transpose()
 }
 
+fn decode_run_status(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<RunStatus> {
+    parse_run_status(row.get_ref(column)?.as_str()?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn enforce_activation_limits(
     connection: &Connection,
     activation: &NewActivation,
 ) -> Result<(), WorkflowStoreError> {
-    let (cycle_cap, status, cancellation_requested): (u64, String, bool) = connection.query_row(
-        "SELECT cycle_cap, status, cancellation_requested_at_ms IS NOT NULL \
+    let (cycle_cap, status, cancellation_requested, deadline_at_ms): (
+        u32,
+        RunStatus,
+        bool,
+        Option<u64>,
+    ) = connection.query_row(
+        "SELECT cycle_cap, status, cancellation_requested_at_ms IS NOT NULL, deadline_at_ms \
          FROM workflow_runs WHERE run_id = ?1",
         [&activation.run_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                decode_run_status(row, 1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        },
     )?;
-    if cancellation_requested || status != RunStatus::Running.as_str() {
+    let status = status.as_str();
+    if status != RunStatus::Running.as_str() {
         return Err(WorkflowStoreError::InvalidData(format!(
             "workflow run does not accept activations while {status}"
         )));
     }
-    if activation.dependency_generation >= cycle_cap {
+    if cancellation_requested {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow cancellation has been requested".to_string(),
+        ));
+    }
+    if deadline_at_ms.is_some_and(|deadline| activation.created_at_ms >= deadline) {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow wall-clock deadline has elapsed".to_string(),
+        ));
+    }
+    if activation.dependency_generation >= u64::from(cycle_cap) {
         return Err(WorkflowStoreError::InvalidData(
             "workflow cycle cap exceeded".to_string(),
         ));
@@ -12552,7 +12582,7 @@ fn enforce_attempt_limits(
         retry_cap,
         cancellation_requested,
         run_status,
-    ): (Option<u64>, u64, u32, u32, bool, String) = connection.query_row(
+    ): (Option<u64>, u64, u32, u32, bool, RunStatus) = connection.query_row(
         "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, retry_cap, \
          cancellation_requested_at_ms IS NOT NULL, status FROM workflow_runs WHERE run_id = ?1",
         [&attempt.run_id],
@@ -12563,10 +12593,11 @@ fn enforce_attempt_limits(
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
-                row.get(5)?,
+                decode_run_status(row, 5)?,
             ))
         },
     )?;
+    let run_status = run_status.as_str();
     if run_status != RunStatus::Running.as_str() {
         return Err(WorkflowStoreError::InvalidData(format!(
             "workflow run does not accept attempts while {run_status}"
@@ -12588,8 +12619,10 @@ fn enforce_attempt_limits(
         ));
     }
     let execution_count: u64 = connection.query_row(
-        "SELECT COUNT(*) FROM workflow_attempts WHERE run_id = ?1",
-        [&attempt.run_id],
+        "SELECT COUNT(*) FROM (
+            SELECT 1 FROM workflow_attempts WHERE run_id = ?1 LIMIT ?2
+         )",
+        rusqlite::params![&attempt.run_id, node_execution_cap],
         |row| row.get(0),
     )?;
     if execution_count >= node_execution_cap {
@@ -12598,9 +12631,12 @@ fn enforce_attempt_limits(
         ));
     }
     let active_count: u32 = connection.query_row(
-        "SELECT COUNT(*) FROM workflow_attempts WHERE run_id = ?1 \
-         AND status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling')",
-        [&attempt.run_id],
+        "SELECT COUNT(*) FROM (
+            SELECT 1 FROM workflow_attempts WHERE run_id = ?1
+            AND status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling')
+            LIMIT ?2
+         )",
+        rusqlite::params![&attempt.run_id, concurrency_cap],
         |row| row.get(0),
     )?;
     if active_count >= concurrency_cap {
@@ -13990,6 +14026,20 @@ fn required_definition_capability(
         )
 }
 
+fn bounded_descendant_count(
+    connection: &Connection,
+    root_run_id: &str,
+    limit: u32,
+) -> Result<u32, WorkflowStoreError> {
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT 1 FROM workflow_run_links WHERE root_run_id = ?1 LIMIT ?2
+         )",
+        rusqlite::params![root_run_id, limit],
+        |row| row.get(0),
+    )?)
+}
+
 fn validate_run_link(
     link: &WorkflowRunLink,
     child: &NewWorkflowRun,
@@ -14084,6 +14134,31 @@ fn decode_run_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRunLink>
             )),
         ));
     }
+    for (column, label) in [
+        (0, "root_run_id"),
+        (1, "parent_run_id"),
+        (2, "parent_node_id"),
+        (3, "parent_activation_id"),
+        (5, "child_run_id"),
+    ] {
+        validate_id(label, row.get_ref(column)?.as_str()?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    }
+    let child_run_id = row.get_ref(5)?.as_str()?;
+    if child_run_id == row.get_ref(0)?.as_str()? || child_run_id == row.get_ref(1)?.as_str()? {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(WorkflowStoreError::InvalidData(
+                "workflow child link aliases its root or parent run".to_string(),
+            )),
+        ));
+    }
     let target_json = row.get_ref(7)?.as_str()?;
     if target_json.len() > MAX_INLINE_JSON_BYTES {
         return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -14094,19 +14169,40 @@ fn decode_run_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRunLink>
             )),
         ));
     }
-    let target = serde_json::from_str(target_json).map_err(|error| {
+    let target: bcode_workflow::WorkflowCallTarget =
+        serde_json::from_str(target_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    target.validate().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    let parent_attempt: u32 = row.get(4)?;
+    let depth: u32 = row.get(8)?;
+    for (column, invalid) in [(4, parent_attempt == 0), (8, depth < 2)] {
+        if invalid {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Integer,
+                Box::new(WorkflowStoreError::InvalidData(
+                    "workflow run link attempt or depth is invalid".to_string(),
+                )),
+            ));
+        }
+    }
     Ok(WorkflowRunLink {
         root_run_id: row.get(0)?,
         parent_run_id: row.get(1)?,
         parent_node_id: row.get(2)?,
         parent_activation_id: row.get(3)?,
-        parent_attempt: row.get(4)?,
+        parent_attempt,
         child_run_id: row.get(5)?,
         version,
         target,
-        depth: row.get(8)?,
+        depth,
         created_at_ms: row.get(9)?,
     })
 }
@@ -15219,7 +15315,7 @@ fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError
 }
 
 fn validate_id(label: &str, value: &str) -> Result<(), WorkflowStoreError> {
-    if value.trim().is_empty() || value.len() > MAX_ID_BYTES {
+    if value.len() > MAX_ID_BYTES || value.trim().is_empty() {
         return Err(WorkflowStoreError::InvalidData(format!(
             "{label} must contain 1..={MAX_ID_BYTES} bytes"
         )));
@@ -15243,6 +15339,21 @@ mod tests {
     use super::*;
     use bcode_workflow::{Step, WorkflowBuilder};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn identifier_validation_enforces_byte_bound_and_non_whitespace_content() {
+        for invalid in [
+            String::new(),
+            " ".repeat(MAX_ID_BYTES + 1),
+            "\u{2003}".repeat(MAX_ID_BYTES),
+            "x".repeat(MAX_ID_BYTES + 1),
+        ] {
+            assert!(validate_id("test_id", &invalid).is_err());
+        }
+        assert!(validate_id("test_id", &"x".repeat(MAX_ID_BYTES)).is_ok());
+        assert!(validate_id("test_id", " x ").is_ok());
+        assert!(validate_id("test_id", "\u{2003}").is_err());
+    }
 
     struct RejectPackageMutationBoundary(WorkflowPackageMutationBoundary);
 
@@ -16799,6 +16910,211 @@ mod tests {
                 .run_id,
             "run-2"
         );
+    }
+
+    #[test]
+    fn descendant_summaries_reject_invalid_links_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        let mut child = new_run();
+        child.run_id = "child-run".to_string();
+        store.create_run(&child).expect("child");
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "example",
+            &definition("example"),
+        )
+        .expect("identity");
+        let target =
+            serde_json::to_string(&bcode_workflow::WorkflowCallTarget::Definition { identity })
+                .expect("target");
+        store.connection.execute(
+            "INSERT INTO workflow_run_links (root_run_id, parent_run_id, parent_node_id,
+             parent_activation_id, parent_attempt, child_run_id, version, target_json, depth, created_at_ms)
+             VALUES ('run-1', 'run-1', 'review', 'activation', 1, 'child-run', ?1, ?2, 2, 0)",
+            rusqlite::params![WORKFLOW_RUN_LINK_VERSION, target],
+        ).expect("link fixture");
+        assert_eq!(
+            store
+                .descendant_run_summaries("run-1", 10)
+                .expect("valid link")
+                .len(),
+            1
+        );
+        for mutation in [
+            "UPDATE workflow_run_links SET version = version + 1",
+            "UPDATE workflow_run_links SET parent_node_id = ''",
+            "UPDATE workflow_run_links SET target_json = 'not-json'",
+        ] {
+            store
+                .connection
+                .execute(mutation, [])
+                .expect("damage fixture");
+            let before = store.connection.total_changes();
+            assert!(store.descendant_run_summaries("run-1", 10).is_err());
+            assert!(store.child_run_links("run-1", 10).is_err());
+            assert_eq!(store.connection.total_changes(), before);
+            store.connection.execute(
+                "UPDATE workflow_run_links SET version = ?1, parent_node_id = 'review', target_json = ?2",
+                rusqlite::params![WORKFLOW_RUN_LINK_VERSION, target],
+            ).expect("restore fixture");
+        }
+        store
+            .connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+             UPDATE workflow_run_links SET child_run_id = 'missing-child';
+             PRAGMA foreign_keys = ON;",
+            )
+            .expect("missing child fixture");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .child_run_links("run-1", 10)
+                .expect("link remains")
+                .len(),
+            1
+        );
+        let error = store
+            .descendant_run_summaries("run-1", 10)
+            .expect_err("missing child");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow run link references a missing child run")
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn descendant_count_saturates_at_limit_and_is_root_scoped() {
+        let connection = Connection::open_in_memory().expect("connection");
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_run_links (root_run_id TEXT NOT NULL);
+             INSERT INTO workflow_run_links VALUES ('root'), ('root'), ('root'), ('other');",
+            )
+            .expect("count fixture");
+        let before = connection.total_changes();
+        for (root, limit, expected) in [
+            ("root", 0, 0),
+            ("root", 1, 1),
+            ("root", 2, 2),
+            ("root", 3, 3),
+            ("root", 4, 3),
+            ("other", 4, 1),
+            ("missing", 4, 0),
+        ] {
+            assert_eq!(
+                bounded_descendant_count(&connection, root, limit).expect("count"),
+                expected
+            );
+        }
+        assert_eq!(connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_link_decoder_rejects_child_aliasing_its_ancestors() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        for child in ["root", "parent"] {
+            let result = store.connection.query_row(
+                "SELECT 'root', 'parent', 'call', 'activation', 1, ?1, ?2, 'not-json', 2, 0",
+                rusqlite::params![child, WORKFLOW_RUN_LINK_VERSION],
+                decode_run_link,
+            );
+            assert!(matches!(
+                result,
+                Err(rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    _
+                ))
+            ));
+        }
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_link_decoder_validates_attempt_and_depth_without_a_recursion_ceiling() {
+        let (_temp, store) = initialized_store();
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "child",
+            &definition("child"),
+        )
+        .expect("identity");
+        let target =
+            serde_json::to_string(&bcode_workflow::WorkflowCallTarget::Definition { identity })
+                .expect("target");
+        let before = store.connection.total_changes();
+        for (attempt, depth, valid) in [
+            (0, 2, false),
+            (1, 0, false),
+            (1, 1, false),
+            (1, 2, true),
+            (u32::MAX, u32::MAX, true),
+        ] {
+            let result = store.connection.query_row(
+                "SELECT 'root', 'parent', 'call', 'activation', ?1, 'child', ?2, ?3, ?4, 0",
+                rusqlite::params![attempt, WORKFLOW_RUN_LINK_VERSION, target, depth],
+                decode_run_link,
+            );
+            assert_eq!(result.is_ok(), valid, "attempt {attempt}, depth {depth}");
+        }
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_link_decoder_rejects_invalid_ids_before_target_decoding() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        for column in [0, 1, 2, 3, 5] {
+            let mut ids = ["root", "parent", "call", "activation", "child"];
+            let index = if column == 5 { 4 } else { column };
+            ids[index] = "";
+            let result = store.connection.query_row(
+                "SELECT ?1, ?2, ?3, ?4, 1, ?5, ?6, 'not-json', 2, 0",
+                rusqlite::params![
+                    ids[0],
+                    ids[1],
+                    ids[2],
+                    ids[3],
+                    ids[4],
+                    WORKFLOW_RUN_LINK_VERSION
+                ],
+                decode_run_link,
+            );
+            assert!(matches!(result,
+                Err(rusqlite::Error::FromSqlConversionFailure(actual, rusqlite::types::Type::Text, _)) if actual == column));
+        }
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn run_link_decoder_rejects_invalid_target_identity() {
+        let (_temp, store) = initialized_store();
+        let mut identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "child",
+            &definition("child"),
+        )
+        .expect("identity");
+        identity.definition_version = 0;
+        let target =
+            serde_json::to_string(&bcode_workflow::WorkflowCallTarget::Definition { identity })
+                .expect("serializable invalid target");
+        let before = store.connection.total_changes();
+        let result = store.connection.query_row(
+            "SELECT 'root', 'parent', 'call', 'activation', 1, 'child', ?1, ?2, 2, 0",
+            (WORKFLOW_RUN_LINK_VERSION, target),
+            decode_run_link,
+        );
+        assert!(matches!(
+            result,
+            Err(rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                _
+            ))
+        ));
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
@@ -18416,6 +18732,41 @@ mod tests {
         assert_eq!(settled[1].payload["effective_iteration_bound"], 2);
     }
 
+    fn assert_invalid_repeat_caps_roll_back(store: &mut WorkflowStore) {
+        for invalid_cap in [-1_i64, 0, i64::from(u32::MAX) + 1] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET cycle_cap = ?1 WHERE run_id = 'repeat-cap-run'",
+                    [invalid_cap],
+                )
+                .expect("invalid cap fixture");
+            let events_before = store
+                .event_history("repeat-cap-run", None, 20)
+                .expect("events");
+            assert!(
+                store
+                    .settle_pending_control_nodes("repeat-cap-run", 10, 3)
+                    .is_err()
+            );
+            assert!(store.connection.is_autocommit());
+            assert_eq!(
+                store
+                    .event_history("repeat-cap-run", None, 20)
+                    .expect("events"),
+                events_before
+            );
+            assert_eq!(
+                store
+                    .run_summary("repeat-cap-run")
+                    .expect("run")
+                    .expect("run")
+                    .status,
+                RunStatus::Running
+            );
+        }
+    }
+
     #[test]
     fn repeat_cycle_cap_is_enforced_with_definition_bound() {
         let temp = tempfile::tempdir().expect("temp");
@@ -18468,6 +18819,14 @@ mod tests {
                 created_at_ms: 2,
             })
             .expect("output");
+        assert_invalid_repeat_caps_roll_back(&mut store);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET cycle_cap = 1 WHERE run_id = 'repeat-cap-run'",
+                [],
+            )
+            .expect("restore cap");
         store
             .settle_pending_control_nodes("repeat-cap-run", 10, 3)
             .expect("settle");
@@ -21110,6 +21469,176 @@ mod tests {
     }
 
     #[test]
+    fn current_node_revision_does_not_rebind_existing_activation_after_reopen() {
+        let (temp, store) = initialized_store();
+        let original = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("binding")
+            .expect("node");
+        let mut revised = original.clone();
+        revised.revision = 2;
+        revised.entry = false;
+        revised.exit = false;
+        revised.node.configuration = serde_json::json!({"revision_fixture": "replacement"});
+        assert_ne!(revised.node.configuration, original.node.configuration);
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("revision transaction");
+        transaction
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, ?1, 0, 0)",
+                [serde_json::to_string(&revised.node).expect("revised executable")],
+            )
+            .expect("revised node fixture");
+        transaction
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("revised graph fixture");
+        transaction.commit().expect("commit revision fixture");
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("current"),
+            Some(revised.clone())
+        );
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("unchanged binding"),
+            Some(original.clone())
+        );
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let before = reopened.connection.total_changes();
+        assert_eq!(
+            reopened
+                .current_run_graph_node("run-1", "review")
+                .expect("reopened current"),
+            Some(revised)
+        );
+        assert_eq!(
+            reopened
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("reopened binding"),
+            Some(original.clone())
+        );
+        assert_eq!(reopened.connection.total_changes(), before);
+        assert!(reopened.connection.is_autocommit());
+        reopened.connection.execute(
+            "UPDATE workflow_run_graph_nodes SET node_json = 'invalid-json' WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 2",
+            [],
+        ).expect("damaged latest revision fixture");
+        let before = reopened.connection.total_changes();
+        assert!(reopened.current_run_graph_node("run-1", "review").is_err());
+        assert_eq!(
+            reopened
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("intact historical binding"),
+            Some(original)
+        );
+        assert_eq!(reopened.connection.total_changes(), before);
+        assert!(reopened.connection.is_autocommit());
+    }
+
+    #[test]
+    fn activation_binding_never_substitutes_valid_latest_for_damaged_bound_revision() {
+        let (_temp, store) = initialized_store();
+        let original = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("binding")
+            .expect("node");
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';
+             UPDATE workflow_run_graph_nodes SET node_json = 'invalid-json'
+             WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1;",
+            )
+            .expect("damaged bound revision fixture");
+        let before = store.connection.total_changes();
+        let mut latest = original;
+        latest.revision = 2;
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("valid latest"),
+            Some(latest)
+        );
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .is_err()
+        );
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn activation_binding_does_not_fall_forward_when_bound_revision_is_missing() {
+        let (_temp, store) = initialized_store();
+        let mut latest = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("binding")
+            .expect("node");
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';
+             DELETE FROM workflow_run_graph_nodes
+             WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1;",
+            )
+            .expect("missing bound revision fixture");
+        latest.revision = 2;
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("latest node"),
+            Some(latest)
+        );
+        assert!(
+            store
+                .run_graph_node_revision("run-1", "review", 1)
+                .expect("missing revision")
+                .is_none()
+        );
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .is_err()
+        );
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
     fn activation_binding_snapshot_survives_another_connections_commit() {
         let (temp, store) = initialized_store();
         store
@@ -21149,7 +21678,28 @@ mod tests {
                 .expect("retained snapshot"),
             Some(original.clone())
         );
+        assert_eq!(
+            run_graph::initial_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .expect("initial binding in retained snapshot"),
+            Some(original.node.clone())
+        );
+        assert!(!store.connection.is_autocommit());
         transaction.commit().expect("release reader snapshot");
+        assert!(
+            run_graph::initial_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .is_err()
+        );
+        assert!(store.connection.is_autocommit());
         let mut revised = original;
         revised.revision = 2;
         assert_eq!(
@@ -21159,6 +21709,190 @@ mod tests {
             Some(revised)
         );
         assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn direct_bound_node_read_releases_owned_snapshot_after_failure() {
+        let (_temp, store) = initialized_store();
+        let expected = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("binding")
+            .expect("node");
+        assert_eq!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .expect("direct binding"),
+            Some(expected.node)
+        );
+        assert!(store.connection.is_autocommit());
+        let before = store.connection.total_changes();
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                "missing-activation"
+            )
+            .is_err()
+        );
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn direct_bound_node_read_releases_snapshot_on_invalid_revision() {
+        let (_temp, store) = initialized_store();
+        store.connection.execute(
+            "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'run-1' AND node_id = 'review'",
+            [],
+        ).expect("invalid binding fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id(),
+            )
+            .is_err()
+        );
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        let revision: u64 = store
+            .connection
+            .query_row(
+                "SELECT node_revision FROM workflow_activations WHERE activation_id = ?1",
+                [activation_id()],
+                |row| row.get(0),
+            )
+            .expect("fixture preserved");
+        assert_eq!(revision, 2);
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("new caller transaction");
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id(),
+            )
+            .is_err()
+        );
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("caller retains ownership");
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn initial_activation_lookup_validates_activation_before_missing_node() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        for (run_id, node_id) in [
+            ("run-1", "review"),
+            ("run-1", "missing"),
+            ("missing", "review"),
+        ] {
+            assert!(
+                run_graph::initial_activation_node(&store.connection, run_id, node_id, "").is_err()
+            );
+            assert!(store.connection.is_autocommit());
+        }
+        assert!(
+            run_graph::initial_activation_node(
+                &store.connection,
+                "run-1",
+                "missing",
+                "valid-activation"
+            )
+            .expect("missing node")
+            .is_none()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn direct_bound_node_read_rejects_missing_committed_executable() {
+        let (temp, store) = initialized_store();
+        store.connection.execute_batch(
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';
+             UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'run-1' AND node_id = 'review';",
+        ).expect("missing executable fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_node_revision("run-1", "review", 2)
+                .expect("missing exact revision")
+                .is_none()
+        );
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .is_err()
+        );
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .is_err()
+        );
+        assert!(store.connection.is_autocommit());
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("caller snapshot");
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .is_err()
+        );
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("caller retains ownership");
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .run_graph_node_revision("run-1", "review", 2)
+                .expect("still missing")
+                .is_none()
+        );
+        drop(store);
+        let reopened =
+            WorkflowStore::open_in_state_dir(temp.path()).expect("reopen damaged binding");
+        let before = reopened.connection.total_changes();
+        assert!(
+            reopened
+                .activation_graph_node("run-1", "review", &activation_id())
+                .is_err()
+        );
+        assert!(
+            reopened
+                .run_graph_node_revision("run-1", "review", 2)
+                .expect("preserved missing executable")
+                .is_none()
+        );
+        let binding: u64 = reopened
+            .connection
+            .query_row(
+                "SELECT node_revision FROM workflow_activations WHERE activation_id = ?1",
+                [activation_id()],
+                |row| row.get(0),
+            )
+            .expect("preserved binding");
+        assert_eq!(binding, 2);
+        assert_eq!(reopened.connection.total_changes(), before);
+        assert!(reopened.connection.is_autocommit());
     }
 
     #[test]
@@ -21379,6 +22113,31 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn exact_edge_read_rejects_invalid_endpoint_storage_without_writes() {
+        let (_temp, store) = initialized_store();
+        let oversized = "x".repeat(MAX_ID_BYTES + 1);
+        for (source, target) in [
+            ("", "review"),
+            ("review", ""),
+            (" ", "review"),
+            ("review", " "),
+            (oversized.as_str(), "review"),
+            ("review", oversized.as_str()),
+        ] {
+            store.connection.execute(
+                "INSERT OR REPLACE INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, ?1, ?2, 'not-json')",
+                (source, target),
+            ).expect("damaged edge fixture");
+            let before = store.connection.total_changes();
+            let error = store
+                .run_graph_edge_revision("run-1", 0, 1)
+                .expect_err("invalid endpoint");
+            assert!(error.to_string().contains("edge endpoint"), "{error}");
+            assert_eq!(store.connection.total_changes(), before);
+        }
     }
 
     #[test]
@@ -22669,12 +23428,12 @@ mod tests {
         }
         assert_eq!(ids, (0..205).collect::<Vec<u64>>());
         let first = store
-            .run_graph_incoming_edges("run-1", &node.id, None, 0)
-            .expect("zero limit clamps to one");
+            .run_graph_incoming_edges("run-1", &node.id, None, 1)
+            .expect("single edge page");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].edge_id, 0);
         let second = store
-            .run_graph_incoming_edges("run-1", &node.id, Some(0), 0)
+            .run_graph_incoming_edges("run-1", &node.id, Some(0), 1)
             .expect("exclusive cursor");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].edge_id, 1);
@@ -23054,6 +23813,1556 @@ mod tests {
                     .run_graph_incoming_edges("run-1", &node.id, None, 10)
                     .is_err()
             );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn exact_edge_revision_reuses_caller_snapshot_without_committing() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("edge payload")],
+        ).expect("edge fixture");
+        let before = store.connection.total_changes();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        assert_eq!(
+            store
+                .run_graph_edge_revision("run-1", 0, 1)
+                .expect("read")
+                .expect("edge")
+                .edge,
+            edge
+        );
+        assert!(!store.connection.is_autocommit());
+        assert!(store.run_graph_edge_revision("run-1", 0, 2).is_err());
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("caller retains ownership");
+        assert!(store.run_graph_edge_revision("run-1", 0, 2).is_err());
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn exact_node_read_preserves_snapshot_across_another_connection_write() {
+        let (temp, store) = initialized_store();
+        let writer = WorkflowStore::open_in_state_dir(temp.path()).expect("second connection");
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        let original = store
+            .run_graph_node_revision("run-1", "review", 1)
+            .expect("initial read")
+            .expect("node");
+        let write = "UPDATE workflow_run_graph_nodes SET node_json = 'not-json' WHERE run_id = 'run-1' AND node_id = 'review'";
+        writer
+            .connection
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("nonblocking writer");
+        let error = writer
+            .connection
+            .execute(write, [])
+            .expect_err("snapshot fences writer");
+        assert!(
+            matches!(error, rusqlite::Error::SqliteFailure(ref code, _) if code.code == rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .run_graph_node_revision("run-1", "review", 1)
+                .expect("snapshot read")
+                .expect("node"),
+            original
+        );
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("release snapshot");
+        writer
+            .connection
+            .execute(write, [])
+            .expect("write after release");
+        assert!(store.run_graph_node_revision("run-1", "review", 1).is_err());
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn exact_node_revision_reuses_caller_snapshot_without_committing() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        let node = store
+            .run_graph_node_revision("run-1", "review", 1)
+            .expect("node read")
+            .expect("node");
+        assert_eq!(node.node.id, "review");
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("current read")
+                .expect("node"),
+            node
+        );
+        assert!(store.current_run_graph_node("run-1", "").is_err());
+        assert!(!store.connection.is_autocommit());
+        assert!(store.run_graph_node_revision("run-1", "review", 2).is_err());
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("caller retains transaction");
+        assert!(store.run_graph_node_revision("run-1", "review", 2).is_err());
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn current_graph_pages_preserve_caller_transaction() {
+        let (_temp, store) = initialized_store();
+        let expected = store
+            .current_run_graph_page("run-1", Some(1), None, None, 100)
+            .expect("baseline");
+        let before = store.connection.total_changes();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        let page = store
+            .current_run_graph_page("run-1", Some(1), None, None, 100)
+            .expect("caller snapshot page");
+        assert_eq!(page.nodes, expected.nodes);
+        assert_eq!(page.edges, expected.edges);
+        assert_eq!(page.nodes_complete, expected.nodes_complete);
+        assert_eq!(page.edges_complete, expected.edges_complete);
+        assert_eq!(
+            store
+                .current_run_graph_nodes("run-1", 1, None, 100)
+                .expect("nodes"),
+            expected.nodes
+        );
+        assert_eq!(
+            store
+                .current_run_graph_edges("run-1", 1, None, 100)
+                .expect("edges"),
+            expected.edges
+        );
+        assert!(
+            store
+                .current_run_graph_page("run-1", Some(2), None, None, 100)
+                .is_err()
+        );
+        assert!(
+            store
+                .current_run_graph_nodes("run-1", 2, None, 100)
+                .is_err()
+        );
+        assert!(
+            store
+                .current_run_graph_edges("run-1", 2, None, 100)
+                .is_err()
+        );
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("caller retains ownership");
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn initial_graph_reads_preserve_caller_revision_transaction() {
+        let (_temp, store) = initialized_store();
+        let expected_nodes = store
+            .run_graph_nodes("run-1", None, 10)
+            .expect("baseline nodes");
+        let expected_node = store
+            .run_graph_node_record("run-1", "review")
+            .expect("baseline record");
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("caller transaction");
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", "review", None, 10)
+                .expect("initial edges")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .run_graph_nodes("run-1", None, 10)
+                .expect("caller snapshot nodes"),
+            expected_nodes
+        );
+        assert_eq!(
+            store
+                .run_graph_node_record("run-1", "review")
+                .expect("caller record"),
+            expected_node
+        );
+        transaction
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("caller revision fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", "review", None, 10)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", "review", None, 10)
+                .is_err()
+        );
+        assert!(store.run_graph_node_record("run-1", "review").is_err());
+        assert!(store.run_graph_nodes("run-1", None, 10).is_err());
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        assert_eq!(
+            store.run_graph_revision("run-1").expect("caller revision"),
+            Some(2)
+        );
+        transaction.rollback().expect("caller rollback");
+        assert_eq!(
+            store
+                .run_graph_revision("run-1")
+                .expect("restored revision"),
+            Some(1)
+        );
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", "review", None, 10)
+                .expect("restored edges")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .run_graph_nodes("run-1", None, 10)
+                .expect("restored nodes"),
+            expected_nodes
+        );
+        assert_eq!(
+            store
+                .run_graph_node_record("run-1", "review")
+                .expect("restored record"),
+            expected_node
+        );
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn graph_page_failure_preserves_uncommitted_caller_writes() {
+        let (_temp, store) = initialized_store();
+        let expected = store
+            .current_run_graph_page("run-1", Some(1), None, None, 100)
+            .expect("baseline");
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("caller transaction");
+        transaction.execute(
+            "UPDATE workflow_run_graph_nodes SET node_json = 'invalid-json' WHERE run_id = 'run-1' AND node_id = 'review'",
+            [],
+        ).expect("uncommitted damage fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .current_run_graph_page("run-1", Some(1), None, None, 100)
+                .is_err()
+        );
+        assert!(
+            store
+                .current_run_graph_nodes("run-1", 1, None, 100)
+                .is_err()
+        );
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        let payload: String = transaction.query_row(
+            "SELECT node_json FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1",
+            [],
+            |row| row.get(0),
+        ).expect("caller write remains visible");
+        assert_eq!(payload, "invalid-json");
+        transaction.rollback().expect("caller rolls back own write");
+        let restored = store
+            .current_run_graph_page("run-1", Some(1), None, None, 100)
+            .expect("original graph restored");
+        assert_eq!(restored.nodes, expected.nodes);
+        assert_eq!(restored.edges, expected.edges);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn current_edges_reject_damaged_current_endpoint_but_exact_edges_remain_readable() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("edge")],
+        ).expect("edge fixture");
+        store.connection.execute_batch(
+            "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, 'invalid-json', 0, 0);
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
+        ).expect("damaged current endpoint");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .run_graph_edge_revision("run-1", 0, 1)
+                .expect("historical edge")
+                .expect("edge")
+                .edge,
+            edge
+        );
+        assert!(store.current_run_graph_edges("run-1", 2, None, 10).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn exact_current_edge_lookup_preserves_snapshot_and_rejects_future_revision() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("edge")],
+        ).expect("edge fixture");
+        assert_eq!(
+            store
+                .current_run_graph_edge("run-1", 0)
+                .expect("current")
+                .expect("edge")
+                .edge,
+            edge
+        );
+        assert!(
+            store
+                .current_run_graph_edge("run-1", 1)
+                .expect("missing edge")
+                .is_none()
+        );
+        assert!(
+            store
+                .current_run_graph_edge("missing", 0)
+                .expect("missing run")
+                .is_none()
+        );
+        assert!(store.current_run_graph_edge("run-1", u64::MAX).is_err());
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("caller snapshot");
+        assert!(
+            store
+                .current_run_graph_edge("run-1", 0)
+                .expect("caller read")
+                .is_some()
+        );
+        transaction.execute_batch(
+            "INSERT INTO workflow_run_graph_edges SELECT run_id, edge_id, 2, source_node_id, target_node_id, edge_json FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = 0;",
+        ).expect("future edge fixture");
+        let before = store.connection.total_changes();
+        assert!(store.current_run_graph_edge("run-1", 0).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("caller rollback");
+        assert!(
+            store
+                .current_run_graph_edge("run-1", 0)
+                .expect("restored")
+                .is_some()
+        );
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn edge_reads_report_selected_revision_independently_of_graph_revision() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("edge")],
+        ).expect("initial edge fixture");
+        assert_eq!(
+            store
+                .run_graph_edge("run-1", 0)
+                .expect("initial")
+                .expect("edge")
+                .revision,
+            1
+        );
+        assert_eq!(
+            store
+                .run_graph_edges("run-1", None, 10)
+                .expect("initial page")[0]
+                .revision,
+            1
+        );
+        store.connection.execute_batch(
+            "INSERT INTO workflow_run_graph_edges SELECT run_id, edge_id, 2, source_node_id, target_node_id, edge_json FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = 0;
+             UPDATE workflow_run_graphs SET revision = 3 WHERE run_id = 'run-1';",
+        ).expect("later revision fixture");
+        let before = store.connection.total_changes();
+        let historical = store
+            .run_graph_edge_revision("run-1", 0, 1)
+            .expect("history")
+            .expect("edge");
+        let current = store
+            .current_run_graph_edge("run-1", 0)
+            .expect("current")
+            .expect("edge");
+        assert_eq!(historical.revision, 1);
+        assert_eq!(current.revision, 2);
+        assert_eq!(historical.edge, current.edge);
+        assert_ne!(historical, current);
+        let page = store
+            .current_run_graph_page("run-1", Some(3), None, None, 10)
+            .expect("page");
+        assert_eq!(page.revision, 3);
+        assert_eq!(page.edges, vec![current]);
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn initial_edge_reads_reject_damaged_endpoint_payload_without_mutation() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("edge")],
+        ).expect("edge fixture");
+        assert!(
+            store
+                .run_graph_edge("run-1", 0)
+                .expect("intact edge")
+                .is_some()
+        );
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("caller snapshot");
+        transaction.execute(
+            "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'run-1' AND node_id = 'review'",
+            ["{"],
+        ).expect("damaged endpoint");
+        let before = store.connection.total_changes();
+        assert!(store.run_graph_edge("run-1", 0).is_err());
+        assert!(store.run_graph_edges("run-1", None, 10).is_err());
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", "review", None, 10)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", "review", None, 10)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("caller rollback");
+        assert!(
+            store
+                .run_graph_edge("run-1", 0)
+                .expect("restored edge")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn initial_edges_validate_each_distinct_endpoint_payload() {
+        let (_temp, store) = initialized_store();
+        let mut target = store
+            .run_graph_node("run-1", "review")
+            .expect("node")
+            .expect("review");
+        target.id = "target".to_string();
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'target', 1, ?1, 0, 1)",
+                [serde_json::to_string(&target).expect("target")],
+            )
+            .expect("target fixture");
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "target".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'target', ?1)",
+            [serde_json::to_string(&edge).expect("edge")],
+        ).expect("edge fixture");
+        target.id = "wrong-identity".to_string();
+        let damaged_payloads = [
+            "{".to_string(),
+            " ".repeat(MAX_INLINE_JSON_BYTES + 1),
+            serde_json::to_string(&target).expect("mismatched identity"),
+        ];
+        for endpoint in ["review", "target"] {
+            for payload in &damaged_payloads {
+                let transaction = store.connection.unchecked_transaction().expect("snapshot");
+                transaction.execute(
+                    "UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = 'run-1' AND node_id = ?2",
+                    (payload, endpoint),
+                ).expect("damage endpoint");
+                let before = store.connection.total_changes();
+                assert!(store.run_graph_edge("run-1", 0).is_err(), "{endpoint}");
+                assert!(
+                    store.run_graph_edges("run-1", None, 10).is_err(),
+                    "{endpoint}"
+                );
+                assert!(
+                    store
+                        .run_graph_incoming_edges("run-1", "target", None, 10)
+                        .is_err(),
+                    "{endpoint}"
+                );
+                assert!(
+                    store
+                        .run_graph_outgoing_edges("run-1", "review", None, 10)
+                        .is_err(),
+                    "{endpoint}"
+                );
+                assert_eq!(store.connection.total_changes(), before);
+                assert!(!store.connection.is_autocommit());
+                transaction.rollback().expect("rollback damage");
+                assert_eq!(
+                    store
+                        .run_graph_edge("run-1", 0)
+                        .expect("restored")
+                        .expect("edge")
+                        .edge,
+                    edge
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initial_edge_endpoint_validation_is_not_reused_across_pages() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        let json = serde_json::to_string(&edge).expect("edge");
+        for id in 0..3 {
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                (id, &json),
+            ).expect("shared endpoint edge");
+        }
+        let page = store.run_graph_edges("run-1", None, 2).expect("first page");
+        assert_eq!(
+            page.iter().map(|edge| edge.edge_id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction.execute_batch(
+            "UPDATE workflow_run_graph_nodes SET node_json = '{' WHERE run_id = 'run-1' AND node_id = 'review'",
+        ).expect("damage shared endpoint");
+        let before = store.connection.total_changes();
+        assert!(store.run_graph_edges("run-1", Some(1), 2).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("rollback");
+        let page = store
+            .run_graph_edges("run-1", Some(1), 2)
+            .expect("restored page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].edge_id, 2);
+    }
+
+    #[test]
+    fn current_edge_pages_revalidate_shared_endpoints_after_changes() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        for id in 0..3 {
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                (id, serde_json::to_string(&edge).expect("edge")),
+            ).expect("edge fixture");
+        }
+        assert_eq!(
+            store
+                .current_run_graph_edges("run-1", 1, None, 2)
+                .expect("page")
+                .len(),
+            2
+        );
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, '{', 1, 1);
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
+            )
+            .expect("damaged current endpoint");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_edge_revision("run-1", 2, 1)
+                .expect("historical edge")
+                .is_some()
+        );
+        assert!(
+            store
+                .current_run_graph_edges("run-1", 2, Some(1), 2)
+                .is_err()
+        );
+        assert!(store.current_run_graph_edge("run-1", 0).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(!store.connection.is_autocommit());
+        transaction.rollback().expect("rollback");
+        let page = store
+            .current_run_graph_edges("run-1", 1, Some(1), 2)
+            .expect("restored");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].edge_id, 2);
+    }
+
+    #[test]
+    fn current_edge_page_reuse_does_not_skip_historical_endpoint_validation() {
+        let (_temp, store) = initialized_store();
+        let node = store
+            .run_graph_node("run-1", "review")
+            .expect("node")
+            .expect("review");
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 3, ?1, 1, 1)",
+                [serde_json::to_string(&node).expect("current node")],
+            )
+            .expect("current node fixture");
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, '{', 1, 1);
+             UPDATE workflow_run_graphs SET revision = 3 WHERE run_id = 'run-1';",
+            )
+            .expect("damaged historical node fixture");
+        for (id, revision) in [(0, 1), (1, 2)] {
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, ?2, 'review', 'review', ?3)",
+                (id, revision, serde_json::to_string(&edge).expect("edge")),
+            ).expect("edge fixture");
+        }
+        let before = store.connection.total_changes();
+        let first = store
+            .current_run_graph_edges("run-1", 3, None, 1)
+            .expect("first edge");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].edge_id, 0);
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("current")
+                .expect("node")
+                .revision,
+            3
+        );
+        assert!(store.current_run_graph_edges("run-1", 3, None, 2).is_err());
+        assert!(store.current_run_graph_edge("run-1", 1).is_err());
+        assert!(store.run_graph_edge_revision("run-1", 1, 2).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn initial_graph_pages_reject_zero_limits_without_mutation() {
+        let (_temp, store) = initialized_store();
+        let before = store.connection.total_changes();
+        for run_id in ["run-1", "missing"] {
+            assert!(store.run_graph_nodes(run_id, None, 0).is_err());
+            assert!(store.run_graph_edges(run_id, None, 0).is_err());
+            assert!(
+                store
+                    .run_graph_incoming_edges(run_id, "review", None, 0)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .run_graph_outgoing_edges(run_id, "review", None, 0)
+                    .is_err()
+            );
+            assert!(store.connection.is_autocommit());
+            let transaction = store
+                .connection
+                .unchecked_transaction()
+                .expect("caller snapshot");
+            assert!(store.run_graph_nodes(run_id, None, 0).is_err());
+            assert!(store.run_graph_edges(run_id, None, 0).is_err());
+            assert!(
+                store
+                    .run_graph_incoming_edges(run_id, "review", None, 0)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .run_graph_outgoing_edges(run_id, "review", None, 0)
+                    .is_err()
+            );
+            assert!(!store.connection.is_autocommit());
+            transaction.rollback().expect("caller rollback");
+        }
+        assert_eq!(store.connection.total_changes(), before);
+        assert_eq!(
+            store
+                .run_graph_nodes("run-1", None, 1)
+                .expect("valid page")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn current_edge_pages_surface_minimum_storage_identity_damage() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("allow damage fixture");
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+            (i64::MIN, serde_json::to_string(&edge).expect("edge")),
+        ).expect("invalid edge identity fixture");
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .expect("restore checks");
+        let before = store.connection.total_changes();
+        assert!(store.current_run_graph_edges("run-1", 1, None, 1).is_err());
+        assert!(
+            store
+                .current_run_graph_page("run-1", Some(1), None, None, 1)
+                .is_err()
+        );
+        assert!(store.run_graph_edges("run-1", None, 1).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn graph_pages_include_maximum_edge_identity_and_finish_without_overflow() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        let maximum = u64::try_from(i64::MAX).expect("maximum identity");
+        for id in [maximum - 1, maximum] {
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                (id, serde_json::to_string(&edge).expect("edge")),
+            ).expect("edge fixture");
+        }
+        let before = store.connection.total_changes();
+        let first = store
+            .current_run_graph_page("run-1", Some(1), None, None, 1)
+            .expect("first page");
+        assert_eq!(first.edges[0].edge_id, maximum - 1);
+        assert!(!first.edges_complete);
+        let last = store
+            .current_run_graph_page("run-1", Some(1), None, Some(maximum - 1), 1)
+            .expect("last page");
+        assert_eq!(last.edges.len(), 1);
+        assert_eq!(last.edges[0].edge_id, maximum);
+        assert!(last.edges_complete);
+        let exhausted = store
+            .current_run_graph_page("run-1", Some(1), None, Some(maximum), 1)
+            .expect("exhausted page");
+        assert!(exhausted.edges.is_empty());
+        assert!(exhausted.edges_complete);
+        assert_eq!(
+            store
+                .current_run_graph_edge("run-1", maximum)
+                .expect("exact current")
+                .expect("edge"),
+            last.edges[0]
+        );
+        assert_eq!(
+            store
+                .run_graph_edge_revision("run-1", maximum, 1)
+                .expect("exact historical")
+                .expect("edge"),
+            last.edges[0]
+        );
+        assert_eq!(
+            store
+                .run_graph_edges("run-1", Some(maximum - 1), 1)
+                .expect("initial last"),
+            last.edges
+        );
+        assert!(
+            store
+                .run_graph_edges("run-1", Some(maximum), 1)
+                .expect("initial exhausted")
+                .is_empty()
+        );
+        assert!(
+            store
+                .run_graph_incoming_edges("run-1", "review", Some(maximum), 1)
+                .expect("incoming exhausted")
+                .is_empty()
+        );
+        assert!(
+            store
+                .run_graph_outgoing_edges("run-1", "review", Some(maximum), 1)
+                .expect("outgoing exhausted")
+                .is_empty()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn combined_graph_continuation_requires_revision_without_mutation() {
+        let (_temp, store) = initialized_store();
+        let first = store
+            .current_run_graph_page("run-1", None, None, None, 1)
+            .expect("discover revision");
+        let cursor = first.nodes[0].node.id.as_str();
+        let before = store.connection.total_changes();
+        for (node, edge) in [
+            (Some(cursor), None),
+            (None, Some(0)),
+            (Some(cursor), Some(0)),
+        ] {
+            assert!(
+                store
+                    .current_run_graph_page("run-1", None, node, edge, 1)
+                    .is_err()
+            );
+            assert!(store.connection.is_autocommit());
+            let transaction = store
+                .connection
+                .unchecked_transaction()
+                .expect("caller snapshot");
+            assert!(
+                store
+                    .current_run_graph_page("run-1", None, node, edge, 1)
+                    .is_err()
+            );
+            assert!(!store.connection.is_autocommit());
+            assert!(
+                store
+                    .current_run_graph_page("run-1", Some(first.revision), node, edge, 1)
+                    .is_ok()
+            );
+            transaction.rollback().expect("caller rollback");
+        }
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn graph_continuation_rejects_old_revision_after_plan_changes() {
+        let (_temp, store) = initialized_store();
+        let first = store
+            .current_run_graph_page("run-1", None, None, None, 1)
+            .expect("first page");
+        let cursor = first.nodes[0].node.id.as_str();
+        let mut revised = first.nodes[0].node.clone();
+        revised.name = "revised plan node".to_string();
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("revision fixture");
+        transaction
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', ?1, 2, ?2, ?3, ?4)",
+                rusqlite::params![
+                    cursor,
+                    serde_json::to_string(&revised).expect("node"),
+                    first.nodes[0].entry,
+                    first.nodes[0].exit
+                ],
+            )
+            .expect("revised node");
+        transaction
+            .execute_batch("UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';")
+            .expect("advance revision");
+        transaction.commit().expect("commit revision fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .current_run_graph_page("run-1", Some(first.revision), Some(cursor), None, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .current_run_graph_page("run-1", None, Some(cursor), None, 1)
+                .is_err()
+        );
+        let refreshed = store
+            .current_run_graph_page("run-1", None, None, None, 1)
+            .expect("rediscover");
+        assert_eq!(refreshed.revision, 2);
+        assert_eq!(refreshed.nodes[0].node, revised);
+        let continued = store
+            .current_run_graph_page("run-1", Some(refreshed.revision), Some(cursor), None, 1)
+            .expect("new continuation");
+        assert_eq!(continued.revision, 2);
+        assert!(
+            continued
+                .nodes
+                .iter()
+                .all(|record| record.node.id.as_str() > cursor)
+        );
+        assert_eq!(
+            store
+                .run_graph_node_revision("run-1", cursor, 1)
+                .expect("history")
+                .expect("node"),
+            first.nodes[0]
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn combined_graph_page_validates_requests_before_reading_storage() {
+        let (_temp, store) = initialized_store();
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("caller transaction");
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON; DROP TABLE workflow_run_graphs;")
+            .expect("unavailable graph fixture");
+        let before = store.connection.total_changes();
+        for (revision, node, edge, limit) in [
+            (Some(1), None, None, 0),
+            (Some(0), None, None, 1),
+            (Some(u64::MAX), None, None, 1),
+            (Some(1), Some(""), None, 1),
+            (Some(1), None, Some(u64::MAX), 1),
+            (None, Some("review"), None, 1),
+        ] {
+            assert!(matches!(
+                store.current_run_graph_page("run-1", revision, node, edge, limit),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(!store.connection.is_autocommit());
+        }
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("restore graph");
+        assert!(
+            store
+                .current_run_graph_page("run-1", None, None, None, 1)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn standalone_graph_pages_validate_before_storage_reads() {
+        let (_temp, store) = initialized_store();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON; DROP TABLE workflow_run_graphs;")
+            .expect("unavailable graph fixture");
+        let before = store.connection.total_changes();
+        for (run_id, revision, limit) in [
+            ("", 1, 1),
+            ("run-1", 0, 1),
+            ("run-1", u64::MAX, 1),
+            ("run-1", 1, 0),
+        ] {
+            assert!(matches!(
+                store.current_run_graph_nodes(run_id, revision, None, limit),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.current_run_graph_edges(run_id, revision, None, limit),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        assert!(matches!(
+            store.current_run_graph_nodes("run-1", 1, Some(""), 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(matches!(
+            store.current_run_graph_edges("run-1", 1, Some(u64::MAX), 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("restore graph");
+        assert!(store.current_run_graph_nodes("run-1", 1, None, 1).is_ok());
+        assert!(store.current_run_graph_edges("run-1", 1, None, 1).is_ok());
+    }
+
+    #[test]
+    fn initial_graph_pages_validate_before_storage_reads() {
+        let (_temp, store) = initialized_store();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON; DROP TABLE workflow_run_graphs;")
+            .expect("unavailable graph fixture");
+        let before = store.connection.total_changes();
+        for (run_id, limit) in [("", 1), ("run-1", 0)] {
+            assert!(matches!(
+                store.run_graph_nodes(run_id, None, limit),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_edges(run_id, None, limit),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_incoming_edges(run_id, "review", None, limit),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_outgoing_edges(run_id, "review", None, limit),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        assert!(matches!(
+            store.run_graph_nodes("run-1", Some(""), 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(matches!(
+            store.run_graph_edges("run-1", Some(u64::MAX), 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("restore graph");
+        assert!(store.run_graph_nodes("run-1", None, 1).is_ok());
+        assert!(store.run_graph_edges("run-1", None, 1).is_ok());
+    }
+
+    #[test]
+    fn exact_graph_revisions_validate_before_storage_reads() {
+        let (_temp, store) = initialized_store();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON; DROP TABLE workflow_run_graphs;")
+            .expect("unavailable graph fixture");
+        let before = store.connection.total_changes();
+        for (run_id, node_id, revision) in [
+            ("", "review", 1),
+            ("run-1", "", 1),
+            ("run-1", "review", 0),
+            ("run-1", "review", u64::MAX),
+        ] {
+            assert!(matches!(
+                store.run_graph_node_revision(run_id, node_id, revision),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        for (run_id, edge_id, revision) in [
+            ("", 0, 1),
+            ("run-1", u64::MAX, 1),
+            ("run-1", 0, 0),
+            ("run-1", 0, u64::MAX),
+        ] {
+            assert!(matches!(
+                store.run_graph_edge_revision(run_id, edge_id, revision),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        assert!(matches!(
+            store.run_graph_node_revision("run-1", "review", 1),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(matches!(
+            store.run_graph_edge_revision("run-1", 0, 1),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("restore graph");
+        assert!(store.run_graph_node_revision("run-1", "review", 1).is_ok());
+        assert!(store.run_graph_edge_revision("run-1", 0, 1).is_ok());
+    }
+
+    #[test]
+    fn current_graph_entities_validate_before_storage_reads() {
+        let (_temp, store) = initialized_store();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON; DROP TABLE workflow_run_graphs;")
+            .expect("unavailable graph fixture");
+        let before = store.connection.total_changes();
+        for (run_id, node_id) in [("", "review"), ("run-1", "")] {
+            assert!(matches!(
+                store.current_run_graph_node(run_id, node_id),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        for (run_id, edge_id) in [("", 0), ("run-1", u64::MAX)] {
+            assert!(matches!(
+                store.current_run_graph_edge(run_id, edge_id),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        assert!(matches!(
+            store.current_run_graph_node("run-1", "review"),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(matches!(
+            store.current_run_graph_edge("run-1", 0),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("restore graph");
+        assert!(store.current_run_graph_node("run-1", "review").is_ok());
+        assert!(store.current_run_graph_edge("run-1", 0).is_ok());
+    }
+
+    #[test]
+    fn activation_graph_reads_validate_before_storage_reads() {
+        let (_temp, store) = initialized_store();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON; DROP TABLE workflow_activations; DROP TABLE workflow_run_graphs;")
+            .expect("unavailable graph fixture");
+        let before = store.connection.total_changes();
+        for (run_id, node_id, activation_id) in [
+            ("", "review", "activation-1"),
+            ("run-1", "", "activation-1"),
+            ("run-1", "review", ""),
+        ] {
+            assert!(matches!(
+                store.activation_graph_node(run_id, node_id, activation_id),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                super::run_graph::initial_activation_node(
+                    &store.connection,
+                    run_id,
+                    node_id,
+                    activation_id
+                ),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        assert!(matches!(
+            store.activation_graph_node("run-1", "review", "activation-1"),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(matches!(
+            super::run_graph::initial_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                "activation-1"
+            ),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("restore graph");
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", "absent-activation")
+                .expect("restored activation storage")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn initial_node_reads_validate_before_storage_reads() {
+        let (_temp, store) = initialized_store();
+        let transaction = store.connection.unchecked_transaction().expect("snapshot");
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON; DROP TABLE workflow_run_graphs;")
+            .expect("unavailable graph fixture");
+        let before = store.connection.total_changes();
+        for (run_id, node_id) in [("", "review"), ("run-1", "")] {
+            assert!(matches!(
+                store.run_graph_node_record(run_id, node_id),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                store.run_graph_node(run_id, node_id),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+            assert!(matches!(
+                super::run_graph::initial_exit(&store.connection, run_id, node_id),
+                Err(WorkflowStoreError::InvalidData(_))
+            ));
+        }
+        assert!(matches!(
+            store.run_graph_node_record("run-1", "review"),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(matches!(
+            store.run_graph_node("run-1", "review"),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(matches!(
+            super::run_graph::initial_exit(&store.connection, "run-1", "review"),
+            Err(WorkflowStoreError::Database(_))
+        ));
+        assert!(!store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        transaction.rollback().expect("restore graph");
+        let record = store
+            .run_graph_node_record("run-1", "review")
+            .expect("restored graph")
+            .expect("node");
+        assert_eq!(
+            store.run_graph_node("run-1", "review").expect("node read"),
+            Some(record.node)
+        );
+        assert_eq!(
+            super::run_graph::initial_exit(&store.connection, "run-1", "review")
+                .expect("exit read"),
+            record.exit
+        );
+    }
+
+    fn assert_activation_keeps_node(store: &WorkflowStore, original: &super::RunGraphNode) {
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("activation binding"),
+            Some(original.clone())
+        );
+    }
+
+    fn assert_single_node_graph_page(store: &WorkflowStore, node: &super::RunGraphNode) {
+        for expected in [None, Some(node.revision)] {
+            let page = store
+                .current_run_graph_page("run-1", expected, None, None, 1)
+                .expect("combined page");
+            assert_eq!(page.revision, node.revision);
+            assert_eq!(page.nodes, vec![node.clone()]);
+            assert!(page.nodes_complete && page.edges_complete);
+            assert!(page.edges.is_empty());
+        }
+    }
+
+    #[test]
+    fn current_node_read_preserves_snapshot_across_concurrent_revision() {
+        let (_temp, store) = initialized_store();
+        // WAL permits the fixture writer to commit while the reader retains its snapshot.
+        store
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("enable concurrent fixture writes");
+        let original = store
+            .current_run_graph_node("run-1", "review")
+            .expect("read")
+            .expect("node");
+        let mut writer =
+            rusqlite::Connection::open(store.connection.path().expect("database path"))
+                .expect("writer");
+        let snapshot = store.connection.unchecked_transaction().expect("snapshot");
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("pin snapshot"),
+            Some(original.clone())
+        );
+        let mut revised_node = original.node.clone();
+        revised_node.name = "Revised review".to_string();
+        let edit = writer.transaction().expect("edit transaction");
+        edit.execute("INSERT INTO workflow_run_graph_nodes SELECT run_id, node_id, 2, ?1, 1 - is_entry, 1 - is_exit FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1", [serde_json::to_string(&revised_node).expect("revised node payload")]).expect("new revision");
+        edit.execute(
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+            [],
+        )
+        .expect("publish revision");
+        edit.commit().expect("concurrent commit");
+        assert_activation_keeps_node(&store, &original);
+        assert_single_node_graph_page(&store, &original);
+        assert!(matches!(
+            store.current_run_graph_page("run-1", Some(2), None, None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(
+            store
+                .current_run_graph_nodes("run-1", 1, None, 1)
+                .expect("snapshot page"),
+            vec![original.clone()]
+        );
+        assert!(matches!(
+            store.current_run_graph_nodes("run-1", 2, None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("snapshot read"),
+            Some(original.clone())
+        );
+        assert_eq!(
+            store
+                .run_graph_revision("run-1")
+                .expect("snapshot revision"),
+            Some(1)
+        );
+        assert!(!store.connection.is_autocommit());
+        snapshot.rollback().expect("release snapshot");
+        assert!(matches!(
+            store.current_run_graph_page("run-1", Some(1), None, None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(matches!(
+            store.current_run_graph_nodes("run-1", 1, None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(store.connection.is_autocommit());
+        let current = store
+            .current_run_graph_node("run-1", "review")
+            .expect("fresh read")
+            .expect("node");
+        assert_eq!(current.revision, 2);
+        assert_single_node_graph_page(&store, &current);
+        assert_eq!(
+            store
+                .current_run_graph_nodes("run-1", 2, None, 1)
+                .expect("fresh revision page"),
+            vec![current.clone()]
+        );
+        assert_eq!(current.node, revised_node);
+        assert_eq!(
+            (current.entry, current.exit),
+            (!original.entry, !original.exit)
+        );
+        assert_ne!(current.node, original.node);
+        assert_activation_keeps_node(&store, &original);
+        assert_eq!(
+            store
+                .run_graph_node_revision("run-1", "review", 1)
+                .expect("historical read"),
+            Some(original)
+        );
+    }
+
+    fn assert_single_edge_graph_page(store: &WorkflowStore, edge: &super::RunGraphEdge) {
+        for expected in [None, Some(edge.revision)] {
+            let page = store
+                .current_run_graph_page("run-1", expected, None, None, 1)
+                .expect("combined edge page");
+            assert_eq!(page.revision, edge.revision);
+            assert_eq!(page.edges, vec![edge.clone()]);
+            assert!(page.edges_complete && page.nodes_complete);
+            assert_eq!(page.nodes.len(), 1);
+            assert_eq!(page.nodes[0].node.id, "review");
+            assert_eq!(page.nodes[0].revision, 1);
+        }
+    }
+
+    #[test]
+    fn current_edge_reads_preserve_snapshot_across_concurrent_revision() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("concurrent fixture");
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("payload")],
+        ).expect("initial edge");
+        let mut writer =
+            rusqlite::Connection::open(store.connection.path().expect("path")).expect("writer");
+        let snapshot = store.connection.unchecked_transaction().expect("snapshot");
+        let original = store
+            .current_run_graph_edge("run-1", 0)
+            .expect("pin snapshot")
+            .expect("edge");
+        let revised_edge = bcode_workflow::EdgeDefinition {
+            kind: bcode_workflow::EdgeKind::Retry { max_attempts: 2 },
+            ..edge
+        };
+        let edit = writer.transaction().expect("edit");
+        edit.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 2, 'review', 'review', ?1)",
+            [serde_json::to_string(&revised_edge).expect("revised payload")],
+        )
+        .expect("new edge revision");
+        edit.execute(
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+            [],
+        )
+        .expect("publish");
+        edit.commit().expect("concurrent commit");
+        assert_single_edge_graph_page(&store, &original);
+        assert_eq!(
+            store
+                .current_run_graph_edge("run-1", 0)
+                .expect("snapshot edge"),
+            Some(original.clone())
+        );
+        assert_eq!(
+            store
+                .current_run_graph_edges("run-1", 1, None, 1)
+                .expect("snapshot page"),
+            vec![original.clone()]
+        );
+        assert!(matches!(
+            store.current_run_graph_edges("run-1", 2, None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(!store.connection.is_autocommit());
+        snapshot.rollback().expect("release");
+        assert!(matches!(
+            store.current_run_graph_edges("run-1", 1, None, 1),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(store.connection.is_autocommit());
+        let current = store
+            .current_run_graph_edge("run-1", 0)
+            .expect("fresh edge")
+            .expect("edge");
+        assert_eq!(current.revision, 2);
+        assert_eq!(current.edge, revised_edge);
+        assert_ne!(current.edge, original.edge);
+        assert_single_edge_graph_page(&store, &current);
+        assert_eq!(
+            store
+                .current_run_graph_edges("run-1", 2, None, 1)
+                .expect("fresh page"),
+            vec![current]
+        );
+        assert_eq!(
+            store
+                .run_graph_edge_revision("run-1", 0, 1)
+                .expect("historical edge"),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn combined_graph_page_surfaces_damaged_lookahead_edge() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("edge payload")],
+        ).expect("valid edge fixture");
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 1, 1, 'review', 'review', 'not-json')",
+            [],
+        ).expect("damaged lookahead fixture");
+        let before = store.connection.total_changes();
+        let edges = store
+            .current_run_graph_edges("run-1", 1, None, 1)
+            .expect("bounded first edge");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].edge, edge);
+        assert_eq!(edges[0].edge_id, 0);
+        for expected in [None, Some(1)] {
+            assert!(
+                store
+                    .current_run_graph_page("run-1", expected, None, None, 1)
+                    .is_err()
+            );
+            assert!(store.connection.is_autocommit());
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn combined_graph_page_surfaces_damaged_lookahead_node() {
+        let (_temp, store) = initialized_store();
+        let oversized = "z".repeat(MAX_ID_BYTES + 1);
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', ?1, 1, 'not-json', 0, 0)",
+                [&oversized],
+            )
+            .expect("damaged lookahead fixture");
+        let before = store.connection.total_changes();
+        let nodes = store
+            .current_run_graph_nodes("run-1", 1, None, 1)
+            .expect("bounded first node");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node.id, "review");
+        let error = store
+            .current_run_graph_page("run-1", Some(1), None, None, 1)
+            .expect_err("lookahead damage must be surfaced");
+        assert!(error.to_string().contains("node_id"), "{error}");
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn initial_node_page_rejects_invalid_identity_before_payload_without_writes() {
+        let (_temp, store) = initialized_store();
+        for id in [String::new(), " ".to_string(), "x".repeat(MAX_ID_BYTES + 1)] {
+            store.connection.execute(
+                "UPDATE workflow_run_graph_nodes SET node_id = ?1, node_json = 'not-json' WHERE run_id = 'run-1'",
+                [&id],
+            ).expect("damaged node fixture");
+            let before = store.connection.total_changes();
+            let error = store
+                .run_graph_nodes("run-1", None, 1)
+                .expect_err("invalid identity");
+            assert!(
+                matches!(error, WorkflowStoreError::InvalidData(ref message) if message.contains("node_id")),
+                "{error}"
+            );
+            let current_error = store
+                .current_run_graph_nodes("run-1", 1, None, 1)
+                .expect_err("current page must surface invalid identity");
+            assert!(
+                current_error.to_string().contains("node_id"),
+                "{current_error}"
+            );
+            for expected_revision in [None, Some(1)] {
+                let page_error = store
+                    .current_run_graph_page("run-1", expected_revision, None, None, 1)
+                    .expect_err("combined page must surface invalid identity");
+                assert!(page_error.to_string().contains("node_id"), "{page_error}");
+                assert!(store.connection.is_autocommit());
+            }
+            assert!(store.connection.is_autocommit());
             assert_eq!(store.connection.total_changes(), before);
         }
     }
@@ -26044,6 +28353,335 @@ mod tests {
             )
             .expect("deadline");
         assert!(deadline_store.prepare_attempt(&attempt).is_err());
+    }
+
+    #[test]
+    fn activation_admission_supports_maximum_cycle_cap() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET cycle_cap = ?1 WHERE run_id = 'run-1'",
+                [u32::MAX],
+            )
+            .expect("maximum cap fixture");
+        assert_eq!(
+            store
+                .run_limits("run-1")
+                .expect("limits")
+                .expect("run")
+                .cycle_cap,
+            u32::MAX
+        );
+        store
+            .create_activation(&NewActivation {
+                activation_id: "maximum-cap-admitted".to_string(),
+                dependency_generation: u64::from(u32::MAX) - 1,
+                ..new_activation()
+            })
+            .expect("generation below maximum cap");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .create_activation(&NewActivation {
+                    activation_id: "maximum-cap-rejected".to_string(),
+                    dependency_generation: u64::from(u32::MAX),
+                    ..new_activation()
+                })
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn activation_admission_rejects_out_of_range_stored_cycle_cap() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET cycle_cap = ?1 WHERE run_id = 'run-1'",
+                [u64::from(u32::MAX) + 1],
+            )
+            .expect("invalid cap fixture");
+        let before = store.connection.total_changes();
+        assert!(store.run_limits("run-1").is_err());
+        assert!(
+            store
+                .create_activation(&NewActivation {
+                    activation_id: "invalid-cycle-cap".to_string(),
+                    ..new_activation()
+                })
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn activation_deadline_is_exclusive_and_rejection_does_not_mutate() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET deadline_at_ms = 20 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("deadline fixture");
+        let activation = NewActivation {
+            activation_id: "deadline-activation".to_string(),
+            created_at_ms: 19,
+            ..new_activation()
+        };
+        store
+            .create_activation(&activation)
+            .expect("before deadline");
+        for created_at_ms in [20, 21] {
+            let before = store.connection.total_changes();
+            let error = store
+                .create_activation(&NewActivation {
+                    created_at_ms,
+                    ..activation.clone()
+                })
+                .expect_err("expired activation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("workflow wall-clock deadline has elapsed")
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            assert!(store.connection.is_autocommit());
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET deadline_at_ms = NULL WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("remove deadline");
+        store
+            .create_activation(&NewActivation {
+                activation_id: "no-deadline-activation".to_string(),
+                created_at_ms: 21,
+                ..activation
+            })
+            .expect("no deadline");
+    }
+
+    #[test]
+    fn activation_admission_preserves_deadline_and_cancellation_after_reopen() {
+        let (temp, store) = initialized_store();
+        store.connection.execute(
+            "UPDATE workflow_runs SET deadline_at_ms = 20, cancellation_requested_at_ms = 12 WHERE run_id = 'run-1'", [],
+        ).expect("persist admission state");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let activation = NewActivation {
+            activation_id: "after-reopen".to_string(),
+            created_at_ms: 19,
+            ..new_activation()
+        };
+        let before = store.connection.total_changes();
+        let error = store
+            .create_activation(&activation)
+            .expect_err("durable cancellation");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow cancellation has been requested")
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        // Isolate the persisted deadline from the cancellation fixture.
+        store.connection.execute(
+            "UPDATE workflow_runs SET cancellation_requested_at_ms = NULL WHERE run_id = 'run-1'", [],
+        ).expect("clear fixture cancellation");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen deadline");
+        let before = store.connection.total_changes();
+        let error = store
+            .create_activation(&NewActivation {
+                created_at_ms: 20,
+                ..activation.clone()
+            })
+            .expect_err("durable deadline");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow wall-clock deadline has elapsed")
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .create_activation(&activation)
+            .expect("before persisted deadline");
+    }
+
+    #[test]
+    fn activation_creation_rejects_durable_cancellation_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET cancellation_requested_at_ms = 12 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("cancellation fixture");
+        let before = store.connection.total_changes();
+        let error = store
+            .create_activation(&NewActivation {
+                activation_id: "after-cancellation".to_string(),
+                ..new_activation()
+            })
+            .expect_err("cancelled admission");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow cancellation has been requested")
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn admission_rejects_unknown_run_status_without_exposing_it() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'future-secret-status' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("future status fixture");
+        let before = store.connection.total_changes();
+        let attempt = PreparedAttempt {
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            attempt: 1,
+            side_effect: DispatchSideEffect::ReadOnly,
+            intent: serde_json::json!({}),
+            prepared_at_ms: 12,
+        };
+        for error in [
+            enforce_attempt_limits(&store.connection, &attempt).expect_err("unknown status"),
+            enforce_activation_limits(&store.connection, &new_activation())
+                .expect_err("unknown status"),
+        ] {
+            assert!(error.to_string().contains("unknown workflow run status"));
+            assert!(!error.to_string().contains("future-secret-status"));
+        }
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn attempt_admission_limits_are_run_scoped() {
+        let (_temp, mut store) = initialized_store();
+        let mut other = new_run();
+        other.run_id = "other-run".to_string();
+        store.create_run(&other).expect("other run");
+        let attempt = PreparedAttempt {
+            run_id: "other-run".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_identity("other-run", "review", 0),
+            attempt: 1,
+            side_effect: DispatchSideEffect::ReadOnly,
+            intent: serde_json::json!({}),
+            prepared_at_ms: 12,
+        };
+        store.prepare_attempt(&attempt).expect("other attempt");
+        store.connection.execute(
+            "UPDATE workflow_runs SET concurrency_cap = 1, node_execution_cap = 1 WHERE run_id = 'run-1'", [],
+        ).expect("limits");
+        let local = PreparedAttempt {
+            run_id: "run-1".to_string(),
+            activation_id: activation_id(),
+            ..attempt
+        };
+        let before = store.connection.total_changes();
+        enforce_attempt_limits(&store.connection, &local)
+            .expect("foreign attempt consumes neither allowance");
+        assert_eq!(store.connection.total_changes(), before);
+        store.prepare_attempt(&local).expect("local admission");
+        let error = enforce_attempt_limits(&store.connection, &local)
+            .expect_err("local allowance exhausted");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow node-execution cap exceeded")
+        );
+    }
+
+    #[test]
+    fn concurrency_admission_counts_all_active_states_but_not_terminal_attempts() {
+        let (_temp, mut store) = initialized_store();
+        store.connection.execute(
+            "UPDATE workflow_runs SET concurrency_cap = 1, node_execution_cap = 100 WHERE run_id = 'run-1'",
+            [],
+        ).expect("limits");
+        let attempt = PreparedAttempt {
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            attempt: 1,
+            side_effect: DispatchSideEffect::ReadOnly,
+            intent: serde_json::json!({}),
+            prepared_at_ms: 12,
+        };
+        enforce_attempt_limits(&store.connection, &attempt).expect("empty capacity");
+        store.prepare_attempt(&attempt).expect("first attempt");
+        for status in [
+            "prepared",
+            "admitted",
+            "running",
+            "cancelling",
+            "sibling_cancelling",
+        ] {
+            store
+                .connection
+                .execute("UPDATE workflow_attempts SET status = ?1", [status])
+                .expect("active fixture");
+            let before = store.connection.total_changes();
+            let error =
+                enforce_attempt_limits(&store.connection, &attempt).expect_err("capacity occupied");
+            assert!(
+                error
+                    .to_string()
+                    .contains("workflow concurrency cap reached"),
+                "{status}: {error}"
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+        for status in ["succeeded", "failed", "cancelled", "abandoned"] {
+            store
+                .connection
+                .execute("UPDATE workflow_attempts SET status = ?1", [status])
+                .expect("terminal fixture");
+            let before = store.connection.total_changes();
+            enforce_attempt_limits(&store.connection, &attempt).expect("capacity released");
+            assert_eq!(store.connection.total_changes(), before);
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET node_execution_cap = 1 WHERE run_id = 'run-1'",
+                    [],
+                )
+                .expect("exhausted allowance");
+            let before = store.connection.total_changes();
+            let error = enforce_attempt_limits(&store.connection, &attempt)
+                .expect_err("terminal attempt consumes allowance");
+            assert!(
+                error
+                    .to_string()
+                    .contains("workflow node-execution cap exceeded")
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET node_execution_cap = 100 WHERE run_id = 'run-1'",
+                    [],
+                )
+                .expect("restore allowance");
+        }
     }
 
     #[test]

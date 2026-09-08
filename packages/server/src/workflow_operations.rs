@@ -5125,6 +5125,7 @@ fn inspect_run_graph(
         edges: edges
             .into_iter()
             .map(|record| bcode_ipc::WorkflowRunGraphEdgeInspection {
+                revision: record.revision,
                 edge_id: record.edge_id,
                 edge: record.edge,
             })
