@@ -4283,8 +4283,10 @@ impl WorkflowStore {
     ) -> Result<bool, WorkflowStoreError> {
         validate_run(run)?;
         let authorization_profile_json = serde_json::to_string(&run.authorization_profile)?;
-        let existing = self
+        let transaction = self
             .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = transaction
             .query_row(
                 "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, parent_session_generation, \
                  CASE WHEN input_json IS NULL THEN NULL
@@ -4346,7 +4348,8 @@ impl WorkflowStore {
             authorization_ceiling,
         )) = existing
         else {
-            self.create_run(run)?;
+            create_run_in_transaction(&transaction, run)?;
+            transaction.commit()?;
             return Ok(true);
         };
         if input_json.as_deref() == Some("")
@@ -4399,7 +4402,7 @@ impl WorkflowStore {
             && input == run.input
             && limits == run.limits
         {
-            if run_graph::graph_revision(&self.connection, &run.run_id)? != Some(1) {
+            if run_graph::graph_revision(&transaction, &run.run_id)? != Some(1) {
                 return Err(WorkflowStoreError::InvalidData(
                     "idempotent workflow start requires a supported run graph revision".to_string(),
                 ));
@@ -16747,6 +16750,82 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_identical_run_creation_has_one_creator_and_one_duplicate() {
+        let (temp, mut first) = initialized_store();
+        let mut second = WorkflowStore::open_in_state_dir(temp.path()).expect("second store");
+        let barrier = std::sync::Barrier::new(2);
+        let mut request = new_run();
+        request.run_id = "concurrent-start".to_string();
+        let mut outcomes = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                first.create_run_idempotent(&request).expect("first start")
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                second
+                    .create_run_idempotent(&request)
+                    .expect("second start")
+            });
+            [
+                left.join().expect("first caller"),
+                right.join().expect("second caller"),
+            ]
+        });
+        outcomes.sort_unstable();
+        assert_eq!(outcomes, [false, true]);
+        assert!(
+            !first
+                .create_run_idempotent(&request)
+                .expect("subsequent duplicate")
+        );
+    }
+
+    #[test]
+    fn concurrent_conflicting_run_creation_preserves_winner_after_reopen() {
+        let (temp, mut first) = initialized_store();
+        let mut second = WorkflowStore::open_in_state_dir(temp.path()).expect("second store");
+        let barrier = std::sync::Barrier::new(2);
+        let mut left_request = new_run();
+        left_request.run_id = "conflicting-start".to_string();
+        let mut right_request = left_request.clone();
+        right_request.input = Some(serde_json::json!(2));
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                first.create_run_idempotent(&left_request)
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                second.create_run_idempotent(&right_request)
+            });
+            (
+                left.join().expect("left caller"),
+                right.join().expect("right caller"),
+            )
+        });
+        let (winner, loser) = match (left, right) {
+            (Ok(true), Err(WorkflowStoreError::InvalidData(_))) => (&left_request, &right_request),
+            (Err(WorkflowStoreError::InvalidData(_)), Ok(true)) => (&right_request, &left_request),
+            other => panic!("expected one creation and one identity conflict: {other:?}"),
+        };
+        drop(first);
+        drop(second);
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let before = reopened.connection.total_changes();
+        assert!(
+            !reopened
+                .create_run_idempotent(winner)
+                .expect("durable winner")
+        );
+        assert!(matches!(
+            reopened.create_run_idempotent(loser),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert_eq!(reopened.connection.total_changes(), before);
+    }
+
+    #[test]
     fn stable_run_creation_is_idempotent_and_checks_all_immutable_context() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -17197,6 +17276,43 @@ mod tests {
         assert_eq!(terminal[0].run_id, "run-1");
         assert_eq!(terminal[0].status, RunStatus::Failed);
         assert!(store.terminal_runs(0).is_err());
+    }
+
+    #[test]
+    fn preparation_rejects_graph_advance_until_revised_scheduling_is_supported() {
+        let (_temp, mut store) = initialized_store();
+        let pending = store.pending_activations(1).expect("pending").remove(0);
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, 0, 0 FROM workflow_run_graph_nodes;
+             UPDATE workflow_run_graphs SET revision = 2;",
+            )
+            .expect("revised graph fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .prepare_pending_activation(
+                    &pending.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({}),
+                    20,
+                )
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.pending_activations(1).is_err());
+        assert_eq!(
+            store
+                .activation_graph_node(&pending.run_id, &pending.node_id, &pending.activation_id)
+                .expect("binding")
+                .expect("node")
+                .revision,
+            1
+        );
     }
 
     #[test]
@@ -20875,6 +20991,116 @@ mod tests {
         assert!(!root.join(MIGRATION_RECEIPT_FILE).exists());
         assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
         assert_eq!(detected_store_schema(&connection), Some(14));
+    }
+
+    #[test]
+    fn activation_binding_snapshot_survives_another_connections_commit() {
+        let (temp, store) = initialized_store();
+        store
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL");
+        let original = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("original binding")
+            .expect("node");
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("reader snapshot");
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("pin snapshot"),
+            Some(original.clone())
+        );
+        let mut writer = Connection::open(workflow_database_path(temp.path())).expect("writer");
+        let write = writer.transaction().expect("writer transaction");
+        write
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';
+             UPDATE workflow_activations SET node_revision = 2
+             WHERE run_id = 'run-1' AND node_id = 'review';",
+            )
+            .expect("revision fixture");
+        write.commit().expect("concurrent commit");
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("retained snapshot"),
+            Some(original.clone())
+        );
+        transaction.commit().expect("release reader snapshot");
+        let mut revised = original;
+        revised.revision = 2;
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("fresh snapshot"),
+            Some(revised)
+        );
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn activation_binding_read_preserves_callers_transaction() {
+        let (_temp, store) = initialized_store();
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("transaction");
+        let original = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("binding in transaction")
+            .expect("node");
+        transaction.execute(
+            "DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review'",
+            [],
+        ).expect("transactional removal");
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .is_err()
+        );
+        assert!(!store.connection.is_autocommit());
+        transaction
+            .rollback()
+            .expect("rollback remains caller-owned");
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("restored executable"),
+            Some(original)
+        );
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
+    fn activation_binding_reads_reject_missing_executable_without_writes() {
+        let (_temp, store) = initialized_store();
+        store.connection.execute(
+            "DELETE FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review'",
+            [],
+        ).expect("missing executable fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .is_err()
+        );
+        assert!(
+            run_graph::bound_activation_node(
+                &store.connection,
+                "run-1",
+                "review",
+                &activation_id()
+            )
+            .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]

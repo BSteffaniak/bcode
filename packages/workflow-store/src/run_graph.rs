@@ -229,10 +229,40 @@ pub fn initial_activation_node(
     node_id: &str,
     activation_id: &str,
 ) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
-    super::validate_id("activation_id", activation_id)?;
     let Some(record) = initial_node_record(connection, run_id, node_id)? else {
         return Ok(None);
     };
+    let node = bound_activation_node(connection, run_id, node_id, activation_id)?;
+    if node.as_ref() != Some(&record.node) {
+        return Err(WorkflowStoreError::InvalidData(
+            "activation executable binding does not match initial graph".to_string(),
+        ));
+    }
+    Ok(node)
+}
+
+pub fn bound_activation_node(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<NodeDefinition>, WorkflowStoreError> {
+    activation_node_record(connection, run_id, node_id, activation_id)?
+        .map(|record| Some(record.node))
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("activation executable binding is missing".to_string())
+        })
+}
+
+fn activation_node_record(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+    super::validate_id("activation_id", activation_id)?;
+    super::validate_id("node_id", node_id)?;
+    super::validate_id("run_id", run_id)?;
     let revision = connection
         .query_row(
             "SELECT node_revision FROM workflow_activations
@@ -241,12 +271,14 @@ pub fn initial_activation_node(
             |row| row.get::<_, u64>(0),
         )
         .optional()?;
-    if revision != Some(record.revision) {
-        return Err(WorkflowStoreError::InvalidData(
-            "activation executable binding does not match the initial graph".to_string(),
-        ));
-    }
-    Ok(Some(record.node))
+    let Some(revision) = revision else {
+        return Ok(None);
+    };
+    WorkflowStore::node_revision(connection, run_id, node_id, revision)?
+        .map(Some)
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("activation executable revision is missing".to_string())
+        })
 }
 
 pub fn initial_exit(
@@ -461,6 +493,9 @@ impl WorkflowStore {
 
     /// Read the immutable executable node selected when an activation was admitted.
     ///
+    /// Binding and executable data are read from one snapshot, reusing an existing
+    /// transaction when the caller already owns one.
+    ///
     /// # Errors
     /// Returns an error for invalid identities, missing or malformed revision bindings,
     /// missing executable data, or database failures. An absent activation returns `None`.
@@ -470,28 +505,16 @@ impl WorkflowStore {
         node_id: &str,
         activation_id: &str,
     ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
-        super::validate_id("run_id", run_id)?;
-        super::validate_id("node_id", node_id)?;
-        super::validate_id("activation_id", activation_id)?;
-        let revision = self
+        let transaction = self
             .connection
-            .query_row(
-                "SELECT node_revision FROM workflow_activations
-             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
-                (run_id, node_id, activation_id),
-                |row| row.get::<_, u64>(0),
-            )
-            .optional()?;
-        let Some(revision) = revision else {
-            return Ok(None);
-        };
-        self.run_graph_node_revision(run_id, node_id, revision)?
-            .map(Some)
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(
-                    "activation executable revision is missing".to_string(),
-                )
-            })
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let node = activation_node_record(&self.connection, run_id, node_id, activation_id)?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(node)
     }
 
     /// Read an exact immutable node revision rather than the current graph topology.
@@ -507,13 +530,22 @@ impl WorkflowStore {
         node_id: &str,
         revision: u64,
     ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+        Self::node_revision(&self.connection, run_id, node_id, revision)
+    }
+
+    fn node_revision(
+        connection: &Connection,
+        run_id: &str,
+        node_id: &str,
+        revision: u64,
+    ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
         super::validate_id("node_id", node_id)?;
         if revision == 0 || i64::try_from(revision).is_err() {
             return Err(WorkflowStoreError::InvalidData(
                 "node revision must be a positive storage integer".to_string(),
             ));
         }
-        let Some(current) = graph_revision(&self.connection, run_id)? else {
+        let Some(current) = graph_revision(connection, run_id)? else {
             return Ok(None);
         };
         if revision > current {
@@ -521,8 +553,7 @@ impl WorkflowStore {
                 "node revision exceeds committed graph revision".to_string(),
             ));
         }
-        let row = self
-            .connection
+        let row = connection
             .query_row(
                 "SELECT CASE WHEN typeof(node_json) = 'text'
                          AND length(CAST(node_json AS BLOB)) <= ?4
