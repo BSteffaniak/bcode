@@ -2321,6 +2321,9 @@ impl AgentRuntime {
     where
         P: ModelProviderInvoker + ?Sized,
     {
+        if request.cancellation.is_cancelled() || !scope.accepts_work() {
+            return Err(RuntimeError::Cancelled);
+        }
         let start = instant_now();
         let model_request =
             model_turn_request(request, self.provider_request_identity_source.as_deref())?;
@@ -2573,10 +2576,10 @@ where
             if context.scope.emit(ScopedTurnEvent::Runtime(event.clone())) {
                 events.push(event);
             }
-            if provider
-                .finish_turn(context.provider_plugin_id, context.finish_request)
-                .await
-                .is_err()
+            if !provider_cleanup_succeeded(|| {
+                provider.finish_turn(context.provider_plugin_id, context.finish_request)
+            })
+            .await
             {
                 tracing::warn!(
                     target: "bcode::sdk",
@@ -2699,6 +2702,11 @@ where
         operation = "start",
     );
     async move {
+        // Identity allocation may synchronously request cancellation. Do not even
+        // construct the provider future after admission has closed.
+        if request.cancellation.is_cancelled() || !scope.accepts_work() {
+            return Err(RuntimeError::Cancelled);
+        }
         switchy::unsync::select! {
             biased;
             () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
@@ -2806,6 +2814,23 @@ where
     .await
 }
 
+// Custom providers can panic either while constructing or polling a cleanup
+// future. Isolate both without exposing the payload or treating failure as release.
+async fn provider_cleanup_succeeded<F, Fut>(operation: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<AckResponse>>,
+{
+    use futures::FutureExt as _;
+    let Ok(future) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) else {
+        return false;
+    };
+    matches!(
+        std::panic::AssertUnwindSafe(future).catch_unwind().await,
+        Ok(Ok(_))
+    )
+}
+
 async fn cancel_and_finish<P>(
     provider: &mut P,
     provider_plugin_id: Option<&str>,
@@ -2820,10 +2845,8 @@ async fn cancel_and_finish<P>(
         provider_id = provider_plugin_id.unwrap_or(""),
         provider_turn_id = %cancel_request.provider_turn_id,
     );
-    if provider
-        .cancel_turn(provider_plugin_id, cancel_request)
+    if !provider_cleanup_succeeded(|| provider.cancel_turn(provider_plugin_id, cancel_request))
         .await
-        .is_err()
     {
         // Custom provider errors may contain secrets; expose only the failed operation.
         tracing::warn!(
@@ -2833,10 +2856,8 @@ async fn cancel_and_finish<P>(
             "provider cancellation failed; attempting finish"
         );
     }
-    if provider
-        .finish_turn(provider_plugin_id, finish_request)
+    if !provider_cleanup_succeeded(|| provider.finish_turn(provider_plugin_id, finish_request))
         .await
-        .is_err()
     {
         tracing::warn!(
             target: "bcode::sdk",
@@ -4331,6 +4352,54 @@ mod tests {
                 finished: false,
                 cancelled: false,
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancellingIdentitySource {
+        cancellation: CancellationToken,
+        calls: AtomicUsize,
+    }
+
+    impl ProviderRequestIdentitySource for CancellingIdentitySource {
+        fn next_identity(&self) -> Result<ProviderRequestIdentity> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.cancellation.cancel();
+            Ok(ProviderRequestIdentity {
+                session_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                turn_id: "cancel-during-admission".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_skips_identity_and_provider_start_callbacks() {
+        for precancelled in [false, true] {
+            let request = AgentTurnRequest::new("model", "cancel");
+            let identities = Arc::new(CancellingIdentitySource {
+                cancellation: request.cancellation.clone(),
+                calls: AtomicUsize::new(0),
+            });
+            if precancelled {
+                request.cancellation.cancel();
+            }
+            let runtime =
+                AgentRuntime::new().with_provider_request_identity_source(identities.clone());
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Pending,
+            };
+            assert!(matches!(
+                runtime.run_text_turn(&mut provider, request).await,
+                Err(RuntimeError::Cancelled)
+            ));
+            assert_eq!(
+                identities.calls.load(Ordering::Acquire),
+                usize::from(!precancelled)
+            );
+            assert!(!lifecycle.started.load(Ordering::Acquire));
+            assert_eq!(runtime.active_turn_generation(), None);
         }
     }
 
@@ -7894,6 +7963,8 @@ mod tests {
         cancelled: AtomicBool,
         fail_cancel: AtomicBool,
         fail_finish: AtomicBool,
+        panic_cancel: AtomicUsize,
+        panic_finish: AtomicUsize,
         cancel_count: AtomicUsize,
         finish_count: AtomicUsize,
         finished: AtomicBool,
@@ -8017,7 +8088,17 @@ mod tests {
         ) -> RuntimeFuture<'a, AckResponse> {
             self.lifecycle.cancelled.store(true, Ordering::Release);
             self.lifecycle.cancel_count.fetch_add(1, Ordering::AcqRel);
+            assert_ne!(
+                self.lifecycle.panic_cancel.load(Ordering::Acquire),
+                1,
+                "cancel construction secret"
+            );
             Box::pin(async move {
+                assert_ne!(
+                    self.lifecycle.panic_cancel.load(Ordering::Acquire),
+                    2,
+                    "cancel polling secret"
+                );
                 if self.lifecycle.fail_cancel.load(Ordering::Acquire) {
                     Err(RuntimeError::ProviderInvocation(
                         "CANCEL_SECRET_SENTINEL".into(),
@@ -8035,7 +8116,17 @@ mod tests {
         ) -> RuntimeFuture<'a, AckResponse> {
             self.lifecycle.finished.store(true, Ordering::Release);
             self.lifecycle.finish_count.fetch_add(1, Ordering::AcqRel);
+            assert_ne!(
+                self.lifecycle.panic_finish.load(Ordering::Acquire),
+                1,
+                "finish construction secret"
+            );
             Box::pin(async move {
+                assert_ne!(
+                    self.lifecycle.panic_finish.load(Ordering::Acquire),
+                    2,
+                    "finish polling secret"
+                );
                 if self.lifecycle.fail_finish.load(Ordering::Acquire) {
                     Err(RuntimeError::ProviderInvocation(
                         "FINISH_SECRET_SENTINEL".into(),
@@ -8044,6 +8135,63 @@ mod tests {
                     Ok(AckResponse::default())
                 }
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_panics_still_attempt_finish_and_preserve_cancellation() {
+        for cancel in 0..=2 {
+            for finish in 0..=2 {
+                let lifecycle = Arc::new(ProviderLifecycle::default());
+                lifecycle.panic_cancel.store(cancel, Ordering::Release);
+                lifecycle.panic_finish.store(finish, Ordering::Release);
+                let runtime = AgentRuntime::new();
+                let mut stream = runtime.run_streaming_text_turn(
+                    LifecyclePollProvider {
+                        lifecycle: Arc::clone(&lifecycle),
+                        outcome: LifecyclePollOutcome::Pending,
+                    },
+                    AgentTurnRequest::new("model", "cancel"),
+                );
+                wait_for_flag(&lifecycle.polling, "provider polling").await;
+                stream.cancel();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let mut errors = 0;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            AgentRuntimeStreamItem::Error(RuntimeError::Cancelled) => errors += 1,
+                            AgentRuntimeStreamItem::Event(_) => {}
+                            other => panic!("unexpected cancellation outcome: {other:?}"),
+                        }
+                    }
+                    assert_eq!(errors, 1);
+                })
+                .await
+                .expect("cleanup terminates");
+                assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
+                assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+                assert_eq!(runtime.active_turn_generation(), None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_cancelled_event_preserves_outcome_when_finish_panics() {
+        for panic in 1..=2 {
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            lifecycle.panic_finish.store(panic, Ordering::Release);
+            lifecycle.release_poll.notify_one();
+            let runtime = AgentRuntime::new();
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Cancelled,
+            };
+            let result = runtime
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "cancel"))
+                .await;
+            assert!(matches!(result, Err(RuntimeError::Cancelled)));
+            assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+            assert_eq!(runtime.active_turn_generation(), None);
         }
     }
 
