@@ -386,6 +386,10 @@ pub struct AuthSecretField {
     /// Optional local validation applied before storage.
     #[serde(default)]
     pub validation: AuthSecretValidation,
+    /// Optional, additive discovery hints. Older hosts may ignore these hints;
+    /// they never grant authority to read or import credentials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_sources: Vec<AuthCredentialSource>,
 }
 
 impl AuthSecretField {
@@ -399,8 +403,67 @@ impl AuthSecretField {
         validate_id("credential_id", &self.credential_id)?;
         validate_storage_key(&self.storage_key)?;
         validate_text("prompt", &self.prompt, MAX_AUTH_LABEL_BYTES)?;
+        validate_count(
+            "discovery_sources",
+            self.discovery_sources.len(),
+            MAX_AUTH_SECRET_FIELDS,
+        )?;
+        for source in &self.discovery_sources {
+            match source {
+                AuthCredentialSource::Environment { name } => validate_storage_key(name)?,
+                AuthCredentialSource::JsonFile {
+                    application,
+                    relative_path,
+                    pointer,
+                    discriminator,
+                } => {
+                    validate_text("application", application, MAX_AUTH_LABEL_BYTES)?;
+                    validate_text("relative_path", relative_path, MAX_AUTH_TEXT_BYTES)?;
+                    if relative_path.starts_with('/')
+                        || relative_path.contains('\\')
+                        || relative_path
+                            .split('/')
+                            .any(|part| matches!(part, ".." | "." | ""))
+                    {
+                        return Err(AuthContractError::InvalidBounds {
+                            field: "relative_path",
+                            min: 1,
+                            max: 0,
+                        });
+                    }
+                    validate_text("pointer", pointer, MAX_AUTH_TEXT_BYTES)?;
+                    if let Some((key, value)) = discriminator {
+                        validate_text("discriminator_pointer", key, MAX_AUTH_TEXT_BYTES)?;
+                        validate_text("discriminator_value", value, MAX_AUTH_LABEL_BYTES)?;
+                    }
+                }
+            }
+        }
         self.validation.validate()
     }
+}
+
+/// A provider-owned hint for finding a compatible static credential.
+/// OAuth tokens are deliberately not described as portable secret fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthCredentialSource {
+    /// One exact environment variable; no environment enumeration is necessary.
+    Environment {
+        /// Variable name.
+        name: String,
+    },
+    /// One bounded JSON document confined beneath the user's home directory.
+    JsonFile {
+        /// Human-readable source application.
+        application: String,
+        /// Relative path beneath the authorized home directory.
+        relative_path: String,
+        /// JSON pointer to the static credential.
+        pointer: String,
+        /// Optional exact discriminator required before interpreting the credential.
+        discriminator: Option<(String, String)>,
+    },
 }
 
 /// Local secret validation performed by the host before storage.
@@ -1021,6 +1084,7 @@ mod tests {
                 method_id: "api_key".to_owned(),
                 display_name: "API key".to_owned(),
                 fields: vec![AuthSecretField {
+                    discovery_sources: Vec::new(),
                     credential_id: "api_key".to_owned(),
                     storage_key: "PROVIDER_API_KEY".to_owned(),
                     prompt: "Exa API key".to_owned(),

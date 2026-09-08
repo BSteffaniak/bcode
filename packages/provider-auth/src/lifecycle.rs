@@ -4,7 +4,7 @@ use crate::{AuthProfileResolutionError, ResolvedAuthProfile};
 use bcode_provider_auth_models::AuthMethodContribution;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// Structured non-secret lifecycle diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub enum AuthVaultLifecycleError {
         method_id: String,
         credential_id: String,
     },
+    #[error("credential values are incomplete or invalid for this method")]
+    InvalidCredential,
+    #[error("auth credential already exists; import never overwrites it")]
+    CredentialExists,
     #[error("auth profile backend '{0}' is unsupported for integrated vault operations")]
     UnsupportedBackend(String),
     #[error("auth profile has no authentication scheme")]
@@ -139,6 +143,30 @@ impl<'a> AuthVaultLifecycle<'a> {
         })
     }
 
+    /// Check locally usable credentials without claiming remote verification.
+    ///
+    /// # Errors
+    /// Returns an error when owned credential storage is unavailable or inconsistent.
+    pub fn locally_available(&self) -> Result<bool, AuthVaultLifecycleError> {
+        let mut values = self.read()?;
+        let available = match self.method {
+            AuthMethodContribution::SecretFields { fields, .. } => fields.iter().all(|field| {
+                values
+                    .get(&field.credential_id)
+                    .map_or(field.optional, |value| {
+                        !value.is_empty() && field.validation.validate_secret(value).is_ok()
+                    })
+            }),
+            // Token expiry/refresh semantics are provider-owned. Presence alone
+            // cannot establish availability for an interactive authentication method.
+            AuthMethodContribution::Interactive { .. } => false,
+        };
+        for value in values.values_mut() {
+            value.zeroize();
+        }
+        Ok(available)
+    }
+
     /// Read owned credentials into canonical credential IDs.
     ///
     /// # Errors
@@ -170,12 +198,64 @@ impl<'a> AuthVaultLifecycle<'a> {
             .collect())
     }
 
+    /// Import static fields only after an explicit review; never replace existing fields.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible fields, existing credentials, or vault failures.
+    pub fn import_new(
+        &self,
+        credentials: BTreeMap<String, String>,
+    ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
+        let AuthMethodContribution::SecretFields { fields, .. } = self.method else {
+            return Err(AuthVaultLifecycleError::UnknownMethod {
+                provider_id: self.resolved.provider_id.clone(),
+                method_id: self.method.method_id().to_owned(),
+            });
+        };
+        for field in fields {
+            if let Some(value) = credentials.get(&field.credential_id) {
+                field
+                    .validation
+                    .validate_secret(value)
+                    .map_err(|_| AuthVaultLifecycleError::InvalidCredential)?;
+            } else if !field.optional {
+                return Err(AuthVaultLifecycleError::InvalidCredential);
+            }
+        }
+        let status = self.inspect()?;
+        if credentials
+            .keys()
+            .any(|key| status.present_credentials.contains(key))
+        {
+            return Err(AuthVaultLifecycleError::CredentialExists);
+        }
+        if credentials.len() != 1 {
+            return Err(AuthVaultLifecycleError::InvalidCredential);
+        }
+        let storage_keys = self.credential_storage_keys()?;
+        let (credential, value) = credentials
+            .into_iter()
+            .next()
+            .ok_or(AuthVaultLifecycleError::InvalidCredential)?;
+        let key = storage_keys
+            .get(&credential)
+            .ok_or(AuthVaultLifecycleError::InvalidCredential)?;
+        let (store, recipient) = self.open_or_initialize_store()?;
+        store
+            .insert_secret_if_absent(self.storage_profile(), key, Zeroizing::new(value))
+            .map_err(|_| {
+                AuthVaultLifecycleError::WriteFailed(
+                    "Import conflicted or vault could not be saved; reload before retrying"
+                        .to_owned(),
+                )
+            })?;
+        self.reconcile_device_seal(Some(&recipient))
+    }
+
     /// Upsert only credentials declared by the selected provider method.
     ///
     /// # Errors
-    ///
-    /// Returns an error before mutation for undeclared credentials, damaged vault/profile state,
-    /// write failure, or unsatisfied required device-seal policy.
+    /// Returns an error for undeclared credentials, damaged vault state, or write/security failure.
     pub fn upsert(
         &self,
         credentials: BTreeMap<String, String>,
@@ -511,6 +591,7 @@ mod tests {
             method_id: "api_key".to_owned(),
             display_name: "API key".to_owned(),
             fields: vec![AuthSecretField {
+                discovery_sources: Vec::new(),
                 credential_id: "api_key".to_owned(),
                 storage_key: "TEST_PROVIDER_API_KEY".to_owned(),
                 prompt: "Exa API key".to_owned(),
@@ -539,6 +620,27 @@ mod tests {
             ],
             supports_revocation: false,
         }
+    }
+
+    #[test]
+    fn import_uses_declared_key_and_never_overwrites() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let resolved = resolved(&temp.path().join("vault"));
+        let method = method();
+        let lifecycle = AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method)
+            .expect("lifecycle");
+        lifecycle
+            .import_new(BTreeMap::from([("api_key".to_owned(), "first".to_owned())]))
+            .expect("import");
+        assert!(
+            lifecycle
+                .import_new(BTreeMap::from([(
+                    "api_key".to_owned(),
+                    "second".to_owned()
+                )]))
+                .is_err()
+        );
+        assert_eq!(lifecycle.read().expect("read")["api_key"], "first");
     }
 
     #[test]

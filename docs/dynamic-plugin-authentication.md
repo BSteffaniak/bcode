@@ -82,6 +82,31 @@ unverifiable ownership, and ownership mismatch still fail closed. Status never c
 metadata or a vault. Login uses the registered method as the enrollment blueprint and persists only
 owned, non-secret runtime profile and binding metadata.
 
+## External static credential discovery
+
+Secret-field declarations may include additive `discovery_sources` hints. Older hosts
+may ignore these hints; they confer no access or import authority. Enabled providers
+own exact environment names and known JSON paths/discriminators. The auth domain
+bounds reads and, on Unix, walks relative paths with held directory descriptors and
+`O_NOFOLLOW`. Other platforms currently reject file discovery rather than using a
+racy confinement fallback. Environment sources remain available.
+
+`bcode auth discover` prints only source metadata. `bcode auth import PROVIDER --source INDEX`
+requires interactive review of the selected source, vault, and owned profile before
+reading the selected value or unlocking storage. Existing credentials are never
+replaced by import. OAuth tokens are not portable static keys and are not copied.
+
+Automatic discovery respects `--no-credential-discovery`,
+`BCODE_NO_CREDENTIAL_DISCOVERY=1`, and `[onboarding] credential_discovery = false`.
+Any opt-out wins; explicitly selecting one source for import is independent of automatic
+scanning. A source being available does not establish remote authentication success.
+
+The sshenv dependency provides insert-if-absent and stale-snapshot
+save rejection. New-library saves serialize their compare/write section using a stable
+sidecar lock and encrypted-content digest. Older sshenv binaries do not participate;
+stop older vault writers before using the new import operation. No vault-format change
+is involved. Bcode follows sshenv's `master` branch with the resolved revision in `Cargo.lock`.
+
 ## Profile resolution and precedence
 
 Resolution is deterministic:

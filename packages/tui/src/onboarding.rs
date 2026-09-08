@@ -343,11 +343,10 @@ impl OnboardingShell {
     /// Returns an error when onboarding completion cannot be persisted.
     pub fn launch_from_onboarding(
         &mut self,
-        store: &SettingsStore,
-        completed_at_ms: u64,
+        _store: &SettingsStore,
+        _completed_at_ms: u64,
     ) -> Result<(), SettingsError> {
-        store.complete_onboarding(completed_at_ms)?;
-        self.status_message = Some("Onboarding complete — ready to launch Bcode".to_owned());
+        self.status_message = Some("Checking effective setup before starting a session".to_owned());
         Ok(())
     }
 
@@ -728,7 +727,7 @@ impl OnboardingShell {
             map_lines,
             focused_detail: self.focused_detail(),
             footer_lines: vec![
-                "←/↑ previous  →/↓ next  Enter select  p provider  a auth  m model  r permissions  i import  g plugins  x apply  y confirm  n cancel  c complete  s skip  l launch  Esc close"
+                "←/↑ previous  →/↓ next  Enter select  p connect  a import credentials  m model profile  r/g/x settings  s skip  l start session  Esc close"
                     .to_owned(),
                 self.status_message.clone().unwrap_or_else(|| {
                     "Setup state is persisted locally and user config remains TOML-backed."
@@ -1182,10 +1181,7 @@ mod tests {
         );
 
         let sections = store.onboarding_sections().expect("sections should load");
-        let progress = store
-            .onboarding_progress()
-            .expect("progress should load")
-            .expect("progress should exist");
+        let progress = store.onboarding_progress().expect("progress should load");
 
         assert!(sections.iter().any(|section| {
             section.section_id == SetupSectionId::Welcome.as_str()
@@ -1195,10 +1191,10 @@ mod tests {
             section.section_id == SetupSectionId::Detection.as_str()
                 && section.status == SetupSectionStatus::Skipped.as_str()
         }));
-        assert!(progress.first_run_completed);
+        assert!(progress.is_none_or(|progress| !progress.first_run_completed));
         assert_eq!(
             shell.status_message(),
-            Some("Onboarding complete — ready to launch Bcode")
+            Some("Checking effective setup before starting a session")
         );
     }
 

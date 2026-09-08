@@ -137,6 +137,11 @@ fn exa_auth_provider_contribution() -> AuthProviderContribution {
             method_id: "api_key".to_owned(),
             display_name: "API key".to_owned(),
             fields: vec![AuthSecretField {
+                discovery_sources: vec![
+                    bcode_provider_auth_models::AuthCredentialSource::Environment {
+                        name: "EXA_API_KEY".to_owned(),
+                    },
+                ],
                 credential_id: EXA_CREDENTIAL_ID.to_owned(),
                 storage_key: EXA_STORAGE_KEY.to_owned(),
                 prompt: "Exa API key".to_owned(),

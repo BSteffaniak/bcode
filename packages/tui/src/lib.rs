@@ -241,6 +241,18 @@ pub async fn run_onboarding() -> Result<(), TuiError> {
 /// # Errors
 /// Returns I/O, settings, or configuration errors.
 pub async fn run_onboarding_with_discovery_policy(allow_discovery: bool) -> Result<bool, TuiError> {
+    run_setup_screen(allow_discovery)
+        .await
+        .map(|outcome| outcome == bcode_settings::SetupContinuation::Launch)
+}
+
+/// Present setup and return the requested domain action after restoring the terminal.
+///
+/// # Errors
+/// Returns configuration, settings, or terminal errors.
+pub async fn run_setup_screen(
+    allow_discovery: bool,
+) -> Result<bcode_settings::SetupContinuation, TuiError> {
     let store = bcode_settings::SettingsStore::default();
     let config = bcode_config::load_config()?;
     let discovery_enabled = config
@@ -296,7 +308,7 @@ async fn run_onboarding_runtime<W: io::Write>(
     store: bcode_settings::SettingsStore,
     shell: onboarding::OnboardingShell,
     tui_config: &bcode_config::TuiConfig,
-) -> Result<bool, TuiError> {
+) -> Result<bcode_settings::SetupContinuation, TuiError> {
     let area = terminal.area();
     let theme = theme::resolve_configured_theme(tui_config, std::path::Path::new("."));
     let program = onboarding_program::OnboardingProgram::new(store, shell, &theme, area)?;
@@ -313,7 +325,7 @@ async fn run_onboarding_runtime<W: io::Write>(
     let result = runtime.run().await;
     input.request_shutdown();
     match result {
-        Ok(output) => Ok(output.program.launch_requested()),
+        Ok(output) => Ok(output.program.continuation()),
         Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
         Err(bmux_tui_runtime::RuntimeError::Presenter { error, .. }) => Err(error.into()),
     }

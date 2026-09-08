@@ -419,6 +419,12 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
+        Commands::Settings {
+            file,
+            key,
+            value,
+            remove,
+        } => credential_setup::edit_setting(file, &key, value.as_deref(), remove)?,
         Commands::Onboard {
             reset,
             dry_run,
@@ -464,7 +470,13 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Theme { command } => handle_theme_command(command)?,
         Commands::Model { command } => handle_model_command(command).await?,
-        Commands::Auth { command } => handle_auth_command(command).await?,
+        Commands::Auth { command } => {
+            if cli.no_credential_discovery && matches!(command, AuthCommand::Discover) {
+                println!("Automatic credential discovery is disabled.");
+            } else {
+                handle_auth_command(command).await?;
+            }
+        }
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::Interaction { command } => handle_interaction_command(command).await?,
@@ -2680,6 +2692,7 @@ async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError
     if options.reset {
         store.reset_database()?;
     }
+    credential_setup::discover_for_onboarding(discovery_enabled)?;
     let now_ms = u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2734,10 +2747,7 @@ async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError
     let summary = bcode_settings::SetupConfigSummary::from_config(&config);
     let mut input = summary.reconciliation_input();
     if let Some(provider) = options.provider.as_deref() {
-        input
-            .configured_sections
-            .insert(bcode_settings::SetupSectionId::Providers);
-        println!("onboarding provider hint: {provider}");
+        println!("onboarding provider hint (not configured): {provider}");
     }
     let progress = store.onboarding_progress()?;
     input.current_section = progress
@@ -2755,18 +2765,26 @@ async fn handle_onboard_command(options: &OnboardOptions) -> Result<(), CliError
     let readiness_report =
         bcode_settings::setup_readiness_report(shell.sections(), &recommendations);
     store.save_readiness_report(&readiness_report, now_ms)?;
-    let launch = Box::pin(bcode_tui::run_onboarding_with_discovery_policy(
-        discovery_enabled,
-    ))
-    .await?;
+    let launch = Box::pin(credential_setup::run_setup(discovery_enabled)).await?;
     if launch && options.launch_mode == OnboardLaunchMode::LaunchWhenReady {
-        Box::pin(run_new_session_tui(
-            None,
-            bcode_tui::TuiLaunchOptions::default(),
-        ))
-        .await?;
+        Box::pin(start_validated_onboarding_session(&store, now_ms)).await?;
     }
     Ok(())
+}
+
+async fn start_validated_onboarding_session(
+    store: &bcode_settings::SettingsStore,
+    now_ms: u64,
+) -> Result<(), CliError> {
+    credential_setup::validate_launch_selection()?;
+    ensure_server_running().await?;
+    Box::pin(model_validate_config(false)).await?;
+    store.complete_onboarding(now_ms)?;
+    Box::pin(run_new_session_tui(
+        None,
+        bcode_tui::TuiLaunchOptions::default(),
+    ))
+    .await
 }
 
 fn onboard_section_from_str(value: &str) -> Option<bcode_settings::SetupSectionId> {
@@ -2825,6 +2843,7 @@ async fn handle_session_io_command(
             .await?;
         }
         Commands::Onboard { .. }
+        | Commands::Settings { .. }
         | Commands::ArtifactId
         | Commands::Server { .. }
         | Commands::Session { .. }
@@ -3134,6 +3153,21 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Review a scoped configuration change while preserving unrelated TOML.
+    Settings {
+        /// Exact configuration file to edit.
+        #[arg(long)]
+        file: PathBuf,
+        /// TOML key segments (separate arguments preserve dots in plugin IDs).
+        #[arg(long, num_args = 1.., required = true)]
+        key: Vec<String>,
+        /// New TOML value, e.g. '"model-name"' or 'false'.
+        #[arg(long, conflicts_with = "remove")]
+        value: Option<String>,
+        /// Remove the selected override.
+        #[arg(long)]
+        remove: bool,
+    },
     Onboard {
         /// Reset onboarding progress before launching the setup map.
         #[arg(long)]
@@ -4892,6 +4926,28 @@ struct VerifyCacheArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Discover provider-declared external API keys without displaying their values.
+    Discover,
+    /// Review and copy one provider-declared external API key into an owned sshenv profile.
+    Import {
+        /// Registered provider ID.
+        provider: String,
+        /// Registered secret-field authentication method.
+        #[arg(long, default_value = "api_key")]
+        method: String,
+        /// Canonical credential field.
+        #[arg(long, default_value = "api_key")]
+        credential: String,
+        /// Source index shown by `auth discover` (explicit import works with discovery disabled).
+        #[arg(long)]
+        source: usize,
+        /// Destination profile; defaults to the provider's selected profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Destination sshenv vault.
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
     /// List authentication providers registered by enabled plugins.
     Providers,
     Status {
@@ -6301,6 +6357,9 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
 
 async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     match command {
+        AuthCommand::Discover | AuthCommand::Import { .. } => {
+            credential_setup::handle_command(command)
+        }
         AuthCommand::Providers => auth_providers(),
         AuthCommand::Status { provider, profile } => provider
             .map_or_else(auth_status, |provider| {
@@ -8254,6 +8313,8 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
         .and_then(|summary| summary.vault)
         .map(|vault| display_from_current_dir(&vault).to_string())
 }
+
+mod credential_setup;
 
 fn auth_providers() -> Result<(), CliError> {
     let mut host = load_cli_plugin_host()?;
@@ -17353,6 +17414,7 @@ mod auth_cli_tests {
             method_id: method_id.to_owned(),
             display_name: method_id.to_owned(),
             fields: vec![bcode_provider_auth_models::AuthSecretField {
+                discovery_sources: Vec::new(),
                 credential_id: "api_key".to_owned(),
                 storage_key: "TEST_PROVIDER_API_KEY".to_owned(),
                 prompt: "API key".to_owned(),

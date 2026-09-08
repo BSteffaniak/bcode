@@ -27,7 +27,7 @@ pub struct OnboardingProgram {
     readiness: Option<bcode_settings::SetupReadinessReport>,
     theme: super::theme::PresentedTheme,
     area: Rect,
-    launch_requested: bool,
+    continuation: bcode_settings::SetupContinuation,
 }
 
 impl OnboardingProgram {
@@ -47,14 +47,14 @@ impl OnboardingProgram {
             readiness,
             theme: *theme,
             area,
-            launch_requested: false,
+            continuation: bcode_settings::SetupContinuation::Close,
         })
     }
 
-    /// Whether setup explicitly requested a session after leaving terminal mode.
+    /// Requested application continuation after terminal teardown.
     #[must_use]
-    pub const fn launch_requested(&self) -> bool {
-        self.launch_requested
+    pub const fn continuation(&self) -> bcode_settings::SetupContinuation {
+        self.continuation
     }
 
     fn refresh_persisted_state(&mut self) -> Result<(), TuiError> {
@@ -65,6 +65,18 @@ impl OnboardingProgram {
 
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
         match code {
+            KeyCode::Char('r' | 'g' | 'x') if !self.shell.has_pending_confirmation() => {
+                self.continuation = bcode_settings::SetupContinuation::Settings;
+                Ok(Lifecycle::Exit)
+            }
+            KeyCode::Char('p' | 'a' | 'm') if !self.shell.has_pending_confirmation() => {
+                self.continuation = match code {
+                    KeyCode::Char('p') => bcode_settings::SetupContinuation::Connection,
+                    KeyCode::Char('m') => bcode_settings::SetupContinuation::Model,
+                    _ => bcode_settings::SetupContinuation::Credentials,
+                };
+                Ok(Lifecycle::Exit)
+            }
             KeyCode::Escape | KeyCode::Char('q') => {
                 let was_confirming = self.shell.has_pending_confirmation();
                 self.shell.handle_action(
@@ -94,7 +106,7 @@ impl OnboardingProgram {
                     .shell
                     .handle_action(action, &self.store, current_time_ms())?;
                 if outcome == onboarding::OnboardingActionOutcome::LaunchReady {
-                    self.launch_requested = true;
+                    self.continuation = bcode_settings::SetupContinuation::Launch;
                     return Ok(Lifecycle::Exit);
                 }
                 Ok(Lifecycle::Continue)

@@ -237,6 +237,7 @@ fn hello_auth_provider() -> bcode_provider_auth_models::AuthProviderContribution
                 method_id: "api_key".to_owned(),
                 display_name: "API key".to_owned(),
                 fields: vec![bcode_provider_auth_models::AuthSecretField {
+                    discovery_sources: Vec::new(),
                     credential_id: "api_key".to_owned(),
                     storage_key: "EXAMPLE_HELLO_API_KEY".to_owned(),
                     prompt: "Example API key".to_owned(),

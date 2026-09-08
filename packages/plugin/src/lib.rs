@@ -6153,6 +6153,7 @@ library = "libcommands.dylib"
                         method_id: "api_key".to_owned(),
                         display_name: "API key".to_owned(),
                         fields: vec![bcode_provider_auth_models::AuthSecretField {
+                            discovery_sources: Vec::new(),
                             credential_id: "api_key".to_owned(),
                             storage_key: "TEST_PROVIDER_API_KEY".to_owned(),
                             prompt: "Exa API key".to_owned(),

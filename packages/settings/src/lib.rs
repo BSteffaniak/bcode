@@ -2287,6 +2287,73 @@ pub struct SetupReadinessItem {
     pub body: String,
 }
 
+/// Current operational setup facts supplied by application/domain inspection.
+/// These are independent of onboarding progress and never imply remote verification.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupOperationalFacts {
+    /// Effective provider is registered and enabled.
+    pub provider_available: bool,
+    /// Effective model resolves through the model catalog.
+    pub model_available: bool,
+    /// Authentication is locally usable, or the provider explicitly needs none.
+    pub authentication_available: bool,
+}
+
+/// Build launch readiness from operational facts, never visited/completed UI sections.
+#[must_use]
+pub fn operational_setup_readiness(facts: &SetupOperationalFacts) -> SetupReadinessReport {
+    let mut items = Vec::new();
+    for (available, section_id, title) in [
+        (
+            facts.provider_available,
+            SetupSectionId::Providers,
+            "Select an enabled provider",
+        ),
+        (
+            facts.model_available,
+            SetupSectionId::Models,
+            "Select a supported model",
+        ),
+        (
+            facts.authentication_available,
+            SetupSectionId::SecureVault,
+            "Connect an available authentication profile",
+        ),
+    ] {
+        if !available {
+            items.push(SetupReadinessItem {
+                section_id,
+                severity: SetupReadinessSeverity::Blocking,
+                title: title.to_owned(),
+                body: "Current setup is incomplete or could not be verified locally.".to_owned(),
+            });
+        }
+    }
+    SetupReadinessReport {
+        launch_ready: items.is_empty(),
+        items,
+    }
+}
+
+/// Explicit continuation requested by a setup frontend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupContinuation {
+    /// Close setup without starting work.
+    #[default]
+    Close,
+    /// Validate effective setup and start work.
+    Launch,
+    /// Edit a provider connection using registered enrollment methods.
+    Connection,
+    /// Select an existing model profile.
+    Model,
+    /// Review discovered credential import sources.
+    Credentials,
+    /// Review an explicit configuration edit.
+    Settings,
+}
+
 /// Aggregate setup readiness report.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupReadinessReport {
@@ -2940,6 +3007,21 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operational_readiness_requires_all_current_facts() {
+        for mask in 0..8 {
+            let facts = super::SetupOperationalFacts {
+                provider_available: mask & 1 != 0,
+                model_available: mask & 2 != 0,
+                authentication_available: mask & 4 != 0,
+            };
+            assert_eq!(
+                super::operational_setup_readiness(&facts).launch_ready,
+                mask == 7
+            );
+        }
+    }
+
     #[test]
     fn disabled_discovery_returns_no_sources_or_recommendations() {
         let snapshot = super::detect_setup_environment_with_policy(false, 42);

@@ -425,6 +425,15 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
         },
         AuthProviderContribution {
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "openrouter".to_owned(),
+            display_name: "OpenRouter".to_owned(),
+            methods: vec![api_key_auth_method(
+                "BCODE_OPENROUTER_API_KEY",
+                "OpenRouter API key",
+            )],
+        },
+        AuthProviderContribution {
+            schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "xai".to_owned(),
             display_name: "xAI".to_owned(),
             methods: vec![api_key_auth_method("BCODE_XAI_API_KEY", "xAI API key")],
@@ -440,11 +449,44 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
     Ok(())
 }
 
+fn api_key_discovery_sources(
+    storage_key: &str,
+) -> Vec<bcode_provider_auth_models::AuthCredentialSource> {
+    use bcode_provider_auth_models::AuthCredentialSource;
+    let (name, provider) = match storage_key {
+        "BCODE_OPENAI_API_KEY" => ("OPENAI_API_KEY", "openai"),
+        "BCODE_OPENROUTER_API_KEY" => ("OPENROUTER_API_KEY", "openrouter"),
+        "BCODE_XAI_API_KEY" => ("XAI_API_KEY", "xai"),
+        _ => return Vec::new(),
+    };
+    let mut sources = vec![
+        AuthCredentialSource::Environment {
+            name: name.to_owned(),
+        },
+        AuthCredentialSource::JsonFile {
+            application: "OpenCode".to_owned(),
+            relative_path: ".local/share/opencode/auth.json".to_owned(),
+            pointer: format!("/{provider}/key"),
+            discriminator: Some((format!("/{provider}/type"), "api".to_owned())),
+        },
+    ];
+    if provider == "openai" {
+        sources.push(AuthCredentialSource::JsonFile {
+            application: "Codex (API key only)".to_owned(),
+            relative_path: ".codex/auth.json".to_owned(),
+            pointer: "/OPENAI_API_KEY".to_owned(),
+            discriminator: None,
+        });
+    }
+    sources
+}
+
 fn api_key_auth_method(storage_key: &str, prompt: &str) -> AuthMethodContribution {
     AuthMethodContribution::SecretFields {
         method_id: "api_key".to_owned(),
         display_name: "API key".to_owned(),
         fields: vec![AuthSecretField {
+            discovery_sources: api_key_discovery_sources(storage_key),
             credential_id: "api_key".to_owned(),
             storage_key: storage_key.to_owned(),
             prompt: prompt.to_owned(),
@@ -10153,7 +10195,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         drop(registrations);
-        assert_eq!(contributions.len(), 2);
+        assert_eq!(contributions.len(), 3);
         assert_eq!(contributions[0].methods.len(), 3);
         assert!(
             contributions[0]
@@ -10169,7 +10211,8 @@ mod tests {
         );
         for (contribution, provider_id, storage_key) in [
             (&contributions[0], "openai", "BCODE_OPENAI_API_KEY"),
-            (&contributions[1], "xai", "BCODE_XAI_API_KEY"),
+            (&contributions[1], "openrouter", "BCODE_OPENROUTER_API_KEY"),
+            (&contributions[2], "xai", "BCODE_XAI_API_KEY"),
         ] {
             contribution.validate().expect("valid contribution");
             assert_eq!(contribution.provider_id, provider_id);

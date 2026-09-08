@@ -10,6 +10,7 @@
 
 pub mod auth_pool_routing;
 pub mod auth_pool_state;
+pub mod discovery;
 pub mod lifecycle;
 pub mod operations;
 pub mod security;
@@ -1014,6 +1015,7 @@ mod tests {
                     method_id: "api_key".to_owned(),
                     display_name: "API key".to_owned(),
                     fields: vec![bcode_provider_auth_models::AuthSecretField {
+                        discovery_sources: Vec::new(),
                         credential_id: "api_key".to_owned(),
                         storage_key: "BCODE_OPENAI_API_KEY".to_owned(),
                         prompt: "OpenAI API key".to_owned(),

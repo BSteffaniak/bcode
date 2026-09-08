@@ -23,6 +23,8 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 pub const BCODE_CONFIG_ENV: &str = "BCODE_CONFIG";
 /// Environment variable containing raw TOML config overlay data.
 pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
+pub mod edit;
+
 /// Environment variable selecting the active model profile.
 pub const BCODE_MODEL_PROFILE_ENV: &str = "BCODE_MODEL_PROFILE";
 /// Environment variable selecting the active auth profile for this client.
@@ -6445,6 +6447,9 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_model_toml(&mut output, &config.model);
     write_agents_toml(&mut output, &config.agent);
     write_auth_toml(&mut output, &config.auth);
+    if !config.onboarding.credential_discovery {
+        output.push_str("[onboarding]\ncredential_discovery = false\n\n");
+    }
     write_observability_toml(&mut output, &config.observability);
     write_skills_toml(&mut output, &config.skills);
     write_workflows_toml(&mut output, &config.workflows);
@@ -8343,6 +8348,19 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_serialization_preserves_credential_discovery_opt_out() {
+        let config = super::BcodeConfig {
+            onboarding: super::OnboardingConfig {
+                credential_discovery: false,
+            },
+            ..super::BcodeConfig::default()
+        };
+        let encoded = super::config_to_toml(&config);
+        let decoded: super::BcodeConfig = toml::from_str(&encoded).expect("config parses");
+        assert!(!decoded.onboarding.credential_discovery);
+    }
+
     #[test]
     fn credential_discovery_opt_out_is_disable_wins() {
         let mut environment =
