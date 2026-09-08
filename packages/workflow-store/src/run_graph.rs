@@ -1036,7 +1036,9 @@ impl WorkflowStore {
                 "edge endpoint identity mismatch".to_string(),
             ));
         }
-        for id in [&source, &target] {
+        // A self-loop has one endpoint identity; validate it once in this snapshot.
+        let endpoints = [&source, &target];
+        for id in &endpoints[..if source == target { 1 } else { 2 }] {
             super::validate_id("edge endpoint", id)?;
             let endpoint_revision = transaction
                 .query_row(

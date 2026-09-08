@@ -25273,6 +25273,100 @@ mod tests {
     }
 
     #[test]
+    fn rolled_back_graph_revision_is_never_published() {
+        let (_temp, store) = initialized_store();
+        store
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("concurrent fixture");
+        let original = store
+            .current_run_graph_node("run-1", "review")
+            .expect("read")
+            .expect("node");
+        let mut writer =
+            rusqlite::Connection::open(store.connection.path().expect("path")).expect("writer");
+        let edit = writer.transaction().expect("candidate");
+        let mut candidate = original.node.clone();
+        candidate.name = "Rolled back candidate".to_string();
+        edit.execute(
+            "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, ?1, 0, 0)",
+            [serde_json::to_string(&candidate).expect("payload")],
+        )
+        .expect("candidate node");
+        let candidate_edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        edit.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 2, 'review', 'review', ?1)",
+            [serde_json::to_string(&candidate_edge).expect("edge payload")],
+        )
+        .expect("candidate edge");
+        edit.execute(
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+            [],
+        )
+        .expect("candidate revision");
+        assert_single_node_graph_page(&store, &original);
+        assert_activation_keeps_node(&store, &original);
+        assert!(matches!(
+            store.run_graph_node_revision("run-1", "review", 2),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        assert!(
+            store
+                .current_run_graph_edge("run-1", 0)
+                .expect("candidate edge invisible")
+                .is_none()
+        );
+        assert!(matches!(
+            store.run_graph_edge_revision("run-1", 0, 2),
+            Err(WorkflowStoreError::InvalidData(_))
+        ));
+        edit.rollback().expect("abort candidate");
+        assert!(
+            store
+                .current_run_graph_edge("run-1", 0)
+                .expect("edge rolled back")
+                .is_none()
+        );
+        assert_eq!(writer.query_row("SELECT count(*) FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND revision = 2", [], |row| row.get::<_, u64>(0)).expect("candidate edge removed"), 0);
+        assert_single_node_graph_page(&store, &original);
+        assert_activation_keeps_node(&store, &original);
+        assert_eq!(writer.query_row("SELECT count(*) FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND revision = 2", [], |row| row.get::<_, u64>(0)).expect("candidate removed"), 0);
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("unchanged node"),
+            Some(original.clone())
+        );
+        let retry = writer.transaction().expect("retry revision");
+        retry
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, ?1, 0, 0)",
+                [serde_json::to_string(&candidate).expect("retry payload")],
+            )
+            .expect("retry node");
+        retry
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("publish retry");
+        retry.commit().expect("commit retry");
+        let current = store
+            .current_run_graph_node("run-1", "review")
+            .expect("retry read")
+            .expect("retry node");
+        assert_eq!(current.revision, 2);
+        assert_eq!(current.node, candidate);
+        assert_activation_keeps_node(&store, &original);
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
     fn combined_graph_page_surfaces_damaged_lookahead_edge() {
         let (_temp, store) = initialized_store();
         let edge = bcode_workflow::EdgeDefinition {
