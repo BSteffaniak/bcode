@@ -82,7 +82,7 @@ pub enum ScriptedProviderAction {
     Delay(Duration),
     /// Fail the poll operation before returning provider events.
     PollError(ProviderError),
-    /// Keep the poll operation pending until its caller cancels or times it out.
+    /// Keep polling pending until the turn is cancelled, including across abandoned polls.
     Pending,
 }
 
@@ -672,24 +672,27 @@ impl ModelProviderInvoker for ScriptedProvider {
         _provider_plugin_id: Option<&'a str>,
         request: &'a PollTurnEventsRequest,
     ) -> RuntimeFuture<'a, PollTurnEventsResponse> {
-        let action = {
-            let mut state = lock_state(&self.state);
-            state.active.get_mut(&request.provider_turn_id).map_or_else(
-                || Err(unknown_turn_error(&request.provider_turn_id)),
-                |turn| {
-                    if turn.cancelled {
-                        return Ok(ScriptedProviderAction::Events(vec![
-                            ProviderTurnEvent::Cancelled,
-                        ]));
-                    }
-                    Ok(turn
-                        .actions
-                        .pop_front()
-                        .unwrap_or(ScriptedProviderAction::Pending))
-                },
-            )
-        };
         Box::pin(async move {
+            let action = {
+                let mut state = lock_state(&self.state);
+                state.active.get_mut(&request.provider_turn_id).map_or_else(
+                    || Err(unknown_turn_error(&request.provider_turn_id)),
+                    |turn| {
+                        if turn.cancelled {
+                            return Ok(ScriptedProviderAction::Events(vec![
+                                ProviderTurnEvent::Cancelled,
+                            ]));
+                        }
+                        if matches!(turn.actions.front(), Some(ScriptedProviderAction::Pending)) {
+                            return Ok(ScriptedProviderAction::Pending);
+                        }
+                        Ok(turn
+                            .actions
+                            .pop_front()
+                            .unwrap_or(ScriptedProviderAction::Pending))
+                    },
+                )
+            };
             match action? {
                 ScriptedProviderAction::Events(events) => Ok(PollTurnEventsResponse { events }),
                 ScriptedProviderAction::Delay(delay) => {
@@ -797,6 +800,62 @@ fn unknown_turn_error(provider_turn_id: &str) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abandoned_pending_poll_does_not_advance_script() {
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::new().pending().events([
+            ProviderTurnEvent::TextDelta {
+                text: "unreachable".into(),
+            },
+        ])]);
+        let request =
+            crate::model_turn_request(&crate::AgentTurnRequest::new("model", "pending"), None)
+                .expect("request");
+        let started = provider.start_turn(None, &request).await.expect("start");
+        let poll = PollTurnEventsRequest {
+            provider_turn_id: started.provider_turn_id,
+        };
+        for _ in 0..2 {
+            let mut future = provider.poll_turn_events(None, &poll);
+            std::future::poll_fn(|cx| {
+                assert!(future.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        provider
+            .cancel_turn(
+                None,
+                &CancelTurnRequest {
+                    provider_turn_id: poll.provider_turn_id.clone(),
+                },
+            )
+            .await
+            .expect("cancel");
+        let response = provider
+            .poll_turn_events(None, &poll)
+            .await
+            .expect("cancelled poll");
+        assert_eq!(response.events, [ProviderTurnEvent::Cancelled]);
+        provider.shutdown_wait().await.expect("drain");
+    }
+
+    #[tokio::test]
+    async fn unpolled_poll_preserves_scripted_action() {
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("retained")]);
+        let request =
+            crate::model_turn_request(&crate::AgentTurnRequest::new("model", "poll"), None)
+                .expect("request");
+        let started = provider.start_turn(None, &request).await.expect("start");
+        let poll = PollTurnEventsRequest {
+            provider_turn_id: started.provider_turn_id,
+        };
+        drop(provider.poll_turn_events(None, &poll));
+        let response = provider.poll_turn_events(None, &poll).await.expect("poll");
+        assert!(response.events.iter().any(|event| matches!(event,
+            ProviderTurnEvent::TextDelta { text } if text == "retained")));
+        provider.shutdown_wait().await.expect("drain");
+    }
 
     #[tokio::test]
     async fn successful_cancellation_prevents_queued_output() {

@@ -11,11 +11,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_runner_help();
         return Ok(());
     }
+    run_native(run())
+}
+
+#[cfg(not(feature = "simulation-example"))]
+fn run_native(
+    scenario: impl std::future::Future<Output = bcode::Result<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use futures::FutureExt as _;
     let runtime = switchy::unsync::Builder::new().build()?;
-    let result = runtime.block_on(run());
-    runtime.wait()?;
-    result?;
-    Ok(())
+    let result = runtime.block_on(std::panic::AssertUnwindSafe(scenario).catch_unwind());
+    let result: Result<(), Box<dyn std::error::Error>> = match result {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err("native SDK scenario panicked".into()),
+    };
+    finish_native_run(result, runtime.wait().is_ok())
+}
+
+#[cfg(not(feature = "simulation-example"))]
+fn finish_native_run(
+    outcome: Result<(), Box<dyn std::error::Error>>,
+    runtime_stopped: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if runtime_stopped {
+        return outcome;
+    }
+    Err(Box::new(NativeShutdownFailure {
+        scenario: outcome.err(),
+    }))
+}
+
+#[cfg(not(feature = "simulation-example"))]
+struct NativeShutdownFailure {
+    scenario: Option<Box<dyn std::error::Error>>,
+}
+
+#[cfg(not(feature = "simulation-example"))]
+impl std::fmt::Debug for NativeShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(not(feature = "simulation-example"))]
+impl std::fmt::Display for NativeShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native runtime shutdown failed; resource release is unverified")
+    }
+}
+
+#[cfg(not(feature = "simulation-example"))]
+impl std::error::Error for NativeShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.scenario.as_deref()
+    }
 }
 
 #[cfg(feature = "simulation-example")]
@@ -101,6 +150,60 @@ impl SimulationBudgets {
             execution: execution.unwrap_or(10_000),
             drain: drain.unwrap_or(10_000),
         })
+    }
+}
+
+#[cfg(all(test, not(feature = "simulation-example")))]
+mod native_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_failure_preserves_scenario_source_without_displaying_it() {
+        let error = finish_native_run(Err("private scenario detail".into()), false).unwrap_err();
+        assert_eq!(format!("{error:?}"), error.to_string());
+        assert_eq!(format!("{error:#?}"), error.to_string());
+        assert_eq!(
+            error.to_string(),
+            "native runtime shutdown failed; resource release is unverified"
+        );
+        assert_eq!(
+            error.source().unwrap().to_string(),
+            "private scenario detail"
+        );
+        assert!(
+            finish_native_run(Ok(()), false)
+                .unwrap_err()
+                .source()
+                .is_none()
+        );
+        assert_eq!(
+            finish_native_run(Err("original".into()), true)
+                .unwrap_err()
+                .to_string(),
+            "original"
+        );
+        assert!(finish_native_run(Ok(()), true).is_ok());
+    }
+
+    #[test]
+    fn root_panic_releases_scenario_state() {
+        struct Release(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Release(Arc::clone(&completed));
+        let result = run_native(async move {
+            let _release = release;
+            panic!("private root panic");
+        });
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "native SDK scenario panicked"
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
     }
 }
 
