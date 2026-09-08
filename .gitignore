@@ -26,3 +26,5 @@ model-live/
 # agent/editor state
 .aider*
 .cursor/
+
+__pycache__/
