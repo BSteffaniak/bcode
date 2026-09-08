@@ -5653,11 +5653,11 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             scan,
             json,
         } => {
-            run_session_repair_command(SessionRepairCliOptions {
+            Box::pin(run_session_repair_command(SessionRepairCliOptions {
                 target: repair_cli_target(session_id, catalog, scan),
                 mode: SessionRepairCliMode::DryRun,
                 output: repair_cli_output(json),
-            })
+            }))
             .await?;
         }
         SessionCommand::RetiredCatalogs { apply, json } => {
@@ -5670,11 +5670,11 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             dry_run,
             json,
         } => {
-            run_session_repair_command(SessionRepairCliOptions {
+            Box::pin(run_session_repair_command(SessionRepairCliOptions {
                 target: repair_cli_target(session_id, catalog, scan),
                 mode: repair_cli_mode(dry_run),
                 output: repair_cli_output(json),
-            })
+            }))
             .await?;
         }
         SessionCommand::Reprice {

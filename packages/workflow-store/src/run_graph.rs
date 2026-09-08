@@ -512,6 +512,17 @@ impl WorkflowStore {
         run_id: &str,
         node_id: &str,
     ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let node = self.current_run_graph_node_in_snapshot(run_id, node_id)?;
+        transaction.commit()?;
+        Ok(node)
+    }
+
+    fn current_run_graph_node_in_snapshot(
+        &self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<Option<RunGraphNode>, WorkflowStoreError> {
         super::validate_id("node_id", node_id)?;
         let Some(current) = graph_revision(&self.connection, run_id)? else {
             return Ok(None);
@@ -534,6 +545,62 @@ impl WorkflowStore {
             ));
         }
         self.run_graph_node_revision(run_id, node_id, revision)
+    }
+
+    /// Read a bounded page of current nodes at an expected graph revision.
+    ///
+    /// Resume with the last returned node ID and the same expected revision. A
+    /// concurrent graph edit invalidates that cursor rather than mixing plans.
+    /// Each page contains at most 100 nodes and uses one read snapshot.
+    ///
+    /// # Errors
+    /// Returns an error for invalid cursors or limits, missing or changed graph
+    /// state, invalid executable data, or database failures.
+    pub fn current_run_graph_nodes(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        after_node_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphNode>, WorkflowStoreError> {
+        if limit == 0 || expected_revision == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "graph page limit and expected revision must be positive".to_string(),
+            ));
+        }
+        if let Some(cursor) = after_node_id {
+            super::validate_id("node cursor", cursor)?;
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        if graph_revision(&transaction, run_id)? != Some(expected_revision) {
+            return Err(WorkflowStoreError::InvalidData(
+                "graph page expected revision does not match committed graph".to_string(),
+            ));
+        }
+        let mut nodes = Vec::new();
+        let mut cursor = after_node_id.unwrap_or("").to_string();
+        for _ in 0..limit.min(GRAPH_PAGE_LIMIT) {
+            let id = transaction
+                .query_row(
+                    "SELECT node_id FROM workflow_run_graph_nodes
+                 WHERE run_id = ?1 AND node_id > ?2 ORDER BY node_id LIMIT 1",
+                    (run_id, &cursor),
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(id) = id else {
+                break;
+            };
+            nodes.push(
+                self.current_run_graph_node_in_snapshot(run_id, &id)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData("graph page node is missing".to_string())
+                    })?,
+            );
+            cursor = id;
+        }
+        transaction.commit()?;
+        Ok(nodes)
     }
 
     /// Read one initial node revision with its admitted entry and exit roles.

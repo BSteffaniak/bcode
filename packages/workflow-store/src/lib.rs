@@ -20948,6 +20948,18 @@ mod tests {
             .expect("exact node")
             .expect("second revision");
         assert_eq!(current.revision, 2);
+        let page = store
+            .current_run_graph_nodes("run-1", 2, None, 1)
+            .expect("current page");
+        assert_eq!(page, vec![current.clone()]);
+        assert!(
+            store
+                .current_run_graph_nodes("run-1", 2, Some("review"), 1)
+                .expect("end")
+                .is_empty()
+        );
+        assert!(store.current_run_graph_nodes("run-1", 1, None, 1).is_err());
+        assert!(store.current_run_graph_nodes("run-1", 2, None, 0).is_err());
         assert!(!current.entry && !current.exit);
         assert_eq!(
             store
@@ -20971,6 +20983,60 @@ mod tests {
         );
         assert!(store.run_graph_node("run-1", "review").is_err());
         assert_eq!(store.connection.total_changes(), changes);
+    }
+
+    #[test]
+    fn current_node_pages_skip_history_and_reject_changed_revision() {
+        let (_temp, store) = initialized_store();
+        let mut node = store
+            .current_run_graph_node("run-1", "review")
+            .expect("read")
+            .expect("node")
+            .node;
+        node.id = "second".to_string();
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'second', 1, ?1, 0, 0)",
+                [serde_json::to_string(&node).expect("json")],
+            )
+            .expect("second node");
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, node_json, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
+            )
+            .expect("revision fixture");
+        let before = store.connection.total_changes();
+        let first = store
+            .current_run_graph_nodes("run-1", 2, None, 1)
+            .expect("first");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].revision, 2);
+        let second = store
+            .current_run_graph_nodes("run-1", 2, Some(&first[0].node.id), 1)
+            .expect("second");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].node.id, "second");
+        assert_eq!(second[0].revision, 1);
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 3 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("changed graph");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .current_run_graph_nodes("run-1", 2, Some(&first[0].node.id), 1)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]
