@@ -2342,8 +2342,8 @@ impl AgentRuntime {
             start,
         )
         .await?;
-        let _provider_cleanup =
-            provider.turn_cleanup_handle(provider_plugin_id, &start_response.provider_turn_id);
+        let id = &start_response.provider_turn_id;
+        let _provider_cleanup = acquire_provider_cleanup(provider, provider_plugin_id, id).await?;
         let poll_request = PollTurnEventsRequest {
             provider_turn_id: start_response.provider_turn_id.clone(),
         };
@@ -2885,6 +2885,36 @@ where
     }
     .instrument(provider_span)
     .await
+}
+
+async fn acquire_provider_cleanup<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    provider_turn_id: &str,
+) -> Result<Option<Box<dyn ProviderTurnCleanup>>>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    if let Ok(cleanup) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        provider.turn_cleanup_handle(provider_plugin_id, provider_turn_id)
+    })) {
+        Ok(cleanup)
+    } else {
+        cancel_and_finish(
+            provider,
+            provider_plugin_id,
+            &CancelTurnRequest {
+                provider_turn_id: provider_turn_id.into(),
+            },
+            &FinishTurnRequest {
+                provider_turn_id: provider_turn_id.into(),
+            },
+        )
+        .await;
+        Err(RuntimeError::ProviderExecutionUnverified(
+            "provider cleanup acquisition panicked; execution is unverified".into(),
+        ))
+    }
 }
 
 async fn finish_provider_safely<P>(
@@ -4655,6 +4685,30 @@ mod tests {
             assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 0);
             assert_eq!(runtime.active_turn_generation(), None);
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_acquisition_panic_cleans_up_started_provider() {
+        let runtime = AgentRuntime::new();
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle
+            .panic_cleanup_acquisition
+            .store(true, Ordering::Release);
+        let mut provider = LifecyclePollProvider {
+            lifecycle: Arc::clone(&lifecycle),
+            outcome: LifecyclePollOutcome::Pending,
+        };
+        let result = runtime
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "cleanup"))
+            .await;
+        assert!(matches!(
+            result,
+            Err(RuntimeError::ProviderExecutionUnverified(_))
+        ));
+        assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
+        assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+        assert!(!lifecycle.polling.load(Ordering::Acquire));
+        assert_eq!(runtime.active_turn_generation(), None);
     }
 
     #[tokio::test]
@@ -8256,6 +8310,7 @@ mod tests {
     }
     #[derive(Debug, Default)]
     struct ProviderLifecycle {
+        panic_cleanup_acquisition: AtomicBool,
         started: AtomicBool,
         polling: AtomicBool,
         poll_count: AtomicUsize,
@@ -8296,6 +8351,20 @@ mod tests {
     }
 
     impl ModelProviderInvoker for LifecyclePollProvider {
+        fn turn_cleanup_handle(
+            &mut self,
+            _provider_plugin_id: Option<&str>,
+            _provider_turn_id: &str,
+        ) -> Option<Box<dyn ProviderTurnCleanup>> {
+            assert!(
+                !self
+                    .lifecycle
+                    .panic_cleanup_acquisition
+                    .load(Ordering::Acquire),
+                "private cleanup acquisition panic"
+            );
+            None
+        }
         fn start_turn<'a>(
             &'a mut self,
             _provider_plugin_id: Option<&'a str>,

@@ -1,5 +1,6 @@
 use bcode::{
-    AgentBuilder, AgentRuntime, ProviderRequestIdentity, ProviderTurnEvent, TokenUsage, testing::*,
+    AgentBuilder, AgentRuntime, ModelProviderInvoker, ProviderRequestIdentity, ProviderTurnEvent,
+    TokenUsage, testing::*,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -434,6 +435,7 @@ async fn run() -> bcode::Result<()> {
             Some(bcode::StopReason::EndTurn)
         );
     }
+    in_process.shutdown_wait().await?;
     let provider = ScriptedProvider::new([ScriptedProviderTurn::new()
         .events([
             ProviderTurnEvent::TurnStarted,
@@ -479,9 +481,11 @@ async fn run() -> bcode::Result<()> {
         .model("test-model")
         .build();
 
+    let mut provider_owner = provider.clone();
     let transcript = TextStreamRecorder::new(agent.stream_text_with_provider(provider, "hello"))
         .finish_up_to(100)
         .await;
+    provider_owner.shutdown_wait().await?;
     let response = transcript
         .assert_finished()
         .expect("coherent successful stream");

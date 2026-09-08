@@ -493,6 +493,7 @@ pub struct ScriptedProvider {
 
 #[derive(Debug)]
 struct ScriptedProviderState {
+    closed: bool,
     turns: VecDeque<ScriptedProviderTurn>,
     active: BTreeMap<String, ActiveScriptedTurn>,
     requests: Vec<CapturedProviderRequest>,
@@ -503,6 +504,7 @@ struct ScriptedProviderState {
 
 #[derive(Debug)]
 struct ActiveScriptedTurn {
+    cancelled: bool,
     cancellation_attempted: bool,
     actions: VecDeque<ScriptedProviderAction>,
     cancel_error: Option<ProviderError>,
@@ -515,6 +517,7 @@ impl ScriptedProvider {
     pub fn new(turns: impl IntoIterator<Item = ScriptedProviderTurn>) -> Self {
         Self {
             state: Arc::new(Mutex::new(ScriptedProviderState {
+                closed: false,
                 turns: turns.into_iter().collect(),
                 active: BTreeMap::new(),
                 requests: Vec::new(),
@@ -556,6 +559,55 @@ impl Drop for ScriptedTurnCleanup {
 }
 
 impl ModelProviderInvoker for ScriptedProvider {
+    fn shutdown_wait(&mut self) -> RuntimeFuture<'_, ()> {
+        let mut state = lock_state(&self.state);
+        state.closed = true;
+        let ids: Vec<_> = state.active.keys().cloned().collect();
+        for id in ids {
+            let turn = state.active.get_mut(&id).expect("active turn");
+            if turn.cancel_error.is_none() {
+                turn.cancelled = true;
+                turn.actions.clear();
+            }
+            if !turn.cancellation_attempted {
+                turn.cancellation_attempted = true;
+                state.cancellations.push(id);
+            }
+        }
+        drop(state);
+        Box::pin(async move {
+            let mut state = lock_state(&self.state);
+            let ids: Vec<_> = state.active.keys().cloned().collect();
+            let mut incomplete = false;
+            for id in ids {
+                let failed = state
+                    .active
+                    .get(&id)
+                    .expect("active turn")
+                    .finish_error
+                    .is_some();
+                state.finishes.push(id.clone());
+                if failed {
+                    incomplete = true;
+                } else {
+                    state.active.remove(&id);
+                }
+            }
+            drop(state);
+            if incomplete {
+                Err(RuntimeError::ProviderExecutionUnverified(
+                    "scripted provider shutdown release is unverified".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn shutdown(&mut self, _budget: Duration) -> RuntimeFuture<'_, ()> {
+        // Scripted turns own no background work; draining requires no clock advancement.
+        self.shutdown_wait()
+    }
     fn turn_cleanup_handle(
         &mut self,
         _provider_plugin_id: Option<&str>,
@@ -574,6 +626,11 @@ impl ModelProviderInvoker for ScriptedProvider {
     ) -> RuntimeFuture<'a, StartTurnResponse> {
         Box::pin(async move {
             let mut state = lock_state(&self.state);
+            if state.closed {
+                return Err(RuntimeError::ProviderExecutionUnverified(
+                    "scripted provider admission is closed".into(),
+                ));
+            }
             let next_turn_id = state.next_turn_id.checked_add(1).ok_or_else(|| {
                 RuntimeError::ProviderInvocation("scripted provider turn ID space exhausted".into())
             })?;
@@ -593,6 +650,7 @@ impl ModelProviderInvoker for ScriptedProvider {
                     state.active.insert(
                         provider_turn_id.clone(),
                         ActiveScriptedTurn {
+                            cancelled: false,
                             cancellation_attempted: false,
                             actions: turn.actions,
                             cancel_error: turn.cancel_error,
@@ -619,6 +677,11 @@ impl ModelProviderInvoker for ScriptedProvider {
             state.active.get_mut(&request.provider_turn_id).map_or_else(
                 || Err(unknown_turn_error(&request.provider_turn_id)),
                 |turn| {
+                    if turn.cancelled {
+                        return Ok(ScriptedProviderAction::Events(vec![
+                            ProviderTurnEvent::Cancelled,
+                        ]));
+                    }
                     Ok(turn
                         .actions
                         .pop_front()
@@ -652,6 +715,10 @@ impl ModelProviderInvoker for ScriptedProvider {
                 .get_mut(&request.provider_turn_id)
                 .and_then(|turn| {
                     turn.cancellation_attempted = true;
+                    if turn.cancel_error.is_none() {
+                        turn.cancelled = true;
+                        turn.actions.clear();
+                    }
                     turn.cancel_error.clone()
                 })
                 .map_or_else(
@@ -730,6 +797,113 @@ fn unknown_turn_error(provider_turn_id: &str) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn successful_cancellation_prevents_queued_output() {
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::complete_text("stale")]);
+        let request =
+            crate::model_turn_request(&crate::AgentTurnRequest::new("model", "cancel"), None)
+                .expect("request");
+        let started = provider.start_turn(None, &request).await.expect("start");
+        provider
+            .cancel_turn(
+                None,
+                &CancelTurnRequest {
+                    provider_turn_id: started.provider_turn_id.clone(),
+                },
+            )
+            .await
+            .expect("cancel");
+        for _ in 0..2 {
+            let response = provider
+                .poll_turn_events(
+                    None,
+                    &PollTurnEventsRequest {
+                        provider_turn_id: started.provider_turn_id.clone(),
+                    },
+                )
+                .await
+                .expect("poll cancelled turn");
+            assert!(matches!(
+                response.events.as_slice(),
+                [ProviderTurnEvent::Cancelled]
+            ));
+        }
+        provider.shutdown_wait().await.expect("drain");
+    }
+
+    #[tokio::test]
+    async fn failed_shutdown_retains_active_turn_for_explicit_cleanup() {
+        let mut provider = ScriptedProvider::new([
+            ScriptedProviderTurn::new().pending(),
+            ScriptedProviderTurn::new().pending(),
+        ]);
+        let request =
+            crate::model_turn_request(&crate::AgentTurnRequest::new("model", "shutdown"), None)
+                .expect("request");
+        let started = provider.start_turn(None, &request).await.expect("start");
+        let healthy = provider
+            .start_turn(None, &request)
+            .await
+            .expect("second start");
+        let RuntimeError::Provider { error, .. } = script_exhausted_error() else {
+            panic!("typed fixture error");
+        };
+        lock_state(&provider.state)
+            .active
+            .get_mut(&started.provider_turn_id)
+            .expect("active")
+            .finish_error = Some(*error);
+        assert!(matches!(
+            provider.shutdown_wait().await,
+            Err(RuntimeError::ProviderExecutionUnverified(_))
+        ));
+        assert_eq!(lock_state(&provider.state).active.len(), 1);
+        assert!(
+            !lock_state(&provider.state)
+                .active
+                .contains_key(&healthy.provider_turn_id)
+        );
+        assert_eq!(lock_state(&provider.state).finishes.len(), 2);
+        lock_state(&provider.state)
+            .active
+            .get_mut(&started.provider_turn_id)
+            .expect("retained")
+            .finish_error = None;
+        provider
+            .shutdown_wait()
+            .await
+            .expect("release after recovery");
+        assert!(lock_state(&provider.state).active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoned_shutdown_closes_admission_and_retains_turn_until_drained() {
+        let mut provider = ScriptedProvider::new([ScriptedProviderTurn::new().pending()]);
+        let request =
+            crate::model_turn_request(&crate::AgentTurnRequest::new("model", "shutdown"), None)
+                .expect("request");
+        let started = provider.start_turn(None, &request).await.expect("start");
+        drop(provider.shutdown_wait());
+        assert!(provider.start_turn(None, &request).await.is_err());
+        {
+            let state = lock_state(&provider.state);
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(
+                state.cancellations,
+                std::slice::from_ref(&started.provider_turn_id)
+            );
+            assert!(state.finishes.is_empty());
+            drop(state);
+        }
+        provider.shutdown(Duration::ZERO).await.expect("drain");
+        provider.shutdown_wait().await.expect("idempotent drain");
+        let state = lock_state(&provider.state);
+        assert!(state.active.is_empty());
+        assert_eq!(state.finishes, [started.provider_turn_id]);
+        drop(state);
+    }
 
     #[tokio::test]
     async fn explicit_cancel_then_abandonment_records_no_duplicate_cancellation() {
