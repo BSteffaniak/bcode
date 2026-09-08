@@ -395,7 +395,70 @@ fn edge_cursor(after_edge_id: Option<u64>) -> Result<i64, WorkflowStoreError> {
         })
 }
 
+/// One consistent, bounded page of a run-owned graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunGraphPage {
+    /// Committed graph revision shared by every field.
+    pub revision: u64,
+    /// Current node representations in identity order.
+    pub nodes: Vec<RunGraphNode>,
+    /// Current edges in identity order.
+    pub edges: Vec<RunGraphEdge>,
+    /// No nodes remain after this page.
+    pub nodes_complete: bool,
+    /// No edges remain after this page.
+    pub edges_complete: bool,
+}
+
 impl WorkflowStore {
+    /// Read nodes, edges, and continuation status from one read snapshot.
+    ///
+    /// # Errors
+    /// Returns an error for missing graphs, revision conflicts, invalid cursors or
+    /// limits, damaged graph data, or database failures.
+    pub fn current_run_graph_page(
+        &self,
+        run_id: &str,
+        expected_revision: Option<u64>,
+        after_node_id: Option<&str>,
+        after_edge_id: Option<u64>,
+        limit: usize,
+    ) -> Result<RunGraphPage, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let revision = graph_revision(&transaction, run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow run graph not found".to_string())
+        })?;
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow graph revision conflict".to_string(),
+            ));
+        }
+        let nodes =
+            self.current_run_graph_nodes_in_snapshot(run_id, revision, after_node_id, limit)?;
+        let edges =
+            self.current_run_graph_edges_in_snapshot(run_id, revision, after_edge_id, limit)?;
+        let nodes_complete = match nodes.last() {
+            Some(last) => self
+                .current_run_graph_nodes_in_snapshot(run_id, revision, Some(&last.node.id), 1)?
+                .is_empty(),
+            None => true,
+        };
+        let edges_complete = match edges.last() {
+            Some(last) => self
+                .current_run_graph_edges_in_snapshot(run_id, revision, Some(last.edge_id), 1)?
+                .is_empty(),
+            None => true,
+        };
+        transaction.commit()?;
+        Ok(RunGraphPage {
+            revision,
+            nodes,
+            edges,
+            nodes_complete,
+            edges_complete,
+        })
+    }
+
     /// Read the immutable executable node selected when an activation was admitted.
     ///
     /// # Errors
@@ -563,6 +626,24 @@ impl WorkflowStore {
         after_node_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RunGraphNode>, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let nodes = self.current_run_graph_nodes_in_snapshot(
+            run_id,
+            expected_revision,
+            after_node_id,
+            limit,
+        )?;
+        transaction.commit()?;
+        Ok(nodes)
+    }
+
+    fn current_run_graph_nodes_in_snapshot(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        after_node_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphNode>, WorkflowStoreError> {
         if limit == 0 || expected_revision == 0 {
             return Err(WorkflowStoreError::InvalidData(
                 "graph page limit and expected revision must be positive".to_string(),
@@ -571,8 +652,8 @@ impl WorkflowStore {
         if let Some(cursor) = after_node_id {
             super::validate_id("node cursor", cursor)?;
         }
-        let transaction = self.connection.unchecked_transaction()?;
-        if graph_revision(&transaction, run_id)? != Some(expected_revision) {
+        let transaction = &self.connection;
+        if graph_revision(transaction, run_id)? != Some(expected_revision) {
             return Err(WorkflowStoreError::InvalidData(
                 "graph page expected revision does not match committed graph".to_string(),
             ));
@@ -599,7 +680,6 @@ impl WorkflowStore {
             );
             cursor = id;
         }
-        transaction.commit()?;
         Ok(nodes)
     }
 
@@ -676,6 +756,18 @@ impl WorkflowStore {
         edge_id: u64,
         revision: u64,
     ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let edge = self.run_graph_edge_revision_in_snapshot(run_id, edge_id, revision)?;
+        transaction.commit()?;
+        Ok(edge)
+    }
+
+    fn run_graph_edge_revision_in_snapshot(
+        &self,
+        run_id: &str,
+        edge_id: u64,
+        revision: u64,
+    ) -> Result<Option<RunGraphEdge>, WorkflowStoreError> {
         let edge_id = i64::try_from(edge_id).map_err(|_| {
             WorkflowStoreError::InvalidData("edge identity exceeds storage range".to_string())
         })?;
@@ -684,8 +776,8 @@ impl WorkflowStore {
                 "invalid edge revision".to_string(),
             ));
         }
-        let transaction = self.connection.unchecked_transaction()?;
-        let Some(current) = graph_revision(&transaction, run_id)? else {
+        let transaction = &self.connection;
+        let Some(current) = graph_revision(transaction, run_id)? else {
             return Ok(None);
         };
         if revision > current {
@@ -742,13 +834,95 @@ impl WorkflowStore {
                     WorkflowStoreError::InvalidData("edge endpoint is missing".to_string())
                 })?;
         }
-        transaction.commit()?;
         Ok(Some(RunGraphEdge {
             edge_id: u64::try_from(edge_id).map_err(|_| {
                 WorkflowStoreError::InvalidData("invalid edge identity".to_string())
             })?,
             edge,
         }))
+    }
+
+    /// Read current edges in bounded identity order at an expected graph revision.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits/cursors, changed or missing graph state,
+    /// uncommitted revisions, invalid edge data, or database failures.
+    pub fn current_run_graph_edges(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        after_edge_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let edges = self.current_run_graph_edges_in_snapshot(
+            run_id,
+            expected_revision,
+            after_edge_id,
+            limit,
+        )?;
+        transaction.commit()?;
+        Ok(edges)
+    }
+
+    fn current_run_graph_edges_in_snapshot(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        after_edge_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RunGraphEdge>, WorkflowStoreError> {
+        let mut cursor = edge_cursor(after_edge_id)?;
+        if limit == 0 || expected_revision == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "invalid graph page limit or revision".to_string(),
+            ));
+        }
+        let transaction = &self.connection;
+        if graph_revision(transaction, run_id)? != Some(expected_revision) {
+            return Err(WorkflowStoreError::InvalidData(
+                "graph page revision conflict".to_string(),
+            ));
+        }
+        let mut edges = Vec::new();
+        for _ in 0..limit.min(GRAPH_PAGE_LIMIT) {
+            let row = transaction
+                .query_row(
+                    "SELECT edge_id FROM workflow_run_graph_edges
+                 WHERE run_id = ?1 AND edge_id > ?2
+                 ORDER BY edge_id LIMIT 1",
+                    (run_id, cursor),
+                    |row| row.get::<_, u64>(0),
+                )
+                .optional()?;
+            let Some(id) = row else {
+                break;
+            };
+            let revision = transaction.query_row(
+                "SELECT revision FROM workflow_run_graph_edges
+                 WHERE run_id = ?1 AND edge_id = ?2 ORDER BY revision DESC LIMIT 1",
+                (run_id, id),
+                |row| row.get::<_, u64>(0),
+            )?;
+            let edge = self
+                .run_graph_edge_revision_in_snapshot(run_id, id, revision)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("graph edge is missing".to_string())
+                })?;
+            for endpoint in [&edge.edge.from, &edge.edge.to] {
+                self.current_run_graph_node_in_snapshot(run_id, endpoint)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "current graph edge endpoint is missing".to_string(),
+                        )
+                    })?;
+            }
+            edges.push(edge);
+            cursor = i64::try_from(id).map_err(|_| {
+                WorkflowStoreError::InvalidData("invalid edge identity".to_string())
+            })?;
+        }
+        Ok(edges)
     }
 
     /// Read a bounded page of initial edges targeting one node, ordered by edge identity.

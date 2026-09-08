@@ -5099,30 +5099,18 @@ fn inspect_run_graph(
     expected_revision: Option<u64>,
     limit: usize,
 ) -> Result<bcode_ipc::WorkflowRunGraphInspection, bcode_workflow_store::WorkflowStoreError> {
-    let revision = store.run_graph_revision(run_id)?.ok_or_else(|| {
-        bcode_workflow_store::WorkflowStoreError::InvalidData(
-            "workflow run graph not found".to_string(),
-        )
-    })?;
-    if expected_revision.is_some_and(|expected| expected != revision) {
-        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
-            format!("workflow graph revision conflict: current revision is {revision}"),
-        ));
-    }
-    let nodes = store.run_graph_nodes(run_id, after_node_id, limit)?;
-    let edges = store.run_graph_edges(run_id, after_edge_id, limit)?;
-    let nodes_complete = match nodes.last() {
-        Some(last) => store
-            .run_graph_nodes(run_id, Some(&last.node.id), 1)?
-            .is_empty(),
-        None => true,
-    };
-    let edges_complete = match edges.last() {
-        Some(last) => store
-            .run_graph_edges(run_id, Some(last.edge_id), 1)?
-            .is_empty(),
-        None => true,
-    };
+    let page = store.current_run_graph_page(
+        run_id,
+        expected_revision,
+        after_node_id,
+        after_edge_id,
+        limit,
+    )?;
+    let revision = page.revision;
+    let nodes = page.nodes;
+    let edges = page.edges;
+    let nodes_complete = page.nodes_complete;
+    let edges_complete = page.edges_complete;
     Ok(bcode_ipc::WorkflowRunGraphInspection {
         revision,
         nodes: nodes

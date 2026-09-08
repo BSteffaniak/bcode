@@ -57751,6 +57751,52 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .path()
             .to_path_buf();
+        let first_page = workflow_operations::inspect_graph_page(
+            &state,
+            &bcode_ipc::WorkflowRunGraphPageRequest {
+                run_id: "parallel-restart-run".to_string(),
+                expected_revision: 1,
+                after_node_id: None,
+                after_edge_id: None,
+                limit: 1,
+            },
+        )
+        .expect("first graph page");
+        assert_eq!(first_page.nodes.len(), 1);
+        assert_eq!(first_page.edges.len(), 1);
+        assert!(!first_page.nodes_complete && !first_page.edges_complete);
+        let next_request = bcode_ipc::WorkflowRunGraphPageRequest {
+            run_id: "parallel-restart-run".to_string(),
+            expected_revision: first_page.revision,
+            after_node_id: Some(first_page.nodes[0].node.id.clone()),
+            after_edge_id: Some(first_page.edges[0].edge_id),
+            limit: 100,
+        };
+        let next_page = workflow_operations::inspect_graph_page(&state, &next_request)
+            .expect("remaining graph");
+        assert!(next_page.nodes_complete && next_page.edges_complete);
+        assert!(
+            next_page
+                .nodes
+                .iter()
+                .all(|node| node.node.id != first_page.nodes[0].node.id)
+        );
+        assert!(
+            next_page
+                .edges
+                .iter()
+                .all(|edge| edge.edge_id != first_page.edges[0].edge_id)
+        );
+        assert!(
+            workflow_operations::inspect_graph_page(
+                &state,
+                &bcode_ipc::WorkflowRunGraphPageRequest {
+                    expected_revision: 2,
+                    ..next_request
+                }
+            )
+            .is_err()
+        );
         struct Fault(bcode_workflow_store::WorkflowDispatchBoundary);
         impl bcode_workflow_store::WorkflowDispatchFault for Fault {
             fn after_boundary(

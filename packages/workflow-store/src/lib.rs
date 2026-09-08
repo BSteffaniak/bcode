@@ -21062,6 +21062,18 @@ mod tests {
         drop(store);
         let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
         let before = store.connection.total_changes();
+        let page = store
+            .current_run_graph_edges("run-1", 2, None, 1)
+            .expect("page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].edge, edge);
+        assert!(
+            store
+                .current_run_graph_edges("run-1", 2, Some(0), 1)
+                .expect("end")
+                .is_empty()
+        );
+        assert!(store.current_run_graph_edges("run-1", 1, None, 1).is_err());
         assert_eq!(
             store
                 .run_graph_edge_revision("run-1", 0, 1)
@@ -21078,6 +21090,109 @@ mod tests {
         );
         assert!(store.run_graph_edge_revision("run-1", 0, 3).is_err());
         assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn current_edges_reject_damaged_current_endpoint_but_preserve_history() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::default(),
+            transform: None,
+        };
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            [serde_json::to_string(&edge).expect("json")],
+        ).expect("edge");
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, '{}', 0, 0);
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
+            )
+            .expect("damaged current endpoint");
+        let before = store.connection.total_changes();
+        assert!(store.current_run_graph_edges("run-1", 2, None, 1).is_err());
+        assert_eq!(
+            store
+                .run_graph_edge_revision("run-1", 0, 1)
+                .expect("history")
+                .expect("edge")
+                .edge,
+            edge
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn combined_graph_page_failure_releases_snapshot_without_writes() {
+        let (_temp, store) = initialized_store();
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', '{}')",
+            [],
+        ).expect("damaged edge");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .current_run_graph_page("run-1", Some(1), None, None, 1)
+                .is_err()
+        );
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+        let page = store
+            .current_run_graph_page("run-1", Some(1), None, Some(0), 1)
+            .expect("page beyond damage");
+        assert_eq!(page.nodes.len(), 1);
+        assert!(page.edges.is_empty());
+        assert!(page.nodes_complete && page.edges_complete);
+        assert!(store.connection.is_autocommit());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn edge_pages_seek_past_revision_history() {
+        let (_temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::default(),
+            transform: None,
+        };
+        let json = serde_json::to_string(&edge).expect("json");
+        for revision in 1..=200 {
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, ?1, 'review', 'review', ?2)",
+                (revision, &json),
+            ).expect("history");
+        }
+        store.connection.execute(
+            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 1, 1, 'review', 'review', ?1)",
+            [&json],
+        ).expect("next edge");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 200 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("revision");
+        let first = store
+            .current_run_graph_edges("run-1", 200, None, 1)
+            .expect("first");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].edge_id, 0);
+        let next = store
+            .current_run_graph_edges("run-1", 200, Some(0), 1)
+            .expect("next");
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].edge_id, 1);
+        assert!(
+            store
+                .current_run_graph_edges("run-1", 200, Some(1), 1)
+                .expect("end")
+                .is_empty()
+        );
     }
 
     #[test]
