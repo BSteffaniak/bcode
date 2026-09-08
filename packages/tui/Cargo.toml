@@ -87,6 +87,7 @@ tracing = { workspace = true }
 unicode-segmentation = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 bcode_default_agents_plugin = { workspace = true, features = [

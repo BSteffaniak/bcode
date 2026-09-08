@@ -75,6 +75,7 @@ pub(crate) mod session_picker_render;
 pub mod session_search;
 pub mod session_search_effect;
 pub(crate) mod setup_board;
+mod setup_connection_form;
 mod setup_settings_form;
 pub(crate) mod skill_flow;
 pub(crate) mod skill_picker;

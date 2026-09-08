@@ -28,6 +28,7 @@ pub struct OnboardingProgram {
     theme: super::theme::PresentedTheme,
     area: Rect,
     continuation: bcode_settings::SetupContinuation,
+    connection_form: Option<super::setup_connection_form::ConnectionForm>,
     settings_form: Option<super::setup_settings_form::SetupSettingsForm>,
 }
 
@@ -49,6 +50,7 @@ impl OnboardingProgram {
             theme: *theme,
             area,
             continuation: bcode_settings::SetupContinuation::Close,
+            connection_form: None,
             settings_form: None,
         })
     }
@@ -75,12 +77,17 @@ impl OnboardingProgram {
                 Ok(Lifecycle::Continue)
             }
             KeyCode::Char('p' | 'a' | 'm') if !self.shell.has_pending_confirmation() => {
-                self.continuation = match code {
-                    KeyCode::Char('p') => bcode_settings::SetupContinuation::Connection,
-                    KeyCode::Char('m') => bcode_settings::SetupContinuation::Model,
-                    _ => bcode_settings::SetupContinuation::Credentials,
-                };
-                Ok(Lifecycle::Exit)
+                if code == KeyCode::Char('m') {
+                    self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::new(
+                        &bcode_config::default_config_dir().join("bcode.toml"),
+                        "model/profile",
+                    ));
+                } else {
+                    self.connection_form = Some(super::setup_connection_form::ConnectionForm::new(
+                        code == KeyCode::Char('a'),
+                    ));
+                }
+                Ok(Lifecycle::Continue)
             }
             KeyCode::Escape | KeyCode::Char('q') => {
                 let was_confirming = self.shell.has_pending_confirmation();
@@ -128,6 +135,18 @@ impl Program for OnboardingProgram {
         &mut self,
         event: RuntimeEvent<Self::Message>,
     ) -> Result<Update<Self::Message>, Self::Error> {
+        if let RuntimeEvent::Terminal(ref terminal_event) = event
+            && !matches!(terminal_event, Event::Resize(_))
+            && let Some(form) = &mut self.connection_form
+        {
+            if form.handle_event(terminal_event) {
+                self.connection_form = None;
+            }
+            return Ok(Update {
+                invalidation: Invalidation::Redraw,
+                ..Update::none()
+            });
+        }
         if let RuntimeEvent::Terminal(ref terminal_event) = event
             && !matches!(terminal_event, Event::Resize(_))
             && let Some(form) = &mut self.settings_form
@@ -228,6 +247,10 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
 
     fn present(&mut self, program: &mut OnboardingProgram) -> Result<PresentReport, Self::Error> {
         let stats = self.terminal.draw_damage(Damage::Full, |frame| {
+            if let Some(form) = &mut program.connection_form {
+                form.render(frame, &program.theme);
+                return;
+            }
             if let Some(form) = &mut program.settings_form {
                 form.render(frame, &program.theme);
                 return;
@@ -251,6 +274,41 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
 mod tests {
     use super::onboarding_action_for_key;
     use bmux_keyboard::KeyCode;
+
+    #[test]
+    fn editing_actions_never_request_terminal_exit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store =
+            bcode_settings::SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let summary = bcode_settings::SetupConfigSummary::default();
+        let shell = crate::onboarding::OnboardingShell::from_reconciliation(
+            &[],
+            &summary.reconciliation_input(),
+        );
+        let theme = crate::theme::resolve_configured_theme(
+            &bcode_config::TuiConfig::default(),
+            temp.path(),
+        );
+        let mut program = super::OnboardingProgram::new(
+            store,
+            shell,
+            &theme,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        )
+        .expect("program");
+        for key in ['p', 'a', 'm', 'r', 'g', 'x'] {
+            assert_eq!(
+                program.handle_key(KeyCode::Char(key)).expect("input"),
+                bmux_tui_runtime::Lifecycle::Continue
+            );
+            assert_eq!(
+                program.continuation(),
+                bcode_settings::SetupContinuation::Close
+            );
+            program.connection_form = None;
+            program.settings_form = None;
+        }
+    }
 
     #[test]
     fn onboarding_runtime_maps_product_actions_without_terminal_types() {

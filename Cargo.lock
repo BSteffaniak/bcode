@@ -2984,6 +2984,7 @@ dependencies = [
  "unicode-segmentation",
  "url 2.5.8",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
