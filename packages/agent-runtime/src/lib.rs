@@ -88,6 +88,11 @@ pub enum RuntimeError {
     /// Provider operation failed before it could be represented as a model event.
     #[error("provider invocation failed: {0}")]
     ProviderInvocation(String),
+    /// Provider execution panicked; side effects or resource release cannot be verified.
+    ///
+    /// Automatic retry and fallback must not repeat this ambiguous execution.
+    #[error("provider execution is unverified: {0}")]
+    ProviderExecutionUnverified(String),
     /// Provider reported a structured model error.
     #[error("provider error {code}: {message}")]
     Provider {
@@ -2546,9 +2551,9 @@ where
         }
         EventDisposition::PrivateMetadata => Ok(None),
         EventDisposition::Finished { stop_reason } => {
-            provider
-                .finish_turn(context.provider_plugin_id, context.finish_request)
-                .await?;
+            finish_provider_safely(provider, context.provider_plugin_id, context.finish_request)
+                .await
+                .map_err(|error| terminal_after_visible_output(error, events))?;
             record_usage(context, usage.as_ref());
             let finished_event = finished_event(
                 usage.as_ref(),
@@ -2677,8 +2682,14 @@ where
                     request_id,
                 );
             }
-            cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await;
-            Err(error)
+            if cancel_and_finish(provider, provider_plugin_id, cancel_request, finish_request).await
+            {
+                Err(error)
+            } else {
+                Err(RuntimeError::ProviderExecutionUnverified(
+                    "provider event failed and resource release is unverified".into(),
+                ))
+            }
         }
     }
 }
@@ -2741,11 +2752,30 @@ where
             () = sleep(remaining) => {
                 Err(RuntimeError::Timeout { timeout: request.timeout })
             }
-            response = provider.start_turn(provider_plugin_id, model_request) => response,
+            response = start_provider_safely(provider, provider_plugin_id, model_request) => response,
         }
     }
     .instrument(provider_span)
     .await
+}
+
+async fn start_provider_safely<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    request: &ModelTurnRequest,
+) -> Result<StartTurnResponse>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    use futures::FutureExt as _;
+    std::panic::AssertUnwindSafe(async { provider.start_turn(provider_plugin_id, request).await })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            Err(RuntimeError::ProviderExecutionUnverified(
+                "provider startup panicked; partial acquisition cleanup is unverified".into(),
+            ))
+        })
 }
 
 struct ProviderPollContext<'a> {
@@ -2835,13 +2865,19 @@ where
             match poll {
                 Ok(response) => Ok(response),
                 Err(error) => {
-                    cancel_and_finish(
+                    let released = cancel_and_finish(
                         provider,
                         context.provider_plugin_id,
                         context.cancel_request,
                         context.finish_request,
                     ).await;
-                    Err(error)
+                    if released {
+                        Err(error)
+                    } else {
+                        Err(RuntimeError::ProviderExecutionUnverified(
+                            "provider polling failed and resource release is unverified".into(),
+                        ))
+                    }
                 }
             }
         },
@@ -2849,6 +2885,31 @@ where
     }
     .instrument(provider_span)
     .await
+}
+
+async fn finish_provider_safely<P>(
+    provider: &mut P,
+    provider_plugin_id: Option<&str>,
+    request: &FinishTurnRequest,
+) -> Result<AckResponse>
+where
+    P: ModelProviderInvoker + ?Sized,
+{
+    use futures::FutureExt as _;
+    std::panic::AssertUnwindSafe(async { provider.finish_turn(provider_plugin_id, request).await })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            Err(RuntimeError::ProviderExecutionUnverified(
+                "provider finish panicked; resource release is unverified".into(),
+            ))
+        })
+        .map_err(|error| match error {
+            RuntimeError::ProviderExecutionUnverified(_) => error,
+            _ => RuntimeError::ProviderExecutionUnverified(
+                "provider finish failed; resource release is unverified".into(),
+            ),
+        })
 }
 
 async fn poll_provider_safely<P>(
@@ -2866,7 +2927,7 @@ where
     .catch_unwind()
     .await
     .unwrap_or_else(|_| {
-        Err(RuntimeError::ProviderInvocation(
+        Err(RuntimeError::ProviderExecutionUnverified(
             "provider event polling panicked".into(),
         ))
     })
@@ -2894,7 +2955,8 @@ async fn cancel_and_finish<P>(
     provider_plugin_id: Option<&str>,
     cancel_request: &CancelTurnRequest,
     finish_request: &FinishTurnRequest,
-) where
+) -> bool
+where
     P: ModelProviderInvoker + ?Sized,
 {
     tracing::info!(
@@ -2914,9 +2976,10 @@ async fn cancel_and_finish<P>(
             "provider cancellation failed; attempting finish"
         );
     }
-    if !provider_cleanup_succeeded(|| provider.finish_turn(provider_plugin_id, finish_request))
-        .await
-    {
+    let released =
+        provider_cleanup_succeeded(|| provider.finish_turn(provider_plugin_id, finish_request))
+            .await;
+    if !released {
         tracing::warn!(
             target: "bcode::sdk",
             event = "bcode.provider_cleanup_failed",
@@ -2924,6 +2987,7 @@ async fn cancel_and_finish<P>(
             "provider finish failed; resource release is not confirmed"
         );
     }
+    released
 }
 
 fn finished_event(
@@ -4542,6 +4606,99 @@ mod tests {
             assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
             assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
             assert!(runtime.complete_turn_scope(&scope));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_start_panics_report_unverified_partial_acquisition() {
+        for panic in 1..=2 {
+            let runtime = AgentRuntime::new();
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            lifecycle.panic_start.store(panic, Ordering::Release);
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Pending,
+            };
+            let result = runtime
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "start"))
+                .await;
+            assert!(
+                matches!(result, Err(RuntimeError::ProviderExecutionUnverified(message))
+                if message == "provider startup panicked; partial acquisition cleanup is unverified")
+            );
+            assert_eq!(lifecycle.poll_count.load(Ordering::Acquire), 0);
+            assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 0);
+            assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 0);
+            assert_eq!(runtime.active_turn_generation(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_finish_panics_do_not_publish_success_or_retry_cleanup() {
+        for panic in 1..=2 {
+            let runtime = AgentRuntime::new();
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            lifecycle.panic_finish.store(panic, Ordering::Release);
+            lifecycle.release_poll.notify_one();
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::Finish,
+            };
+            let result = runtime
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "finish"))
+                .await;
+            assert!(
+                matches!(result, Err(RuntimeError::ProviderExecutionUnverified(message))
+                if message == "provider finish panicked; resource release is unverified")
+            );
+            assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+            assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 0);
+            assert_eq!(runtime.active_turn_generation(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn finalization_error_without_output_reports_unverified_release() {
+        let runtime = AgentRuntime::new();
+        let lifecycle = Arc::new(ProviderLifecycle::default());
+        lifecycle.fail_finish.store(true, Ordering::Release);
+        lifecycle.release_poll.notify_one();
+        let mut provider = LifecyclePollProvider {
+            lifecycle: Arc::clone(&lifecycle),
+            outcome: LifecyclePollOutcome::Finish,
+        };
+        let result = runtime
+            .run_text_turn(&mut provider, AgentTurnRequest::new("model", "finish"))
+            .await;
+        assert!(
+            matches!(result, Err(RuntimeError::ProviderExecutionUnverified(message))
+            if message == "provider finish failed; resource release is unverified")
+        );
+        assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+        assert_eq!(runtime.active_turn_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn finalization_failure_after_visible_output_is_not_retryable() {
+        for panic in 0..=2 {
+            let runtime = AgentRuntime::new();
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            lifecycle.fail_finish.store(panic == 0, Ordering::Release);
+            lifecycle.panic_finish.store(panic, Ordering::Release);
+            lifecycle.release_poll.notify_one();
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::ToolCall,
+            };
+            let result = runtime
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "finish"))
+                .await;
+            assert!(matches!(
+                result,
+                Err(RuntimeError::ProviderExecutionUnverified(_))
+            ));
+            assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+            assert_eq!(runtime.active_turn_generation(), None);
         }
     }
 
@@ -8105,6 +8262,7 @@ mod tests {
         cancelled: AtomicBool,
         fail_cancel: AtomicBool,
         fail_finish: AtomicBool,
+        panic_start: AtomicUsize,
         panic_cancel: AtomicUsize,
         panic_finish: AtomicUsize,
         cancel_count: AtomicUsize,
@@ -8116,6 +8274,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum LifecyclePollOutcome {
+        PollError,
         Finish,
         Cancelled,
         ProviderError,
@@ -8143,7 +8302,17 @@ mod tests {
             _request: &'a ModelTurnRequest,
         ) -> RuntimeFuture<'a, StartTurnResponse> {
             self.lifecycle.started.store(true, Ordering::Release);
-            Box::pin(async {
+            assert_ne!(
+                self.lifecycle.panic_start.load(Ordering::Acquire),
+                1,
+                "private startup construction payload"
+            );
+            Box::pin(async move {
+                assert_ne!(
+                    self.lifecycle.panic_start.load(Ordering::Acquire),
+                    2,
+                    "private startup polling payload"
+                );
                 Ok(StartTurnResponse {
                     provider_turn_id: "lifecycle".to_string(),
                 })
@@ -8217,6 +8386,9 @@ mod tests {
                             }],
                         })
                     }
+                    LifecyclePollOutcome::PollError => Err(RuntimeError::ProviderInvocation(
+                        "temporary polling failure".into(),
+                    )),
                     LifecyclePollOutcome::Panic => panic!("private provider panic payload"),
                     LifecyclePollOutcome::Pending => std::future::pending().await,
                 }
@@ -8318,6 +8490,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_error_event_requires_verified_release() {
+        for fail_finish in [false, true] {
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            lifecycle.fail_finish.store(fail_finish, Ordering::Release);
+            lifecycle.release_poll.notify_one();
+            let runtime = AgentRuntime::new();
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::ProviderError,
+            };
+            let result = runtime
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "error"))
+                .await;
+            if fail_finish {
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::ProviderExecutionUnverified(_))
+                ));
+            } else {
+                assert!(matches!(result, Err(RuntimeError::Provider { .. })));
+            }
+            assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
+            assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+            assert_eq!(runtime.active_turn_generation(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_failure_requires_verified_release_before_retry() {
+        for fail_finish in [false, true] {
+            let lifecycle = Arc::new(ProviderLifecycle::default());
+            lifecycle.fail_finish.store(fail_finish, Ordering::Release);
+            lifecycle.release_poll.notify_one();
+            let runtime = AgentRuntime::new();
+            let mut provider = LifecyclePollProvider {
+                lifecycle: Arc::clone(&lifecycle),
+                outcome: LifecyclePollOutcome::PollError,
+            };
+            let result = runtime
+                .run_text_turn(&mut provider, AgentTurnRequest::new("model", "poll"))
+                .await;
+            if fail_finish {
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::ProviderExecutionUnverified(_))
+                ));
+            } else {
+                assert!(matches!(result, Err(RuntimeError::ProviderInvocation(_))));
+            }
+            assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
+            assert_eq!(lifecycle.finish_count.load(Ordering::Acquire), 1);
+            assert_eq!(runtime.active_turn_generation(), None);
+        }
+    }
+
+    #[tokio::test]
     async fn provider_poll_panic_cancels_and_finishes_acquired_turn() {
         let lifecycle = Arc::new(ProviderLifecycle::default());
         lifecycle.release_poll.notify_one();
@@ -8330,7 +8558,7 @@ mod tests {
             .run_text_turn(&mut provider, AgentTurnRequest::new("model", "panic"))
             .await;
         assert!(
-            matches!(result, Err(RuntimeError::ProviderInvocation(message))
+            matches!(result, Err(RuntimeError::ProviderExecutionUnverified(message))
             if message == "provider event polling panicked")
         );
         assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
@@ -8459,12 +8687,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finish_error_preserves_original_provider_error() {
+    async fn finish_error_reports_unverified_provider_release() {
         check_cleanup_errors(false, true).await;
     }
 
     #[tokio::test]
-    async fn both_cleanup_errors_preserve_original_provider_error() {
+    async fn both_cleanup_errors_report_unverified_provider_release() {
         check_cleanup_errors(true, true).await;
     }
 
@@ -8534,7 +8762,16 @@ mod tests {
             .run_text_turn(&mut provider, AgentTurnRequest::new("model", "cleanup"))
             .await
             .expect_err("poll error remains terminal");
-        assert!(matches!(error, RuntimeError::Provider { code, .. } if code == "lifecycle_error"));
+        if fail_finish {
+            assert!(matches!(
+                error,
+                RuntimeError::ProviderExecutionUnverified(_)
+            ));
+        } else {
+            assert!(
+                matches!(error, RuntimeError::Provider { code, .. } if code == "lifecycle_error")
+            );
+        }
         assert!(lifecycle.cancelled.load(Ordering::Acquire));
         assert!(lifecycle.finished.load(Ordering::Acquire));
         assert_eq!(lifecycle.cancel_count.load(Ordering::Acquire), 1);
@@ -9116,7 +9353,9 @@ mod tests {
             while let Some(item) = stream.next().await {
                 assert_eq!(errors, 0, "terminal error must be last");
                 match item {
-                    AgentRuntimeStreamItem::Error(RuntimeError::ProviderInvocation(message)) => {
+                    AgentRuntimeStreamItem::Error(RuntimeError::ProviderExecutionUnverified(
+                        message,
+                    )) => {
                         assert_eq!(message, "provider event polling panicked");
                         errors += 1;
                     }
@@ -9161,7 +9400,9 @@ mod tests {
             while let Some(item) = stream.next().await {
                 assert_eq!(errors, 0, "terminal error must be last");
                 match item {
-                    AgentLoopStreamItem::Error(RuntimeError::ProviderInvocation(message)) => {
+                    AgentLoopStreamItem::Error(RuntimeError::ProviderExecutionUnverified(
+                        message,
+                    )) => {
                         assert_eq!(message, "provider event polling panicked");
                         errors += 1;
                     }

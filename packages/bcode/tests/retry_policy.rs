@@ -15,6 +15,7 @@ use std::time::Duration;
 
 #[derive(Debug, Default)]
 struct FlakyProvider {
+    panic_on_start: bool,
     starts: u32,
     events: Vec<ProviderTurnEvent>,
 }
@@ -27,6 +28,7 @@ impl ModelProviderInvoker for FlakyProvider {
     ) -> RuntimeFuture<'a, StartTurnResponse> {
         self.starts += 1;
         Box::pin(async move {
+            assert!(!self.panic_on_start, "private provider panic");
             if self.starts == 1 {
                 Err(bcode::RuntimeError::ProviderInvocation(
                     "temporary failure".to_string(),
@@ -425,6 +427,25 @@ async fn retry_policy_retries_provider_failures_within_bound() {
 
     assert_eq!(provider.starts, 2);
     assert_eq!(response.text, "recovered");
+}
+
+#[tokio::test]
+async fn retry_policy_does_not_repeat_unverified_provider_execution() {
+    let mut provider = FlakyProvider {
+        panic_on_start: true,
+        ..FlakyProvider::default()
+    };
+    let error = generate_text_builder()
+        .prompt("do not repeat ambiguous execution")
+        .retry_policy(RetryPolicy::new(3, Duration::ZERO))
+        .run(&mut provider)
+        .await
+        .expect_err("provider panic must be terminal");
+    assert_eq!(provider.starts, 1);
+    assert!(matches!(
+        error,
+        bcode::BcodeError::Runtime(bcode::RuntimeError::ProviderExecutionUnverified(_))
+    ));
 }
 
 #[tokio::test]
