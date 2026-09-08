@@ -5448,6 +5448,25 @@ async fn read_artifact_range_to(
     write_artifact_range(output, &range, args.raw)
 }
 
+async fn describe_skill(skill_id: String, json: bool) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let skill = BcodeClient::default_endpoint()
+        .describe_skill(bcode_skill_models::SkillId::new(skill_id))
+        .await?;
+    if json {
+        print_json(&skill)?;
+    } else {
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "{} ({})", skill.summary.name, skill.summary.id)?;
+        if let Some(description) = skill.summary.description {
+            writeln!(output, "{description}")?;
+        }
+        writeln!(output, "{}", skill.instructions)?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
@@ -5490,21 +5509,7 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             }
         }
         SessionCommand::DescribeSkill { skill_id, json } => {
-            ensure_server_running().await?;
-            let skill = BcodeClient::default_endpoint()
-                .describe_skill(bcode_skill_models::SkillId::new(skill_id))
-                .await?;
-            if json {
-                print_json(&skill)?;
-            } else {
-                let mut output = std::io::stdout().lock();
-                writeln!(output, "{} ({})", skill.summary.name, skill.summary.id)?;
-                if let Some(description) = skill.summary.description {
-                    writeln!(output, "{description}")?;
-                }
-                writeln!(output, "{}", skill.instructions)?;
-                output.flush()?;
-            }
+            Box::pin(describe_skill(skill_id, json)).await?;
         }
         SessionCommand::Create { name, cwd, json } => {
             Box::pin(create_session(name, cwd, json)).await?;
