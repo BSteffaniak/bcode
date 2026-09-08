@@ -4453,7 +4453,10 @@ impl WorkflowStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let parent = transaction
             .query_row(
-                "SELECT run.workspace_snapshot, activation.status, definition.definition_json, \
+                "SELECT run.workspace_snapshot, activation.status,
+                        CASE WHEN typeof(definition.definition_json) = 'text'
+                          AND length(CAST(definition.definition_json AS BLOB)) <= ?4
+                          THEN definition.definition_json END, \
                         run.authorization_ceiling, run.authorization_profile_json \
                  FROM workflow_runs run \
                  JOIN workflow_activations activation ON activation.run_id = run.run_id \
@@ -4466,6 +4469,7 @@ impl WorkflowStore {
                     &request.link.parent_run_id,
                     &request.link.parent_node_id,
                     &request.link.parent_activation_id,
+                    MAX_INLINE_JSON_BYTES,
                 ),
                 |row| {
                     Ok((
@@ -4621,8 +4625,14 @@ impl WorkflowStore {
         }
         let target = request.link.target.definition_identity();
         let child_definition_json: String = transaction.query_row(
-            "SELECT definition_json FROM workflow_definitions WHERE definition_id = ?1 AND version = ?2",
-            (&target.definition_id, target.definition_version),
+            "SELECT CASE WHEN typeof(definition_json) = 'text'
+               AND length(CAST(definition_json AS BLOB)) <= ?3 THEN definition_json END
+             FROM workflow_definitions WHERE definition_id = ?1 AND version = ?2",
+            (
+                &target.definition_id,
+                target.definition_version,
+                MAX_INLINE_JSON_BYTES,
+            ),
             |row| row.get(0),
         )?;
         let child_definition: WorkflowDefinition = serde_json::from_str(&child_definition_json)?;
