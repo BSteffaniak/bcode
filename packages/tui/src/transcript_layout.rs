@@ -207,6 +207,11 @@ impl TranscriptLayoutCache {
         self.entries.content_anchor(index, row)
     }
 
+    /// Resolve a region offset without crossing into the next region.
+    pub fn resolve_content_anchor(&self, index: usize, key: &str, offset: usize) -> Option<usize> {
+        self.entries.resolve_content_anchor(index, key, offset)
+    }
+
     /// Resolve an accepted content key in the current item layout.
     pub fn content_anchor_row(&self, index: usize, key: &str) -> Option<usize> {
         self.entries.content_anchor_row(index, key)

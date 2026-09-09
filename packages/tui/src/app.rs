@@ -322,11 +322,7 @@ impl StableTranscriptAnchor {
         }
         self.content
             .as_ref()
-            .and_then(|(key, offset)| {
-                layout
-                    .content_anchor_row(index, key)
-                    .map(|row| row.saturating_add(*offset))
-            })
+            .and_then(|(key, offset)| layout.resolve_content_anchor(index, key, *offset))
             .unwrap_or(self.row_in_item)
             .min(rows.saturating_sub(1))
     }
@@ -409,6 +405,8 @@ pub struct BmuxApp {
     latest_hidden_activity_at: Option<Instant>,
     latest_hidden_activity_burst: u8,
     latest_bar_animation_started_at: Instant,
+    activity_frame: usize,
+    activity_elapsed: Duration,
     latest_bar_next_frame_at: Option<Instant>,
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
@@ -594,6 +592,8 @@ impl BmuxApp {
             latest_hidden_activity_at: None,
             latest_hidden_activity_burst: 0,
             latest_bar_animation_started_at: now,
+            activity_frame: 0,
+            activity_elapsed: Duration::ZERO,
             latest_bar_next_frame_at: None,
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
@@ -2115,6 +2115,18 @@ impl BmuxApp {
     #[must_use]
     pub const fn latest_hidden_activity_at(&self) -> Option<Instant> {
         self.latest_hidden_activity_at
+    }
+
+    /// Accepted activity animation tick; drawing itself does not sample wall time.
+    #[must_use]
+    pub const fn activity_frame(&self) -> usize {
+        self.activity_frame
+    }
+
+    /// Elapsed activity time accepted on the animation invalidation boundary.
+    #[must_use]
+    pub const fn activity_elapsed(&self) -> Duration {
+        self.activity_elapsed
     }
 
     /// Return the current hidden transcript activity burst intensity.
@@ -3677,6 +3689,8 @@ impl BmuxApp {
                 damage.insert(TemporalDamage::Full);
                 invalidation.merge(UiInvalidation::Paint)
             } else if is_activity_animation_invalidation(key) {
+                self.activity_frame = self.activity_frame.wrapping_add(1);
+                self.activity_elapsed = now.saturating_duration_since(self.activity_started_at);
                 if self.activity_animation_active() {
                     damage.insert(TemporalDamage::Status);
                     invalidation.merge(UiInvalidation::Paint)
@@ -3925,6 +3939,9 @@ impl BmuxApp {
 
     pub(crate) fn begin_transcript_presentation(&mut self) {
         self.restore_uncommitted_navigation();
+        // Capture against the old accepted geometry before a candidate may replace
+        // it. A retry must not recapture old coordinates from the new layout.
+        self.capture_stable_transcript_anchor();
         self.navigation_checkpoint = Some(TranscriptNavigationCheckpoint {
             viewport: self.viewport,
             animation: self.transcript_scroll_animation,
@@ -4299,6 +4316,7 @@ impl BmuxApp {
         if self.activity != activity {
             if !self.activity.same_phase_as(&activity) {
                 self.activity_started_at = Instant::now();
+                self.activity_elapsed = Duration::ZERO;
             }
             self.activity = activity;
         }
@@ -6315,6 +6333,25 @@ mod tests {
             next_latest_bar_frame_at(started_at, delayed, Duration::from_millis(40)),
             started_at + Duration::from_millis(80)
         );
+    }
+
+    #[test]
+    fn activity_presentation_changes_only_on_accepted_ticks() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_activity(ActivityState::PreparingModelRequest);
+        let now = app.activity_started_at + Duration::from_millis(250);
+        assert_eq!(app.activity_elapsed(), Duration::ZERO);
+        let frame = app.activity_frame();
+        app.handle_invalidations_with_damage(
+            &[InvalidationKey::new(ACTIVITY_ANIMATION_INVALIDATION_KEY)],
+            now,
+        );
+        assert_eq!(app.activity_elapsed(), Duration::from_millis(250));
+        assert_eq!(app.activity_frame(), frame + 1);
+        app.set_activity(ActivityState::Idle);
+        app.set_activity(ActivityState::PreparingModelRequest);
+        assert_eq!(app.activity_elapsed(), Duration::ZERO);
+        drop(app);
     }
 
     #[test]

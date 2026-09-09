@@ -5112,8 +5112,9 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let mut line = ChromeLine::new(" · ", muted).required(
         activity_label(
             app.activity(),
-            app.activity_started_at(),
+            app.activity_elapsed(),
             app.daemon_connection(),
+            app.activity_frame(),
         ),
         theme.info,
         true,
@@ -5215,15 +5216,20 @@ fn compact_key_hints(hints: &str) -> String {
 
 fn activity_label(
     activity: &ActivityState,
-    started_at: std::time::Instant,
+    elapsed: std::time::Duration,
     daemon_connection: DaemonConnectionState,
+    activity_frame: usize,
 ) -> String {
-    let elapsed = format_activity_elapsed(started_at.elapsed());
-    let active = |label: String| format!("{} {label} · {elapsed}", spinner_frame());
+    let elapsed = format_activity_elapsed(elapsed);
+    let active = |label: String| format!("{} {label} · {elapsed}", spinner_frame(activity_frame));
     match activity {
         ActivityState::Idle => match daemon_connection {
-            DaemonConnectionState::Connecting => format!("{} connecting…", spinner_frame()),
-            DaemonConnectionState::Starting => format!("{} starting daemon…", spinner_frame()),
+            DaemonConnectionState::Connecting => {
+                format!("{} connecting…", spinner_frame(activity_frame))
+            }
+            DaemonConnectionState::Starting => {
+                format!("{} starting daemon…", spinner_frame(activity_frame))
+            }
             DaemonConnectionState::Connected | DaemonConnectionState::IdleOffline => {
                 "ready".to_owned()
             }
@@ -5257,7 +5263,7 @@ fn activity_label(
             retry_at_unix,
         } => format!(
             "{} {message}; retrying in {} · Esc to cancel",
-            spinner_frame(),
+            spinner_frame(activity_frame),
             format_retry_remaining(*retry_at_unix)
         ),
         ActivityState::RunningTool { name } => active(tool_activity_label(name)),
@@ -5305,12 +5311,8 @@ fn tool_activity_label(tool_name: &str) -> String {
     format!("tool {tool_name}")
 }
 
-fn spinner_frame() -> &'static str {
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    let index = usize::try_from((elapsed / 100) % SPINNER_FRAMES.len() as u128).unwrap_or(0);
-    SPINNER_FRAMES[index]
+const fn spinner_frame(activity_frame: usize) -> &'static str {
+    SPINNER_FRAMES[activity_frame % SPINNER_FRAMES.len()]
 }
 
 fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {

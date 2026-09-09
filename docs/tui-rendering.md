@@ -167,7 +167,11 @@ reveal policy; the former application `TranscriptScrollMode` has been removed. C
 checkpoint navigation, reveal requests, animation state, and history reveal state. Repeated
 preparations restore the checkpoint, and successful presentation commits it. New semantic events
 restore uncommitted navigation before applying their effects. Manual input supersedes the candidate.
-Animation cadence remains separate from navigation intent.
+Animation cadence remains separate from navigation intent. Activity spinner frames and elapsed
+labels advance on accepted activity invalidations rather than sampling wall time during drawing;
+full and partial presentations of the same state therefore agree. Candidate checkpoints capture
+correspondence before layout replacement, and region offsets are clamped before the next region,
+not merely before the end of the containing item.
 
 Detached Markdown anchors retain an exact source byte position from the accepted projection's
 selection provenance. On width changes that position resolves against the new accepted projection,

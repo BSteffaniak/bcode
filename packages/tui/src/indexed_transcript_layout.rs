@@ -316,6 +316,19 @@ impl IndexedTranscriptLayout {
             .map(|anchor| (anchor.key.as_str(), row.saturating_sub(anchor.row)))
     }
 
+    pub fn resolve_content_anchor(&self, index: usize, key: &str, offset: usize) -> Option<usize> {
+        let entry = self.transcript.entries.get(index)?;
+        let start = entry.anchors.iter().find(|anchor| anchor.key == key)?.row;
+        let end = entry
+            .anchors
+            .iter()
+            .filter(|anchor| anchor.row > start)
+            .map(|anchor| anchor.row)
+            .min()
+            .unwrap_or(entry.row_count);
+        Some(start.saturating_add(offset).min(end.saturating_sub(1)))
+    }
+
     pub fn content_anchor_row(&self, index: usize, key: &str) -> Option<usize> {
         self.transcript
             .entries
@@ -546,6 +559,32 @@ impl IndexedTranscriptLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shrinking_region_anchor_cannot_escape_into_following_region() {
+        use bcode_plugin_sdk::tui_visual::TuiVisualAnchor;
+        let mut layout = IndexedTranscriptLayout::default();
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("regions".to_owned()),
+            |_| TranscriptLayoutRows::Anchored {
+                rows: vec![Line::default(); 10],
+                anchors: vec![
+                    TuiVisualAnchor {
+                        key: "body".to_owned(),
+                        row: 1,
+                    },
+                    TuiVisualAnchor {
+                        key: "status".to_owned(),
+                        row: 4,
+                    },
+                ],
+            },
+            |_| None,
+        );
+        assert_eq!(layout.resolve_content_anchor(0, "body", 20), Some(3));
+        assert_eq!(layout.resolve_content_anchor(0, "missing", 0), None);
+    }
+
     #[test]
     fn accepted_markdown_source_survives_width_reflow() {
         use bcode_markdown_render::{MarkdownRenderOptions, render_markdown};
