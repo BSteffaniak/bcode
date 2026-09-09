@@ -49,9 +49,16 @@ impl Component for ComposerPanel<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         self.surface.paint(layout, cx);
+        let title = Line::raw(" Message ");
+        let title_width = u16::try_from(title.width()).unwrap_or(u16::MAX);
         cx.write_line_with_fallback_style(
-            LocalRect::new(1, 0, layout.size.width.saturating_sub(2), 1),
-            &Line::raw(" Message "),
+            LocalRect::new(
+                1,
+                0,
+                title_width.min(layout.size.width.saturating_sub(2)),
+                1,
+            ),
+            &title,
             self.title_style,
         );
     }
@@ -66,6 +73,39 @@ mod tests {
     use super::*;
     use bmux_tui::composition::TextBlock;
     use bmux_tui::geometry::Size;
+
+    #[test]
+    fn composer_title_preserves_remaining_top_border() {
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::frame::Frame;
+        use bmux_tui::geometry::Rect;
+        for width in [1, 2, 5, 20, 80] {
+            let panel = composer_panel(
+                ComposerStyle {
+                    border: Style::new(),
+                    surface: Style::new(),
+                },
+                TextBlock::new("editor"),
+            );
+            let layout = panel.layout(
+                Constraints::tight(Size::new(width, 3)),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+            panel.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            if width >= 2 {
+                let title = " Message ";
+                let interior = usize::from(width - 2);
+                let title_len = title.len().min(interior);
+                let expected = format!(
+                    "┌{}{}┐",
+                    &title[..title_len],
+                    "─".repeat(interior - title_len)
+                );
+                assert_eq!(buffer.row_symbols(0).expect("top row"), expected);
+            }
+        }
+    }
 
     #[test]
     fn composer_panel_preserves_one_cell_horizontal_padding() {
