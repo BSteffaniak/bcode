@@ -11,6 +11,305 @@ use std::{
     sync::Arc,
 };
 
+/// Failure to prepare a session for opening.
+pub enum PrepareOpenError {
+    /// Historical writer cannot be upgraded by the migration coordinator.
+    Incompatible(String),
+    /// Current-format session preparation failed.
+    Session(bcode_session::SessionError),
+}
+
+/// Prepare a session, delegating historical upgrade policy to the migration coordinator.
+///
+/// # Errors
+/// Returns an incompatible-writer error when no supported migration plan exists,
+/// or the current session preparation error. Running upgrades report through their snapshot.
+pub async fn prepare_open(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+) -> Result<bcode_session_models::SessionOpenOperationSnapshot, PrepareOpenError> {
+    let source_writer_epoch = match state.sessions.session_health(session_id).await {
+        bcode_session::SessionHealth::Migratable { source, .. }
+        | bcode_session::SessionHealth::BlockedOwner { source, .. }
+        | bcode_session::SessionHealth::WriterIncompatible {
+            actual: Some(source),
+            ..
+        } => u32::try_from(source).ok(),
+        _ => None,
+    };
+    let source_writer_epoch = super::current_writer_with_released_historical_events(
+        state,
+        session_id,
+        source_writer_epoch,
+    )
+    .await;
+    if let Some(source_writer_epoch) = source_writer_epoch {
+        state
+            .session_migrations
+            .plan(source_writer_epoch)
+            .map_err(|error| PrepareOpenError::Incompatible(error.to_string()))?;
+        let initial = super::migrating_session_open_snapshot(session_id, source_writer_epoch);
+        let sessions = state.sessions.clone();
+        let operation = state
+            .session_migrations
+            .operations()
+            .start_or_join(initial, move |operation| async move {
+                let reporter =
+                    bcode_session_migration::SessionMigrationProgressReporter::new(operation);
+                let result = async {
+                    let root = sessions
+                        .session_store_root()
+                        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+                    let lease_owner = sessions
+                        .session_lease_owner()
+                        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+                    let lease = super::session_migration_execution::migrate_owned_session_storage(
+                        session_id,
+                        &root,
+                        u64::from(source_writer_epoch),
+                        &reporter,
+                        &bcode_metrics::MetricsRegistry::disabled(),
+                        &lease_owner,
+                    )
+                    .await?;
+                    sessions.adopt_session_lease(session_id, lease).await?;
+                    sessions.load_current_session(session_id).await
+                }
+                .await;
+                match result {
+                    Ok(()) => bcode_session_models::SessionOpenTerminalOutcome::Ready,
+                    Err(error) => super::session_migration_failure_outcome(&error),
+                }
+            })
+            .await;
+        return Ok(operation.snapshot());
+    }
+    state
+        .sessions
+        .prepare_session_open(session_id)
+        .await
+        .map_err(PrepareOpenError::Session)
+}
+
+/// Reprice an explicit session cost range using a validated catalog snapshot.
+///
+/// Callers must resolve session-location ambiguity before invoking this mutation.
+///
+/// # Errors
+/// Returns a public diagnostic for invalid ranges/catalogs, unsupported or oversized
+/// snapshots, serialization failures, or unavailable ownership/projections.
+pub async fn reprice(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    range: bcode_session_models::SessionCostRange,
+    catalog: bcode_model_catalog_models::CatalogDocument,
+) -> Result<bcode_session_models::SessionRepriceReport, String> {
+    use sha2::Digest as _;
+    range.validate()?;
+    bcode_model_catalog::validate_catalog(&catalog)
+        .map_err(|error| error.public_message().to_owned())?;
+    if catalog.schema_version != bcode_model_catalog_models::SCHEMA_VERSION {
+        return Err("unsupported catalog snapshot schema".to_owned());
+    }
+    let bytes = serde_json::to_vec(&catalog).map_err(|_| "invalid catalog snapshot")?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("catalog snapshot exceeds 16 MiB".to_owned());
+    }
+    let revision = catalog.catalog_revision.clone();
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let catalog = Arc::new(bcode_model_catalog::ModelCatalog::new(catalog));
+    let plugins = state.plugins.clone();
+    let (count, summary) = state
+        .sessions
+        .renormalize_usage(
+            session_id,
+            range,
+            Arc::new(move |source| {
+                let plugins = plugins.clone();
+                let catalog = Arc::clone(&catalog);
+                Box::pin(async move {
+                    let mut facts = source.usage;
+                    if let Some(original) = source.original {
+                        let provider = facts
+                            .request
+                            .as_ref()
+                            .ok_or("missing provider attribution")?
+                            .provider_plugin_id
+                            .clone();
+                        if provider != original.provider_id {
+                            return Err("original usage provider mismatch".into());
+                        }
+                        let normalized: bcode_model::TokenUsage = plugins
+                            .invoke_service_json_scoped_with_timeout(
+                                &provider,
+                                bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+                                bcode_model::OP_NORMALIZE_USAGE,
+                                &original,
+                                // Offline decoding must not acquire/reenter the session actor
+                                // that is coordinating this explicit maintenance operation.
+                                super::PluginInvocationScope::Global,
+                                std::time::Duration::from_secs(5),
+                            )
+                            .await
+                            .map_err(|_| {
+                                "provider usage normalizer unavailable or rejected evidence"
+                                    .to_owned()
+                            })?;
+                        super::replace_normalized_usage(&mut facts, &normalized);
+                    }
+                    let cost = bcode_model_catalog::price_session_usage(&catalog, &facts);
+                    Ok(bcode_session_models::SessionUsageValuation { usage: facts, cost })
+                })
+            }),
+        )
+        .await
+        .map_err(|_| {
+            "session repricing failed; check session ownership, projection readiness, original capture completeness, and provider normalize_usage availability"
+                .to_owned()
+        })?;
+    Ok(bcode_session_models::SessionRepriceReport {
+        session_id,
+        range,
+        repriced_requests: count,
+        catalog_revision: revision,
+        catalog_digest: digest,
+        summary,
+    })
+}
+
+/// Failure during explicit turn admission or queue dispatch.
+pub enum SubmitTurnError {
+    /// Ownership acquisition or durable admission failed.
+    Admission(bcode_session::SessionError),
+    /// An accepted turn could not be dispatched.
+    Dispatch(super::ServerError),
+}
+
+/// Admit and enqueue an interactive turn while the caller holds the session admission lock.
+///
+/// The caller retains that lock and the ownership slot through response delivery to preserve
+/// admission ordering and the lease lifetime on rejection or admission error. Accepted work
+/// takes ownership from the slot when queued.
+/// Namespace fencing and interactive-priority selection must precede this operation.
+///
+/// # Errors
+/// Returns admission errors for ownership or durable admission failures, and dispatch errors
+/// for a missing accepted event or queue failure. Dispatch failure does not roll back admission.
+pub async fn submit_turn(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    client_id: bcode_session_models::ClientId,
+    text: String,
+    admission: bcode_session_models::TurnAdmissionMetadata,
+    ownership: &mut Option<bcode_session::SessionOwnershipGuard>,
+) -> Result<bcode_session_models::TurnAdmission, SubmitTurnError> {
+    *ownership = Some(
+        state
+            .sessions
+            .acquire_session_ownership(
+                session_id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .map_err(SubmitTurnError::Admission)?,
+    );
+    let (admission, user_event) = super::admit_turn(state, session_id, client_id, text, admission)
+        .await
+        .map_err(SubmitTurnError::Admission)?;
+    if let bcode_session_models::TurnAdmission::Accepted(_) = &admission {
+        let user_event = user_event.ok_or_else(|| {
+            SubmitTurnError::Dispatch(bcode_session::SessionError::NotFound(session_id).into())
+        })?;
+        super::enqueue_followup_command(
+            state,
+            session_id,
+            super::FollowupCommand::ExecuteTurn {
+                client_id,
+                runtime_context: state.client_runtime_context(client_id).await,
+                user_event: Box::new(user_event),
+                queued_steering: None,
+                cancel_state: None,
+                completion: None,
+                recovering: false,
+                ownership: ownership.take().expect("acquired turn ownership"),
+            },
+        )
+        .await
+        .map_err(SubmitTurnError::Dispatch)?;
+    }
+    Ok(admission)
+}
+
+/// Failure to prepare or enqueue a skill invocation.
+pub enum InvokeSkillError {
+    /// Skill support is disabled for this session.
+    Disabled,
+    /// The requested skill is absent from the session registry.
+    Unknown(bcode_skill_models::SkillId),
+    /// Execution metadata is invalid.
+    Invalid(bcode_session::SessionError),
+    /// Session ownership could not be acquired.
+    Ownership(super::ServerError),
+    /// Queue admission failed.
+    Admission(super::ServerError),
+}
+
+/// Prepare and enqueue a skill invocation without writing a transport response.
+///
+/// # Errors
+/// Returns an error for disabled or unknown skills, invalid execution metadata,
+/// ownership acquisition failure, or queue admission failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn invoke_skill(
+    state: &Arc<ServerState>,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+    skill_id: bcode_skill_models::SkillId,
+    arguments: String,
+    display_text: String,
+    execution: bcode_session_models::TurnExecutionOptions,
+) -> Result<super::MessageQueueStatus, InvokeSkillError> {
+    let runtime_context = state.client_runtime_context(client_id).await;
+    state
+        .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
+        .await;
+    let registry = state
+        .session_skills(session_id)
+        .await
+        .ok_or(InvokeSkillError::Disabled)?;
+    let summary = registry
+        .summary(&skill_id)
+        .cloned()
+        .ok_or_else(|| InvokeSkillError::Unknown(skill_id.clone()))?;
+    (bcode_session_models::TurnAdmissionMetadata {
+        execution: execution.clone(),
+        ..bcode_session_models::TurnAdmissionMetadata::default()
+    })
+    .validate()
+    .map_err(|error| InvokeSkillError::Invalid(error.into()))?;
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await
+        .map_err(|error| InvokeSkillError::Ownership(error.into()))?;
+    let command = super::FollowupCommand::SkillInvocation {
+        client_id,
+        runtime_context: state.client_runtime_context(client_id).await,
+        skill_id,
+        arguments,
+        source: Some(summary.source),
+        display_text,
+        execution: Box::new(execution),
+        ownership,
+    };
+    super::enqueue_followup_command(state, session_id, command)
+        .await
+        .map_err(InvokeSkillError::Admission)
+}
+
 /// Return the coherent bounded session catalog for one working directory.
 ///
 /// This preserves the existing initial-load coordination while keeping response framing out of

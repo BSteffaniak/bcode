@@ -11443,91 +11443,16 @@ async fn handle_prepare_session_open(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let source_writer_epoch = match state.sessions.session_health(session_id).await {
-        bcode_session::SessionHealth::Migratable { source, .. }
-        | bcode_session::SessionHealth::BlockedOwner { source, .. }
-        | bcode_session::SessionHealth::WriterIncompatible {
-            actual: Some(source),
-            ..
-        } => u32::try_from(source).ok(),
-        _ => None,
+    let response = match session_operations::prepare_open(state, session_id).await {
+        Ok(snapshot) => Response::Ok(ResponsePayload::SessionOpenPrepared { snapshot }),
+        Err(session_operations::PrepareOpenError::Incompatible(message)) => {
+            Response::Err(ErrorResponse::new("session_writer_incompatible", message))
+        }
+        Err(session_operations::PrepareOpenError::Session(error)) => {
+            Response::Err(session_error_response(&error))
+        }
     };
-    let source_writer_epoch =
-        current_writer_with_released_historical_events(state, session_id, source_writer_epoch)
-            .await;
-    if let Some(source_writer_epoch) = source_writer_epoch {
-        if let Err(error) = state.session_migrations.plan(source_writer_epoch) {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(
-                    "session_writer_incompatible",
-                    error.to_string(),
-                )),
-            )
-            .await;
-        }
-        let initial = migrating_session_open_snapshot(session_id, source_writer_epoch);
-        let sessions = state.sessions.clone();
-        let operation = state
-            .session_migrations
-            .operations()
-            .start_or_join(initial, move |operation| async move {
-                let reporter =
-                    bcode_session_migration::SessionMigrationProgressReporter::new(operation);
-                let result = async {
-                    let root = sessions
-                        .session_store_root()
-                        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
-                    let lease_owner = sessions
-                        .session_lease_owner()
-                        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
-                    let lease = session_migration_execution::migrate_owned_session_storage(
-                        session_id,
-                        &root,
-                        u64::from(source_writer_epoch),
-                        &reporter,
-                        &bcode_metrics::MetricsRegistry::disabled(),
-                        &lease_owner,
-                    )
-                    .await?;
-                    sessions.adopt_session_lease(session_id, lease).await?;
-                    sessions.load_current_session(session_id).await
-                }
-                .await;
-                match result {
-                    Ok(()) => bcode_session_models::SessionOpenTerminalOutcome::Ready,
-                    Err(error) => session_migration_failure_outcome(&error),
-                }
-            })
-            .await;
-        return send_response(
-            writer,
-            request_id,
-            Response::Ok(ResponsePayload::SessionOpenPrepared {
-                snapshot: operation.snapshot(),
-            }),
-        )
-        .await;
-    }
-    match state.sessions.prepare_session_open(session_id).await {
-        Ok(snapshot) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::SessionOpenPrepared { snapshot }),
-            )
-            .await
-        }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await
-        }
-    }
+    send_response(writer, request_id, response).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12401,83 +12326,10 @@ async fn handle_reprice_session(
     range: bcode_session_models::SessionCostRange,
     catalog: bcode_model_catalog_models::CatalogDocument,
 ) -> Result<(), ServerError> {
-    use sha2::Digest as _;
     if let Some(response) = ambiguous_session_location_response(state, session_id).await {
         return send_response(writer, request_id, response).await;
     }
-    let result = async {
-        range.validate()?;
-        bcode_model_catalog::validate_catalog(&catalog)
-            .map_err(|error| error.public_message().to_owned())?;
-        if catalog.schema_version != bcode_model_catalog_models::SCHEMA_VERSION {
-            return Err("unsupported catalog snapshot schema".to_owned());
-        }
-        let bytes = serde_json::to_vec(&catalog).map_err(|_| "invalid catalog snapshot")?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err("catalog snapshot exceeds 16 MiB".to_owned());
-        }
-        let revision = catalog.catalog_revision.clone();
-        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
-        let catalog = Arc::new(bcode_model_catalog::ModelCatalog::new(catalog));
-        let plugins = state.plugins.clone();
-        let (count, summary) = state
-            .sessions
-            .renormalize_usage(
-                session_id,
-                range,
-                Arc::new(move |source| {
-                    let plugins = plugins.clone();
-                    let catalog = Arc::clone(&catalog);
-                    Box::pin(async move {
-                        let mut facts = source.usage;
-                        if let Some(original) = source.original {
-                            let provider = facts
-                                .request
-                                .as_ref()
-                                .ok_or("missing provider attribution")?
-                                .provider_plugin_id
-                                .clone();
-                            if provider != original.provider_id {
-                                return Err("original usage provider mismatch".into());
-                            }
-                            let normalized: TokenUsage = plugins
-                                .invoke_service_json_scoped_with_timeout(
-                                    &provider,
-                                    bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-                                    bcode_model::OP_NORMALIZE_USAGE,
-                                    &original,
-                                    // Offline decoding must not acquire/reenter the session actor
-                                    // that is coordinating this explicit maintenance operation.
-                                    PluginInvocationScope::Global,
-                                    Duration::from_secs(5),
-                                )
-                                .await
-                                .map_err(|_| {
-                                    "provider usage normalizer unavailable or rejected evidence"
-                                        .to_owned()
-                                })?;
-                            replace_normalized_usage(&mut facts, &normalized);
-                        }
-                        let cost = bcode_model_catalog::price_session_usage(&catalog, &facts);
-                        Ok(bcode_session_models::SessionUsageValuation { usage: facts, cost })
-                    })
-                }),
-            )
-            .await
-            .map_err(|_| {
-                "session repricing failed; check session ownership, projection readiness, original capture completeness, and provider normalize_usage availability"
-                    .to_owned()
-            })?;
-        Ok(bcode_session_models::SessionRepriceReport {
-            session_id,
-            range,
-            repriced_requests: count,
-            catalog_revision: revision,
-            catalog_digest: digest,
-            summary,
-        })
-    }
-    .await;
+    let result = session_operations::reprice(state, session_id, range, catalog).await;
     let response = match result {
         Ok(report) => Response::Ok(ResponsePayload::SessionRepriced {
             report: Box::new(report),
@@ -14101,74 +13953,34 @@ async fn handle_invoke_skill(
         return send_incompatible_active_session_response(writer, request_id, &active_namespace)
             .await;
     }
-    let runtime_context = state.client_runtime_context(client_id).await;
-    state
-        .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
-        .await;
-    let Some(registry) = state.session_skills(session_id).await else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new("skills_disabled", "skills are disabled")),
-        )
-        .await;
-    };
-    let Some(summary) = registry.summary(&skill_id).cloned() else {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(ErrorResponse::new(
-                "unknown_skill",
-                format!("unknown skill: {skill_id}"),
-            )),
-        )
-        .await;
-    };
-    if let Err(error) = (bcode_session_models::TurnAdmissionMetadata {
-        execution: execution.clone(),
-        ..bcode_session_models::TurnAdmissionMetadata::default()
-    })
-    .validate()
-    {
-        return send_response(
-            writer,
-            request_id,
-            Response::Err(session_error_response(&bcode_session::SessionError::from(
-                error,
-            ))),
-        )
-        .await;
-    }
-    let ownership = state
-        .sessions
-        .acquire_session_ownership(
-            session_id,
-            bcode_session::SessionOwnershipKind::QueuedCommand,
-        )
-        .await?;
-    let command = FollowupCommand::SkillInvocation {
+    let result = session_operations::invoke_skill(
+        state,
         client_id,
-        runtime_context: state.client_runtime_context(client_id).await,
+        session_id,
         skill_id,
         arguments,
-        source: Some(summary.source),
         display_text,
-        execution: Box::new(execution),
-        ownership,
-    };
-    match enqueue_followup_command(state, session_id, command).await {
+        execution,
+    )
+    .await;
+    let error = match result {
         Ok(status) => {
-            send_message_acceptance_response(state, writer, request_id, client_id, status).await
+            return send_message_acceptance_response(state, writer, request_id, client_id, status)
+                .await;
         }
-        Err(error) => {
-            send_response(
-                writer,
-                request_id,
-                Response::Err(server_session_error_response(&error)),
-            )
-            .await
+        Err(session_operations::InvokeSkillError::Disabled) => {
+            ErrorResponse::new("skills_disabled", "skills are disabled")
         }
-    }
+        Err(session_operations::InvokeSkillError::Unknown(skill_id)) => {
+            ErrorResponse::new("unknown_skill", format!("unknown skill: {skill_id}"))
+        }
+        Err(session_operations::InvokeSkillError::Invalid(error)) => session_error_response(&error),
+        Err(session_operations::InvokeSkillError::Ownership(error)) => return Err(error),
+        Err(session_operations::InvokeSkillError::Admission(error)) => {
+            server_session_error_response(&error)
+        }
+    };
+    send_response(writer, request_id, Response::Err(error)).await
 }
 
 enum SubmittedModelTurn {
@@ -14327,16 +14139,19 @@ async fn handle_submit_turn(
     }
     let admission_lock = turn_admission_lock(state, session_id).await;
     let _admission_guard = admission_lock.lock().await;
-    let ownership = match state
-        .sessions
-        .acquire_session_ownership(
-            session_id,
-            bcode_session::SessionOwnershipKind::QueuedCommand,
-        )
-        .await
+    let mut ownership = None;
+    let admission = match session_operations::submit_turn(
+        state,
+        session_id,
+        client_id,
+        text,
+        admission,
+        &mut ownership,
+    )
+    .await
     {
-        Ok(ownership) => ownership,
-        Err(error) => {
+        Ok(admission) => admission,
+        Err(session_operations::SubmitTurnError::Admission(error)) => {
             return send_response(
                 writer,
                 request_id,
@@ -14344,37 +14159,8 @@ async fn handle_submit_turn(
             )
             .await;
         }
+        Err(session_operations::SubmitTurnError::Dispatch(error)) => return Err(error),
     };
-    let result = admit_turn(state, session_id, client_id, text, admission).await;
-    let (admission, user_event) = match result {
-        Ok(result) => result,
-        Err(error) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(session_error_response(&error)),
-            )
-            .await;
-        }
-    };
-    if let bcode_session_models::TurnAdmission::Accepted(_) = &admission {
-        let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
-        enqueue_followup_command(
-            state,
-            session_id,
-            FollowupCommand::ExecuteTurn {
-                client_id,
-                runtime_context: state.client_runtime_context(client_id).await,
-                user_event: Box::new(user_event),
-                queued_steering: None,
-                cancel_state: None,
-                completion: None,
-                recovering: false,
-                ownership,
-            },
-        )
-        .await?;
-    }
     send_response(
         writer,
         request_id,

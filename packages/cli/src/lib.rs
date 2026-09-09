@@ -673,6 +673,18 @@ async fn handle_workflow_launch_detail(client: &BcodeClient, path: &Path) -> Res
 
 #[derive(Debug, Subcommand)]
 enum WorkflowTemplateCommand {
+    /// Start one exact plugin-owned template and return its run admission result as JSON.
+    Start {
+        /// `WorkflowTemplateStartRequest` JSON file, or - for stdin.
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Instantiate a template as an inactive authored workflow and draft using a bounded JSON request.
+    Instantiate {
+        /// `WorkflowTemplateInstantiationRequest` JSON file, or - for stdin.
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// List bounded normalized template descriptions as JSON.
     List {
         #[arg(long, default_value_t = 100)]
@@ -695,6 +707,33 @@ fn handle_workflow_template_command(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CliError>> + Send + '_>> {
     Box::pin(async move {
         match command {
+            WorkflowTemplateCommand::Start { request } => {
+                let request: bcode_workflow::WorkflowTemplateStartRequest =
+                    serde_json::from_value(read_bounded_json(&request)?).map_err(|_| {
+                        CliError::InvalidArguments(
+                            "invalid workflow template start request".to_string(),
+                        )
+                    })?;
+                let result = bcode_workflow::WorkflowRunApplication::start_workflow_template(
+                    client, request,
+                )
+                .await?;
+                print_json(&result)
+            }
+            WorkflowTemplateCommand::Instantiate { request } => {
+                let request: bcode_workflow::WorkflowTemplateInstantiationRequest =
+                    serde_json::from_value(read_bounded_json(&request)?).map_err(|_| {
+                        CliError::InvalidArguments(
+                            "invalid workflow template instantiation request".to_string(),
+                        )
+                    })?;
+                let (workflow, draft) =
+                    bcode_workflow::WorkflowAuthoringApplication::instantiate_workflow_template(
+                        client, request,
+                    )
+                    .await?;
+                print_json(&serde_json::json!({"workflow": workflow, "draft": draft}))
+            }
             WorkflowTemplateCommand::List { limit } => print_json(
                 &bcode_workflow::WorkflowAuthoringApplication::inspect_workflow_templates(
                     client, limit,

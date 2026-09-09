@@ -146,6 +146,13 @@ fn graph_cli_json(root: &std::path::Path, arguments: &[&str]) -> serde_json::Val
 }
 
 fn start_graph_test_daemon(root: &tempfile::TempDir) -> ForegroundDaemon {
+    start_graph_test_daemon_with_setup(root, |_| {})
+}
+
+fn start_graph_test_daemon_with_setup(
+    root: &tempfile::TempDir,
+    setup: impl FnOnce(&std::path::Path),
+) -> ForegroundDaemon {
     let library = std::fs::canonicalize(
         std::env::var_os("BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY")
             .expect("set BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY"),
@@ -168,6 +175,7 @@ fn start_graph_test_daemon(root: &tempfile::TempDir) -> ForegroundDaemon {
         "[plugins]\ndefault = \"none\"\nenabled = [\"bcode.default-agents\"]\n",
     )
     .unwrap();
+    setup(&plugins);
     let log = std::fs::File::create(root.path().join("daemon.log")).unwrap();
     let mut daemon = ForegroundDaemon(
         isolated_cli(root.path())
@@ -536,6 +544,140 @@ fn workflow_package_cli_applies_and_publishes_exact_lock() {
         1
     );
     drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn workflow_template_cli_instantiates_and_starts_external_document() {
+    use sha2::Digest as _;
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon_with_setup(&root, |plugins| {
+        let mut document: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/workflows/source-defined-input.workflow.json"
+        ))
+        .unwrap();
+        document["configuration_schema"] = document["definition"]["input"].clone();
+        document["configuration_defaults"] = serde_json::json!({"message":"template acceptance"});
+        let source = serde_json::to_string(&document).unwrap();
+        std::fs::write(plugins.join("template.json"), &source).unwrap();
+        let manifest = plugins.join("bcode-plugin.toml");
+        let mut contents = std::fs::read_to_string(&manifest).unwrap();
+        contents.push_str(&format!("\n[[workflow_templates]]\ncontribution_version = 1\ntemplate_id = \"cli-input\"\ntemplate_version = 1\ntitle = \"CLI input\"\ndescription = \"CLI acceptance\"\n[workflow_templates.document_source]\npath = \"template.json\"\nsha256 = \"{:x}\"\n", sha2::Sha256::digest(source.as_bytes())));
+        std::fs::write(manifest, contents).unwrap();
+    });
+    let request = serde_json::json!({"owner_plugin_id":"bcode.default-agents", "template_id":"cli-input", "template_version":1, "workflow_id":"cli/template", "draft_id":"cli-draft"});
+    std::fs::write(
+        root.path().join("instantiate.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let instantiated = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "template",
+            "instantiate",
+            "--request",
+            "instantiate.json",
+        ],
+    );
+    assert_eq!(instantiated["workflow"]["workflow_id"], "cli/template");
+    assert_eq!(instantiated["draft"]["generation"], 1);
+    let session = graph_cli_json(
+        root.path(),
+        &["session", "create", "template-parent", "--json"],
+    );
+    let request = serde_json::json!({"owner_plugin_id":"bcode.default-agents", "template_id":"cli-input", "template_version":1, "parent_session_id":session["id"], "configuration":{"message":"template acceptance"}, "run_id":"cli-template-run"});
+    std::fs::write(
+        root.path().join("start.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let started = graph_cli_json(
+        root.path(),
+        &["workflow", "template", "start", "--request", "start.json"],
+    );
+    assert_eq!(started["run"]["run_id"], "cli-template-run");
+    graph_cli_json(
+        root.path(),
+        &["workflow", "cancel-run", "--run-id", "cli-template-run"],
+    );
+    drop(daemon);
+}
+
+#[test]
+fn workflow_template_instantiation_rejects_invalid_request_before_startup() {
+    let output = run_cli_with_fixture(
+        &[
+            "workflow",
+            "template",
+            "instantiate",
+            "--request",
+            "request.json",
+        ],
+        true,
+        Stdio::piped(),
+        |root| {
+            std::fs::write(root.join("request.json"), r#"{"private":"do-not-echo"}"#).unwrap();
+        },
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("invalid workflow template instantiation request"));
+    assert!(!error.contains("do-not-echo"));
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn workflow_template_start_missing_template_returns_no_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let session = graph_cli_json(
+        root.path(),
+        &["session", "create", "template-parent", "--json"],
+    );
+    std::fs::write(
+        root.path().join("request.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "owner_plugin_id":"missing.plugin", "template_id":"missing", "template_version":1,
+            "parent_session_id":session["id"], "configuration":{}, "run_id":"missing-template-run"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run_cli_at_root(
+        root.path(),
+        &["workflow", "template", "start", "--request", "request.json"],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("workflow_unavailable: workflow state is unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(daemon);
+}
+
+#[test]
+fn workflow_template_start_rejects_invalid_request_before_startup() {
+    let output = run_cli_with_fixture(
+        &["workflow", "template", "start", "--request", "request.json"],
+        true,
+        Stdio::piped(),
+        |root| {
+            std::fs::write(root.join("request.json"), r#"{"private":"do-not-echo"}"#).unwrap();
+        },
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("invalid workflow template start request"));
+    assert!(!error.contains("do-not-echo"));
 }
 
 #[test]
