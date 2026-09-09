@@ -67527,13 +67527,75 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.shell".into()]),
+                enabled: BTreeSet::from([
+                    "bcode.shell".into(),
+                    "bcode.default-agents".into(),
+                    "bcode.fake-provider".into(),
+                ]),
                 disabled: BTreeSet::new(),
             },
-            &[plugin],
+            &[
+                plugin,
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+                    bcode_default_agents_plugin::static_plugin(),
+                ),
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+                    bcode_fake_provider_plugin::static_plugin(),
+                ),
+            ],
         )
         .expect("external template plugin");
         Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn external_template_start_is_inspectable_over_ipc() {
+        let root = tempfile::tempdir().expect("plugin root");
+        let state = external_template_test_state(root.path());
+        let parent = state
+            .sessions
+            .create_session(Some("template parent".into()), root.path().to_path_buf())
+            .await
+            .expect("parent");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(root.path().join("start.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let started = client
+            .start_workflow_template(bcode_workflow::WorkflowTemplateStartRequest {
+                owner_plugin_id: "bcode.shell".into(),
+                template_id: "external".into(),
+                template_version: 1,
+                run_id: Some("template-start".into()),
+                workspace_snapshot: None,
+                parent_session_id: parent.id,
+                configuration: serde_json::json!({}),
+                limits: bcode_workflow::WorkflowRunLimits::default(),
+            })
+            .await
+            .expect("template admission");
+        assert_eq!(started.run.run_id, "template-start");
+        assert!(
+            client
+                .workflow_run_status("template-start".into())
+                .await
+                .expect("status")
+                .is_some()
+        );
+        client
+            .cancel_workflow_run("template-start".into())
+            .await
+            .expect("cancel cleanup");
+        shutdown.send(()).expect("shutdown");
+        server.await.expect("server");
+        drop(state);
     }
 
     #[tokio::test]
