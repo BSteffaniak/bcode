@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 20;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 26;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1579,7 +1579,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=19),
+                                actual: Some(14..=25),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1609,7 +1609,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=19),
+                                actual: Some(14..=25),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1758,7 +1758,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=19) {
+        if !matches!(previous_schema_version, 14..=25) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -1802,6 +1802,9 @@ impl WorkflowStore {
             transaction.execute_batch(
                 "ALTER TABLE workflow_activations ADD COLUMN node_revision INTEGER NOT NULL DEFAULT 1 CHECK (node_revision > 0);",
             )?;
+        }
+        if (16..=20).contains(&previous_schema_version) {
+            run_graph::initialize_retirement(&transaction)?;
         }
         run_graph::initialize_edit_candidates(&transaction)?;
         transaction.execute(
@@ -5235,6 +5238,13 @@ impl WorkflowStore {
             &record.node,
             record.revision,
         )?;
+        record_activation_graph_binding(
+            &transaction,
+            &activation.run_id,
+            &activation.node_id,
+            &activation.activation_id,
+            expected_revision,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -8403,7 +8413,7 @@ impl WorkflowStore {
                     settled_at_ms,
                 ),
             )?;
-            transaction.execute(
+            let activation_inserted = transaction.execute(
                 "INSERT INTO workflow_activations \
                  (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
@@ -8418,6 +8428,15 @@ impl WorkflowStore {
                     settled_at_ms,
                 ),
             )?;
+            if activation_inserted == 1 {
+                record_activation_graph_binding(
+                    &transaction,
+                    &activation.run_id,
+                    &member_node_id,
+                    &member_activation_id,
+                    1,
+                )?;
+            }
             if inserted == 1 {
                 append_event(
                     &transaction,
@@ -10602,6 +10621,13 @@ fn skip_branch_nodes(
                 created_at_ms,
             ),
         )?;
+        record_activation_graph_binding(
+            transaction,
+            run_id,
+            node_id,
+            &activation_identity(run_id, node_id, generation),
+            1,
+        )?;
     }
     Ok(())
 }
@@ -10908,6 +10934,15 @@ where
         (&output.run_id, &output.node_id, &output.activation_id),
         |row| row.get(0),
     )?;
+    if run_graph::graph_revision(transaction, &output.run_id)? != Some(1) {
+        let exit = run_graph::revised_leaf_exit(
+            transaction,
+            &output.run_id,
+            &output.node_id,
+            &output.activation_id,
+        )?;
+        return Ok((Vec::new(), exit));
+    }
     let completed_node = run_graph::initial_activation_node(
         transaction,
         &output.run_id,
@@ -11073,6 +11108,13 @@ where
                 "workflow successor insertion did not create exactly one activation: {node_id}"
             )));
         }
+        record_activation_graph_binding(
+            transaction,
+            &activation.run_id,
+            &activation.node_id,
+            &activation.activation_id,
+            1,
+        )?;
         append_event(
             transaction,
             &activation.run_id,
@@ -11468,6 +11510,10 @@ fn settle_parallel_failure(
     member_failed: bool,
     settled_at_ms: u64,
 ) -> Result<Option<ParallelFailureSettlement>, WorkflowStoreError> {
+    if run_graph::graph_revision(transaction, run_id)? != Some(1) {
+        run_graph::revised_leaf_exit(transaction, run_id, member_node_id, activation_id)?;
+        return Ok(None);
+    }
     let generation: u64 = transaction.query_row(
         "SELECT dependency_generation FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2 \
          AND activation_id = ?3",
@@ -13107,6 +13153,11 @@ fn insert_activation_with_status(
     activation: &NewActivation,
     status: &str,
 ) -> Result<(), WorkflowStoreError> {
+    if run_graph::graph_revision(transaction, &activation.run_id)? != Some(1) {
+        return Err(WorkflowStoreError::InvalidData(
+            "revised workflow graph requires revision-aware activation admission".to_string(),
+        ));
+    }
     activation.input.as_ref().ok_or_else(|| {
         WorkflowStoreError::InvalidData(format!(
             "workflow activation input is required: {}/{}/{}",
@@ -13120,7 +13171,29 @@ fn insert_activation_with_status(
                 activation.node_id
             ))
         })?;
-    insert_activation_bound_to_node(transaction, activation, status, &node, 1)
+    insert_activation_bound_to_node(transaction, activation, status, &node, 1)?;
+    record_activation_graph_binding(
+        transaction,
+        &activation.run_id,
+        &activation.node_id,
+        &activation.activation_id,
+        1,
+    )
+}
+
+fn record_activation_graph_binding(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+    graph_revision: u64,
+) -> Result<(), WorkflowStoreError> {
+    transaction.execute(
+        "INSERT INTO workflow_activation_graph_bindings
+         (run_id, node_id, activation_id, graph_revision) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![run_id, node_id, activation_id, graph_revision],
+    )?;
+    Ok(())
 }
 
 fn insert_activation_bound_to_node(
@@ -17696,6 +17769,53 @@ mod tests {
     }
 
     #[test]
+    fn preparation_rejects_inconsistent_admission_graph_binding() {
+        let (_temp, mut store) = initialized_store();
+        store.connection.execute(
+            "UPDATE workflow_activation_graph_bindings SET graph_revision = 2 WHERE run_id = 'run-1'", [],
+        ).expect("damaged binding");
+        let before = store.connection.total_changes();
+        let error = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect_err("inconsistent admission");
+        assert!(error.to_string().contains("admission binding"));
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(
+            store
+                .attempt_history("run-1", None, 10)
+                .expect("history")
+                .is_empty()
+        );
+        store
+            .connection
+            .execute(
+                "DELETE FROM workflow_activation_graph_bindings WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("historical unrecorded binding");
+        assert!(
+            store
+                .prepare_pending_activation(
+                    "run-1",
+                    "review",
+                    &activation_id(),
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"operation": "review"}),
+                    12,
+                )
+                .expect("historical initial graph")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn pending_activation_admission_is_atomic_and_single_winner() {
         let (temp, mut first_store) = initialized_store();
         let mut second_store = WorkflowStore::open_in_state_dir(temp.path()).expect("second store");
@@ -17778,7 +17898,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, 0, 0 FROM workflow_run_graph_nodes;
              UPDATE workflow_run_graphs SET revision = 2;",
             )
@@ -20773,10 +20893,88 @@ mod tests {
             .expect("admit work after upgrade");
     }
 
+    fn remove_retirement_fixture(store: &WorkflowStore) {
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX workflow_run_graph_nodes_retirement;
+             DROP INDEX workflow_run_graph_edges_retirement;
+             DROP INDEX workflow_run_graph_nodes_live;
+             DROP INDEX workflow_run_graph_edges_live;
+             ALTER TABLE workflow_run_graph_nodes DROP COLUMN retired_at_revision;
+             ALTER TABLE workflow_run_graph_edges DROP COLUMN retired_at_revision;",
+            )
+            .expect("pre-retirement schema");
+    }
+
+    #[test]
+    fn retirement_preserves_history_and_current_page_continuations_after_upgrade() {
+        let (temp, store) = initialized_store();
+        remove_retirement_fixture(&store);
+        store
+            .connection
+            .execute("UPDATE workflow_store_contract SET schema_version = 20", [])
+            .expect("old contract");
+        drop(store);
+        let store = WorkflowStore::initialize_in_state_dir(temp.path(), 901).expect("upgrade");
+        store.connection.execute_batch(
+            "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
+             SELECT run_id, 'after', revision, replace(node_json, 'review', 'after'), 0, 0
+             FROM workflow_run_graph_nodes WHERE node_id = 'review';
+             INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json)
+             VALUES ('run-1', 0, 1, 'review', 'review', '{\"from\":\"review\",\"to\":\"review\"}');
+             UPDATE workflow_run_graph_nodes SET retired_at_revision = 2 WHERE node_id = 'review';
+             UPDATE workflow_run_graph_edges SET retired_at_revision = 2;
+             UPDATE workflow_run_graphs SET revision = 2;",
+        ).expect("published retirement fixture");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("retired")
+                .is_none()
+        );
+        assert!(
+            store
+                .current_run_graph_edge("run-1", 0)
+                .expect("retired edge")
+                .is_none()
+        );
+        assert!(
+            store
+                .run_graph_node_revision("run-1", "review", 1)
+                .expect("history")
+                .is_some()
+        );
+        let page = store
+            .current_run_graph_page("run-1", Some(2), None, None, 1)
+            .expect("page");
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.nodes[0].node.id, "after");
+        assert!(page.nodes_complete && page.edges_complete);
+        assert!(page.edges.is_empty());
+        assert!(
+            store
+                .current_run_graph_nodes("run-1", 2, Some("after"), 1)
+                .expect("continuation")
+                .is_empty()
+        );
+        assert_eq!(before, store.connection.total_changes());
+        store.connection.execute("UPDATE workflow_run_graph_nodes SET retired_at_revision = 3 WHERE node_id = 'review'", []).expect("future retirement fixture");
+        assert!(
+            store
+                .current_run_graph_page("run-1", Some(2), None, None, 1)
+                .is_err()
+        );
+    }
+
     #[test]
     fn startup_upgrade_supports_schema_14_and_16() {
         for schema in [14, 16] {
             let (temp, store) = initialized_store();
+            remove_retirement_fixture(&store);
             if schema == 14 {
                 store
                     .connection
@@ -21532,6 +21730,7 @@ mod tests {
     #[test]
     fn graph_edit_candidate_survives_upgrade_and_duplicate_delivery() {
         let (temp, store) = initialized_store();
+        remove_retirement_fixture(&store);
         store
             .connection
             .execute_batch(
@@ -21630,6 +21829,60 @@ mod tests {
             .collect::<Result<_, _>>()
             .expect("validation records");
         assert_eq!(records, vec![("valid-replacement".to_string(), 1)]);
+        let delta: (String, String, bool, bool) = store
+            .connection
+            .query_row(
+                "SELECT mutation_id, node_id, node_json IS NOT NULL, is_entry
+             FROM workflow_graph_edit_nodes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("validated replacement delta");
+        assert_eq!(
+            delta,
+            (
+                "valid-replacement".to_string(),
+                "review".to_string(),
+                true,
+                true
+            )
+        );
+        assert_eq!(
+            store
+                .run_graph_revision("run-1")
+                .expect("unpublished graph"),
+            Some(1)
+        );
+    }
+
+    fn verify_running_candidate_requires_disposition(
+        store: &mut WorkflowStore,
+        replacement: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &WorkflowExecutionAuthority,
+    ) {
+        let mut candidate = replacement.clone();
+        candidate.mutation_id = "missing-disposition".to_string();
+        candidate.reconciliation.clear();
+        store
+            .stage_run_graph_edit(&candidate, authority, 24)
+            .expect("stage");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'running' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("running target");
+        let before = store.connection.total_changes();
+        let error = store
+            .validate_staged_run_graph_edit("run-1", "missing-disposition", authority)
+            .expect_err("explicit disposition required");
+        assert!(
+            error
+                .to_string()
+                .contains("requires explicit graph reconciliation")
+        );
+        assert_eq!(before, store.connection.total_changes());
     }
 
     fn verify_candidate_read_and_damage(
@@ -21659,6 +21912,10 @@ mod tests {
             entry: node.entry,
             exit: node.exit,
         }];
+        verify_running_candidate_requires_disposition(store, &replacement, authority);
+        replacement.reconciliation = vec![bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+            activation_id: activation_id(),
+        }];
         store
             .stage_run_graph_edit(&replacement, authority, 24)
             .expect("stage replacement");
@@ -21669,6 +21926,29 @@ mod tests {
             RunGraphCandidateValidation::Validated
         );
         verify_persisted_candidate_validation(store, authority);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'completed' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("settled reconciliation target");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .validate_staged_run_graph_edit("run-1", "valid-replacement", authority)
+                .expect_err("terminal reconciliation target")
+                .to_string()
+                .contains("unambiguous active activation")
+        );
+        assert_eq!(before, store.connection.total_changes());
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'pending' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("restore target");
         for (status, cancellation) in [("completed", None), ("running", Some(25))] {
             store.connection.execute(
                 "UPDATE workflow_runs SET status = ?1, cancellation_requested_at_ms = ?2 WHERE run_id = 'run-1'",
@@ -21702,6 +21982,80 @@ mod tests {
     }
 
     #[test]
+    fn admission_records_graph_revision_independently_of_unchanged_node() {
+        let (temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE workflow_activation_graph_bindings;
+             UPDATE workflow_store_contract SET schema_version = 21;",
+            )
+            .expect("schema 21 fixture");
+        drop(store);
+        store = WorkflowStore::initialize_in_state_dir(temp.path(), 901).expect("upgrade");
+        assert!(
+            store
+                .activation_admitted_graph_revision("run-1", "review", &activation_id())
+                .expect("unknown historical admission")
+                .is_none()
+        );
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';
+             UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
+            )
+            .expect("graph with unchanged executable");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let activation = NewActivation {
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_identity("run-1", "review", 1),
+            dependency_generation: 1,
+            input: Some(serde_json::json!(42)),
+            created_at_ms: 20,
+        };
+        store
+            .create_activation_at_graph_revision(&activation, 2, &authority)
+            .expect("admit");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision("run-1", "review", &activation.activation_id)
+                .expect("admitted graph"),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation.activation_id)
+                .expect("node")
+                .expect("binding")
+                .revision,
+            1
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activation_graph_bindings SET graph_revision = 3",
+                [],
+            )
+            .expect("future binding");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .activation_admitted_graph_revision("run-1", "review", &activation.activation_id)
+                .is_err()
+        );
+        assert_eq!(before, store.connection.total_changes());
+    }
+
+    #[test]
     fn revision_aware_admission_fences_and_preserves_bindings() {
         let (temp, mut store) = initialized_store();
         let original = store
@@ -21714,7 +22068,7 @@ mod tests {
                 "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
              coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
              coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';
-             INSERT INTO workflow_run_graph_nodes
+             INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = 'run-1';
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
@@ -21750,6 +22104,9 @@ mod tests {
                 .expect("no failed admission")
                 .is_none()
         );
+        let before = store.connection.total_changes();
+        assert!(store.create_activation(&activation).is_err());
+        assert_eq!(before, store.connection.total_changes());
         store
             .create_activation_at_graph_revision(&activation, 2, &authority)
             .expect("admit revised activation");
@@ -21795,7 +22152,7 @@ mod tests {
             .expect("revision transaction");
         transaction
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, ?1, 0, 0)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 2, ?1, 0, 0)",
                 [serde_json::to_string(&revised.node).expect("revised executable")],
             )
             .expect("revised node fixture");
@@ -21861,7 +22218,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';
@@ -21906,7 +22263,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';
@@ -21971,7 +22328,7 @@ mod tests {
         let write = writer.transaction().expect("writer transaction");
         write
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';
@@ -22275,6 +22632,7 @@ mod tests {
              UPDATE workflow_store_contract SET schema_version = 17;",
             )
             .expect("schema 17 fixture");
+        remove_retirement_fixture(&store);
         drop(store);
         let store = WorkflowStore::initialize_in_state_dir(temp.path(), 900).expect("upgrade");
         assert_eq!(
@@ -22312,7 +22670,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, 0, 0 FROM workflow_run_graph_nodes
              WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1;
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
@@ -22381,14 +22739,14 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'second', 1, ?1, 0, 0)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'second', 1, ?1, 0, 0)",
                 [serde_json::to_string(&node).expect("json")],
             )
             .expect("second node");
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
@@ -22424,6 +22782,59 @@ mod tests {
     }
 
     #[test]
+    fn edge_endpoint_retirement_is_evaluated_at_edge_revision() {
+        let (temp, store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_string(),
+            to: "review".to_string(),
+            kind: bcode_workflow::EdgeKind::default(),
+            transform: None,
+        };
+        for revision in [1, 2, 3] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO workflow_run_graph_edges
+                 (run_id, edge_id, revision, source_node_id, target_node_id, edge_json)
+                 VALUES ('run-1', 0, ?1, 'review', 'review', ?2)",
+                    rusqlite::params![revision, serde_json::to_string(&edge).expect("json")],
+                )
+                .expect("edge fixture");
+        }
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_run_graph_nodes SET retired_at_revision = 2;
+             INSERT INTO workflow_run_graph_nodes
+             (run_id, node_id, revision, node_json, is_entry, is_exit)
+             SELECT run_id, node_id, 3, node_json, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE revision = 1;
+             UPDATE workflow_run_graphs SET revision = 3;",
+            )
+            .expect("retirement and reintroduction");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .run_graph_edge_revision("run-1", 0, 1)
+                .expect("before retirement")
+                .is_some()
+        );
+        let error = store
+            .run_graph_edge_revision("run-1", 0, 2)
+            .expect_err("retired endpoint");
+        assert!(error.to_string().contains("endpoint was retired"));
+        assert!(
+            store
+                .run_graph_edge_revision("run-1", 0, 3)
+                .expect("reintroduced endpoint")
+                .is_some()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
     fn exact_edge_read_rejects_invalid_endpoint_storage_without_writes() {
         let (_temp, store) = initialized_store();
         let oversized = "x".repeat(MAX_ID_BYTES + 1);
@@ -22436,7 +22847,7 @@ mod tests {
             ("review", oversized.as_str()),
         ] {
             store.connection.execute(
-                "INSERT OR REPLACE INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, ?1, ?2, 'not-json')",
+                "INSERT OR REPLACE INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, ?1, ?2, 'not-json')",
                 (source, target),
             ).expect("damaged edge fixture");
             let before = store.connection.total_changes();
@@ -22458,7 +22869,7 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("json")],
         ).expect("edge fixture");
         store
@@ -22511,13 +22922,13 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("json")],
         ).expect("edge");
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, '{}', 0, 0);
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 2, '{}', 0, 0);
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
             )
             .expect("damaged current endpoint");
@@ -22538,7 +22949,7 @@ mod tests {
     fn combined_graph_page_failure_releases_snapshot_without_writes() {
         let (_temp, store) = initialized_store();
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', '{}')",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', '{}')",
             [],
         ).expect("damaged edge");
         let before = store.connection.total_changes();
@@ -22571,12 +22982,12 @@ mod tests {
         let json = serde_json::to_string(&edge).expect("json");
         for revision in 1..=200 {
             store.connection.execute(
-                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, ?1, 'review', 'review', ?2)",
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, ?1, 'review', 'review', ?2)",
                 (revision, &json),
             ).expect("history");
         }
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 1, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 1, 1, 'review', 'review', ?1)",
             [&json],
         ).expect("next edge");
         store
@@ -22610,7 +23021,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, node_json, is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review';",
             )
@@ -23066,6 +23477,7 @@ mod tests {
              DELETE FROM workflow_run_graphs WHERE run_id = 'run-1';",
             )
             .expect("orphan graph fixture");
+        remove_retirement_fixture(&store);
         drop(store);
         let error = WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 78)
             .expect_err("orphaned graph must reject migration");
@@ -23220,7 +23632,7 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', ?1, 1, ?2, 0, 1)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', ?1, 1, ?2, 0, 1)",
                 rusqlite::params![
                     target.id,
                     serde_json::to_string(&target).expect("serialize target")
@@ -23396,7 +23808,7 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 42, 1, ?1, ?2, ?3)",
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 42, 1, ?1, ?2, ?3)",
                 rusqlite::params![
                     node_id,
                     target.id,
@@ -23412,6 +23824,7 @@ mod tests {
              ALTER TABLE workflow_activations DROP COLUMN node_revision; UPDATE workflow_store_contract SET schema_version = 16 WHERE contract_id = 1;",
             )
             .expect("schema 16 fixture");
+        remove_retirement_fixture(&store);
         drop(store);
         assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
         let receipt = WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 71)
@@ -23493,7 +23906,7 @@ mod tests {
             store
                 .connection
                 .execute(
-                    "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 42, 1, ?1, ?1, ?2)",
+                    "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 42, 1, ?1, ?1, ?2)",
                     rusqlite::params![node.id, serde_json::to_string(&edge).expect("serialize")],
                 )
                 .expect("persist edge");
@@ -23590,13 +24003,13 @@ mod tests {
             store
                 .connection
                 .execute(
-                    "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, ?2, ?2, ?3)",
+                    "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, 1, ?2, ?2, ?3)",
                     rusqlite::params![id, node.id, json],
                 )
                 .expect("edge");
         }
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 205, 1, 'unrelated', ?1, 'invalid')",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 205, 1, 'unrelated', ?1, 'invalid')",
             [&node.id],
         ).expect("unrelated source damage");
         let first = store
@@ -24135,7 +24548,7 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("edge payload")],
         ).expect("edge fixture");
         let before = store.connection.total_changes();
@@ -24408,11 +24821,11 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("edge")],
         ).expect("edge fixture");
         store.connection.execute_batch(
-            "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, 'invalid-json', 0, 0);
+            "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 2, 'invalid-json', 0, 0);
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
         ).expect("damaged current endpoint");
         let before = store.connection.total_changes();
@@ -24439,7 +24852,7 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("edge")],
         ).expect("edge fixture");
         assert_eq!(
@@ -24474,7 +24887,7 @@ mod tests {
                 .is_some()
         );
         transaction.execute_batch(
-            "INSERT INTO workflow_run_graph_edges SELECT run_id, edge_id, 2, source_node_id, target_node_id, edge_json FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = 0;",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) SELECT run_id, edge_id, 2, source_node_id, target_node_id, edge_json FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = 0;",
         ).expect("future edge fixture");
         let before = store.connection.total_changes();
         assert!(store.current_run_graph_edge("run-1", 0).is_err());
@@ -24500,7 +24913,7 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("edge")],
         ).expect("initial edge fixture");
         assert_eq!(
@@ -24519,7 +24932,7 @@ mod tests {
             1
         );
         store.connection.execute_batch(
-            "INSERT INTO workflow_run_graph_edges SELECT run_id, edge_id, 2, source_node_id, target_node_id, edge_json FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = 0;
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) SELECT run_id, edge_id, 2, source_node_id, target_node_id, edge_json FROM workflow_run_graph_edges WHERE run_id = 'run-1' AND edge_id = 0;
              UPDATE workflow_run_graphs SET revision = 3 WHERE run_id = 'run-1';",
         ).expect("later revision fixture");
         let before = store.connection.total_changes();
@@ -24553,7 +24966,7 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("edge")],
         ).expect("edge fixture");
         assert!(
@@ -24605,7 +25018,7 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'target', 1, ?1, 0, 1)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'target', 1, ?1, 0, 1)",
                 [serde_json::to_string(&target).expect("target")],
             )
             .expect("target fixture");
@@ -24616,7 +25029,7 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'target', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'target', ?1)",
             [serde_json::to_string(&edge).expect("edge")],
         ).expect("edge fixture");
         target.id = "wrong-identity".to_string();
@@ -24677,7 +25090,7 @@ mod tests {
         let json = serde_json::to_string(&edge).expect("edge");
         for id in 0..3 {
             store.connection.execute(
-                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
                 (id, &json),
             ).expect("shared endpoint edge");
         }
@@ -24712,7 +25125,7 @@ mod tests {
         };
         for id in 0..3 {
             store.connection.execute(
-                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
                 (id, serde_json::to_string(&edge).expect("edge")),
             ).expect("edge fixture");
         }
@@ -24726,7 +25139,7 @@ mod tests {
         let transaction = store.connection.unchecked_transaction().expect("snapshot");
         transaction
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, '{', 1, 1);
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 2, '{', 1, 1);
              UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';",
             )
             .expect("damaged current endpoint");
@@ -24769,20 +25182,20 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 3, ?1, 1, 1)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 3, ?1, 1, 1)",
                 [serde_json::to_string(&node).expect("current node")],
             )
             .expect("current node fixture");
         store
             .connection
             .execute_batch(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, '{', 1, 1);
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 2, '{', 1, 1);
              UPDATE workflow_run_graphs SET revision = 3 WHERE run_id = 'run-1';",
             )
             .expect("damaged historical node fixture");
         for (id, revision) in [(0, 1), (1, 2)] {
             store.connection.execute(
-                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, ?2, 'review', 'review', ?3)",
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, ?2, 'review', 'review', ?3)",
                 (id, revision, serde_json::to_string(&edge).expect("edge")),
             ).expect("edge fixture");
         }
@@ -24868,7 +25281,7 @@ mod tests {
             .execute_batch("PRAGMA ignore_check_constraints = ON;")
             .expect("allow damage fixture");
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
             (i64::MIN, serde_json::to_string(&edge).expect("edge")),
         ).expect("invalid edge identity fixture");
         store
@@ -24899,7 +25312,7 @@ mod tests {
         let maximum = u64::try_from(i64::MAX).expect("maximum identity");
         for id in [maximum - 1, maximum] {
             store.connection.execute(
-                "INSERT INTO workflow_run_graph_edges VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
                 (id, serde_json::to_string(&edge).expect("edge")),
             ).expect("edge fixture");
         }
@@ -25015,7 +25428,7 @@ mod tests {
             .expect("revision fixture");
         transaction
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', ?1, 2, ?2, ?3, ?4)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', ?1, 2, ?2, ?3, ?4)",
                 rusqlite::params![
                     cursor,
                     serde_json::to_string(&revised).expect("node"),
@@ -25407,7 +25820,7 @@ mod tests {
         let mut revised_node = original.node.clone();
         revised_node.name = "Revised review".to_string();
         let edit = writer.transaction().expect("edit transaction");
-        edit.execute("INSERT INTO workflow_run_graph_nodes SELECT run_id, node_id, 2, ?1, 1 - is_entry, 1 - is_exit FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1", [serde_json::to_string(&revised_node).expect("revised node payload")]).expect("new revision");
+        edit.execute("INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) SELECT run_id, node_id, 2, ?1, 1 - is_entry, 1 - is_exit FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1", [serde_json::to_string(&revised_node).expect("revised node payload")]).expect("new revision");
         edit.execute(
             "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
             [],
@@ -25508,7 +25921,7 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("payload")],
         ).expect("initial edge");
         let mut writer =
@@ -25524,7 +25937,7 @@ mod tests {
         };
         let edit = writer.transaction().expect("edit");
         edit.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 2, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 2, 'review', 'review', ?1)",
             [serde_json::to_string(&revised_edge).expect("revised payload")],
         )
         .expect("new edge revision");
@@ -25597,7 +26010,7 @@ mod tests {
         let mut candidate = original.node.clone();
         candidate.name = "Rolled back candidate".to_string();
         edit.execute(
-            "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, ?1, 0, 0)",
+            "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 2, ?1, 0, 0)",
             [serde_json::to_string(&candidate).expect("payload")],
         )
         .expect("candidate node");
@@ -25608,7 +26021,7 @@ mod tests {
             transform: None,
         };
         edit.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 2, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 2, 'review', 'review', ?1)",
             [serde_json::to_string(&candidate_edge).expect("edge payload")],
         )
         .expect("candidate edge");
@@ -25653,7 +26066,7 @@ mod tests {
         let retry = writer.transaction().expect("retry revision");
         retry
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', 'review', 2, ?1, 0, 0)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', 'review', 2, ?1, 0, 0)",
                 [serde_json::to_string(&candidate).expect("retry payload")],
             )
             .expect("retry node");
@@ -25684,11 +26097,11 @@ mod tests {
             transform: None,
         };
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 0, 1, 'review', 'review', ?1)",
             [serde_json::to_string(&edge).expect("edge payload")],
         ).expect("valid edge fixture");
         store.connection.execute(
-            "INSERT INTO workflow_run_graph_edges VALUES ('run-1', 1, 1, 'review', 'review', 'not-json')",
+            "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', 1, 1, 'review', 'review', 'not-json')",
             [],
         ).expect("damaged lookahead fixture");
         let before = store.connection.total_changes();
@@ -25716,7 +26129,7 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO workflow_run_graph_nodes VALUES ('run-1', ?1, 1, 'not-json', 0, 0)",
+                "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit) VALUES ('run-1', ?1, 1, 'not-json', 0, 0)",
                 [&oversized],
             )
             .expect("damaged lookahead fixture");
@@ -26025,9 +26438,12 @@ mod tests {
     #[test]
     fn branch_skip_preserves_existing_generation_with_distinct_identity() {
         let (_temp, mut store) = initialized_store();
-        store.connection.execute(
-            "UPDATE workflow_activations SET activation_id = 'existing-identity' WHERE run_id = 'run-1'",
-            [],
+        store.connection.execute_batch(
+            "PRAGMA defer_foreign_keys = ON;
+             BEGIN;
+             UPDATE workflow_activation_graph_bindings SET activation_id = 'existing-identity' WHERE run_id = 'run-1';
+             UPDATE workflow_activations SET activation_id = 'existing-identity' WHERE run_id = 'run-1';
+             COMMIT;",
         ).expect("identity fixture");
         let transaction = store.connection.transaction().expect("transaction");
         let changes = transaction.total_changes();
@@ -32966,6 +33382,47 @@ mod tests {
     }
 
     #[test]
+    fn revised_leaf_output_requires_current_admission_and_completes() {
+        let (temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch("UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1';")
+            .expect("revision fixture");
+        let output = ValidatedOutput {
+            output_id: "revised-output".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        assert!(store.persist_validated_output(&output).is_err());
+        store.connection.execute(
+            "UPDATE workflow_activation_graph_bindings SET graph_revision = 2 WHERE run_id = 'run-1'", []
+        ).expect("current admission fixture");
+        let outcome = store
+            .persist_validated_output(&output)
+            .expect("revised leaf settlement");
+        assert_eq!(outcome.run_status, RunStatus::Completed);
+        assert!(outcome.activated.is_empty());
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(store.persist_validated_output(&output).is_err());
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("durable terminal status");
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
     fn validated_output_atomically_activates_direct_successor_and_completes_run() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -32977,6 +33434,12 @@ mod tests {
         run.run_id = "sequential-run".to_string();
         store.create_run(&run).expect("run");
         let first_id = activation_identity("sequential-run", "first", 0);
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision("sequential-run", "first", &first_id)
+                .expect("entry binding"),
+            Some(1)
+        );
         let first = store
             .persist_validated_output(&ValidatedOutput {
                 output_id: "first-output".to_string(),
@@ -32994,6 +33457,18 @@ mod tests {
         assert_eq!(first.activated.len(), 1);
         assert_eq!(first.activated[0].node_id, "second");
         assert_eq!(first.activated[0].input, Some(serde_json::json!(2)));
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen successor");
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(
+                    "sequential-run",
+                    "second",
+                    &first.activated[0].activation_id
+                )
+                .expect("successor binding"),
+            Some(1)
+        );
         let second = store
             .persist_validated_output(&ValidatedOutput {
                 output_id: "second-output".to_string(),
@@ -34231,7 +34706,7 @@ mod tests {
             .unchecked_transaction()
             .expect("transaction");
         transaction.execute(
-            "INSERT INTO workflow_run_graph_nodes
+            "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
              SELECT run_id, node_id, 2, ?1, is_entry, is_exit
              FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1",
             [serde_json::to_string(&replacement).expect("serialize")],

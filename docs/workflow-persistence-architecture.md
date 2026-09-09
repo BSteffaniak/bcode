@@ -20,6 +20,74 @@ revision, permission, or reconciliation checks. Candidate
 publication, lifecycle management, and application integration remain unimplemented; dispatch safety
 gates remain in place.
 
+## Retired graph entities
+
+Schema 21 adds retirement revisions to node and edge records without deleting their executable
+payloads. Current reads exclude retired entities through partial indexes before applying page limits;
+exact historical revision reads retain the original payloads. Historical edge reads require endpoints
+that were live at the edge's revision: retirement does not invalidate older edges, and later
+reintroduction cannot legitimize an edge created while its endpoint was absent. Indexed retirement checks reject
+uncommitted retirement revisions rather than hiding them from pages. Publication must retire every
+previously live record of a removed identity in the same transaction that advances the graph revision;
+reintroduction uses a new executable revision. The existing exclusive, backup-verified upgrade path
+preserves schemas 14–20 and initializes existing records as unretired. Normal reads never migrate.
+
+This representation is a publication prerequisite, not an edit publication API. Atomic publication,
+active-work reconciliation, and incremental candidate validation remain unimplemented.
+
+## Activation admission graph bindings
+
+Schema 22 records the admitted graph revision separately from the executable node revision for
+`create_activation_at_graph_revision`. Both records commit in the ownership-fenced admission
+transaction. An unchanged node can retain revision 1 while its activation is admitted at graph
+revision 2. Bounded `activation_admitted_graph_revision` reads validate the binding against the
+committed graph and executable node; they preserve caller-owned transactions.
+
+The exclusive upgrade path supports schemas 14–21 without inventing admission facts. Earlier
+activations have no recorded graph binding and return `None`; callers must not substitute the node
+revision. New initial-graph admissions, successor creation, branch skips, and newly inserted fan-out
+members record graph revision 1 in their existing transaction. Duplicate fan-out delivery does not
+backfill historical admission facts. Revision-aware admission records its verified expected revision.
+Initial-only execution lookups reject recorded admission bindings other than revision 1 before
+preparation or settlement mutation. Missing historical admission facts retain the existing validated
+initial-executable path; they are not persisted or inferred. Scheduler integration for edited graphs
+and publication remain unfinished.
+
+## Validated candidate deltas
+
+Schema 23 persists normalized candidate node/edge deltas in the structural-validation transaction.
+Only identities touched by the bounded edit request are stored; unchanged graph portions are not
+copied. Payloads contain the final validated state after all operations, with null payloads denoting
+removal. Duplicate validation upserts the same candidate identities. These records reference the
+candidate validation revision and are not executable graph authority. Older validation markers have
+no inferred deltas: revalidation is required before a future publisher can consume them. Exclusive
+backup-verified upgrades now support schemas 14–22. Publication and reconciliation remain absent.
+
+## Reconciliation target validation
+
+Schema 24 adds a run/activation identity index for bounded reconciliation lookup. Candidate validation
+requires each explicit retain/cancel target to resolve to exactly one nonterminal activation without
+an output in the candidate's run. Invalid, missing, ambiguous, or settled targets fail before validation
+writes. This is snapshot validation only: publication must recheck targets and apply dispositions
+atomically; no cancellation or retention is performed here. The exclusive upgrade path supports
+schemas 14–23. Schema 25 adds a partial running-node index and requires explicit dispositions for
+running activations of changed nodes and old/new targets of changed edges during bounded candidate
+validation. The lookup stops after the maximum disposition count plus one; it cannot silently accept
+an uncovered running activation. Within the bounded graph snapshot, affected identities expand
+transitively over current edges and candidate-added/replaced edges, with visited identities preventing
+cycles from looping. Completed activations remain untouched. Schema 26 adds an indexed lookup of
+running synthetic fan-out members by affected controller, requiring their explicit dispositions within
+the same bounded coverage check. Operation-owner fencing remains uncovered, and validation does
+not apply dispositions. Publication must perform
+complete execution-aware reconciliation under current authority. Legacy activation insertion now
+rejects graphs beyond revision 1 rather than silently binding initial nodes; exact-revision admission
+remains the supported store capability for revised graphs. Repeat/join/output settlement still reads
+initial topology. Revised leaf output settlement now accepts an activation explicitly admitted at
+the current graph revision when its bound node is still the latest non-retired representation and
+there are no outgoing edge records. It uses that node's exit flag and preserves transactional output
+completion. Historical admissions and any outgoing edges still require reconciliation; this narrow
+path does not enable publication, repeat/join settlement, or operation-owner coordination.
+
 ## Canonical ownership
 
 Durable workflow execution uses one dedicated database:

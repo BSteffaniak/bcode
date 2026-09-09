@@ -8,6 +8,84 @@ use std::collections::BTreeSet;
 
 const GRAPH_PAGE_LIMIT: usize = 100;
 
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn affected_controller_requires_running_member_disposition() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection.execute_batch(
+            "CREATE TABLE workflow_activations (run_id TEXT, node_id TEXT, activation_id TEXT, status TEXT);
+             CREATE TABLE workflow_fan_out_members (run_id TEXT, controller_node_id TEXT, member_activation_id TEXT, status TEXT);
+             INSERT INTO workflow_fan_out_members VALUES ('run', 'controller', 'member', 'running');",
+        ).expect("execution fixture");
+        let mut request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run".to_string(),
+            mutation_id: "edit".to_string(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "controller".to_string(),
+            }],
+            reconciliation: vec![],
+        };
+        let before = connection.total_changes();
+        assert!(validate_affected_work(&connection, &request, &[]).is_err());
+        request
+            .reconciliation
+            .push(bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: "member".to_string(),
+            });
+        validate_affected_work(&connection, &request, &[]).expect("explicit member disposition");
+        assert_eq!(before, connection.total_changes());
+    }
+
+    #[test]
+    fn affected_dependencies_follow_current_and_new_edges_without_looping() {
+        let edge = |from: &str, to: &str| EdgeDefinition {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: bcode_workflow::EdgeKind::default(),
+            transform: None,
+        };
+        let current = vec![
+            RunGraphEdge {
+                revision: 1,
+                edge_id: 0,
+                edge: edge("first", "second"),
+            },
+            RunGraphEdge {
+                revision: 1,
+                edge_id: 1,
+                edge: edge("second", "third"),
+            },
+            RunGraphEdge {
+                revision: 1,
+                edge_id: 2,
+                edge: edge("third", "first"),
+            },
+        ];
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run".to_string(),
+            mutation_id: "edit".to_string(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::ReplaceEdge {
+                edge_id: 1,
+                edge: edge("second", "new"),
+            }],
+            reconciliation: vec![],
+        };
+        let mut affected = BTreeSet::from(["first"]);
+        expand_affected_dependencies(&mut affected, &request, &current);
+        assert_eq!(
+            affected,
+            BTreeSet::from(["first", "second", "third", "new"])
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum EdgeEndpoint<'a> {
     Source(&'a str),
@@ -38,9 +116,43 @@ pub struct RunGraphEdge {
     pub edge: EdgeDefinition,
 }
 
+pub fn initialize_retirement(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    connection.execute_batch(
+        "ALTER TABLE workflow_run_graph_nodes ADD COLUMN retired_at_revision INTEGER
+            CHECK (retired_at_revision > revision);
+         ALTER TABLE workflow_run_graph_edges ADD COLUMN retired_at_revision INTEGER
+            CHECK (retired_at_revision > revision);
+         CREATE INDEX workflow_run_graph_nodes_retirement
+            ON workflow_run_graph_nodes(run_id, retired_at_revision);
+         CREATE INDEX workflow_run_graph_edges_retirement
+            ON workflow_run_graph_edges(run_id, retired_at_revision);
+         CREATE INDEX workflow_run_graph_nodes_live
+            ON workflow_run_graph_nodes(run_id, node_id) WHERE retired_at_revision IS NULL;
+         CREATE INDEX workflow_run_graph_edges_live
+            ON workflow_run_graph_edges(run_id, edge_id) WHERE retired_at_revision IS NULL;",
+    )?;
+    Ok(())
+}
+
 pub fn initialize_edit_candidates(connection: &Connection) -> Result<(), WorkflowStoreError> {
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS workflow_graph_edit_candidates (
+        "CREATE INDEX IF NOT EXISTS workflow_fan_out_running_controller
+            ON workflow_fan_out_members(run_id, controller_node_id, member_activation_id)
+            WHERE status = 'running';
+        CREATE INDEX IF NOT EXISTS workflow_activations_running_node
+            ON workflow_activations(run_id, node_id, activation_id) WHERE status = 'running';
+        CREATE INDEX IF NOT EXISTS workflow_activations_identity
+            ON workflow_activations(run_id, activation_id);
+        CREATE TABLE IF NOT EXISTS workflow_activation_graph_bindings (
+            run_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            activation_id TEXT NOT NULL,
+            graph_revision INTEGER NOT NULL CHECK (graph_revision > 0),
+            PRIMARY KEY (run_id, node_id, activation_id),
+            FOREIGN KEY (run_id, node_id, activation_id)
+                REFERENCES workflow_activations(run_id, node_id, activation_id)
+        );
+        CREATE TABLE IF NOT EXISTS workflow_graph_edit_candidates (
             run_id TEXT NOT NULL REFERENCES workflow_runs(run_id),
             mutation_id TEXT NOT NULL,
             expected_revision INTEGER NOT NULL CHECK (expected_revision > 0),
@@ -56,6 +168,26 @@ pub fn initialize_edit_candidates(connection: &Connection) -> Result<(), Workflo
             PRIMARY KEY (run_id, mutation_id),
             FOREIGN KEY (run_id, mutation_id)
                 REFERENCES workflow_graph_edit_candidates(run_id, mutation_id)
+        );
+        CREATE TABLE IF NOT EXISTS workflow_graph_edit_nodes (
+            run_id TEXT NOT NULL,
+            mutation_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            node_json TEXT,
+            is_entry INTEGER NOT NULL CHECK (is_entry IN (0, 1)),
+            is_exit INTEGER NOT NULL CHECK (is_exit IN (0, 1)),
+            PRIMARY KEY (run_id, mutation_id, node_id),
+            FOREIGN KEY (run_id, mutation_id)
+                REFERENCES workflow_graph_edit_validations(run_id, mutation_id)
+        );
+        CREATE TABLE IF NOT EXISTS workflow_graph_edit_edges (
+            run_id TEXT NOT NULL,
+            mutation_id TEXT NOT NULL,
+            edge_id INTEGER NOT NULL CHECK (edge_id >= 0),
+            edge_json TEXT,
+            PRIMARY KEY (run_id, mutation_id, edge_id),
+            FOREIGN KEY (run_id, mutation_id)
+                REFERENCES workflow_graph_edit_validations(run_id, mutation_id)
         );",
     )?;
     Ok(())
@@ -71,6 +203,57 @@ pub enum RunGraphCandidateValidation {
 }
 
 impl WorkflowStore {
+    /// Read an activation's explicitly recorded admission graph revision.
+    ///
+    /// Missing activations and historical admissions without this fact return `None`.
+    /// The executable node revision is not a substitute for the admitted graph revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identities, inconsistent or future bindings, missing
+    /// executable data, or database failures. This bounded read never reconstructs history.
+    pub fn activation_admitted_graph_revision(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+    ) -> Result<Option<u64>, WorkflowStoreError> {
+        validate_activation_node_request(run_id, node_id, activation_id)?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let revision = self
+            .connection
+            .query_row(
+                "SELECT graph_revision FROM workflow_activation_graph_bindings
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+                (run_id, node_id, activation_id),
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
+        if let Some(revision) = revision {
+            let current = graph_revision(&self.connection, run_id)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData("activation graph is missing".to_string())
+            })?;
+            let node = self
+                .activation_graph_node(run_id, node_id, activation_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("activation executable is missing".to_string())
+                })?;
+            if revision == 0 || revision > current || node.revision > revision {
+                return Err(WorkflowStoreError::InvalidData(
+                    "invalid activation admission graph revision".to_string(),
+                ));
+            }
+        }
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(revision)
+    }
+
     /// Validate a persisted edit against one bounded snapshot of the committed graph.
     ///
     /// This validates structure, not execution reconciliation or caller permissions. Large graphs
@@ -95,6 +278,7 @@ impl WorkflowStore {
                 WorkflowStoreError::InvalidData("graph edit candidate not found".to_string())
             })?;
         ensure_run_accepts_graph_edits(&transaction, run_id)?;
+        validate_reconciliation_targets(&transaction, &request)?;
         let page = self.current_run_graph_page(
             run_id,
             Some(request.expected_revision),
@@ -105,6 +289,7 @@ impl WorkflowStore {
         if !page.nodes_complete || !page.edges_complete {
             return Ok(RunGraphCandidateValidation::RequiresIncrementalValidation);
         }
+        validate_affected_work(&transaction, &request, &page.edges)?;
         let payload: String = transaction.query_row(
             "SELECT CASE WHEN typeof(definition_json) = 'text'
              AND length(CAST(definition_json AS BLOB)) <= ?2 THEN definition_json END
@@ -134,7 +319,7 @@ impl WorkflowStore {
         for edit in &request.edits {
             apply_candidate_edit(&mut graph, &mut edges, edit)?;
         }
-        graph.edges = edges.into_values().collect();
+        graph.edges = edges.values().cloned().collect();
         graph
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -145,6 +330,7 @@ impl WorkflowStore {
              SET expected_revision = excluded.expected_revision",
             rusqlite::params![run_id, mutation_id, request.expected_revision],
         )?;
+        persist_candidate_delta(&transaction, &request, &graph, &edges)?;
         transaction.commit()?;
         Ok(RunGraphCandidateValidation::Validated)
     }
@@ -301,6 +487,202 @@ fn ensure_run_accepts_graph_edits(
     Ok(())
 }
 
+fn validate_affected_work(
+    connection: &Connection,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    current_edges: &[RunGraphEdge],
+) -> Result<(), WorkflowStoreError> {
+    use bcode_workflow::{
+        WorkflowRunGraphEdit as Edit, WorkflowRunGraphReconciliation as Reconciliation,
+    };
+    let mut affected = BTreeSet::new();
+    for edit in &request.edits {
+        match edit {
+            Edit::AddNode { node, .. } | Edit::ReplaceNode { node, .. } => {
+                affected.insert(node.id.as_str());
+            }
+            Edit::RemoveNode { node_id } => {
+                affected.insert(node_id.as_str());
+            }
+            Edit::AddEdge { edge, .. } => {
+                affected.insert(edge.to.as_str());
+            }
+            Edit::ReplaceEdge { edge_id, edge } => {
+                affected.insert(edge.to.as_str());
+                if let Some(old) = current_edges.iter().find(|old| old.edge_id == *edge_id) {
+                    affected.insert(old.edge.to.as_str());
+                }
+            }
+            Edit::RemoveEdge { edge_id } => {
+                if let Some(old) = current_edges.iter().find(|old| old.edge_id == *edge_id) {
+                    affected.insert(old.edge.to.as_str());
+                }
+            }
+        }
+    }
+    expand_affected_dependencies(&mut affected, request, current_edges);
+    let dispositions: BTreeSet<_> = request
+        .reconciliation
+        .iter()
+        .map(|item| {
+            let (Reconciliation::Retain { activation_id }
+            | Reconciliation::Cancel { activation_id }) = item;
+            activation_id.as_str()
+        })
+        .collect();
+    for node_id in affected {
+        let mut statement = connection.prepare(
+            "SELECT activation_id FROM workflow_activations
+             WHERE run_id = ?1 AND node_id = ?2 AND status = 'running'
+             UNION ALL
+             SELECT member_activation_id FROM workflow_fan_out_members
+             WHERE run_id = ?1 AND controller_node_id = ?2 AND status = 'running'
+             LIMIT ?3",
+        )?;
+        let mut rows = statement.query(rusqlite::params![
+            request.run_id,
+            node_id,
+            bcode_workflow::MAX_WORKFLOW_RUN_GRAPH_EDITS + 1
+        ])?;
+        while let Some(row) = rows.next()? {
+            let identity: String = row.get(0)?;
+            if !dispositions.contains(identity.as_str()) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "affected running activation requires explicit graph reconciliation"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expand_affected_dependencies<'a>(
+    affected: &mut BTreeSet<&'a str>,
+    request: &'a bcode_workflow::WorkflowRunGraphEditBatch,
+    current_edges: &'a [RunGraphEdge],
+) {
+    use bcode_workflow::WorkflowRunGraphEdit as Edit;
+    let mut dependencies = std::collections::BTreeMap::<&str, BTreeSet<&str>>::new();
+    for edge in
+        current_edges
+            .iter()
+            .map(|record| &record.edge)
+            .chain(request.edits.iter().filter_map(|edit| match edit {
+                Edit::AddEdge { edge, .. } | Edit::ReplaceEdge { edge, .. } => Some(edge),
+                _ => None,
+            }))
+    {
+        dependencies
+            .entry(edge.from.as_str())
+            .or_default()
+            .insert(edge.to.as_str());
+    }
+    let mut pending: Vec<_> = affected.iter().copied().collect();
+    while let Some(node) = pending.pop() {
+        if let Some(targets) = dependencies.get(node) {
+            for &target in targets {
+                if affected.insert(target) {
+                    pending.push(target);
+                }
+            }
+        }
+    }
+}
+
+fn validate_reconciliation_targets(
+    connection: &Connection,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+) -> Result<(), WorkflowStoreError> {
+    use bcode_workflow::WorkflowRunGraphReconciliation as Reconciliation;
+    for disposition in &request.reconciliation {
+        let (Reconciliation::Retain { activation_id } | Reconciliation::Cancel { activation_id }) =
+            disposition;
+        let mut statement = connection.prepare(
+            "SELECT status, output_id FROM workflow_activations
+             WHERE run_id = ?1 AND activation_id = ?2 LIMIT 2",
+        )?;
+        let mut rows = statement.query((&request.run_id, activation_id))?;
+        let valid = if let Some(row) = rows.next()? {
+            let status: String = row.get(0)?;
+            let output: Option<String> = row.get(1)?;
+            output.is_none()
+                && matches!(
+                    status.as_str(),
+                    "pending"
+                        | "running"
+                        | "waiting_input"
+                        | "waiting_approval"
+                        | "waiting_mutation_approval"
+                )
+        } else {
+            false
+        };
+        if !valid || rows.next()?.is_some() {
+            return Err(WorkflowStoreError::InvalidData(
+                "graph reconciliation requires an unambiguous active activation in this run"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn persist_candidate_delta(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    graph: &WorkflowDefinition,
+    edges: &std::collections::BTreeMap<u64, EdgeDefinition>,
+) -> Result<(), WorkflowStoreError> {
+    use bcode_workflow::WorkflowRunGraphEdit as Edit;
+    let mut nodes = BTreeSet::new();
+    let mut edge_ids = BTreeSet::new();
+    for edit in &request.edits {
+        match edit {
+            Edit::AddNode { node, .. } | Edit::ReplaceNode { node, .. } => {
+                nodes.insert(node.id.as_str());
+            }
+            Edit::RemoveNode { node_id } => {
+                nodes.insert(node_id.as_str());
+            }
+            Edit::AddEdge { edge_id, .. }
+            | Edit::ReplaceEdge { edge_id, .. }
+            | Edit::RemoveEdge { edge_id } => {
+                edge_ids.insert(*edge_id);
+            }
+        }
+    }
+    for node_id in nodes {
+        let payload = graph
+            .nodes
+            .get(node_id)
+            .map(|node| super::bounded_json("validated graph node", node))
+            .transpose()?;
+        transaction.execute(
+            "INSERT INTO workflow_graph_edit_nodes
+             (run_id, mutation_id, node_id, node_json, is_entry, is_exit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id, mutation_id, node_id) DO UPDATE SET
+             node_json = excluded.node_json, is_entry = excluded.is_entry, is_exit = excluded.is_exit",
+            rusqlite::params![request.run_id, request.mutation_id, node_id, payload,
+                graph.entries.iter().any(|id| id == node_id), graph.exits.iter().any(|id| id == node_id)],
+        )?;
+    }
+    for edge_id in edge_ids {
+        let payload = edges
+            .get(&edge_id)
+            .map(|edge| super::bounded_json("validated graph edge", edge))
+            .transpose()?;
+        transaction.execute(
+            "INSERT INTO workflow_graph_edit_edges (run_id, mutation_id, edge_id, edge_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id, mutation_id, edge_id) DO UPDATE SET edge_json = excluded.edge_json",
+            rusqlite::params![request.run_id, request.mutation_id, edge_id, payload],
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_candidate_edit(
     graph: &mut WorkflowDefinition,
     edges: &mut std::collections::BTreeMap<u64, EdgeDefinition>,
@@ -369,7 +751,8 @@ pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
         CREATE INDEX workflow_run_graph_edges_target
             ON workflow_run_graph_edges(run_id, target_node_id, edge_id);",
     )?;
-    initialize_source_index(connection)
+    initialize_source_index(connection)?;
+    initialize_retirement(connection)
 }
 
 pub fn initialize_source_index(connection: &Connection) -> Result<(), WorkflowStoreError> {
@@ -514,7 +897,22 @@ pub fn graph_revision(
         .optional()?;
     match row {
         None => Ok(None),
-        Some(Some(revision)) if revision > 0 => Ok(Some(revision)),
+        Some(Some(revision)) if revision > 0 => {
+            let future: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_run_graph_nodes
+                     WHERE run_id = ?1 AND retired_at_revision > ?2)
+                 OR EXISTS(SELECT 1 FROM workflow_run_graph_edges
+                     WHERE run_id = ?1 AND retired_at_revision > ?2)",
+                (run_id, revision),
+                |row| row.get(0),
+            )?;
+            if future {
+                return Err(WorkflowStoreError::InvalidData(
+                    "retirement exceeds committed graph revision".to_string(),
+                ));
+            }
+            Ok(Some(revision))
+        }
         _ => Err(WorkflowStoreError::InvalidData(
             "workflow run graph is missing or invalid".to_string(),
         )),
@@ -557,6 +955,19 @@ fn initial_activation_node_in_snapshot(
     let Some(record) = initial_node_record(connection, run_id, node_id)? else {
         return Ok(None);
     };
+    let admitted_revision = connection
+        .query_row(
+            "SELECT graph_revision FROM workflow_activation_graph_bindings
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            (run_id, node_id, activation_id),
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?;
+    if admitted_revision.is_some_and(|revision| revision != 1) {
+        return Err(WorkflowStoreError::InvalidData(
+            "activation admission binding does not match initial graph".to_string(),
+        ));
+    }
     let node = bound_activation_node(connection, run_id, node_id, activation_id)?;
     if node.as_ref() != Some(&record.node) {
         return Err(WorkflowStoreError::InvalidData(
@@ -630,6 +1041,52 @@ fn activation_node_record_in_snapshot(
         .ok_or_else(|| {
             WorkflowStoreError::InvalidData("activation executable revision is missing".to_string())
         })
+}
+
+pub fn revised_leaf_exit(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    let current = graph_revision(connection, run_id)?.ok_or_else(|| {
+        WorkflowStoreError::InvalidData("settlement graph is missing".to_string())
+    })?;
+    let admitted = connection
+        .query_row(
+            "SELECT graph_revision FROM workflow_activation_graph_bindings
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            (run_id, node_id, activation_id),
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?;
+    if admitted != Some(current) {
+        return Err(WorkflowStoreError::InvalidData(
+            "settlement requires reconciliation with the current graph".to_string(),
+        ));
+    }
+    let node =
+        activation_node_record(connection, run_id, node_id, activation_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("settlement binding is missing".to_string())
+        })?;
+    let latest: (u64, Option<u64>) = connection.query_row(
+        "SELECT revision, retired_at_revision FROM workflow_run_graph_nodes
+         WHERE run_id = ?1 AND node_id = ?2 ORDER BY revision DESC LIMIT 1",
+        (run_id, node_id),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let has_edges: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_run_graph_edges
+         WHERE run_id = ?1 AND source_node_id = ?2)",
+        (run_id, node_id),
+        |row| row.get(0),
+    )?;
+    if latest != (node.revision, None) || has_edges {
+        return Err(WorkflowStoreError::InvalidData(
+            "revised successor settlement requires execution reconciliation".to_string(),
+        ));
+    }
+    Ok(node.exit)
 }
 
 pub fn initial_exit(
@@ -1063,19 +1520,22 @@ impl WorkflowStore {
         let revision = self
             .connection
             .query_row(
-                "SELECT revision FROM workflow_run_graph_nodes
+                "SELECT revision, retired_at_revision FROM workflow_run_graph_nodes
              WHERE run_id = ?1 AND node_id = ?2 ORDER BY revision DESC LIMIT 1",
                 (run_id, node_id),
-                |row| row.get::<_, u64>(0),
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<u64>>(1)?)),
             )
             .optional()?;
-        let Some(revision) = revision else {
+        let Some((revision, retired)) = revision else {
             return Ok(None);
         };
-        if revision > current {
+        if revision > current || retired.is_some_and(|end| end > current || end <= revision) {
             return Err(WorkflowStoreError::InvalidData(
                 "node revision exceeds committed graph revision".to_string(),
             ));
+        }
+        if retired.is_some() {
+            return Ok(None);
         }
         self.run_graph_node_revision(run_id, node_id, revision)
     }
@@ -1148,10 +1608,14 @@ impl WorkflowStore {
                 .query_row(
                     if cursor.is_some() {
                         "SELECT node_id FROM workflow_run_graph_nodes
-                         WHERE run_id = ?1 AND node_id > ?2 ORDER BY node_id LIMIT 1"
+                         WHERE run_id = ?1 AND node_id > ?2
+                         AND retired_at_revision IS NULL
+                         ORDER BY node_id LIMIT 1"
                     } else {
                         "SELECT node_id FROM workflow_run_graph_nodes
-                         WHERE run_id = ?1 AND node_id >= ?2 ORDER BY node_id LIMIT 1"
+                         WHERE run_id = ?1 AND node_id >= ?2
+                         AND retired_at_revision IS NULL
+                         ORDER BY node_id LIMIT 1"
                     },
                     (run_id, cursor.as_deref().unwrap_or("")),
                     |row| {
@@ -1346,11 +1810,11 @@ impl WorkflowStore {
             super::validate_id("edge endpoint", id)?;
             let endpoint_revision = transaction
                 .query_row(
-                    "SELECT revision FROM workflow_run_graph_nodes
+                    "SELECT revision, retired_at_revision FROM workflow_run_graph_nodes
                  WHERE run_id = ?1 AND node_id = ?2 AND revision <= ?3
                  ORDER BY revision DESC LIMIT 1",
                     (run_id, id, revision),
-                    |row| row.get::<_, u64>(0),
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<u64>>(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| {
@@ -1358,6 +1822,12 @@ impl WorkflowStore {
                         "edge endpoint is missing at revision".to_string(),
                     )
                 })?;
+            let (endpoint_revision, retired) = endpoint_revision;
+            if retired.is_some_and(|end| end <= revision) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "edge endpoint was retired at edge revision".to_string(),
+                ));
+            }
             self.run_graph_node_revision(run_id, id, endpoint_revision)?
                 .ok_or_else(|| {
                     WorkflowStoreError::InvalidData("edge endpoint is missing".to_string())
@@ -1415,16 +1885,19 @@ impl WorkflowStore {
             return Ok(None);
         };
         let revision = self.connection.query_row(
-            "SELECT revision FROM workflow_run_graph_edges WHERE run_id = ?1 AND edge_id = ?2 ORDER BY revision DESC LIMIT 1",
-            (run_id, id), |row| row.get::<_, u64>(0),
+            "SELECT revision, retired_at_revision FROM workflow_run_graph_edges WHERE run_id = ?1 AND edge_id = ?2 ORDER BY revision DESC LIMIT 1",
+            (run_id, id), |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<u64>>(1)?)),
         ).optional()?;
-        let Some(revision) = revision else {
+        let Some((revision, retired)) = revision else {
             return Ok(None);
         };
-        if revision > current {
+        if revision > current || retired.is_some_and(|end| end > current || end <= revision) {
             return Err(WorkflowStoreError::InvalidData(
                 "edge revision exceeds committed graph revision".to_string(),
             ));
+        }
+        if retired.is_some() {
+            return Ok(None);
         }
         let edge = self
             .run_graph_edge_revision_in_snapshot(run_id, edge_id, revision)?
@@ -1508,10 +1981,12 @@ impl WorkflowStore {
                     if after_edge_id.is_none() && edges.is_empty() {
                         "SELECT edge_id FROM workflow_run_graph_edges
                          WHERE run_id = ?1 AND edge_id >= ?2
+                         AND retired_at_revision IS NULL
                          ORDER BY edge_id LIMIT 1"
                     } else {
                         "SELECT edge_id FROM workflow_run_graph_edges
                          WHERE run_id = ?1 AND edge_id > ?2
+                         AND retired_at_revision IS NULL
                          ORDER BY edge_id LIMIT 1"
                     },
                     (run_id, cursor),
