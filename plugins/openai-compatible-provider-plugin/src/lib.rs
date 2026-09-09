@@ -9450,6 +9450,32 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_runtime_survives_host_overlap_and_reopens_after_discovery() {
+        let registration = bcode_plugin_sdk::static_lifecycle::StaticConcurrentInstance::<
+            OpenAiCompatibleProviderPlugin,
+        >::new();
+        registration.activate().expect("discovery activation");
+        registration.deactivate().expect("discovery shutdown");
+        registration.activate().expect("login activation");
+        registration.activate().expect("another host activation");
+        registration.deactivate().expect("other host shutdown");
+        {
+            let lease = registration.acquire().expect("login instance");
+            assert_eq!(
+                lease
+                    .plugin()
+                    .runtime
+                    .as_ref()
+                    .expect("runtime")
+                    .block_on(async { 42 })
+                    .expect("runtime must be live"),
+                42
+            );
+        }
+        registration.deactivate().expect("login shutdown");
+    }
+
     #[tokio::test]
     async fn cancellation_interrupts_pending_response_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

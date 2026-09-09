@@ -7,7 +7,7 @@ use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Span, Style, Widget};
+use bmux_tui::prelude::{Line, Span, Style, TextBlock, TextWrap, Widget};
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 use std::collections::BTreeMap;
 
@@ -486,15 +486,7 @@ impl ConnectionForm {
             if render_auth_prompt(device, frame, area, theme) {
                 return;
             }
-            for (index, text) in device.lines.iter().enumerate() {
-                write(
-                    frame,
-                    area,
-                    u16::try_from(index).unwrap_or(0).saturating_add(2),
-                    text,
-                    theme.text,
-                );
-            }
+            render_login_text(frame, area, &device.lines, theme.text);
             write(
                 frame,
                 area,
@@ -655,6 +647,19 @@ fn load_connection_choices()
     Ok(providers)
 }
 
+fn render_login_text(frame: &mut Frame<'_>, area: Rect, lines: &[String], style: Style) {
+    let content = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(2),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(5),
+    );
+    TextBlock::new(lines.join("\n"))
+        .style(style)
+        .wrap(TextWrap::Word)
+        .render(content, frame);
+}
+
 fn write(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str, style: Style) {
     if row < area.height {
         frame.write_line_with_fallback_style(
@@ -673,6 +678,31 @@ fn write(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str, style: Style) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_error_wraps_inside_pane_without_covering_controls() {
+        let area = Rect::new(4, 3, 34, 14);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 50, 20));
+        let text = "The authentication provider rejected or could not complete the request. Return to method selection to retry.";
+        render_login_text(
+            &mut Frame::new(&mut buffer),
+            area,
+            &[text.to_owned()],
+            Style::new(),
+        );
+        let rows = (area.y + 2..area.bottom() - 3)
+            .map(|y| buffer.row_symbols(y).expect("row"))
+            .collect::<Vec<_>>();
+        assert!(rows.iter().filter(|row| !row.trim().is_empty()).count() > 1);
+        assert!(rows.join(" ").contains("retry."));
+        assert!(
+            buffer
+                .row_symbols(area.bottom() - 2)
+                .expect("footer")
+                .trim()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn failed_login_can_return_to_method_selection_without_closing_tui() {

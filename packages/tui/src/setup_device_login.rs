@@ -233,7 +233,7 @@ fn flow(
                 operation,
                 &request,
             )
-            .map_err(|error| login_request_failure(&error))?;
+            .map_err(|error| report_request_failure(&error, send))?;
         response
             .validate()
             .map_err(|_| "Provider returned an invalid authentication response.")?;
@@ -324,6 +324,23 @@ fn answer_prompts(
         }
     }
     Ok(())
+}
+
+fn report_request_failure(
+    error: &bcode_plugin::PluginServiceCallError,
+    channel: &LoginChannel,
+) -> &'static str {
+    let mut lines = vec![login_request_failure(error).to_owned()];
+    if let bcode_plugin::PluginServiceCallError::Service { code, .. } = error
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        lines.push(format!("Authentication error code: {code}"));
+    }
+    let _ = channel.updates.send(LoginUpdate::Progress(lines, true));
+    login_request_failure(error)
 }
 
 const fn login_request_failure(error: &bcode_plugin::PluginServiceCallError) -> &'static str {

@@ -7,6 +7,8 @@
 
 pub mod interaction;
 pub mod path;
+#[doc(hidden)]
+pub mod static_lifecycle;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod tui_visual;
@@ -2119,14 +2121,14 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
 
 #[doc(hidden)]
 #[must_use]
-pub fn activate_concurrent_export<P: ConcurrentRustPlugin>(instance: &'static Arc<P>) -> i32 {
+pub fn activate_concurrent_export<P: ConcurrentRustPlugin>(instance: &Arc<P>) -> i32 {
     result_to_exit_code(instance.activate_concurrent())
 }
 
 #[doc(hidden)]
 #[must_use]
 pub fn register_auth_providers_concurrent_export<P: ConcurrentRustPlugin>(
-    instance: &'static Arc<P>,
+    instance: &Arc<P>,
     callback: Option<AuthRegistrationCallback>,
     user_data: *mut c_void,
 ) -> i32 {
@@ -2137,7 +2139,7 @@ pub fn register_auth_providers_concurrent_export<P: ConcurrentRustPlugin>(
 
 #[doc(hidden)]
 #[must_use]
-pub fn deactivate_concurrent_export<P: ConcurrentRustPlugin>(instance: &'static Arc<P>) -> i32 {
+pub fn deactivate_concurrent_export<P: ConcurrentRustPlugin>(instance: &Arc<P>) -> i32 {
     result_to_exit_code(instance.deactivate_concurrent())
 }
 
@@ -2145,7 +2147,7 @@ pub fn deactivate_concurrent_export<P: ConcurrentRustPlugin>(instance: &'static 
 #[doc(hidden)]
 #[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
-    instance: &'static Arc<P>,
+    instance: &Arc<P>,
     input_ptr: *const u8,
     input_len: usize,
     output_ptr: *mut u8,
@@ -2181,7 +2183,7 @@ pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_concurrent_service_streaming_export<P: ConcurrentRustPlugin>(
-    instance: &'static Arc<P>,
+    instance: &Arc<P>,
     input_ptr: *const u8,
     input_len: usize,
     output_ptr: *mut u8,
@@ -2650,8 +2652,9 @@ macro_rules! static_plugin_vtable {
 #[macro_export]
 macro_rules! static_concurrent_plugin_vtable {
     ($plugin:ty, $manifest_toml:expr) => {{
-        static BCODE_STATIC_PLUGIN_INSTANCE: std::sync::OnceLock<std::sync::Arc<$plugin>> =
-            std::sync::OnceLock::new();
+        static BCODE_STATIC_PLUGIN_INSTANCE: $crate::static_lifecycle::StaticConcurrentInstance<
+            $plugin,
+        > = $crate::static_lifecycle::StaticConcurrentInstance::new();
         fn manifest(
             cached: &'static std::sync::OnceLock<Option<std::ffi::CString>>,
         ) -> *const std::ffi::c_char {
@@ -2672,10 +2675,15 @@ macro_rules! static_concurrent_plugin_vtable {
             cancellation_callback: Option<$crate::ServiceCancellationWaitCallback>,
             cancellation_user_data: *mut std::ffi::c_void,
         ) -> i32 {
-            let instance =
-                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
-            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
-            $crate::invoke_concurrent_service_streaming_export(
+            let instance = unsafe {
+                &*(instance.cast::<$crate::static_lifecycle::StaticConcurrentInstance<$plugin>>())
+            };
+            let lease = match instance.acquire() {
+                Ok(lease) => lease,
+                Err(_) => return 1,
+            };
+            let instance = lease.plugin();
+            let result = $crate::invoke_concurrent_service_streaming_export(
                 instance,
                 input_ptr,
                 input_len,
@@ -2688,32 +2696,42 @@ macro_rules! static_concurrent_plugin_vtable {
                 bridge_user_data,
                 cancellation_callback,
                 cancellation_user_data,
-            )
+            );
+            drop(lease);
+            result
         }
         fn handle_event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
             $crate::EVENT_STATUS_OK
         }
         fn activate(instance: *const std::ffi::c_void) -> i32 {
-            let instance =
-                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
-            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
-            $crate::activate_concurrent_export(instance)
+            let instance = unsafe {
+                &*(instance.cast::<$crate::static_lifecycle::StaticConcurrentInstance<$plugin>>())
+            };
+            $crate::result_to_exit_code(instance.activate())
         }
         fn deactivate(instance: *const std::ffi::c_void) -> i32 {
-            let instance =
-                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
-            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
-            $crate::deactivate_concurrent_export(instance)
+            let instance = unsafe {
+                &*(instance.cast::<$crate::static_lifecycle::StaticConcurrentInstance<$plugin>>())
+            };
+            $crate::result_to_exit_code(instance.deactivate())
         }
         fn register_auth_providers(
             instance: *const std::ffi::c_void,
             callback: Option<$crate::AuthRegistrationCallback>,
             user_data: *mut std::ffi::c_void,
         ) -> i32 {
-            let instance =
-                unsafe { &*(instance.cast::<std::sync::OnceLock<std::sync::Arc<$plugin>>>()) };
-            let instance = $crate::plugin_instance_arc::<$plugin>(instance);
-            $crate::register_auth_providers_concurrent_export(instance, callback, user_data)
+            let instance = unsafe {
+                &*(instance.cast::<$crate::static_lifecycle::StaticConcurrentInstance<$plugin>>())
+            };
+            let lease = match instance.acquire() {
+                Ok(lease) => lease,
+                Err(_) => return 1,
+            };
+            let instance = lease.plugin();
+            let result =
+                $crate::register_auth_providers_concurrent_export(instance, callback, user_data);
+            drop(lease);
+            result
         }
         $crate::StaticPluginVtable {
             instance: (&BCODE_STATIC_PLUGIN_INSTANCE as *const _) as *const std::ffi::c_void,
