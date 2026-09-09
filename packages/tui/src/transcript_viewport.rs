@@ -65,15 +65,6 @@ impl TranscriptViewport {
             .saturating_add(usize::from(self.viewport_height))
     }
 
-    /// Preserve viewport position before live transcript rows append.
-    ///
-    /// The viewport is top-anchored while detached from the bottom, so appends
-    /// below the visible history are naturally stable. This is retained as a
-    /// compatibility hook for callers at transcript mutation boundaries.
-    pub fn preserve_for_append(&mut self) {
-        self.refresh_offset_cache();
-    }
-
     /// Follow live transcript output from a stable top row.
     pub fn follow_anchor(&mut self, top_row: usize) {
         self.mode = TranscriptViewportMode::AnchoredTop {
@@ -238,7 +229,48 @@ impl TranscriptViewport {
         self.refresh_offset_cache();
     }
 
+    /// Resolve existing content correspondence before testing tail-space exhaustion.
+    /// Bounds are maximum offset, maximum virtual space, total rows, and viewport height.
+    pub fn sync_with_anchor(
+        &mut self,
+        bounds: (usize, usize, usize, u16),
+        anchor: Option<usize>,
+        history: &mut OlderHistoryState,
+    ) {
+        if let Some(top_row) = anchor {
+            self.mode = match self.mode {
+                TranscriptViewportMode::FollowBottom => TranscriptViewportMode::FollowBottom,
+                TranscriptViewportMode::AnchoredTop { .. } => {
+                    TranscriptViewportMode::AnchoredTop { top_row }
+                }
+                TranscriptViewportMode::TailSpace { .. } => {
+                    TranscriptViewportMode::TailSpace { top_row }
+                }
+            };
+        }
+        if anchor.is_some() {
+            // Identity correspondence already includes history inserted above the
+            // reader. Do not apply a second max-offset-based prepend adjustment.
+            history.clear_reveal_request();
+        }
+        self.sync_max(bounds.0, bounds.1, bounds.2, bounds.3, false, history);
+    }
+
+    /// Apply explicit reveal overflow policy at the viewport ownership boundary.
+    pub const fn reconcile_overflow(
+        &mut self,
+        previous_bottom: usize,
+        allowed: bool,
+        history: &mut OlderHistoryState,
+    ) -> bool {
+        if allowed && self.previous_total_rows > previous_bottom {
+            return self.scroll_to_bottom(history);
+        }
+        false
+    }
+
     /// Restore content correspondence without changing the user's navigation intent.
+    #[cfg(test)]
     pub fn restore_anchor(&mut self, top_row: usize) {
         let top_row = top_row.min(self.previous_total_rows);
         self.mode = match self.mode {
@@ -256,6 +288,8 @@ impl TranscriptViewport {
 
     fn resolve_tail_space(&mut self) {
         if let TranscriptViewportMode::TailSpace { top_row } = self.mode {
+            let top_row = top_row.min(self.previous_total_rows);
+            self.mode = TranscriptViewportMode::TailSpace { top_row };
             let bottom = top_row.saturating_add(usize::from(self.viewport_height));
             self.bottom_overscroll = bottom
                 .saturating_sub(self.previous_total_rows)
@@ -296,6 +330,19 @@ mod tests {
 
     fn older_history() -> OlderHistoryState {
         OlderHistoryState::new(&[], false)
+    }
+
+    #[test]
+    fn correspondence_precedes_tail_exhaustion() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        viewport.sync_max(20, 9, 30, 10, false, &mut history);
+        viewport.scroll_down(4, &mut history);
+        // Ten rows inserted above the reading position do not consume tail space.
+        viewport.sync_with_anchor((30, 9, 40, 10), Some(34), &mut history);
+        assert!(!viewport.follows_bottom());
+        assert_eq!(viewport.bottom_overscroll(), 4);
+        assert_eq!(viewport.top_row(40, 10), 34);
     }
 
     #[test]

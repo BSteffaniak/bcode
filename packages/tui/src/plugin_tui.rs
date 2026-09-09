@@ -171,6 +171,7 @@ impl DynamicVisualCoordinator {
                                     version:
                                         bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
                                     render_mode: String::new(),
+                                    anchors: Vec::new(),
                                     title: None,
                                     timeout_ms: None,
                                     rows: Vec::new(),
@@ -374,6 +375,7 @@ pub struct RoutedTuiVisual {
     pub render_mode: bcode_plugin_sdk::tui::PluginTuiVisualRenderMode,
     pub rows: Vec<bmux_tui::prelude::Line>,
     pub header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader,
+    pub anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
 }
 
 impl PluginTuiPresentation {
@@ -615,8 +617,8 @@ impl PluginTuiPresentation {
     ) -> Option<RoutedTuiVisual> {
         for route in self.visual_routes(schema, schema_version, producer_plugin_id) {
             if let Some(registry) = self.registry(&route.plugin_id)
-                && let Some(rows) =
-                    registry.visual_rows(&route.adapter_id, &route.schema, payload, context)
+                && let Some((rows, anchors)) =
+                    registry.visual_layout(&route.adapter_id, &route.schema, payload, context)
             {
                 let render_mode = registry
                     .visual_render_mode(&route.adapter_id, &route.schema, payload)
@@ -629,6 +631,7 @@ impl PluginTuiPresentation {
                     render_mode,
                     rows,
                     header,
+                    anchors,
                 });
             }
             if !self.backend.has_service(
@@ -656,6 +659,7 @@ impl PluginTuiPresentation {
                     render_mode: serialized_render_mode(&response, route.render_mode),
                     route,
                     rows: serialized_visual_rows(&response, context.theme().as_ref()),
+                    anchors: response.anchors.clone(),
                     header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
                         title: response.title,
                         timeout_ms: response.timeout_ms,
@@ -1219,6 +1223,7 @@ library = "libdynamic_visual_test.dylib"
                         "malformed" => bcode_plugin_sdk::ServiceResponse::json(
                             &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse {
                                 version: 999,
+                                anchors: Vec::new(),
                                 render_mode: "transcript_block".to_owned(),
                                 title: None,
                                 timeout_ms: None,
@@ -1247,6 +1252,7 @@ library = "libdynamic_visual_test.dylib"
                                         bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
                                     render_mode: "transcript_block".to_owned(),
                                     title: Some("Dynamic shell".to_owned()),
+                                    anchors: Vec::new(),
                                     timeout_ms: Some(321),
                                     rows: vec![bcode_plugin_sdk::tui_visual::SerializedTuiRow {
                                         spans: vec![bcode_plugin_sdk::tui_visual::SerializedTuiSpan {
@@ -1405,6 +1411,7 @@ library = "libdynamic_visual_test.dylib"
         use bmux_tui::prelude::{Color, Style};
 
         let response = RenderTuiVisualResponse {
+            anchors: Vec::new(),
             version: 2,
             render_mode: "inline".to_owned(),
             title: None,

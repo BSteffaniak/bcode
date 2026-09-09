@@ -70,6 +70,7 @@ pub enum TranscriptFrameInput {
     DurableBatch(Vec<SessionEvent>),
     Resize(u16, u16),
     ScrollUp(usize),
+    ScrollDown(usize),
     ReasoningDisplayMode(bcode_config::TuiThinkingMode),
     ThinkingConfig(bcode_config::TuiThinkingConfig),
     AdvanceStreaming(std::time::Duration),
@@ -136,6 +137,9 @@ impl<'a> TranscriptFrameSequence<'a> {
                 TranscriptFrameInput::Resize(width, height) => {
                     self.width = width;
                     self.height = height;
+                }
+                TranscriptFrameInput::ScrollDown(rows) => {
+                    self.app.scroll_transcript_down(rows);
                 }
                 TranscriptFrameInput::ScrollUp(rows) => {
                     let _ = self.app.scroll_transcript_up(rows);
@@ -1696,6 +1700,29 @@ mod tests {
         );
         assert!(
             frames[3].observation.semantic_items[0].1 > frames[2].observation.semantic_items[0].1
+        );
+    }
+
+    #[test]
+    fn virtual_space_observation_does_not_move_without_new_input() {
+        let mut app = BmuxApp::new_with_history(Some(SessionId::new()), &[], &[], false);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "content",
+                input: TranscriptFrameInput::EphemeralPlain("row\n".repeat(30)),
+            },
+            TranscriptFrameStep {
+                label: "space",
+                input: TranscriptFrameInput::ScrollDown(4),
+            },
+            TranscriptFrameStep {
+                label: "observe",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(
+            frames[1].observation.viewport_top,
+            frames[2].observation.viewport_top
         );
     }
 

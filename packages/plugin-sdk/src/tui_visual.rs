@@ -16,7 +16,7 @@ pub const OP_DELIVER_TUI_VISUAL_ARTIFACT: &str = "artifact_chunk";
 /// Earliest serialized TUI visual extension contract version accepted by this SDK.
 pub const MIN_TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 1;
 /// Current serialized TUI visual extension contract version.
-pub const TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 2;
+pub const TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 3;
 /// Maximum rows accepted from one serialized visual response.
 pub const MAX_SERIALIZED_TUI_VISUAL_ROWS: usize = 256;
 /// Maximum spans accepted across one serialized visual response.
@@ -118,6 +118,37 @@ pub struct RenderTuiVisualRequest {
     pub context: SerializedTuiVisualContext,
 }
 
+/// Stable, adapter-owned correspondence within one terminal visual.
+///
+/// Keys are scoped to the invocation and producer by the host. They identify
+/// presentation content only and never authorize navigation or execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiVisualAnchor {
+    pub key: String,
+    pub row: usize,
+}
+
+/// Validate bounded correspondence before accepting a plugin layout.
+///
+/// # Errors
+/// Returns an error for excessive, duplicate, empty, or out-of-range anchors.
+pub fn validate_visual_anchors(anchors: &[TuiVisualAnchor], rows: usize) -> Result<(), String> {
+    if anchors.len() > rows.min(MAX_SERIALIZED_TUI_VISUAL_ROWS) {
+        return Err("too many visual anchors".to_owned());
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for anchor in anchors {
+        if anchor.key.is_empty()
+            || anchor.key.len() > 256
+            || anchor.row >= rows
+            || !keys.insert(&anchor.key)
+        {
+            return Err("invalid visual anchor".to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// Successful serialized extension response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderTuiVisualResponse {
@@ -129,6 +160,9 @@ pub struct RenderTuiVisualResponse {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     pub rows: Vec<SerializedTuiRow>,
+    /// Optional correspondence, supported from contract version 3.
+    #[serde(default)]
+    pub anchors: Vec<TuiVisualAnchor>,
 }
 
 impl RenderTuiVisualResponse {
@@ -147,6 +181,10 @@ impl RenderTuiVisualResponse {
                 self.version
             ));
         }
+        if self.version < 3 && !self.anchors.is_empty() {
+            return Err("visual anchors require response version 3".to_owned());
+        }
+        validate_visual_anchors(&self.anchors, self.rows.len())?;
         if self.version < 2
             && self
                 .rows
@@ -183,11 +221,39 @@ impl RenderTuiVisualResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_correspondence_is_bounded_and_versioned() {
+        use super::*;
+        let anchor = TuiVisualAnchor {
+            key: "body".to_owned(),
+            row: 0,
+        };
+        assert!(validate_visual_anchors(std::slice::from_ref(&anchor), 1).is_ok());
+        assert!(validate_visual_anchors(std::slice::from_ref(&anchor), 0).is_err());
+        assert!(validate_visual_anchors(&[anchor.clone(), anchor.clone()], 2).is_err());
+        let mut response = RenderTuiVisualResponse {
+            version: 3,
+            render_mode: "full_block".to_owned(),
+            title: None,
+            timeout_ms: None,
+            rows: vec![SerializedTuiRow::default()],
+            anchors: vec![anchor],
+        };
+        assert!(response.validate().is_ok());
+        response.version = 2;
+        assert!(response.validate().is_err());
+        response.anchors.clear();
+        assert!(response.validate().is_ok());
+        response.version = TUI_VISUAL_ADAPTER_CONTRACT_VERSION + 1;
+        assert!(response.validate().is_err());
+    }
+
     use super::*;
 
     #[test]
     fn version_one_concrete_color_response_remains_compatible() {
         let response = RenderTuiVisualResponse {
+            anchors: Vec::new(),
             version: 1,
             render_mode: "inline".to_owned(),
             title: None,
@@ -212,6 +278,7 @@ mod tests {
     #[test]
     fn semantic_roles_require_version_two_and_future_versions_fail_closed() {
         let semantic = RenderTuiVisualResponse {
+            anchors: Vec::new(),
             version: 1,
             render_mode: "inline".to_owned(),
             title: None,

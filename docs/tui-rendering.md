@@ -143,10 +143,29 @@ synchronization as well as before semantic adaptation, covering asynchronous pre
 and width changes. Restored row offsets are confined to the surviving item, and manual input clears
 pending correspondence from the preceding navigation intent.
 
-This is an incremental foundation, not the completed viewport-controller migration. Application
-reveal policy and viewport navigation remain separate; successful-presentation transaction ownership,
-intra-item semantic correspondence, unified tool-surface composition, and versioned plugin anchor
-metadata still require implementation. Existing generic plugin fallbacks remain unchanged.
+Accepted rows retain optional content keys alongside their geometry. Native adapters prepare rows
+and keys together; serialized visual responses support bounded keys in contract version 3 while
+versions 1–2 retain item-level fallback. Invalid keys reject the candidate. Keys are namespaced by
+producer within the owning item and cannot authorize navigation or execution. Filesystem diff bodies,
+shell terminal bodies, and accepted Markdown heading anchors provide correspondence without host
+interpretation of tool payloads. Correspondence is resolved before tail-space exhaustion, so growth
+above a reading position does not consume virtual space.
+
+The successful terminal presentation callback advances the presented anchor baseline. Unacknowledged
+preparations do not replace it. Manual input and new reveal transitions discard obsolete baselines.
+Animation targets retain item identity and are re-resolved during layout; animation deadlines only
+request a frame rather than independently terminalizing navigation. Missing items fall back to a
+surviving document position, and missing content keys fall back to a clamped item row.
+
+Drafts, contributions, and results share the same tool-surface composition function. Filesystem
+write/edit previews and results declare full-block ownership consistently in native adapters and
+manifests, preventing completion from adding a second host header. Other adapters retain explicit
+inline/transcript/full-block composition and generic fallbacks.
+
+The broader controller migration is not complete: application reveal policy and viewport navigation
+still have separate modes, preparation still mutates navigation before presenter acknowledgment,
+and correspondence is region/heading-level rather than source-line-level across arbitrary reflow.
+These remaining boundaries must not be described as fully transactional or fully content-stable.
 
 ## Accepted Markdown projection scheduling
 

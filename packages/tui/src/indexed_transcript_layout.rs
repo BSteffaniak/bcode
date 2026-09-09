@@ -13,20 +13,23 @@ struct IndexedEntry {
     signature: TranscriptLayoutSignature,
     rows: Vec<Line>,
     row_count: usize,
+    anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
 }
 
 impl IndexedEntry {
     fn new(signature: TranscriptLayoutSignature, rows: TranscriptLayoutRows) -> Self {
         let row_count = rows.len();
-        let rows = match rows {
-            TranscriptLayoutRows::Rendered(rows) => rows,
-            TranscriptLayoutRows::BlankSpan(0) => Vec::new(),
-            TranscriptLayoutRows::BlankSpan(_) => vec![Line::default()],
+        let (rows, anchors) = match rows {
+            TranscriptLayoutRows::Rendered(rows) => (rows, Vec::new()),
+            TranscriptLayoutRows::Anchored { rows, anchors } => (rows, anchors),
+            TranscriptLayoutRows::BlankSpan(0) => (Vec::new(), Vec::new()),
+            TranscriptLayoutRows::BlankSpan(_) => (vec![Line::default()], Vec::new()),
         };
         Self {
             signature,
             rows,
             row_count,
+            anchors,
         }
     }
 
@@ -261,6 +264,27 @@ pub struct IndexedTranscriptLayout {
 }
 
 impl IndexedTranscriptLayout {
+    pub fn content_anchor(&self, index: usize, row: usize) -> Option<(&str, usize)> {
+        self.transcript
+            .entries
+            .get(index)?
+            .anchors
+            .iter()
+            .filter(|anchor| anchor.row <= row)
+            .max_by_key(|anchor| anchor.row)
+            .map(|anchor| (anchor.key.as_str(), row.saturating_sub(anchor.row)))
+    }
+
+    pub fn content_anchor_row(&self, index: usize, key: &str) -> Option<usize> {
+        self.transcript
+            .entries
+            .get(index)?
+            .anchors
+            .iter()
+            .find(|anchor| anchor.key == key)
+            .map(|anchor| anchor.row)
+    }
+
     pub fn clear(&mut self) {
         self.history.clear();
         self.transcript.clear();
@@ -481,6 +505,37 @@ impl IndexedTranscriptLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accepted_content_key_resolves_after_header_growth() {
+        use bcode_plugin_sdk::tui_visual::TuiVisualAnchor;
+        let mut layout = IndexedTranscriptLayout::default();
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("draft".to_owned()),
+            |_| TranscriptLayoutRows::Anchored {
+                rows: vec![Line::default(); 5],
+                anchors: vec![TuiVisualAnchor {
+                    key: "body".to_owned(),
+                    row: 1,
+                }],
+            },
+            |_| None,
+        );
+        assert_eq!(layout.content_anchor(0, 3), Some(("body", 2)));
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("finished".to_owned()),
+            |_| TranscriptLayoutRows::Anchored {
+                rows: vec![Line::default(); 7],
+                anchors: vec![TuiVisualAnchor {
+                    key: "body".to_owned(),
+                    row: 3,
+                }],
+            },
+            |_| None,
+        );
+        assert_eq!(layout.content_anchor_row(0, "body"), Some(3));
+    }
     use super::*;
 
     #[test]

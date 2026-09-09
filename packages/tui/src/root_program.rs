@@ -2155,6 +2155,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
     ) -> bmux_tui_runtime::Update<Self::Message> {
         self.invalidation = super::invalidation::UiInvalidation::None;
         self.last_presented_at = Some(Instant::now());
+        self.chat.app.commit_transcript_presentation();
         self.loop_state.mark_presentation_committed();
         let deferred = self
             .loop_state

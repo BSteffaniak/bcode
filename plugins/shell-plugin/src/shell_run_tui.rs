@@ -398,6 +398,26 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         .collect()
     }
 
+    fn anchors(
+        &self,
+        _kind: &str,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        rows: &[Line],
+    ) -> Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor> {
+        if payload.get("preview").is_some() {
+            return Vec::new();
+        }
+        let row = shell_terminal_prompt_rows(payload, context.width(), context).len();
+        (row < rows.len())
+            .then(|| bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                key: "terminal-body".to_owned(),
+                row,
+            })
+            .into_iter()
+            .collect()
+    }
+
     fn rows(
         &self,
         kind: &str,
@@ -1583,6 +1603,27 @@ fn payload_u16(payload: &serde_json::Value, key: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_region_correspondence_does_not_depend_on_output_contents() {
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let payload = serde_json::json!({"command": "printf output"});
+        let rows = vec![Line::default(); 30];
+        let anchors = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::anchors(
+            &adapter,
+            SHELL_RUN_SCHEMA,
+            &payload,
+            &context,
+            &rows,
+        );
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].key, "terminal-body");
+        assert!(anchors[0].row < rows.len());
+    }
     use super::*;
 
     fn line_text(line: &Line) -> String {

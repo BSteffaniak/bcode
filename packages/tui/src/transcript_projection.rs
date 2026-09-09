@@ -21,6 +21,7 @@ const MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC: usize = 64;
 /// Prepare transcript layout and viewport projections for a frame body.
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
     let initial_transcript_area = render::transcript_area_for_body(app, body);
+    app.begin_transcript_geometry_update();
     sync_layout(app, initial_transcript_area.width);
     // Chrome is decided against the full body. A bar cannot create its own reason
     // to exist by reducing the viewport, and measurement never consumes navigation.
@@ -79,14 +80,14 @@ fn transcript_item_rows(
         return TranscriptLayoutRows::BlankSpan(usize::from(height.max(1)));
     }
     let markdown = render::transcript_markdown_projection_for_layout(app, item, input.width);
-    render::transcript_item_rows_from_item_with_markdown(
+    let (rows, anchors) = render::transcript_item_layout_from_item(
         item,
         input.width,
         input.plugin_host,
         input.diff_viewer_config,
         markdown.as_deref(),
-    )
-    .into()
+    );
+    TranscriptLayoutRows::Anchored { rows, anchors }
 }
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {

@@ -42,10 +42,38 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
 
     fn render_mode(
         &self,
-        _kind: &str,
+        kind: &str,
         _payload: &Value,
     ) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
-        bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
+        if matches!(
+            kind,
+            "bcode.filesystem.request-draft.write"
+                | "bcode.filesystem.request-draft.edit"
+                | "bcode.filesystem.request"
+        ) {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock
+        } else {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
+        }
+    }
+
+    fn anchors(
+        &self,
+        kind: &str,
+        _payload: &Value,
+        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        rows: &[Line],
+    ) -> Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor> {
+        if matches!(
+            kind,
+            "bcode.filesystem.request-draft.write"
+                | "bcode.filesystem.request-draft.edit"
+                | "bcode.filesystem.request"
+        ) {
+            crate::file_change_tui::file_change_anchors(rows)
+        } else {
+            Vec::new()
+        }
     }
 
     fn rows(

@@ -6317,6 +6317,17 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     assert_eq!(draft.matches("Filesystem write · assembling").count(), 1);
     assert!(draft.contains("hello"), "{draft}");
     assert!(!draft.contains("File change · duration"), "{draft}");
+    let draft_body = app
+        .transcript_layout()
+        .content_anchor_row(0, "bcode.filesystem:diff-body")
+        .expect("draft diff body correspondence");
+    let draft_rows = app
+        .transcript_layout()
+        .entry_row_count(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            0,
+        )
+        .expect("draft rows");
     let draft_item = app
         .transcript()
         .iter()
@@ -6387,6 +6398,22 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
         })
         .expect("final transcript item");
     assert_eq!(final_item.id(), draft_id);
+    let final_body = app
+        .transcript_layout()
+        .content_anchor_row(0, "bcode.filesystem:diff-body")
+        .expect("final diff body correspondence");
+    let final_rows = app
+        .transcript_layout()
+        .entry_row_count(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            0,
+        )
+        .expect("final rows");
+    assert_eq!(
+        draft_rows.saturating_sub(draft_body),
+        final_rows.saturating_sub(final_body),
+        "completion preserves the diff body geometry even when metadata changes"
+    );
     assert_eq!(
         app.transcript()
             .iter()
@@ -6396,10 +6423,12 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     );
     drop(app);
     assert_eq!(
-        final_text
-            .matches("Tool result · filesystem.write · ok")
-            .count(),
+        final_text.matches("File change · Writing file").count(),
         1,
+        "{final_text}"
+    );
+    assert!(
+        !final_text.contains("Tool result · filesystem.write · ok"),
         "{final_text}"
     );
     assert!(final_text.contains("hello"), "{final_text}");

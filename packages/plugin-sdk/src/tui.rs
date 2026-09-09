@@ -1459,6 +1459,18 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Return correspondence for exactly the rows just prepared by this adapter.
+    /// The default keeps older adapters usable with host item-level fallback.
+    fn anchors(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+        _context: &PluginTuiVisualRenderContext,
+        _rows: &[Line],
+    ) -> Vec<crate::tui_visual::TuiVisualAnchor> {
+        Vec::new()
+    }
+
     /// Build transcript rows for the artifact/view payload at the given width.
     fn rows(
         &self,
@@ -2298,6 +2310,23 @@ impl PluginTuiRegistry {
             })
             .take(MAX_PLUGIN_TUI_DIAGNOSTICS_PER_DRAIN)
             .collect()
+    }
+
+    /// Prepare rows and correspondence together through one adapter invocation.
+    /// Invalid correspondence rejects this candidate without compromising fallback.
+    #[allow(clippy::must_use_candidate)] // Option already carries must-use under repository API conventions.
+    pub fn visual_layout(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &PluginTuiVisualRenderContext,
+    ) -> Option<(Vec<Line>, Vec<crate::tui_visual::TuiVisualAnchor>)> {
+        let adapter = self.visual_adapter(adapter_id, kind)?;
+        let rows = adapter.rows(kind, payload, context);
+        let anchors = adapter.anchors(kind, payload, context, &rows);
+        crate::tui_visual::validate_visual_anchors(&anchors, rows.len()).ok()?;
+        Some((rows, anchors))
     }
 
     /// Build transcript rows with host-owned presentation preferences.

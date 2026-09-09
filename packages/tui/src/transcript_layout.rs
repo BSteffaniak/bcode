@@ -29,6 +29,11 @@ impl TranscriptLayoutSignature {
 pub enum TranscriptLayoutRows {
     /// Fully rendered ordinary transcript rows.
     Rendered(Vec<Line>),
+    /// Rows and bounded adapter-owned content correspondence accepted together.
+    Anchored {
+        rows: Vec<Line>,
+        anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    },
     /// Logical rows rendered directly by an active terminal interaction.
     BlankSpan(usize),
 }
@@ -44,7 +49,7 @@ impl TranscriptLayoutRows {
     #[must_use]
     pub const fn len(&self) -> usize {
         match self {
-            Self::Rendered(rows) => rows.len(),
+            Self::Rendered(rows) | Self::Anchored { rows, .. } => rows.len(),
             Self::BlankSpan(len) => *len,
         }
     }
@@ -178,6 +183,16 @@ pub enum VisibleTranscriptSource {
 }
 
 impl TranscriptLayoutCache {
+    /// Find the nearest accepted content key at or before an item row.
+    pub fn content_anchor(&self, index: usize, row: usize) -> Option<(&str, usize)> {
+        self.entries.content_anchor(index, row)
+    }
+
+    /// Resolve an accepted content key in the current item layout.
+    pub fn content_anchor_row(&self, index: usize, key: &str) -> Option<usize> {
+        self.entries.content_anchor_row(index, key)
+    }
+
     /// Return whether the cache already represents the given fingerprint.
     #[must_use]
     pub fn is_current(&self, fingerprint: &TranscriptLayoutFingerprint) -> bool {

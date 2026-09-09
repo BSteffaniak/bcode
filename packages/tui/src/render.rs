@@ -524,6 +524,7 @@ pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
 #[cfg(test)]
 pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLayout) {
     render_prepared_damage(app, frame, layout, |_| true);
+    app.commit_transcript_presentation();
 }
 
 /// Render only prepared layout regions selected by terminal-space damage.
@@ -2172,6 +2173,7 @@ pub fn transcript_item_rows_from_item(
     transcript_item_rows_from_item_with_markdown(item, width, plugin_host, diff_viewer_config, None)
 }
 
+#[cfg(test)]
 pub fn transcript_item_rows_from_item_with_markdown(
     item: &TranscriptItem,
     width: u16,
@@ -2179,10 +2181,26 @@ pub fn transcript_item_rows_from_item_with_markdown(
     diff_viewer_config: TuiDiffViewerConfig,
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) -> Vec<Line> {
+    let (rows, _) =
+        transcript_item_layout_from_item(item, width, plugin_host, diff_viewer_config, markdown);
+    rows
+}
+
+pub fn transcript_item_layout_from_item(
+    item: &TranscriptItem,
+    width: u16,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    diff_viewer_config: TuiDiffViewerConfig,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+) {
     DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
     let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, item, width, plugin_host, markdown);
-    rows
+    let mut anchors = Vec::new();
+    push_transcript_item_rows(&mut rows, &mut anchors, item, width, plugin_host, markdown);
+    (rows, anchors)
 }
 
 #[cfg(test)]
@@ -2273,6 +2291,7 @@ pub fn pending_submission_signature(
 #[allow(clippy::too_many_lines)]
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
+    anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     item: &TranscriptItem,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
@@ -2358,16 +2377,24 @@ fn push_transcript_item_rows(
                         item.text(),
                     )
                 });
-            if canonical_request_visual.as_ref().is_some_and(|visual| {
-                push_canonical_tool_visual_rows(
-                    rows,
+            if let Some(routed) = canonical_request_visual.as_ref().and_then(|visual| {
+                let CanonicalToolVisual::Plugin(visual) = visual;
+                resolve_canonical_plugin_visual(
                     visual,
                     working_directory.as_deref(),
                     width,
                     plugin_host,
                 )
             }) {
-                rows.push(Line::default());
+                push_routed_tool_surface(
+                    rows,
+                    anchors,
+                    routed,
+                    item,
+                    tool_name,
+                    (*status, false),
+                    width,
+                );
             } else {
                 let context = ToolRequestRenderContext {
                     tool_name,
@@ -2388,6 +2415,7 @@ fn push_transcript_item_rows(
         } => {
             push_tool_result_rows(
                 rows,
+                anchors,
                 item,
                 &ToolResultRenderContext {
                     tool_name: tool_name.as_deref(),
@@ -2487,10 +2515,22 @@ fn push_transcript_item_rows(
                 refs: Vec::new(),
             };
             let visual = CanonicalToolVisual::from_artifact(&artifact);
-            if canonical_plugin_visual_available(&visual, plugin_host)
-                && push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host)
+            let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
+            if let Some(routed) =
+                resolve_canonical_plugin_visual(plugin_visual, None, width, plugin_host)
             {
-                rows.push(Line::default());
+                push_routed_tool_surface(
+                    rows,
+                    anchors,
+                    routed,
+                    item,
+                    "Tool request draft",
+                    (
+                        Some(bcode_session_view_models::ToolInvocationViewStatus::Requested),
+                        false,
+                    ),
+                    width,
+                );
             } else {
                 push_meta_block(rows, item.text(), width);
             }
@@ -2533,47 +2573,21 @@ fn push_transcript_item_rows(
                 width,
                 plugin_host,
             ) {
-                match routed.render_mode {
-                    PluginTuiVisualRenderMode::FullBlock => {
-                        rows.extend(routed.rows);
-                        rows.push(Line::default());
-                    }
-                    PluginTuiVisualRenderMode::TranscriptBlock => {
-                        let mut timing = item.tool_timing();
-                        if let Some(timeout_ms) = routed.header.timeout_ms {
-                            timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
-                        }
-                        push_tool_block_header(
-                            rows,
-                            routed
-                                .header
-                                .title
-                                .as_deref()
-                                .unwrap_or("Tool contribution"),
-                            timing,
-                            invocation.as_deref().map(|invocation| invocation.status),
-                            invocation
-                                .as_deref()
-                                .and_then(|invocation| invocation.is_error)
-                                .unwrap_or(false),
-                            width,
-                        );
-                        rows.extend(routed.rows);
-                        rows.push(Line::default());
-                    }
-                    PluginTuiVisualRenderMode::Inline => {
-                        push_tool_block_header(
-                            rows,
-                            "Tool contribution",
-                            item.tool_timing(),
-                            None,
-                            false,
-                            width,
-                        );
-                        rows.extend(routed.rows);
-                        rows.push(Line::default());
-                    }
-                }
+                push_routed_tool_surface(
+                    rows,
+                    anchors,
+                    routed,
+                    item,
+                    "Tool contribution",
+                    (
+                        invocation.as_deref().map(|invocation| invocation.status),
+                        invocation
+                            .as_deref()
+                            .and_then(|invocation| invocation.is_error)
+                            .unwrap_or(false),
+                    ),
+                    width,
+                );
             } else if matches!(
                 placement,
                 bcode_session_models::ToolContributionPlacement::Request
@@ -2601,6 +2615,26 @@ fn push_transcript_item_rows(
                 width,
             );
         }
+    }
+    if let Some(markdown) = markdown
+        && matches!(
+            item.kind(),
+            TranscriptItemKind::AssistantMessage | TranscriptItemKind::UserMessage
+        )
+        && !markdown.lines.is_empty()
+    {
+        let body_start = rows
+            .len()
+            .saturating_sub(markdown.lines.len().saturating_add(1));
+        anchors.extend(markdown.anchors.iter().map(|anchor| {
+            bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                key: format!("markdown:{}", anchor.fragment),
+                row: body_start.saturating_add(usize::from(anchor.row)),
+            }
+        }));
+    }
+    for anchor in anchors.iter_mut() {
+        anchor.row = anchor.row.saturating_add(layout.bottom_rows);
     }
     apply_container_recipe(rows, item_start, layout);
 }
@@ -4390,23 +4424,6 @@ fn push_tool_request_rows(
     rows.push(Line::default());
 }
 
-fn canonical_plugin_visual_available(
-    visual: &CanonicalToolVisual,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-) -> bool {
-    let CanonicalToolVisual::Plugin(plugin_visual) = visual;
-    let Some(presentation) = plugin_host else {
-        return false;
-    };
-    presentation
-        .visual_route(
-            &plugin_visual.schema,
-            plugin_visual.schema_version,
-            plugin_visual.producer_plugin_id.as_deref(),
-        )
-        .is_some()
-}
-
 fn resolve_canonical_plugin_visual(
     visual: &CanonicalPluginVisual,
     working_directory: Option<&std::path::Path>,
@@ -4426,6 +4443,42 @@ fn resolve_canonical_plugin_visual(
         &visual.payload,
         &plugin_visual_context(width, working_directory),
     )
+}
+
+/// Compose every tool lifecycle surface through the same chrome boundary.
+fn push_routed_tool_surface(
+    rows: &mut Vec<Line>,
+    anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    routed: crate::plugin_tui::RoutedTuiVisual,
+    item: &TranscriptItem,
+    title: &str,
+    state: (
+        Option<bcode_session_view_models::ToolInvocationViewStatus>,
+        bool,
+    ),
+    width: u16,
+) {
+    let (status, is_error) = state;
+    if routed.render_mode != PluginTuiVisualRenderMode::FullBlock {
+        let mut timing = item.tool_timing();
+        if let Some(timeout_ms) = routed.header.timeout_ms {
+            timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
+        }
+        let title = if routed.render_mode == PluginTuiVisualRenderMode::TranscriptBlock {
+            routed.header.title.as_deref().unwrap_or(title)
+        } else {
+            title
+        };
+        push_tool_block_header(rows, title, timing, status, is_error, width);
+    }
+    let body_start = rows.len();
+    anchors.extend(routed.anchors.into_iter().map(|mut anchor| {
+        anchor.key = format!("{}:{}", routed.route.plugin_id, anchor.key);
+        anchor.row = anchor.row.saturating_add(body_start);
+        anchor
+    }));
+    rows.extend(routed.rows);
+    rows.push(Line::default());
 }
 
 fn push_canonical_tool_visual_rows(
@@ -4661,6 +4714,7 @@ struct ToolResultRenderContext<'a> {
 #[allow(clippy::too_many_lines)] // Composition branches preserve distinct host-owned tool chrome.
 fn push_tool_result_rows(
     rows: &mut Vec<Line>,
+    anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     item: &TranscriptItem,
     context: &ToolResultRenderContext<'_>,
     width: u16,
@@ -4675,58 +4729,32 @@ fn push_tool_result_rows(
             width,
             plugin_host,
         ) {
-            match routed.render_mode {
-                PluginTuiVisualRenderMode::FullBlock => {
-                    rows.extend(routed.rows);
-                    rows.push(Line::default());
-                }
-                PluginTuiVisualRenderMode::TranscriptBlock => {
-                    let mut timing = item.tool_timing();
-                    if let Some(timeout_ms) = routed.header.timeout_ms {
-                        timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
-                    }
-                    push_tool_block_header(
-                        rows,
-                        routed
-                            .header
-                            .title
-                            .as_deref()
-                            .or(artifact.title.as_deref())
-                            .unwrap_or("Tool result"),
-                        timing,
-                        Some(if context.is_error {
-                            bcode_session_view_models::ToolInvocationViewStatus::Failed
-                        } else {
-                            bcode_session_view_models::ToolInvocationViewStatus::Finished
-                        }),
-                        context.is_error,
-                        width,
-                    );
-                    rows.extend(routed.rows);
-                    rows.push(Line::default());
-                }
-                PluginTuiVisualRenderMode::Inline => {
-                    let status = if context.is_error { "failed" } else { "ok" };
-                    let title = context.tool_name.map_or_else(
-                        || format!("Tool result · {status}"),
-                        |name| format!("Tool result · {name} · {status}"),
-                    );
-                    push_tool_block_header(
-                        rows,
-                        &title,
-                        item.tool_timing(),
-                        Some(if context.is_error {
-                            bcode_session_view_models::ToolInvocationViewStatus::Failed
-                        } else {
-                            bcode_session_view_models::ToolInvocationViewStatus::Finished
-                        }),
-                        context.is_error,
-                        width,
-                    );
-                    rows.extend(routed.rows);
-                    rows.push(Line::default());
-                }
-            }
+            let status = if context.is_error { "failed" } else { "ok" };
+            let title = context.tool_name.map_or_else(
+                || format!("Tool result · {status}"),
+                |name| format!("Tool result · {name} · {status}"),
+            );
+            let title = if routed.render_mode == PluginTuiVisualRenderMode::TranscriptBlock {
+                artifact.title.as_deref().unwrap_or("Tool result")
+            } else {
+                &title
+            };
+            push_routed_tool_surface(
+                rows,
+                anchors,
+                routed,
+                item,
+                title,
+                (
+                    Some(if context.is_error {
+                        bcode_session_view_models::ToolInvocationViewStatus::Failed
+                    } else {
+                        bcode_session_view_models::ToolInvocationViewStatus::Finished
+                    }),
+                    context.is_error,
+                ),
+                width,
+            );
             return;
         }
     }

@@ -34,6 +34,7 @@ fn render_shell_visual(context: &NativeServiceContext) -> Option<ServiceResponse
         ServiceResponse::json(&bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse {
             version: bcode_plugin_sdk::tui_visual::TUI_VISUAL_ADAPTER_CONTRACT_VERSION,
             render_mode: "transcript_block".to_owned(),
+            anchors: Vec::new(),
             title: Some("Hello user shell".to_owned()),
             timeout_ms: None,
             rows: vec![bcode_plugin_sdk::tui_visual::SerializedTuiRow {

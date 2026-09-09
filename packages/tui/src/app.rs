@@ -100,6 +100,7 @@ pub enum TemporalDamage {
 struct TranscriptScrollAnimation {
     start_top_row: usize,
     target_top_row: usize,
+    target_item: Option<TranscriptPresentationEntryId>,
     started_at: Instant,
     duration: Duration,
     next_frame_at: Instant,
@@ -110,6 +111,7 @@ impl TranscriptScrollAnimation {
         Self {
             start_top_row,
             target_top_row,
+            target_item: None,
             started_at,
             duration: TRANSCRIPT_SCROLL_ANIMATION_DURATION,
             next_frame_at: started_at + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
@@ -291,10 +293,35 @@ pub struct TranscriptFrameObservation {
     pub anchor: Option<StableTranscriptAnchor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct StableTranscriptAnchor {
     pub item_id: TranscriptPresentationEntryId,
     pub row_in_item: usize,
+    pub content: Option<(String, usize)>,
+    pub fallback_index: usize,
+}
+
+impl PartialEq for StableTranscriptAnchor {
+    fn eq(&self, other: &Self) -> bool {
+        self.item_id == other.item_id
+            && self.row_in_item == other.row_in_item
+            && self.content == other.content
+    }
+}
+impl Eq for StableTranscriptAnchor {}
+
+impl StableTranscriptAnchor {
+    fn resolve_row(&self, layout: &TranscriptLayoutCache, index: usize, rows: usize) -> usize {
+        self.content
+            .as_ref()
+            .and_then(|(key, offset)| {
+                layout
+                    .content_anchor_row(index, key)
+                    .map(|row| row.saturating_add(*offset))
+            })
+            .unwrap_or(self.row_in_item)
+            .min(rows.saturating_sub(1))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +379,7 @@ pub struct BmuxApp {
     scroll_mode: TranscriptScrollMode,
     pending_visual_overflow_bottom: Option<usize>,
     pending_stable_transcript_anchor: Option<StableTranscriptAnchor>,
+    presented_transcript_anchor: Option<StableTranscriptAnchor>,
     latest_hidden_activity_at: Option<Instant>,
     latest_hidden_activity_burst: u8,
     latest_bar_animation_started_at: Instant,
@@ -564,6 +592,7 @@ impl BmuxApp {
             scroll_mode: TranscriptScrollMode::BottomFollow,
             pending_visual_overflow_bottom: None,
             pending_stable_transcript_anchor: None,
+            presented_transcript_anchor: None,
             latest_hidden_activity_at: None,
             latest_hidden_activity_burst: 0,
             latest_bar_animation_started_at: now,
@@ -747,6 +776,8 @@ impl BmuxApp {
         self.pending_visual_overflow_bottom = None;
         self.scroll_mode = TranscriptScrollMode::ManualDetached;
         self.viewport.follow_anchor(row);
+        self.presented_transcript_anchor = None;
+        self.pending_stable_transcript_anchor = None;
         self.pending_markdown_focus = Some(contribution_id.to_owned());
         true
     }
@@ -766,6 +797,8 @@ impl BmuxApp {
         self.pending_visual_overflow_bottom = None;
         self.scroll_mode = TranscriptScrollMode::ManualDetached;
         self.viewport.follow_anchor(row);
+        self.presented_transcript_anchor = None;
+        self.pending_stable_transcript_anchor = None;
         self.set_status("Navigated to Markdown section".to_owned());
         true
     }
@@ -870,7 +903,12 @@ impl BmuxApp {
                             .presentation_id(line.entry_index)
                             .map(|item_id| StableTranscriptAnchor {
                                 item_id,
+                                fallback_index: line.entry_index,
                                 row_in_item: line.row_in_entry,
+                                content: self
+                                    .transcript_layout
+                                    .content_anchor(line.entry_index, line.row_in_entry)
+                                    .map(|(key, offset)| (key.to_owned(), offset)),
                             })
                     })
                     .flatten()
@@ -2013,33 +2051,46 @@ impl BmuxApp {
         self.hidden_entry_start_row_below_viewport().is_some()
     }
 
+    fn resolve_pending_transcript_anchor(&self) -> Option<usize> {
+        let anchor = self.pending_stable_transcript_anchor.as_ref()?;
+        let index = self
+            .transcript
+            .presentation_index(anchor.item_id)
+            .unwrap_or_else(|| {
+                anchor
+                    .fallback_index
+                    .min(self.transcript.items().len().saturating_sub(1))
+            });
+        let start = self
+            .transcript_layout
+            .entry_start_row(VisibleTranscriptSource::Transcript, index)?;
+        let rows = self
+            .transcript_layout
+            .entry_row_count(VisibleTranscriptSource::Transcript, index)?;
+        let row = if self.transcript.presentation_id(index) == Some(anchor.item_id) {
+            anchor.resolve_row(&self.transcript_layout, index, rows)
+        } else {
+            0
+        };
+        Some(start.saturating_add(row))
+    }
+
     /// Measure latest-content chrome without consuming navigation state.
     pub(crate) fn needs_latest_bar_at_height(&self, height: u16) -> bool {
         let total_rows = self.transcript_layout.total_rows();
         let mut viewport = self.viewport;
         let mut history = self.older_history.clone();
-        viewport.sync_max(
-            total_rows.saturating_sub(usize::from(height)),
-            usize::from(height).saturating_sub(1),
-            total_rows,
-            height,
-            false,
+        let anchor = self.resolve_pending_transcript_anchor();
+        viewport.sync_with_anchor(
+            (
+                total_rows.saturating_sub(usize::from(height)),
+                usize::from(height).saturating_sub(1),
+                total_rows,
+                height,
+            ),
+            anchor,
             &mut history,
         );
-        if let Some(anchor) = &self.pending_stable_transcript_anchor
-            && let Some(index) = self.transcript.presentation_index(anchor.item_id)
-            && let Some(start) = self
-                .transcript_layout
-                .entry_start_row(VisibleTranscriptSource::Transcript, index)
-        {
-            let rows = self
-                .transcript_layout
-                .entry_row_count(VisibleTranscriptSource::Transcript, index)
-                .unwrap_or_default();
-            viewport.restore_anchor(
-                start.saturating_add(anchor.row_in_item.min(rows.saturating_sub(1))),
-            );
-        }
         let bottom = viewport.bottom_row(total_rows);
         bottom < total_rows
             && self
@@ -2793,7 +2844,9 @@ impl BmuxApp {
     }
 
     /// Pin transcript to the newest rows.
-    pub const fn scroll_transcript_to_bottom(&mut self) -> bool {
+    pub fn scroll_transcript_to_bottom(&mut self) -> bool {
+        self.presented_transcript_anchor = None;
+        self.pending_stable_transcript_anchor = None;
         self.transcript_scroll_animation = None;
         self.manual_transcript_scroll_until = None;
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
@@ -2809,6 +2862,8 @@ impl BmuxApp {
 
     /// Animate transcript to the newest rows.
     pub fn transition_transcript_to_bottom(&mut self) -> bool {
+        self.presented_transcript_anchor = None;
+        self.pending_stable_transcript_anchor = None;
         self.manual_transcript_scroll_until = None;
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.scroll_mode = TranscriptScrollMode::BottomFollow;
@@ -2847,6 +2902,7 @@ impl BmuxApp {
         // A pending correspondence belongs to the previous navigation intent.
         // It must not undo input received between semantic updates and preparation.
         self.pending_stable_transcript_anchor = None;
+        self.presented_transcript_anchor = None;
         self.manual_transcript_scroll_until = Some(Instant::now() + MANUAL_TRANSCRIPT_SCROLL_GRACE);
     }
 
@@ -2860,6 +2916,14 @@ impl BmuxApp {
             .is_some_and(|until| Instant::now() < until)
     }
 
+    /// Capture the geometry boundary once per preparation, irrespective of event kind.
+    pub(crate) fn begin_transcript_geometry_update(&mut self) {
+        self.pending_visual_overflow_bottom = Some(
+            self.viewport
+                .bottom_row(self.transcript_layout.total_rows()),
+        );
+    }
+
     /// Sync cached rendered transcript scroll bounds from the latest frame.
     pub fn sync_transcript_scroll_max(
         &mut self,
@@ -2869,7 +2933,18 @@ impl BmuxApp {
         viewport_height: u16,
     ) {
         let now = Instant::now();
-        if let Some(animation) = self.transcript_scroll_animation {
+        let mut animated_top = None;
+        if let Some(mut animation) = self.transcript_scroll_animation {
+            if let Some(id) = animation.target_item
+                && let Some(index) = self.transcript.presentation_index(id)
+                && let Some(row) = self
+                    .transcript_layout
+                    .entry_start_row(VisibleTranscriptSource::Transcript, index)
+            {
+                animation.target_top_row = row;
+            } else if matches!(self.scroll_mode, TranscriptScrollMode::BottomFollow) {
+                animation.target_top_row = total_rows.saturating_sub(usize::from(viewport_height));
+            }
             let top_row = animation.top_row_at(now);
             if animation.finished(now) {
                 self.transcript_scroll_animation = None;
@@ -2887,19 +2962,25 @@ impl BmuxApp {
                     | TranscriptScrollMode::ManualDetached => {}
                 }
             } else {
-                self.viewport.materialize_top_row(top_row);
+                animated_top = Some(top_row);
                 self.transcript_scroll_animation = Some(animation);
             }
         }
-        self.viewport.sync_max(
-            max_scroll_offset,
-            max_bottom_overscroll,
-            total_rows,
-            viewport_height,
-            self.manual_transcript_scroll_active(),
+        let anchor = self.resolve_pending_transcript_anchor();
+        self.pending_stable_transcript_anchor = None;
+        self.viewport.sync_with_anchor(
+            (
+                max_scroll_offset,
+                max_bottom_overscroll,
+                total_rows,
+                viewport_height,
+            ),
+            anchor,
             &mut self.older_history,
         );
-        self.restore_stable_transcript_anchor();
+        if let Some(top_row) = animated_top {
+            self.viewport.materialize_top_row(top_row);
+        }
         self.resolve_visual_overflow_follow(total_rows, now);
     }
 
@@ -2919,26 +3000,20 @@ impl BmuxApp {
         if changed_hidden_entry_rows > 0 {
             self.record_latest_hidden_activity(now, changed_hidden_entry_rows);
         }
-        let overflowed = total_rows > previous_bottom;
-        if self.manual_transcript_scroll_active()
-            || self.transcript_scroll_animation.is_some()
-            || !self.scroll_mode.allows_overflow_catch()
+        let allowed = !self.manual_transcript_scroll_active()
+            && self.transcript_scroll_animation.is_none()
+            && self.scroll_mode.allows_overflow_catch();
+        if self
+            .viewport
+            .reconcile_overflow(previous_bottom, allowed, &mut self.older_history)
         {
-            return;
+            self.scroll_mode = TranscriptScrollMode::BottomFollow;
         }
-        if !overflowed {
-            if !self.newer_transcript_content_below() {
-                self.latest_hidden_activity_at = None;
-                self.latest_hidden_activity_burst = 0;
-                self.latest_bar_next_frame_at = None;
-            }
-            return;
+        if !self.newer_transcript_content_below() {
+            self.latest_hidden_activity_at = None;
+            self.latest_hidden_activity_burst = 0;
+            self.latest_bar_next_frame_at = None;
         }
-        self.scroll_mode = TranscriptScrollMode::BottomFollow;
-        self.latest_hidden_activity_at = None;
-        self.latest_hidden_activity_burst = 0;
-        self.latest_bar_next_frame_at = None;
-        self.viewport.scroll_to_bottom(&mut self.older_history);
     }
 
     fn record_latest_hidden_activity(&mut self, now: Instant, changed_rows: usize) {
@@ -2987,6 +3062,8 @@ impl BmuxApp {
                 self.transcript_scroll_animation = None;
                 self.scroll_mode = TranscriptScrollMode::ManualDetached;
                 self.viewport.follow_anchor(top_row);
+                self.presented_transcript_anchor = None;
+                self.pending_stable_transcript_anchor = None;
             }
             return;
         }
@@ -3096,14 +3173,19 @@ impl BmuxApp {
     }
 
     fn start_transcript_scroll_animation(&mut self, top_row: usize) {
+        self.presented_transcript_anchor = None;
+        self.pending_stable_transcript_anchor = None;
         if let Some((start_top_row, target_top_row)) =
             self.viewport.start_follow_anchor_animation(top_row)
         {
-            self.transcript_scroll_animation = Some(TranscriptScrollAnimation::new(
-                start_top_row,
-                target_top_row,
-                Instant::now(),
-            ));
+            let mut animation =
+                TranscriptScrollAnimation::new(start_top_row, target_top_row, Instant::now());
+            animation.target_item = self
+                .transcript_layout
+                .line_at_row(target_top_row)
+                .filter(|line| line.source == VisibleTranscriptSource::Transcript)
+                .and_then(|line| self.transcript.presentation_id(line.entry_index));
+            self.transcript_scroll_animation = Some(animation);
         }
     }
 
@@ -3280,38 +3362,22 @@ impl BmuxApp {
         match &event.kind {
             SessionLiveEventKind::AssistantTextStreamUpdated { .. } => {
                 let should_anchor = self.should_anchor_new_assistant_stream();
-                self.pending_visual_overflow_bottom = Some(
-                    self.viewport
-                        .bottom_row(self.transcript_layout.total_rows()),
-                );
-                self.viewport.preserve_for_append();
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionLiveEventKind::AssistantTextDelta { text, .. } => {
                 let should_anchor = self.should_anchor_new_assistant_stream();
-                self.pending_visual_overflow_bottom = Some(
-                    self.viewport
-                        .bottom_row(self.transcript_layout.total_rows()),
-                );
-                self.viewport.preserve_for_append();
                 self.add_streaming_delta(text, SessionEventApplication::Live);
                 self.maybe_request_assistant_stream_anchor(should_anchor);
-            }
-            SessionLiveEventKind::AssistantReasoningDelta { .. }
-            | SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
-            | SessionLiveEventKind::AssistantReasoningActivity { .. } => {
-                self.pending_visual_overflow_bottom = Some(
-                    self.viewport
-                        .bottom_row(self.transcript_layout.total_rows()),
-                );
-                self.viewport.preserve_for_append();
             }
             SessionLiveEventKind::UsageSummaryChanged { .. } => {
                 if let Some(usage) = &self.session_view.snapshot().runtime.latest_usage {
                     self.token_usage.absorb(usage);
                 }
             }
-            SessionLiveEventKind::ToolContributionPlaced { .. }
+            SessionLiveEventKind::AssistantReasoningDelta { .. }
+            | SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
+            | SessionLiveEventKind::AssistantReasoningActivity { .. }
+            | SessionLiveEventKind::ToolContributionPlaced { .. }
             | SessionLiveEventKind::ToolPresentationUpdated { .. }
             | SessionLiveEventKind::RequestContextOccupancyChanged { .. }
             | SessionLiveEventKind::ToolRequestDraft { .. } => {
@@ -3331,16 +3397,7 @@ impl BmuxApp {
         if event_breaks_sticky_entry_anchor(event) {
             self.downgrade_sticky_entry_anchor();
         }
-        if event_affects_transcript_rows(event) {
-            self.pending_visual_overflow_bottom = Some(
-                self.viewport
-                    .bottom_row(self.transcript_layout.total_rows()),
-            );
-        }
         let should_anchor = self.should_anchor_new_assistant_stream();
-        if event_affects_transcript_rows(event) {
-            self.viewport.preserve_for_append();
-        }
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => {
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
@@ -3655,26 +3712,10 @@ impl BmuxApp {
         let Some(mut animation) = self.transcript_scroll_animation else {
             return false;
         };
-        if animation.finished(now) {
-            self.transcript_scroll_animation = None;
-            self.viewport.follow_anchor(animation.target_top_row);
-            match self.scroll_mode {
-                TranscriptScrollMode::TransitionToEntry { sticky } => {
-                    self.scroll_mode = TranscriptScrollMode::AnchoredToEntry { sticky };
-                }
-                TranscriptScrollMode::BottomFollow => {
-                    self.latest_hidden_activity_at = None;
-                    self.latest_hidden_activity_burst = 0;
-                    self.latest_bar_next_frame_at = None;
-                    self.viewport.scroll_to_bottom(&mut self.older_history);
-                }
-                TranscriptScrollMode::AnchoredToEntry { .. }
-                | TranscriptScrollMode::ManualDetached => {}
-            }
-        } else {
-            animation.advance_frame(now);
-            self.transcript_scroll_animation = Some(animation);
-        }
+        // Deadlines request presentation; geometry reconciliation alone resolves
+        // identity-based targets and terminal animation state.
+        animation.advance_frame(now);
+        self.transcript_scroll_animation = Some(animation);
         true
     }
 
@@ -3863,8 +3904,25 @@ impl BmuxApp {
         }
     }
 
+    /// Advance correspondence only after the terminal presenter acknowledges a frame.
+    pub fn commit_transcript_presentation(&mut self) {
+        self.presented_transcript_anchor = None;
+        self.pending_stable_transcript_anchor = None;
+        self.capture_stable_transcript_anchor();
+        self.presented_transcript_anchor = self.pending_stable_transcript_anchor.take();
+    }
+
     pub(crate) fn capture_stable_transcript_anchor(&mut self) {
-        if self.viewport.follows_bottom() || self.pending_stable_transcript_anchor.is_some() {
+        if self.viewport.follows_bottom()
+            || self.pending_stable_transcript_anchor.is_some()
+            || self.transcript_scroll_animation.is_some()
+        {
+            return;
+        }
+        if let Some(anchor) = &self.presented_transcript_anchor
+            && self.transcript.presentation_index(anchor.item_id).is_some()
+        {
+            self.pending_stable_transcript_anchor = Some(anchor.clone());
             return;
         }
         let top_row = self
@@ -3886,30 +3944,13 @@ impl BmuxApp {
         };
         self.pending_stable_transcript_anchor = Some(StableTranscriptAnchor {
             item_id,
+            fallback_index: line.entry_index,
             row_in_item: line.row_in_entry,
+            content: self
+                .transcript_layout
+                .content_anchor(line.entry_index, line.row_in_entry)
+                .map(|(key, offset)| (key.to_owned(), offset)),
         });
-    }
-
-    pub(crate) fn restore_stable_transcript_anchor(&mut self) {
-        let Some(anchor) = self.pending_stable_transcript_anchor.take() else {
-            return;
-        };
-        let Some(index) = self.transcript.presentation_index(anchor.item_id) else {
-            return;
-        };
-        let Some(start_row) = self
-            .transcript_layout
-            .entry_start_row(VisibleTranscriptSource::Transcript, index)
-        else {
-            return;
-        };
-        let row_count = self
-            .transcript_layout
-            .entry_row_count(VisibleTranscriptSource::Transcript, index)
-            .unwrap_or_default();
-        self.viewport.restore_anchor(
-            start_row.saturating_add(anchor.row_in_item.min(row_count.saturating_sub(1))),
-        );
     }
 
     fn apply_session_view_terminal_adapter(&mut self) -> TranscriptDocumentDamage {

@@ -17,6 +17,24 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         )
     }
 
+    fn render_mode(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+    ) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderMode {
+        bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock
+    }
+
+    fn anchors(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        rows: &[Line],
+    ) -> Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor> {
+        file_change_anchors(rows)
+    }
+
     fn rows(
         &self,
         _kind: &str,
@@ -25,6 +43,21 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
     ) -> Vec<Line> {
         file_change_rows(payload, context)
     }
+}
+
+/// Identify the start of the bounded diff body independently of volatile chrome.
+/// Line-level correspondence belongs to the diff component; until it is available,
+/// the host retains a clamped offset within this stable region rather than guessing
+/// content identity from formatted text or hashes.
+pub fn file_change_anchors(rows: &[Line]) -> Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor> {
+    rows.iter()
+        .position(|line| line.spans.iter().any(|span| span.content.contains('┌')))
+        .map(|row| bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+            key: "diff-body".to_owned(),
+            row,
+        })
+        .into_iter()
+        .collect()
 }
 
 pub fn file_change_rows(
