@@ -21496,6 +21496,7 @@ mod workflow_source_tests {
                 include_repo_workflows: true,
                 include_user_workflows: false,
                 paths: Vec::new(),
+                ..bcode_config::WorkflowsConfig::default()
             },
             ..bcode_config::BcodeConfig::default()
         };

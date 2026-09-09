@@ -1601,6 +1601,10 @@ pub struct WorkflowsConfig {
     /// Whether the user config and state workflow roots are discovered.
     #[serde(default = "default_true")]
     pub include_user_workflows: bool,
+    /// Plugin identities explicitly authorized to stage edits from active workflow executions.
+    /// Does not authorize publication or bypass tool permissions. Empty denies all plugins.
+    #[serde(default)]
+    pub run_edit_plugins: BTreeSet<String>,
     /// Additional filesystem roots scanned for workflow packages.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
@@ -1611,6 +1615,7 @@ impl Default for WorkflowsConfig {
         Self {
             include_repo_workflows: true,
             include_user_workflows: true,
+            run_edit_plugins: BTreeSet::new(),
             paths: Vec::new(),
         }
     }
@@ -7903,6 +7908,16 @@ fn write_workflows_toml(output: &mut String, workflows: &WorkflowsConfig) {
     }
     if !workflows.include_user_workflows {
         output.push_str("include_user_workflows = false\n");
+    }
+    if !workflows.run_edit_plugins.is_empty() {
+        output.push_str("run_edit_plugins = [");
+        for (index, plugin) in workflows.run_edit_plugins.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&toml_string(plugin));
+        }
+        output.push_str("]\n");
     }
     if !workflows.paths.is_empty() {
         output.push_str("paths = [");

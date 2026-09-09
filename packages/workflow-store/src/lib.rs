@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 27;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 28;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1579,7 +1579,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=26),
+                                actual: Some(14..=27),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1609,7 +1609,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=26),
+                                actual: Some(14..=27),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1758,7 +1758,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=26) {
+        if !matches!(previous_schema_version, 14..=27) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -22055,6 +22055,78 @@ mod tests {
             2
         );
         assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn retained_leaf_publication_preserves_admission_and_settles() {
+        let (temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("owner");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let (node_id, activation_id): (String, String) = store.connection.query_row(
+            "SELECT node_id, activation_id FROM workflow_activations WHERE run_id = 'run-1' LIMIT 1",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("activation");
+        let mut node = store
+            .current_run_graph_node("run-1", &node_id)
+            .expect("node")
+            .expect("node")
+            .node;
+        node.id = "new-leaf".to_string();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run-1".to_string(),
+            mutation_id: "retain-leaf".to_string(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node,
+                entry: true,
+                exit: true,
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: activation_id.clone(),
+            }],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .expect("stage");
+        assert_eq!(
+            store
+                .publish_retained_leaf_run_graph_edit("run-1", "retain-leaf", &authority, 21)
+                .expect("publish"),
+            2
+        );
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision("run-1", &node_id, &activation_id)
+                .expect("admission"),
+            Some(1)
+        );
+        assert!(
+            run_graph::revised_leaf_exit(&store.connection, "run-1", &node_id, &activation_id)
+                .expect("settlement")
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            run_graph::revised_leaf_exit(&store.connection, "run-1", &node_id, &activation_id)
+                .expect("retained settlement")
+        );
+        assert_eq!(
+            store
+                .publish_retained_leaf_run_graph_edit("run-1", "retain-leaf", &authority, 22)
+                .expect("duplicate"),
+            2
+        );
     }
 
     #[test]

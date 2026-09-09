@@ -1693,6 +1693,7 @@ impl ServerState {
             },
             |store| (store, None),
         );
+        let run_edit_plugins = init.startup_config.workflows.run_edit_plugins.clone();
         Self {
             locations: None,
             state_root,
@@ -1743,7 +1744,12 @@ impl ServerState {
             workflow_store: StdMutex::new(workflow_store),
             workflow_store_unavailable,
             workflow_run_graph_edit_policy: Some(WorkflowRunGraphEditPolicy {
-                evaluator: Arc::new(workflow_operations::authorize_local_run_graph_edit),
+                evaluator: Arc::new(move |facts| {
+                    workflow_operations::authorize_configured_run_graph_edit(
+                        facts,
+                        &run_edit_plugins,
+                    )
+                }),
             }),
             workflow_application_authorization: init.workflow_application_authorization.unwrap_or(
                 workflow_operations::WorkflowApplicationAuthorizationPolicy {
@@ -24384,6 +24390,25 @@ async fn invocation_service_routes(
     state: &ServerState,
     session_id: SessionId,
 ) -> Vec<ServerInvocationServiceRoute> {
+    let mut routes = provider_invocation_service_routes(state, session_id).await;
+    if state.workflow_run_graph_edit_policy.is_some() {
+        routes.push(ServerInvocationServiceRoute {
+            advertised: bcode_tool::ToolInvocationServiceRoute {
+                route_id: bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
+                interface_id: bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
+                operations: vec!["stage_run_graph_edit".to_owned()],
+            },
+            target_plugin_id: None,
+            payload_overlay: serde_json::Value::Null,
+        });
+    }
+    routes
+}
+
+async fn provider_invocation_service_routes(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Vec<ServerInvocationServiceRoute> {
     let selection = session_model_selection(state, session_id).await;
     let target_plugin_id = selection.provider_plugin_id.or_else(|| {
         state
@@ -26156,7 +26181,7 @@ async fn resolve_server_plugin_bridge_request(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-    _plugin_id: &str,
+    plugin_id: &str,
     request: ServiceBridgeRequest,
     inputs: &Mutex<mpsc::Receiver<ToolInvocationInput>>,
     cancel_state: &TurnCancelState,
@@ -26179,6 +26204,52 @@ async fn resolve_server_plugin_bridge_request(
             } else {
                 receive.await
             })
+        }
+        ServiceBridgeRequest::InvokeService(request)
+            if request.interface_id == bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID =>
+        {
+            let resolution = if request.invocation_id != call.id {
+                ToolInvocationServiceResolution::Failed {
+                    code: "invocation_id_mismatch".to_owned(),
+                    message: "service request does not belong to the active invocation".to_owned(),
+                }
+            } else if cancel_state.is_cancelled() {
+                ToolInvocationServiceResolution::Cancelled
+            } else if request.route_id.as_deref()
+                != Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID)
+                || request.operation != "stage_run_graph_edit"
+            {
+                ToolInvocationServiceResolution::Unsupported
+            } else if let Ok(edit) = serde_json::from_value(request.payload) {
+                match state
+                    .stage_workflow_run_graph_edit_from_invocation(
+                        session_id,
+                        plugin_id,
+                        edit,
+                        cancel_state,
+                    )
+                    .await
+                {
+                    Ok(staged) => ToolInvocationServiceResolution::Responded {
+                        payload: serde_json::json!({ "staged": staged }),
+                    },
+                    Err(ServerError::WorkflowComputationCancelled(_)) => {
+                        ToolInvocationServiceResolution::Cancelled
+                    }
+                    Err(_) => ToolInvocationServiceResolution::Failed {
+                        code: "workflow_admission_failed".to_owned(),
+                        message:
+                            "workflow edit was not admitted; verify policy and active execution"
+                                .to_owned(),
+                    },
+                }
+            } else {
+                ToolInvocationServiceResolution::Failed {
+                    code: "invalid_request".to_owned(),
+                    message: "invalid workflow graph edit request".to_owned(),
+                }
+            };
+            ServiceBridgeResponse::Service(resolution)
         }
         ServiceBridgeRequest::InvokeService(request) => {
             let router = ServerServiceRouter::new(state, session_id, call, cancel_state);
@@ -47981,6 +48052,453 @@ library = "test"
                 .is_empty()
         );
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn workflow_invocation_bridge_uses_authenticated_plugin_identity() {
+        let mut state = test_server_state(SessionManager::default());
+        state.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
+            evaluator: Arc::new(|facts| {
+                assert_eq!(facts.actor.actor_id, "authenticated-plugin");
+                assert_eq!(
+                    facts.actor.kind,
+                    bcode_workflow::WorkflowApplicationActorKind::Plugin
+                );
+                WorkflowApplicationAuthorizationDecision::Deny {
+                    reason: "private policy detail".to_owned(),
+                }
+            }),
+        });
+        let call = bcode_model::ToolCall {
+            id: "invocation".to_owned(),
+            name: "workflow-edit".to_owned(),
+            arguments: serde_json::json!({}),
+        };
+        let edit = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "missing-run".to_owned(),
+            mutation_id: "edit".to_owned(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![],
+        };
+        let (_sender, receiver) = mpsc::channel(1);
+        let response = resolve_server_plugin_bridge_request(
+            &state,
+            SessionId::new(),
+            &call,
+            "authenticated-plugin",
+            ServiceBridgeRequest::InvokeService(ToolInvocationServiceRequest {
+                invocation_id: call.id.clone(),
+                request_id: "stage-edit".to_owned(),
+                route_id: Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned()),
+                interface_id: bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
+                operation: "stage_run_graph_edit".to_owned(),
+                payload: serde_json::to_value(edit).expect("edit payload"),
+            }),
+            &Mutex::new(receiver),
+            &TurnCancelState::default(),
+        )
+        .await
+        .expect("bridge response");
+        drop(state);
+        assert!(matches!(response, ServiceBridgeResponse::Service(
+            ToolInvocationServiceResolution::Failed { code, message }
+        ) if code == "workflow_admission_failed" && !message.contains("private policy detail")));
+    }
+
+    fn persist_active_edit_definition(store: &mut bcode_workflow_store::WorkflowStore) {
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_owned(),
+            schema: serde_json::json!({"type":"boolean"}),
+        };
+        store
+            .persist_definition(
+                "edit-test",
+                1,
+                &bcode_workflow::WorkflowDefinition {
+                    schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                    name: "edit-test".to_owned(),
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    nodes: BTreeMap::from([(
+                        "agent".to_owned(),
+                        bcode_workflow::NodeDefinition {
+                            id: "agent".to_owned(),
+                            name: "agent".to_owned(),
+                            kind: bcode_workflow::NodeKind::Agent,
+                            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                            input: schema.clone(),
+                            output: schema.clone(),
+                            resources: vec![],
+                            configuration: test_workflow_prompt_configuration(
+                                schema,
+                                bcode_workflow::PromptContextTarget::FreshIsolated,
+                            ),
+                        },
+                    )]),
+                    entries: vec!["agent".to_owned()],
+                    exits: vec!["agent".to_owned()],
+                    edges: vec![],
+                },
+            )
+            .expect("definition");
+    }
+
+    async fn active_edit_execution_fixture() -> (ServerState, SessionId, tempfile::TempDir) {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(None, PathBuf::from("."))
+            .await
+            .expect("parent");
+        let root = tempfile::tempdir().expect("root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).expect("store");
+        persist_active_edit_definition(&mut store);
+        let authority = test_workflow_execution_authority();
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "edit-run".to_owned(),
+                definition_id: "edit-test".to_owned(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_owned(),
+                parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(true)),
+                execution_authority: Some(authority.clone()),
+                created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_owned(),
+                    profile_id: "build".to_owned(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let pending = store
+            .pending_activations(1)
+            .expect("pending")
+            .pop()
+            .expect("activation");
+        let prepared = store
+            .prepare_pending_activation(
+                "edit-run",
+                "agent",
+                &pending.activation_id,
+                bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                2,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        let child = sessions
+            .create_fresh_execution_session(
+                None,
+                ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+                    owner: "bcode.workflow".to_owned(),
+                    run_id: "edit-run".to_owned(),
+                    node_id: "agent".to_owned(),
+                    activation_id: Some(pending.activation_id.clone()),
+                    attempt: prepared.attempt,
+                    parent_session_id: parent.id,
+                    context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                    workspace_snapshot: Some("snapshot".to_owned()),
+                    parent_generation: None,
+                },
+                None,
+            )
+            .await
+            .expect("child");
+        store
+            .link_execution_session(&bcode_workflow_store::WorkflowExecutionSessionLink::new(
+                "edit-run".to_owned(),
+                "agent".to_owned(),
+                pending.activation_id,
+                prepared.attempt,
+                child.id.to_string(),
+                "snapshot".to_owned(),
+                3,
+            ))
+            .expect("link");
+        let mut state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        state.daemon_status.instance_id = authority.daemon_instance_id.clone();
+        state.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
+            evaluator: Arc::new(|facts| {
+                workflow_operations::authorize_configured_run_graph_edit(
+                    facts,
+                    &BTreeSet::from(["bcode.workflow".to_owned()]),
+                )
+            }),
+        });
+        (state, child.id, root)
+    }
+
+    #[tokio::test]
+    async fn registered_workflow_tool_stages_active_execution() {
+        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
+            bcode_workflow_plugin::static_plugin(),
+        );
+        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.workflow".to_owned()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("registered workflow plugin");
+        let edit = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "edit-run".to_owned(),
+            mutation_id: "registered-edit".to_owned(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "agent".to_owned(),
+            }],
+            reconciliation: vec![],
+        };
+        let call = bcode_model::ToolCall {
+            id: "registered-call".to_owned(),
+            name: "workflow.stage_run_graph_edit".to_owned(),
+            arguments: serde_json::json!({"edit_json":serde_json::to_string(&edit).expect("edit")}),
+        };
+        let (tool, preparation) = tokio::time::timeout(
+            Duration::from_secs(10),
+            prepare_server_tool(&state, child_id, &call),
+        )
+        .await
+        .expect("registered preparation deadline")
+        .expect("prepare registered tool");
+        let metadata = tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+            .expect("policy facts");
+        assert!(metadata.requires_permission);
+        let approve = async {
+            loop {
+                let permission = state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .cloned();
+                if let Some(permission) = permission {
+                    state
+                        .pending_permissions
+                        .lock()
+                        .await
+                        .remove(&permission.summary.permission_id);
+                    *permission.decision.lock().await = Some(true);
+                    permission.notify.notify_waiters();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let cancel = TurnCancelState::default();
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                invoke_prepared_tool_for_test(
+                    &state,
+                    child_id,
+                    &call,
+                    tool,
+                    preparation,
+                    &metadata,
+                    &cancel,
+                ),
+                approve
+            )
+        })
+        .await
+        .expect("registered workflow invocation deadline");
+        let response = response.expect("tool transport");
+        assert!(!response.is_error, "{}", response.output);
+        assert!(response.output.contains("Topology has not been published"));
+        let store = state.workflow_store.lock().expect("store");
+        let authority = store
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("owned");
+        assert_eq!(
+            store
+                .staged_run_graph_edit("edit-run", "registered-edit", &authority)
+                .expect("candidate"),
+            Some(edit)
+        );
+        assert_eq!(
+            store.run_graph_revision("edit-run").expect("revision"),
+            Some(1)
+        );
+        drop(store);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn cancellation_fences_waiting_workflow_staging_commit() {
+        let (state, child_id, _root) = active_edit_execution_fixture().await;
+        let cancel = TurnCancelState::default();
+        let commit = cancel.marker_commit.lock().await;
+        let edit = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "edit-run".to_owned(),
+            mutation_id: "cancelled-edit".to_owned(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "agent".to_owned(),
+            }],
+            reconciliation: vec![],
+        };
+        let admission = state.stage_workflow_run_graph_edit_from_invocation(
+            child_id,
+            "bcode.workflow",
+            edit,
+            &cancel,
+        );
+        tokio::pin!(admission);
+        // Poll admission while its commit boundary is held. No candidate may be written.
+        assert!(futures::poll!(&mut admission).is_pending());
+        let cancellation = cancel.cancel();
+        tokio::pin!(cancellation);
+        assert!(futures::poll!(&mut cancellation).is_pending());
+        assert!(cancel.is_cancelled());
+        drop(commit);
+        // Both waiters must be driven: cancellation can be first in the mutex queue.
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(&mut admission, &mut cancellation)
+        })
+        .await
+        .expect("admission and cancellation deadline");
+        assert!(matches!(
+            result,
+            Err(ServerError::WorkflowComputationCancelled(_))
+        ));
+        let store = state.workflow_store.lock().expect("store");
+        let authority = store
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("owned");
+        assert!(
+            store
+                .staged_run_graph_edit("edit-run", "cancelled-edit", &authority)
+                .expect("candidate")
+                .is_none()
+        );
+        assert_eq!(
+            store.run_graph_revision("edit-run").expect("revision"),
+            Some(1)
+        );
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn workflow_bridge_stages_for_active_execution_and_preserves_revision() {
+        let (state, child_id, _root) = active_edit_execution_fixture().await;
+        let authority = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("owned");
+        let edit = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "edit-run".to_owned(),
+            mutation_id: "agent-edit".to_owned(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "agent".to_owned(),
+            }],
+            reconciliation: vec![],
+        };
+        let call = bcode_model::ToolCall {
+            id: "edit-call".to_owned(),
+            name: "workflow.stage_run_graph_edit".to_owned(),
+            arguments: serde_json::json!({}),
+        };
+        let (_sender, receiver) = mpsc::channel(1);
+        let inputs = Mutex::new(receiver);
+        for staged in [true, false] {
+            let response = resolve_server_plugin_bridge_request(
+                &state,
+                child_id,
+                &call,
+                "bcode.workflow",
+                ServiceBridgeRequest::InvokeService(ToolInvocationServiceRequest {
+                    invocation_id: call.id.clone(),
+                    request_id: "request".to_owned(),
+                    route_id: Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned()),
+                    interface_id: bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
+                    operation: "stage_run_graph_edit".to_owned(),
+                    payload: serde_json::to_value(&edit).expect("payload"),
+                }),
+                &inputs,
+                &TurnCancelState::default(),
+            )
+            .await
+            .expect("bridge");
+            assert!(
+                matches!(response, ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded { payload }) if payload == serde_json::json!({"staged":staged}))
+            );
+        }
+        let store = state.workflow_store.lock().expect("store");
+        assert_eq!(
+            store
+                .staged_run_graph_edit("edit-run", "agent-edit", &authority)
+                .expect("candidate"),
+            Some(edit)
+        );
+        assert_eq!(
+            store.run_graph_revision("edit-run").expect("revision"),
+            Some(1)
+        );
+        drop(store);
+        drop(state);
+    }
+
+    #[test]
+    fn configured_run_edit_policy_grants_only_exact_plugin_identity() {
+        let mut facts = bcode_workflow::WorkflowRunGraphEditFacts {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::Plugin,
+                actor_id: "bcode.workflow".to_owned(),
+            },
+            request: bcode_workflow::WorkflowRunGraphEditBatch {
+                version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+                run_id: "run".to_owned(),
+                mutation_id: "edit".to_owned(),
+                expected_revision: 1,
+                edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+                reconciliation: vec![],
+            },
+        };
+        let plugins = BTreeSet::from(["bcode.workflow".to_owned()]);
+        assert_eq!(
+            workflow_operations::authorize_configured_run_graph_edit(&facts, &plugins),
+            WorkflowApplicationAuthorizationDecision::Allow
+        );
+        assert!(matches!(
+            workflow_operations::authorize_configured_run_graph_edit(&facts, &BTreeSet::new()),
+            WorkflowApplicationAuthorizationDecision::Deny { .. }
+        ));
+        facts.actor.kind = bcode_workflow::WorkflowApplicationActorKind::Service;
+        assert!(matches!(
+            workflow_operations::authorize_configured_run_graph_edit(&facts, &plugins),
+            WorkflowApplicationAuthorizationDecision::Deny { .. }
+        ));
+        facts.actor.kind = bcode_workflow::WorkflowApplicationActorKind::Plugin;
+        facts.actor.actor_id = "other-plugin".to_owned();
+        assert!(matches!(
+            workflow_operations::authorize_configured_run_graph_edit(&facts, &plugins),
+            WorkflowApplicationAuthorizationDecision::Deny { .. }
+        ));
     }
 
     #[tokio::test]

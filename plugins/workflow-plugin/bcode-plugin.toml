@@ -5,6 +5,12 @@ version = "0.0.1"
 categories = ["workflow", "automation"]
 
 [[services]]
+class        = "tool_execution"
+description  = "Execution-scoped workflow graph staging"
+interface_id = "bcode.tool/v1"
+name         = "Workflow Tools"
+
+[[services]]
 class        = "service"
 description  = "Workflow discovery and lifecycle commands"
 interface_id = "bcode.command/v1"

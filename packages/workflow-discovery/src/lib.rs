@@ -665,6 +665,7 @@ members:
                 include_repo_workflows: true,
                 include_user_workflows: false,
                 paths: Vec::new(),
+                ..bcode_config::WorkflowsConfig::default()
             },
             20,
         )
@@ -708,6 +709,7 @@ members:
                 include_repo_workflows: false,
                 include_user_workflows: false,
                 paths: vec![configured],
+                ..bcode_config::WorkflowsConfig::default()
             },
             20,
         )
@@ -737,6 +739,7 @@ members:
                 include_repo_workflows: true,
                 include_user_workflows: false,
                 paths: Vec::new(),
+                ..bcode_config::WorkflowsConfig::default()
             },
             20,
         )

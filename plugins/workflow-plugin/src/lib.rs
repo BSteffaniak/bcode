@@ -7,6 +7,7 @@
 mod authoring_tui;
 #[cfg(feature = "static-bundled")]
 mod cli;
+mod tools;
 pub mod tui;
 
 use bcode_command::{
@@ -37,6 +38,9 @@ impl RustPlugin for WorkflowPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID {
+            return tools::invoke(&context);
+        }
         match (
             context.request.interface_id.as_str(),
             context.request.operation.as_str(),

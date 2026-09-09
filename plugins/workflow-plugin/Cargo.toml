@@ -20,6 +20,7 @@ bcode_ipc = { workspace = true }
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_session_models = { workspace = true }
 bcode_session_view_models = { workspace = true }
+bcode_tool = { workspace = true }
 bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }
 bcode_workflow_view_models = { workspace = true }

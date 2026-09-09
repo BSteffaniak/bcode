@@ -78,6 +78,26 @@ pub fn authorize_local_workflow_application_operation(
     }
 }
 
+/// Apply explicit startup plugin grants in addition to local-client admission.
+/// Execution relationship and durable authority are verified separately before staging.
+pub fn authorize_configured_run_graph_edit(
+    facts: &bcode_workflow::WorkflowRunGraphEditFacts,
+    plugins: &std::collections::BTreeSet<String>,
+) -> WorkflowApplicationAuthorizationDecision {
+    if facts.validate().is_err() {
+        return WorkflowApplicationAuthorizationDecision::Deny {
+            reason: "invalid run graph edit facts".to_owned(),
+        };
+    }
+    if facts.actor.kind == bcode_workflow::WorkflowApplicationActorKind::Plugin
+        && plugins.contains(&facts.actor.actor_id)
+    {
+        WorkflowApplicationAuthorizationDecision::Allow
+    } else {
+        authorize_local_run_graph_edit(facts)
+    }
+}
+
 /// Authorize candidate persistence for authenticated local clients only.
 ///
 /// This follows local authored-workflow admission policy but does not authorize publication or

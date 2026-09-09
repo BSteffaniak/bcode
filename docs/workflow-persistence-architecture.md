@@ -1,5 +1,14 @@
 # Workflow Persistence Architecture
 
+## Retained leaf publication
+
+Schema 28 adds revision-scoped leaf retention records through the existing exclusive upgrade
+coordinator (including schema 27). `publish_retained_leaf_run_graph_edit` atomically records
+explicit retention of every active, unchanged leaf alongside publication. Admission revisions
+remain immutable; revised leaf settlement accepts a retention record for the current revision.
+Connected graphs, changed active nodes, cancellation dispositions, and result-edge bindings
+remain rejected. This store capability is not yet exposed through application/tool publication.
+
 ## Quiescent leaf publication
 
 Schema 27 adds durable publication outcomes keyed by staged mutation identity. The store's

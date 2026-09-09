@@ -169,6 +169,15 @@ pub fn initialize_edit_candidates(connection: &Connection) -> Result<(), Workflo
             FOREIGN KEY (run_id, mutation_id)
                 REFERENCES workflow_graph_edit_candidates(run_id, mutation_id)
         );
+        CREATE TABLE IF NOT EXISTS workflow_leaf_retentions (
+            run_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            activation_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 1),
+            PRIMARY KEY (run_id, node_id, activation_id, revision),
+            FOREIGN KEY (run_id, node_id, activation_id)
+                REFERENCES workflow_activations(run_id, node_id, activation_id)
+        );
         CREATE TABLE IF NOT EXISTS workflow_graph_edit_validations (
             run_id TEXT NOT NULL,
             mutation_id TEXT NOT NULL,
@@ -449,6 +458,37 @@ impl WorkflowStore {
         authority: &super::WorkflowExecutionAuthority,
         created_at_ms: u64,
     ) -> Result<u64, WorkflowStoreError> {
+        self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, false)
+    }
+
+    /// Publish a leaf-only edit while explicitly retaining unchanged active activations.
+    ///
+    /// Admission bindings remain historical. Settlement consumes the publication's retained
+    /// identities. Connected topology and edits to retained nodes remain unsupported.
+    /// The caller must authorize the operation before invoking this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale authority/revision, missing retention, changed active nodes,
+    /// unsupported topology, invalid candidates, or persistence failure.
+    pub fn publish_retained_leaf_run_graph_edit(
+        &mut self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        created_at_ms: u64,
+    ) -> Result<u64, WorkflowStoreError> {
+        self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, true)
+    }
+
+    fn publish_leaf_run_graph_edit(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        created_at_ms: u64,
+        retain_active: bool,
+    ) -> Result<u64, WorkflowStoreError> {
         let transaction = self.connection.unchecked_transaction()?;
         let request = self
             .staged_run_graph_edit(run_id, mutation_id, authority)?
@@ -470,7 +510,9 @@ impl WorkflowStore {
             [run_id],
             |row| row.get(0),
         )?;
-        if active || !request.reconciliation.is_empty() {
+        if retain_active {
+            validate_leaf_retention(&transaction, &request)?;
+        } else if active || !request.reconciliation.is_empty() {
             return Err(WorkflowStoreError::InvalidData(
                 "publication requires execution reconciliation".to_string(),
             ));
@@ -498,6 +540,14 @@ impl WorkflowStore {
             ));
         }
         let revision = request.expected_revision + 1;
+        if retain_active {
+            transaction.execute(
+                "INSERT INTO workflow_leaf_retentions (run_id, node_id, activation_id, revision)
+                 SELECT run_id, node_id, activation_id, ?2 FROM workflow_activations
+                 WHERE run_id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped')",
+                rusqlite::params![run_id, revision],
+            )?;
+        }
         transaction.execute(
             "UPDATE workflow_run_graph_nodes SET retired_at_revision = ?3
              WHERE run_id = ?1 AND retired_at_revision IS NULL AND node_id IN
@@ -774,6 +824,51 @@ fn expand_affected_dependencies<'a>(
             }
         }
     }
+}
+
+fn validate_leaf_retention(
+    connection: &Connection,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+) -> Result<(), WorkflowStoreError> {
+    let mut retained = BTreeSet::new();
+    for disposition in &request.reconciliation {
+        let bcode_workflow::WorkflowRunGraphReconciliation::Retain { activation_id } = disposition
+        else {
+            return Err(WorkflowStoreError::InvalidData(
+                "leaf publication supports only explicit retention".to_string(),
+            ));
+        };
+        retained.insert(activation_id.as_str());
+    }
+    let mut statement = connection.prepare(
+        "SELECT node_id, activation_id FROM workflow_activations WHERE run_id = ?1
+         AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped') LIMIT ?2",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        request.run_id,
+        bcode_workflow::MAX_WORKFLOW_RUN_GRAPH_EDITS + 1
+    ])?;
+    while let Some(row) = rows.next()? {
+        let node_id: String = row.get(0)?;
+        let activation_id: String = row.get(1)?;
+        let changed: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_graph_edit_nodes WHERE run_id = ?1 AND mutation_id = ?2 AND node_id = ?3)",
+            (&request.run_id, &request.mutation_id, &node_id), |row| row.get(0),
+        )?;
+        if changed || !retained.remove(activation_id.as_str()) {
+            return Err(WorkflowStoreError::InvalidData(
+                "leaf publication requires explicit retention of every unchanged active node"
+                    .to_string(),
+            ));
+        }
+        revised_leaf_exit(connection, &request.run_id, &node_id, &activation_id)?;
+    }
+    if !retained.is_empty() {
+        return Err(WorkflowStoreError::InvalidData(
+            "retention does not identify active leaf work".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_reconciliation_targets(
@@ -1295,9 +1390,17 @@ pub fn revised_leaf_exit(
         )
         .optional()?;
     if admitted != Some(current) {
-        return Err(WorkflowStoreError::InvalidData(
-            "settlement requires reconciliation with the current graph".to_string(),
-        ));
+        let retained: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_leaf_retentions
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND revision = ?4)",
+            rusqlite::params![run_id, node_id, activation_id, current],
+            |row| row.get(0),
+        )?;
+        if admitted.is_none_or(|revision| revision == 0 || revision > current) || !retained {
+            return Err(WorkflowStoreError::InvalidData(
+                "settlement requires reconciliation with the current graph".to_string(),
+            ));
+        }
     }
     let node =
         activation_node_record(connection, run_id, node_id, activation_id)?.ok_or_else(|| {

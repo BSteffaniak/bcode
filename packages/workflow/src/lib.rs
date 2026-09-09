@@ -4011,6 +4011,23 @@ impl WorkflowCompilationPreview {
     }
 }
 
+/// Invocation service interface for execution-scoped workflow application operations.
+///
+/// Version 1 supports `stage_run_graph_edit`; payloads use `WorkflowRunGraphEditBatch`.
+/// Successful responses contain a boolean `staged` indicating whether a new edit was staged.
+/// Staging does not publish or execute revised topology.
+pub const WORKFLOW_APPLICATION_INTERFACE_ID: &str = "bcode.workflow-application/v1";
+
+/// Successful staging response for workflow application interface version 1.
+///
+/// This acknowledges candidate persistence only, never topology publication or execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphStageResponse {
+    /// True for a newly staged candidate; false for an identical previously staged candidate.
+    pub staged: bool,
+}
+
 /// Compatibility version for live run graph edit requests.
 pub const WORKFLOW_RUN_GRAPH_EDIT_VERSION: u32 = 2;
 /// Maximum structural operations admitted in one live graph edit request.
