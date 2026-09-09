@@ -28,6 +28,7 @@ mod session_search_operations;
 mod workflow_operations;
 pub use workflow_operations::{
     WorkflowApplicationAuthorizationDecision, WorkflowRunGraphEditPolicy,
+    WorkflowRunGraphPublicationPolicy,
 };
 mod worktree_creation;
 mod worktree_operations;
@@ -354,6 +355,8 @@ pub struct ServerState {
     workflow_store: StdMutex<bcode_workflow_store::WorkflowStore>,
     workflow_store_unavailable: Option<String>,
     workflow_run_graph_edit_policy: Option<workflow_operations::WorkflowRunGraphEditPolicy>,
+    workflow_run_graph_publication_policy:
+        Option<workflow_operations::WorkflowRunGraphPublicationPolicy>,
     workflow_application_authorization: workflow_operations::WorkflowApplicationAuthorizationPolicy,
     workflow_computations:
         StdMutex<BTreeMap<String, Arc<workflow_operations::ComputationCancellation>>>,
@@ -1507,6 +1510,27 @@ impl ServerState {
     }
 
     /// Configure run-edit staging policy before sharing the server with clients.
+    /// Configure executable graph publication policy. Staging policy never grants this permission.
+    pub fn set_workflow_run_graph_publication_policy(
+        &mut self,
+        policy: WorkflowRunGraphPublicationPolicy,
+    ) {
+        self.workflow_run_graph_publication_policy = Some(policy);
+    }
+
+    /// Authorize and publish a retained-leaf edit for an accepted local client.
+    ///
+    /// # Errors
+    /// Returns an error for denied policy, invalid facts, unavailable storage, stale authority,
+    /// candidate conflicts, or unsupported execution reconciliation/topology.
+    pub async fn publish_workflow_run_graph_edit(
+        self: &Arc<Self>,
+        client_id: ClientId,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<u64, ServerError> {
+        workflow_operations::publish_run_graph_edit(self, client_id, request).await
+    }
+
     pub fn set_workflow_run_graph_edit_policy(&mut self, policy: WorkflowRunGraphEditPolicy) {
         self.workflow_run_graph_edit_policy = Some(policy);
     }
@@ -1743,6 +1767,7 @@ impl ServerState {
             turn_admission_locks: Mutex::default(),
             workflow_store: StdMutex::new(workflow_store),
             workflow_store_unavailable,
+            workflow_run_graph_publication_policy: None,
             workflow_run_graph_edit_policy: Some(WorkflowRunGraphEditPolicy {
                 evaluator: Arc::new(move |facts| {
                     workflow_operations::authorize_configured_run_graph_edit(

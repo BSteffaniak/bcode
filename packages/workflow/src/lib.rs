@@ -4122,6 +4122,38 @@ pub struct WorkflowRunGraphEditFacts {
     pub request: WorkflowRunGraphEditBatch,
 }
 
+/// Canonical authorization facts for publishing a run graph edit.
+///
+/// Approval authorizes executable topology publication, not merely candidate staging.
+/// The application derives the actor and verifies the exact candidate before publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphPublicationFacts {
+    /// Compatibility boundary; currently version 1.
+    pub version: u32,
+    /// Authenticated application caller.
+    pub actor: WorkflowApplicationActor,
+    /// Exact edit whose execution effects are being authorized.
+    pub request: WorkflowRunGraphEditBatch,
+}
+
+impl WorkflowRunGraphPublicationFacts {
+    /// Validate compatibility, actor, and edit envelope without granting authority.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported versions, invalid actors, or malformed edits.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != 1 {
+            return Err(authoring_error(
+                "run_graph_publication.version",
+                "unsupported publication fact version",
+            ));
+        }
+        self.actor.validate()?;
+        self.request.validate()
+    }
+}
+
 impl WorkflowRunGraphEditFacts {
     /// Validate compatibility, actor identity, and the candidate envelope.
     ///

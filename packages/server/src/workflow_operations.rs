@@ -1,3 +1,24 @@
+/// Host policy for executable run graph publication, distinct from staging approval.
+#[derive(Clone)]
+pub struct WorkflowRunGraphPublicationPolicy {
+    /// Evaluate canonical publication facts before ownership or persistence effects.
+    pub evaluator: std::sync::Arc<
+        dyn Fn(
+                &bcode_workflow::WorkflowRunGraphPublicationFacts,
+            ) -> WorkflowApplicationAuthorizationDecision
+            + Send
+            + Sync,
+    >,
+}
+
+impl std::fmt::Debug for WorkflowRunGraphPublicationPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkflowRunGraphPublicationPolicy")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Host-configured policy for staging run edits. It is never supplied by request payloads.
 #[derive(Clone)]
 pub struct WorkflowRunGraphEditPolicy {
@@ -164,6 +185,71 @@ pub async fn stage_run_graph_edit(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .stage_run_graph_edit(&facts.request, &guard.authority, super::current_time_ms())
+        .map_err(Into::into)
+}
+
+/// Authorize executable publication separately from staging.
+///
+/// # Errors
+/// Returns an error for policy denial, invalid facts, unavailable authority, or store rejection.
+pub async fn publish_run_graph_edit(
+    state: &std::sync::Arc<ServerState>,
+    client_id: super::ClientId,
+    request: bcode_workflow::WorkflowRunGraphEditBatch,
+) -> Result<u64, super::ServerError> {
+    let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
+        version: 1,
+        actor: bcode_workflow::WorkflowApplicationActor {
+            kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
+            actor_id: client_id.to_string(),
+        },
+        request,
+    };
+    facts.validate().map_err(|error| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(error.to_string())
+    })?;
+    let policy = state
+        .workflow_run_graph_publication_policy
+        .as_ref()
+        .ok_or_else(|| {
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "run graph publication policy is not configured".to_string(),
+            )
+        })?;
+    if let WorkflowApplicationAuthorizationDecision::Deny { reason } = (policy.evaluator)(&facts) {
+        return Err(super::ServerError::WorkflowApplicationOperationUnauthorized(reason));
+    }
+    state.require_workflow_store()?;
+    let guard = execution_authority(state, &facts.request.run_id)
+        .await?
+        .ok_or_else(|| {
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "publication requires durable execution authority".to_string(),
+            )
+        })?;
+    let mut store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let staged = store.staged_run_graph_edit(
+        &facts.request.run_id,
+        &facts.request.mutation_id,
+        &guard.authority,
+    )?;
+    if staged.as_ref() != Some(&facts.request) {
+        return Err(
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "publication candidate does not match authorized facts".to_string(),
+            ),
+        );
+    }
+    store
+        .publish_retained_leaf_run_graph_edit(
+            &facts.request.run_id,
+            &facts.request.mutation_id,
+            &guard.authority,
+            super::current_time_ms(),
+        )
         .map_err(Into::into)
 }
 
