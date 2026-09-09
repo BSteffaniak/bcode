@@ -471,6 +471,87 @@ fn ralph_status_reads_live_daemon_and_missing_run_fails() {
 }
 
 #[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn composer_draft_cli_reads_sets_and_clears_live_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let directory = root.path().to_str().unwrap();
+    let base = [
+        "session",
+        "composer-draft",
+        "--launch-working-directory",
+        directory,
+    ];
+    assert_eq!(graph_cli_json(root.path(), &base), serde_json::Value::Null);
+    let path = root.path().join("draft.txt");
+    let text = "draft with Unicode λ\nand a trailing newline\n";
+    std::fs::write(&path, text).unwrap();
+    let mut set = base.to_vec();
+    set.extend(["--set-file", path.to_str().unwrap()]);
+    assert_eq!(graph_cli_json(root.path(), &set), serde_json::Value::Null);
+    assert_eq!(graph_cli_json(root.path(), &base), serde_json::json!(text));
+    let session = graph_cli_json(root.path(), &["session", "create", "draft-test", "--json"]);
+    let session_scope = [
+        "session",
+        "composer-draft",
+        "--session-id",
+        session["id"].as_str().unwrap(),
+    ];
+    assert_eq!(
+        graph_cli_json(root.path(), &session_scope),
+        serde_json::Value::Null
+    );
+    std::fs::write(&path, "session-only draft").unwrap();
+    let mut session_set = session_scope.to_vec();
+    session_set.extend(["--set-file", path.to_str().unwrap()]);
+    assert_eq!(
+        graph_cli_json(root.path(), &session_set),
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        graph_cli_json(root.path(), &session_scope),
+        serde_json::json!("session-only draft")
+    );
+    assert_eq!(graph_cli_json(root.path(), &base), serde_json::json!(text));
+    let mut session_clear = session_scope.to_vec();
+    session_clear.push("--clear");
+    assert_eq!(
+        graph_cli_json(root.path(), &session_clear),
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        graph_cli_json(root.path(), &session_scope),
+        serde_json::Value::Null
+    );
+    assert_eq!(graph_cli_json(root.path(), &base), serde_json::json!(text));
+    let mut clear = base.to_vec();
+    clear.push("--clear");
+    assert_eq!(graph_cli_json(root.path(), &clear), serde_json::Value::Null);
+    assert_eq!(graph_cli_json(root.path(), &base), serde_json::Value::Null);
+    drop(daemon);
+}
+
+#[test]
+fn derivation_commands_validate_identity_and_reach_daemon() {
+    for command in [
+        "derivation-snapshot",
+        "derivation-status",
+        "cancel-derivation",
+    ] {
+        let invalid = run_cli_with_state(&["session", command, "not-an-id"], true);
+        assert_eq!(invalid.status.code(), Some(2));
+        assert!(invalid.stdout.is_empty());
+        let failed = run_cli_with_state(
+            &["session", command, "00000000-0000-0000-0000-000000000001"],
+            true,
+        );
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(failed.stdout.is_empty());
+        assert!(!failed.stderr.is_empty());
+    }
+}
+
+#[test]
 fn composer_draft_requires_one_scope_and_reports_daemon_failure() {
     let missing = run_cli_with_state(&["session", "composer-draft"], true);
     assert_eq!(missing.status.code(), Some(2));

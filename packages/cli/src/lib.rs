@@ -4565,6 +4565,18 @@ enum SessionCommand {
         #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=100_000))]
         entry_budget: u32,
     },
+    /// Inspect a bounded derivation source snapshot as JSON.
+    DerivationSnapshot {
+        session_id: SessionId,
+    },
+    /// Inspect a derivation operation as JSON.
+    DerivationStatus {
+        operation_id: uuid::Uuid,
+    },
+    /// Request derivation cancellation; JSON true acknowledges acceptance, not termination.
+    CancelDerivation {
+        operation_id: uuid::Uuid,
+    },
     /// Read persisted composer text as a JSON string or null without submitting it.
     ComposerDraft {
         #[arg(
@@ -4575,6 +4587,12 @@ enum SessionCommand {
         session_id: Option<SessionId>,
         #[arg(long, required_unless_present = "session_id")]
         launch_working_directory: Option<PathBuf>,
+        /// Replace draft from a UTF-8 file (maximum 1 MiB); does not submit a prompt.
+        #[arg(long, conflicts_with = "clear")]
+        set_file: Option<PathBuf>,
+        /// Clear the persisted draft. Mutations return JSON null on success.
+        #[arg(long)]
+        clear: bool,
     },
     /// Read a bounded artifact byte range as JSON, including reference and availability metadata.
     ArtifactRange(ArtifactRangeArgs),
@@ -6114,8 +6132,51 @@ async fn describe_skill(skill_id: String, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+async fn print_derivation_cancellation(operation_id: uuid::Uuid) -> Result<(), CliError> {
+    print_json(
+        &BcodeClient::default_endpoint()
+            .cancel_session_derivation(bcode_session_models::SessionDerivationOperationId(
+                operation_id,
+            ))
+            .await?,
+    )
+}
+
+async fn print_derivation_snapshot(session_id: SessionId) -> Result<(), CliError> {
+    print_json(
+        &BcodeClient::default_endpoint()
+            .session_derivation_snapshot(session_id)
+            .await?,
+    )
+}
+
+async fn print_derivation_status(operation_id: uuid::Uuid) -> Result<(), CliError> {
+    print_json(
+        &BcodeClient::default_endpoint()
+            .session_derivation_status(bcode_session_models::SessionDerivationOperationId(
+                operation_id,
+            ))
+            .await?,
+    )
+}
+
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
+    match command.as_ref() {
+        SessionCommand::DerivationSnapshot { session_id } => {
+            print_derivation_snapshot(*session_id).await
+        }
+        SessionCommand::DerivationStatus { operation_id } => {
+            print_derivation_status(*operation_id).await
+        }
+        SessionCommand::CancelDerivation { operation_id } => {
+            print_derivation_cancellation(*operation_id).await
+        }
+        _ => Box::pin(dispatch_session_command(command)).await,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
         SessionCommand::StorageUsage {
             session_id,
@@ -6127,9 +6188,16 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
                 .await?;
             print_json(&usage)?;
         }
+        SessionCommand::DerivationSnapshot { .. }
+        | SessionCommand::DerivationStatus { .. }
+        | SessionCommand::CancelDerivation { .. } => {
+            unreachable!("handled by handle_session_command")
+        }
         SessionCommand::ComposerDraft {
             session_id,
             launch_working_directory,
+            set_file,
+            clear,
         } => {
             let scope = match (session_id, launch_working_directory) {
                 (Some(session_id), None) => {
@@ -6142,11 +6210,27 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
                 }
                 _ => unreachable!("clap requires exactly one composer draft scope"),
             };
-            print_json(
-                &BcodeClient::default_endpoint()
-                    .composer_draft(scope)
-                    .await?,
-            )?;
+            let client = BcodeClient::default_endpoint();
+            let text = if let Some(path) = set_file {
+                let bytes = read_bytes_with_limit(
+                    std::fs::File::open(path)?,
+                    1024 * 1024,
+                    "composer draft",
+                )?;
+                Some(String::from_utf8(bytes).map_err(|_| {
+                    CliError::InvalidArguments("composer draft must be UTF-8".to_owned())
+                })?)
+            } else if clear {
+                Some(String::new())
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                Box::pin(client.set_composer_draft(scope, text)).await?;
+                print_json(&())?;
+            } else {
+                print_json(&Box::pin(client.composer_draft(scope)).await?)?;
+            }
         }
         SessionCommand::ArtifactRange(args) => {
             Box::pin(read_artifact_range_to(
