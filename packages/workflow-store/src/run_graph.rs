@@ -550,6 +550,35 @@ impl WorkflowStore {
         authority: &super::WorkflowExecutionAuthority,
         created_at_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
+        self.stage_run_graph_edit_for_caller(request, authority, created_at_ms, None)
+    }
+
+    /// Stage a candidate only while its exact calling execution session remains active.
+    ///
+    /// The application must authenticate the caller and authorize the edit before invoking this
+    /// operation. A session link alone does not grant permission. Link and active-attempt checks
+    /// share the candidate transaction so settlement cannot race with admission.
+    ///
+    /// # Errors
+    /// Returns an error for a mismatched session link, inactive attempt, stale authority,
+    /// invalid candidate, conflicting duplicate/revision, or persistence failure.
+    pub fn stage_run_graph_edit_from_execution(
+        &mut self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &super::WorkflowExecutionAuthority,
+        caller: &super::WorkflowExecutionSessionLink,
+        created_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        self.stage_run_graph_edit_for_caller(request, authority, created_at_ms, Some(caller))
+    }
+
+    fn stage_run_graph_edit_for_caller(
+        &self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &super::WorkflowExecutionAuthority,
+        created_at_ms: u64,
+        caller: Option<&super::WorkflowExecutionSessionLink>,
+    ) -> Result<bool, WorkflowStoreError> {
         request
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -559,6 +588,35 @@ impl WorkflowStore {
         let authority_json = super::bounded_json("graph edit authority", authority)?;
         let transaction = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(&request.run_id, authority)?;
+        if let Some(caller) = caller {
+            super::validate_execution_session_link(caller)?;
+            let stored = self.execution_session_link(
+                &caller.run_id,
+                &caller.node_id,
+                &caller.activation_id,
+                caller.attempt,
+            )?;
+            if caller.run_id != request.run_id || stored.as_ref() != Some(caller) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "run edit caller link mismatch".to_string(),
+                ));
+            }
+            let active: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt
+                 JOIN workflow_activations activation ON activation.run_id = attempt.run_id
+                   AND activation.node_id = attempt.node_id AND activation.activation_id = attempt.activation_id
+                 WHERE attempt.run_id = ?1 AND attempt.node_id = ?2 AND attempt.activation_id = ?3
+                   AND attempt.attempt = ?4 AND activation.status = 'running'
+                   AND attempt.status IN ('prepared', 'admitted'))",
+                rusqlite::params![caller.run_id, caller.node_id, caller.activation_id, caller.attempt],
+                |row| row.get(0),
+            )?;
+            if !active {
+                return Err(WorkflowStoreError::InvalidData(
+                    "run edit caller is no longer active".to_string(),
+                ));
+            }
+        }
         if let Some(existing) =
             self.staged_run_graph_edit(&request.run_id, &request.mutation_id, authority)?
         {

@@ -19228,6 +19228,79 @@ mod tests {
     }
 
     #[test]
+    fn run_edit_staging_checks_exact_active_execution() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = initialized_store_at(temp.path());
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("owner fixture");
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        let link = WorkflowExecutionSessionLink::new(
+            "run-1".to_string(),
+            "review".to_string(),
+            activation_id(),
+            prepared.attempt,
+            "session-1".to_string(),
+            "snapshot-1".to_string(),
+            13,
+        );
+        store.link_execution_session(&link).expect("link");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owned");
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run-1".to_string(),
+            expected_revision: 1,
+            mutation_id: "agent-edit".to_string(),
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![],
+        };
+        let mut wrong = link.clone();
+        wrong.session_id = "other-session".to_string();
+        assert!(
+            store
+                .stage_run_graph_edit_from_execution(&request, &authority, &wrong, 14)
+                .is_err()
+        );
+        assert!(
+            store
+                .stage_run_graph_edit_from_execution(&request, &authority, &link, 14)
+                .expect("stage")
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'cancelled' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("settle fixture");
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .stage_run_graph_edit_from_execution(&request, &authority, &link, 15)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
     fn damaged_execution_session_link_fails_closed_on_read() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = initialized_store_at(temp.path());

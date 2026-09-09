@@ -26,6 +26,9 @@ mod session_bulk_migration;
 mod session_operations;
 mod session_search_operations;
 mod workflow_operations;
+pub use workflow_operations::{
+    WorkflowApplicationAuthorizationDecision, WorkflowRunGraphEditPolicy,
+};
 mod worktree_creation;
 mod worktree_operations;
 
@@ -347,6 +350,7 @@ pub struct ServerState {
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     workflow_store: StdMutex<bcode_workflow_store::WorkflowStore>,
     workflow_store_unavailable: Option<String>,
+    workflow_run_graph_edit_policy: Option<workflow_operations::WorkflowRunGraphEditPolicy>,
     workflow_application_authorization: workflow_operations::WorkflowApplicationAuthorizationPolicy,
     workflow_computations:
         StdMutex<BTreeMap<String, Arc<workflow_operations::ComputationCancellation>>>,
@@ -1384,6 +1388,28 @@ impl ServerState {
             })
     }
 
+    /// Stage a live graph candidate through authenticated application policy.
+    ///
+    /// The host supplies the policy; caller payloads must never select it. This operation does
+    /// not publish topology or dispatch work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid requests, policy denial, unavailable storage, unverified
+    /// execution ownership, revision conflicts, or persistence failure.
+    pub async fn stage_workflow_run_graph_edit(
+        self: &Arc<Self>,
+        client_id: ClientId,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<bool, ServerError> {
+        workflow_operations::stage_run_graph_edit(self, client_id, request).await
+    }
+
+    /// Configure run-edit staging policy before sharing the server with clients.
+    pub fn set_workflow_run_graph_edit_policy(&mut self, policy: WorkflowRunGraphEditPolicy) {
+        self.workflow_run_graph_edit_policy = Some(policy);
+    }
+
     /// Authorize one normalized side-effecting authored-workflow application operation.
     ///
     /// This boundary is independent of tool-call/session permission coordination. Callers must
@@ -1589,6 +1615,9 @@ impl ServerState {
             turn_admission_locks: Mutex::default(),
             workflow_store: StdMutex::new(workflow_store),
             workflow_store_unavailable,
+            workflow_run_graph_edit_policy: Some(WorkflowRunGraphEditPolicy {
+                evaluator: Arc::new(workflow_operations::authorize_local_run_graph_edit),
+            }),
             workflow_application_authorization: init.workflow_application_authorization.unwrap_or(
                 workflow_operations::WorkflowApplicationAuthorizationPolicy {
                     evaluator: Arc::new(
@@ -4784,6 +4813,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
+        Request::StageWorkflowRunGraphEdit { .. } => "stage_workflow_run_graph_edit",
         Request::InspectWorkflowRunGraph { .. } => "inspect_workflow_run_graph",
         Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
         Request::WorkflowRunView { .. } => "workflow_run_view",
@@ -6247,6 +6277,17 @@ async fn handle_workflow_run_request(
 ) -> Result<(), ServerError> {
     state.require_workflow_store()?;
     match request {
+        RuntimeAndModelRequest::StageWorkflowRunGraphEdit { request } => {
+            let created = state
+                .stage_workflow_run_graph_edit(client_id, request)
+                .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunGraphEditStaged { created }),
+            )
+            .await
+        }
         RuntimeAndModelRequest::InspectWorkflowRunGraph { request } => {
             let graph = workflow_operations::inspect_graph_page(state, &request)?;
             send_response(
@@ -47728,6 +47769,42 @@ library = "test"
         drop(state);
     }
 
+    #[tokio::test]
+    async fn run_edit_admission_authorizes_before_missing_run_lookup() {
+        let mut state = Arc::new(test_server_state(SessionManager::default()));
+        let client_id = ClientId::new();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "missing-run".to_string(),
+            mutation_id: "edit-1".to_string(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![],
+        };
+        let expected = request.clone();
+        let policy = move |facts: &bcode_workflow::WorkflowRunGraphEditFacts| {
+            assert_eq!(facts.actor.actor_id, client_id.to_string());
+            assert_eq!(facts.request, expected);
+            workflow_operations::WorkflowApplicationAuthorizationDecision::Deny {
+                reason: "staging denied".to_string(),
+            }
+        };
+        Arc::get_mut(&mut state)
+            .expect("unshared state")
+            .set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
+                evaluator: Arc::new(policy),
+            });
+        let error = state
+            .stage_workflow_run_graph_edit(client_id, request)
+            .await
+            .expect_err("deny before accessing nonexistent run");
+        drop(state);
+        assert!(matches!(error,
+            ServerError::WorkflowApplicationOperationUnauthorized(reason)
+            if reason == "staging denied"
+        ));
+    }
+
     #[test]
     fn authored_workflow_application_authorization_uses_canonical_facts_and_precedes_mutation() {
         let mut state = test_server_state(SessionManager::default());
@@ -63299,6 +63376,68 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    async fn assert_staging_over_ipc(state: &Arc<ServerState>, run_id: &str) {
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("stage.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let server_state = Arc::clone(state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("connection");
+            handle_client(stream, server_state).await.expect("client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run_id.to_string(),
+            expected_revision: 1,
+            mutation_id: "staged-removal".to_string(),
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "wait".to_string(),
+            }],
+            reconciliation: vec![],
+        };
+        for (id, created) in [(1, true), (2, false)] {
+            let envelope = bcode_ipc::request_envelope(
+                id,
+                &Request::StageWorkflowRunGraphEdit {
+                    request: request.clone(),
+                },
+            )
+            .expect("request");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send");
+            let response = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("receive");
+            assert!(
+                matches!(bcode_ipc::decode_response(&response.payload).expect("response"),
+                Response::Ok(ResponsePayload::WorkflowRunGraphEditStaged { created: actual }) if actual == created)
+            );
+        }
+        drop(stream);
+        server.await.expect("server");
+        let store = state.workflow_store.lock().expect("store");
+        let authority = store
+            .execution_authority(run_id)
+            .expect("authority")
+            .expect("owned");
+        assert_eq!(
+            store
+                .staged_run_graph_edit(run_id, &request.mutation_id, &authority)
+                .expect("candidate"),
+            Some(request)
+        );
+        assert_eq!(store.run_graph_revision(run_id).expect("revision"), Some(1));
+        assert!(
+            store
+                .current_run_graph_node(run_id, "wait")
+                .expect("node")
+                .is_some()
+        );
+        drop(store);
+    }
+
     #[tokio::test]
     async fn direct_resume_drives_pending_activation() {
         let sessions = SessionManager::default();
@@ -63375,6 +63514,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             sessions, store,
         ));
 
+        assert_staging_over_ipc(&state, "direct-resume-pending-run").await;
         assert!(
             workflow_operations::resume_run(&state, "direct-resume-pending-run")
                 .await

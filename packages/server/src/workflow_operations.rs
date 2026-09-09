@@ -1,3 +1,24 @@
+/// Host-configured policy for staging run edits. It is never supplied by request payloads.
+#[derive(Clone)]
+pub struct WorkflowRunGraphEditPolicy {
+    /// Evaluate canonical caller and candidate facts before any ownership or persistence effects.
+    pub evaluator: std::sync::Arc<
+        dyn Fn(
+                &bcode_workflow::WorkflowRunGraphEditFacts,
+            ) -> WorkflowApplicationAuthorizationDecision
+            + Send
+            + Sync,
+    >,
+}
+
+impl std::fmt::Debug for WorkflowRunGraphEditPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkflowRunGraphEditPolicy")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkflowApplicationAuthorizationPolicy {
     pub evaluator: std::sync::Arc<
@@ -55,6 +76,75 @@ pub fn authorize_local_workflow_application_operation(
             }
         }
     }
+}
+
+/// Authorize candidate persistence for authenticated local clients only.
+///
+/// This follows local authored-workflow admission policy but does not authorize publication or
+/// execution. Plugin and service actors require their own explicitly configured capabilities.
+pub fn authorize_local_run_graph_edit(
+    facts: &bcode_workflow::WorkflowRunGraphEditFacts,
+) -> WorkflowApplicationAuthorizationDecision {
+    if facts.actor.kind == bcode_workflow::WorkflowApplicationActorKind::LocalClient {
+        WorkflowApplicationAuthorizationDecision::Allow
+    } else {
+        WorkflowApplicationAuthorizationDecision::Deny {
+            reason: "run graph staging requires an authorized local application client".to_string(),
+        }
+    }
+}
+
+/// Authorize and stage a run edit without publishing executable topology.
+///
+/// Policy is configured on the application host, never decoded from a client request. The actor
+/// is derived from the accepted connection identity. Policy runs before ownership acquisition,
+/// which can itself transfer durable authority, as well as before candidate persistence.
+///
+/// # Errors
+///
+/// Returns an error for invalid facts, policy denial, unavailable workflow storage, missing or
+/// foreign execution authority, conflicting revisions/duplicates, or candidate persistence failure.
+pub async fn stage_run_graph_edit(
+    state: &std::sync::Arc<ServerState>,
+    client_id: super::ClientId,
+    request: bcode_workflow::WorkflowRunGraphEditBatch,
+) -> Result<bool, super::ServerError> {
+    let facts = bcode_workflow::WorkflowRunGraphEditFacts {
+        version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION,
+        actor: bcode_workflow::WorkflowApplicationActor {
+            kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
+            actor_id: client_id.to_string(),
+        },
+        request,
+    };
+    facts.validate().map_err(|error| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(error.to_string())
+    })?;
+    let policy = state
+        .workflow_run_graph_edit_policy
+        .as_ref()
+        .ok_or_else(|| {
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "run graph edit policy is not configured".to_string(),
+            )
+        })?;
+    if let WorkflowApplicationAuthorizationDecision::Deny { reason } = (policy.evaluator)(&facts) {
+        return Err(super::ServerError::WorkflowApplicationOperationUnauthorized(reason));
+    }
+    state.require_workflow_store()?;
+    let guard = execution_authority(state, &facts.request.run_id)
+        .await?
+        .ok_or_else(|| {
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "run edit requires durable execution authority".to_string(),
+            )
+        })?;
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .stage_run_graph_edit(&facts.request, &guard.authority, super::current_time_ms())
+        .map_err(Into::into)
 }
 
 /// Server-owned input used to derive authenticated local-client operation facts.

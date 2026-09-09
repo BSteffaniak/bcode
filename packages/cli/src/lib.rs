@@ -637,6 +637,14 @@ fn write_theme_command(
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     match *command {
+        WorkflowCommand::StageRunEdit { file } => {
+            let request: bcode_workflow::WorkflowRunGraphEditBatch =
+                serde_json::from_value(read_bounded_json(&file)?)?;
+            let created = Box::pin(client.stage_workflow_run_graph_edit(request)).await?;
+            print_json(
+                &serde_json::json!({"staged": true, "created": created, "published": false}),
+            )?;
+        }
         WorkflowCommand::Author { command } => {
             Box::pin(handle_workflow_author_command(&client, command)).await?;
         }
@@ -3344,6 +3352,12 @@ enum ThemeCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
+    /// Persist a live run edit candidate; does not publish topology or execute the edit.
+    StageRunEdit {
+        /// Bounded JSON `WorkflowRunGraphEditBatch`, including run, revision, and mutation identity.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Runtime-authored workflow operations.
     Author {
         #[command(subcommand)]
@@ -19297,6 +19311,17 @@ mod web_command_tests {
             invalid_arguments[10] = invalid;
             assert!(Cli::try_parse_from(invalid_arguments).is_err());
         }
+    }
+
+    #[test]
+    fn workflow_stage_run_edit_requires_candidate_file() {
+        assert!(Cli::try_parse_from(["bcode", "workflow", "stage-run-edit"]).is_err());
+        let cli =
+            Cli::try_parse_from(["bcode", "workflow", "stage-run-edit", "--file", "edit.json"])
+                .expect("stage edit command");
+        assert!(matches!(cli.command,
+            Some(Commands::Workflow { command: WorkflowCommand::StageRunEdit { file } })
+            if file == Path::new("edit.json")));
     }
 
     #[test]

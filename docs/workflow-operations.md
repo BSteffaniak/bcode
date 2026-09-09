@@ -1,5 +1,19 @@
 # Workflow operator status, doctor, and repair
 
+## Stage a run graph edit candidate
+
+`bcode workflow stage-run-edit --file edit.json` reads a bounded JSON
+`WorkflowRunGraphEditBatch` and submits it through the normal authenticated application boundary.
+The request includes its compatibility version, run ID, expected graph revision, mutation ID,
+structural edits, and explicit reconciliation intent. Identical retries return `created: false`;
+conflicting reuse of a mutation ID fails. Policy and durable execution ownership are checked before
+candidate persistence.
+
+The JSON result reports `staged: true` and `published: false`. Staging does **not** validate a
+candidate against all execution state, publish topology, cancel activations, or dispatch work.
+A staged candidate is not permission to execute it. General live-edit publication remains incomplete;
+do not expect this command alone to change the running plan. Draft authoring remains separate.
+
 ## Bounded status and history
 
 Normal workflow list, status, inspect, and history operations are read-only and bounded. They query normalized projections and never replay the complete workflow event log, contact external owners, or perform repair.

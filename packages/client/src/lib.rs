@@ -4053,6 +4053,26 @@ impl BcodeClient {
         }
     }
 
+    /// Stage a run-owned graph candidate, without publishing topology or dispatching work.
+    ///
+    /// Returns true for new candidates and false for identical duplicate delivery.
+    ///
+    /// # Errors
+    /// Returns an error for transport failure, policy denial (including unconfigured policy),
+    /// invalid candidates, unverified authority, revision conflicts, or conflicting duplicates.
+    pub async fn stage_workflow_run_graph_edit(
+        &self,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::StageWorkflowRunGraphEdit { request })
+            .await?
+        {
+            ResponsePayload::WorkflowRunGraphEditStaged { created } => Ok(created),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read one bounded run-owned graph page.
     ///
     /// # Errors

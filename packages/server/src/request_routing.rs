@@ -496,6 +496,9 @@ pub enum WorkflowDefinitionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAndModelRequest {
     /// Read one bounded run graph page at an expected revision.
+    StageWorkflowRunGraphEdit {
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    },
     InspectWorkflowRunGraph {
         request: bcode_ipc::WorkflowRunGraphPageRequest,
     },
@@ -1140,6 +1143,9 @@ impl RoutedRequest {
                     definition_id,
                     version,
                 },
+            )),
+            Request::StageWorkflowRunGraphEdit { request } => Self::RuntimeAndModel(Box::new(
+                RuntimeAndModelRequest::StageWorkflowRunGraphEdit { request },
             )),
             Request::InspectWorkflowRunGraph { request } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::InspectWorkflowRunGraph {

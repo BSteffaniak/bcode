@@ -681,6 +681,10 @@ pub enum Request {
         definition_id: String,
         version: u32,
     },
+    /// Persist a candidate edit without publishing or dispatching it.
+    StageWorkflowRunGraphEdit {
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    },
     /// Read a bounded run graph page at an expected revision.
     InspectWorkflowRunGraph {
         request: WorkflowRunGraphPageRequest,
@@ -3049,6 +3053,10 @@ pub enum ResponsePayload {
     },
     WorkflowDefinitionDescription {
         definition: Option<bcode_workflow_store::StoredWorkflowDefinition>,
+    },
+    /// Candidate persisted (true) or identical candidate already present (false).
+    WorkflowRunGraphEditStaged {
+        created: bool,
     },
     WorkflowRunGraphInspection {
         graph: WorkflowRunGraphInspection,

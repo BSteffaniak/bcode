@@ -4084,6 +4084,47 @@ pub struct WorkflowRunGraphEditBatch {
     pub reconciliation: Vec<WorkflowRunGraphReconciliation>,
 }
 
+/// Compatibility version for run-edit application authorization facts.
+pub const WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION: u32 = 1;
+
+/// Canonical policy input for staging a live run graph edit.
+///
+/// The application derives the actor from the authenticated caller, never from producer metadata
+/// or a caller-supplied run identity. Approval permits candidate persistence only: publication and
+/// execution require their own authority checks and execution-aware validation. These facts are
+/// separate from authored-workflow operations because a run revision is not a published definition
+/// revision. The complete edit is retained so policy need not infer intent from display summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphEditFacts {
+    /// Independently evolving authorization-fact compatibility boundary.
+    pub version: u32,
+    /// Authenticated identity assigned by the application boundary.
+    pub actor: WorkflowApplicationActor,
+    /// Exact candidate request evaluated before persistence.
+    pub request: WorkflowRunGraphEditBatch,
+}
+
+impl WorkflowRunGraphEditFacts {
+    /// Validate compatibility, actor identity, and the candidate envelope.
+    ///
+    /// This does not grant permission or validate the edit against durable execution state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported fact version, malformed actor, or invalid edit envelope.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION {
+            return Err(authoring_error(
+                "run_graph_edit_facts.version",
+                "unsupported run graph edit authorization fact version",
+            ));
+        }
+        self.actor.validate()?;
+        self.request.validate()
+    }
+}
+
 impl WorkflowRunGraphEditBatch {
     /// Validate compatibility, request bounds, identities, and duplicate dispositions.
     ///
@@ -15739,6 +15780,42 @@ fn ensure_acyclic(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn run_edit_facts_validate_actor_request_and_compatibility() {
+        let mut facts = WorkflowRunGraphEditFacts {
+            version: WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION,
+            actor: WorkflowApplicationActor {
+                kind: WorkflowApplicationActorKind::LocalClient,
+                actor_id: "client-1".to_string(),
+            },
+            request: WorkflowRunGraphEditBatch {
+                version: WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+                run_id: "run-1".to_string(),
+                expected_revision: 2,
+                mutation_id: "edit-1".to_string(),
+                edits: vec![WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+                reconciliation: vec![],
+            },
+        };
+        facts.validate().expect("valid staging facts");
+        let wire = serde_json::to_value(&facts).expect("serialize");
+        assert_eq!(
+            serde_json::from_value::<WorkflowRunGraphEditFacts>(wire.clone()).expect("decode"),
+            facts
+        );
+        let mut unknown = wire;
+        unknown["executes"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkflowRunGraphEditFacts>(unknown).is_err());
+        facts.version += 1;
+        assert!(facts.validate().is_err());
+        facts.version = WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION;
+        facts.actor.actor_id.clear();
+        assert!(facts.validate().is_err());
+        facts.actor.actor_id = "client-1".to_string();
+        facts.request.expected_revision = 0;
+        assert!(facts.validate().is_err());
+    }
 
     #[test]
     fn live_edit_envelope_preserves_intent_and_rejects_ambiguity() {
