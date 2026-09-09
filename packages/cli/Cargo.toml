@@ -14,6 +14,7 @@ version     = { workspace = true }
 base64 = { workspace = true }
 bcode_build_info = { workspace = true }
 bcode_client = { workspace = true }
+bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
 bcode_hyperchad = { workspace = true, optional = true }

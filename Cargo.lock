@@ -1592,6 +1592,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_build_info",
  "bcode_client",
+ "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",
  "bcode_hyperchad",

@@ -595,6 +595,122 @@ fn derivation_cli_executes_and_observes_live_daemon() {
 }
 
 #[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn presentation_note_cli_appends_without_submitting_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let session = graph_cli_json(root.path(), &["session", "create", "note-test", "--json"]);
+    let id = session["id"].as_str().unwrap();
+    let path = root.path().join("note.txt");
+    let text = "**note λ**\n";
+    std::fs::write(&path, text).unwrap();
+    assert_eq!(
+        graph_cli_json(
+            root.path(),
+            &[
+                "session",
+                "append-presentation-note",
+                id,
+                "--source-id",
+                "cli-test",
+                "--note-id",
+                "note-1",
+                "--text-file",
+                path.to_str().unwrap(),
+                "--format",
+                "markdown"
+            ]
+        ),
+        serde_json::Value::Null
+    );
+    let page = graph_cli_json(root.path(), &["session", "history", id, "--json"]);
+    let serialized = serde_json::to_string(&page).unwrap();
+    assert!(serialized.contains("plugin_status_note"), "{page}");
+    assert!(serialized.contains("presentation_only"), "{page}");
+    assert!(serialized.contains("note-1"), "{page}");
+    assert!(!serialized.contains("user_message"), "{page}");
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn workflow_package_publication_cli_reports_absence() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    assert_eq!(
+        graph_cli_json(
+            root.path(),
+            &["workflow", "package-publication", "cli-unpublished"]
+        ),
+        serde_json::Value::Null
+    );
+    drop(daemon);
+}
+
+#[test]
+fn workflow_package_publication_cli_reports_daemon_failure() {
+    let output = run_cli_with_state(
+        &["workflow", "package-publication", "cli-unpublished"],
+        true,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn associated_run_cli_preserves_absence_for_lookup_inspection_and_control() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let base = [
+        "workflow",
+        "associated-run",
+        "--owner-plugin-id",
+        "cli-test",
+        "--workflow-kind",
+        "test",
+        "--scope-key",
+        "missing",
+    ];
+    assert_eq!(graph_cli_json(root.path(), &base), serde_json::Value::Null);
+    let mut args = base.to_vec();
+    args.extend(["--inspect", "--limit", "1"]);
+    assert_eq!(graph_cli_json(root.path(), &args), serde_json::Value::Null);
+    for action in ["pause", "resume", "cancel"] {
+        let mut args = base.to_vec();
+        args.extend(["--action", action]);
+        assert_eq!(
+            graph_cli_json(root.path(), &args),
+            serde_json::json!([null, false])
+        );
+    }
+    drop(daemon);
+}
+
+#[test]
+fn associated_run_cli_rejects_conflicting_modes_and_reports_failure() {
+    let base = [
+        "workflow",
+        "associated-run",
+        "--owner-plugin-id",
+        "cli-test",
+        "--workflow-kind",
+        "test",
+        "--scope-key",
+        "missing",
+    ];
+    let mut conflict = base.to_vec();
+    conflict.extend(["--inspect", "--action", "cancel"]);
+    let invalid = run_cli_with_state(&conflict, true);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    let failed = run_cli_with_state(&base, true);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+}
+
+#[test]
 fn derivation_commands_validate_identity_and_reach_daemon() {
     for command in [
         "derivation-snapshot",
@@ -723,6 +839,11 @@ fn workflow_package_cli_applies_and_publishes_exact_lock() {
         &["workflow", "package", "apply", "package.json"],
     );
     assert_eq!(applied[0]["outcome"], "applied");
+    let lookup = ["workflow", "package-publication", "cli/package"];
+    assert_eq!(
+        graph_cli_json(root.path(), &lookup),
+        serde_json::Value::Null
+    );
     std::fs::write(
         root.path().join("lock.json"),
         serde_json::to_vec(&applied[0]["lock"]).unwrap(),
@@ -748,6 +869,19 @@ fn workflow_package_cli_applies_and_publishes_exact_lock() {
         ],
     );
     assert_eq!(published["outcome"], "published");
+    let receipt = graph_cli_json(root.path(), &lookup);
+    let typed: bcode_workflow::WorkflowPackagePublicationReceipt =
+        serde_json::from_value(receipt.clone()).unwrap();
+    typed.validate().unwrap();
+    assert_eq!(typed.package_id, "cli/package");
+    let lock: bcode_workflow::WorkflowPackageLock =
+        serde_json::from_value(published["lock"].clone()).unwrap();
+    assert_eq!(
+        typed.package_lock_digest_sha256,
+        lock.digest_sha256().unwrap()
+    );
+    assert_eq!(typed.exports, lock.exports);
+    assert_eq!(graph_cli_json(root.path(), &lookup), receipt);
     assert_eq!(
         published["lock"]["members"][0]["published_revision"]["revision"],
         1

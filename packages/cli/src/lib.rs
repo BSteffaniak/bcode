@@ -802,7 +802,61 @@ async fn handle_ralph_command(command: RalphCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn handle_associated_run(
+    key: bcode_workflow::WorkflowRunBindingLookup,
+    inspect: bool,
+    limit: usize,
+    action: Option<&str>,
+) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    if let Some(action) = action {
+        let action = match action {
+            "pause" => bcode_workflow::WorkflowRunControlAction::Pause,
+            "resume" => bcode_workflow::WorkflowRunControlAction::Resume,
+            "cancel" => bcode_workflow::WorkflowRunControlAction::Cancel,
+            _ => unreachable!("clap validates lifecycle action"),
+        };
+        print_json(&client.control_associated_workflow_run(key, action).await?)
+    } else if inspect {
+        print_json(&client.inspect_associated_workflow_run(key, limit).await?)
+    } else {
+        print_json(&client.associated_workflow_run(key).await?)
+    }
+}
+
+async fn print_package_publication(package_id: &str) -> Result<(), CliError> {
+    print_json(
+        &BcodeClient::default_endpoint()
+            .workflow_package_publication(package_id.to_owned())
+            .await?,
+    )
+}
+
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
+    if let WorkflowCommand::AssociatedRun {
+        owner_plugin_id,
+        workflow_kind,
+        scope_key,
+        inspect,
+        limit,
+        action,
+    } = command.as_ref()
+    {
+        return Box::pin(handle_associated_run(
+            bcode_workflow::WorkflowRunBindingLookup {
+                owner_plugin_id: owner_plugin_id.clone(),
+                workflow_kind: workflow_kind.clone(),
+                scope_key: scope_key.clone(),
+            },
+            *inspect,
+            *limit,
+            action.as_deref(),
+        ))
+        .await;
+    }
+    if let WorkflowCommand::PackagePublication { package_id } = command.as_ref() {
+        return Box::pin(print_package_publication(package_id)).await;
+    }
     if let WorkflowCommand::LaunchDetail { request } = command.as_ref() {
         return Box::pin(handle_workflow_launch_detail(
             &BcodeClient::default_endpoint(),
@@ -918,7 +972,11 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 .await?,
             )?;
         }
-        WorkflowCommand::LaunchDetail { .. } => unreachable!("handled before dispatch"),
+        WorkflowCommand::AssociatedRun { .. }
+        | WorkflowCommand::PackagePublication { .. }
+        | WorkflowCommand::LaunchDetail { .. } => {
+            unreachable!("handled before dispatch")
+        }
         WorkflowCommand::CatalogView { query } => {
             let request =
                 serde_json::from_value(read_workflow_input_value(&query)?).map_err(|_| {
@@ -3771,6 +3829,25 @@ enum WorkflowCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Look up, inspect, or control the newest run for an exact binding key as JSON.
+    AssociatedRun {
+        #[arg(long)]
+        owner_plugin_id: String,
+        #[arg(long)]
+        workflow_kind: String,
+        #[arg(long)]
+        scope_key: String,
+        /// Inspect bounded run details rather than only its summary.
+        #[arg(long, conflicts_with = "action")]
+        inspect: bool,
+        #[arg(long, default_value_t = 100, requires = "inspect")]
+        limit: usize,
+        /// Apply a daemon-owned lifecycle transition; prints [run-or-null, changed].
+        #[arg(long, value_parser = ["pause", "resume", "cancel"], conflicts_with = "inspect")]
+        action: Option<String>,
+    },
+    /// Read a package publication receipt as JSON, or null when unpublished.
+    PackagePublication { package_id: String },
     /// Inspect loaded workflow templates without mutation.
     Template {
         #[command(subcommand)]
@@ -4569,6 +4646,19 @@ enum SessionCommand {
         /// Maximum directory entries visited; partial results are explicitly marked.
         #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=100_000))]
         entry_budget: u32,
+    },
+    /// Append a durable presentation-only note without submitting a model turn.
+    AppendPresentationNote {
+        session_id: SessionId,
+        #[arg(long)]
+        source_id: String,
+        #[arg(long)]
+        note_id: String,
+        /// UTF-8 text file, or - for stdin (maximum 64 KiB).
+        #[arg(long)]
+        text_file: PathBuf,
+        #[arg(long, default_value = "plain-text", value_parser = ["plain-text", "markdown", "json"])]
+        format: String,
     },
     /// Read one generation-pinned page of derivation prompt candidates as JSON.
     DerivationPrompts {
@@ -6153,6 +6243,38 @@ async fn describe_skill(skill_id: String, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn append_cli_presentation_note(
+    session_id: SessionId,
+    source_id: &str,
+    note_id: &str,
+    path: &Path,
+    format: &str,
+) -> Result<(), CliError> {
+    let bytes = if path == Path::new("-") {
+        read_bytes_with_limit(std::io::stdin().lock(), 64 * 1024, "presentation note")?
+    } else {
+        read_bytes_with_limit(fs::File::open(path)?, 64 * 1024, "presentation note")?
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| CliError::InvalidArguments("presentation note must be UTF-8".to_owned()))?;
+    let format = match format {
+        "plain-text" => bcode_command::CommandTextFormat::PlainText,
+        "markdown" => bcode_command::CommandTextFormat::Markdown,
+        "json" => bcode_command::CommandTextFormat::Json,
+        _ => unreachable!("format validated by clap"),
+    };
+    BcodeClient::default_endpoint()
+        .append_presentation_note(
+            session_id,
+            source_id.to_owned(),
+            note_id.to_owned(),
+            text,
+            format,
+        )
+        .await?;
+    print_json(&())
+}
+
 async fn execute_derivation(path: &Path) -> Result<(), CliError> {
     let request: bcode_session_models::SessionDerivationRequest = serde_json::from_value(
         read_json_with_limit(path, 1024 * 1024, "session derivation request")?,
@@ -6230,6 +6352,22 @@ async fn print_derivation_status(operation_id: uuid::Uuid) -> Result<(), CliErro
 
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match command.as_ref() {
+        SessionCommand::AppendPresentationNote {
+            session_id,
+            source_id,
+            note_id,
+            text_file,
+            format,
+        } => {
+            Box::pin(append_cli_presentation_note(
+                *session_id,
+                source_id,
+                note_id,
+                text_file,
+                format,
+            ))
+            .await
+        }
         SessionCommand::Derive { request } => Box::pin(execute_derivation(request)).await,
         SessionCommand::DerivationPrompts {
             session_id,
@@ -6271,7 +6409,8 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
                 .await?;
             print_json(&usage)?;
         }
-        SessionCommand::Derive { .. }
+        SessionCommand::AppendPresentationNote { .. }
+        | SessionCommand::Derive { .. }
         | SessionCommand::DerivationPrompts { .. }
         | SessionCommand::DerivationSnapshot { .. }
         | SessionCommand::DerivationStatus { .. }
