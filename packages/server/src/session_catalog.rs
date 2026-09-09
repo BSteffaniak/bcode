@@ -73,6 +73,8 @@ struct SourceDiagnostics {}
 
 #[derive(Debug, Clone)]
 enum CatalogSourcePlan {
+    /// Sessions owned by an in-memory manager, with no durable location claim.
+    InMemory,
     /// Canonical sessions owned by one resolved state location.
     ///
     /// The primary location is loaded through the owning `SessionManager`. Additional
@@ -165,8 +167,14 @@ impl SessionCatalog {
     ) -> SessionCatalogSnapshot {
         let working_directory = normalize_path(working_directory);
         self.ensure_sources(state, &working_directory).await;
+        let hide_imported = if state.locations.is_some() {
+            state.startup_config.session_import.hide_already_imported
+        } else {
+            bcode_config::load_config()
+                .map_or(true, |config| config.session_import.hide_already_imported)
+        };
         let inner = self.inner.lock().await;
-        snapshot_locked(&inner, &working_directory)
+        snapshot_locked(&inner, &working_directory, hide_imported)
     }
 
     /// Return whether more than one readable state location claims this session ID.
@@ -197,7 +205,16 @@ impl SessionCatalog {
 
     /// Replace the primary native source with a fresh view from the session manager.
     pub async fn refresh_native_now(&self, state: &ServerState) {
-        let Some(location) = native_locations()
+        if state.sessions.session_store_root().is_none() {
+            self.apply_source_result(
+                native_source_key(),
+                native_metadata(),
+                load_in_memory_source(state).await,
+            )
+            .await;
+            return;
+        }
+        let Some(location) = native_locations(state)
             .into_iter()
             .find(|location| location.primary)
         else {
@@ -412,6 +429,7 @@ struct SourceLoadResult {
 impl CatalogSourcePlan {
     fn key(&self) -> CatalogSourceKey {
         match self {
+            Self::InMemory => native_source_key(),
             Self::Native { location } => CatalogSourceKey {
                 source_id: location.source_id(),
                 scope: CatalogSourceScope::Global,
@@ -429,6 +447,7 @@ impl CatalogSourcePlan {
 
     fn metadata(&self) -> SourceMetadata {
         match self {
+            Self::InMemory => native_metadata(),
             Self::Native { location } => SourceMetadata {
                 display_name: location.display_name(),
             },
@@ -471,12 +490,13 @@ fn native_metadata() -> SourceMetadata {
 /// `[state] readable_profiles`. Resolution failures are skipped rather than propagated: a
 /// location that cannot be resolved must not prevent the rest of the catalog from loading
 /// (`Domain-local durable failures remain isolated`).
-fn native_locations() -> Vec<NativeLocation> {
-    let primary_sessions_root = bcode_config::default_session_store_dir();
-    let primary_root = bcode_config::default_state_dir();
-    let primary_id = bcode_config::StateLocationId::from_canonical_root(&primary_root)
-        .as_str()
-        .to_owned();
+fn native_locations(state: &ServerState) -> Vec<NativeLocation> {
+    let Some(primary_sessions_root) = state.sessions.session_store_root() else {
+        return Vec::new();
+    };
+    let Some(primary_id) = state.daemon_status.state_location_id.clone() else {
+        return Vec::new();
+    };
     let mut locations = vec![NativeLocation {
         location_id: primary_id.clone(),
         profile: None,
@@ -484,17 +504,22 @@ fn native_locations() -> Vec<NativeLocation> {
         primary: true,
     }];
 
-    let Ok(config) = bcode_config::load_config() else {
-        return locations;
-    };
-    if config.state.readable_profiles.is_empty() {
-        return locations;
-    }
-    let Ok(resolved) = bcode_config::resolve_state_location_set(
-        &config.state,
-        &bcode_config::StateLocationSelection::default(),
-    ) else {
-        return locations;
+    let resolved = if let Some(locations) = &state.locations {
+        locations.clone()
+    } else {
+        let Ok(config) = bcode_config::load_config() else {
+            return locations;
+        };
+        if config.state.readable_profiles.is_empty() {
+            return locations;
+        }
+        let Ok(resolved) = bcode_config::resolve_state_location_set(
+            &config.state,
+            &bcode_config::StateLocationSelection::default(),
+        ) else {
+            return locations;
+        };
+        resolved
     };
     for location in resolved.readable() {
         let location_id = location.id().as_str().to_owned();
@@ -515,12 +540,35 @@ fn native_locations() -> Vec<NativeLocation> {
     locations
 }
 
+async fn load_in_memory_source(state: &ServerState) -> Result<SourceLoadResult, String> {
+    let entries = state.sessions.all_session_catalog_entries().await;
+    Ok(SourceLoadResult {
+        diagnostics: native_source_diagnostics(&entries),
+        sessions: entries
+            .into_iter()
+            .map(|entry| {
+                let mut summary = entry.summary;
+                summary.location = None;
+                summary
+            })
+            .collect(),
+    })
+}
+
 async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<CatalogSourcePlan> {
-    let mut plans = native_locations()
+    let mut plans = native_locations(state)
         .into_iter()
         .map(|location| CatalogSourcePlan::Native { location })
         .collect::<Vec<_>>();
-    if !bcode_config::load_config().map_or(true, |config| config.session_import.enabled) {
+    if state.sessions.session_store_root().is_none() {
+        plans.push(CatalogSourcePlan::InMemory);
+    }
+    let imports_enabled = if state.locations.is_some() {
+        state.startup_config.session_import.enabled
+    } else {
+        bcode_config::load_config().map_or(true, |config| config.session_import.enabled)
+    };
+    if !imports_enabled {
         return plans;
     }
     let providers = state
@@ -547,6 +595,7 @@ async fn load_source(
     plan: &CatalogSourcePlan,
 ) -> Result<SourceLoadResult, String> {
     match plan {
+        CatalogSourcePlan::InMemory => load_in_memory_source(state).await,
         CatalogSourcePlan::Native { location } => {
             if location.primary {
                 load_native_source(state, location).await
@@ -630,14 +679,13 @@ fn native_source_diagnostics(_entries: &[SessionCatalogEntry]) -> SourceDiagnost
 fn snapshot_locked(
     inner: &SessionCatalogInner,
     working_directory: &Path,
+    hide_imported: bool,
 ) -> SessionCatalogSnapshot {
     let native_sessions = inner
         .sources
         .get(&native_source_key())
         .map_or(&[][..], SourceCache::sessions);
     let native_imports = native_import_identities(native_sessions);
-    let hide_imported = bcode_config::load_config()
-        .map_or(true, |config| config.session_import.hide_already_imported);
     let mut sessions = Vec::new();
     let mut sources = Vec::new();
 
@@ -944,6 +992,24 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_primary_uses_retained_store_and_identity() {
+        let root = tempfile::tempdir().expect("store root");
+        let mut state = crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        );
+        state.daemon_status.state_location_id = Some("retained-location".to_owned());
+        let locations = super::native_locations(&state);
+        let primary = locations
+            .iter()
+            .find(|location| location.primary)
+            .expect("primary");
+        assert_eq!(primary.sessions_root, root.path());
+        assert_eq!(primary.location_id, "retained-location");
+        state.daemon_status.state_location_id = None;
+        assert!(super::native_locations(&state).is_empty());
+        drop(state);
+    }
     use super::{
         CatalogSourcePlan, NativeLocation, SessionCatalog, SourceDiagnostics, SourceLoadResult,
         mark_ambiguous_locations,
@@ -1001,7 +1067,7 @@ mod tests {
         renamed.name = Some("renamed".into());
         catalog.upsert_native_session(renamed).await;
         let inner = catalog.inner.lock().await;
-        let snapshot = super::snapshot_locked(&inner, &session.working_directory);
+        let snapshot = super::snapshot_locked(&inner, &session.working_directory, true);
         drop(inner);
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.sessions[0].name.as_deref(), Some("renamed"));
@@ -1011,7 +1077,7 @@ mod tests {
         catalog.invalidate_native().await;
         assert_eq!(*revisions.borrow_and_update(), 4);
         let inner = catalog.inner.lock().await;
-        let snapshot = super::snapshot_locked(&inner, &session.working_directory);
+        let snapshot = super::snapshot_locked(&inner, &session.working_directory, true);
         drop(inner);
         assert_eq!(snapshot.revision, 4);
         assert!(snapshot.sessions.is_empty());

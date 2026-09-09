@@ -9460,19 +9460,16 @@ mod tests {
         registration.activate().expect("login activation");
         registration.activate().expect("another host activation");
         registration.deactivate().expect("other host shutdown");
-        {
-            let lease = registration.acquire().expect("login instance");
-            assert_eq!(
-                lease
-                    .plugin()
-                    .runtime
-                    .as_ref()
-                    .expect("runtime")
-                    .block_on(async { 42 })
-                    .expect("runtime must be live"),
-                42
-            );
-        }
+        let lease = registration.acquire().expect("login instance");
+        let result = lease
+            .plugin()
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .block_on(async { 42 })
+            .expect("runtime must be live");
+        drop(lease);
+        assert_eq!(result, 42);
         registration.deactivate().expect("login shutdown");
     }
 

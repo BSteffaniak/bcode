@@ -3,7 +3,7 @@
 
 use bcode_fake_provider_plugin::FakeProviderPlugin;
 use bcode_fake_provider_plugin::prompt_cache::{
-    FAKE_CACHE_EXPLICIT_MODEL_ID, FAKE_CACHE_PREFIX_MODEL_ID, reset,
+    FAKE_CACHE_EXPLICIT_MODEL_ID, FAKE_CACHE_PREFIX_MODEL_ID,
 };
 use bcode_model_provider_runtime::BlockingModelProviderInvoker;
 use bcode_plugin_sdk::{
@@ -14,18 +14,6 @@ use bcode_prompt_cache::scenarios::{
     PromptCacheScenarioOptions, run_prompt_cache_scenarios, scenario,
 };
 use bcode_prompt_cache::{PromptCacheMechanism, PromptCacheScenarioOutcome, measurement};
-use std::sync::{Mutex, MutexGuard};
-
-/// The fake cache simulator is process-wide; serialize tests that reset it.
-static SIMULATOR_LOCK: Mutex<()> = Mutex::new(());
-
-fn simulator_guard() -> MutexGuard<'static, ()> {
-    let guard = SIMULATOR_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reset();
-    guard
-}
 
 #[derive(Default)]
 struct FakePluginInvoker {
@@ -100,7 +88,6 @@ fn outcome<'a>(
 
 #[test]
 fn explicit_cache_model_passes_every_scenario() {
-    let _guard = simulator_guard();
     let report = run_prompt_cache_scenarios(
         &mut FakePluginInvoker::default(),
         &options(FAKE_CACHE_EXPLICIT_MODEL_ID),
@@ -153,7 +140,6 @@ fn explicit_cache_model_passes_every_scenario() {
 
 #[test]
 fn automatic_prefix_model_passes_applicable_scenarios_and_skips_explicit_ones() {
-    let _guard = simulator_guard();
     let report = run_prompt_cache_scenarios(
         &mut FakePluginInvoker::default(),
         &options(FAKE_CACHE_PREFIX_MODEL_ID),
@@ -202,7 +188,6 @@ fn automatic_prefix_model_passes_applicable_scenarios_and_skips_explicit_ones() 
 
 #[test]
 fn non_caching_model_skips_every_scenario() {
-    let _guard = simulator_guard();
     let report =
         run_prompt_cache_scenarios(&mut FakePluginInvoker::default(), &options("fake-echo"))
             .expect("scenario suite runs against a non-caching model");

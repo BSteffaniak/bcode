@@ -275,6 +275,7 @@ struct InvariantSelectorModel {
 
 #[derive(Clone)]
 struct InvariantSelectorRuntime {
+    state_root: PathBuf,
     plugins: bcode_plugin::PluginRuntimeHost,
     config: bcode_config::InvariantsConfig,
     model: InvariantSelectorModel,
@@ -306,6 +307,8 @@ struct WorktreeCreateOperation {
 
 #[derive(Debug)]
 pub struct ServerState {
+    locations: Option<bcode_config::StateLocationSet>,
+    state_root: PathBuf,
     pub sessions: SessionManager,
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
@@ -1644,11 +1647,35 @@ impl ServerState {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn new_with_workflow_status(
+        sessions: SessionManager,
+        plugins: bcode_plugin::PluginRuntimeHost,
+        init: ServerStateInit,
+        unavailable: Option<String>,
+        state_root: PathBuf,
+        locations: Option<bcode_config::StateLocationSet>,
+    ) -> Self {
+        let mut state = Self::new_in_state_root(sessions, plugins, init, state_root);
+        state.locations = locations;
+        state.workflow_store_unavailable = unavailable;
+        state
+    }
+
+    #[cfg(test)]
     fn new(
         sessions: SessionManager,
         plugins: bcode_plugin::PluginRuntimeHost,
         init: ServerStateInit,
+    ) -> Self {
+        Self::new_in_state_root(sessions, plugins, init, bcode_config::default_state_dir())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn new_in_state_root(
+        sessions: SessionManager,
+        plugins: bcode_plugin::PluginRuntimeHost,
+        init: ServerStateInit,
+        state_root: PathBuf,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         let session_migrations = bcode_session_migration::SessionMigrationService::default();
@@ -1656,10 +1683,10 @@ impl ServerState {
             || {
                 workflow_store_or_degraded(
                     bcode_workflow_store::WorkflowStore::initialize_in_state_dir(
-                        &bcode_config::default_state_dir(),
+                        &state_root,
                         current_time_ms(),
                     ),
-                    &bcode_config::default_state_dir()
+                    &state_root
                         .join("degraded-domains")
                         .join(format!("workflow-{}", std::process::id())),
                 )
@@ -1667,6 +1694,8 @@ impl ServerState {
             |store| (store, None),
         );
         Self {
+            locations: None,
+            state_root,
             sessions,
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
@@ -3126,6 +3155,7 @@ async fn invariant_selector_runtime(
     model.model_id = target.model_id;
     model.provider_context = target.provider_context;
     Some(InvariantSelectorRuntime {
+        state_root: state.state_root.clone(),
         plugins: state.plugins.clone(),
         config: config.invariants.clone(),
         model,
@@ -3275,14 +3305,12 @@ fn invariant_guidance_state_path(state_root: &Path, session_id: SessionId) -> Pa
         .join(format!("{session_id}.json"))
 }
 
-fn invariant_guidance_state_dir(session_id: SessionId) -> PathBuf {
-    invariant_guidance_state_path(&bcode_config::default_state_dir(), session_id)
-}
-
 fn load_persisted_invariant_guidance(
+    state_root: &Path,
     session_id: SessionId,
 ) -> Option<invariant_guidance::InvariantGuidance> {
-    let contents = fs::read_to_string(invariant_guidance_state_dir(session_id)).ok()?;
+    let contents =
+        fs::read_to_string(invariant_guidance_state_path(state_root, session_id)).ok()?;
     serde_json::from_str(&contents).ok()
 }
 
@@ -3304,14 +3332,18 @@ fn write_invariant_guidance_path(
 }
 
 fn persist_invariant_guidance(
+    state_root: &Path,
     session_id: SessionId,
     guidance: &invariant_guidance::InvariantGuidance,
 ) {
-    let _ = write_invariant_guidance_path(&invariant_guidance_state_dir(session_id), guidance);
+    let _ = write_invariant_guidance_path(
+        &invariant_guidance_state_path(state_root, session_id),
+        guidance,
+    );
 }
 
-fn clear_persisted_invariant_guidance(session_id: SessionId) {
-    let _ = fs::remove_file(invariant_guidance_state_dir(session_id));
+fn clear_persisted_invariant_guidance(state_root: &Path, session_id: SessionId) {
+    let _ = fs::remove_file(invariant_guidance_state_path(state_root, session_id));
 }
 
 fn user_message_text(event: &bcode_session_models::SessionEvent) -> Option<&str> {
@@ -3671,10 +3703,10 @@ async fn apply_invariant_selector_result(
     let mut stored = runtime.guidance.lock().await;
     runtime.full_fallback.lock().await.remove(&session_id);
     if let Some(guidance) = guidance {
-        persist_invariant_guidance(session_id, &guidance);
+        persist_invariant_guidance(&runtime.state_root, session_id, &guidance);
         stored.insert(session_id, guidance);
     } else {
-        clear_persisted_invariant_guidance(session_id);
+        clear_persisted_invariant_guidance(&runtime.state_root, session_id);
         stored.remove(&session_id);
     }
 }
@@ -3870,6 +3902,7 @@ async fn run_with_config(
             plugin_selection,
             default_plugin_ids,
             shutdown: bcode_agent_runtime::CancellationToken::new(),
+            locations: None,
         },
     )
     .await
@@ -3926,6 +3959,38 @@ pub async fn run_embedded_with_services_and_shutdown(
     default_plugin_ids: Vec<String>,
     shutdown: bcode_agent_runtime::CancellationToken,
 ) -> Result<(), ServerError> {
+    run_embedded_with_locations_and_shutdown(
+        endpoint,
+        config,
+        plugins,
+        model_catalog,
+        default_plugin_ids,
+        shutdown,
+        None,
+    )
+    .await
+}
+
+/// Run an embedded server with caller-resolved durable locations and graceful shutdown.
+///
+/// When supplied, locations own primary storage and readable catalog discovery for this
+/// instance without modifying process configuration. `None` retains native acquisition.
+/// Plugin services must already be configured for the same locations by their owner.
+/// IPC, clocks, scheduling, and non-storage configuration acquisition remain native.
+///
+/// # Errors
+///
+/// Returns initialization, client handling, or shutdown failures.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_embedded_with_locations_and_shutdown(
+    endpoint: IpcEndpoint,
+    config: bcode_config::BcodeConfig,
+    plugins: bcode_plugin::PluginRuntimeHost,
+    model_catalog: bcode_model_catalog::ModelCatalogResolver,
+    default_plugin_ids: Vec<String>,
+    shutdown: bcode_agent_runtime::CancellationToken,
+    locations: Option<bcode_config::StateLocationSet>,
+) -> Result<(), ServerError> {
     let plugin_selection = plugins.selection().clone();
     Box::pin(run_with_services(
         endpoint,
@@ -3933,6 +3998,7 @@ pub async fn run_embedded_with_services_and_shutdown(
         config,
         Instant::now(),
         ServerStartupServices {
+            locations,
             plugins,
             model_catalog,
             plugin_selection,
@@ -3948,6 +4014,7 @@ pub async fn run_embedded_with_services_and_shutdown(
 /// Keep acquisition outside execution so construction failures use the same
 /// plugin cleanup path regardless of how these services were acquired.
 struct ServerStartupServices {
+    locations: Option<bcode_config::StateLocationSet>,
     plugins: bcode_plugin::PluginRuntimeHost,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     plugin_selection: bcode_plugin::PluginSelection,
@@ -3969,16 +4036,21 @@ async fn run_with_services(
         plugin_selection,
         default_plugin_ids,
         shutdown: host_shutdown,
+        locations,
     } = services;
     if host_shutdown.is_cancelled() {
         plugins.deactivate_all().await?;
         return Ok(());
     }
+    let state_root = locations
+        .as_ref()
+        .map_or_else(bcode_config::default_state_dir, |locations| {
+            locations.primary().root().to_path_buf()
+        });
     let mut stage_started_at = Instant::now();
     let startup_resources = (|| {
-        let legacy_recovery = session_migration_adapter::recover_historical_session_storage(
-            &bcode_config::default_state_dir(),
-        )?;
+        let legacy_recovery =
+            session_migration_adapter::recover_historical_session_storage(&state_root)?;
         if !legacy_recovery.relocated.is_empty() {
             tracing::info!(
                 target: "bcode_server::startup",
@@ -4040,7 +4112,13 @@ async fn run_with_services(
             session_event_schema_version: Some(
                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             ),
-            state_location_id: Some(bcode_ipc::state_location_id()),
+            state_location_id: Some(
+                locations
+                    .as_ref()
+                    .map_or_else(bcode_ipc::state_location_id, |locations| {
+                        locations.primary().id().as_str().to_owned()
+                    }),
+            ),
             ..DaemonStatus::default()
         },
         daemon_status_from_record,
@@ -4056,9 +4134,7 @@ async fn run_with_services(
     let metrics = if config.metrics.enabled {
         if config.metrics.persist_events {
             MetricsRegistry::with_event_log_config(
-                bcode_config::default_state_dir()
-                    .join("metrics")
-                    .join("events.jsonl"),
+                state_root.join("metrics").join("events.jsonl"),
                 MetricsEventLogConfig {
                     segment_max_bytes: config.metrics.segment_max_bytes,
                     total_max_bytes: config.metrics.total_max_bytes,
@@ -4076,7 +4152,11 @@ async fn run_with_services(
         .with_selection(plugin_selection.clone())
         .with_metrics(metrics.clone());
     let sessions = SessionManager::persistent_lazy_with_metrics_and_lease_owner(
-        bcode_config::default_session_store_dir(),
+        locations
+            .as_ref()
+            .map_or_else(bcode_config::default_session_store_dir, |locations| {
+                locations.primary().sessions_root().to_path_buf()
+            }),
         metrics.clone(),
         SessionLeaseOwnerContext {
             storage_writer_epoch: Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
@@ -4114,8 +4194,17 @@ async fn run_with_services(
             selection: resolved_model.clone(),
         },
     );
+    let (workflow_store, workflow_store_unavailable) = workflow_store_or_degraded(
+        bcode_workflow_store::WorkflowStore::initialize_in_state_dir(
+            &state_root,
+            current_time_ms(),
+        ),
+        &state_root
+            .join("degraded-domains")
+            .join(format!("workflow-{}", std::process::id())),
+    );
     let construction_started_at = Instant::now();
-    let state = Arc::new(ServerState::new(
+    let state = Arc::new(ServerState::new_with_workflow_status(
         sessions,
         plugins,
         ServerStateInit {
@@ -4130,27 +4219,29 @@ async fn run_with_services(
             selected_reasoning_capabilities: reasoning_capabilities_from_config(
                 &resolved_model.reasoning,
             ),
-            provider_state: ProviderStateStore::load(default_provider_state_path()),
+            provider_state: ProviderStateStore::load(provider_state_path(&state_root)),
             observability: config.observability,
             session_search_enabled: config.session_search.enabled,
-            trace_store: TraceStore::new(default_trace_store_dir()),
+            trace_store: TraceStore::new(state_root.join("traces")),
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
             skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
             skills,
             daemon_status,
             daemon_record_path: daemon_record.as_ref().map(|daemon_record| {
-                bcode_daemon_lifecycle::record_path(
-                    &bcode_config::default_state_dir(),
-                    &daemon_record.namespace,
-                )
+                bcode_daemon_lifecycle::record_path(&state_root, &daemon_record.namespace)
             }),
             startup_started_at: Some(startup_started_at),
             metrics,
-            workflow_store: None,
+            workflow_store: Some(workflow_store),
             workflow_application_authorization: None,
-            ralph_store: bcode_ralph::RalphStateStore::default(),
+            ralph_store: bcode_ralph::RalphStateStore::from_ralph_state_root(
+                state_root.join("ralph"),
+            ),
         },
+        workflow_store_unavailable,
+        state_root,
+        locations,
     ));
     tracing::debug!(
         target: "bcode_server::startup",
@@ -6798,6 +6889,17 @@ async fn handle_core_runtime_request(
             .await
         }
         CoreRuntimeRequest::SetAuthPoolPreference { pool, profile } => {
+            if state.locations.is_some() {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "auth_pool_preference_unavailable",
+                        "Scoped auth-pool preference persistence is unavailable; no user state was changed",
+                    )),
+                )
+                .await;
+            }
             match bcode_provider_auth::set_auth_pool_preference(&pool, profile.as_deref()) {
                 Ok(_) => {
                     send_response(
@@ -7093,8 +7195,13 @@ struct ClientHello {
 /// explicit endpoint. Verifying here keeps the daemon from mutating canonical
 /// session storage on behalf of a client that resolved another location. A client
 /// that advertises no identity is unverifiable, not assumed local.
-fn validate_client_state_location(state_location_id: Option<&str>) -> Result<(), String> {
-    let expected = bcode_ipc::state_location_id();
+fn validate_client_state_location(
+    state_location_id: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Err("daemon state location is unverifiable".to_owned());
+    };
     match state_location_id {
         Some(state_location_id) if state_location_id == expected => Ok(()),
         Some(state_location_id) => Err(format!(
@@ -7150,7 +7257,10 @@ async fn handle_hello(
         )
         .await;
     }
-    if let Err(message) = validate_client_state_location(hello.state_location_id.as_deref()) {
+    if let Err(message) = validate_client_state_location(
+        hello.state_location_id.as_deref(),
+        state.daemon_status.state_location_id.as_deref(),
+    ) {
         return send_response(
             writer,
             request_id,
@@ -10243,8 +10353,15 @@ fn remove_finalized_active_artifact(
     }
 }
 
+fn session_artifact_dir(state: &ServerState, session_id: SessionId) -> Result<PathBuf, String> {
+    let root = state.sessions.session_store_root().ok_or_else(|| {
+        "session artifact storage requires an owning persistent session store".to_owned()
+    })?;
+    Ok(root.join("session-artifacts").join(session_id.to_string()))
+}
+
 async fn read_active_artifact_range(
-    session_id: SessionId,
+    artifact_root: PathBuf,
     artifact_id: &str,
     reference_key: &str,
     offset: u64,
@@ -10257,7 +10374,6 @@ async fn read_active_artifact_range(
                 .to_owned(),
         );
     }
-    let artifact_root = default_session_artifact_dir(session_id);
     let path = active.path.clone();
     let committed_bytes = active.committed_bytes;
     let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
@@ -10308,7 +10424,7 @@ async fn read_session_artifact_range(
     let active = active_artifact_reference(state, session_id, artifact_id, reference_key)?;
     if let Some(active) = active.as_ref().filter(|reference| !reference.finalized) {
         return read_active_artifact_range(
-            session_id,
+            session_artifact_dir(state, session_id)?,
             artifact_id,
             reference_key,
             offset,
@@ -10334,7 +10450,7 @@ async fn read_session_artifact_range(
         ) => {
             if let Some(active) = active {
                 return read_active_artifact_range(
-                    session_id,
+                    session_artifact_dir(state, session_id)?,
                     artifact_id,
                     reference_key,
                     offset,
@@ -10350,7 +10466,7 @@ async fn read_session_artifact_range(
     let Some(reference) = reference else {
         if let Some(active) = active {
             return read_active_artifact_range(
-                session_id,
+                session_artifact_dir(state, session_id)?,
                 artifact_id,
                 reference_key,
                 offset,
@@ -10370,7 +10486,7 @@ async fn read_session_artifact_range(
         .storage_uri
         .as_deref()
         .ok_or_else(|| "artifact reference has no storage URI".to_owned())?;
-    let artifact_root = default_session_artifact_dir(session_id);
+    let artifact_root = session_artifact_dir(state, session_id)?;
     let path = artifact_reference_path(uri, &artifact_root)?;
     let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
         read_artifact_file_range(&path, &artifact_root, offset, length)
@@ -16202,7 +16318,7 @@ async fn run_model_turn(
             .lock()
             .await
             .contains_key(&session_id)
-        && let Some(guidance) = load_persisted_invariant_guidance(session_id)
+        && let Some(guidance) = load_persisted_invariant_guidance(&state.state_root, session_id)
     {
         state
             .invariant_guidance
@@ -24362,15 +24478,22 @@ async fn invocation_service_host_context(
         .into_iter()
         .map(|route| route.advertised)
         .collect::<Vec<_>>();
-    Ok(vec![
+    let mut context = vec![
         bcode_tool::ToolHostContextEntry {
             schema: bcode_tool::TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA.to_owned(),
             schema_version: 1,
             payload: serde_json::to_value(routes).unwrap_or(serde_json::Value::Null),
         },
         workspace_host_context_entry(working_directory, Some(&session_id.to_string()))?,
-        artifact_host_context_entry(&default_session_artifact_dir(session_id)),
-    ])
+    ];
+    // An in-memory session has no durable artifact capability. Do not prevent unrelated
+    // tools from preparing, or silently give them a process-global persistence location.
+    if state.sessions.session_store_root().is_some() {
+        context.push(artifact_host_context_entry(&session_artifact_dir(
+            state, session_id,
+        )?));
+    }
+    Ok(context)
 }
 
 #[derive(Debug)]
@@ -25556,7 +25679,7 @@ fn server_workflow_plugin_bridge(
                 dispatch_identity.clone(),
             );
             let sink = SessionArtifactSink::new(
-                default_session_artifact_dir(parent_session_id),
+                session_artifact_dir(&state, parent_session_id)?,
                 &dispatch_identity,
                 &cancel_state,
             );
@@ -26063,7 +26186,7 @@ async fn resolve_server_plugin_bridge_request(
         }
         ServiceBridgeRequest::WriteArtifact(request) => {
             let sink = SessionArtifactSink::new(
-                default_session_artifact_dir(session_id),
+                session_artifact_dir(state, session_id)?,
                 &call.id,
                 cancel_state,
             );
@@ -27073,7 +27196,7 @@ fn update_active_artifact(
     if owner.producer_plugin_id != event.producer_id {
         return Err("active artifact producer does not own the invocation".to_owned());
     }
-    let artifact_root = default_session_artifact_dir(session_id);
+    let artifact_root = session_artifact_dir(state, session_id)?;
     let path = artifact_reference_path(&artifact.storage_uri, &artifact_root)?;
     let canonical_root = artifact_root
         .canonicalize()
@@ -31028,7 +31151,7 @@ fn workflow_run_artifact_is_launchable(state: &Arc<ServerState>, run_id: &str) -
         .execution_authority(run_id);
     match authority {
         Ok(Some(authority)) => bcode_daemon_lifecycle::artifact_image_is_available(
-            &bcode_config::default_state_dir(),
+            &state.state_root,
             &authority.target_artifact_id,
         ),
         // Without readable authority evidence, assume a recoverable deferral rather than
@@ -33459,13 +33582,11 @@ async fn active_skill_contexts(
     contexts
 }
 
-fn default_provider_state_path() -> PathBuf {
-    bcode_config::default_state_dir()
-        .join("provider-state")
-        .join(format!(
-            "{}.json",
-            safe_state_namespace(bcode_ipc::BUILD_FINGERPRINT)
-        ))
+fn provider_state_path(state_root: &Path) -> PathBuf {
+    state_root.join("provider-state").join(format!(
+        "{}.json",
+        safe_state_namespace(bcode_ipc::BUILD_FINGERPRINT)
+    ))
 }
 
 fn safe_state_namespace(value: &str) -> String {
@@ -33484,10 +33605,6 @@ fn safe_state_namespace(value: &str) -> String {
     } else {
         namespace
     }
-}
-
-fn default_trace_store_dir() -> PathBuf {
-    bcode_config::default_state_dir().join("traces")
 }
 
 fn remove_session_artifact_dir(path: &Path) -> std::io::Result<()> {
@@ -33510,6 +33627,7 @@ fn remove_session_artifact_dir(path: &Path) -> std::io::Result<()> {
 /// every canonical backup copy them. Canonical session discovery only accepts
 /// directory names that parse as a session ID, so this sibling is ignored by
 /// catalog scans.
+#[cfg(test)]
 fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
     bcode_config::default_session_store_dir()
         .join("session-artifacts")
@@ -38225,7 +38343,7 @@ library = "test"
             .expect("session")
             .id;
         let state = test_server_state(sessions.clone());
-        let artifact_root = default_session_artifact_dir(session_id);
+        let artifact_root = session_artifact_dir(&state, session_id).expect("owned artifact root");
         let cancel_state = TurnCancelState::default();
         let sink = SessionArtifactSink::new(artifact_root.clone(), "call-image", &cancel_state);
         let resolution = sink
@@ -39423,7 +39541,8 @@ library = "test"
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // Exercises registration, revision, range, finalization, and cleanup as one lifecycle.
     async fn active_artifact_registry_enforces_owner_revision_commit_and_snapshot() {
-        let sessions = SessionManager::default();
+        let artifact_store = tempfile::tempdir().expect("artifact session store");
+        let sessions = SessionManager::persistent_lazy(artifact_store.path());
         let session_id = sessions
             .create_session(Some("active-artifact".to_owned()), test_working_directory())
             .await
@@ -39431,7 +39550,7 @@ library = "test"
             .id;
         let state = test_server_state(sessions);
         let tool_call_id = "call-active";
-        let artifact_dir = default_session_artifact_dir(session_id);
+        let artifact_dir = session_artifact_dir(&state, session_id).expect("owned artifact root");
         std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
         let path = artifact_dir.join("active.bin");
         std::fs::write(&path, b"committed-uncommitted").expect("active artifact");
@@ -39577,7 +39696,7 @@ library = "test"
             )
             .await
             .expect("tool request");
-        let artifact_dir = default_session_artifact_dir(session_id);
+        let artifact_dir = session_artifact_dir(&state, session_id).expect("owned artifact root");
         std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
         let path = artifact_dir.join("transition.bin");
         std::fs::write(&path, b"canonical").expect("artifact");
@@ -39678,7 +39797,8 @@ library = "test"
 
     #[tokio::test]
     async fn unfinished_active_artifact_becomes_explicitly_incomplete_after_producer_drop() {
-        let sessions = SessionManager::default();
+        let artifact_store = tempfile::tempdir().expect("artifact session store");
+        let sessions = SessionManager::persistent_lazy(artifact_store.path());
         let session_id = sessions
             .create_session(
                 Some("abandoned-artifact".to_owned()),
@@ -39688,7 +39808,7 @@ library = "test"
             .expect("session")
             .id;
         let state = test_server_state(sessions);
-        let artifact_dir = default_session_artifact_dir(session_id);
+        let artifact_dir = session_artifact_dir(&state, session_id).expect("owned artifact root");
         std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
         let path = artifact_dir.join("abandoned.bin");
         std::fs::write(&path, b"committed").expect("artifact");
@@ -39806,21 +39926,17 @@ library = "test"
 
     #[test]
     fn client_state_location_validation_fails_closed() {
-        let expected = bcode_ipc::state_location_id();
-
-        assert!(
-            super::validate_client_state_location(Some(expected.as_str())).is_ok(),
-            "a client resolving the same state location must be accepted"
-        );
-
-        let foreign = super::validate_client_state_location(Some("some-other-location"))
-            .expect_err("a client resolving another state location must be rejected");
-        assert!(foreign.contains("some-other-location"), "{foreign}");
-        assert!(foreign.contains(&expected), "{foreign}");
-
-        let unverifiable = super::validate_client_state_location(None)
-            .expect_err("a client advertising no state location is unverifiable, not compatible");
-        assert!(unverifiable.contains(&expected), "{unverifiable}");
+        // The serving identity is captured at startup, not read from the process here.
+        let expected = "captured-server-location";
+        assert!(super::validate_client_state_location(Some(expected), Some(expected)).is_ok());
+        let foreign =
+            super::validate_client_state_location(Some("some-other-location"), Some(expected))
+                .expect_err("foreign client must be rejected");
+        assert!(foreign.contains("some-other-location"));
+        assert!(foreign.contains(expected));
+        assert!(super::validate_client_state_location(None, Some(expected)).is_err());
+        assert!(super::validate_client_state_location(Some(expected), None).is_err());
+        assert!(super::validate_client_state_location(None, None).is_err());
     }
 
     #[test]
@@ -52224,9 +52340,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         })
             )
         }));
-        let guarded_path =
-            artifact_reference_path(&storage_uri, &default_session_artifact_dir(session_id))
-                .expect("resolve guarded image reference");
+        let guarded_path = artifact_reference_path(
+            &storage_uri,
+            &session_artifact_dir(&state, session_id).expect("owned artifact root"),
+        )
+        .expect("resolve guarded image reference");
         assert_eq!(
             std::fs::read(guarded_path).expect("guarded image bytes"),
             png_bytes
@@ -57809,6 +57927,110 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn embedded_resolved_locations_initialize_only_the_supplied_roots() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let ready = tokio::sync::Barrier::new(2);
+        let created = tokio::sync::Barrier::new(2);
+        let directory = &directory;
+        let ready = &ready;
+        let created = &created;
+        let exercise = |name: &'static str| async move {
+            let root = directory.path().join(name);
+            fs::create_dir(&root).expect("state root");
+            let locations = bcode_config::resolve_state_location_set_with_environment(
+                &bcode_config::StateConfig::default(),
+                &bcode_config::StateLocationSelection {
+                    root: Some(root.clone()),
+                    profile: None,
+                },
+                &bcode_config::ConfigEnvironmentSnapshot::new(
+                    BTreeMap::new(),
+                    directory.path().to_path_buf(),
+                ),
+            )
+            .expect("resolve locations");
+            let (plugins,) = (
+                bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                    &bcode_plugin::PluginSelection {
+                        mode: bcode_plugin::PluginSelectionMode::Explicit,
+                        enabled: BTreeSet::new(),
+                        disabled: BTreeSet::new(),
+                    },
+                    &[],
+                )
+                .expect("empty plugins"),
+            );
+            let shutdown = bcode_agent_runtime::CancellationToken::new();
+            let socket = directory.path().join(format!("{name}.sock"));
+            let client = bcode_client::BcodeClient::for_state_location(
+                IpcEndpoint::unix_socket(socket.clone()),
+                locations.primary(),
+            );
+            let server = run_embedded_with_locations_and_shutdown(
+                IpcEndpoint::unix_socket(socket.clone()),
+                bcode_config::BcodeConfig::default(),
+                plugins,
+                bcode_model_catalog::ModelCatalogResolver::embedded(),
+                Vec::new(),
+                shutdown.clone(),
+                Some(locations),
+            );
+            let stop = async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !socket.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("server binds");
+                let status = client
+                    .verified_server_status()
+                    .await
+                    .expect("scoped handshake and status");
+                assert!(status.daemon.state_location_id.is_some());
+                let preference_error = client
+                    .set_auth_pool_preference("pool".into(), Some("profile".into()))
+                    .await
+                    .expect_err("scoped persistence unavailable");
+                assert!(
+                    matches!(preference_error, bcode_client::ClientError::Server { code, .. } if code == "auth_pool_preference_unavailable")
+                );
+                let wrong_client =
+                    bcode_client::BcodeClient::new(IpcEndpoint::unix_socket(socket.clone()));
+                assert!(
+                    wrong_client.verified_server_status().await.is_err(),
+                    "ambient identity must not match supplied root"
+                );
+                ready.wait().await;
+                let session = client
+                    .create_session_in_working_directory(
+                        Some(name.to_owned()),
+                        directory.path().to_path_buf(),
+                    )
+                    .await
+                    .expect("create scoped session");
+                created.wait().await;
+                let sessions = client
+                    .list_sessions_in_working_directory(directory.path().to_path_buf())
+                    .await
+                    .expect("scoped catalog")
+                    .sessions;
+                assert_eq!(sessions.len(), 1, "other location must not enter catalog");
+                assert_eq!(sessions[0].id, session.id);
+                shutdown.cancel();
+            };
+            let (result, ()) = tokio::join!(server, stop);
+            result.expect("server shutdown");
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(Box::pin(exercise("first")), Box::pin(exercise("second")));
+        })
+        .await
+        .expect("concurrent scoped servers finish");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn embedded_startup_bind_failure_deactivates_plugins() {
         static DEACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
         fn deactivate(_: *const std::ffi::c_void) -> i32 {
@@ -60892,9 +61114,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[test]
     fn workflow_plugin_artifact_bridge_writes_bounded_opaque_reference() {
+        let artifact_store = tempfile::tempdir().expect("artifact session store");
         let session_id = SessionId::new();
         let invocation_id = "workflow-artifact-test";
-        let state = Arc::new(test_server_state(SessionManager::default()));
+        let state = Arc::new(test_server_state(SessionManager::persistent_lazy(
+            artifact_store.path(),
+        )));
         let bridge = server_workflow_plugin_bridge(
             Arc::clone(&state),
             bcode_config::BcodeConfig::default(),
@@ -60927,8 +61152,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .get("uri")
             .and_then(serde_json::Value::as_str)
             .expect("URI");
-        let path = artifact_reference_path(uri, &default_session_artifact_dir(session_id))
-            .expect("reference path");
+        let path = artifact_reference_path(
+            uri,
+            &session_artifact_dir(&state, session_id).expect("owned artifact root"),
+        )
+        .expect("reference path");
         assert_eq!(std::fs::read(path).expect("artifact"), br#"{"ok":true}"#);
         let mismatch = bridge
             .request(
@@ -60947,7 +61175,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ServiceBridgeResponse::Artifact(ToolArtifactWriteResolution::Failed { code, .. })
                 if code == "invocation_id_mismatch"
         ));
-        let _ = remove_session_artifact_dir(&default_session_artifact_dir(session_id));
+        let _ = remove_session_artifact_dir(
+            &session_artifact_dir(&state, session_id).expect("owned artifact root"),
+        );
+        drop(bridge);
+        drop(state);
     }
 
     /// The provider-turn bridge only serves `bcode.provider-auth-host` requests, and only when the
@@ -65593,6 +65825,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(turn_route.1, MODEL_PROVIDER_INTERFACE_ID_V3);
 
         let runtime = InvariantSelectorRuntime {
+            state_root: tempfile::tempdir()
+                .expect("state root")
+                .path()
+                .to_path_buf(),
             plugins: state.plugins.clone(),
             config: bcode_config::InvariantsConfig::default(),
             model: InvariantSelectorModel {
@@ -65708,6 +65944,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn invariant_selector_streams_output_through_push_delivery() {
         let state = test_server_state_with_fake_provider(SessionManager::default());
         let runtime = InvariantSelectorRuntime {
+            state_root: tempfile::tempdir()
+                .expect("state root")
+                .path()
+                .to_path_buf(),
             plugins: state.plugins.clone(),
             config: bcode_config::InvariantsConfig::default(),
             model: InvariantSelectorModel {

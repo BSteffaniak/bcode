@@ -16,6 +16,7 @@ use bcode_prompt_cache::simulation::{
     PromptCacheSimulator, PromptCacheSimulatorProfile, SimulatedCacheRound,
 };
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Explicit-breakpoint cache model that reports cache writes (Anthropic-style).
@@ -154,48 +155,99 @@ pub fn provider_feature_claims() -> Vec<(PromptCacheFeature, CapabilitySupport)>
     .collect()
 }
 
-/// Process-wide simulator shared by every cache-model turn.
-///
-/// Cache entries are partitioned by the request's cache key, so independent sessions do not
-/// observe each other's entries even though they share this store. When `BCODE_STATE_DIR` is
-/// set, entries are also persisted beneath it so a restarted daemon sees the same cache a real
-/// provider would still hold; a cache that vanished on restart would hide resume regressions.
-static SIMULATOR: Mutex<Option<PromptCacheSimulator>> = Mutex::new(None);
+/// Plugin-instance-owned simulator. Durable rounds reload under exclusive ownership so
+/// different plugin instances cannot overwrite each other's updates.
+#[derive(Default)]
+pub struct CacheStore {
+    memory: Mutex<PromptCacheSimulator>,
+}
 
 const SIMULATOR_STATE_FILE: &str = "fake-provider-prompt-cache.json";
 
-fn simulator_state_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("BCODE_STATE_DIR")
-        .filter(|value| !value.is_empty())
-        .map(|dir| std::path::PathBuf::from(dir).join(SIMULATOR_STATE_FILE))
-}
-
-fn load_simulator() -> PromptCacheSimulator {
-    simulator_state_path()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn persist_simulator(simulator: &PromptCacheSimulator) {
-    let Some(path) = simulator_state_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec(simulator) {
-        let _ = std::fs::write(path, bytes);
+fn state_error() -> ProviderError {
+    ProviderError {
+        code: "fake_cache_state_unavailable".into(),
+        category: bcode_model::ProviderErrorCategory::ProviderInternal,
+        message: "fake cache state is unavailable, unsafe, or requires maintenance".into(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
     }
 }
 
-/// Forget every simulated cache entry, including any persisted beneath `BCODE_STATE_DIR`.
-pub fn reset() {
-    if let Ok(mut simulator) = SIMULATOR.lock() {
-        *simulator = Some(PromptCacheSimulator::default());
+fn confined_file(root: &Path, name: &str) -> Result<PathBuf, ProviderError> {
+    let path = root.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Ok(_) | Err(_) => Err(state_error()),
     }
-    if let Some(path) = simulator_state_path() {
-        let _ = std::fs::remove_file(path);
+}
+
+impl CacheStore {
+    fn serve(
+        &self,
+        root: Option<&Path>,
+        profile: &PromptCacheSimulatorProfile,
+        request: &ModelTurnRequest,
+        output_tokens: u32,
+    ) -> Result<SimulatedCacheRound, ProviderError> {
+        let Some(root) = root else {
+            return self
+                .memory
+                .lock()
+                .map_err(|_| state_error())
+                .map(|mut simulator| simulator.serve(profile, request, output_tokens));
+        };
+        if !root.is_absolute() {
+            return Err(state_error());
+        }
+        // Normalize the host-authorized root, including platform aliases such as /var.
+        let mut ancestor = root;
+        let mut missing = Vec::new();
+        let mut root = loop {
+            match std::fs::canonicalize(ancestor) {
+                Ok(path) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(ancestor.file_name().ok_or_else(state_error)?.to_owned());
+                    ancestor = ancestor.parent().ok_or_else(state_error)?;
+                }
+                Err(_) => return Err(state_error()),
+            }
+        };
+        for component in missing.iter().rev() {
+            root.push(component);
+        }
+        std::fs::create_dir_all(&root).map_err(|_| state_error())?;
+        let root = std::fs::canonicalize(root).map_err(|_| state_error())?;
+        let lock_path = confined_file(&root, "fake-provider-prompt-cache.lock")?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|_| state_error())?;
+        lock.try_lock().map_err(|_| state_error())?;
+        let path = confined_file(&root, SIMULATOR_STATE_FILE)?;
+        let mut simulator: PromptCacheSimulator = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| state_error())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PromptCacheSimulator::default()
+            }
+            Err(_) => return Err(state_error()),
+        };
+        let round = simulator.serve(profile, request, output_tokens);
+        let bytes = serde_json::to_vec(&simulator).map_err(|_| state_error())?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&root).map_err(|_| state_error())?;
+        std::io::Write::write_all(&mut temporary, &bytes).map_err(|_| state_error())?;
+        temporary.persist(&path).map_err(|_| state_error())?;
+        drop(lock);
+        Ok(round)
     }
 }
 
@@ -224,6 +276,8 @@ pub fn serve_turn(
     profile: &PromptCacheSimulatorProfile,
     request: &ModelTurnRequest,
     push: &dyn Fn(ProviderTurnEvent),
+    store: &CacheStore,
+    root: Option<&Path>,
 ) {
     let user_text = last_user_text(&request.messages);
     let completed_calls = request
@@ -268,16 +322,17 @@ pub fn serve_turn(
         format!("fake cache reply: {user_text}")
     };
     let output_tokens = u32::try_from(text.split_whitespace().count().max(1)).unwrap_or(u32::MAX);
-    let SimulatedCacheRound { usage, projection } = {
-        let mut guard = SIMULATOR
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let simulator = guard.get_or_insert_with(load_simulator);
-        let round = simulator.serve(profile, request, output_tokens);
-        persist_simulator(simulator);
-        drop(guard);
-        round
-    };
+    let SimulatedCacheRound { usage, projection } =
+        match store.serve(root, profile, request, output_tokens) {
+            Ok(round) => round,
+            Err(error) => {
+                push(ProviderTurnEvent::Error { error });
+                push(ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::Error,
+                });
+                return;
+            }
+        };
     push(ProviderTurnEvent::RequestProjection { projection });
     if let Some(call) = tool_call {
         push(ProviderTurnEvent::ToolCallStarted {
@@ -315,4 +370,141 @@ fn last_user_text(messages: &[ModelMessage]) -> String {
                 .join(" ")
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> ModelTurnRequest {
+        ModelTurnRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            turn_id: "cache-test".into(),
+            model_id: FAKE_CACHE_PREFIX_MODEL_ID.into(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: Some("stable prefix ".repeat(100)),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_call_policy: bcode_model::ToolCallRequestPolicy::default(),
+            tool_schema_mode: None,
+            parameters: bcode_model::ModelParameters::default(),
+            structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
+            prompt_cache: bcode_model::PromptCacheHints {
+                mode: bcode_model::PromptCacheMode::Auto,
+                key: Some("same-key".into()),
+                ..Default::default()
+            },
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: std::collections::BTreeMap::default(),
+        }
+    }
+
+    #[test]
+    fn cache_roots_and_memory_instances_are_isolated_and_restart_is_warm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        let request = request();
+        let profile = profile_for(FAKE_CACHE_PREFIX_MODEL_ID).unwrap();
+        let store = CacheStore::default();
+        let cold = store.serve(Some(&first), &profile, &request, 1).unwrap();
+        let warm = CacheStore::default()
+            .serve(Some(&first), &profile, &request, 1)
+            .unwrap();
+        assert_ne!(cold.usage, warm.usage);
+        assert_eq!(
+            cold.usage,
+            store
+                .serve(Some(&second), &profile, &request, 1)
+                .unwrap()
+                .usage
+        );
+        assert_eq!(
+            cold.usage,
+            store.serve(None, &profile, &request, 1).unwrap().usage
+        );
+        assert_eq!(
+            warm.usage,
+            store.serve(None, &profile, &request, 1).unwrap().usage
+        );
+        assert_eq!(
+            cold.usage,
+            CacheStore::default()
+                .serve(None, &profile, &request, 1)
+                .unwrap()
+                .usage
+        );
+    }
+
+    #[test]
+    fn damaged_or_locked_cache_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join(SIMULATOR_STATE_FILE);
+        let store = CacheStore::default();
+        let profile = profile_for(FAKE_CACHE_PREFIX_MODEL_ID).unwrap();
+        let request = request();
+        std::fs::write(&path, b"invalid cache").unwrap();
+        assert!(store.serve(Some(&root), &profile, &request, 1).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid cache");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("fake-provider-prompt-cache.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(store.serve(Some(&root), &profile, &request, 1).is_err());
+        drop(lock);
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid cache");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_root_accepts_platform_alias_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let alias = root.join("alias");
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        CacheStore::default()
+            .serve(
+                Some(&alias.join("nested/cache")),
+                &profile_for(FAKE_CACHE_PREFIX_MODEL_ID).unwrap(),
+                &request(),
+                1,
+            )
+            .unwrap();
+        assert!(
+            target
+                .join("nested/cache")
+                .join(SIMULATOR_STATE_FILE)
+                .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cache_cannot_escape_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"preserve").unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::os::unix::fs::symlink(&outside, cache.join(SIMULATOR_STATE_FILE)).unwrap();
+        assert!(
+            CacheStore::default()
+                .serve(
+                    Some(&cache),
+                    &profile_for(FAKE_CACHE_PREFIX_MODEL_ID).unwrap(),
+                    &request(),
+                    1
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+    }
 }

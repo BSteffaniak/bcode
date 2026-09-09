@@ -977,9 +977,9 @@ pub async fn delete(
         .session_catalog
         .remove_native_session(session_id)
         .await;
-    if let Err(error) =
-        super::remove_session_artifact_dir(&super::default_session_artifact_dir(session_id))
-    {
+    if let Err(error) = super::session_artifact_dir(state, session_id).and_then(|root| {
+        super::remove_session_artifact_dir(&root).map_err(|error| error.to_string())
+    }) {
         tracing::warn!(
             session_id = %session_id,
             error = %error,

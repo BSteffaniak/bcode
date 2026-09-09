@@ -116,6 +116,28 @@ pub fn set_auth_pool_preference(
     Ok(path)
 }
 
+/// Update an auth-pool preference and routing cursor in caller-owned state.
+///
+/// No ambient configuration or filesystem access occurs. The caller owns persistence
+/// of both values; this operation does not claim an atomic durable commit.
+///
+/// # Errors
+///
+/// Returns an error when the pool/profile is invalid, leaving both values unchanged.
+pub fn update_auth_pool_preference(
+    config: &bcode_config::BcodeConfig,
+    subscriptions: &mut bcode_config::RuntimeAuthSubscriptions,
+    routing: &mut auth_pool_state::AuthPoolState,
+    pool: &str,
+    profile: Option<&str>,
+) -> Result<(), bcode_config::ConfigError> {
+    bcode_config::update_runtime_auth_pool_preference(config, subscriptions, pool, profile)?;
+    if let Some(entry) = routing.pools.get_mut(pool) {
+        entry.last_selected_profile = None;
+    }
+    Ok(())
+}
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1006,6 +1028,55 @@ fn apply_default_priming_required_windows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_preference_updates_only_matching_owned_state() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.pools.insert(
+            "pool".into(),
+            bcode_config::AuthPoolConfig {
+                profiles: vec!["a".into(), "b".into()],
+                ..bcode_config::AuthPoolConfig::default()
+            },
+        );
+        let mut subscriptions = bcode_config::RuntimeAuthSubscriptions::default();
+        let mut routing = super::auth_pool_state::AuthPoolState::default();
+        routing.pools.insert(
+            "pool".into(),
+            super::auth_pool_state::AuthPoolRoutingState {
+                last_selected_profile: Some("b".into()),
+            },
+        );
+        let untouched = routing.clone();
+        assert!(
+            super::update_auth_pool_preference(
+                &config,
+                &mut subscriptions,
+                &mut routing,
+                "pool",
+                Some("unknown")
+            )
+            .is_err()
+        );
+        assert_eq!(routing, untouched);
+        assert!(subscriptions.pools.is_empty());
+        super::update_auth_pool_preference(
+            &config,
+            &mut subscriptions,
+            &mut routing,
+            "pool",
+            Some("a"),
+        )
+        .expect("valid preference");
+        assert_eq!(
+            subscriptions.pools["pool"].preferred_profile.as_deref(),
+            Some("a")
+        );
+        assert_eq!(routing.pools["pool"].last_selected_profile, None);
+        assert_eq!(
+            untouched.pools["pool"].last_selected_profile.as_deref(),
+            Some("b")
+        );
+    }
     use super::*;
 
     fn legacy_openai_method(

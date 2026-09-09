@@ -4830,6 +4830,49 @@ pub fn runtime_auth_subscriptions_path() -> PathBuf {
     default_state_dir().join("auth").join("subscriptions.json")
 }
 
+/// Acquire exclusive registry ownership before reading state for mutation.
+fn lock_auth_subscriptions(path: &Path) -> Result<fs::File, ConfigError> {
+    let parent = path.parent().ok_or_else(|| ConfigError::Composition {
+        message: "auth registry requires a parent directory".to_owned(),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let lock_path = path.with_extension("lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| ConfigError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    file.try_lock().map_err(|error| ConfigError::Composition {
+        message: format!("auth registry is busy or cannot be locked: {error}"),
+    })?;
+    Ok(file)
+}
+
+fn read_auth_subscriptions_for_update(
+    path: &Path,
+) -> Result<RuntimeAuthSubscriptions, ConfigError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| ConfigError::Composition {
+            message: "auth registry is invalid; existing state preserved".to_owned(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(RuntimeAuthSubscriptions::default())
+        }
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Load runtime auth subscriptions from user state.
 #[must_use]
 pub fn load_runtime_auth_subscriptions() -> RuntimeAuthSubscriptions {
@@ -4877,7 +4920,8 @@ pub fn register_runtime_auth_subscription(
         device_seal: profile.device_seal.clone(),
     };
     let path = runtime_auth_subscriptions_path();
-    let mut registry = load_runtime_auth_subscriptions();
+    let _lock = lock_auth_subscriptions(&path)?;
+    let mut registry = read_auth_subscriptions_for_update(&path)?;
     if let Some(existing) = registry.profiles.get(&profile.auth_profile)
         && (existing.provider_id != runtime_profile.provider_id
             || existing.owner_plugin_id != runtime_profile.owner_plugin_id)
@@ -4919,20 +4963,7 @@ pub fn register_runtime_auth_subscription(
     } else {
         pool_entry.profiles.push(profile);
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let contents =
-        serde_json::to_string_pretty(&registry).map_err(|source| ConfigError::Composition {
-            message: format!("failed to serialize runtime auth subscriptions: {source}"),
-        })?;
-    fs::write(&path, contents).map_err(|source| ConfigError::Io {
-        path: path.clone(),
-        source,
-    })?;
+    write_runtime_auth_subscriptions(&path, &registry)?;
     Ok(path)
 }
 
@@ -4959,7 +4990,8 @@ pub fn register_runtime_auth_profile(
         });
     }
     let path = runtime_auth_subscriptions_path();
-    let mut registry = load_runtime_auth_subscriptions();
+    let _lock = lock_auth_subscriptions(&path)?;
+    let mut registry = read_auth_subscriptions_for_update(&path)?;
     if let Some(existing) = registry.profiles.get(profile_name)
         && (existing.provider_id != profile.provider_id
             || existing.owner_plugin_id != profile.owner_plugin_id)
@@ -5031,7 +5063,8 @@ pub fn remove_runtime_auth_profile(
     owner_plugin_id: &str,
 ) -> Result<RuntimeAuthProfileRemoval, ConfigError> {
     let path = runtime_auth_subscriptions_path();
-    let mut registry = load_runtime_auth_subscriptions();
+    let _lock = lock_auth_subscriptions(&path)?;
+    let mut registry = read_auth_subscriptions_for_update(&path)?;
     let removal = remove_runtime_auth_profile_from(&mut registry, profile_name, owner_plugin_id);
     if removal.changed() {
         write_runtime_auth_subscriptions(&path, &registry)?;
@@ -5110,7 +5143,33 @@ pub fn set_runtime_auth_pool_preference(
     }
     let config = load_config()?;
     let path = runtime_auth_subscriptions_path();
-    let mut registry = load_runtime_auth_subscriptions();
+    let _lock = lock_auth_subscriptions(&path)?;
+    let mut registry = read_auth_subscriptions_for_update(&path)?;
+    update_runtime_auth_pool_preference(&config, &mut registry, pool, profile)?;
+    write_runtime_auth_subscriptions(&path, &registry)?;
+    Ok(path)
+}
+
+/// Validate and update a preference in caller-owned subscription state.
+///
+/// Performs no configuration loading or persistence. The caller owns committing the
+/// updated registry and coordinating provider-auth routing state.
+///
+/// # Errors
+///
+/// Returns an error for an empty or unknown pool or a profile outside that pool.
+/// The supplied registry is unchanged on error.
+pub fn update_runtime_auth_pool_preference(
+    config: &BcodeConfig,
+    registry: &mut RuntimeAuthSubscriptions,
+    pool: &str,
+    profile: Option<&str>,
+) -> Result<(), ConfigError> {
+    if pool.trim().is_empty() {
+        return Err(ConfigError::Composition {
+            message: "auth pool preference requires a non-empty pool ID".to_owned(),
+        });
+    }
     let mut known_profiles = config
         .auth
         .pools
@@ -5141,8 +5200,7 @@ pub fn set_runtime_auth_pool_preference(
     }
     let entry = registry.pools.entry(pool.to_owned()).or_default();
     entry.preferred_profile = profile.map(str::to_owned);
-    write_runtime_auth_subscriptions(&path, &registry)?;
-    Ok(path)
+    Ok(())
 }
 
 /// Non-secret effective auth-pool order and preference source.
@@ -5234,6 +5292,7 @@ fn write_runtime_auth_subscriptions(
     path: &Path,
     registry: &RuntimeAuthSubscriptions,
 ) -> Result<(), ConfigError> {
+    use std::io::Write as _;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
             path: parent.to_path_buf(),
@@ -5244,10 +5303,26 @@ fn write_runtime_auth_subscriptions(
         serde_json::to_string_pretty(registry).map_err(|source| ConfigError::Composition {
             message: format!("failed to serialize runtime auth metadata: {source}"),
         })?;
-    fs::write(path, contents).map_err(|source| ConfigError::Io {
+    // Callers retain the registry lock across read, validation, and publication.
+    // A same-directory temporary keeps failed writes away from canonical bytes.
+    let parent = path.parent().ok_or_else(|| ConfigError::Composition {
+        message: "auth registry requires a parent directory".to_owned(),
+    })?;
+    let io_error = |source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
-    })
+    };
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
+    temporary.write_all(contents.as_bytes()).map_err(io_error)?;
+    temporary.as_file().sync_all().map_err(io_error)?;
+    temporary
+        .persist(path)
+        .map_err(|error| io_error(error.error))?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)?;
+    Ok(())
 }
 
 /// Return the default Bcode state directory.
@@ -5358,8 +5433,7 @@ impl Drop for StateLocationGuard {
 /// session's canonical storage; it only selects which location this process uses.
 #[must_use]
 pub fn push_process_state_location(location: &StateLocation) -> StateLocationGuard {
-    let sessions_root = (location.sessions_root() != location.root().join("sessions"))
-        .then(|| location.sessions_root().to_path_buf());
+    let sessions_root = Some(location.sessions_root().to_path_buf());
     let mut guard = process_state_selection()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -8431,6 +8505,23 @@ mod tests {
     }
 
     #[test]
+    fn auth_registry_mutation_lock_and_damage_are_fail_closed() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("subscriptions.json");
+        let lock = super::lock_auth_subscriptions(&path).expect("first owner");
+        assert!(super::lock_auth_subscriptions(&path).is_err());
+        std::fs::write(&path, b"invalid registry").expect("damage fixture");
+        assert!(super::read_auth_subscriptions_for_update(&path).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("preserved bytes"),
+            b"invalid registry"
+        );
+        drop(lock);
+        let next = super::lock_auth_subscriptions(&path).expect("released owner");
+        drop(next);
+    }
+
+    #[test]
     fn model_ignore_parse_errors_do_not_echo_file_contents() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("ignores.toml");
@@ -10779,6 +10870,49 @@ on_timeout = "deterministic"
         assert!(
             !absent_state.exists(),
             "identity must not create directories"
+        );
+    }
+
+    #[test]
+    fn explicit_location_preserves_default_session_root() {
+        const CHILD: &str = "BCODE_TEST_EXPLICIT_SESSION_ROOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "tests::explicit_location_preserves_default_session_root",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("isolated test process");
+            assert!(status.success());
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mut environment = state_environment(temp.path());
+        let locations = super::resolve_state_location_set_with_environment(
+            &super::StateConfig::default(),
+            &super::StateLocationSelection {
+                root: Some(temp.path().join("selected")),
+                profile: None,
+            },
+            &environment,
+        )
+        .expect("resolved location");
+        let selected = locations.primary().sessions_root().to_path_buf();
+        environment.set_var(
+            super::BCODE_SESSION_STORE_DIR_ENV,
+            temp.path().join("foreign"),
+        );
+        let guard = super::push_process_state_location(locations.primary());
+        assert_eq!(
+            super::default_session_store_dir_with_environment(&environment),
+            selected
+        );
+        drop(guard);
+        assert_eq!(
+            super::default_session_store_dir_with_environment(&environment),
+            temp.path().join("foreign")
         );
     }
 

@@ -935,6 +935,7 @@ const fn decode_message_acceptance(
 /// Client configured for a local Bcode server endpoint.
 #[derive(Debug, Clone)]
 pub struct BcodeClient {
+    expected_state_location: Option<bcode_config::StateLocationId>,
     endpoint: IpcEndpoint,
     runtime_context: Option<ClientRuntimeContext>,
     daemon_availability: DaemonAvailability,
@@ -1164,6 +1165,7 @@ impl BcodeClient {
     #[must_use]
     pub fn default_endpoint() -> Self {
         Self {
+            expected_state_location: None,
             endpoint: default_endpoint(),
             runtime_context: Some(current_runtime_context()),
             daemon_availability: DaemonAvailability::AutoStart,
@@ -1178,6 +1180,7 @@ impl BcodeClient {
     #[must_use]
     pub fn new(endpoint: IpcEndpoint) -> Self {
         Self {
+            expected_state_location: None,
             endpoint,
             runtime_context: None,
             daemon_availability: DaemonAvailability::RequireRunning,
@@ -1186,6 +1189,21 @@ impl BcodeClient {
             startup_gate: Arc::new(tokio::sync::Mutex::new(())),
             request_timeout: DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Create a client for an already-running server at a resolved durable location.
+    ///
+    /// Handshake and status verification retain this identity across connections without
+    /// consulting process state. Automatic daemon launch is disabled for this client,
+    /// including after availability policy changes: its host owns scoped server startup.
+    #[must_use]
+    pub fn for_state_location(
+        endpoint: IpcEndpoint,
+        location: &bcode_config::StateLocation,
+    ) -> Self {
+        let mut client = Self::new(endpoint);
+        client.expected_state_location = Some(location.id().clone());
+        client
     }
 
     /// Attach a client-supplied runtime context to future connections.
@@ -1277,7 +1295,9 @@ impl BcodeClient {
     /// Returns an error when daemon acquisition fails or this client is configured
     /// to require an already-running daemon.
     pub async fn ensure_daemon_available(&self) -> Result<(), ClientError> {
-        if self.daemon_availability == DaemonAvailability::RequireRunning {
+        if self.daemon_availability == DaemonAvailability::RequireRunning
+            || self.expected_state_location.is_some()
+        {
             return Ok(());
         }
         let _startup_guard = self.startup_gate.lock().await;
@@ -1450,13 +1470,28 @@ impl BcodeClient {
         }
     }
 
+    #[cfg(test)]
     fn verify_daemon_identity(status: &bcode_ipc::DaemonStatus) -> Result<(), ClientError> {
+        Self::verify_daemon_identity_at(status, &bcode_ipc::state_location_id())
+    }
+
+    fn verify_server_identity(&self, status: &bcode_ipc::DaemonStatus) -> Result<(), ClientError> {
+        let expected = self
+            .expected_state_location
+            .as_ref()
+            .map_or_else(bcode_ipc::state_location_id, |id| id.as_str().to_owned());
+        Self::verify_daemon_identity_at(status, &expected)
+    }
+
+    fn verify_daemon_identity_at(
+        status: &bcode_ipc::DaemonStatus,
+        expected_state_location: &str,
+    ) -> Result<(), ClientError> {
         let expected_namespace = bcode_ipc::daemon_namespace();
         let expected_protocol = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
         let expected_artifact_id = bcode_ipc::ArtifactId::current();
         let expected_writer_epoch = bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
         let expected_event_schema = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
-        let expected_state_location = bcode_ipc::state_location_id();
         if status.namespace == expected_namespace
             && status.protocol_version == expected_protocol
             && status.artifact_id.as_ref() == Some(&expected_artifact_id)
@@ -1466,7 +1501,7 @@ impl BcodeClient {
             // A daemon that does not advertise a state location is unverifiable, not
             // assumed compatible: connecting anyway would let this client mutate a
             // different location's canonical session storage.
-            && status.state_location_id.as_deref() == Some(expected_state_location.as_str())
+            && status.state_location_id.as_deref() == Some(expected_state_location)
         {
             return Ok(());
         }
@@ -1501,7 +1536,7 @@ impl BcodeClient {
     /// this client's executable identity.
     pub async fn verified_server_status(&self) -> Result<bcode_ipc::ServerStatus, ClientError> {
         let status = self.server_status().await?;
-        Self::verify_daemon_identity(&status.daemon)?;
+        self.verify_server_identity(&status.daemon)?;
         Ok(status)
     }
 
@@ -5206,6 +5241,7 @@ impl BcodeClient {
             Ok(connection) => Ok(connection),
             Err(error)
                 if self.daemon_availability == DaemonAvailability::AutoStart
+                    && self.expected_state_location.is_none()
                     && error.is_daemon_unavailable() =>
             {
                 self.ensure_daemon_available().await?;
@@ -5274,14 +5310,18 @@ impl BcodeClient {
                 daemon_namespace: bcode_ipc::daemon_namespace(),
                 artifact_id: Some(bcode_ipc::ArtifactId::current()),
                 build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
-                state_location_id: Some(bcode_ipc::state_location_id()),
+                state_location_id: Some(
+                    self.expected_state_location
+                        .as_ref()
+                        .map_or_else(bcode_ipc::state_location_id, |id| id.as_str().to_owned()),
+                ),
             })
             .await?
         {
             ResponsePayload::Hello {
                 client_id, daemon, ..
             } => {
-                Self::verify_daemon_identity(&daemon)?;
+                self.verify_server_identity(&daemon)?;
                 connection.client_id = Some(client_id);
                 Ok(connection)
             }

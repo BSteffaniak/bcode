@@ -4242,17 +4242,27 @@ fn provider_auth_bridge_resolution(
     plugins: &bcode_plugin::PluginRuntimeHost,
     caller_plugin_id: &str,
     request: bcode_tool::ToolInvocationServiceRequest,
+    inputs: Option<&(
+        bcode_config::BcodeConfig,
+        bcode_config::RuntimeAuthSubscriptions,
+    )>,
 ) -> bcode_tool::ToolInvocationServiceResolution {
-    let Ok(config) = bcode_config::load_config() else {
-        return bcode_tool::ToolInvocationServiceResolution::Failed {
-            code: "auth_config_unavailable".to_owned(),
-            message: "authentication configuration is unavailable".to_owned(),
+    let acquired;
+    let (config, runtime) = if let Some(inputs) = inputs {
+        inputs
+    } else {
+        let Ok(config) = bcode_config::load_config() else {
+            return bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "auth_config_unavailable".to_owned(),
+                message: "authentication configuration is unavailable".to_owned(),
+            };
         };
+        acquired = (config, bcode_config::load_runtime_auth_subscriptions());
+        &acquired
     };
-    let runtime = bcode_config::load_runtime_auth_subscriptions();
     bcode_provider_auth::operations::resolve_credential_update_service_request(
-        &config,
-        &runtime,
+        config,
+        runtime,
         caller_plugin_id,
         |provider_id| {
             plugins.auth_provider(provider_id).map(|registered| {
@@ -4271,6 +4281,12 @@ fn provider_invocation_bridge(
     plugins: bcode_plugin::PluginRuntimeHost,
     caller_plugin_id: String,
     invocation_id: String,
+    #[cfg(feature = "config")] auth_inputs: Option<
+        Arc<(
+            bcode_config::BcodeConfig,
+            bcode_config::RuntimeAuthSubscriptions,
+        )>,
+    >,
 ) -> bcode_plugin::PluginInvocationBridge {
     bcode_plugin::PluginInvocationBridge::new(move |request, _| {
         let ServiceBridgeRequest::InvokeService(request) = request else {
@@ -4288,7 +4304,12 @@ fn provider_invocation_bridge(
             ));
         }
         #[cfg(feature = "config")]
-        let resolution = provider_auth_bridge_resolution(&plugins, &caller_plugin_id, request);
+        let resolution = provider_auth_bridge_resolution(
+            &plugins,
+            &caller_plugin_id,
+            request,
+            auth_inputs.as_deref(),
+        );
         #[cfg(not(feature = "config"))]
         let resolution = {
             let _ = (&plugins, &caller_plugin_id, request);
@@ -4300,9 +4321,25 @@ fn provider_invocation_bridge(
 
 /// Provider invoker backed by a loaded Bcode plugin runtime.
 #[cfg(feature = "embedded-plugins")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PluginModelProviderInvoker {
     plugins: bcode_plugin::PluginRuntimeHost,
+    #[cfg(feature = "config")]
+    auth_inputs: Option<
+        Arc<(
+            bcode_config::BcodeConfig,
+            bcode_config::RuntimeAuthSubscriptions,
+        )>,
+    >,
+}
+
+#[cfg(feature = "embedded-plugins")]
+impl std::fmt::Debug for PluginModelProviderInvoker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginModelProviderInvoker")
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "embedded-plugins")]
@@ -4310,7 +4347,27 @@ impl PluginModelProviderInvoker {
     /// Create a provider invoker from a loaded plugin runtime host.
     #[must_use]
     pub const fn new(plugins: bcode_plugin::PluginRuntimeHost) -> Self {
-        Self { plugins }
+        Self {
+            plugins,
+            #[cfg(feature = "config")]
+            auth_inputs: None,
+        }
+    }
+
+    /// Use caller-resolved configuration and subscriptions for provider credential updates.
+    ///
+    /// These snapshots replace ambient input discovery for this invoker's service bridge.
+    /// Native credential storage and ownership checks still run in the provider-auth domain;
+    /// this is not a simulated vault. Provider request credentials are configured separately.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn auth_inputs(
+        mut self,
+        config: bcode_config::BcodeConfig,
+        subscriptions: bcode_config::RuntimeAuthSubscriptions,
+    ) -> Self {
+        self.auth_inputs = Some(Arc::new((config, subscriptions)));
+        self
     }
 
     fn resolve_provider(
@@ -4331,6 +4388,91 @@ impl PluginModelProviderInvoker {
     }
 }
 
+#[cfg(all(test, feature = "embedded-plugins", feature = "config"))]
+mod explicit_provider_auth_tests {
+    use super::*;
+
+    #[test]
+    fn sdk_preserves_explicit_invoker_after_configuring_tool_runtime() {
+        let plugins = bcode_plugin::PluginRuntimeHost::from(
+            bcode_plugin::PluginHost::load_static_plugins(&[]).expect("empty plugin host"),
+        );
+        let provider = PluginModelProviderInvoker::new(plugins.clone()).auth_inputs(
+            bcode_config::BcodeConfig::default(),
+            bcode_config::RuntimeAuthSubscriptions::default(),
+        );
+        let inputs = provider.auth_inputs.clone().expect("explicit inputs");
+        let sdk = Bcode::builder()
+            .plugin_runtime(plugins.clone())
+            .provider_invoker(provider.clone())
+            .build();
+        let builders = [
+            sdk.agent(),
+            sdk.agent_from_context(SessionId::new(), PathBuf::from("/fixture")),
+        ];
+        drop(sdk);
+        for builder in builders {
+            let inherited = builder.provider.expect("inherited provider");
+            assert!(Arc::ptr_eq(
+                inherited.auth_inputs.as_ref().expect("preserved inputs"),
+                &inputs,
+            ));
+            drop(inherited);
+        }
+        let replaced = Bcode::builder()
+            .provider_invoker(provider.clone())
+            .plugin_runtime(plugins)
+            .build();
+        assert!(
+            replaced
+                .agent()
+                .provider
+                .expect("native provider")
+                .auth_inputs
+                .is_none()
+        );
+        drop(replaced);
+        drop(provider);
+    }
+
+    #[test]
+    fn explicit_inputs_use_shared_auth_validation_without_discovery() {
+        let plugins = bcode_plugin::PluginRuntimeHost::from(
+            bcode_plugin::PluginHost::load_static_plugins(&[]).expect("empty plugin host"),
+        );
+        let provider = PluginModelProviderInvoker::new(plugins).auth_inputs(
+            bcode_config::BcodeConfig::default(),
+            bcode_config::RuntimeAuthSubscriptions::default(),
+        );
+        let bridge = provider_invocation_bridge(
+            provider.plugins.clone(),
+            "unregistered".to_owned(),
+            "turn".to_owned(),
+            provider.auth_inputs.clone(),
+        );
+        let resolution = bridge
+            .request(
+                ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
+                    invocation_id: "turn".to_owned(),
+                    request_id: "update".to_owned(),
+                    route_id: None,
+                    interface_id: bcode_provider_auth_models::AUTH_HOST_INTERFACE_ID.to_owned(),
+                    operation: bcode_provider_auth_models::OP_UPDATE_CREDENTIALS.to_owned(),
+                    payload: serde_json::Value::Null,
+                }),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .expect("bridge request");
+        drop(bridge);
+        assert!(matches!(resolution,
+            ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Failed { code, .. })
+            if code == "invalid_request"
+        ));
+        assert!(!format!("{provider:?}").contains("auth_inputs"));
+        drop(provider);
+    }
+}
+
 #[cfg(feature = "embedded-plugins")]
 impl ModelProviderInvoker for PluginModelProviderInvoker {
     fn start_turn<'a>(
@@ -4346,6 +4488,8 @@ impl ModelProviderInvoker for PluginModelProviderInvoker {
                 self.plugins.clone(),
                 provider_plugin_id.clone(),
                 request.turn_id.clone(),
+                #[cfg(feature = "config")]
+                self.auth_inputs.clone(),
             );
             let mut invocation = self
                 .plugins
@@ -4971,6 +5115,7 @@ struct ProviderSetupCandidateInput<'a> {
 /// Top-level SDK handle.
 #[derive(Debug, Clone)]
 pub struct Bcode {
+    tool_artifact_root: Option<PathBuf>,
     mode: BcodeMode,
     runtime: AgentRuntime,
     provider_registry: ProviderRegistry,
@@ -5110,18 +5255,23 @@ impl Bcode {
     }
 
     fn configure_agent(&self, builder: AgentBuilder) -> AgentBuilder {
+        let builder = if let Some(root) = &self.tool_artifact_root {
+            builder.tool_artifact_root(root)
+        } else {
+            builder
+        };
         let builder = builder
             .runtime(self.runtime.clone())
             .provider_context(self.provider_context.clone());
         #[cfg(feature = "embedded-plugins")]
-        let builder = if let Some(provider) = self.provider.clone() {
-            builder.provider_invoker(provider)
+        let builder = if let Some(plugins) = self.plugins.clone() {
+            builder.plugin_runtime(plugins)
         } else {
             builder
         };
         #[cfg(feature = "embedded-plugins")]
-        let builder = if let Some(plugins) = self.plugins.clone() {
-            builder.plugin_runtime(plugins)
+        let builder = if let Some(provider) = self.provider.clone() {
+            builder.provider_invoker(provider)
         } else {
             builder
         };
@@ -5546,6 +5696,7 @@ impl Bcode {
 /// Builder for [`Bcode`].
 #[derive(Debug, Clone)]
 pub struct BcodeBuilder {
+    tool_artifact_root: Option<PathBuf>,
     mode: BcodeMode,
     runtime: AgentRuntime,
     provider_registry: ProviderRegistry,
@@ -5561,6 +5712,7 @@ pub struct BcodeBuilder {
 impl Default for BcodeBuilder {
     fn default() -> Self {
         Self {
+            tool_artifact_root: None,
             mode: BcodeMode::Embedded,
             runtime: AgentRuntime::new(),
             provider_registry: ProviderRegistry::new(),
@@ -5576,6 +5728,18 @@ impl Default for BcodeBuilder {
 }
 
 impl BcodeBuilder {
+    /// Supply the caller-owned absolute tool-artifact root inherited by this handle's agents.
+    ///
+    /// This setter performs no filesystem access. Tool execution rejects relative roots;
+    /// tool owners remain responsible for path confinement. The caller owns retention and
+    /// cleanup. An agent may override this default with [`AgentBuilder::tool_artifact_root`].
+    /// This does not select or relocate canonical session storage or configure a daemon.
+    #[must_use]
+    pub fn tool_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.tool_artifact_root = Some(root.into());
+        self
+    }
+
     /// Configure the runtime mode.
     #[must_use]
     pub const fn mode(mut self, mode: BcodeMode) -> Self {
@@ -5715,6 +5879,10 @@ impl BcodeBuilder {
     }
 
     /// Configure a daemon-backed programmatic client path.
+    ///
+    /// For a host-owned server at an explicit durable location, pass a client constructed
+    /// with [`BcodeClient::for_state_location`]. This preserves its location identity across
+    /// handshakes and reconnections without changing process state or SDK session persistence.
     #[cfg(feature = "daemon-client")]
     #[must_use]
     pub fn daemon_client(mut self, client: BcodeClient) -> Self {
@@ -5728,6 +5896,18 @@ impl BcodeBuilder {
     #[must_use]
     pub fn default_daemon_client(self) -> Self {
         self.daemon_client(BcodeClient::default_endpoint())
+    }
+
+    /// Configure the embedded provider invoker inherited by this handle's agents.
+    ///
+    /// Preserves caller-resolved authentication inputs when the `config` feature is enabled.
+    /// This does not change the runtime used for tool
+    /// discovery or execution. A later [`Self::plugin_runtime`] call replaces this invoker.
+    #[cfg(feature = "embedded-plugins")]
+    #[must_use]
+    pub fn provider_invoker(mut self, provider: PluginModelProviderInvoker) -> Self {
+        self.provider = Some(provider);
+        self
     }
 
     /// Configure a plugin-backed embedded provider invoker.
@@ -5744,6 +5924,7 @@ impl BcodeBuilder {
     #[must_use]
     pub fn build(self) -> Bcode {
         Bcode {
+            tool_artifact_root: self.tool_artifact_root,
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,
@@ -5759,6 +5940,7 @@ impl BcodeBuilder {
             .daemon_client
             .or_else(|| (self.mode == BcodeMode::Daemon).then(BcodeClient::default_endpoint));
         Bcode {
+            tool_artifact_root: self.tool_artifact_root,
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,
@@ -5772,6 +5954,7 @@ impl BcodeBuilder {
     #[must_use]
     pub fn build(self) -> Bcode {
         Bcode {
+            tool_artifact_root: self.tool_artifact_root,
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,
@@ -5789,6 +5972,7 @@ impl BcodeBuilder {
             .daemon_client
             .or_else(|| (self.mode == BcodeMode::Daemon).then(BcodeClient::default_endpoint));
         Bcode {
+            tool_artifact_root: self.tool_artifact_root,
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,

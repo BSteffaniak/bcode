@@ -2549,8 +2549,7 @@ async fn prior_owner_liveness(
     // A lease can be lost while the daemon process survives, so consult the daemon registry
     // before concluding the owner is gone. Only the record naming the recorded coordinator is
     // probed: classifying every registry record costs a bounded endpoint probe per record.
-    let state_dir = bcode_config::default_state_dir();
-    for (_, record) in bcode_daemon_lifecycle::read_records(&state_dir) {
+    for (_, record) in bcode_daemon_lifecycle::read_records(&state.state_root) {
         if record.instance_id != current.daemon_instance_id {
             continue;
         }
@@ -2679,7 +2678,7 @@ pub async fn execution_authority(
                 }
             },
             artifact_image_available: bcode_daemon_lifecycle::artifact_image_is_available(
-                &bcode_config::default_state_dir(),
+                &state.state_root,
                 &current.target_artifact_id,
             ),
         };
@@ -3396,7 +3395,7 @@ pub async fn reconcile_orphaned_runs(
             ended_daemon_instance_id: authority.daemon_instance_id.clone(),
             ended_target_artifact_id: authority.target_artifact_id.clone(),
             artifact_image_available: bcode_daemon_lifecycle::artifact_image_is_available(
-                &bcode_config::default_state_dir(),
+                &state.state_root,
                 &authority.target_artifact_id,
             ),
             updated_at_ms: run.updated_at_ms,

@@ -148,6 +148,7 @@ pub fn fake_compaction_started() -> bool {
 #[derive(Default)]
 pub struct FakeProviderPlugin {
     state: Mutex<FakeProviderState>,
+    cache: prompt_cache::CacheStore,
 }
 
 /// Provider ID the fake plugin registers for host credential-custody tests.
@@ -523,6 +524,7 @@ impl FakeProviderPlugin {
         profile: &bcode_prompt_cache::simulation::PromptCacheSimulatorProfile,
         request: &ModelTurnRequest,
         positioned_output: bool,
+        root: Option<&std::path::Path>,
     ) -> ServiceResponse {
         if let Err(error) = prompt_cache::validate(profile, request) {
             return json_response(&StartTurnResponse {
@@ -542,7 +544,13 @@ impl FakeProviderPlugin {
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
         turn.push(ProviderTurnEvent::TurnStarted);
-        prompt_cache::serve_turn(profile, request, &|event| turn.push(event));
+        prompt_cache::serve_turn(
+            profile,
+            request,
+            &|event| turn.push(event),
+            &self.cache,
+            root,
+        );
         json_response(&StartTurnResponse { provider_turn_id })
     }
 
@@ -572,7 +580,12 @@ impl FakeProviderPlugin {
             });
         }
         if let Some(profile) = prompt_cache::profile_for(&request.model_id) {
-            return self.start_cache_model_turn(&profile, &request, positioned_output);
+            return self.start_cache_model_turn(
+                &profile,
+                &request,
+                positioned_output,
+                context.config.state_root.as_deref(),
+            );
         }
         if let Some(error) = validate_fake_parallel_tool_policy(&request) {
             return error;

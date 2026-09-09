@@ -20,19 +20,21 @@ fn configured_bcode() -> Bcode {
 
 #[test]
 fn setup_report_uses_plugin_metadata_and_runtime_auth_without_secrets() {
-    let mut config = BcodeConfig::default();
-    config.model = ModelConfig {
-        provider_plugin_id: Some("bcode.openai-compatible".to_owned()),
-        model_id: Some("gpt-test".to_owned()),
-        profiles: BTreeMap::from([(
-            "alternate".to_owned(),
-            ModelProfileConfig {
-                provider_plugin_id: "bcode.openai-compatible".to_owned(),
-                model_id: Some("gpt-other".to_owned()),
-                ..ModelProfileConfig::default()
-            },
-        )]),
-        ..ModelConfig::default()
+    let config = BcodeConfig {
+        model: ModelConfig {
+            provider_plugin_id: Some("bcode.openai-compatible".to_owned()),
+            model_id: Some("gpt-test".to_owned()),
+            profiles: BTreeMap::from([(
+                "alternate".to_owned(),
+                ModelProfileConfig {
+                    provider_plugin_id: "bcode.openai-compatible".to_owned(),
+                    model_id: Some("gpt-other".to_owned()),
+                    ..ModelProfileConfig::default()
+                },
+            )]),
+            ..ModelConfig::default()
+        },
+        ..BcodeConfig::default()
     };
     let runtime = RuntimeAuthSubscriptions {
         bindings: BTreeMap::from([(

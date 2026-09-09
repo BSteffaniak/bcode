@@ -497,10 +497,13 @@ async fn explicit_artifact_root_enables_shell_recording_updates() {
             .canonicalize()
             .expect("absolute artifact root");
         let observer = Arc::new(ContributionObserver::default());
-        let agent = Agent::builder()
+        let sdk = bcode::Bcode::builder()
             .plugin_runtime(plugins)
-            .plugin_tool(shell_definition(), "bcode.shell")
             .tool_artifact_root(&root)
+            .build();
+        let agent = sdk
+            .agent_from_context(bcode::SessionId::new(), root.clone())
+            .plugin_tool(shell_definition(), "bcode.shell")
             .authorization_coordinator(Arc::new(AllowAuthorization))
             .event_observability(observer.clone())
             .build();

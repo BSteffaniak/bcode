@@ -121,8 +121,11 @@ required = {
     "daemon handshake must carry a state location identity":
         "pub state_location_id: Option<String>" in ipc
         and "state_location_id: Option<String>," in ipc,
+    "workflow ownership recovery must use the server-owned state root":
+        "default_state_dir" not in Path("packages/server/src/workflow_operations.rs").read_text(encoding="utf-8")
+        and "artifact_image_is_available(\n            &state.state_root," in server,
     "client must refuse a daemon serving another state location":
-        "state_location_id.as_deref() == Some(expected_state_location.as_str())" in client,
+        "state_location_id.as_deref() == Some(expected_state_location)" in client,
     "daemon must refuse a client resolving another state location":
         "fn validate_client_state_location" in server
         and "incompatible_state_location" in server,
