@@ -1,5 +1,25 @@
 # Workflow Persistence Architecture
 
+## Staged live graph edits
+
+Schema 19 adds workflow-owned edit candidates. `stage_run_graph_edit` atomically retains a
+bounded typed request, its admitting execution authority, and a staging event. Identical duplicate
+delivery is non-mutating; conflicting mutation IDs and stale revisions fail closed. Migration from
+schema 18 uses the existing exclusive, backup-verified migration coordinator and preserves activation
+bindings. Older supported migrations still initialize bindings before adding candidate storage.
+
+A candidate is **not executable graph authority**. Staging does not change the committed graph
+revision or reconcile active work. `validate_staged_run_graph_edit` reads one graph snapshot,
+applies candidate operations in memory with identity preconditions, and invokes workflow structural
+validation. Graphs exceeding one bounded page explicitly require incremental validation; that path is
+not yet implemented. Schema 20 persists successful bounded structural validation keyed by candidate
+identity and expected graph revision; duplicate validation replaces the same record after revalidation.
+The existing exclusive migration coordinator upgrades schema 19 without changing candidate requests
+or activation bindings. These records are not publication authority and cannot bypass ownership,
+revision, permission, or reconciliation checks. Candidate
+publication, lifecycle management, and application integration remain unimplemented; dispatch safety
+gates remain in place.
+
 ## Canonical ownership
 
 Durable workflow execution uses one dedicated database:

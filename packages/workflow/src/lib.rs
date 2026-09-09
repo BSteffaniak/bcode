@@ -4011,6 +4011,126 @@ impl WorkflowCompilationPreview {
     }
 }
 
+/// Compatibility version for live run graph edit requests.
+pub const WORKFLOW_RUN_GRAPH_EDIT_VERSION: u32 = 1;
+/// Maximum structural operations admitted in one live graph edit request.
+pub const MAX_WORKFLOW_RUN_GRAPH_EDITS: usize = 256;
+
+/// Explicit disposition of an existing activation affected by a live edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowRunGraphReconciliation {
+    /// Preserve the activation's admitted executable and inputs.
+    Retain { activation_id: String },
+    /// Request cancellation; replacement cannot dispatch until cancellation is reconciled.
+    Cancel { activation_id: String },
+}
+
+/// Structural mutation of a run-owned graph, independent of authored draft state.
+///
+/// Removing a node does not implicitly remove incident edges or erase execution history.
+/// Callers must explicitly retire incident edges in the same admitted revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowRunGraphEdit {
+    /// Admit a new logical node identity.
+    AddNode {
+        node: NodeDefinition,
+        entry: bool,
+        exit: bool,
+    },
+    /// Admit a replacement executable for an existing logical node.
+    ReplaceNode {
+        node: NodeDefinition,
+        entry: bool,
+        exit: bool,
+    },
+    /// Retire a logical node from future scheduling without deleting its history.
+    RemoveNode { node_id: String },
+    /// Admit an edge with a caller-selected stable run-local identity.
+    AddEdge { edge_id: u64, edge: EdgeDefinition },
+    /// Reconnect an existing stable edge identity.
+    ReplaceEdge { edge_id: u64, edge: EdgeDefinition },
+    /// Retire an edge without deleting historical revisions.
+    RemoveEdge { edge_id: u64 },
+}
+
+/// Bounded live graph edit intent. This request never grants execution authority.
+///
+/// The application authenticates the caller and the store checks current execution ownership.
+/// Graph revision, idempotency identity, edits, and reconciliation must commit atomically;
+/// validation here checks the request envelope only, not graph or execution-state validity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphEditBatch {
+    /// Independently evolving live-edit compatibility boundary.
+    pub version: u32,
+    /// Canonical run identity.
+    pub run_id: String,
+    /// Exact committed graph revision used to author this edit.
+    pub expected_revision: u64,
+    /// Stable identity for duplicate delivery; conflicting reuse must fail closed.
+    pub mutation_id: String,
+    /// Structural changes, never edits to an authored definition.
+    pub edits: Vec<WorkflowRunGraphEdit>,
+    /// Explicit treatment of affected active work.
+    pub reconciliation: Vec<WorkflowRunGraphReconciliation>,
+}
+
+impl WorkflowRunGraphEditBatch {
+    /// Validate compatibility, request bounds, identities, and duplicate dispositions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, invalid identities or revisions, empty or
+    /// oversized batches, or repeated reconciliation identities. Durable graph validation and
+    /// authorization are required separately before any mutation.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        let invalid = |message: &str| authoring_error("run_graph_edit", message);
+        if self.version != WORKFLOW_RUN_GRAPH_EDIT_VERSION {
+            return Err(invalid("unsupported live graph edit version"));
+        }
+        if self.expected_revision == 0 || self.expected_revision >= i64::MAX as u64 {
+            return Err(invalid("graph revision cannot be advanced"));
+        }
+        let valid_id =
+            |id: &str| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control);
+        if !valid_id(&self.run_id) || !valid_id(&self.mutation_id) {
+            return Err(invalid("invalid run or mutation identity"));
+        }
+        if self.edits.is_empty()
+            || self.edits.len() > MAX_WORKFLOW_RUN_GRAPH_EDITS
+            || self.reconciliation.len() > MAX_WORKFLOW_RUN_GRAPH_EDITS
+        {
+            return Err(invalid("live graph edit batch exceeds operation bounds"));
+        }
+        for edit in &self.edits {
+            let valid = match edit {
+                WorkflowRunGraphEdit::AddNode { node, .. }
+                | WorkflowRunGraphEdit::ReplaceNode { node, .. } => valid_id(&node.id),
+                WorkflowRunGraphEdit::RemoveNode { node_id } => valid_id(node_id),
+                WorkflowRunGraphEdit::AddEdge { edge_id, edge }
+                | WorkflowRunGraphEdit::ReplaceEdge { edge_id, edge } => {
+                    i64::try_from(*edge_id).is_ok() && valid_id(&edge.from) && valid_id(&edge.to)
+                }
+                WorkflowRunGraphEdit::RemoveEdge { edge_id } => i64::try_from(*edge_id).is_ok(),
+            };
+            if !valid {
+                return Err(invalid("invalid graph element identity"));
+            }
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for disposition in &self.reconciliation {
+            let (WorkflowRunGraphReconciliation::Retain { activation_id }
+            | WorkflowRunGraphReconciliation::Cancel { activation_id }) = disposition;
+            if !valid_id(activation_id) || !identities.insert(activation_id) {
+                return Err(invalid("invalid or repeated activation disposition"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Current renderer-neutral semantic authoring-edit contract version.
 pub const WORKFLOW_AUTHORING_EDIT_VERSION: u32 = 1;
 /// Maximum operations accepted in one atomic semantic edit batch.
@@ -15593,6 +15713,45 @@ fn ensure_acyclic(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn live_edit_envelope_preserves_intent_and_rejects_ambiguity() {
+        let mut batch = WorkflowRunGraphEditBatch {
+            version: WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run-1".to_string(),
+            expected_revision: 1,
+            mutation_id: "edit-1".to_string(),
+            edits: vec![WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![WorkflowRunGraphReconciliation::Retain {
+                activation_id: "activation-1".to_string(),
+            }],
+        };
+        batch.validate().expect("valid envelope");
+        let wire = serde_json::to_value(&batch).expect("serialize");
+        assert_eq!(
+            serde_json::from_value::<WorkflowRunGraphEditBatch>(wire.clone()).expect("decode"),
+            batch
+        );
+        let mut unknown = wire;
+        unknown["authority"] = serde_json::json!("untrusted");
+        assert!(serde_json::from_value::<WorkflowRunGraphEditBatch>(unknown).is_err());
+        batch
+            .reconciliation
+            .push(WorkflowRunGraphReconciliation::Cancel {
+                activation_id: "activation-1".to_string(),
+            });
+        assert!(batch.validate().is_err());
+        batch.reconciliation.pop();
+        batch.version += 1;
+        assert!(batch.validate().is_err());
+        batch.version = WORKFLOW_RUN_GRAPH_EDIT_VERSION;
+        batch.expected_revision = i64::MAX as u64;
+        assert!(batch.validate().is_err());
+        batch.expected_revision = 1;
+        batch.edits =
+            vec![WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }; MAX_WORKFLOW_RUN_GRAPH_EDITS + 1];
+        assert!(batch.validate().is_err());
+    }
 
     fn valid_prompt_configuration() -> WorkflowPromptConfiguration {
         WorkflowPromptConfiguration {

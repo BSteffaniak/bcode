@@ -26,7 +26,7 @@ use std::pin::Pin;
 use thiserror::Error;
 
 mod run_graph;
-pub use run_graph::{RunGraphEdge, RunGraphNode};
+pub use run_graph::{RunGraphCandidateValidation, RunGraphEdge, RunGraphNode};
 
 const DATABASE_FILE: &str = "workflow.db";
 const LOCK_FILE: &str = "workflow.lock";
@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 18;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 20;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1579,7 +1579,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=17),
+                                actual: Some(14..=19),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1609,7 +1609,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=17),
+                                actual: Some(14..=19),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1758,7 +1758,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=17) {
+        if !matches!(previous_schema_version, 14..=19) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -1798,9 +1798,12 @@ impl WorkflowStore {
         } else if previous_schema_version == 16 {
             run_graph::initialize_source_index(&transaction)?;
         }
-        transaction.execute_batch(
-            "ALTER TABLE workflow_activations ADD COLUMN node_revision INTEGER NOT NULL DEFAULT 1 CHECK (node_revision > 0);",
-        )?;
+        if previous_schema_version < 18 {
+            transaction.execute_batch(
+                "ALTER TABLE workflow_activations ADD COLUMN node_revision INTEGER NOT NULL DEFAULT 1 CHECK (node_revision > 0);",
+            )?;
+        }
+        run_graph::initialize_edit_candidates(&transaction)?;
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
             [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -14636,7 +14639,7 @@ fn validate_output_against_node_schema(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
 ) -> Result<(), WorkflowStoreError> {
-    let node = run_graph::initial_activation_node(
+    let node = run_graph::bound_activation_node(
         transaction,
         &output.run_id,
         &output.node_id,
@@ -15344,6 +15347,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              ON workflow_authoring_events(workflow_id, event_seq);",
     )?;
     run_graph::initialize(&transaction)?;
+    run_graph::initialize_edit_candidates(&transaction)?;
     transaction.execute(
         "INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, ?1)",
         [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -21526,6 +21530,178 @@ mod tests {
     }
 
     #[test]
+    fn graph_edit_candidate_survives_upgrade_and_duplicate_delivery() {
+        let (temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE workflow_graph_edit_candidates;
+             UPDATE workflow_store_contract SET schema_version = 18;
+             UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("schema eighteen fixture");
+        drop(store);
+        let mut store =
+            WorkflowStore::initialize_in_state_dir(temp.path(), 20).expect("preservation upgrade");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run-1".to_string(),
+            expected_revision: 1,
+            mutation_id: "mutation-1".to_string(),
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "review".to_string(),
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: activation_id(),
+            }],
+        };
+        let original = store
+            .activation_graph_node("run-1", "review", &activation_id())
+            .expect("binding");
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(store.stage_run_graph_edit(&request, &stale, 21).is_err());
+        assert!(
+            store
+                .stage_run_graph_edit(&request, &authority, 21)
+                .expect("stage")
+        );
+        assert_eq!(
+            store.run_graph_revision("run-1").expect("revision"),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .activation_graph_node("run-1", "review", &activation_id())
+                .expect("binding unchanged"),
+            original
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            !store
+                .stage_run_graph_edit(&request, &authority, 22)
+                .expect("duplicate")
+        );
+        let mut conflict = request.clone();
+        conflict.expected_revision = 2;
+        assert!(
+            store
+                .stage_run_graph_edit(&conflict, &authority, 23)
+                .is_err()
+        );
+        conflict.mutation_id = "mutation-2".to_string();
+        assert!(
+            store
+                .stage_run_graph_edit(&conflict, &authority, 23)
+                .is_err()
+        );
+        let count: u64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM workflow_graph_edit_candidates",
+                [],
+                |row| row.get(0),
+            )
+            .expect("candidate count");
+        assert_eq!(count, 1);
+        verify_candidate_read_and_damage(&mut store, &request, &authority);
+    }
+
+    fn verify_persisted_candidate_validation(
+        store: &WorkflowStore,
+        authority: &WorkflowExecutionAuthority,
+    ) {
+        store
+            .validate_staged_run_graph_edit("run-1", "valid-replacement", authority)
+            .expect("duplicate validation");
+        let records: Vec<(String, u64)> = store
+            .connection
+            .prepare("SELECT mutation_id, expected_revision FROM workflow_graph_edit_validations")
+            .expect("prepare validation records")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query validation records")
+            .collect::<Result<_, _>>()
+            .expect("validation records");
+        assert_eq!(records, vec![("valid-replacement".to_string(), 1)]);
+    }
+
+    fn verify_candidate_read_and_damage(
+        store: &mut WorkflowStore,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &WorkflowExecutionAuthority,
+    ) {
+        assert_eq!(
+            store
+                .staged_run_graph_edit("run-1", "mutation-1", authority)
+                .expect("read candidate"),
+            Some(request.clone())
+        );
+        assert!(
+            store
+                .validate_staged_run_graph_edit("run-1", "mutation-1", authority)
+                .is_err()
+        );
+        let node = store
+            .current_run_graph_node("run-1", "review")
+            .expect("current node")
+            .expect("node");
+        let mut replacement = request.clone();
+        replacement.mutation_id = "valid-replacement".to_string();
+        replacement.edits = vec![bcode_workflow::WorkflowRunGraphEdit::ReplaceNode {
+            node: node.node,
+            entry: node.entry,
+            exit: node.exit,
+        }];
+        store
+            .stage_run_graph_edit(&replacement, authority, 24)
+            .expect("stage replacement");
+        assert_eq!(
+            store
+                .validate_staged_run_graph_edit("run-1", "valid-replacement", authority)
+                .expect("validate"),
+            RunGraphCandidateValidation::Validated
+        );
+        verify_persisted_candidate_validation(store, authority);
+        for (status, cancellation) in [("completed", None), ("running", Some(25))] {
+            store.connection.execute(
+                "UPDATE workflow_runs SET status = ?1, cancellation_requested_at_ms = ?2 WHERE run_id = 'run-1'",
+                rusqlite::params![status, cancellation],
+            ).expect("close graph edit admission");
+            let changes = store.connection.total_changes();
+            assert!(
+                store
+                    .validate_staged_run_graph_edit("run-1", "valid-replacement", authority)
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), changes);
+        }
+        store.connection.execute(
+            "UPDATE workflow_runs SET status = 'running', cancellation_requested_at_ms = NULL WHERE run_id = 'run-1'", [],
+        ).expect("restore run admission");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_graph_edit_candidates SET expected_revision = 2",
+                [],
+            )
+            .expect("damage candidate revision");
+        assert!(
+            store
+                .staged_run_graph_edit("run-1", "mutation-1", authority)
+                .is_err()
+        );
+        assert!(store.stage_run_graph_edit(request, authority, 24).is_err());
+        assert!(store.connection.is_autocommit());
+    }
+
+    #[test]
     fn revision_aware_admission_fences_and_preserves_bindings() {
         let (temp, mut store) = initialized_store();
         let original = store
@@ -26827,7 +27003,7 @@ mod tests {
                 .persist_validated_output(&output)
                 .expect_err("missing graph")
                 .to_string()
-                .contains("missing run-graph node")
+                .contains("activation executable revision is missing")
         );
         assert_eq!(store.connection.total_changes(), before);
         assert_eq!(
@@ -34038,6 +34214,53 @@ mod tests {
             decision.value["skipped_nodes"],
             serde_json::json!(["other"])
         );
+    }
+
+    #[test]
+    fn output_schema_validation_retains_activation_revision_after_graph_edit() {
+        let (_temp, store) = initialized_store();
+        let mut replacement = store
+            .current_run_graph_node("run-1", "review")
+            .expect("current node")
+            .expect("node")
+            .node;
+        replacement.output.type_name = "replacement-string".to_string();
+        replacement.output.schema = serde_json::json!({"type": "string"});
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("transaction");
+        transaction.execute(
+            "INSERT INTO workflow_run_graph_nodes
+             SELECT run_id, node_id, 2, ?1, is_entry, is_exit
+             FROM workflow_run_graph_nodes WHERE run_id = 'run-1' AND node_id = 'review' AND revision = 1",
+            [serde_json::to_string(&replacement).expect("serialize")],
+        ).expect("new revision fixture");
+        transaction
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("advance graph fixture");
+        let mut output = ValidatedOutput {
+            output_id: "output-1".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_identity("run-1", "review", 0),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        validate_output_against_node_schema(&transaction, &output).expect("original binding");
+        output.schema_id = "replacement-string".to_string();
+        output.value = serde_json::json!("replacement");
+        assert!(validate_output_against_node_schema(&transaction, &output).is_err());
+        transaction.execute(
+            "UPDATE workflow_activations SET node_revision = 2 WHERE run_id = 'run-1' AND node_id = 'review'", [],
+        ).expect("new binding fixture");
+        validate_output_against_node_schema(&transaction, &output).expect("new binding");
     }
 
     #[test]

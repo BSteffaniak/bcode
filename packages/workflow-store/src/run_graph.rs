@@ -38,6 +38,310 @@ pub struct RunGraphEdge {
     pub edge: EdgeDefinition,
 }
 
+pub fn initialize_edit_candidates(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workflow_graph_edit_candidates (
+            run_id TEXT NOT NULL REFERENCES workflow_runs(run_id),
+            mutation_id TEXT NOT NULL,
+            expected_revision INTEGER NOT NULL CHECK (expected_revision > 0),
+            request_json TEXT NOT NULL,
+            authority_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (run_id, mutation_id)
+        );
+        CREATE TABLE IF NOT EXISTS workflow_graph_edit_validations (
+            run_id TEXT NOT NULL,
+            mutation_id TEXT NOT NULL,
+            expected_revision INTEGER NOT NULL CHECK (expected_revision > 0),
+            PRIMARY KEY (run_id, mutation_id),
+            FOREIGN KEY (run_id, mutation_id)
+                REFERENCES workflow_graph_edit_candidates(run_id, mutation_id)
+        );",
+    )?;
+    Ok(())
+}
+
+/// Structural validation outcome; neither variant authorizes graph publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunGraphCandidateValidation {
+    /// The bounded candidate graph passed domain structural validation.
+    Validated,
+    /// The graph exceeds one validation slice and requires incremental validation.
+    RequiresIncrementalValidation,
+}
+
+impl WorkflowStore {
+    /// Validate a persisted edit against one bounded snapshot of the committed graph.
+    ///
+    /// This validates structure, not execution reconciliation or caller permissions. Large graphs
+    /// remain preserved and explicitly require incremental validation rather than being truncated.
+    /// Successful validation is persisted for this candidate and graph revision, but never
+    /// authorizes publication or bypasses subsequent ownership and reconciliation checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale ownership/revision, damaged state, invalid structural edits,
+    /// missing candidates, or database failures.
+    pub fn validate_staged_run_graph_edit(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+    ) -> Result<RunGraphCandidateValidation, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let request = self
+            .staged_run_graph_edit(run_id, mutation_id, authority)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("graph edit candidate not found".to_string())
+            })?;
+        ensure_run_accepts_graph_edits(&transaction, run_id)?;
+        let page = self.current_run_graph_page(
+            run_id,
+            Some(request.expected_revision),
+            None,
+            None,
+            GRAPH_PAGE_LIMIT,
+        )?;
+        if !page.nodes_complete || !page.edges_complete {
+            return Ok(RunGraphCandidateValidation::RequiresIncrementalValidation);
+        }
+        let payload: String = transaction.query_row(
+            "SELECT CASE WHEN typeof(definition_json) = 'text'
+             AND length(CAST(definition_json AS BLOB)) <= ?2 THEN definition_json END
+             FROM workflow_definitions definition JOIN workflow_runs run
+             ON definition.definition_id = run.definition_id AND definition.version = run.definition_version
+             WHERE run.run_id = ?1",
+            rusqlite::params![run_id, super::MAX_INLINE_JSON_BYTES], |row| row.get(0),
+        )?;
+        let mut graph: WorkflowDefinition = serde_json::from_str(&payload)?;
+        graph.nodes.clear();
+        graph.entries.clear();
+        graph.exits.clear();
+        for record in page.nodes {
+            if record.entry {
+                graph.entries.push(record.node.id.clone());
+            }
+            if record.exit {
+                graph.exits.push(record.node.id.clone());
+            }
+            graph.nodes.insert(record.node.id.clone(), record.node);
+        }
+        let mut edges = page
+            .edges
+            .into_iter()
+            .map(|record| (record.edge_id, record.edge))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for edit in &request.edits {
+            apply_candidate_edit(&mut graph, &mut edges, edit)?;
+        }
+        graph.edges = edges.into_values().collect();
+        graph
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        transaction.execute(
+            "INSERT INTO workflow_graph_edit_validations (run_id, mutation_id, expected_revision)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (run_id, mutation_id) DO UPDATE
+             SET expected_revision = excluded.expected_revision",
+            rusqlite::params![run_id, mutation_id, request.expected_revision],
+        )?;
+        transaction.commit()?;
+        Ok(RunGraphCandidateValidation::Validated)
+    }
+
+    /// Read a staged edit under current execution authority without publishing it.
+    ///
+    /// The stored envelope and provenance are validated in one snapshot. A transferred owner
+    /// may inspect a predecessor's intent, but inspection does not authorize publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale ownership, invalid identities, unsupported or damaged candidate
+    /// data, inconsistent indexed revision, or persistence failure. Reads never repair state.
+    pub fn staged_run_graph_edit(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+    ) -> Result<Option<bcode_workflow::WorkflowRunGraphEditBatch>, WorkflowStoreError> {
+        super::validate_id("run_id", run_id)?;
+        super::validate_id("mutation_id", mutation_id)?;
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN typeof(request_json) = 'text'
+                 AND length(CAST(request_json AS BLOB)) <= ?3 THEN request_json END,
+                 CASE WHEN typeof(authority_json) = 'text'
+                 AND length(CAST(authority_json AS BLOB)) <= ?3 THEN authority_json END,
+                 expected_revision, created_at_ms
+             FROM workflow_graph_edit_candidates WHERE run_id = ?1 AND mutation_id = ?2",
+                rusqlite::params![run_id, mutation_id, super::MAX_INLINE_JSON_BYTES],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let request = row
+            .map(|(payload, provenance, revision, _created_at_ms)| {
+                let request: bcode_workflow::WorkflowRunGraphEditBatch =
+                    serde_json::from_str(&payload)?;
+                request
+                    .validate()
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                let owner: super::WorkflowExecutionAuthority = serde_json::from_str(&provenance)?;
+                super::validate_id("target_artifact_id", &owner.target_artifact_id)?;
+                super::validate_id("daemon_instance_id", &owner.daemon_instance_id)?;
+                super::validate_id("fencing_token", &owner.fencing_token)?;
+                if owner.generation == 0
+                    || request.run_id != run_id
+                    || request.mutation_id != mutation_id
+                    || request.expected_revision != revision
+                {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "inconsistent graph edit candidate".to_string(),
+                    ));
+                }
+                Ok(request)
+            })
+            .transpose()?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(request)
+    }
+
+    /// Durably stage a live graph edit without publishing executable topology.
+    ///
+    /// Returns `true` for a new candidate and `false` for identical duplicate delivery.
+    /// Candidates preserve their admitting authority and do not authorize execution or bypass
+    /// structural validation. Publication and reconciliation are separate required operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or oversized requests, stale ownership or revision,
+    /// conflicting duplicate identity, terminal/cancelling runs, or persistence failure.
+    pub fn stage_run_graph_edit(
+        &mut self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &super::WorkflowExecutionAuthority,
+        created_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        request
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        super::validate_id("run_id", &request.run_id)?;
+        super::validate_id("mutation_id", &request.mutation_id)?;
+        let payload = super::bounded_json("graph edit candidate", request)?;
+        let authority_json = super::bounded_json("graph edit authority", authority)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(&request.run_id, authority)?;
+        if let Some(existing) =
+            self.staged_run_graph_edit(&request.run_id, &request.mutation_id, authority)?
+        {
+            if existing != *request {
+                return Err(WorkflowStoreError::InvalidData(
+                    "conflicting graph edit mutation identity".to_string(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(false);
+        }
+        if graph_revision(&transaction, &request.run_id)? != Some(request.expected_revision) {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow graph revision conflict".to_string(),
+            ));
+        }
+        ensure_run_accepts_graph_edits(&transaction, &request.run_id)?;
+        transaction.execute(
+            "INSERT INTO workflow_graph_edit_candidates
+             (run_id, mutation_id, expected_revision, request_json, authority_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                request.run_id,
+                request.mutation_id,
+                request.expected_revision,
+                payload,
+                authority_json,
+                created_at_ms
+            ],
+        )?;
+        super::append_event(&transaction, &request.run_id, "graph_edit_staged",
+            &serde_json::json!({"mutation_id": request.mutation_id, "expected_revision": request.expected_revision}).to_string(), created_at_ms)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+}
+
+fn ensure_run_accepts_graph_edits(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<(), WorkflowStoreError> {
+    let accepts: bool = connection.query_row(
+        "SELECT status IN ('running', 'paused') AND cancellation_requested_at_ms IS NULL
+         FROM workflow_runs WHERE run_id = ?1",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if !accepts {
+        return Err(WorkflowStoreError::InvalidData(
+            "run does not accept graph edits".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_candidate_edit(
+    graph: &mut WorkflowDefinition,
+    edges: &mut std::collections::BTreeMap<u64, EdgeDefinition>,
+    edit: &bcode_workflow::WorkflowRunGraphEdit,
+) -> Result<(), WorkflowStoreError> {
+    use bcode_workflow::WorkflowRunGraphEdit as Edit;
+    let invalid =
+        || WorkflowStoreError::InvalidData("graph edit identity precondition failed".to_string());
+    match edit {
+        Edit::AddNode { node, entry, exit } | Edit::ReplaceNode { node, entry, exit } => {
+            if graph.nodes.contains_key(&node.id) != matches!(edit, Edit::ReplaceNode { .. }) {
+                return Err(invalid());
+            }
+            graph.entries.retain(|id| id != &node.id);
+            graph.exits.retain(|id| id != &node.id);
+            if *entry {
+                graph.entries.push(node.id.clone());
+            }
+            if *exit {
+                graph.exits.push(node.id.clone());
+            }
+            graph.nodes.insert(node.id.clone(), node.clone());
+        }
+        Edit::RemoveNode { node_id } => {
+            graph.nodes.remove(node_id).ok_or_else(invalid)?;
+            graph.entries.retain(|id| id != node_id);
+            graph.exits.retain(|id| id != node_id);
+        }
+        Edit::AddEdge { edge_id, edge } | Edit::ReplaceEdge { edge_id, edge } => {
+            if edges.contains_key(edge_id) != matches!(edit, Edit::ReplaceEdge { .. }) {
+                return Err(invalid());
+            }
+            edges.insert(*edge_id, edge.clone());
+        }
+        Edit::RemoveEdge { edge_id } => {
+            edges.remove(edge_id).ok_or_else(invalid)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
     connection.execute_batch(
         "CREATE TABLE workflow_run_graphs (
