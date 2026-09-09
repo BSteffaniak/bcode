@@ -632,7 +632,12 @@ impl DocumentSource {
 }
 
 fn source(request: &ExtractRequest) -> Result<DocumentSource, DocumentError> {
-    match (&request.url, &request.path) {
+    let url = request.url.as_ref().filter(|url| !url.is_empty());
+    let path = request
+        .path
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty());
+    match (url, path) {
         (Some(url), None) => {
             if url.starts_with("http://") || url.starts_with("https://") {
                 Ok(DocumentSource::Url(url.clone()))
@@ -745,8 +750,8 @@ fn extract_tool_definition() -> ToolDefinition {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string" },
-                "path": { "type": "string" },
+                "url": { "type": "string", "description": "HTTP(S) PDF URL. Provide exactly one nonempty url or path; omit or leave empty when using path." },
+                "path": { "type": "string", "description": "Local PDF path. Provide exactly one nonempty path or url; omit or leave empty when using url." },
                 "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_BYTES },
                 "timeout_ms": { "type": "integer", "minimum": 1 }
             }
@@ -1047,6 +1052,63 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn empty_unused_source_survives_preparation_and_invocation() {
+        for (arguments, expected_operation, expected_source) in [
+            (
+                json!({"path": "report.pdf", "url": ""}),
+                bcode_plugin_sdk::ToolPolicyOperation::Read {
+                    paths: vec!["/tmp/workspace/report.pdf".to_owned()],
+                },
+                "/tmp/workspace/report.pdf",
+            ),
+            (
+                json!({"path": "", "url": "https://example.com/report.pdf"}),
+                bcode_plugin_sdk::ToolPolicyOperation::Web {
+                    url: Some("https://example.com/report.pdf".to_owned()),
+                },
+                "https://example.com/report.pdf",
+            ),
+        ] {
+            let definition = extract_tool_definition();
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "call".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments: arguments.clone(),
+                },
+                host_context: workspace_context(Path::new("/tmp/workspace")),
+            };
+            let policy = document_policy_operation(&request, &definition).expect("document policy");
+            assert!(policy.requires_permission);
+            assert_eq!(policy.operation, expected_operation);
+            let descriptor = serde_json::from_value(policy.descriptor).expect("descriptor");
+            let mut extract = serde_json::from_value(arguments).expect("extract request");
+            apply_document_preparation(&mut extract, &descriptor).expect("apply preparation");
+            assert_eq!(
+                source(&extract).expect("source").as_string(),
+                expected_source
+            );
+        }
+    }
+
+    #[test]
+    fn source_rejects_empty_inputs() {
+        for arguments in [
+            json!({"url": "", "path": ""}),
+            json!({"url": ""}),
+            json!({"path": ""}),
+            json!({"url": null, "path": ""}),
+            json!({"url": "", "path": null}),
+        ] {
+            let request = serde_json::from_value(arguments).expect("extract request");
+            assert!(matches!(
+                source(&request),
+                Err(DocumentError::InvalidSource)
+            ));
+        }
     }
 
     #[test]
