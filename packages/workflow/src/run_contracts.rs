@@ -2,6 +2,56 @@
 //! Existing wire representations are preserved. Authored provenance compatibility is recognized
 //! by its version; run status variants are explicit and unknown variants are rejected.
 
+/// A connected source of workflow notifications, independent of transport details.
+///
+/// The returned subscription owns its delivery resources. Dropping it ends observation;
+/// it does not cancel workflow execution. Reconnection does not imply durable resume.
+pub trait WorkflowRunObservationApplication: Sync {
+    /// Transport or normalized domain failure.
+    type Error;
+    /// Connection-owning notification subscription.
+    type Subscription: WorkflowRunSubscription<Error = Self::Error>;
+
+    /// Subscribe to canonical-state change notifications.
+    ///
+    /// # Errors
+    /// Returns an error when connection or subscription admission fails.
+    fn watch_workflow_runs(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Self::Subscription, Self::Error>> + Send;
+}
+
+/// An owned, live-only workflow notification subscription.
+///
+/// Consumers refetch bounded projections on changes and replace snapshots on resync.
+/// Delivery resources are released on drop without cancelling the observed runs.
+pub trait WorkflowRunSubscription: Send {
+    /// Transport or normalized domain failure.
+    type Error;
+
+    /// Wait for the next notification after duplicate and gap handling.
+    ///
+    /// # Errors
+    /// Returns an error on connection closure or decoding failure.
+    fn next_event(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<WorkflowRunWatchEvent, Self::Error>> + Send;
+}
+
+/// Outcome of receiving one workflow live notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowRunWatchEvent {
+    /// Canonical state changed; refetch this run's bounded projection.
+    Changed(bcode_workflow_view_models::WorkflowLiveEvent),
+    /// Delivery skipped beyond the bounded catch-up window; replace bounded snapshots.
+    ResyncRequired,
+    /// A future event contract was received and cannot be interpreted.
+    UnsupportedVersion {
+        /// Unsupported event contract version.
+        version: u32,
+    },
+}
+
 /// Connected application operations for workflow run admission.
 ///
 /// Implementations own caller identity and authorization. An error does not promise rollback
@@ -9,6 +59,71 @@
 pub trait WorkflowRunApplication: Sync {
     /// Adapter-owned transport or normalized domain failure.
     type Error;
+
+    /// Admit an exact definition and binding through normal authorization and ownership checks.
+    /// Stable run IDs permit identical retries, but conflicting requests fail closed.
+    ///
+    /// # Errors
+    /// Returns an error on invalid definitions, denied admission, ownership conflicts,
+    /// unavailable state, or transport failure. Errors do not imply rollback.
+    fn start_workflow(
+        &self,
+        request: WorkflowStartRequest,
+    ) -> impl std::future::Future<Output = Result<WorkflowRunStartResponse, Self::Error>> + Send;
+
+    /// Read a bounded page of ordered live notifications after a global sequence.
+    /// This is gap catch-up, not durable resume. When `resync_required` is set,
+    /// consumers must replace their view from a fresh bounded snapshot.
+    ///
+    /// # Errors
+    /// Returns an error for limits outside 1..=1000, unavailable state, or transport failure.
+    fn workflow_live_event_catch_up(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<bcode_workflow_view_models::WorkflowLiveEventPage, Self::Error>,
+    > + Send;
+
+    /// Look up the newest run for an exact binding without repairing durable state.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state or transport failure.
+    fn associated_workflow_run(
+        &self,
+        key: WorkflowRunBindingLookup,
+    ) -> impl std::future::Future<Output = Result<Option<WorkflowRunSummary>, Self::Error>> + Send;
+
+    /// Inspect bounded collections for the newest run for an exact binding.
+    ///
+    /// # Errors
+    /// Returns an error on unverifiable state or transport failure.
+    fn inspect_associated_workflow_run(
+        &self,
+        key: WorkflowRunBindingLookup,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Option<WorkflowRunInspection>, Self::Error>> + Send;
+
+    /// Control the newest associated run under its verified execution authority.
+    /// The flag reports a recorded change, not terminal completion. Errors do not imply rollback.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, foreign ownership, invalid transitions,
+    /// cancellation propagation failure, or transport failure.
+    fn control_associated_workflow_run(
+        &self,
+        key: WorkflowRunBindingLookup,
+        action: WorkflowRunControlAction,
+    ) -> impl std::future::Future<Output = Result<(Option<WorkflowRunSummary>, bool), Self::Error>> + Send;
+
+    /// Read one revision-checked graph page without reconstructing the full graph.
+    ///
+    /// # Errors
+    /// Returns an error for invalid cursors, changed revisions, unavailable state, or transport failure.
+    fn inspect_workflow_run_graph(
+        &self,
+        request: crate::WorkflowRunGraphPageRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowRunGraphInspection, Self::Error>> + Send;
 
     /// List a bounded set of recent runs without repairing durable state.
     ///

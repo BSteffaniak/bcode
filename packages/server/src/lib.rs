@@ -6718,13 +6718,16 @@ async fn handle_workflow_validation_request(
             .await
         }
         WorkflowDefinitionRequest::StartWorkflow(request) => {
-            let started = workflow_operations::start(state, request).await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+            let result = bcode_workflow::WorkflowRunApplication::start_workflow(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                request,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(started) => Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         WorkflowDefinitionRequest::StartWorkflowRun(request) => {
             let started = workflow_operations::start_run(state, request, None).await?;
@@ -6798,13 +6801,16 @@ async fn handle_workflow_run_request(
             .await
         }
         RuntimeAndModelRequest::InspectWorkflowRunGraph { request } => {
-            let graph = workflow_operations::inspect_graph_page(state, &request)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowRunGraphInspection { graph }),
+            let result = bcode_workflow::WorkflowRunApplication::inspect_workflow_run_graph(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                request,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(graph) => Response::Ok(ResponsePayload::WorkflowRunGraphInspection { graph }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::InspectWorkflowRun { run_id, limit } => {
             let result = Box::pin(
@@ -6856,48 +6862,46 @@ async fn handle_workflow_run_request(
             send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::AssociatedWorkflowRun { key } => {
-            let key = bcode_workflow_store::WorkflowRunBindingKey {
-                owner_plugin_id: key.owner_plugin_id,
-                workflow_kind: key.workflow_kind,
-                scope_key: key.scope_key,
-            };
-            let run = workflow_operations::associated_run(state, &key)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::AssociatedWorkflowRun { run }),
+            let result = bcode_workflow::WorkflowRunApplication::associated_workflow_run(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                key,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(run) => Response::Ok(ResponsePayload::AssociatedWorkflowRun { run }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::InspectAssociatedWorkflowRun { key, limit } => {
-            let key = bcode_workflow_store::WorkflowRunBindingKey {
-                owner_plugin_id: key.owner_plugin_id,
-                workflow_kind: key.workflow_kind,
-                scope_key: key.scope_key,
-            };
-            let inspection =
-                workflow_operations::inspect_associated_run(state, &key, limit).await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::AssociatedWorkflowRunInspection { inspection }),
+            let result = bcode_workflow::WorkflowRunApplication::inspect_associated_workflow_run(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                key,
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(inspection) => Response::Ok(ResponsePayload::AssociatedWorkflowRunInspection {
+                    inspection: inspection.map(Box::new),
+                }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ControlAssociatedWorkflowRun { key, action } => {
-            let key = bcode_workflow_store::WorkflowRunBindingKey {
-                owner_plugin_id: key.owner_plugin_id,
-                workflow_kind: key.workflow_kind,
-                scope_key: key.scope_key,
-            };
-            let (run, changed) =
-                workflow_operations::control_associated_run(state, &key, action).await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::AssociatedWorkflowRunControlled { run, changed }),
+            let result = bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                key,
+                action,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok((run, changed)) => {
+                    Response::Ok(ResponsePayload::AssociatedWorkflowRunControlled { run, changed })
+                }
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ListWorkflowRuns { limit } => {
             let result = bcode_workflow::WorkflowRunApplication::list_workflow_runs(
@@ -7123,13 +7127,17 @@ async fn handle_workflow_run_request(
             after_sequence,
             limit,
         } => {
-            let page = workflow_operations::live_event_catch_up(state, after_sequence, limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowLiveEventCatchUp { page }),
+            let result = bcode_workflow::WorkflowRunApplication::workflow_live_event_catch_up(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                after_sequence,
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(page) => Response::Ok(ResponsePayload::WorkflowLiveEventCatchUp { page }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::SubscribeWorkflowRuns => {
             handle_subscribe_workflow_runs(request_id, client_id, state, writer).await
@@ -15732,21 +15740,23 @@ async fn handle_subscribe_runtime_work(
 async fn handle_subscribe_workflow_runs(
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
-    let after_sequence = workflow_operations::subscribe_runs(
-        state,
-        client_id,
-        ClientEventSink::new(client_id, writer.clone(), state.metrics.clone()),
-    )
-    .await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunsSubscribed { after_sequence }),
-    )
-    .await
+    let result = workflow_operations::WorkflowAuthoringApplication::new(state, client_id)
+        .subscribe_runs(ClientEventSink::new(
+            client_id,
+            writer.clone(),
+            state.metrics.clone(),
+        ))
+        .await;
+    let response = match result {
+        Ok(after_sequence) => {
+            Response::Ok(ResponsePayload::WorkflowRunsSubscribed { after_sequence })
+        }
+        Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+    };
+    send_response(writer, request_id, response).await
 }
 
 async fn send_compaction_noop_response(
@@ -66222,48 +66232,68 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 })
                 .expect("run");
         }
-        let status = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .associated_run(&key)
-            .expect("status")
-            .expect("run");
-        assert_eq!(status.status, bcode_workflow_store::RunStatus::Running);
-
-        let (paused, changed) = workflow_operations::control_associated_run(
-            &state,
-            &key,
-            bcode_workflow::WorkflowRunControlAction::Pause,
+        let application =
+            || workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
+        let lookup = bcode_workflow::WorkflowRunBindingLookup {
+            owner_plugin_id: key.owner_plugin_id.clone(),
+            workflow_kind: key.workflow_kind.clone(),
+            scope_key: key.scope_key.clone(),
+        };
+        let status = bcode_workflow::WorkflowRunApplication::associated_workflow_run(
+            &application(),
+            lookup.clone(),
         )
         .await
-        .expect("pause");
+        .expect("status")
+        .expect("run");
+        assert_eq!(status.status, bcode_workflow_store::RunStatus::Running);
+        assert!(
+            bcode_workflow::WorkflowRunApplication::inspect_associated_workflow_run(
+                &application(),
+                lookup.clone(),
+                10
+            )
+            .await
+            .expect("inspection")
+            .is_some()
+        );
+
+        let (paused, changed) =
+            bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
+                &application(),
+                lookup.clone(),
+                bcode_workflow::WorkflowRunControlAction::Pause,
+            )
+            .await
+            .expect("pause");
         assert!(changed);
         assert_eq!(
             paused.expect("paused").status,
             bcode_workflow_store::RunStatus::Paused
         );
 
-        let (resumed, changed) = workflow_operations::control_associated_run(
-            &state,
-            &key,
-            bcode_workflow::WorkflowRunControlAction::Resume,
-        )
-        .await
-        .expect("resume");
+        let (resumed, changed) =
+            bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
+                &application(),
+                lookup.clone(),
+                bcode_workflow::WorkflowRunControlAction::Resume,
+            )
+            .await
+            .expect("resume");
         assert!(changed);
         assert_eq!(
             resumed.expect("resumed").status,
             bcode_workflow_store::RunStatus::Running
         );
 
-        let (stopped, changed) = workflow_operations::control_associated_run(
-            &state,
-            &key,
-            bcode_workflow::WorkflowRunControlAction::Cancel,
-        )
-        .await
-        .expect("stop");
+        let (stopped, changed) =
+            bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
+                &application(),
+                lookup,
+                bcode_workflow::WorkflowRunControlAction::Cancel,
+            )
+            .await
+            .expect("stop");
         assert!(changed);
         let stopped = stopped.expect("stopped");
         assert!(stopped.cancellation_requested_at_ms.is_some());
@@ -66385,14 +66415,43 @@ event_symbol = "bcode_plugin_handle_event_v1"
             limits: bcode_workflow_store::WorkflowRunLimits::default(),
         };
 
-        let first = workflow_operations::start(&state, request.clone())
-            .await
-            .expect("first start");
-        let retry = workflow_operations::start(&state, request)
+        let application =
+            || workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
+        let first =
+            bcode_workflow::WorkflowRunApplication::start_workflow(&application(), request.clone())
+                .await
+                .expect("first start");
+        let retry = bcode_workflow::WorkflowRunApplication::start_workflow(&application(), request)
             .await
             .expect("retry");
         assert_eq!(first, retry);
         assert_eq!(first.run.workspace_snapshot, "/repo");
+        let lookup = bcode_workflow::WorkflowRunBindingLookup {
+            owner_plugin_id: "bcode.test".to_string(),
+            workflow_kind: "bcode.test.bound".to_string(),
+            scope_key: session.id.to_string(),
+        };
+        for (action, expected) in [
+            (
+                bcode_workflow::WorkflowRunControlAction::Pause,
+                bcode_workflow::RunStatus::Paused,
+            ),
+            (
+                bcode_workflow::WorkflowRunControlAction::Resume,
+                bcode_workflow::RunStatus::Running,
+            ),
+        ] {
+            let (run, changed) =
+                bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
+                    &application(),
+                    lookup.clone(),
+                    action,
+                )
+                .await
+                .expect("application control");
+            assert!(changed);
+            assert_eq!(run.expect("associated run").status, expected);
+        }
 
         let key = bcode_workflow_store::WorkflowRunBindingKey {
             owner_plugin_id: "bcode.test".to_string(),
@@ -66410,30 +66469,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(associated.run_id, "bound-stable-run");
         assert_eq!(associated.binding, first.run.binding);
 
+        assert_eq!(associated.status, bcode_workflow_store::RunStatus::Running);
         drop(reopened);
-        let mut reopened =
-            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen control");
-        assert!(
-            reopened
-                .pause_run("bound-stable-run", current_unix_millis())
-                .expect("pause after restart")
-        );
-        drop(reopened);
-        let mut reopened =
-            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen resume");
-        assert!(
-            reopened
-                .resume_run("bound-stable-run", current_unix_millis())
-                .expect("resume after restart")
-        );
-        assert_eq!(
-            reopened
-                .associated_run(&key)
-                .expect("lookup after lifecycle")
-                .expect("run")
-                .status,
-            bcode_workflow_store::RunStatus::Running
-        );
         drop(state);
     }
 
@@ -74985,7 +75022,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         });
 
         let client = bcode_client::BcodeClient::new(endpoint);
-        let mut watcher = client.watch_workflow_runs().await.expect("watcher");
+        let mut watcher =
+            bcode_workflow::WorkflowRunObservationApplication::watch_workflow_runs(&client)
+                .await
+                .expect("watcher");
         let disconnected_watcher = client.watch_workflow_runs().await.expect("second watcher");
         assert_eq!(state.workflow_event_clients.lock().await.len(), 2);
         drop(disconnected_watcher);
@@ -74999,10 +75039,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .request_cancellation_tree("run-1", 2)
             .expect("cancellation event");
-        let observed = tokio::time::timeout(Duration::from_secs(2), watcher.next_event())
-            .await
-            .expect("workflow notification timeout")
-            .expect("workflow notification");
+        let observed = tokio::time::timeout(
+            Duration::from_secs(2),
+            bcode_workflow::WorkflowRunSubscription::next_event(&mut watcher),
+        )
+        .await
+        .expect("workflow notification timeout")
+        .expect("workflow notification");
         let bcode_client::WorkflowRunWatchEvent::Changed(event) = observed else {
             panic!("expected changed notification");
         };

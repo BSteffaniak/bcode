@@ -829,15 +829,18 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 ));
             }
             print_json(
-                &Box::pin(client.inspect_workflow_run_graph(
-                    bcode_workflow::WorkflowRunGraphPageRequest {
-                        run_id,
-                        expected_revision,
-                        after_node_id,
-                        after_edge_id,
-                        limit,
-                    },
-                ))
+                &Box::pin(
+                    bcode_workflow::WorkflowRunApplication::inspect_workflow_run_graph(
+                        &client,
+                        bcode_workflow::WorkflowRunGraphPageRequest {
+                            run_id,
+                            expected_revision,
+                            after_node_id,
+                            after_edge_id,
+                            limit,
+                        },
+                    ),
+                )
                 .await?,
             )?;
         }

@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_session_models = { workspace = true }
+bcode_workflow_view_models = { workspace = true }
 futures = { workspace = true }
 jsonschema = { workspace = true }
 schemars = { workspace = true }

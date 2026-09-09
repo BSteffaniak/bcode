@@ -465,6 +465,54 @@ pub enum ClientError {
 }
 
 impl bcode_workflow::WorkflowRunApplication for BcodeClient {
+    async fn start_workflow(
+        &self,
+        request: bcode_workflow::WorkflowStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, Self::Error> {
+        Self::start_workflow(self, request).await
+    }
+    async fn workflow_live_event_catch_up(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<bcode_workflow_view_models::WorkflowLiveEventPage, Self::Error> {
+        match self
+            .send_request(Request::WorkflowLiveEventCatchUp {
+                after_sequence,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowLiveEventCatchUp { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+    async fn associated_workflow_run(
+        &self,
+        key: bcode_workflow::WorkflowRunBindingLookup,
+    ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, Self::Error> {
+        Self::associated_workflow_run(self, key).await
+    }
+    async fn inspect_associated_workflow_run(
+        &self,
+        key: bcode_workflow::WorkflowRunBindingLookup,
+        limit: usize,
+    ) -> Result<Option<bcode_workflow::WorkflowRunInspection>, Self::Error> {
+        Self::inspect_associated_workflow_run(self, key, limit).await
+    }
+    async fn control_associated_workflow_run(
+        &self,
+        key: bcode_workflow::WorkflowRunBindingLookup,
+        action: bcode_workflow::WorkflowRunControlAction,
+    ) -> Result<(Option<bcode_workflow::WorkflowRunSummary>, bool), Self::Error> {
+        Self::control_associated_workflow_run(self, key, action).await
+    }
+    async fn inspect_workflow_run_graph(
+        &self,
+        request: bcode_workflow::WorkflowRunGraphPageRequest,
+    ) -> Result<bcode_workflow::WorkflowRunGraphInspection, Self::Error> {
+        Self::inspect_workflow_run_graph(self, request).await
+    }
     async fn list_workflow_runs(
         &self,
         limit: usize,
@@ -1134,15 +1182,24 @@ pub struct WorkflowRunWatcher {
     sequence: bcode_workflow_view_models::WorkflowLiveSequence,
 }
 
-/// Outcome of receiving one workflow live notification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkflowRunWatchEvent {
-    /// Canonical state changed; refetch this run's bounded projection.
-    Changed(bcode_workflow_view_models::WorkflowLiveEvent),
-    /// Delivery skipped beyond the bounded catch-up window; replace bounded snapshots.
-    ResyncRequired,
-    /// A future event contract was received and cannot be interpreted.
-    UnsupportedVersion { version: u32 },
+/// Portable workflow notification outcome, retained here for source compatibility.
+pub use bcode_workflow::WorkflowRunWatchEvent;
+
+impl bcode_workflow::WorkflowRunObservationApplication for BcodeClient {
+    type Error = ClientError;
+    type Subscription = WorkflowRunWatcher;
+
+    async fn watch_workflow_runs(&self) -> Result<Self::Subscription, Self::Error> {
+        Self::watch_workflow_runs(self).await
+    }
+}
+
+impl bcode_workflow::WorkflowRunSubscription for WorkflowRunWatcher {
+    type Error = ClientError;
+
+    async fn next_event(&mut self) -> Result<WorkflowRunWatchEvent, Self::Error> {
+        Self::next_event(self).await
+    }
 }
 
 impl WorkflowRunWatcher {

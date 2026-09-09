@@ -33,10 +33,10 @@ pub use run_contracts::{
     WorkflowRunAdmissionResult, WorkflowRunApplication, WorkflowRunBinding,
     WorkflowRunBindingLookup, WorkflowRunControlAction, WorkflowRunInspection,
     WorkflowRunLifecycleObservation, WorkflowRunLimits, WorkflowRunLink,
-    WorkflowRunOperationFailure, WorkflowRunStartRequest, WorkflowRunStartResponse,
-    WorkflowRunSummary, WorkflowStartRequest, WorkflowTemplateInstantiationRequest,
-    WorkflowTemplateStartRequest, WorkflowTerminalOutputInspection, WorkflowWaitKind,
-    WorkflowWaitResolutionObservation,
+    WorkflowRunObservationApplication, WorkflowRunOperationFailure, WorkflowRunStartRequest,
+    WorkflowRunStartResponse, WorkflowRunSubscription, WorkflowRunSummary, WorkflowRunWatchEvent,
+    WorkflowStartRequest, WorkflowTemplateInstantiationRequest, WorkflowTemplateStartRequest,
+    WorkflowTerminalOutputInspection, WorkflowWaitKind, WorkflowWaitResolutionObservation,
 };
 
 mod authoring_contracts;

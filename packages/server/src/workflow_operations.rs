@@ -57,6 +57,20 @@ impl<'a> WorkflowAuthoringApplication<'a> {
         Self { state, client_id }
     }
 
+    /// Bind this caller's delivery sink only after subscription state is verified.
+    /// The transport retains framing and disconnect cleanup ownership.
+    pub(crate) async fn subscribe_runs(
+        &self,
+        event_sink: ClientEventSink,
+    ) -> Result<u64, bcode_workflow::WorkflowRunOperationFailure> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        subscribe_runs(self.state, self.client_id, event_sink)
+            .await
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+
     pub(crate) fn apply_draft_edits(
         &self,
         request: bcode_workflow::ApplyWorkflowDraftEditsRequest,
@@ -116,6 +130,73 @@ fn run_operation_failure(error: super::ServerError) -> bcode_workflow::WorkflowR
 }
 
 impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_> {
+    async fn start_workflow(
+        &self,
+        request: bcode_workflow::WorkflowStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        start(self.state, request)
+            .await
+            .map_err(run_operation_failure)
+    }
+    async fn workflow_live_event_catch_up(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<bcode_workflow_view_models::WorkflowLiveEventPage, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        live_event_catch_up(self.state, after_sequence, limit)
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn associated_workflow_run(
+        &self,
+        key: bcode_workflow::WorkflowRunBindingLookup,
+    ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        associated_run(self.state, &binding_key(key))
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn inspect_associated_workflow_run(
+        &self,
+        key: bcode_workflow::WorkflowRunBindingLookup,
+        limit: usize,
+    ) -> Result<Option<bcode_workflow::WorkflowRunInspection>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        inspect_associated_run(self.state, &binding_key(key), limit)
+            .await
+            .map(|value| value.map(|inspection| *inspection))
+            .map_err(run_operation_failure)
+    }
+    async fn control_associated_workflow_run(
+        &self,
+        key: bcode_workflow::WorkflowRunBindingLookup,
+        action: bcode_workflow::WorkflowRunControlAction,
+    ) -> Result<(Option<bcode_workflow::WorkflowRunSummary>, bool), Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        control_associated_run(self.state, &binding_key(key), action)
+            .await
+            .map_err(run_operation_failure)
+    }
+    async fn inspect_workflow_run_graph(
+        &self,
+        request: bcode_workflow::WorkflowRunGraphPageRequest,
+    ) -> Result<bcode_workflow::WorkflowRunGraphInspection, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        inspect_graph_page(self.state, &request)
+            .map_err(|error| run_operation_failure(error.into()))
+    }
     async fn list_workflow_runs(
         &self,
         limit: usize,
@@ -5537,6 +5618,16 @@ pub fn run_status(
         .run_summary(run_id)
 }
 
+fn binding_key(
+    key: bcode_workflow::WorkflowRunBindingLookup,
+) -> bcode_workflow_store::WorkflowRunBindingKey {
+    bcode_workflow_store::WorkflowRunBindingKey {
+        owner_plugin_id: key.owner_plugin_id,
+        workflow_kind: key.workflow_kind,
+        scope_key: key.scope_key,
+    }
+}
+
 /// Return the workflow run associated with one plugin-owned binding.
 pub fn associated_run(
     state: &ServerState,
@@ -5882,12 +5973,14 @@ pub async fn subscribe_runs(
     client_id: super::ClientId,
     event_sink: ClientEventSink,
 ) -> Result<u64, bcode_workflow_store::WorkflowStoreError> {
-    state
-        .workflow_event_clients
-        .lock()
-        .await
-        .insert(client_id, event_sink);
-    latest_event_sequence(state)
+    // Hold the subscriber lock across the bounded watermark read and registration.
+    // A publisher cannot snapshot subscribers between these operations, and a failed
+    // read leaves any existing registration untouched.
+    let mut clients = state.workflow_event_clients.lock().await;
+    let after_sequence = latest_event_sequence(state)?;
+    clients.insert(client_id, event_sink);
+    drop(clients);
+    Ok(after_sequence)
 }
 
 /// Return the current global workflow-event sequence for subscription setup.
