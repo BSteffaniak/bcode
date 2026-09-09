@@ -12,6 +12,7 @@ pub mod auth_pool_routing;
 pub mod auth_pool_state;
 pub mod discovery;
 pub mod enrollment;
+pub mod interactive;
 pub mod lifecycle;
 pub mod operations;
 pub mod security;

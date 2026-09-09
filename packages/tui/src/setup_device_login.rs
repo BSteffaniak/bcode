@@ -123,6 +123,11 @@ fn flow(
             .onboarding
             .browser_opening_enabled(&bcode_config::ProcessConfigEnvironment),
     );
+    let mut domain_flow = bcode_provider_auth::interactive::InteractiveEnrollment::new(
+        provider_id.to_owned(),
+        method_id.to_owned(),
+        prepared.resolved.profile_name.clone(),
+    );
     let mut display = vec!["Waiting for sign-in… Esc cancels.".to_owned()];
     loop {
         if cancel.load(Ordering::Acquire) {
@@ -155,7 +160,8 @@ fn flow(
             }
             return Err("Sign-in cancelled; credentials were not saved.");
         }
-        match response.status {
+        let progress = domain_flow.accept(response)?;
+        match progress.status {
             AuthFlowStatus::Succeeded => {
                 let lifecycle = bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
                     &prepared.resolved,
@@ -164,7 +170,7 @@ fn flow(
                     method,
                 )
                 .map_err(|_| "Profile ownership mismatch.")?;
-                lifecycle.replace_owned(response.credentials).map_err(|_| "Sign-in succeeded but secure storage failed. Inspect authentication state before retrying.")?;
+                lifecycle.replace_owned(domain_flow.take_credentials()).map_err(|_| "Sign-in succeeded but secure storage failed. Inspect authentication state before retrying.")?;
                 if prepared.publish_runtime {
                     bcode_provider_auth::enrollment::publish(&prepared.resolved)
                         .map_err(|_| "Credentials saved but profile publication failed.")?;
@@ -177,11 +183,10 @@ fn flow(
             AuthFlowStatus::Cancelled => return Err("Sign-in cancelled."),
             AuthFlowStatus::Pending => {}
         }
-        let wait = adapt_effects(response.effects, &mut display, &mut browser)?;
+        let wait = adapt_effects(progress.effects, &mut display, &mut browser)?;
         let _ = send.try_send((display.clone(), false));
         wait_or_cancel(wait, cancel);
-        request.operation = AuthFlowOperation::Continue;
-        request.state = response.state;
+        request = domain_flow.request()?.clone();
     }
 }
 

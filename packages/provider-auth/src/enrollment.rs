@@ -133,6 +133,30 @@ pub fn prepare(
     }
 }
 
+/// Allocate a default name for a new account without reusing existing metadata.
+/// Selection is advisory: enrollment must still verify ownership at commit time.
+#[must_use]
+pub fn new_profile_name(
+    config: &BcodeConfig,
+    runtime: &RuntimeAuthSubscriptions,
+    provider_id: &str,
+) -> String {
+    if !config.auth.profiles.contains_key(provider_id)
+        && !runtime.profiles.contains_key(provider_id)
+    {
+        return provider_id.to_owned();
+    }
+    for index in 2_u64.. {
+        let candidate = format!("{provider_id}-{index}");
+        if !config.auth.profiles.contains_key(&candidate)
+            && !runtime.profiles.contains_key(&candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!("profile name space exhausted")
+}
+
 fn mapping(key: &str) -> AuthCredentialMapping {
     AuthCredentialMapping {
         env: None,

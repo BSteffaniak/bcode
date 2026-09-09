@@ -11,7 +11,19 @@ use bmux_tui::prelude::{Line, Span, Style, Widget};
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Presentation {
+    Guided,
+    Advanced,
+}
+
 pub struct ConnectionForm {
+    presentation: Presentation,
+    providers: Vec<bcode_provider_auth_models::AuthProviderContribution>,
+    picker: Option<bool>,
+    selected: usize,
+    query: String,
+    interactive: bool,
     device: Option<super::setup_device_login::DeviceLogin>,
     importing: bool,
     fields: [TextInputState; 4],
@@ -23,7 +35,10 @@ pub struct ConnectionForm {
 
 impl ConnectionForm {
     pub fn new(importing: bool) -> Self {
+        let providers = load_connection_choices().unwrap_or_default();
         Self {
+            presentation: Presentation::Guided,
+            providers, picker: Some(false), selected: 0, query: String::new(), interactive: false,
             device: None,
             importing,
             fields: [String::new(), "api_key".to_owned(), String::new(), bcode_config::default_auth_vault_path().display().to_string()]
@@ -34,6 +49,9 @@ impl ConnectionForm {
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
+        if self.picker.is_some() {
+            return self.handle_picker(event);
+        }
         if let Some(device) = &mut self.device {
             device.refresh();
             if matches!(event, Event::Key(key) if key.key == KeyCode::Escape) {
@@ -53,11 +71,27 @@ impl ConnectionForm {
                     return true;
                 }
             }
+            Event::Key(key) if key.key == KeyCode::F(2) => {
+                self.presentation = if self.presentation == Presentation::Guided {
+                    Presentation::Advanced
+                } else {
+                    Presentation::Guided
+                };
+                self.focus = if self.presentation == Presentation::Advanced {
+                    2
+                } else {
+                    4
+                };
+            }
             Event::Key(key) if key.key == KeyCode::Tab && !self.review => {
-                self.focus = (self.focus + 1) % 5;
+                self.focus = if self.presentation == Presentation::Advanced {
+                    (self.focus + 1) % 5
+                } else {
+                    4
+                };
             }
             Event::Key(key) if key.key == KeyCode::Enter => {
-                if self.review && !self.importing && self.fields[1].buffer().text() != "api_key" {
+                if self.review && !self.importing && self.interactive {
                     self.device = Some(super::setup_device_login::DeviceLogin::start(
                         self.fields[0].buffer().text().to_owned(),
                         self.fields[1].buffer().text().to_owned(),
@@ -100,6 +134,122 @@ impl ConnectionForm {
             _ => {}
         }
         false
+    }
+
+    fn choices(&self) -> Vec<(usize, String)> {
+        let labels = if self.picker == Some(true) {
+            self.providers
+                .iter()
+                .find(|provider| provider.provider_id == self.fields[0].buffer().text())
+                .map(|provider| {
+                    provider
+                        .methods
+                        .iter()
+                        .map(|method| match method {
+                            bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+                                display_name,
+                                ..
+                            }
+                            | bcode_provider_auth_models::AuthMethodContribution::Interactive {
+                                display_name,
+                                ..
+                            } => display_name.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.providers
+                .iter()
+                .map(|provider| provider.display_name.clone())
+                .collect::<Vec<_>>()
+        };
+        labels
+            .into_iter()
+            .enumerate()
+            .filter(|(_, label)| label.to_lowercase().contains(&self.query.to_lowercase()))
+            .collect()
+    }
+
+    fn handle_picker(&mut self, event: &Event) -> bool {
+        match event {
+            Event::Key(key) => match key.key {
+                KeyCode::Escape => {
+                    if self.picker == Some(true) {
+                        self.picker = Some(false);
+                        self.query.clear();
+                        self.selected = 0;
+                    } else {
+                        return true;
+                    }
+                }
+                KeyCode::Char(character) => {
+                    self.query.push(character);
+                    self.selected = 0;
+                }
+                KeyCode::Backspace => {
+                    self.query.pop();
+                    self.selected = 0;
+                }
+                KeyCode::Down => self.selected = self.selected.saturating_add(1),
+                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Enter => self.select_choice(),
+                _ => {}
+            },
+            Event::Paste(text) => {
+                self.query.extend(
+                    text.chars()
+                        .filter(|character| !character.is_control())
+                        .take(256),
+                );
+                self.selected = 0;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn select_choice(&mut self) {
+        let choices = self.choices();
+        let Some((index, _)) = choices.get(self.selected.min(choices.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        if self.picker == Some(false) {
+            let provider = &self.providers[*index];
+            self.fields[0] =
+                TextInputState::new(TextEditBuffer::from_text(provider.provider_id.clone()));
+            if let Ok(config) = bcode_config::load_config() {
+                let name = bcode_provider_auth::enrollment::new_profile_name(
+                    &config,
+                    &bcode_config::load_runtime_auth_subscriptions(),
+                    &provider.provider_id,
+                );
+                self.fields[2] = TextInputState::new(TextEditBuffer::from_text(name));
+            }
+            self.picker = Some(true);
+        } else {
+            let Some(provider) = self
+                .providers
+                .iter()
+                .find(|provider| provider.provider_id == self.fields[0].buffer().text())
+            else {
+                return;
+            };
+            let method = &provider.methods[*index];
+            self.interactive = matches!(
+                method,
+                bcode_provider_auth_models::AuthMethodContribution::Interactive { .. }
+            );
+            self.fields[1] =
+                TextInputState::new(TextEditBuffer::from_text(method.method_id().to_owned()));
+            self.focus = 4;
+            self.review = self.interactive;
+            "Enter confirms connection using the selected method and default secure destination. Tab reviews advanced fields.".clone_into(&mut self.status);
+            self.picker = None;
+        }
+        self.query.clear();
+        self.selected = 0;
     }
 
     fn save(&self) -> Result<(), String> {
@@ -199,7 +349,128 @@ impl ConnectionForm {
         Ok(())
     }
 
+    fn render_picker(&self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
+        let area = frame.area();
+        write(
+            frame,
+            area,
+            1,
+            if self.picker == Some(true) {
+                "How would you like to connect?"
+            } else {
+                "Choose a provider"
+            },
+            theme.focused,
+        );
+        write(
+            frame,
+            area,
+            3,
+            &format!("Search: {}", self.query),
+            theme.text,
+        );
+        let choices = self.choices();
+        let selected = self.selected.min(choices.len().saturating_sub(1));
+        let height = usize::from(area.height.saturating_sub(8));
+        let start = selected.saturating_sub(height.saturating_sub(1));
+        for (row, (_, label)) in choices.iter().enumerate().skip(start).take(height) {
+            write(
+                frame,
+                area,
+                5 + u16::try_from(row - start).unwrap_or(0),
+                &format!("{} {label}", if row == selected { ">" } else { " " }),
+                if row == selected {
+                    theme.focused
+                } else {
+                    theme.text
+                },
+            );
+        }
+        if choices.is_empty() {
+            write(
+                frame,
+                area,
+                5,
+                "No matching enabled providers or methods.",
+                theme.muted,
+            );
+        }
+        write(
+            frame,
+            area,
+            area.height.saturating_sub(2),
+            "Type to search • ↑/↓ select • Enter continue • Esc back",
+            theme.muted,
+        );
+    }
+
+    fn render_guided(&self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
+        let area = frame.area();
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == self.fields[0].buffer().text());
+        let name = provider.map_or("Connection", |provider| provider.display_name.as_str());
+        write(frame, area, 1, name, theme.focused);
+        write(
+            frame,
+            area,
+            3,
+            if self.interactive {
+                "Ready to start browser authorization"
+            } else {
+                "Enter your credential (paste supported)"
+            },
+            theme.text,
+        );
+        if !self.interactive {
+            write(
+                frame,
+                area,
+                5,
+                if self.secret.is_empty() {
+                    "Credential: (empty)"
+                } else {
+                    "Credential: ********"
+                },
+                theme.text,
+            );
+        }
+        write(
+            frame,
+            area,
+            7,
+            &format!("Secure profile: {}", self.fields[2].buffer().text()),
+            theme.muted,
+        );
+        write(
+            frame,
+            area,
+            8,
+            &format!("Vault: {}", self.fields[3].buffer().text()),
+            theme.muted,
+        );
+        write(
+            frame,
+            area,
+            area.height.saturating_sub(3),
+            "Enter continue/confirm • F2 Advanced • Esc back",
+            theme.focused,
+        );
+        write(
+            frame,
+            area,
+            area.height.saturating_sub(2),
+            &self.status,
+            theme.text,
+        );
+    }
+
     pub fn render(&mut self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
+        if self.picker.is_some() {
+            self.render_picker(frame, theme);
+            return;
+        }
         if let Some(device) = &mut self.device {
             device.refresh();
             let area = frame.area();
@@ -212,6 +483,10 @@ impl ConnectionForm {
                     theme.text,
                 );
             }
+            return;
+        }
+        if self.presentation == Presentation::Guided {
+            self.render_guided(frame, theme);
             return;
         }
         let area = frame.area();
@@ -266,6 +541,28 @@ impl ConnectionForm {
             theme.muted,
         );
     }
+}
+
+fn load_connection_choices()
+-> Result<Vec<bcode_provider_auth_models::AuthProviderContribution>, String> {
+    let config = bcode_config::load_config().map_err(|_| "Configuration unavailable".to_owned())?;
+    let selection =
+        bcode_config::plugin_selection_with_default_plugin_ids(&config, std::iter::empty::<&str>());
+    let mut host = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
+        &selection,
+        &super::static_bundled_plugins(),
+    )
+    .map_err(|_| "Provider registration unavailable".to_owned())?;
+    let mut providers = host
+        .auth_provider_registry()
+        .providers()
+        .into_iter()
+        .map(|provider| provider.contribution.clone())
+        .collect::<Vec<_>>();
+    providers.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+    host.deactivate_all()
+        .map_err(|_| "Provider cleanup failed".to_owned())?;
+    Ok(providers)
 }
 
 fn write(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str, style: Style) {
