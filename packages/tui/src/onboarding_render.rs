@@ -152,7 +152,7 @@ fn render_setup_map_panel(
         if offset >= board_area.height {
             break;
         }
-        let selected = section.section_id == shell.board_state().focused;
+        let selected = section.section_id == shell.focused_section();
         let label = section.section_id.as_str().replace('_', " ");
         let text = format!("{} {}", if selected { ">" } else { " " }, label);
         frame.write_line_with_fallback_style(
@@ -309,4 +309,44 @@ fn render_box(area: Rect, title: &str, style: Style, frame: &mut Frame<'_>) {
 
 fn status_badge(status: &str) -> String {
     format!("⟦{status}⟧")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_tui::buffer::Buffer;
+
+    #[test]
+    fn setup_selection_tracks_keyboard_focus_in_both_directions() {
+        let summary = bcode_settings::SetupConfigSummary::default();
+        let mut shell = OnboardingShell::from_reconciliation(&[], &summary.reconciliation_input());
+        shell.focus_section_index(0);
+        let theme = crate::theme::resolve_configured_theme(
+            &bcode_config::TuiConfig::default(),
+            std::path::Path::new("."),
+        );
+        let area = Rect::new(0, 0, 100, 30);
+        let render_selected = |shell: &OnboardingShell| {
+            let mut buffer = Buffer::empty(area);
+            render_onboarding(
+                shell,
+                &mut Frame::new(&mut buffer),
+                &SettingsDbHealth::Available,
+                None,
+                &theme,
+            );
+            let board = onboarding_board_area(area);
+            (board.y..board.bottom())
+                .filter_map(|y| buffer.row_symbols(y))
+                .find(|row| row.contains("> "))
+                .expect("selected setup row")
+        };
+        assert!(render_selected(&shell).contains("> welcome"));
+        shell.focus_next();
+        assert!(render_selected(&shell).contains("> detection"));
+        shell.focus_next();
+        assert!(render_selected(&shell).contains("> secure vault"));
+        shell.focus_previous();
+        assert!(render_selected(&shell).contains("> detection"));
+    }
 }
