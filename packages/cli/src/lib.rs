@@ -803,12 +803,12 @@ async fn handle_ralph_command(command: RalphCommand) -> Result<(), CliError> {
 }
 
 async fn handle_associated_run(
+    client: &impl bcode_workflow::WorkflowRunApplication<Error = bcode_client::ClientError>,
     key: bcode_workflow::WorkflowRunBindingLookup,
     inspect: bool,
     limit: usize,
     action: Option<&str>,
 ) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
     if let Some(action) = action {
         let action = match action {
             "pause" => bcode_workflow::WorkflowRunControlAction::Pause,
@@ -824,9 +824,12 @@ async fn handle_associated_run(
     }
 }
 
-async fn print_package_publication(package_id: &str) -> Result<(), CliError> {
+async fn print_package_publication(
+    client: &impl bcode_workflow::WorkflowAuthoringApplication<Error = bcode_client::ClientError>,
+    package_id: &str,
+) -> Result<(), CliError> {
     print_json(
-        &BcodeClient::default_endpoint()
+        &client
             .workflow_package_publication(package_id.to_owned())
             .await?,
     )
@@ -843,6 +846,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
     } = command.as_ref()
     {
         return Box::pin(handle_associated_run(
+            &BcodeClient::default_endpoint(),
             bcode_workflow::WorkflowRunBindingLookup {
                 owner_plugin_id: owner_plugin_id.clone(),
                 workflow_kind: workflow_kind.clone(),
@@ -855,7 +859,11 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         .await;
     }
     if let WorkflowCommand::PackagePublication { package_id } = command.as_ref() {
-        return Box::pin(print_package_publication(package_id)).await;
+        return Box::pin(print_package_publication(
+            &BcodeClient::default_endpoint(),
+            package_id,
+        ))
+        .await;
     }
     if let WorkflowCommand::LaunchDetail { request } = command.as_ref() {
         return Box::pin(handle_workflow_launch_detail(
