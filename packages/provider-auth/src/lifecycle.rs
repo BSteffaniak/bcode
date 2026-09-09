@@ -464,26 +464,13 @@ impl<'a> AuthVaultLifecycle<'a> {
                 });
             }
         }
-        let (store, recipient_key) = self.open_or_initialize_store()?;
-        let mut values = match store.get_profile(self.storage_profile()) {
-            Ok(Some(values)) => values,
-            Ok(None) => BTreeMap::new(),
-            Err(error) => {
-                return Err(AuthVaultLifecycleError::ProfileUnavailable(
-                    error.to_string(),
-                ));
-            }
-        };
-        for key in storage_keys.values() {
-            values.remove(key);
-        }
-        for (credential, value) in credentials {
-            values.insert(storage_keys[&credential].clone(), Zeroizing::new(value));
-        }
-        store
-            .replace_profile(self.storage_profile(), values)
-            .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))?;
-        self.reconcile_device_seal(Some(&recipient_key))
+        let mut credentials = credentials;
+        self.persist_storage_updates(
+            storage_keys
+                .into_iter()
+                .map(|(credential, key)| (key, credentials.remove(&credential)))
+                .collect(),
+        )
     }
 
     /// Delete only credentials declared by the selected provider method.
@@ -710,6 +697,49 @@ mod tests {
             supports_verification: false,
             supports_revocation: false,
         }
+    }
+
+    #[test]
+    fn required_seal_failure_preserves_credentials_for_updates_and_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault");
+        let mut resolved = resolved(&path);
+        let method = method();
+        AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method)
+            .unwrap()
+            .upsert(BTreeMap::from([("api_key".into(), "original".into())]))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        resolved
+            .profile
+            .settings
+            .insert("device_seal".into(), "required".into());
+        // Select a backend unavailable on this target, without probing native credential stores.
+        let unavailable = if cfg!(target_os = "windows") {
+            "linux-tpm"
+        } else {
+            "windows-dpapi"
+        };
+        resolved
+            .profile
+            .settings
+            .insert("device_seal_backend".into(), unavailable.into());
+        resolved
+            .profile
+            .settings
+            .insert("device_seal_strict".into(), "true".into());
+        let lifecycle =
+            AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method).unwrap();
+        assert!(matches!(
+            lifecycle.update(BTreeMap::from([("api_key".into(), Some("changed".into()))])),
+            Err(AuthVaultLifecycleError::DeviceSealRequired(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(matches!(
+            lifecycle.replace_owned(BTreeMap::from([("api_key".into(), "changed".into())])),
+            Err(AuthVaultLifecycleError::DeviceSealRequired(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
