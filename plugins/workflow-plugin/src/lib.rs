@@ -161,6 +161,16 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Inspect workflow graph and history",
         ),
         (
+            "workflow.publish-run-edit",
+            "Workflow: Publish Run Edit",
+            "Publish an exact staged edit subject to separate publication authorization",
+        ),
+        (
+            "workflow.stage-run-edit",
+            "Workflow: Stage Run Edit",
+            "Stage an exact live run edit without publishing topology",
+        ),
+        (
             "workflow.graph",
             "Workflow: Graph Page",
             "Read run graph nodes and edges at an expected revision",
@@ -235,6 +245,18 @@ fn graph_command_arguments(id: &str) -> Vec<bcode_command::CommandArgumentContri
     use bcode_command::CommandArgumentKind::{Integer, String as Text};
 
     let fields = match id {
+        "workflow.publish-run-edit" => vec![(
+            "edit_json",
+            Text,
+            true,
+            "Exact staged WorkflowRunGraphEditBatch JSON; requires publication authorization",
+        )],
+        "workflow.stage-run-edit" => vec![(
+            "edit_json",
+            Text,
+            true,
+            "Exact WorkflowRunGraphEditBatch JSON; staging does not publish",
+        )],
         "workflow.graph" => vec![
             ("run_id", Text, true, "Run identity"),
             (
@@ -710,6 +732,30 @@ pub(crate) async fn execute_command(
             .map_err(|error| error.to_string())?;
             options.insert("run_id".to_string(), serde_json::json!(run_id));
             format!("{} changed={changed}", request.command_id)
+        }
+        "workflow.publish-run-edit" => {
+            let edit: bcode_workflow::WorkflowRunGraphEditBatch =
+                serde_json::from_str(&required_arg(&request, "edit_json")?)
+                    .map_err(|_| "invalid workflow run edit JSON".to_string())?;
+            edit.validate().map_err(|error| error.to_string())?;
+            let revision = client
+                .publish_workflow_run_graph_edit(edit)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("revision".to_string(), serde_json::json!(revision));
+            format!("Workflow edit published at revision {revision}")
+        }
+        "workflow.stage-run-edit" => {
+            let edit: bcode_workflow::WorkflowRunGraphEditBatch =
+                serde_json::from_str(&required_arg(&request, "edit_json")?)
+                    .map_err(|_| "invalid workflow run edit JSON".to_string())?;
+            edit.validate().map_err(|error| error.to_string())?;
+            let created = client
+                .stage_workflow_run_graph_edit(edit)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("staged".to_string(), serde_json::json!(created));
+            "Workflow edit staged; topology has not been published".to_string()
         }
         "workflow.graph" => {
             let page = graph_page_request(&request)?;

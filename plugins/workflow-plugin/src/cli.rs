@@ -18,6 +18,10 @@ struct WorkflowCli {
     /// Definition or run identity for the selected action.
     #[arg(long)]
     id: Option<String>,
+    /// Exact `WorkflowRunGraphEditBatch` JSON for `stage-run-edit` or `publish-run-edit`.
+    /// Publication requires separate authorization; staging never grants it.
+    #[arg(long)]
+    edit_json: Option<String>,
     /// Expected run graph revision for `graph` (from `inspect`).
     #[arg(long)]
     expected_revision: Option<u64>,
@@ -163,6 +167,7 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         };
         let mut args = BTreeMap::new();
         for (name, value) in [
+            ("edit_json", cli.edit_json),
             (
                 "expected_revision",
                 cli.expected_revision.map(|value| value.to_string()),
