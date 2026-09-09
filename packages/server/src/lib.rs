@@ -1405,6 +1405,104 @@ impl ServerState {
         workflow_operations::stage_run_graph_edit(self, client_id, request).await
     }
 
+    /// Stage a candidate for a host-authenticated plugin invocation's execution session.
+    ///
+    /// The invocation dispatcher supplies both identities; neither may come from tool arguments.
+    /// Plugin policy must explicitly permit staging. This never transfers execution authority or
+    /// publishes topology. The store atomically rechecks the exact active execution relationship.
+    ///
+    /// # Errors
+    /// Returns an error for invalid facts, denied policy, missing or inconsistent execution
+    /// provenance/linkage, foreign authority, inactive attempts, or persistence conflicts.
+    pub async fn stage_workflow_run_graph_edit_from_invocation(
+        &self,
+        session_id: SessionId,
+        plugin_id: &str,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+        cancellation: &TurnCancelState,
+    ) -> Result<bool, ServerError> {
+        if cancellation.is_cancelled() {
+            return Err(ServerError::WorkflowComputationCancelled(
+                request.mutation_id,
+            ));
+        }
+        let denied = || {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "run edit requires an authorized current workflow execution".to_string(),
+            )
+        };
+        let facts = bcode_workflow::WorkflowRunGraphEditFacts {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::Plugin,
+                actor_id: plugin_id.to_string(),
+            },
+            request,
+        };
+        facts.validate().map_err(|_| denied())?;
+        let policy = self
+            .workflow_run_graph_edit_policy
+            .as_ref()
+            .ok_or_else(denied)?;
+        if let WorkflowApplicationAuthorizationDecision::Deny { reason } =
+            (policy.evaluator)(&facts)
+        {
+            return Err(ServerError::WorkflowApplicationOperationUnauthorized(
+                reason,
+            ));
+        }
+        self.require_workflow_store()?;
+        let session = self.sessions.session_summary(session_id).await?;
+        let provenance = session.execution.ok_or_else(denied)?.provenance;
+        if provenance.version != bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION
+            || provenance.owner != "bcode.workflow"
+            || provenance.run_id != facts.request.run_id
+        {
+            return Err(denied());
+        }
+        let activation_id = provenance.activation_id.as_deref().ok_or_else(denied)?;
+        // Cancellation closes admission immediately and waits for this boundary before returning.
+        // Acquire it before the store lock; never hold a database handle across this await.
+        let commit = cancellation.marker_commit.lock().await;
+        let mut store = self
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let link = store
+            .execution_session_link(
+                &provenance.run_id,
+                &provenance.node_id,
+                activation_id,
+                provenance.attempt,
+            )?
+            .ok_or_else(denied)?;
+        if link.session_id != session_id.to_string()
+            || Some(link.workspace_snapshot.as_str()) != provenance.workspace_snapshot.as_deref()
+        {
+            return Err(denied());
+        }
+        let authority = store
+            .execution_authority(&provenance.run_id)?
+            .ok_or_else(denied)?;
+        if authority.daemon_instance_id != self.daemon_status.instance_id {
+            return Err(denied());
+        }
+        if cancellation.is_cancelled() {
+            return Err(ServerError::WorkflowComputationCancelled(
+                facts.request.mutation_id,
+            ));
+        }
+        let result = store.stage_run_graph_edit_from_execution(
+            &facts.request,
+            &authority,
+            &link,
+            current_time_ms(),
+        );
+        drop(store);
+        drop(commit);
+        result.map_err(Into::into)
+    }
+
     /// Configure run-edit staging policy before sharing the server with clients.
     pub fn set_workflow_run_graph_edit_policy(&mut self, policy: WorkflowRunGraphEditPolicy) {
         self.workflow_run_graph_edit_policy = Some(policy);
@@ -47767,6 +47865,32 @@ library = "test"
                 .is_empty()
         );
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn invocation_run_edit_does_not_inherit_local_client_policy() {
+        let state = test_server_state(SessionManager::default());
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "missing-run".to_string(),
+            mutation_id: "edit-1".to_string(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![],
+        };
+        let result = state
+            .stage_workflow_run_graph_edit_from_invocation(
+                SessionId::new(),
+                "bcode.workflow",
+                request,
+                &TurnCancelState::default(),
+            )
+            .await;
+        drop(state);
+        assert!(matches!(
+            result,
+            Err(ServerError::WorkflowApplicationOperationUnauthorized(_))
+        ));
     }
 
     #[tokio::test]
