@@ -10886,11 +10886,14 @@ fn activation_input(
     output: &ValidatedOutput,
     target: &bcode_workflow::NodeDefinition,
     generation: u64,
+    edge: &bcode_workflow::EdgeDefinition,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    let edge_transform =
-        run_graph::initial_edge_between(transaction, &output.run_id, &output.node_id, &target.id)?
-            .and_then(|edge| edge.transform);
-    let input = if let Some(transform) = edge_transform {
+    if edge.from != output.node_id || edge.to != target.id {
+        return Err(WorkflowStoreError::InvalidData(
+            "successor input edge does not match activation endpoints".to_owned(),
+        ));
+    }
+    let input = if let Some(transform) = &edge.transform {
         transform
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -11073,6 +11076,7 @@ where
     let mut completed_is_exit =
         run_graph::initial_exit(transaction, &output.run_id, &output.node_id)?;
     let mut targets = Vec::new();
+    let mut selected_edges = std::collections::BTreeMap::new();
     let mut cursor = None;
     let mut has_outgoing = false;
     let mut all_conditional = true;
@@ -11102,7 +11106,15 @@ where
                 }
             };
             if selected {
-                targets.push(edge.to);
+                targets.push(edge.to.clone());
+                if selected_edges
+                    .insert(edge.to.clone(), (record.edge_id, record.revision, edge))
+                    .is_some()
+                {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "successor input requires one selected edge binding".to_owned(),
+                    ));
+                }
             }
         }
     }
@@ -11193,7 +11205,10 @@ where
                     "workflow successor node is missing from the run graph: {node_id}"
                 ))
             })?;
-        let input = activation_input(transaction, output, &target, generation)?;
+        let (edge_id, edge_revision, edge) = selected_edges.get(&node_id).ok_or_else(|| {
+            WorkflowStoreError::InvalidData("selected successor edge is missing".to_owned())
+        })?;
+        let input = activation_input(transaction, output, &target, generation, edge)?;
         let activation = NewActivation {
             run_id: output.run_id.clone(),
             node_id: node_id.clone(),
@@ -11241,7 +11256,19 @@ where
             } else {
                 "activation_waiting"
             },
-            &serde_json::json!({"activation": activation, "status": status}).to_string(),
+            &serde_json::json!({
+                "activation": activation,
+                "status": status,
+                "input_binding": {
+                    "version": 1,
+                    "graph_revision": 1,
+                    "edge_id": edge_id,
+                    "edge_revision": edge_revision,
+                    "source_activation_id": output.activation_id,
+                    "source_output_id": output.output_id,
+                },
+            })
+            .to_string(),
             activation.created_at_ms,
         )?;
         activated.push(activation);
@@ -23286,6 +23313,30 @@ mod tests {
     }
 
     #[test]
+    fn successor_input_rejects_ambiguous_edge_binding() {
+        let (_temp, mut store) = initialized_store();
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".to_owned(),
+            to: "review".to_owned(),
+            kind: bcode_workflow::EdgeKind::default(),
+            transform: None,
+        };
+        for id in [0, 1] {
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json)
+                 VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                rusqlite::params![id, serde_json::to_string(&edge).expect("json")],
+            ).expect("edge");
+        }
+        let transaction = store.connection.transaction().expect("transaction");
+        let before = transaction.total_changes();
+        let error = run_graph::initial_edge_between(&transaction, "run-1", "review", "review")
+            .expect_err("ambiguous binding");
+        assert!(error.to_string().contains("unambiguous edge binding"));
+        assert_eq!(transaction.total_changes(), before);
+    }
+
+    #[test]
     fn exact_edge_revision_preserves_history_after_reopen() {
         let (temp, store) = initialized_store();
         let edge = bcode_workflow::EdgeDefinition {
@@ -27305,7 +27356,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_between_finds_first_match_beyond_a_page_without_mutation() {
+    fn edge_between_rejects_ambiguous_matches_beyond_a_page_without_mutation() {
         let (_temp, mut store) = initialized_store();
         let mut plan = definition("example");
         let mut target = plan.nodes["review"].clone();
@@ -27332,7 +27383,7 @@ mod tests {
             .expect("replace fixture graph");
         run_graph::materialize(&transaction, "run-1", &plan).expect("materialize");
         // A different later duplicate makes edge ordering observable.
-        let mut later = matched.clone();
+        let mut later = matched;
         later.kind = bcode_workflow::EdgeKind::Conditional {
             predicate: bcode_workflow::PredicateExpression::Equals {
                 version: bcode_workflow::WORKFLOW_PREDICATE_VERSION,
@@ -27343,10 +27394,11 @@ mod tests {
         };
         transaction.execute("UPDATE workflow_run_graph_edges SET edge_json = ?1 WHERE run_id = 'run-1' AND edge_id = 101", [serde_json::to_string(&later).expect("edge")]).expect("later duplicate");
         let before = transaction.total_changes();
-        assert_eq!(
+        assert!(
             run_graph::initial_edge_between(&transaction, "run-1", "review", "target")
-                .expect("second page match"),
-            Some(matched)
+                .expect_err("ambiguous second page matches")
+                .to_string()
+                .contains("unambiguous edge binding")
         );
         assert_eq!(
             run_graph::initial_edge_between(&transaction, "run-1", "review", "absent")
@@ -33636,6 +33688,9 @@ mod tests {
             },
             &definition.nodes["second"],
             0,
+            &run_graph::initial_edge_between(&transaction, "run-1", "first", "second")
+                .expect("edge lookup")
+                .expect("edge"),
         )
         .expect_err("future transform");
         assert!(error.to_string().contains(&expected));
@@ -33911,6 +33966,24 @@ mod tests {
         assert_eq!(first.activated[0].input, Some(serde_json::json!(2)));
         drop(store);
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen successor");
+        let payload: String = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM workflow_events WHERE run_id = 'sequential-run'
+             AND event_type = 'activation_created' ORDER BY event_seq DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("successor event");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("event JSON");
+        assert_eq!(
+            payload["input_binding"],
+            serde_json::json!({
+                "version": 1, "graph_revision": 1, "edge_id": 0, "edge_revision": 1,
+                "source_activation_id": activation_identity("sequential-run", "first", 0),
+                "source_output_id": "first-output",
+            })
+        );
         assert_eq!(
             store
                 .activation_admitted_graph_revision(

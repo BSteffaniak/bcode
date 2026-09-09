@@ -1487,21 +1487,26 @@ pub fn initial_edge_between(
 ) -> Result<Option<EdgeDefinition>, WorkflowStoreError> {
     super::validate_id("target_node_id", target_node_id)?;
     let mut cursor = None;
+    let mut selected = None;
     loop {
         let edges = initial_outgoing_edges(transaction, run_id, source_node_id, cursor)?;
         if edges.is_empty() {
-            return Ok(None);
+            return Ok(selected);
         }
         cursor = edges.last().map(|edge| edge.edge_id);
         let final_page = edges.len() < GRAPH_PAGE_LIMIT;
-        if let Some(record) = edges
+        for record in edges
             .into_iter()
-            .find(|record| record.edge.to == target_node_id)
+            .filter(|record| record.edge.to == target_node_id)
         {
-            return Ok(Some(record.edge));
+            if selected.replace(record.edge).is_some() {
+                return Err(WorkflowStoreError::InvalidData(
+                    "successor input requires an unambiguous edge binding".to_string(),
+                ));
+            }
         }
         if final_page {
-            return Ok(None);
+            return Ok(selected);
         }
     }
 }
