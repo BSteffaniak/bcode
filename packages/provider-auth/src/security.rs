@@ -274,7 +274,7 @@ pub struct AuthSecurityDiagnostic {
 
 impl AuthSecurityDiagnostic {
     #[must_use]
-    fn info(code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn info(code: &str, message: impl Into<String>) -> Self {
         Self {
             severity: AuthSecurityDiagnosticSeverity::Info,
             code: code.to_string(),
@@ -284,7 +284,11 @@ impl AuthSecurityDiagnostic {
     }
 
     #[must_use]
-    fn warning(code: &str, message: impl Into<String>, remediation: impl Into<String>) -> Self {
+    pub(crate) fn warning(
+        code: &str,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self {
             severity: AuthSecurityDiagnosticSeverity::Warning,
             code: code.to_string(),
@@ -294,7 +298,11 @@ impl AuthSecurityDiagnostic {
     }
 
     #[must_use]
-    fn error(code: &str, message: impl Into<String>, remediation: impl Into<String>) -> Self {
+    pub(crate) fn error(
+        code: &str,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self {
             severity: AuthSecurityDiagnosticSeverity::Error,
             code: code.to_string(),
@@ -782,37 +790,63 @@ pub fn reconcile_auth_vault_security_with_options(
     let (mut vault, data_key) = load_auth_vault_metadata(vault_path)
         .map_err(|error| format!("failed to unlock auth vault metadata: {error}"))?;
 
+    let (actions, changed) = prepare_auth_vault_security(
+        &mut vault,
+        &data_key,
+        vault_path,
+        profile,
+        options,
+        explicit_recipient_key,
+    )?;
+    if changed {
+        vault
+            .save(vault_path, &data_key)
+            .map_err(|error| format!("failed to save reconciled auth vault: {error}"))?;
+    }
+    Ok(actions)
+}
+
+/// Prepare security changes on the caller's loaded vault without publishing credentials.
+/// The caller must discard this vault on failure and retain ownership through publication.
+pub(crate) fn prepare_auth_vault_security(
+    vault: &mut sshenv_vault::Vault,
+    data_key: &[u8; 32],
+    vault_path: &Path,
+    profile: &str,
+    options: AuthDeviceSealOptions,
+    explicit_recipient_key: Option<&str>,
+) -> Result<(Vec<String>, bool), String> {
     let mut actions = Vec::new();
     if matches!(options.policy, AuthDeviceSealPolicy::Off) {
-        if profile_has_device_seal(&vault, profile) {
+        if profile_has_device_seal(vault, profile) {
             actions.push(format!(
                 "auth profile {profile} is device-sealed even though config sets device_seal=off; leaving stronger vault policy unchanged"
             ));
         }
-        return Ok(actions);
+        return Ok((actions, false));
     }
 
     if !vault.profiles.profiles.contains_key(profile)
         && !vault.profiles.profile_entries.contains_key(profile)
     {
-        return Ok(actions);
+        return Ok((actions, false));
     }
 
-    if profile_has_device_seal(&vault, profile)
-        && profile_device_seal_matches_options(&vault, profile, options.seal)
+    if profile_has_device_seal(vault, profile)
+        && profile_device_seal_matches_options(vault, profile, options.seal)
     {
-        return Ok(actions);
+        return Ok((actions, false));
     }
 
     if vault.profiles.get(profile).is_none() && vault.profiles.profile_entries.contains_key(profile)
     {
         vault
-            .unlock_profile_with_passphrase(profile, &data_key, None)
+            .unlock_profile_with_passphrase(profile, data_key, None)
             .map_err(|error| format!("failed to unlock auth profile {profile}: {error}"))?;
     }
 
     if vault.header.version != VERSION_V2 {
-        let recipient_keys = recipient_keys_for_vault(vault_path, &vault, explicit_recipient_key)?;
+        let recipient_keys = recipient_keys_for_vault(vault_path, vault, explicit_recipient_key)?;
         vault
             .migrate_to_v2(&recipient_keys)
             .map_err(|error| format!("failed to migrate auth vault to v2: {error}"))?;
@@ -826,7 +860,7 @@ pub fn reconcile_auth_vault_security_with_options(
         actions.push("enabled per-profile auth vault encryption".to_string());
     }
 
-    let rebinding_existing_seal = profile_has_device_seal(&vault, profile);
+    let rebinding_existing_seal = profile_has_device_seal(vault, profile);
     vault
         .require_profile_device_seal_with_options(profile, options.seal)
         .map_err(|error| {
@@ -837,11 +871,7 @@ pub fn reconcile_auth_vault_security_with_options(
     } else {
         format!("bound auth profile {profile} to this device")
     });
-    vault
-        .save(vault_path, &data_key)
-        .map_err(|error| format!("failed to save reconciled auth vault: {error}"))?;
-
-    Ok(actions)
+    Ok((actions, true))
 }
 
 fn populate_device_seal_status(

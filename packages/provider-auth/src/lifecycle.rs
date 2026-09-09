@@ -365,27 +365,80 @@ impl<'a> AuthVaultLifecycle<'a> {
         &self,
         changes: BTreeMap<String, Option<String>>,
     ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
-        let (store, recipient_key) = self.open_or_initialize_store()?;
-        let mut values = match store.get_profile(self.storage_profile()) {
-            Ok(Some(values)) => values,
-            Ok(None) => BTreeMap::new(),
-            Err(error) => {
-                return Err(AuthVaultLifecycleError::ProfileUnavailable(
-                    error.to_string(),
-                ));
-            }
-        };
+        let (_store, recipient_key) = self.open_or_initialize_store()?;
+        let vault_path = self.vault_path();
+        let (mut vault, data_key) = sshenv_vault::load_and_unlock_metadata_with_private_key_paths(
+            &vault_path,
+            &crate::security::vault_private_key_paths(&vault_path),
+        )
+        .map_err(|_| {
+            AuthVaultLifecycleError::VaultUnavailable("could not unlock credential metadata".into())
+        })?;
+        let profile = self.storage_profile();
+        if vault.profiles.profile_entries.contains_key(profile) {
+            vault
+                .unlock_profile_with_passphrase(profile, &data_key, None)
+                .map_err(|_| {
+                    AuthVaultLifecycleError::ProfileUnavailable(
+                        "could not unlock credential profile".into(),
+                    )
+                })?;
+        }
+        let values = vault
+            .profiles
+            .profiles
+            .entry(profile.to_owned())
+            .or_default();
         for (key, value) in changes {
             if let Some(value) = value {
-                values.insert(key, Zeroizing::new(value));
-            } else {
-                values.remove(&key);
+                if let Some(mut previous) = values.insert(key, value) {
+                    previous.zeroize();
+                }
+            } else if let Some(mut previous) = values.remove(&key) {
+                previous.zeroize();
             }
         }
-        store
-            .replace_profile(self.storage_profile(), values)
-            .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))?;
-        self.reconcile_device_seal(Some(&recipient_key))
+        let options = crate::security::device_seal_options_for_auth_profile(&self.resolved.profile);
+        let mut prepared = vault.clone();
+        let diagnostics = match crate::security::prepare_auth_vault_security(
+            &mut prepared,
+            &data_key,
+            &vault_path,
+            profile,
+            options,
+            Some(&recipient_key),
+        ) {
+            Ok((actions, _)) => {
+                vault = prepared;
+                actions
+                    .into_iter()
+                    .map(|action| {
+                        crate::security::AuthSecurityDiagnostic::info(
+                            "auth_vault_security_refreshed",
+                            action,
+                        )
+                    })
+                    .collect()
+            }
+            Err(_) if options.policy == crate::security::AuthDeviceSealPolicy::Required => {
+                return Err(AuthVaultLifecycleError::DeviceSealRequired(vec![
+                    crate::security::AuthSecurityDiagnostic::error(
+                        "auth_vault_security_required_unsatisfied",
+                        "Required device seal could not be prepared; credentials were not published",
+                        "Restore device custody before retrying the credential update",
+                    ),
+                ]));
+            }
+            Err(_) => vec![crate::security::AuthSecurityDiagnostic::warning(
+                "auth_vault_security_refresh_skipped",
+                "Preferred device seal could not be prepared; existing profile policy preserved",
+                "Restore device custody to enable the preferred seal",
+            )],
+        };
+        vault.save(&vault_path, &data_key).map_err(|_| {
+            AuthVaultLifecycleError::WriteFailed("could not publish credential update".into())
+        })?;
+        Ok(diagnostics)
     }
 
     /// Replace the complete credential set owned by the selected method.
