@@ -169,10 +169,15 @@ preparations restore the checkpoint, and successful presentation commits it. New
 restore uncommitted navigation before applying their effects. Manual input supersedes the candidate.
 Animation cadence remains separate from navigation intent.
 
-The migration still requires broader source correspondence: current keys identify regions and
-Markdown headings rather than arbitrary source lines across reflow. Presentation checkpoints also
-need comprehensive coverage of all asynchronous geometry and input paths before claiming a fully
-transactional presentation contract.
+Detached Markdown anchors retain an exact source byte position from the accepted projection's
+selection provenance. On width changes that position resolves against the new accepted projection,
+so wrapped paragraphs do not rely on the old intra-item row. The retained projection is shared by
+`Arc`; provenance is requested only when capturing or resolving a reading anchor, not for every
+follow-tail update. Missing source geometry falls back to the existing region/item policy.
+
+Remaining coverage includes plugin source-line correspondence across layout modes and all
+asynchronous geometry/input interactions with presentation checkpoints. Region-level plugin
+fallback must not be described as exact source correspondence.
 
 ## Accepted Markdown projection scheduling
 

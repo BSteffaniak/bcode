@@ -34,6 +34,13 @@ pub enum TranscriptLayoutRows {
         rows: Vec<Line>,
         anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     },
+    /// Accepted Markdown projection retained for source-aware reflow correspondence.
+    Markdown {
+        rows: Vec<Line>,
+        anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+        projection: std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>,
+        body_start: usize,
+    },
     /// Logical rows rendered directly by an active terminal interaction.
     BlankSpan(usize),
 }
@@ -49,7 +56,9 @@ impl TranscriptLayoutRows {
     #[must_use]
     pub const fn len(&self) -> usize {
         match self {
-            Self::Rendered(rows) | Self::Anchored { rows, .. } => rows.len(),
+            Self::Rendered(rows) | Self::Anchored { rows, .. } | Self::Markdown { rows, .. } => {
+                rows.len()
+            }
             Self::BlankSpan(len) => *len,
         }
     }
@@ -183,6 +192,16 @@ pub enum VisibleTranscriptSource {
 }
 
 impl TranscriptLayoutCache {
+    /// Resolve a visible row to its accepted Markdown source position.
+    pub fn source_position(&self, index: usize, row: usize) -> Option<usize> {
+        self.entries.source_position(index, row)
+    }
+
+    /// Resolve an accepted source position after reflow.
+    pub fn source_row(&self, index: usize, position: usize) -> Option<usize> {
+        self.entries.source_row(index, position)
+    }
+
     /// Find the nearest accepted content key at or before an item row.
     pub fn content_anchor(&self, index: usize, row: usize) -> Option<(&str, usize)> {
         self.entries.content_anchor(index, row)

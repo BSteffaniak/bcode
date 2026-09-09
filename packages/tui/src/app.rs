@@ -299,6 +299,7 @@ pub struct StableTranscriptAnchor {
     pub row_in_item: usize,
     pub content: Option<(String, usize)>,
     pub fallback_index: usize,
+    pub source_position: Option<usize>,
 }
 
 impl PartialEq for StableTranscriptAnchor {
@@ -306,12 +307,19 @@ impl PartialEq for StableTranscriptAnchor {
         self.item_id == other.item_id
             && self.row_in_item == other.row_in_item
             && self.content == other.content
+            && self.source_position == other.source_position
     }
 }
 impl Eq for StableTranscriptAnchor {}
 
 impl StableTranscriptAnchor {
     fn resolve_row(&self, layout: &TranscriptLayoutCache, index: usize, rows: usize) -> usize {
+        if let Some(row) = self
+            .source_position
+            .and_then(|position| layout.source_row(index, position))
+        {
+            return row.min(rows.saturating_sub(1));
+        }
         self.content
             .as_ref()
             .and_then(|(key, offset)| {
@@ -342,6 +350,10 @@ struct TranscriptNavigationCheckpoint {
     pending_assistant: bool,
     pending_sequence: Option<u64>,
     history: OlderHistoryState,
+    hidden_activity_at: Option<Instant>,
+    hidden_activity_burst: u8,
+    bar_started_at: Instant,
+    bar_next_frame_at: Option<Instant>,
 }
 
 /// State owned by the terminal user interface.
@@ -890,6 +902,9 @@ impl BmuxApp {
                             .map(|item_id| StableTranscriptAnchor {
                                 item_id,
                                 fallback_index: line.entry_index,
+                                source_position: self
+                                    .transcript_layout
+                                    .source_position(line.entry_index, line.row_in_entry),
                                 row_in_item: line.row_in_entry,
                                 content: self
                                     .transcript_layout
@@ -2275,7 +2290,8 @@ impl BmuxApp {
     }
 
     /// Mark older history as loading or idle.
-    pub const fn set_loading_older_history(&mut self, loading: bool) {
+    pub fn set_loading_older_history(&mut self, loading: bool) {
+        self.restore_uncommitted_navigation();
         self.older_history.set_loading(loading);
     }
 
@@ -2298,7 +2314,8 @@ impl BmuxApp {
     }
 
     /// Mark newer history as loading or idle.
-    pub const fn set_loading_newer_history(&mut self, loading: bool) {
+    pub fn set_loading_newer_history(&mut self, loading: bool) {
+        self.restore_uncommitted_navigation();
         self.older_history.set_loading_newer(loading);
     }
 
@@ -3899,6 +3916,10 @@ impl BmuxApp {
             self.pending_assistant_stream_anchor = checkpoint.pending_assistant;
             self.pending_transcript_top_anchor_sequence = checkpoint.pending_sequence;
             self.older_history = checkpoint.history;
+            self.latest_hidden_activity_at = checkpoint.hidden_activity_at;
+            self.latest_hidden_activity_burst = checkpoint.hidden_activity_burst;
+            self.latest_bar_animation_started_at = checkpoint.bar_started_at;
+            self.latest_bar_next_frame_at = checkpoint.bar_next_frame_at;
         }
     }
 
@@ -3913,6 +3934,10 @@ impl BmuxApp {
             pending_assistant: self.pending_assistant_stream_anchor,
             pending_sequence: self.pending_transcript_top_anchor_sequence,
             history: self.older_history.clone(),
+            hidden_activity_at: self.latest_hidden_activity_at,
+            hidden_activity_burst: self.latest_hidden_activity_burst,
+            bar_started_at: self.latest_bar_animation_started_at,
+            bar_next_frame_at: self.latest_bar_next_frame_at,
         });
     }
 
@@ -3958,6 +3983,9 @@ impl BmuxApp {
         self.pending_stable_transcript_anchor = Some(StableTranscriptAnchor {
             item_id,
             fallback_index: line.entry_index,
+            source_position: self
+                .transcript_layout
+                .source_position(line.entry_index, line.row_in_entry),
             row_in_item: line.row_in_entry,
             content: self
                 .transcript_layout
@@ -4973,6 +5001,19 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uncommitted_retries_do_not_accumulate_hidden_activity() {
+        let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
+        let initial = app.latest_hidden_activity_burst;
+        app.begin_transcript_presentation();
+        app.record_latest_hidden_activity(std::time::Instant::now(), 4);
+        assert!(app.latest_hidden_activity_burst > initial);
+        app.begin_transcript_presentation();
+        assert_eq!(app.latest_hidden_activity_burst, initial);
+        assert!(app.latest_hidden_activity_at.is_none());
+        drop(app);
+    }
+
     #[test]
     fn manual_scroll_supersedes_uncommitted_navigation() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);

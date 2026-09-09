@@ -88,7 +88,31 @@ fn transcript_item_rows(
         input.diff_viewer_config,
         markdown.as_deref(),
     );
-    TranscriptLayoutRows::Anchored { rows, anchors }
+    if let Some(projection) = markdown
+        && matches!(
+            item.kind(),
+            super::transcript::TranscriptItemKind::AssistantMessage
+                | super::transcript::TranscriptItemKind::UserMessage
+        )
+    {
+        let container =
+            render::TranscriptItemLayout::resolve(&app.presented_theme(), item, input.width);
+        let body_start = rows.len().saturating_sub(
+            projection
+                .lines
+                .len()
+                .saturating_add(1)
+                .saturating_add(container.bottom_rows()),
+        );
+        TranscriptLayoutRows::Markdown {
+            rows,
+            anchors,
+            projection,
+            body_start,
+        }
+    } else {
+        TranscriptLayoutRows::Anchored { rows, anchors }
+    }
 }
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {

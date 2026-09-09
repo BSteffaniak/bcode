@@ -13,13 +13,27 @@ struct IndexedEntry {
     signature: TranscriptLayoutSignature,
     rows: Vec<Line>,
     row_count: usize,
+    markdown: Option<(
+        std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>,
+        usize,
+    )>,
     anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
 }
 
 impl IndexedEntry {
     fn new(signature: TranscriptLayoutSignature, rows: TranscriptLayoutRows) -> Self {
         let row_count = rows.len();
+        let mut markdown = None;
         let (rows, anchors) = match rows {
+            TranscriptLayoutRows::Markdown {
+                rows,
+                anchors,
+                projection,
+                body_start,
+            } => {
+                markdown = Some((projection, body_start));
+                (rows, anchors)
+            }
             TranscriptLayoutRows::Rendered(rows) => (rows, Vec::new()),
             TranscriptLayoutRows::Anchored { rows, anchors } => (rows, anchors),
             TranscriptLayoutRows::BlankSpan(0) => (Vec::new(), Vec::new()),
@@ -29,6 +43,7 @@ impl IndexedEntry {
             signature,
             rows,
             row_count,
+            markdown,
             anchors,
         }
     }
@@ -264,6 +279,32 @@ pub struct IndexedTranscriptLayout {
 }
 
 impl IndexedTranscriptLayout {
+    pub fn source_position(&self, index: usize, row: usize) -> Option<usize> {
+        let (projection, body_start) = self.transcript.entries.get(index)?.markdown.as_ref()?;
+        let row = row.checked_sub(*body_start)?;
+        let row = u16::try_from(row).ok()?;
+        projection
+            .selection_provenance_for_rows(row..row.saturating_add(1))
+            .iter()
+            .filter_map(|unit| unit.source_ranges.first().map(|range| range.start))
+            .min()
+    }
+
+    pub fn source_row(&self, index: usize, position: usize) -> Option<usize> {
+        let (projection, body_start) = self.transcript.entries.get(index)?.markdown.as_ref()?;
+        projection
+            .selection_provenance()
+            .iter()
+            .filter(|unit| {
+                unit.source_ranges
+                    .iter()
+                    .any(|range| range.contains(&position))
+            })
+            .flat_map(|unit| unit.rects.iter())
+            .map(|rect| body_start.saturating_add(usize::from(rect.y)))
+            .min()
+    }
+
     pub fn content_anchor(&self, index: usize, row: usize) -> Option<(&str, usize)> {
         self.transcript
             .entries
@@ -505,6 +546,50 @@ impl IndexedTranscriptLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accepted_markdown_source_survives_width_reflow() {
+        use bcode_markdown_render::{MarkdownRenderOptions, render_markdown};
+        let source = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        let mut layout = IndexedTranscriptLayout::default();
+        let make_rows = |width| {
+            let projection =
+                std::sync::Arc::new(render_markdown(source, &MarkdownRenderOptions::new(width)));
+            TranscriptLayoutRows::Markdown {
+                rows: projection.lines.clone(),
+                anchors: Vec::new(),
+                projection,
+                body_start: 0,
+            }
+        };
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("wide".to_owned()),
+            |_| make_rows(32),
+            |_| None,
+        );
+        let position = layout
+            .source_position(0, 1)
+            .expect("source position on second row");
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("narrow".to_owned()),
+            |_| make_rows(12),
+            |_| None,
+        );
+        let row = layout
+            .source_row(0, position)
+            .expect("same source after reflow");
+        assert!(row > 1);
+        let entry = &layout.transcript.entries[0];
+        let (projection, _) = entry.markdown.as_ref().expect("accepted projection");
+        assert!(projection.selection_provenance().iter().any(|unit| {
+            unit.source_ranges
+                .iter()
+                .any(|range| range.contains(&position))
+                && unit.rects.iter().any(|rect| usize::from(rect.y) == row)
+        }));
+    }
+
     #[test]
     fn accepted_content_key_resolves_after_header_growth() {
         use bcode_plugin_sdk::tui_visual::TuiVisualAnchor;
