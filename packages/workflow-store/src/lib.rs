@@ -6977,6 +6977,37 @@ impl WorkflowStore {
         self.persist_validated_output_with_fault(output, &NoopWorkflowOutputFault)
     }
 
+    /// Settle output against an exact graph revision under current execution authority.
+    ///
+    /// Ownership, graph selection, output persistence, and successor settlement share one
+    /// transaction. This does not authorize unsupported graph reconciliation or replace
+    /// operation-owner receipt checks performed by the dispatch coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale authority or revision, malformed output, conflicting output,
+    /// unsupported reconciliation, or persistence failure. Errors roll back settlement.
+    pub fn persist_validated_output_at_graph_revision(
+        &mut self,
+        output: &ValidatedOutput,
+        expected_revision: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<OutputPersistenceResult, WorkflowStoreError> {
+        validate_output(output)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(&output.run_id, authority)?;
+        if expected_revision == 0
+            || run_graph::graph_revision(&transaction, &output.run_id)? != Some(expected_revision)
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow settlement graph revision conflict".to_string(),
+            ));
+        }
+        let result = persist_validated_output_transaction(&transaction, output)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Persist validated output with deterministic in-transaction fault injection.
     ///
     /// # Errors
@@ -7676,11 +7707,73 @@ impl WorkflowStore {
             .await
     }
 
+    /// Observe and settle one run's receipts under durable execution authority.
+    ///
+    /// Authority and graph revision are captured with receipt discovery in one snapshot and
+    /// rechecked inside the settlement transaction. No database transaction spans owner awaits;
+    /// ownership transfer or a graph edit during observation rejects the entire settlement batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale authority, invalid bounds, owner observation failure,
+    /// or invalid durable transitions. Failed settlement rolls back the entire batch.
+    pub async fn reconcile_owned_receipts_for_run_async<O>(
+        &mut self,
+        observer: &O,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+        reconciled_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError>
+    where
+        O: AsyncAttemptStatusObserver + ?Sized,
+    {
+        let (revision, requests) = {
+            let transaction = self.connection.unchecked_transaction()?;
+            self.verify_execution_authority(run_id, authority)?;
+            let revision = run_graph::graph_revision(&transaction, run_id)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "receipt reconciliation graph is missing".to_string(),
+                )
+            })?;
+            let requests =
+                receipt_backed_attempts(&transaction, Some(run_id), bounded_limit(limit)?)?;
+            transaction.commit()?;
+            (revision, requests)
+        };
+        self.reconcile_attempt_requests_with_authority_async(
+            observer,
+            requests,
+            reconciled_at_ms,
+            Some((run_id, authority, revision)),
+        )
+        .await
+    }
+
     async fn reconcile_attempt_requests_async<O>(
         &mut self,
         observer: &O,
         requests: Vec<AttemptReconciliationRequest>,
         reconciled_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError>
+    where
+        O: AsyncAttemptStatusObserver + ?Sized,
+    {
+        self.reconcile_attempt_requests_with_authority_async(
+            observer,
+            requests,
+            reconciled_at_ms,
+            None,
+        )
+        .await
+    }
+
+    async fn reconcile_attempt_requests_with_authority_async<O>(
+        &mut self,
+        observer: &O,
+        requests: Vec<AttemptReconciliationRequest>,
+        reconciled_at_ms: u64,
+        authority: Option<(&str, &WorkflowExecutionAuthority, u64)>,
     ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError>
     where
         O: AsyncAttemptStatusObserver + ?Sized,
@@ -7696,6 +7789,31 @@ impl WorkflowStore {
             observations.push((request, observation));
         }
         let transaction = self.connection.transaction()?;
+        if let Some((run_id, authority, revision)) = authority {
+            if run_graph::graph_revision(&transaction, run_id)? != Some(revision) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "receipt settlement graph revision conflict".to_string(),
+                ));
+            }
+            let owned: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1
+                 AND target_artifact_id = ?2 AND coordinator_daemon_instance_id = ?3
+                 AND coordinator_generation = ?4 AND coordinator_fencing_token = ?5)",
+                rusqlite::params![
+                    run_id,
+                    authority.target_artifact_id,
+                    authority.daemon_instance_id,
+                    authority.generation,
+                    authority.fencing_token
+                ],
+                |row| row.get(0),
+            )?;
+            if !owned {
+                return Err(WorkflowStoreError::InvalidData(
+                    "receipt settlement lost execution authority".to_string(),
+                ));
+            }
+        }
         let mut summary = ReceiptReconciliationSummary::default();
         for (request, observation) in observations {
             apply_attempt_observation(
@@ -19292,6 +19410,62 @@ mod tests {
             .expect("prepare")
             .expect("next attempt");
         assert_eq!(prepared.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn receipt_settlement_rechecks_authority_after_observation() {
+        verify_receipt_observation_fence(
+            "UPDATE workflow_runs SET coordinator_generation = 2 WHERE run_id = 'run-1'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn receipt_settlement_rechecks_graph_after_observation() {
+        verify_receipt_observation_fence(
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+        )
+        .await;
+    }
+
+    async fn verify_receipt_observation_fence(change: &'static str) {
+        struct Observer(std::path::PathBuf, &'static str);
+        impl AsyncAttemptStatusObserver for Observer {
+            fn observe_async<'a>(
+                &'a self,
+                _: &'a AttemptReconciliationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    let store = WorkflowStore::open_at_path(&self.0)?;
+                    store.connection.execute(self.1, [])?;
+                    Ok(AttemptObservation::Running)
+                })
+            }
+        }
+        let (_temp, mut store) = initialized_store();
+        prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.connection.execute_batch("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';").expect("authority");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let observer = Observer(store.path().to_path_buf(), change);
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .reconcile_owned_receipts_for_run_async(&observer, "run-1", &authority, 10, 30)
+                .await
+                .is_err()
+        );
+        assert_eq!(before, store.connection.total_changes());
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("history")[0].status,
+            "admitted"
+        );
     }
 
     #[tokio::test]
@@ -33403,8 +33577,34 @@ mod tests {
         store.connection.execute(
             "UPDATE workflow_activation_graph_bindings SET graph_revision = 2 WHERE run_id = 'run-1'", []
         ).expect("current admission fixture");
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("authority fixture");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .persist_validated_output_at_graph_revision(&output, 2, &stale)
+                .is_err()
+        );
+        assert!(
+            store
+                .persist_validated_output_at_graph_revision(&output, 1, &authority)
+                .is_err()
+        );
+        assert_eq!(before, store.connection.total_changes());
         let outcome = store
-            .persist_validated_output(&output)
+            .persist_validated_output_at_graph_revision(&output, 2, &authority)
             .expect("revised leaf settlement");
         assert_eq!(outcome.run_status, RunStatus::Completed);
         assert!(outcome.activated.is_empty());

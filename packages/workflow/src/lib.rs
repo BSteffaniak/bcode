@@ -4012,7 +4012,7 @@ impl WorkflowCompilationPreview {
 }
 
 /// Compatibility version for live run graph edit requests.
-pub const WORKFLOW_RUN_GRAPH_EDIT_VERSION: u32 = 1;
+pub const WORKFLOW_RUN_GRAPH_EDIT_VERSION: u32 = 2;
 /// Maximum structural operations admitted in one live graph edit request.
 pub const MAX_WORKFLOW_RUN_GRAPH_EDITS: usize = 256;
 
@@ -4022,6 +4022,13 @@ pub const MAX_WORKFLOW_RUN_GRAPH_EDITS: usize = 256;
 pub enum WorkflowRunGraphReconciliation {
     /// Preserve the activation's admitted executable and inputs.
     Retain { activation_id: String },
+    /// Preserve execution and explicitly authorize its result for these candidate edge identities.
+    /// Version 2 only. The store must verify source identity and schema compatibility; envelope
+    /// validation alone does not grant output reuse authority.
+    RetainWithBindings {
+        activation_id: String,
+        edge_ids: Vec<u64>,
+    },
     /// Request cancellation; replacement cannot dispatch until cancellation is reconciled.
     Cancel { activation_id: String },
 }
@@ -4087,7 +4094,7 @@ impl WorkflowRunGraphEditBatch {
     /// authorization are required separately before any mutation.
     pub fn validate(&self) -> Result<(), WorkflowError> {
         let invalid = |message: &str| authoring_error("run_graph_edit", message);
-        if self.version != WORKFLOW_RUN_GRAPH_EDIT_VERSION {
+        if !matches!(self.version, 1..=WORKFLOW_RUN_GRAPH_EDIT_VERSION) {
             return Err(invalid("unsupported live graph edit version"));
         }
         if self.expected_revision == 0 || self.expected_revision >= i64::MAX as u64 {
@@ -4120,8 +4127,27 @@ impl WorkflowRunGraphEditBatch {
             }
         }
         let mut identities = std::collections::BTreeSet::new();
+        let mut bindings = std::collections::BTreeSet::new();
         for disposition in &self.reconciliation {
+            if let WorkflowRunGraphReconciliation::RetainWithBindings { edge_ids, .. } = disposition
+            {
+                if self.version < 2
+                    || edge_ids.is_empty()
+                    || edge_ids.len() > MAX_WORKFLOW_RUN_GRAPH_EDITS
+                {
+                    return Err(invalid("unsupported or oversized retained-result bindings"));
+                }
+                for edge_id in edge_ids {
+                    if i64::try_from(*edge_id).is_err()
+                        || !bindings.insert(*edge_id)
+                        || bindings.len() > MAX_WORKFLOW_RUN_GRAPH_EDITS
+                    {
+                        return Err(invalid("invalid or repeated retained-result binding"));
+                    }
+                }
+            }
             let (WorkflowRunGraphReconciliation::Retain { activation_id }
+            | WorkflowRunGraphReconciliation::RetainWithBindings { activation_id, .. }
             | WorkflowRunGraphReconciliation::Cancel { activation_id }) = disposition;
             if !valid_id(activation_id) || !identities.insert(activation_id) {
                 return Err(invalid("invalid or repeated activation disposition"));
@@ -15727,6 +15753,23 @@ mod tests {
             }],
         };
         batch.validate().expect("valid envelope");
+        batch.version = 1;
+        batch.validate().expect("legacy candidate preserved");
+        batch.reconciliation = vec![WorkflowRunGraphReconciliation::RetainWithBindings {
+            activation_id: "activation-1".to_string(),
+            edge_ids: vec![1],
+        }];
+        assert!(batch.validate().is_err());
+        batch.version = WORKFLOW_RUN_GRAPH_EDIT_VERSION;
+        batch.validate().expect("explicit binding envelope");
+        batch.reconciliation = vec![WorkflowRunGraphReconciliation::RetainWithBindings {
+            activation_id: "activation-1".to_string(),
+            edge_ids: vec![1, 1],
+        }];
+        assert!(batch.validate().is_err());
+        batch.reconciliation = vec![WorkflowRunGraphReconciliation::Retain {
+            activation_id: "activation-1".to_string(),
+        }];
         let wire = serde_json::to_value(&batch).expect("serialize");
         assert_eq!(
             serde_json::from_value::<WorkflowRunGraphEditBatch>(wire.clone()).expect("decode"),

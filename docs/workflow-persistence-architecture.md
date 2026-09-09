@@ -88,6 +88,23 @@ there are no outgoing edge records. It uses that node's exit flag and preserves 
 completion. Historical admissions and any outgoing edges still require reconciliation; this narrow
 path does not enable publication, repeat/join settlement, or operation-owner coordination.
 
+### Retained-result binding decision
+
+Retaining an in-flight activation preserves its admitted executable and inputs; it does not by
+itself authorize output reuse across newly connected or changed dependencies. The live-edit contract
+must represent explicit compatible bindings from retained activations to revised dependencies.
+Publication must validate these bindings against the candidate graph and immutable source executable,
+then commit them with reconciliation intent. Settlement must consume the authorized bindings without
+changing historical result identity. Matching node IDs or current topology alone confer no reuse
+authority. Existing staged version-1 candidates must be preserved without acquiring implicit bindings.
+This decision is approved. Live-edit version 2 now represents `RetainWithBindings` using an
+activation identity and a bounded list of candidate edge identities. Version 1 remains accepted
+without bindings and rejects the new disposition; old candidates gain no implicit authority.
+Staging preserves binding intent in the existing bounded request payload. Candidate validation
+requires each bound edge to originate at the retained executable's node and its target input to
+exactly match the immutable source output schema; transforms are rejected until compatibility can
+be proved. Publication and settlement consumption of these bindings remain outstanding.
+
 ## Canonical ownership
 
 Durable workflow execution uses one dedicated database:

@@ -320,6 +320,7 @@ impl WorkflowStore {
             apply_candidate_edit(&mut graph, &mut edges, edit)?;
         }
         graph.edges = edges.values().cloned().collect();
+        validate_retained_bindings(&transaction, &request, &graph, &edges)?;
         graph
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -526,6 +527,7 @@ fn validate_affected_work(
         .iter()
         .map(|item| {
             let (Reconciliation::Retain { activation_id }
+            | Reconciliation::RetainWithBindings { activation_id, .. }
             | Reconciliation::Cancel { activation_id }) = item;
             activation_id.as_str()
         })
@@ -596,8 +598,9 @@ fn validate_reconciliation_targets(
 ) -> Result<(), WorkflowStoreError> {
     use bcode_workflow::WorkflowRunGraphReconciliation as Reconciliation;
     for disposition in &request.reconciliation {
-        let (Reconciliation::Retain { activation_id } | Reconciliation::Cancel { activation_id }) =
-            disposition;
+        let (Reconciliation::Retain { activation_id }
+        | Reconciliation::RetainWithBindings { activation_id, .. }
+        | Reconciliation::Cancel { activation_id }) = disposition;
         let mut statement = connection.prepare(
             "SELECT status, output_id FROM workflow_activations
              WHERE run_id = ?1 AND activation_id = ?2 LIMIT 2",
@@ -623,6 +626,53 @@ fn validate_reconciliation_targets(
                 "graph reconciliation requires an unambiguous active activation in this run"
                     .to_string(),
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_retained_bindings(
+    connection: &Connection,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    graph: &WorkflowDefinition,
+    edges: &std::collections::BTreeMap<u64, EdgeDefinition>,
+) -> Result<(), WorkflowStoreError> {
+    for disposition in &request.reconciliation {
+        let bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+            activation_id,
+            edge_ids,
+        } = disposition
+        else {
+            continue;
+        };
+        let source_id: String = connection.query_row(
+            "SELECT node_id FROM workflow_activations WHERE run_id = ?1 AND activation_id = ?2",
+            (&request.run_id, activation_id),
+            |row| row.get(0),
+        )?;
+        let source = bound_activation_node(connection, &request.run_id, &source_id, activation_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("binding source is missing".to_string())
+            })?;
+        for edge_id in edge_ids {
+            let edge = edges.get(edge_id).ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "binding edge is missing from candidate".to_string(),
+                )
+            })?;
+            let target = graph.nodes.get(&edge.to).ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "binding target is missing from candidate".to_string(),
+                )
+            })?;
+            // Exact schema equality is a conservative proof. Transform-aware compatibility
+            // requires a separate proof and must not be inferred from a node identity.
+            if edge.from != source_id || edge.transform.is_some() || source.output != target.input {
+                return Err(WorkflowStoreError::InvalidData(
+                    "retained-result binding lacks compatible source and target schemas"
+                        .to_string(),
+                ));
+            }
         }
     }
     Ok(())

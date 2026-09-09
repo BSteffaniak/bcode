@@ -14852,14 +14852,19 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
                 now_ms,
             )
             .await?;
-        let reconciled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .reconcile_receipt_backed_attempts_for_run_async(
-                &WorkflowTurnReceiptObserver { state },
-                run_id,
-                1_000,
-                now_ms,
-            )
-            .await?;
+        let reconciled = if let Some(authority) = authority.as_ref() {
+            bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+                .reconcile_owned_receipts_for_run_async(
+                    &WorkflowTurnReceiptObserver { state },
+                    run_id,
+                    &authority.authority,
+                    1_000,
+                    now_ms,
+                )
+                .await?
+        } else {
+            bcode_workflow_store::ReceiptReconciliationSummary::default()
+        };
         if !reconciled.sibling_cancellations.is_empty() {
             propagate_fail_fast_sibling_cancellation(
                 state,
@@ -30964,9 +30969,10 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             continue;
         }
         let reconciliation = store
-            .reconcile_receipt_backed_attempts_for_run_async(
+            .reconcile_owned_receipts_for_run_async(
                 &WorkflowTurnReceiptObserver { state },
                 &run_id,
+                &authority.authority,
                 1_000,
                 current_unix_millis(),
             )
