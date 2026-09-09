@@ -130,6 +130,132 @@ fn run_operation_failure(error: super::ServerError) -> bcode_workflow::WorkflowR
 }
 
 impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_> {
+    async fn list_all_workflow_mutation_approvals(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowMutationApprovalInspection>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        list_mutation_approvals_all(self.state, limit)
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn list_workflow_mutation_approvals(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowMutationApprovalInspection>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        list_mutation_approvals(self.state, &run_id, limit)
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn resolve_workflow_mutation_approval(
+        &self,
+        approval_id: String,
+        decision: bcode_workflow::WorkflowMutationApprovalDecision,
+    ) -> Result<bcode_workflow::WorkflowMutationApprovalResolution, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        resolve_mutation_approval(self.state, &approval_id, decision)
+            .await
+            .map_err(run_operation_failure)
+    }
+    async fn workflow_attempt_history(
+        &self,
+        run_id: String,
+        cursor: Option<bcode_workflow::AttemptCursor>,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::AttemptSummary>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        attempt_history(self.state, &run_id, cursor.as_ref(), limit)
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn workflow_event_history(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowHistoryEvent>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        event_history(self.state, &run_id, after_sequence, limit)
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn retry_workflow_node(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        failed_attempt: u32,
+    ) -> Result<bcode_workflow::WorkflowNodeRetryResult, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        retry_node(
+            self.state,
+            &run_id,
+            &node_id,
+            &activation_id,
+            failed_attempt,
+        )
+        .await
+        .map_err(run_operation_failure)
+    }
+    async fn list_workflow_waits(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WaitingActivation>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        list_waits(self.state, &run_id, limit).map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn provide_workflow_input(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        value: serde_json::Value,
+    ) -> Result<bcode_workflow::WaitingResolutionResult, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        provide_input(self.state, &run_id, &node_id, &activation_id, value)
+            .await
+            .map_err(run_operation_failure)
+    }
+    async fn resolve_workflow_approval(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        approved: bool,
+    ) -> Result<bcode_workflow::WaitingResolutionResult, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        resolve_approval(self.state, &run_id, &node_id, &activation_id, approved)
+            .await
+            .map_err(run_operation_failure)
+    }
+    async fn start_workflow_run(
+        &self,
+        request: bcode_workflow::WorkflowRunStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        start_run(self.state, request, None)
+            .await
+            .map_err(run_operation_failure)
+    }
     async fn start_workflow(
         &self,
         request: bcode_workflow::WorkflowStartRequest,

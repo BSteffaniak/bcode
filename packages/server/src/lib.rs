@@ -6730,13 +6730,16 @@ async fn handle_workflow_validation_request(
             send_response(writer, request_id, response).await
         }
         WorkflowDefinitionRequest::StartWorkflowRun(request) => {
-            let started = workflow_operations::start_run(state, request, None).await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+            let result = bcode_workflow::WorkflowRunApplication::start_workflow_run(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                request,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(started) => Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         WorkflowDefinitionRequest::ListWorkflowDefinitions { limit } => {
             let definitions = workflow_operations::list_definitions(state, limit)?;
@@ -7003,29 +7006,32 @@ async fn handle_workflow_run_request(
             activation_id,
             failed_attempt,
         } => {
-            let result = workflow_operations::retry_node(
-                state,
-                &run_id,
-                &node_id,
-                &activation_id,
+            let result = bcode_workflow::WorkflowRunApplication::retry_workflow_node(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                node_id,
+                activation_id,
                 failed_attempt,
             )
-            .await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowNodeRetried { result }),
-            )
-            .await
+            .await;
+            let response = match result {
+                Ok(result) => Response::Ok(ResponsePayload::WorkflowNodeRetried { result }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ListWorkflowWaits { run_id, limit } => {
-            let waits = workflow_operations::list_waits(state, &run_id, limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowWaitList { waits }),
+            let result = bcode_workflow::WorkflowRunApplication::list_workflow_waits(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(waits) => Response::Ok(ResponsePayload::WorkflowWaitList { waits }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ProvideWorkflowInput {
             run_id,
@@ -7033,15 +7039,19 @@ async fn handle_workflow_run_request(
             activation_id,
             value,
         } => {
-            let result =
-                workflow_operations::provide_input(state, &run_id, &node_id, &activation_id, value)
-                    .await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
+            let result = bcode_workflow::WorkflowRunApplication::provide_workflow_input(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                node_id,
+                activation_id,
+                value,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(result) => Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ResolveWorkflowApproval {
             run_id,
@@ -7049,79 +7059,104 @@ async fn handle_workflow_run_request(
             activation_id,
             approved,
         } => {
-            let result = workflow_operations::resolve_approval(
-                state,
-                &run_id,
-                &node_id,
-                &activation_id,
+            let result = bcode_workflow::WorkflowRunApplication::resolve_workflow_approval(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                node_id,
+                activation_id,
                 approved,
             )
-            .await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
-            )
-            .await
+            .await;
+            let response = match result {
+                Ok(result) => Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ListWorkflowMutationApprovalsAll { limit } => {
-            let approvals = workflow_operations::list_mutation_approvals_all(state, limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
-            )
-            .await
+            let result =
+                bcode_workflow::WorkflowRunApplication::list_all_workflow_mutation_approvals(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    limit,
+                )
+                .await;
+            let response = match result {
+                Ok(approvals) => {
+                    Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals })
+                }
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ListWorkflowMutationApprovals { run_id, limit } => {
-            let approvals = workflow_operations::list_mutation_approvals(state, &run_id, limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
+            let result = bcode_workflow::WorkflowRunApplication::list_workflow_mutation_approvals(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(approvals) => {
+                    Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals })
+                }
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ResolveWorkflowMutationApproval {
             approval_id,
             decision,
         } => {
             let result =
-                workflow_operations::resolve_mutation_approval(state, &approval_id, decision)
-                    .await?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowMutationApprovalResolved { result }),
-            )
-            .await
+                bcode_workflow::WorkflowRunApplication::resolve_workflow_mutation_approval(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    approval_id,
+                    decision,
+                )
+                .await;
+            let response = match result {
+                Ok(result) => {
+                    Response::Ok(ResponsePayload::WorkflowMutationApprovalResolved { result })
+                }
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::WorkflowAttemptHistory {
             run_id,
             cursor,
             limit,
         } => {
-            let attempts =
-                workflow_operations::attempt_history(state, &run_id, cursor.as_ref(), limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowAttemptHistory { attempts }),
+            let result = bcode_workflow::WorkflowRunApplication::workflow_attempt_history(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                cursor,
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(attempts) => Response::Ok(ResponsePayload::WorkflowAttemptHistory { attempts }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::WorkflowEventHistory {
             run_id,
             after_sequence,
             limit,
         } => {
-            let events = workflow_operations::event_history(state, &run_id, after_sequence, limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowEventHistory { events }),
+            let result = bcode_workflow::WorkflowRunApplication::workflow_event_history(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                after_sequence,
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(events) => Response::Ok(ResponsePayload::WorkflowEventHistory { events }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::WorkflowLiveEventCatchUp {
             after_sequence,
@@ -65251,15 +65286,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drive_workflow_run(&state, "input-wake-run")
             .await
             .expect("drive to input wait");
-        let wait = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .waiting_activations("input-wake-run", 10)
-            .expect("waits")
-            .into_iter()
-            .next()
-            .expect("input wait");
+        let wait = bcode_workflow::WorkflowRunApplication::list_workflow_waits(
+            &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
+            "input-wake-run".to_string(),
+            10,
+        )
+        .await
+        .expect("waits")
+        .into_iter()
+        .next()
+        .expect("input wait");
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
@@ -65769,7 +65805,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn direct_resume_drives_pending_activation() {
-        let sessions = SessionManager::default();
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent_with_metrics_and_lease_owner(
+            session_root.path(),
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                daemon_instance_id: Some(test_workflow_execution_authority().daemon_instance_id),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("persistent sessions");
         let session = sessions
             .create_session(
                 Some("direct resume pending".to_string()),
@@ -65781,37 +65826,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut store =
             bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
                 .expect("workflow store");
-        let schema = bcode_workflow::ValueSchema {
-            type_name: "boolean".to_string(),
-            schema: serde_json::json!({"type": "boolean"}),
-        };
+        let workflow = bcode_workflow::WorkflowBuilder::new(
+            "direct-resume-pending",
+            bcode_workflow::Step::<bool, bool>::input("wait"),
+        )
+        .build()
+        .expect("workflow");
         store
-            .persist_definition(
-                "direct-resume-pending",
-                1,
-                &bcode_workflow::WorkflowDefinition {
-                    schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
-                    name: "direct-resume-pending".to_string(),
-                    input: schema.clone(),
-                    output: schema.clone(),
-                    nodes: BTreeMap::from([(
-                        "wait".to_string(),
-                        bcode_workflow::NodeDefinition {
-                            id: "wait".to_string(),
-                            name: "wait".to_string(),
-                            kind: bcode_workflow::NodeKind::Input,
-                            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
-                            input: schema.clone(),
-                            output: schema,
-                            resources: Vec::new(),
-                            configuration: serde_json::json!({}),
-                        },
-                    )]),
-                    entries: vec!["wait".to_string()],
-                    exits: vec!["wait".to_string()],
-                    edges: Vec::new(),
-                },
-            )
+            .persist_definition("direct-resume-pending", 1, workflow.definition())
             .expect("definition");
         store
             .create_run(&bcode_workflow_store::NewWorkflowRun {
@@ -65847,10 +65869,31 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("unique host")
             .daemon_status
             .instance_id = "unverified-other-host".to_string();
+        let live_lease = bcode_session::lease::acquire_session_lease(
+            session_root.path(),
+            session.id,
+            &SessionLeaseOwnerContext {
+                daemon_instance_id: Some(owner.clone()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("live authority lease");
+        let observations =
+            bcode_session::lease::session_owner_observations(session_root.path(), session.id)
+                .expect("owner observations");
+        assert!(
+            observations.iter().any(
+                |observation| observation.owner.daemon_instance_id.as_deref()
+                    == Some(owner.as_str())
+                    && observation.liveness == bcode_session::lease::SessionOwnerLiveness::Live
+            ),
+            "the recorded authority must have a verified live lease"
+        );
         assert_unverifiable_run_owner_is_not_mutated(
             &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
         )
         .await;
+        drop(live_lease);
         Arc::get_mut(&mut state)
             .expect("no retained host handles")
             .daemon_status
@@ -65884,7 +65927,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 result
                     .expect_err("unverifiable ownership must fail closed")
                     .code,
-                "workflow_unavailable"
+                "workflow_owned_by_live_daemon"
             );
         }
         let after = application

@@ -2,6 +2,64 @@
 //! Existing wire representations are preserved. Authored provenance compatibility is recognized
 //! by its version; run status variants are explicit and unknown variants are rejected.
 
+/// Keyset cursor for bounded attempt history; existing serialized shape is preserved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttemptCursor {
+    /// Preparation time in Unix milliseconds.
+    pub prepared_at_ms: u64,
+    /// Dispatch identity used to break timestamp ties.
+    pub dispatch_identity: String,
+}
+
+/// Result of an explicit operator retry; existing serialized representation is preserved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowNodeRetryResult {
+    /// Owning run.
+    pub run_id: String,
+    /// Retried node.
+    pub node_id: String,
+    /// Exact activation identity.
+    pub activation_id: String,
+    /// Failed attempt replaced by this transition.
+    pub previous_attempt: u32,
+    /// Newly scheduled attempt.
+    pub next_attempt: u32,
+}
+
+/// One durable node activation. Existing serialized representation is preserved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NewActivation {
+    /// Owning run.
+    pub run_id: String,
+    /// Activated node.
+    pub node_id: String,
+    /// Exact activation identity.
+    pub activation_id: String,
+    /// Dependency generation.
+    pub dependency_generation: u64,
+    /// Optional schema-validated activation input.
+    pub input: Option<serde_json::Value>,
+    /// Creation time in Unix milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Result of resolving one exact durable wait. Existing serialized representation is preserved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WaitingResolutionResult {
+    /// Owning run.
+    pub run_id: String,
+    /// Waiting node.
+    pub node_id: String,
+    /// Exact activation identity.
+    pub activation_id: String,
+    /// Recorded resolution outcome.
+    pub outcome: String,
+    /// Newly activated work.
+    pub activated: Vec<NewActivation>,
+    /// Resulting run status.
+    pub run_status: crate::RunStatus,
+}
+
 /// A connected source of workflow notifications, independent of transport details.
 ///
 /// The returned subscription owns its delivery resources. Dropping it ends observation;
@@ -59,6 +117,121 @@ pub enum WorkflowRunWatchEvent {
 pub trait WorkflowRunApplication: Sync {
     /// Adapter-owned transport or normalized domain failure.
     type Error;
+
+    /// List bounded pending mutation approvals across runs without repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state or transport failure.
+    fn list_all_workflow_mutation_approvals(
+        &self,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<Vec<WorkflowMutationApprovalInspection>, Self::Error>,
+    > + Send;
+
+    /// List bounded pending mutation approvals for one run without repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state or transport failure.
+    fn list_workflow_mutation_approvals(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<Vec<WorkflowMutationApprovalInspection>, Self::Error>,
+    > + Send;
+
+    /// Resolve an exact mutation approval and continue admitted work.
+    ///
+    /// # Errors
+    /// Returns an error on invalid identity/decision, unavailable state, ownership conflict,
+    /// or transport failure. Errors do not imply rollback of a committed decision.
+    fn resolve_workflow_mutation_approval(
+        &self,
+        approval_id: String,
+        decision: WorkflowMutationApprovalDecision,
+    ) -> impl std::future::Future<Output = Result<WorkflowMutationApprovalResolution, Self::Error>> + Send;
+
+    /// Read bounded attempt history using a keyset cursor without repair or full replay.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable/invalid state or transport failure.
+    fn workflow_attempt_history(
+        &self,
+        run_id: String,
+        cursor: Option<AttemptCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<crate::AttemptSummary>, Self::Error>> + Send;
+
+    /// Read bounded semantic event history after an optional run sequence.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable/invalid state or transport failure.
+    fn workflow_event_history(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<WorkflowHistoryEvent>, Self::Error>> + Send;
+
+    /// Retry one exact failed attempt under verified execution authority.
+    ///
+    /// # Errors
+    /// Returns an error for stale attempt identity, invalid transitions, foreign ownership,
+    /// unavailable state, scheduling failure, or transport failure. Errors do not imply rollback.
+    fn retry_workflow_node(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        failed_attempt: u32,
+    ) -> impl std::future::Future<Output = Result<WorkflowNodeRetryResult, Self::Error>> + Send;
+
+    /// List a bounded set of current waits without repairing durable state.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or invalid durable state or transport failure.
+    fn list_workflow_waits(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<crate::WaitingActivation>, Self::Error>> + Send;
+
+    /// Supply schema-validated input to an exact wait under verified execution authority.
+    ///
+    /// # Errors
+    /// Returns an error for invalid input/identity, foreign ownership, unavailable state,
+    /// scheduling failure, or transport failure. Errors do not imply rollback.
+    fn provide_workflow_input(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        value: serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<WaitingResolutionResult, Self::Error>> + Send;
+
+    /// Resolve an exact approval wait under verified execution authority.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identity/state, foreign ownership, scheduling failure,
+    /// or transport failure. Errors do not imply rollback.
+    fn resolve_workflow_approval(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        approved: bool,
+    ) -> impl std::future::Future<Output = Result<WaitingResolutionResult, Self::Error>> + Send;
+
+    /// Admit a run of an exact registered definition through normal admission checks.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable definitions/state, denied authorization,
+    /// conflicting identity, invalid context, or transport failure. Errors do not imply rollback.
+    fn start_workflow_run(
+        &self,
+        request: WorkflowRunStartRequest,
+    ) -> impl std::future::Future<Output = Result<WorkflowRunStartResponse, Self::Error>> + Send;
 
     /// Admit an exact definition and binding through normal authorization and ownership checks.
     /// Stable run IDs permit identical retries, but conflicting requests fail closed.

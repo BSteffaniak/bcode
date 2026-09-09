@@ -214,23 +214,9 @@ pub use bcode_workflow::WorkflowActivationInputSummary;
 /// Compatibility export of the workflow-owned inspection contract.
 pub use bcode_workflow::WorkflowActivationSummary;
 
-/// Result of resolving one exact durable waiting activation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaitingResolutionResult {
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub outcome: String,
-    pub activated: Vec<NewActivation>,
-    pub run_status: RunStatus,
-}
+pub use bcode_workflow::WaitingResolutionResult;
 
-/// Keyset cursor for bounded attempt history.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttemptCursor {
-    pub prepared_at_ms: u64,
-    pub dispatch_identity: String,
-}
+pub use bcode_workflow::AttemptCursor;
 
 /// Compatibility export of the workflow-owned inspection contract.
 pub use bcode_workflow::AttemptSummary;
@@ -401,18 +387,7 @@ pub struct NewWorkflowRun {
     pub limits: WorkflowRunLimits,
 }
 
-/// One durable node activation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NewActivation {
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub dependency_generation: u64,
-    /// Optional schema-validated activation input. Entry activations inherit the run input;
-    /// downstream activations inherit the predecessor output or a controller-derived envelope.
-    pub input: Option<serde_json::Value>,
-    pub created_at_ms: u64,
-}
+pub use bcode_workflow::NewActivation;
 
 /// Prepared external-operation intent written before dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -876,15 +851,7 @@ pub trait ActivationDispatchOwner: Sync {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>>;
 }
 
-/// Result of an explicit operator retry transition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowNodeRetryResult {
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub previous_attempt: u32,
-    pub next_attempt: u32,
-}
+pub use bcode_workflow::WorkflowNodeRetryResult;
 
 /// Summary of bounded deterministic control-node settlement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

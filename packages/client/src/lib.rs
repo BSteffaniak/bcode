@@ -465,6 +465,82 @@ pub enum ClientError {
 }
 
 impl bcode_workflow::WorkflowRunApplication for BcodeClient {
+    async fn list_all_workflow_mutation_approvals(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowMutationApprovalInspection>, Self::Error> {
+        Self::list_all_workflow_mutation_approvals(self, limit).await
+    }
+    async fn list_workflow_mutation_approvals(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowMutationApprovalInspection>, Self::Error> {
+        Self::list_workflow_mutation_approvals(self, run_id, limit).await
+    }
+    async fn resolve_workflow_mutation_approval(
+        &self,
+        approval_id: String,
+        decision: bcode_workflow::WorkflowMutationApprovalDecision,
+    ) -> Result<bcode_workflow::WorkflowMutationApprovalResolution, Self::Error> {
+        Self::resolve_workflow_mutation_approval(self, approval_id, decision).await
+    }
+    async fn workflow_attempt_history(
+        &self,
+        run_id: String,
+        cursor: Option<bcode_workflow::AttemptCursor>,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::AttemptSummary>, Self::Error> {
+        Self::workflow_attempt_history(self, run_id, cursor, limit).await
+    }
+    async fn workflow_event_history(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowHistoryEvent>, Self::Error> {
+        Self::workflow_event_history(self, run_id, after_sequence, limit).await
+    }
+    async fn retry_workflow_node(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        failed_attempt: u32,
+    ) -> Result<bcode_workflow::WorkflowNodeRetryResult, Self::Error> {
+        Self::retry_workflow_node(self, run_id, node_id, activation_id, failed_attempt).await
+    }
+    async fn list_workflow_waits(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WaitingActivation>, Self::Error> {
+        Self::list_workflow_waits(self, run_id, limit).await
+    }
+    async fn provide_workflow_input(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        value: serde_json::Value,
+    ) -> Result<bcode_workflow::WaitingResolutionResult, Self::Error> {
+        Self::provide_workflow_input(self, run_id, node_id, activation_id, value).await
+    }
+    async fn resolve_workflow_approval(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        approved: bool,
+    ) -> Result<bcode_workflow::WaitingResolutionResult, Self::Error> {
+        Self::resolve_workflow_approval(self, run_id, node_id, activation_id, approved).await
+    }
+    async fn start_workflow_run(
+        &self,
+        request: bcode_workflow::WorkflowRunStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, Self::Error> {
+        Self::start_workflow_run(self, request).await
+    }
     async fn start_workflow(
         &self,
         request: bcode_workflow::WorkflowStartRequest,
