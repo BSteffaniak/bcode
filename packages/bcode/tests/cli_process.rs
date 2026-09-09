@@ -3,6 +3,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use std::fmt::Write as _;
 use std::io::Read as _;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -532,6 +533,68 @@ fn composer_draft_cli_reads_sets_and_clears_live_daemon() {
 }
 
 #[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn derivation_cli_executes_and_observes_live_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let session = graph_cli_json(
+        root.path(),
+        &["session", "create", "derivation-source", "--json"],
+    );
+    let id = session["id"].as_str().unwrap();
+    let source = graph_cli_json(root.path(), &["session", "derivation-snapshot", id]);
+    let generation = source["generation"].to_string();
+    let page = graph_cli_json(
+        root.path(),
+        &[
+            "session",
+            "derivation-prompts",
+            id,
+            "--generation",
+            &generation,
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(page["generation"], source["generation"]);
+    assert_eq!(page["candidates"], serde_json::json!([]));
+    let operation_id = "00000000-0000-0000-0000-000000000042";
+    let request = serde_json::json!({
+        "version": source["version"], "operation_id": operation_id,
+        "idempotency_key": "cli-derivation-test", "source": source,
+        "cutoff_sequence": 0, "destination_name": "derived-test",
+        "initial_draft": "derived draft",
+        "lineage": {"producer": "cli-test", "operation_kind": "test"}
+    });
+    let path = root.path().join("derive.json");
+    std::fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
+    let args = ["session", "derive", "--request", path.to_str().unwrap()];
+    let outcome = graph_cli_json(root.path(), &args);
+    assert_eq!(outcome["status"], "succeeded");
+    assert_ne!(outcome["session"]["id"], session["id"]);
+    assert_eq!(graph_cli_json(root.path(), &args), outcome);
+    let status = graph_cli_json(root.path(), &["session", "derivation-status", operation_id]);
+    assert_eq!(status["outcome"], outcome);
+    assert_eq!(
+        graph_cli_json(root.path(), &["session", "cancel-derivation", operation_id]),
+        false
+    );
+    assert_eq!(
+        graph_cli_json(
+            root.path(),
+            &[
+                "session",
+                "composer-draft",
+                "--session-id",
+                outcome["session"]["id"].as_str().unwrap()
+            ]
+        ),
+        "derived draft"
+    );
+    drop(daemon);
+}
+
+#[test]
 fn derivation_commands_validate_identity_and_reach_daemon() {
     for command in [
         "derivation-snapshot",
@@ -708,7 +771,7 @@ fn workflow_template_cli_instantiates_and_starts_external_document() {
         std::fs::write(plugins.join("template.json"), &source).unwrap();
         let manifest = plugins.join("bcode-plugin.toml");
         let mut contents = std::fs::read_to_string(&manifest).unwrap();
-        contents.push_str(&format!("\n[[workflow_templates]]\ncontribution_version = 1\ntemplate_id = \"cli-input\"\ntemplate_version = 1\ntitle = \"CLI input\"\ndescription = \"CLI acceptance\"\n[workflow_templates.document_source]\npath = \"template.json\"\nsha256 = \"{:x}\"\n", sha2::Sha256::digest(source.as_bytes())));
+        write!(contents, "\n[[workflow_templates]]\ncontribution_version = 1\ntemplate_id = \"cli-input\"\ntemplate_version = 1\ntitle = \"CLI input\"\ndescription = \"CLI acceptance\"\n[workflow_templates.document_source]\npath = \"template.json\"\nsha256 = \"{:x}\"\n", sha2::Sha256::digest(source.as_bytes())).unwrap();
         std::fs::write(manifest, contents).unwrap();
     });
     let request = serde_json::json!({"owner_plugin_id":"bcode.default-agents", "template_id":"cli-input", "template_version":1, "workflow_id":"cli/template", "draft_id":"cli-draft"});

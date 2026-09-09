@@ -66,6 +66,10 @@ pub enum CliError {
     /// The daemon returned a conflict or semantic rejection for a draft edit.
     #[error("workflow draft edit was not applied; inspect the returned outcome")]
     WorkflowDraftEditNotApplied,
+
+    /// Derivation returned a non-success terminal outcome already printed as JSON.
+    #[error("session derivation did not succeed; see JSON outcome")]
+    SessionDerivationNotSucceeded,
     #[error("workflow store error: {0}")]
     WorkflowStore(#[from] bcode_workflow_store::WorkflowStoreError),
     #[error("session database error: {0}")]
@@ -224,6 +228,7 @@ impl CliError {
             | Self::AuthPrimeFailed(_)
             | Self::Sshenv(_)
             | Self::WorkflowDraftEditNotApplied
+            | Self::SessionDerivationNotSucceeded
             | Self::WorkflowApprovalContinuationFailed
             | Self::WorkflowApprovalDecisionNotApplied => 1,
             #[cfg(feature = "web-renderer")]
@@ -4565,6 +4570,22 @@ enum SessionCommand {
         #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=100_000))]
         entry_budget: u32,
     },
+    /// Read one generation-pinned page of derivation prompt candidates as JSON.
+    DerivationPrompts {
+        session_id: SessionId,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        before_sequence: Option<u64>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Execute a versioned derivation request and print its terminal outcome as JSON.
+    Derive {
+        /// Request JSON file, or - for stdin (maximum 1 MiB).
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Inspect a bounded derivation source snapshot as JSON.
     DerivationSnapshot {
         session_id: SessionId,
@@ -6132,6 +6153,53 @@ async fn describe_skill(skill_id: String, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn execute_derivation(path: &Path) -> Result<(), CliError> {
+    let request: bcode_session_models::SessionDerivationRequest = serde_json::from_value(
+        read_json_with_limit(path, 1024 * 1024, "session derivation request")?,
+    )
+    .map_err(|_| CliError::InvalidArguments("invalid session derivation request".to_owned()))?;
+    request.validate().map_err(|_| {
+        CliError::InvalidArguments("unsupported or invalid session derivation request".to_owned())
+    })?;
+    let outcome = BcodeClient::default_endpoint()
+        .derive_session(request)
+        .await?;
+    print_json(&outcome)?;
+    if !matches!(
+        outcome,
+        bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { .. }
+    ) {
+        return Err(CliError::SessionDerivationNotSucceeded);
+    }
+    Ok(())
+}
+
+async fn print_derivation_prompts(
+    session_id: SessionId,
+    generation: u64,
+    before_sequence: Option<u64>,
+    limit: usize,
+) -> Result<(), CliError> {
+    if limit == 0 || limit > bcode_session_models::MAX_SESSION_DERIVATION_PROMPT_CANDIDATES {
+        return Err(CliError::InvalidArguments(format!(
+            "derivation prompt limit must be between 1 and {}",
+            bcode_session_models::MAX_SESSION_DERIVATION_PROMPT_CANDIDATES,
+        )));
+    }
+    print_json(
+        &BcodeClient::default_endpoint()
+            .session_derivation_prompts(
+                session_id,
+                bcode_session_models::SessionDerivationPromptQuery {
+                    generation,
+                    before_sequence,
+                    limit,
+                },
+            )
+            .await?,
+    )
+}
+
 async fn print_derivation_cancellation(operation_id: uuid::Uuid) -> Result<(), CliError> {
     print_json(
         &BcodeClient::default_endpoint()
@@ -6162,6 +6230,21 @@ async fn print_derivation_status(operation_id: uuid::Uuid) -> Result<(), CliErro
 
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match command.as_ref() {
+        SessionCommand::Derive { request } => Box::pin(execute_derivation(request)).await,
+        SessionCommand::DerivationPrompts {
+            session_id,
+            generation,
+            before_sequence,
+            limit,
+        } => {
+            Box::pin(print_derivation_prompts(
+                *session_id,
+                *generation,
+                *before_sequence,
+                *limit,
+            ))
+            .await
+        }
         SessionCommand::DerivationSnapshot { session_id } => {
             print_derivation_snapshot(*session_id).await
         }
@@ -6188,7 +6271,9 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
                 .await?;
             print_json(&usage)?;
         }
-        SessionCommand::DerivationSnapshot { .. }
+        SessionCommand::Derive { .. }
+        | SessionCommand::DerivationPrompts { .. }
+        | SessionCommand::DerivationSnapshot { .. }
         | SessionCommand::DerivationStatus { .. }
         | SessionCommand::CancelDerivation { .. } => {
             unreachable!("handled by handle_session_command")
