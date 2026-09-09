@@ -3,10 +3,11 @@
 use std::io;
 
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_text_edit::keyboard::TextKeymap;
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyHandler, TextInputKeyOutcome};
 use bmux_tui::terminal::Terminal;
+use bmux_tui_components::text_input::{
+    EnterBehavior as TextInputEnterBehavior, TextInputOutcome as TextInputKeyOutcome,
+};
 
 /// Errors returned by the code review TUI surface.
 #[derive(Debug, thiserror::Error)]
@@ -30,10 +31,7 @@ pub enum TuiError {
 
 /// Shared helper functions needed by the code review TUI.
 pub mod helpers {
-    use super::{
-        KeyCode, KeyStroke, Rect, Terminal, TextInputEnterBehavior, TextInputKeyHandler,
-        TextInputKeyOutcome, TextKeymap,
-    };
+    use super::{KeyCode, KeyStroke, Rect, Terminal, TextInputEnterBehavior, TextInputKeyOutcome};
     use std::io::{self, Write};
 
     /// Apply a key stroke to a text buffer using the default text-input bindings.
@@ -47,7 +45,13 @@ pub mod helpers {
             return TextInputKeyOutcome::Edited;
         }
 
-        TextInputKeyHandler::new(TextKeymap::default(), enter_behavior).handle_key(buffer, stroke)
+        let mut policy = bmux_tui_components::text_input::TextInputPolicy::chat_composer();
+        policy.keyboard.enter = enter_behavior;
+        let mut state = bmux_tui_components::text_input::TextInputState::new(buffer.clone());
+        let outcome = bmux_tui_components::text_input::TextInputControl::new(&policy)
+            .handle_key(&mut state, stroke);
+        *buffer = state.buffer().clone();
+        outcome
     }
 
     const fn shifted_text_character(stroke: KeyStroke) -> Option<char> {

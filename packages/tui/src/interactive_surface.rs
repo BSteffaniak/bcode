@@ -11,7 +11,9 @@ use bmux_tui::event::Event;
 #[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::paint::{LocalRect, PaintCx};
+#[cfg(test)]
+use bmux_tui::paint::LocalRect;
+use bmux_tui::paint::PaintCx;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -624,7 +626,11 @@ mod tests {
         let mut backend = Frame::new(&mut buffer);
         let mut frame = PaintCx::new(&mut backend);
         if underpaint {
-            frame.fill(area, " ", bmux_tui::prelude::Style::new());
+            frame.fill(
+                LocalRect::terminal(area),
+                " ",
+                bmux_tui::prelude::Style::new(),
+            );
         }
         surface.render(area, &mut frame);
         let cursor = frame.cursor();
@@ -747,7 +753,11 @@ mod tests {
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
         let mut backend = Frame::new(&mut buffer);
         let mut frame = PaintCx::new(&mut backend);
-        frame.fill(area, ".", bmux_tui::prelude::Style::new());
+        frame.fill(
+            LocalRect::terminal(area),
+            ".",
+            bmux_tui::prelude::Style::new(),
+        );
         surface.render_slice(MAX_INTERACTION_LOGICAL_ROWS, 0, area, &mut frame);
 
         assert_ne!(buffer.row_symbols(0).as_deref(), Some("........"));
@@ -773,7 +783,10 @@ mod tests {
         let full_area = Rect::new(0, 0, 30, surface.preferred_height(30));
         let mut full_buffer = bmux_tui::buffer::Buffer::empty(full_area);
         let mut full_frame = Frame::new(&mut full_buffer);
-        surface.render(full_area, &mut full_frame);
+        surface.render(
+            full_area,
+            &mut bmux_tui::paint::PaintCx::new(&mut full_frame),
+        );
         let cursor = full_frame.cursor().expect("focused custom cursor");
 
         for (offset, height, visible) in [
@@ -809,7 +822,12 @@ mod tests {
         let full_area = Rect::new(0, 0, 40, surface.preferred_height(40));
         let destination = Rect::new(5, 7, 40, full_area.height.saturating_sub(1));
         let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 50, 20));
-        surface.render_clipped(full_area, 1, destination, &mut Frame::new(&mut buffer));
+        surface.render_clipped(
+            full_area,
+            1,
+            destination,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
         assert!(
             buffer
                 .row_symbols(destination.y)
@@ -875,7 +893,7 @@ mod tests {
             initial_area,
             visible_offset,
             clipped_destination,
-            &mut clipped_frame,
+            &mut bmux_tui::paint::PaintCx::new(&mut clipped_frame),
         );
         assert_eq!(
             clipped_frame
@@ -917,8 +935,12 @@ mod tests {
         pinned_buffer.fill(resized_area, "x", sentinel);
         {
             let mut frame = Frame::new(&mut pinned_buffer);
-            frame.fill(resized_area, " ", bmux_tui::prelude::Style::new());
-            surface.render(resized_area, &mut frame);
+            PaintCx::new(&mut frame).fill(
+                LocalRect::terminal(resized_area),
+                " ",
+                bmux_tui::prelude::Style::new(),
+            );
+            surface.render(resized_area, &mut PaintCx::new(&mut frame));
         }
         assert!(area_points(resized_area).all(|point| {
             pinned_buffer
@@ -941,8 +963,12 @@ mod tests {
         pinned_buffer.fill(resized_area, "x", sentinel);
         {
             let mut frame = Frame::new(&mut pinned_buffer);
-            frame.fill(resized_area, " ", bmux_tui::prelude::Style::new());
-            compact.render(compact_area, &mut frame);
+            PaintCx::new(&mut frame).fill(
+                LocalRect::terminal(resized_area),
+                " ",
+                bmux_tui::prelude::Style::new(),
+            );
+            compact.render(compact_area, &mut PaintCx::new(&mut frame));
         }
         assert!(area_points(resized_area).all(|point| {
             pinned_buffer
@@ -985,13 +1011,21 @@ mod tests {
         {
             let mut backend = Frame::new(&mut buffer);
             let mut frame = PaintCx::new(&mut backend);
-            frame.fill(area, " ", bmux_tui::prelude::Style::new());
+            frame.fill(
+                LocalRect::terminal(area),
+                " ",
+                bmux_tui::prelude::Style::new(),
+            );
             large.render(area, &mut frame);
         }
         {
             let mut backend = Frame::new(&mut buffer);
             let mut frame = PaintCx::new(&mut backend);
-            frame.fill(area, " ", bmux_tui::prelude::Style::new());
+            frame.fill(
+                LocalRect::terminal(area),
+                " ",
+                bmux_tui::prelude::Style::new(),
+            );
             small.render(area, &mut frame);
         }
         assert!(area_points(area).all(|point| {
@@ -1064,7 +1098,10 @@ mod tests {
         .await;
         let area = Rect::new(0, 0, 48, 12);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        surface.render_for_test(area, &mut Frame::new(&mut buffer));
+        surface.render_for_test(
+            area,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
 
         assert!(matches!(
             surface.handle_event_outcome(&key(KeyCode::Left)),
@@ -1153,7 +1190,10 @@ mod tests {
         .await;
         let area = Rect::new(0, 0, 48, 12);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        surface.render_for_test(area, &mut Frame::new(&mut buffer));
+        surface.render_for_test(
+            area,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
 
         for character in ['a', 'b'] {
             assert!(

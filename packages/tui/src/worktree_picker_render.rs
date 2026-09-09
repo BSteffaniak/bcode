@@ -1,6 +1,6 @@
 //! TUI worktree picker rendering.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -11,7 +11,7 @@ use super::render::TuiTheme;
 use super::worktree_picker::WorktreePickerApp;
 
 /// Render the worktree picker.
-pub fn render_picker(app: &mut WorktreePickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
+pub fn render_picker(app: &mut WorktreePickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
     let Some((inner, list_y)) = render_picker_chrome(
         " Worktrees ",
         &header_line(),
@@ -23,18 +23,18 @@ pub fn render_picker(app: &mut WorktreePickerApp, frame: &mut Frame<'_>, theme: 
         return;
     };
 
-    let bottom_y = render_picker_status(
-        inner,
-        app.status(),
-        theme.muted,
-        frame,
-        theme,
-    );
+    let bottom_y = render_picker_status(inner, app.status(), theme.muted, frame, theme);
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };
     let items = app.list_items(theme.muted);
-    render_picker_list(&items, app.list_render_state(list_area.height), list_area, frame, theme);
+    render_picker_list(
+        &items,
+        app.list_render_state(list_area.height),
+        list_area,
+        frame,
+        theme,
+    );
 }
 
 fn header_line() -> Line {

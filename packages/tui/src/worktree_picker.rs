@@ -2,9 +2,10 @@
 
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_worktree_models::WorktreeInfo;
-use bmux_tui::list::{ListItem, ListState};
+use bmux_tui::prelude::Line as ListItem;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
+use bmux_tui_components::selectable_list::SelectableListState as ListState;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
@@ -118,7 +119,7 @@ fn worktree_item(worktree: &WorktreeInfo, muted: Style) -> ListItem {
     let marker = if worktree.is_main { "main" } else { "linked" };
     let branch = worktree.branch.as_deref().unwrap_or("<detached>");
     let commit = worktree.commit.as_deref().unwrap_or("-");
-    ListItem::new(Line::from_spans(vec![
+    Line::from_spans(vec![
         Span::styled(branch.to_owned(), Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(marker.to_owned(), muted),
@@ -126,12 +127,9 @@ fn worktree_item(worktree: &WorktreeInfo, muted: Style) -> ListItem {
         Span::styled(commit.to_owned(), muted),
         Span::raw("  "),
         Span::raw(display_from_current_dir(&worktree.path).to_string()),
-    ]))
+    ])
 }
 
 fn empty_item(message: &str, muted: Style) -> ListItem {
-    ListItem::new(Line::from_spans(vec![Span::styled(
-        message.to_owned(),
-        muted,
-    )]))
+    Line::from_spans(vec![Span::styled(message.to_owned(), muted)])
 }

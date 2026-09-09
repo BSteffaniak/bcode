@@ -634,7 +634,7 @@ impl OnboardingShell {
     pub fn render_board(
         &self,
         area: bmux_tui::geometry::Rect,
-        frame: &mut bmux_tui::frame::Frame<'_>,
+        frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
         theme: &super::theme::PresentedTheme,
     ) {
         let spots = self.board_spots();

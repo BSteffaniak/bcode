@@ -1,12 +1,13 @@
 //! TUI timeline dialog rendering.
 
 use bcode_markdown_render::markdown_to_plain_text;
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::{Insets, Size};
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::display_width;
-use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalPlacement, ModalSizing};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -22,26 +23,38 @@ const TIMESTAMP_WIDTH: usize = 19;
 /// Render the timeline dialog.
 pub fn render_timeline_dialog(
     state: &mut TimelineDialogState,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
     let sizing = dialog_sizing();
-    let layout = Dialog::new(&[], &[], theme.modal_theme())
-        .title(" Timeline ")
-        .sizing(sizing)
-        .placement(ModalPlacement::Centered)
-        .layout(frame.area());
-    if layout.body.is_empty() {
+    let action_state = std::cell::Cell::new(bmux_tui_components::action_row::ActionRowState::new());
+    let probe = DialogComponent::new(
+        "timeline",
+        Dialog::new(&[], &[], theme.modal_theme())
+            .title(" Timeline ")
+            .sizing(sizing)
+            .placement(ModalPlacement::Centered),
+        &action_state,
+    );
+    let constraints = Constraints::tight(Size::new(frame.area().width, frame.area().height));
+    let layout = probe.layout(constraints, &mut LayoutCx::new());
+    let Some(body_layout) = layout.find(&bmux_tui::component::LayoutId::new("timeline.body"))
+    else {
         return;
-    }
-    let visible_entries = usize::from(layout.body.height.saturating_sub(3));
+    };
+    let visible_entries = body_layout.size.height.saturating_sub(3);
     state.sync_scroll(visible_entries);
-    let body = rows(state, layout.body.width, visible_entries, theme);
-    Dialog::new(&body, &[], theme.modal_theme())
-        .title(" Timeline ")
-        .sizing(sizing)
-        .placement(ModalPlacement::Centered)
-        .render(frame.area(), &DialogState::new(), frame);
+    let body = rows(state, body_layout.size.width, visible_entries, theme);
+    let dialog = DialogComponent::new(
+        "timeline",
+        Dialog::new(&body, &[], theme.modal_theme())
+            .title(" Timeline ")
+            .sizing(sizing)
+            .placement(ModalPlacement::Centered),
+        &action_state,
+    );
+    let layout = dialog.layout(constraints, &mut LayoutCx::new());
+    dialog.paint(&layout, frame);
 }
 
 const fn dialog_sizing() -> ModalSizing {

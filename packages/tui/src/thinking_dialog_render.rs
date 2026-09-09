@@ -1,10 +1,11 @@
 //! TUI reasoning output settings dialog rendering.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::{Insets, Size};
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
-use bmux_tui_components::dialog::{Dialog, DialogState};
+use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalPlacement, ModalSizing};
 
 use super::render::TuiTheme;
@@ -16,14 +17,27 @@ const MIN_DIALOG_HEIGHT: u16 = 15;
 const MAX_DIALOG_HEIGHT: u16 = 22;
 
 /// Render a reasoning output settings dialog.
-pub fn render_thinking_dialog(state: &ThinkingDialogState, frame: &mut Frame<'_>, theme: TuiTheme) {
+pub fn render_thinking_dialog(
+    state: &ThinkingDialogState,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+) {
     let body = rows(state, theme);
-    Dialog::new(&body, &[], theme.modal_theme())
+    let dialog = Dialog::new(&body, &[], theme.modal_theme())
         .title(" Reasoning output settings ")
         .sizing(dialog_sizing())
         .padding(Insets::new(1, 2, 1, 2))
-        .placement(ModalPlacement::UpperThird)
-        .render(frame.area(), &DialogState::new(), frame);
+        .placement(ModalPlacement::UpperThird);
+    let actions = std::cell::Cell::new(bmux_tui_components::action_row::ActionRowState::new());
+    let component = DialogComponent::new("thinking.dialog", dialog, &actions);
+    let layout = component.layout(
+        Constraints::tight(bmux_tui::geometry::Size::new(
+            frame.area().width,
+            frame.area().height,
+        )),
+        &mut LayoutCx::new(),
+    );
+    component.paint(&layout, frame);
 }
 
 const fn dialog_sizing() -> ModalSizing {

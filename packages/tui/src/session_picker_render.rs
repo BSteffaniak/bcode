@@ -1,6 +1,6 @@
 //! TUI session picker rendering.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -11,7 +11,7 @@ use super::render::TuiTheme;
 use super::session_picker::{SessionPickerApp, SessionPickerMode};
 
 /// Render the session picker.
-pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
+pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
     let mode = app.mode();
     let Some((inner, list_y)) = render_picker_chrome(
         " Sessions ",
@@ -32,12 +32,12 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: T
         let warning_y = bottom_y.saturating_sub(1);
         if warning_y > list_y {
             frame.write_line_with_fallback_style(
-                bmux_tui::geometry::Rect::new(
+                LocalRect::terminal(bmux_tui::geometry::Rect::new(
                     inner.x.saturating_add(1),
                     warning_y,
                     inner.width.saturating_sub(2),
                     1,
-                ),
+                )),
                 &Line::from_spans(vec![Span::styled(warning_text, theme.muted)]),
                 Style::new(),
             );
@@ -47,12 +47,12 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut Frame<'_>, theme: T
         let preview_y = bottom_y.saturating_sub(1);
         if preview_y > list_y {
             frame.write_line_with_fallback_style(
-                bmux_tui::geometry::Rect::new(
+                LocalRect::terminal(bmux_tui::geometry::Rect::new(
                     inner.x.saturating_add(1),
                     preview_y,
                     inner.width.saturating_sub(2),
                     1,
-                ),
+                )),
                 &Line::from_spans(vec![
                     Span::styled("Preview: ", Style::new().add_modifier(Modifier::BOLD)),
                     Span::styled(app.search_preview(), theme.muted),
@@ -185,7 +185,7 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         render_picker(
             &mut app,
-            &mut frame,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
             TuiTheme::for_theme_id("terminal-native"),
         );
         let text = buffer_text(frame.buffer(), area);

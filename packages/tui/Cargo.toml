@@ -67,6 +67,7 @@ bmux_tui_components = { workspace = true, features = [
     "labeled-details",
     "modal-frame",
     "picker-frame",
+    "selectable-list",
     "scroll-view",
     "text-view",
     "stepper",

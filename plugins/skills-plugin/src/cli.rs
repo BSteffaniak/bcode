@@ -40,7 +40,7 @@ enum CliError {
     },
 }
 
-pub(super) fn registration() -> StaticCliRegistration {
+pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
         requires_daemon: true,
         command: SkillCli::command,

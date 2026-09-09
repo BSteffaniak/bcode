@@ -1,6 +1,6 @@
 //! TUI model picker rendering.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -11,7 +11,7 @@ use super::picker_render::{
 use super::render::TuiTheme;
 
 /// Render the model picker.
-pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
+pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
     let help = match app.mode() {
         ModelPickerMode::Actions => {
             "  Enter selects  / filter  Esc cancels  s sort  S reverse  i ignore  u unignore  I ignored"
@@ -50,7 +50,12 @@ pub fn render_model_picker(app: &mut ModelPickerApp, frame: &mut Frame<'_>, them
         return;
     }
     frame.write_line_with_fallback_style(
-        bmux_tui::geometry::Rect::new(list_area.x, list_area.y, list_area.width, 1),
+        LocalRect::terminal(bmux_tui::geometry::Rect::new(
+            list_area.x,
+            list_area.y,
+            list_area.width,
+            1,
+        )),
         &app.header_line(list_area.width, theme),
         super::picker_render::picker_base_style(theme),
     );

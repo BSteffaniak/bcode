@@ -2,9 +2,10 @@
 
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{SessionId, SessionSummary};
-use bmux_tui::list::{ListItem, ListState};
+use bmux_tui::prelude::Line as ListItem;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
+use bmux_tui_components::selectable_list::SelectableListState as ListState;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
@@ -475,7 +476,7 @@ fn search_result_item(
         .then_some(format!(" [{:?}]", result.outcome))
         .unwrap_or_default();
     let title = canonical_title.unwrap_or("<canonical title unavailable>");
-    ListItem::new(Line::from_spans(vec![
+    Line::from_spans(vec![
         Span::styled(
             format!(
                 "{title}  {} #{} {:?}{timestamp}",
@@ -498,7 +499,7 @@ fn search_result_item(
         } else {
             ""
         }),
-    ]))
+    ])
 }
 
 fn session_item(session: &SessionSummary, muted: Style) -> ListItem {
@@ -526,7 +527,7 @@ fn session_item(session: &SessionSummary, muted: Style) -> ListItem {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(label, muted));
     }
-    ListItem::new(Line::from_spans(spans))
+    Line::from_spans(spans)
 }
 
 /// Render the owning state location for a session, when aggregated discovery spans more
@@ -580,10 +581,7 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
 }
 
 fn empty_item(message: &str, muted: Style) -> ListItem {
-    ListItem::new(Line::from_spans(vec![Span::styled(
-        message.to_owned(),
-        muted,
-    )]))
+    Line::from_spans(vec![Span::styled(message.to_owned(), muted)])
 }
 
 #[cfg(test)]
@@ -772,7 +770,6 @@ mod tests {
         let items = app.list_items(Style::new());
         assert_eq!(items.len(), 2);
         let first_text = items[0]
-            .line()
             .spans
             .iter()
             .map(|span| span.content.as_str())

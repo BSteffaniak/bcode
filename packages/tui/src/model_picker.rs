@@ -5,9 +5,10 @@ use std::cmp::Ordering;
 use bcode_model::{
     ModelInfo, ModelPricingInfo, ModelTokenPrice, ModelVisibility, ModelVisibilitySource,
 };
-use bmux_tui::list::{ListItem, ListState};
+use bmux_tui::prelude::Line as ListItem;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
+use bmux_tui_components::selectable_list::SelectableListState as ListState;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::filtered_list::FilteredListState;
@@ -402,7 +403,7 @@ fn model_item(
     widths: &ModelPickerColumnWidths,
     theme: super::render::TuiTheme,
 ) -> ListItem {
-    ListItem::new(Line::from_spans(vec![
+    Line::from_spans(vec![
         Span::styled(row.marker, theme.muted),
         Span::raw(CELL_GAP),
         Span::styled(
@@ -433,7 +434,7 @@ fn model_item(
         ),
         Span::raw(CELL_GAP),
         Span::styled(pad_right(&row.state, widths.state), theme.muted),
-    ]))
+    ])
 }
 
 fn format_header(
@@ -759,10 +760,7 @@ fn model_matches(model: &ModelInfo, query: &str) -> bool {
 }
 
 fn empty_item(message: &str, theme: super::render::TuiTheme) -> ListItem {
-    ListItem::new(Line::from_spans(vec![Span::styled(
-        message.to_owned(),
-        theme.muted,
-    )]))
+    Line::from_spans(vec![Span::styled(message.to_owned(), theme.muted)])
 }
 
 #[cfg(test)]

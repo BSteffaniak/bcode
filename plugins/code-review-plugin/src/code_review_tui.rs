@@ -53,10 +53,12 @@ use bcode_session_view_models::{
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, FocusEvent, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::{TextInputEnterBehavior, TextInputKeyOutcome};
+use bmux_tui::paint::PaintCx;
 use bmux_tui::terminal::Terminal;
+use bmux_tui_components::text_input::{
+    EnterBehavior as TextInputEnterBehavior, TextInputOutcome as TextInputKeyOutcome,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
@@ -408,14 +410,14 @@ impl PluginTuiSurface for CodeReviewSurface {
         "Code Review"
     }
 
-    fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, _area: Rect, frame: &mut PaintCx<'_, '_>) {
         crate::code_review_tui_render::render(&mut self.app, frame, self.theme.as_ref());
     }
 
     fn render_with_theme(
         &mut self,
         _area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.theme = theme.copied();

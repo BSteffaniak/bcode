@@ -1,11 +1,17 @@
 //! Shared rendering helpers for TUI pickers.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::input::TextInput;
-use bmux_tui::list::{List, ListItem, ListState};
-use bmux_tui::prelude::{Line, Span, StatefulWidget, Style, Widget};
-use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy, PickerFrameStyles};
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui_components::picker_frame::{
+    PickerFrame, PickerFrameComponent, PickerFramePolicy, PickerFrameStyles,
+};
+use bmux_tui_components::selectable_list::{
+    SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
+};
+use bmux_tui_components::text_input::TextInputComponent;
 use bmux_tui_components::text_input::TextInputState;
 
 use super::render::TuiTheme;
@@ -23,30 +29,50 @@ pub fn render_picker_chrome(
     header: &Line,
     input: &mut TextInputState,
     placeholder: &'static str,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) -> Option<(Rect, u16)> {
-    let area = frame.area();
+    let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     if area.is_empty() {
         return None;
     }
 
     let inner = render_picker_panel(title, area, frame, theme);
     frame.write_line_with_fallback_style(
-        Rect::new(inner.x, inner.y, inner.width, 1),
+        LocalRect::terminal(Rect::new(inner.x, inner.y, inner.width, 1)),
         header,
         theme.text,
     );
     let input_area = Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1);
     input.set_content_area(input_area, &text_input_flow::single_line_policy());
-    TextInput::new(input.buffer())
+    paint_picker_input(input, input_area, placeholder, frame, theme);
+    Some((inner, input_area.y.saturating_add(2)))
+}
+
+/// Paint a measured picker editor and retain its terminal input area.
+pub fn paint_picker_input(
+    input: &mut TextInputState,
+    input_area: Rect,
+    placeholder: &str,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+) {
+    let retained = std::cell::RefCell::new(input.clone());
+    let policy = text_input_flow::single_line_policy();
+    let editor = TextInputComponent::new("picker.input", &retained, &policy)
         .style(theme.text)
         .selection_style(theme.selection)
-        .placeholder(placeholder)
-        .placeholder_style(theme.muted)
-        .vertical_scroll(input.vertical_scroll())
-        .render(input_area, frame);
-    Some((inner, input_area.y.saturating_add(2)))
+        .placeholder(placeholder, theme.muted)
+        .focused(true);
+    let layout = editor.layout(Constraints::tight(input_area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(input_area.x),
+        i64::from(input_area.y),
+        LocalRect::new(0, 0, input_area.width, input_area.height),
+        |cx| editor.paint(&layout, cx),
+    );
+    *input = retained.into_inner();
+    input.set_content_area(input_area, &policy);
 }
 
 /// Render a standard picker status line and return its row.
@@ -54,12 +80,17 @@ pub fn render_picker_status(
     inner: Rect,
     text: &str,
     style: Style,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) -> u16 {
     let y = inner.bottom().saturating_sub(1);
     frame.write_line_with_fallback_style(
-        Rect::new(inner.x, y, inner.width, u16::from(inner.height > 0)),
+        LocalRect::terminal(Rect::new(
+            inner.x,
+            y,
+            inner.width,
+            u16::from(inner.height > 0),
+        )),
         &Line::from_spans(vec![Span::styled(text.to_owned(), style)]),
         theme.text,
     );
@@ -79,10 +110,10 @@ pub const fn picker_list_area(inner: Rect, list_y: u16, bottom_y: u16) -> Option
 pub fn render_picker_panel(
     title: &'static str,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) -> Rect {
-    PickerFrame::new()
+    let shell = PickerFrame::new()
         .title(title)
         .policy(PickerFramePolicy {
             chrome: true,
@@ -103,24 +134,51 @@ pub fn render_picker_panel(
             input: theme.text,
             list: theme.raised,
             footer: theme.text,
-        })
-        .render(area, frame)
-        .inner
+        });
+    let component = PickerFrameComponent::new("picker", shell, TextBlock::new(""));
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+    let panel = &layout.children[0];
+    let child = &panel.node.children[0];
+    Rect::new(
+        area.x.saturating_add(panel.x).saturating_add(child.x),
+        area.y
+            .saturating_add(u16::try_from(panel.y + child.y).unwrap_or(u16::MAX)),
+        child.node.size.width,
+        u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+    )
 }
 
 /// Render a standard selectable list using caller-synchronized render state.
 pub fn render_picker_list(
-    items: &[ListItem],
-    state: &mut ListState,
+    items: &[Line],
+    state: &SelectableListState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
-    List::new(items)
-        .style(theme.text)
-        .selected_style(theme.selection)
-        .highlight_symbol("> ")
-        .render(area, frame, state);
+    let rows = items
+        .iter()
+        .enumerate()
+        .map(|(i, line)| SelectableListItem::rich(i.to_string(), line.clone()))
+        .collect::<Vec<_>>();
+    SelectableList::new(&rows)
+        .styles(SelectableListStyles {
+            normal: theme.text,
+            focused: theme.selection,
+            selected: theme.selection,
+            hovered: theme.focused,
+            pressed: theme.selection,
+            disabled: theme.muted,
+            background: theme.raised,
+            scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+        })
+        .paint(area, state, theme.text, frame);
 }
 
 #[cfg(test)]
@@ -148,11 +206,16 @@ mod tests {
             let theme = TuiTheme::for_theme_id(theme_id);
             let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 8));
             let mut frame = Frame::new(&mut buffer);
-            let inner = render_picker_panel(" Picker ", frame.area(), &mut frame, theme);
+            let inner = render_picker_panel(
+                " Picker ",
+                frame.area(),
+                &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                theme,
+            );
             assert_eq!(inner, Rect::new(2, 2, 20, 4));
             assert_eq!(
                 frame.buffer().get(Point::new(0, 0)).expect("border").style,
-                theme.border,
+                theme.raised.patch(theme.border),
                 "{theme_id} border"
             );
             assert_eq!(

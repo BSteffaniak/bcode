@@ -1,7 +1,7 @@
 //! TUI auth-pool profile picker state.
 
 use bcode_provider_auth_models::AuthPoolSummary;
-use bmux_tui::list::ListItem;
+use bmux_tui::prelude::Line as ListItem;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -33,7 +33,7 @@ impl AuthPoolPickerApp {
         &mut self,
         items: &[ListItem],
         area: bmux_tui::geometry::Rect,
-        frame: &mut bmux_tui::frame::Frame<'_>,
+        frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
         theme: super::render::TuiTheme,
     ) {
         super::picker_render::render_picker_list(
@@ -49,7 +49,7 @@ impl AuthPoolPickerApp {
     #[must_use]
     pub fn list_items(&self, muted: Style, accent: Style) -> Vec<ListItem> {
         if self.rows.is_empty() {
-            return vec![ListItem::new(Line::from("No auth pools configured."))];
+            return vec![Line::from("No auth pools configured.")];
         }
         self.rows
             .iter()
@@ -62,7 +62,7 @@ impl AuthPoolPickerApp {
                 } else {
                     "available"
                 };
-                ListItem::new(Line::from_spans(vec![
+                Line::from_spans(vec![
                     Span::styled(pool.pool.clone(), Style::new().add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
                     Span::styled(profile.profile.clone(), accent),
@@ -70,7 +70,7 @@ impl AuthPoolPickerApp {
                     Span::styled(marker.to_owned(), muted),
                     Span::raw("  "),
                     Span::styled(availability.to_owned(), muted),
-                ]))
+                ])
             })
             .collect()
     }

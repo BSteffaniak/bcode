@@ -819,7 +819,10 @@ fn every_supported_ephemeral_notice_format_renders_visible_rows() {
     }
 
     let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 40, 20));
-    render(&mut app, &mut Frame::new(&mut buffer));
+    render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     drop(app);
     let text = (0..20)
         .filter_map(|row| buffer.row_symbols(row))
@@ -1161,8 +1164,12 @@ async fn explanatory_assistant_context_remains_visible_above_question_dock() {
         prepare_frame_with_bottom_dock(&mut app, terminal, preferred_height).expect("docked frame");
     let mut buffer = bmux_tui::buffer::Buffer::empty(terminal);
     let mut frame = Frame::new(&mut buffer);
-    render_prepared(&mut app, &mut frame, layout);
-    surface.render_for_test(dock, &mut frame);
+    render_prepared(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut frame),
+        layout,
+    );
+    surface.render_for_test(dock, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     let context_row = (0..terminal.height)
         .find(|row| {
@@ -1192,7 +1199,10 @@ fn resolved_canvas_fills_the_normal_frame_without_opaque_terminal_native_fallbac
     assert!(opaque.apply_theme("bcode-dark"));
     let mut opaque_buffer = bmux_tui::buffer::Buffer::empty(area);
     let mut opaque_frame = Frame::new(&mut opaque_buffer);
-    render(&mut opaque, &mut opaque_frame);
+    render(
+        &mut opaque,
+        &mut bmux_tui::paint::PaintCx::new(&mut opaque_frame),
+    );
     drop(opaque);
     assert_eq!(
         opaque_buffer
@@ -1205,7 +1215,10 @@ fn resolved_canvas_fills_the_normal_frame_without_opaque_terminal_native_fallbac
     assert!(native.apply_theme("terminal-native"));
     let mut native_buffer = bmux_tui::buffer::Buffer::empty(area);
     let mut native_frame = Frame::new(&mut native_buffer);
-    render(&mut native, &mut native_frame);
+    render(
+        &mut native,
+        &mut bmux_tui::paint::PaintCx::new(&mut native_frame),
+    );
     drop(native);
     assert!(
         native_buffer
@@ -1550,7 +1563,10 @@ mod header_tests {
     fn full_frame_contains_build_version_in_header() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 160, 24));
-        render(&mut app, &mut Frame::new(&mut buffer));
+        render(
+            &mut app,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
         let header = buffer.row_symbols(0).expect("header row");
         assert!(header.contains(super::super::build_info().display_version()));
     }

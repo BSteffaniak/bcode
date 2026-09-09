@@ -14,26 +14,31 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutId};
 use bmux_tui::event::{Event, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
+use bmux_tui_components::action_row::{
+    ActionButton, ActionRow, ActionRowComponent, ActionRowOutcome, ActionRowState,
+};
 use bmux_tui_components::bar_chart::{
-    BarChart, BarChartItem, BarChartPolicy, BarChartStyles, BarChartValuePlacement,
+    BarChartComponent, BarChartItem, BarChartPolicy, BarChartStyles, BarChartValuePlacement,
 };
 use bmux_tui_components::button::ButtonStyles;
-use bmux_tui_components::dialog::{Dialog, DialogOutcome, DialogState};
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::dialog::{Dialog, DialogComponent};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{ModalSizing, ModalTheme};
-use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
-use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::sparkline::{SparklineComponent, SparklinePolicy, SparklineStyles};
+use bmux_tui_components::tab_bar::{
+    TabBar, TabBarComponent, TabBarOutcome, TabBarState, TabBarStyles, TabItem,
+};
 use bmux_tui_components::table::{
     Table, TableAlign, TableColumn, TableOutcome, TableRow, TableState, TableStyles,
 };
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
-use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
+use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 use std::path::PathBuf;
 use std::sync::mpsc::{self as std_mpsc, Receiver};
 
@@ -413,7 +418,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         "Eval Runs"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.surface_area = area;
         if let Some(viewer) = self.embedded_viewer.as_mut() {
             viewer.render(area, frame);
@@ -437,7 +442,7 @@ impl PluginTuiSurface for EvalRunPickerSurface {
         let rows = overview_table_rows(&self.runs, &self.campaigns);
         render_eval_table(frame, self.table_area, &columns, &rows, &self.table_state);
         let actions = picker_actions();
-        themed_action_row(&actions).render_state(action_area, &self.action_state, frame);
+        paint_eval_actions(&actions, action_area, &self.action_state, frame);
         let hints = [
             KeyHint::new("Click/Enter", "open"),
             KeyHint::new("r", "refresh"),
@@ -449,12 +454,12 @@ impl PluginTuiSurface for EvalRunPickerSurface {
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         ACTIVE_THEME.with(|active| active.set(theme.copied()));
         if let Some(theme) = theme {
-            frame.fill(area, " ", theme.canvas);
+            frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         }
         self.render(area, frame);
         ACTIVE_THEME.with(|active| active.set(None));
@@ -575,14 +580,14 @@ enum EvalWizard {
 
 #[derive(Debug, Clone)]
 struct HelpWizard {
-    state: DialogState,
+    state: ActionRowState,
     title: &'static str,
     body: Vec<Line>,
 }
 
 #[derive(Debug, Clone)]
 struct RunSuiteWizard {
-    state: DialogState,
+    state: ActionRowState,
     suite_choices: Vec<StartCampaignSuiteChoice>,
     suite_index: usize,
     output_root: PathBuf,
@@ -592,7 +597,7 @@ struct RunSuiteWizard {
 
 #[derive(Debug, Clone)]
 struct DecideGenerationWizard {
-    state: DialogState,
+    state: ActionRowState,
     campaign: PathBuf,
     generation_id: String,
     status: bcode_eval_models::EvalImprovementVerdictStatus,
@@ -603,7 +608,7 @@ struct DecideGenerationWizard {
 
 #[derive(Debug, Clone)]
 struct StartCampaignWizard {
-    state: DialogState,
+    state: ActionRowState,
     suite_choices: Vec<StartCampaignSuiteChoice>,
     suite_index: usize,
     output_root: PathBuf,
@@ -632,7 +637,7 @@ enum StartCampaignField {
 
 #[derive(Debug, Clone)]
 struct RecordGenerationWizard {
-    state: DialogState,
+    state: ActionRowState,
     campaign_choices: Vec<RecordCampaignChoice>,
     campaign_index: usize,
     parent_choices: Vec<RecordParentChoice>,
@@ -715,7 +720,7 @@ enum EvalWizardCompletion {
 impl EvalWizard {
     fn help(title: &'static str, lines: Vec<&'static str>) -> Self {
         Self::Help(HelpWizard {
-            state: DialogState::new(),
+            state: ActionRowState::new(),
             title,
             body: lines.into_iter().map(Line::from).collect(),
         })
@@ -730,7 +735,7 @@ impl EvalWizard {
             return Err("no suites with recorded paths are available".to_string());
         }
         Ok(Self::RunSuite(Box::new(RunSuiteWizard {
-            state: DialogState::new(),
+            state: ActionRowState::new(),
             suite_choices: choices,
             suite_index: 0,
             output_root: output_root.to_path_buf(),
@@ -748,7 +753,7 @@ impl EvalWizard {
             return Err("the baseline generation cannot be promoted or rejected".to_string());
         }
         Ok(Self::DecideGeneration(Box::new(DecideGenerationWizard {
-            state: DialogState::new(),
+            state: ActionRowState::new(),
             campaign: data.campaign_dir.clone(),
             generation_id: generation.id.clone(),
             status,
@@ -816,7 +821,7 @@ impl EvalWizard {
             unique_campaign_id(campaigns_root, &format!("{}-improvement", choice.suite_id));
         let name = format!("{} improvement", choice.suite_id);
         Self::StartCampaign(Box::new(StartCampaignWizard {
-            state: DialogState::new(),
+            state: ActionRowState::new(),
             suite_choices: choices,
             suite_index,
             output_root: campaigns_root.to_path_buf(),
@@ -854,7 +859,7 @@ impl EvalWizard {
             Line::from(format!("Run: {}", run.run_id)),
         ];
         Ok(Self::RecordGeneration(Box::new(RecordGenerationWizard {
-            state: DialogState::new(),
+            state: ActionRowState::new(),
             campaign_choices,
             campaign_index: 0,
             parent_choices: vec![RecordParentChoice {
@@ -908,7 +913,7 @@ impl EvalWizard {
             Line::from(format!("Run: {}", run.label)),
         ];
         Ok(Self::RecordGeneration(Box::new(RecordGenerationWizard {
-            state: DialogState::new(),
+            state: ActionRowState::new(),
             campaign_choices: vec![RecordCampaignChoice {
                 label: data.campaign.id.clone(),
                 campaign_dir: data.campaign_dir.clone(),
@@ -935,7 +940,7 @@ impl EvalWizard {
         })))
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         match self {
             Self::StartCampaign(wizard) => wizard.render(area, frame),
             Self::RunSuite(wizard) => wizard.render(area, frame),
@@ -983,15 +988,29 @@ impl EvalWizard {
             }),
             Self::Help(_) => vec![ActionButton::new("cancel", "Close")],
         };
-        let outcome = Dialog::new(&[], &actions, eval_modal_theme())
-            .title(self.title())
-            .sizing(wizard_sizing())
-            .handle_event(area, self.dialog_state_mut(), event);
-        match outcome {
-            DialogOutcome::Ignored => EvalWizardOutcome::Continue,
-            DialogOutcome::Redraw => EvalWizardOutcome::Redraw,
-            DialogOutcome::Action { id, .. } if id == "cancel" => EvalWizardOutcome::Cancel,
-            DialogOutcome::Action { .. } => self.complete(),
+        let action_state = std::cell::Cell::new(*self.dialog_state_mut());
+        let component = DialogComponent::new(
+            "eval.wizard",
+            Dialog::new(&[], &actions, eval_modal_theme())
+                .title(self.title())
+                .sizing(wizard_sizing()),
+            &action_state,
+        );
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let rect = layout
+            .find_logical_rect(&LayoutId::new("eval.wizard.actions"))
+            .expect("wizard actions");
+        let action_area = Rect::new(
+            area.x + rect.x,
+            area.y + u16::try_from(rect.y).unwrap_or(u16::MAX),
+            rect.width,
+            u16::try_from(rect.height).unwrap_or(u16::MAX),
+        );
+        match ActionRow::new(&actions).handle_event(action_area, self.dialog_state_mut(), event) {
+            ActionRowOutcome::Activated { id, .. } if id == "cancel" => EvalWizardOutcome::Cancel,
+            ActionRowOutcome::Activated { .. } => self.complete(),
+            ActionRowOutcome::Ignored => EvalWizardOutcome::Continue,
+            _ => EvalWizardOutcome::Redraw,
         }
     }
 
@@ -1008,7 +1027,7 @@ impl EvalWizard {
         }
     }
 
-    const fn dialog_state_mut(&mut self) -> &mut DialogState {
+    const fn dialog_state_mut(&mut self) -> &mut ActionRowState {
         match self {
             Self::StartCampaign(wizard) => &mut wizard.state,
             Self::RunSuite(wizard) => &mut wizard.state,
@@ -1145,7 +1164,7 @@ impl EvalWizard {
 }
 
 impl RunSuiteWizard {
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let choice = &self.suite_choices[self.suite_index];
         let mut body = vec![
             Line::from(format!("Suite: {}", choice.suite_id)),
@@ -1158,10 +1177,14 @@ impl RunSuiteWizard {
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
         }
-        Dialog::new(&body, &wizard_actions("run"), eval_modal_theme())
-            .title("Run Eval Suite")
-            .sizing(wizard_sizing())
-            .render(area, &self.state, frame);
+        paint_eval_dialog(
+            Dialog::new(&body, &wizard_actions("run"), eval_modal_theme())
+                .title("Run Eval Suite")
+                .sizing(wizard_sizing()),
+            area,
+            &self.state,
+            frame,
+        );
         let layout = wizard_layout(area);
         render_input_box(
             layout.primary,
@@ -1201,7 +1224,7 @@ impl RunSuiteWizard {
 }
 
 impl DecideGenerationWizard {
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let action = match self.status {
             bcode_eval_models::EvalImprovementVerdictStatus::Promoted => "promote",
             _ => "reject",
@@ -1215,14 +1238,18 @@ impl DecideGenerationWizard {
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
         }
-        Dialog::new(&body, &wizard_actions(action), eval_modal_theme())
-            .title(if action == "promote" {
-                "Promote Generation"
-            } else {
-                "Reject Generation"
-            })
-            .sizing(wizard_sizing())
-            .render(area, &self.state, frame);
+        paint_eval_dialog(
+            Dialog::new(&body, &wizard_actions(action), eval_modal_theme())
+                .title(if action == "promote" {
+                    "Promote Generation"
+                } else {
+                    "Reject Generation"
+                })
+                .sizing(wizard_sizing()),
+            area,
+            &self.state,
+            frame,
+        );
         render_input_box(
             wizard_layout(area).primary,
             frame,
@@ -1264,20 +1291,24 @@ impl DecideGenerationWizard {
 }
 
 impl HelpWizard {
-    fn render(&self, area: Rect, frame: &mut Frame<'_>) {
-        Dialog::new(
-            &self.body,
-            &[ActionButton::new("cancel", "Close")],
-            eval_modal_theme(),
-        )
-        .title(self.title)
-        .sizing(wizard_sizing())
-        .render(area, &self.state, frame);
+    fn render(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+        paint_eval_dialog(
+            Dialog::new(
+                &self.body,
+                &[ActionButton::new("cancel", "Close")],
+                eval_modal_theme(),
+            )
+            .title(self.title)
+            .sizing(wizard_sizing()),
+            area,
+            &self.state,
+            frame,
+        );
     }
 }
 
 impl StartCampaignWizard {
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let actions = wizard_actions("create");
         let choice = self.selected_choice();
         let run_label = choice.run_id.as_deref().unwrap_or("no baseline run");
@@ -1295,10 +1326,14 @@ impl StartCampaignWizard {
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
         }
-        Dialog::new(&body, &actions, eval_modal_theme())
-            .title("Start Improvement Campaign")
-            .sizing(wizard_sizing())
-            .render(area, &self.state, frame);
+        paint_eval_dialog(
+            Dialog::new(&body, &actions, eval_modal_theme())
+                .title("Start Improvement Campaign")
+                .sizing(wizard_sizing()),
+            area,
+            &self.state,
+            frame,
+        );
         let layout = wizard_layout(area);
         render_input_box(
             layout.primary,
@@ -1397,7 +1432,7 @@ impl StartCampaignWizard {
 }
 
 impl RecordGenerationWizard {
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let actions = wizard_actions("record");
         let mut body = self.context.clone();
         body.push(Line::from(format!(
@@ -1436,10 +1471,14 @@ impl RecordGenerationWizard {
         if let Some(error) = &self.error {
             body.push(Line::from(format!("Error: {error}")));
         }
-        Dialog::new(&body, &actions, eval_modal_theme())
-            .title("Record Generation")
-            .sizing(wizard_sizing())
-            .render(area, &self.state, frame);
+        paint_eval_dialog(
+            Dialog::new(&body, &actions, eval_modal_theme())
+                .title("Record Generation")
+                .sizing(wizard_sizing()),
+            area,
+            &self.state,
+            frame,
+        );
         let layout = wizard_layout(area);
         render_input_box(
             layout.primary,
@@ -1630,11 +1669,25 @@ struct WizardLayout {
 }
 
 fn wizard_layout(area: Rect) -> WizardLayout {
-    let body = Dialog::new(&[], &wizard_actions("confirm"), eval_modal_theme())
-        .title("Wizard")
-        .sizing(wizard_sizing())
-        .layout(area)
-        .body;
+    let actions = wizard_actions("confirm");
+    let state = std::cell::Cell::new(ActionRowState::new());
+    let component = DialogComponent::new(
+        "eval.wizard",
+        Dialog::new(&[], &actions, eval_modal_theme())
+            .title("Wizard")
+            .sizing(wizard_sizing()),
+        &state,
+    );
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    let rect = layout
+        .find_logical_rect(&LayoutId::new("eval.wizard.body"))
+        .expect("wizard body");
+    let body = Rect::new(
+        area.x + rect.x,
+        area.y + u16::try_from(rect.y).unwrap_or(u16::MAX),
+        rect.width,
+        u16::try_from(rect.height).unwrap_or(u16::MAX),
+    );
     WizardLayout {
         primary: Rect::new(body.x, body.y.saturating_add(4), body.width, 4),
         secondary: Rect::new(body.x, body.y.saturating_add(8), body.width, 4),
@@ -1663,13 +1716,14 @@ const fn wizard_sizing() -> ModalSizing {
 
 fn render_input_box(
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     label: &'static str,
     state: &mut TextInputState,
     focused: bool,
     rows: u16,
 ) {
-    TextInputBox::new(TextInputPolicy::chat_composer())
+    let retained = std::cell::RefCell::new(state.clone());
+    let input = TextInputBoxComponent::new(label, TextInputPolicy::chat_composer(), &retained)
         .label(label)
         .policy(TextInputBoxPolicy {
             field_chrome: true,
@@ -1680,8 +1734,19 @@ fn render_input_box(
             disabled: false,
             min_rows: rows,
             max_rows: Some(rows),
-        })
-        .render(area, state, frame);
+        });
+    paint_eval_component(&input, area, frame);
+    *state = retained.into_inner();
+    let local = state.content_area();
+    state.set_content_area(
+        Rect::new(
+            area.x + local.x,
+            area.y + local.y,
+            local.width,
+            local.height,
+        ),
+        &TextInputPolicy::chat_composer(),
+    );
 }
 
 fn handle_input_box(area: Rect, state: &mut TextInputState, event: &Event, focused: bool) -> bool {
@@ -1689,11 +1754,11 @@ fn handle_input_box(area: Rect, state: &mut TextInputState, event: &Event, focus
         return false;
     }
     matches!(
-        TextInputBox::new(TextInputPolicy::chat_composer())
-            .label("")
-            .policy(TextInputBoxPolicy::labeled_field())
-            .handle_event(area, state, event),
-        TextInputBoxOutcome::Edited | TextInputBoxOutcome::Redraw | TextInputBoxOutcome::Submitted
+        bmux_tui_components::text_input::TextInputControl::new(&TextInputPolicy::chat_composer())
+            .handle_event(state, event),
+        bmux_tui_components::text_input::TextInputOutcome::Edited
+            | bmux_tui_components::text_input::TextInputOutcome::Redraw
+            | bmux_tui_components::text_input::TextInputOutcome::Submitted
     )
 }
 
@@ -2290,7 +2355,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
         "Eval Improvement Campaign"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.surface_area = area;
         if let Some(viewer) = self.selected_run_viewer.as_mut() {
             viewer.render(area, frame);
@@ -2342,7 +2407,7 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
             &rows,
             &self.generation_state,
         );
-        themed_action_row(&campaign_actions()).render_state(action_area, &self.action_state, frame);
+        paint_eval_actions(&campaign_actions(), action_area, &self.action_state, frame);
         let hints = [
             KeyHint::new("Enter", "details"),
             KeyHint::new("O", "open run"),
@@ -2355,12 +2420,12 @@ impl PluginTuiSurface for EvalCampaignViewerSurface {
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         ACTIVE_THEME.with(|active| active.set(theme.copied()));
         if let Some(theme) = theme {
-            frame.fill(area, " ", theme.canvas);
+            frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         }
         self.render(area, frame);
         ACTIVE_THEME.with(|active| active.set(None));
@@ -2711,7 +2776,7 @@ impl EvalGenerationDetailSurface {
         GenerationDetailTab::from_index(self.tab_state.selected().unwrap_or(0))
     }
 
-    fn render_summary(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_summary(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let Some(generation) = self.generation() else {
             render_lines(area, frame, &[Line::from("generation not found")]);
             return;
@@ -2754,7 +2819,7 @@ impl EvalGenerationDetailSurface {
         render_lines(area, frame, &lines);
     }
 
-    fn render_delta(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_delta(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let Some(generation) = self.generation() else {
             render_lines(area, frame, &[Line::from("generation not found")]);
             return;
@@ -2820,7 +2885,7 @@ impl EvalGenerationDetailSurface {
         render_lines(area, frame, &lines);
     }
 
-    fn render_metrics(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_metrics(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let Some(generation) = self.generation() else {
             render_lines(area, frame, &[Line::from("generation not found")]);
             return;
@@ -2850,7 +2915,7 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
         "Eval Generation"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.surface_area = area;
         if let Some(wizard) = self.active_wizard.as_mut() {
             wizard.render(area, frame);
@@ -2873,9 +2938,7 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             area.width,
             TAB_HEIGHT,
         );
-        TabBar::new(&tabs)
-            .styles(eval_tab_styles())
-            .render(self.tab_area, &self.tab_state, frame);
+        paint_eval_tabs(&tabs, self.tab_area, &self.tab_state, frame);
         let body = Rect::new(
             area.x,
             area.y.saturating_add(TITLE_HEIGHT + TAB_HEIGHT),
@@ -2889,7 +2952,8 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             GenerationDetailTab::Delta => self.render_delta(content_area, frame),
             GenerationDetailTab::Metrics => self.render_metrics(content_area, frame),
         }
-        themed_action_row(&generation_detail_actions()).render_state(
+        paint_eval_actions(
+            &generation_detail_actions(),
             action_area,
             &self.action_state,
             frame,
@@ -2905,12 +2969,12 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         ACTIVE_THEME.with(|active| active.set(theme.copied()));
         if let Some(theme) = theme {
-            frame.fill(area, " ", theme.canvas);
+            frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         }
         self.render(area, frame);
         ACTIVE_THEME.with(|active| active.set(None));
@@ -3151,7 +3215,7 @@ impl PluginTuiSurface for EvalRunViewerSurface {
         "Eval Run"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_header(
             area,
             frame,
@@ -3166,9 +3230,7 @@ impl PluginTuiSurface for EvalRunViewerSurface {
             TAB_HEIGHT,
         );
         self.tab_area = tab_area;
-        TabBar::new(&tabs)
-            .styles(eval_tab_styles())
-            .render(tab_area, &self.tab_state, frame);
+        paint_eval_tabs(&tabs, tab_area, &self.tab_state, frame);
         let body = Rect::new(
             area.x,
             area.y.saturating_add(TITLE_HEIGHT + TAB_HEIGHT),
@@ -3188,7 +3250,7 @@ impl PluginTuiSurface for EvalRunViewerSurface {
             ViewerTab::Derivations => self.render_derivations(content_area, frame),
         }
         let actions = viewer_actions(self.selected_tab());
-        themed_action_row(&actions).render_state(action_area, &self.action_state, frame);
+        paint_eval_actions(&actions, action_area, &self.action_state, frame);
         let hints = [
             KeyHint::new("Tab", "pane"),
             KeyHint::new("d/t/c", "artifact"),
@@ -3201,12 +3263,12 @@ impl PluginTuiSurface for EvalRunViewerSurface {
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         ACTIVE_THEME.with(|active| active.set(theme.copied()));
         if let Some(theme) = theme {
-            frame.fill(area, " ", theme.canvas);
+            frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         }
         self.render(area, frame);
         ACTIVE_THEME.with(|active| active.set(None));
@@ -3331,7 +3393,7 @@ impl EvalRunViewerSurface {
         }
     }
 
-    fn render_overview(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_overview(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Run command center");
         let area = inset_top(area, 1);
         let card_area = Rect::new(area.x, area.y, area.width, CARD_HEIGHT);
@@ -3349,7 +3411,7 @@ impl EvalRunViewerSurface {
         }
     }
 
-    fn render_kpi_cards(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_kpi_cards(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let metrics = run_dashboard_metrics(&self.data);
         let cards = split_columns(area, 4, 1);
         if let Some(card) = cards.first().copied() {
@@ -3401,7 +3463,7 @@ impl EvalRunViewerSurface {
         }
     }
 
-    fn render_variant_charts(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_variant_charts(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Variant comparison");
         let area = inset_top(area, 1);
         let half = area.height / 2;
@@ -3413,20 +3475,30 @@ impl EvalRunViewerSurface {
             area.height.saturating_sub(half).saturating_sub(1),
         );
         let pass_items = variant_pass_items(&self.data);
-        BarChart::new(&pass_items)
-            .policy(BarChartPolicy::with_values().value_placement(BarChartValuePlacement::Right))
-            .styles(eval_bar_chart_styles())
-            .empty("No variants")
-            .render(pass_area, frame);
+        paint_eval_component(
+            &BarChartComponent::new("eval.barchart", &pass_items)
+                .policy(
+                    BarChartPolicy::with_values().value_placement(BarChartValuePlacement::Right),
+                )
+                .styles(eval_bar_chart_styles())
+                .empty("No variants"),
+            pass_area,
+            frame,
+        );
         let token_items = variant_token_items(&self.data);
-        BarChart::new(&token_items)
-            .policy(BarChartPolicy::with_values().value_placement(BarChartValuePlacement::Right))
-            .styles(eval_bar_chart_styles())
-            .empty("No token data")
-            .render(cost_area, frame);
+        paint_eval_component(
+            &BarChartComponent::new("eval.barchart", &token_items)
+                .policy(
+                    BarChartPolicy::with_values().value_placement(BarChartValuePlacement::Right),
+                )
+                .styles(eval_bar_chart_styles())
+                .empty("No token data"),
+            cost_area,
+            frame,
+        );
     }
 
-    fn render_repetition_trends(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_repetition_trends(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Repetition telemetry");
         let area = inset_top(area, 1);
         let latency = repetition_samples(&self.data, "wall_time_ms");
@@ -3452,7 +3524,7 @@ impl EvalRunViewerSurface {
         );
     }
 
-    fn render_analysis(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_analysis(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Deep analysis and recommendations");
         let area = inset_top(area, 1);
         let top_height = area.height.min(6);
@@ -3474,24 +3546,24 @@ impl EvalRunViewerSurface {
         }
     }
 
-    fn render_recommendations(&self, area: Rect, frame: &mut Frame<'_>) {
-        frame.fill(area, " ", Style::new().bg(panel_alt()));
+    fn render_recommendations(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+        frame.fill(LocalRect::terminal(area), " ", Style::new().bg(panel_alt()));
         let lines = recommendation_lines(&self.data);
         for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
             frame.write_line_with_fallback_style(
-                Rect::new(
+                LocalRect::terminal(Rect::new(
                     area.x,
                     area.y.saturating_add(usize_to_u16(row)),
                     area.width,
                     1,
-                ),
+                )),
                 line,
                 Style::new().bg(panel_alt()),
             );
         }
     }
 
-    fn render_analysis_charts(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_analysis_charts(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Core graph stack");
         let area = inset_top(area, 1);
         let sections = split_rows(area, 4, 1);
@@ -3527,7 +3599,7 @@ impl EvalRunViewerSurface {
         }
     }
 
-    fn render_score_profile(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_score_profile(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let title = best_variant(&self.data.result).map_or_else(
             || "Score profile".to_string(),
             |variant| format!("Score profile — {}", variant.variant_id),
@@ -3538,26 +3610,29 @@ impl EvalRunViewerSurface {
 
     fn render_dense_bar_panel(
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         title: &str,
         items: &[BarChartItem<'_>],
         max: Option<u64>,
     ) {
-        frame.fill(area, " ", Style::new().bg(panel()));
+        frame.fill(LocalRect::terminal(area), " ", Style::new().bg(panel()));
         render_panel_title(area, frame, title);
         let area = inset_top(area, 1);
-        BarChart::new(items)
-            .policy(
-                BarChartPolicy::with_values()
-                    .max(max)
-                    .value_placement(BarChartValuePlacement::Right),
-            )
-            .styles(eval_bar_chart_styles())
-            .empty("No graph data")
-            .render(area, frame);
+        paint_eval_component(
+            &BarChartComponent::new("eval.barchart", items)
+                .policy(
+                    BarChartPolicy::with_values()
+                        .max(max)
+                        .value_placement(BarChartValuePlacement::Right),
+                )
+                .styles(eval_bar_chart_styles())
+                .empty("No graph data"),
+            area,
+            frame,
+        );
     }
 
-    fn render_analysis_tables(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_analysis_tables(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Failure intelligence");
         let area = inset_top(area, 1);
         let half = area.height / 2;
@@ -3600,21 +3675,21 @@ impl EvalRunViewerSurface {
         );
     }
 
-    fn render_cases(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_cases(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Case performance");
         let area = inset_top(area, 1);
         let (columns, rows) = case_table(&self.data);
         render_eval_table(frame, area, &columns, &rows, &self.case_state);
     }
 
-    fn render_tools(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_tools(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Tool usage");
         let area = inset_top(area, 1);
         let (columns, rows) = tool_table(&self.data);
         render_eval_table(frame, area, &columns, &rows, &self.tool_state);
     }
 
-    fn render_repetitions(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_repetitions(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(
             area,
             frame,
@@ -3625,7 +3700,7 @@ impl EvalRunViewerSurface {
         render_eval_table(frame, area, &columns, &rows, &self.rep_state);
     }
 
-    fn render_artifact(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_artifact(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let Some((title, text, truncated, binary)) = &self.artifact else {
             render_panel_title(area, frame, "Artifact viewer");
             let hints = [KeyHint::new(
@@ -3645,7 +3720,7 @@ impl EvalRunViewerSurface {
         let content_offset = u16::from(!notice.is_empty());
         if !notice.is_empty() {
             frame.write_line_with_fallback_style(
-                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
                 &Line::from_spans(vec![Span::styled(notice, Style::new().fg(warning()))]),
                 Style::new().bg(panel()),
             );
@@ -3664,14 +3739,14 @@ impl EvalRunViewerSurface {
                 .saturating_add(content_offset)
                 .saturating_add(usize_to_u16(row));
             frame.write_line_with_fallback_style(
-                Rect::new(area.x, y, area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
                 &artifact_line(line),
                 Style::new().bg(panel()),
             );
         }
     }
 
-    fn render_derivations(&self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_derivations(&self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Metric derivations and scoring model");
         let metrics = run_dashboard_metrics(&self.data);
         let lines = derivation_lines(&metrics);
@@ -3681,12 +3756,12 @@ impl EvalRunViewerSurface {
             .enumerate()
         {
             frame.write_line_with_fallback_style(
-                Rect::new(
+                LocalRect::terminal(Rect::new(
                     area.x,
                     area.y.saturating_add(1).saturating_add(usize_to_u16(row)),
                     area.width,
                     1,
-                ),
+                )),
                 line,
                 Style::new().bg(panel()),
             );
@@ -3733,7 +3808,7 @@ impl ViewerTab {
     }
 }
 
-fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
+fn render_header(area: Rect, frame: &mut PaintCx<'_, '_>, title: &str, status: &str) {
     if area.height == 0 {
         return;
     }
@@ -3756,13 +3831,13 @@ fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
         Span::styled(status, Style::new().fg(muted()).bg(dashboard_bg())),
     ]);
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &title_line,
         Style::new().bg(dashboard_bg()),
     );
     if area.height > 1 {
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 "─".repeat(usize::from(area.width)),
                 Style::new().fg(border()).bg(dashboard_bg()),
@@ -3772,18 +3847,20 @@ fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
     }
 }
 
-fn render_status(area: Rect, frame: &mut Frame<'_>, hints: &[KeyHint<'_>]) {
-    KeyHintBar::new(hints)
-        .styles(eval_hint_styles())
-        .render(area, frame);
+fn render_status(area: Rect, frame: &mut PaintCx<'_, '_>, hints: &[KeyHint<'_>]) {
+    paint_eval_component(
+        &KeyHintBarComponent::new("eval.keyhintbar", hints).styles(eval_hint_styles()),
+        area,
+        frame,
+    );
 }
 
-fn render_panel_title(area: Rect, frame: &mut Frame<'_>, title: &str) {
+fn render_panel_title(area: Rect, frame: &mut PaintCx<'_, '_>, title: &str) {
     if area.height == 0 {
         return;
     }
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![
             Span::styled(
                 " ▸ ",
@@ -3819,6 +3896,7 @@ fn eval_hint_styles() -> KeyHintBarStyles {
 
 fn eval_table_styles() -> TableStyles {
     TableStyles {
+        scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
         header: Style::new()
             .fg(accent())
             .bg(panel())
@@ -3888,13 +3966,13 @@ fn eval_table<'a>(columns: &'a [TableColumn<'a>], rows: &'a [TableRow]) -> Table
 }
 
 fn render_eval_table(
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     area: Rect,
     columns: &[TableColumn<'_>],
     rows: &[TableRow],
     state: &TableState,
 ) {
-    eval_table(columns, rows).render(area, state, frame);
+    eval_table(columns, rows).paint(area, state, frame);
 }
 
 fn handle_eval_table_event(
@@ -3939,16 +4017,16 @@ fn eval_sparkline_styles() -> SparklineStyles {
 }
 
 fn render_kpi_card(
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     area: Rect,
     label: &str,
     value: &str,
     detail: &str,
     accent: Color,
 ) {
-    frame.fill(area, " ", Style::new().bg(panel_alt()));
+    frame.fill(LocalRect::terminal(area), " ", Style::new().bg(panel_alt()));
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![
             Span::styled("  ", Style::new().bg(panel_alt())),
             Span::styled(
@@ -3962,7 +4040,7 @@ fn render_kpi_card(
         Style::new().bg(panel_alt()),
     );
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
         &Line::from_spans(vec![
             Span::styled("  ", Style::new().bg(panel_alt())),
             Span::styled(
@@ -3976,7 +4054,7 @@ fn render_kpi_card(
         Style::new().bg(panel_alt()),
     );
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(2), area.width, 1)),
         &Line::from_spans(vec![
             Span::styled("  ", Style::new().bg(panel_alt())),
             Span::styled(detail, Style::new().fg(muted()).bg(panel_alt())),
@@ -4205,12 +4283,12 @@ fn repetition_samples(data: &EvalRunData, metric_name: &str) -> Vec<u64> {
         .collect()
 }
 
-fn render_sparkline_block(frame: &mut Frame<'_>, area: Rect, title: &str, samples: &[u64]) {
+fn render_sparkline_block(frame: &mut PaintCx<'_, '_>, area: Rect, title: &str, samples: &[u64]) {
     if area.height == 0 {
         return;
     }
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![
             Span::styled("  ", Style::new().bg(panel_alt())),
             Span::styled(
@@ -4235,14 +4313,14 @@ fn render_sparkline_block(frame: &mut Frame<'_>, area: Rect, title: &str, sample
     policy.background = true;
     policy.highlight_high = true;
     policy.highlight_low = true;
-    Sparkline::new(samples)
-        .policy(policy)
-        .styles(eval_sparkline_styles())
-        .empty("No telemetry")
-        .render(
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-            frame,
-        );
+    paint_eval_component(
+        &SparklineComponent::new("eval.sparkline", samples)
+            .policy(policy)
+            .styles(eval_sparkline_styles())
+            .empty("No telemetry"),
+        Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        frame,
+    );
 }
 
 fn derivation_lines(metrics: &DashboardMetrics) -> Vec<Line> {
@@ -5122,15 +5200,15 @@ fn score_delta_label(parent: Option<&EvalRunData>, current: Option<&EvalRunData>
     score_delta(parent, current).map_or_else(|| "—".to_string(), format_signed)
 }
 
-fn render_lines(area: Rect, frame: &mut Frame<'_>, lines: &[Line]) {
+fn render_lines(area: Rect, frame: &mut PaintCx<'_, '_>, lines: &[Line]) {
     for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y.saturating_add(usize_to_u16(row)),
                 area.width,
                 1,
-            ),
+            )),
             line,
             Style::new().bg(panel()),
         );
@@ -5394,6 +5472,49 @@ const fn table_action(outcome: TableOutcome) -> bool {
     )
 }
 
+fn paint_eval_actions(
+    actions: &[ActionButton],
+    area: Rect,
+    state: &ActionRowState,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    let state = std::cell::Cell::new(*state);
+    let component =
+        ActionRowComponent::new("eval.actions", actions, &state).styles(eval_button_styles());
+    paint_eval_component(&component, area, cx);
+}
+fn paint_eval_tabs(
+    tabs: &[TabItem<'_>],
+    area: Rect,
+    state: &TabBarState,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    let state = std::cell::RefCell::new(state.clone());
+    let component = TabBarComponent::new("eval.tabs", tabs, &state).styles(eval_tab_styles());
+    paint_eval_component(&component, area, cx);
+}
+
+fn paint_eval_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
+fn paint_eval_dialog(
+    dialog: Dialog<'_>,
+    area: Rect,
+    state: &ActionRowState,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    let state = std::cell::Cell::new(*state);
+    let component = DialogComponent::new("eval.wizard", dialog, &state);
+    paint_eval_component(&component, area, cx);
+}
+
 #[cfg(test)]
 mod interaction_tests {
     use bcode_plugin_sdk::tui::{
@@ -5403,7 +5524,9 @@ mod interaction_tests {
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::event::Event;
+    #[cfg(test)]
     use bmux_tui::frame::Frame;
+    use bmux_tui::paint::PaintCx;
     use bmux_tui::prelude::Rect;
     use bmux_tui::style::{Color, Style};
 
@@ -5466,7 +5589,11 @@ mod interaction_tests {
         let area = Rect::new(0, 0, 36, 12);
         let mut buffer = Buffer::empty(area);
         let theme = plugin_theme();
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
+        surface.render_with_theme(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            Some(&theme),
+        );
 
         assert!(
             buffer
@@ -5489,7 +5616,11 @@ mod interaction_tests {
         let hints = [KeyHint::new("Tab", "pane"), KeyHint::new("q", "close")];
         let area = Rect::new(0, 0, 14, 1);
         let mut buffer = Buffer::empty(area);
-        render_status(area, &mut Frame::new(&mut buffer), &hints);
+        render_status(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            &hints,
+        );
 
         let text = buffer.row_symbols(0).expect("status row");
         assert!(text.starts_with("Tab pane"));

@@ -389,7 +389,7 @@ fn question_plugin_host() -> bcode_plugin::PluginHost {
 fn render_app_text(app: &mut BmuxApp) -> String {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
-    render::render(app, &mut frame);
+    render::render(app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     rendered_text(&buffer)
 }
 
@@ -856,7 +856,7 @@ fn render_includes_status_and_composer() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
     let cursor = {
         let mut frame = Frame::new(&mut buffer);
-        render::render(&mut app, &mut frame);
+        render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
         frame.cursor()
     };
 
@@ -875,7 +875,7 @@ fn composer_expands_and_scrolls_when_input_exceeds_max_rows() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 20));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -1553,12 +1553,12 @@ fn status_line_includes_scroll_offset_when_scrolled() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_up(1));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert_eq!(app.scroll_offset(), 1);
     drop(app);
@@ -1593,7 +1593,7 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert!(buffer.row_symbols(0).unwrap().contains("Canonical title"));
@@ -1649,7 +1649,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 36, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let header = buffer.row_symbols(0).unwrap();
 
@@ -1666,7 +1666,7 @@ fn header_shortens_session_id_on_wide_panes() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let header = buffer.row_symbols(0).unwrap();
 
     assert!(header.contains(&format!("#{}", &session_id.to_string()[..8])));
@@ -1734,7 +1734,7 @@ fn header_accent_color_tracks_arbitrary_selected_agent() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_eq!(
@@ -1752,7 +1752,7 @@ fn composer_border_accent_color_tracks_arbitrary_selected_agent() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let border_y = app.composer_content_area().y.saturating_sub(1);
     drop(app);
 
@@ -1772,7 +1772,7 @@ fn same_agent_gets_same_accent_across_chrome() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let header_accent = buffer.get(Point::new(0, 0)).and_then(|cell| cell.style.fg);
     let border_y = app.composer_content_area().y.saturating_sub(1);
     drop(app);
@@ -1791,7 +1791,7 @@ fn configured_agent_accent_overrides_fallback_color() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_eq!(
@@ -1808,7 +1808,10 @@ fn invalid_configured_agent_accent_falls_back_to_agent_color() {
     fallback_app.set_current_agent_id("quiet-plan");
     let mut fallback_buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut fallback_frame = Frame::new(&mut fallback_buffer);
-    render::render(&mut fallback_app, &mut fallback_frame);
+    render::render(
+        &mut fallback_app,
+        &mut bmux_tui::paint::PaintCx::new(&mut fallback_frame),
+    );
     drop(fallback_app);
     let fallback_accent = fallback_buffer
         .get(Point::new(0, 0))
@@ -1820,7 +1823,7 @@ fn invalid_configured_agent_accent_falls_back_to_agent_color() {
     app.set_current_agent("quiet-plan", Some("not-a-color".to_owned()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_eq!(
@@ -1928,7 +1931,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -1960,13 +1963,13 @@ fn plugin_status_is_rendered_and_atomic_replacement_removes_stale_text() {
     }]);
     let mut buffer = Buffer::empty(Rect::new(0, 0, 160, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert!(rendered_text(&buffer).contains("Plugin active"));
 
     app.set_plugin_status(Vec::new());
     let mut buffer = Buffer::empty(Rect::new(0, 0, 160, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     assert!(!rendered_text(&buffer).contains("Plugin active"));
 }
@@ -2022,7 +2025,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 68, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -2054,7 +2057,7 @@ fn status_line_includes_unknown_context_before_spent_tokens() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -2071,7 +2074,7 @@ fn status_line_drops_low_priority_segments_in_narrow_panes() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 36, 8));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -2089,7 +2092,7 @@ fn draft_agent_selection_updates_header() {
 
     let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert!(buffer.row_symbols(0).unwrap().contains("plan"));
@@ -2130,7 +2133,7 @@ fn migration_stage_families_and_terminal_failure_render_through_status_chrome() 
         app.set_status(status.clone());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 12));
         let mut frame = Frame::new(&mut buffer);
-        render::render(&mut app, &mut frame);
+        render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
         drop(app);
         let output = rendered_text(&buffer);
         assert!(
@@ -2211,7 +2214,7 @@ fn migration_stage_families_and_terminal_failure_render_through_status_chrome() 
     );
     let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut failed, &mut frame);
+    render::render(&mut failed, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(failed);
     let output = rendered_text(&buffer);
     assert!(output.contains("Verifying retained backup"));
@@ -2749,7 +2752,10 @@ async fn session_open_preserved_plugin_host_renders_live_request_contribution() 
 
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut chat.app, &mut frame);
+    render::render(
+        &mut chat.app,
+        &mut bmux_tui::paint::PaintCx::new(&mut frame),
+    );
     let output = rendered_text(&buffer);
     assert!(output.contains("Writing file"), "{output}");
     assert!(output.contains("src/lib.rs"), "{output}");
@@ -2809,7 +2815,7 @@ fn slash_pending_submission_clears_after_take() {
 
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 10));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -2829,7 +2835,7 @@ fn taken_pending_submission_can_be_restored_after_send_failure() {
     assert_eq!(app.composer().text(), "hello");
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 10));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -2848,7 +2854,7 @@ fn slash_palette_renders_above_composer() {
     slash_palette_render::render_palette(
         &palette,
         Rect::new(2, 18, 76, 1),
-        &mut frame,
+        &mut bmux_tui::paint::PaintCx::new(&mut frame),
         render::TuiTheme::for_agent("build", None, true),
     );
     let output = rendered_text(&buffer);
@@ -3107,13 +3113,19 @@ fn rich_markdown_resize_reflows_cached_rows_and_restores_wide_layout() {
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
 
     let mut wide_buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
-    render::render(&mut app, &mut Frame::new(&mut wide_buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut wide_buffer)),
+    );
     let wide_rows = app.transcript_layout().total_rows();
     let wide_text = rendered_text(&wide_buffer);
     assert!(wide_text.contains("┌"));
 
     let mut narrow_buffer = Buffer::empty(Rect::new(0, 0, 28, 24));
-    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut narrow_buffer)),
+    );
     let narrow_rows = app.transcript_layout().total_rows();
     let narrow_text = rendered_text(&narrow_buffer);
     assert_ne!(narrow_rows, wide_rows);
@@ -3121,7 +3133,10 @@ fn rich_markdown_resize_reflows_cached_rows_and_restores_wide_layout() {
     assert!(!narrow_text.contains("┌────────────────"));
 
     let mut restored_buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
-    render::render(&mut app, &mut Frame::new(&mut restored_buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut restored_buffer)),
+    );
     assert_eq!(app.transcript_layout().total_rows(), wide_rows);
     drop(app);
     let restored_text = rendered_text(&restored_buffer);
@@ -3247,7 +3262,7 @@ fn prepended_history_coalesces_assistant_deltas() {
     app.prepend_older_history(&older, false);
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 14));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Bcode"));
@@ -3299,7 +3314,7 @@ fn transcript_renders_compact_tool_blocks_without_raw_arguments() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 32));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -3335,7 +3350,7 @@ fn live_file_write_statusline_is_not_duplicated_and_truncates_path() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 72, 16));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -3386,7 +3401,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let output = rendered_text(&buffer);
     assert!(output.contains("Permission required"), "{output}");
     assert!(!output.contains("Editing file"), "{output}");
@@ -3420,7 +3435,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
     assert!(output.contains("finished"), "{output}");
@@ -3473,7 +3488,7 @@ fn denied_file_permission_marks_preview_failed() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 40));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
     let output = rendered_text(&buffer);
 
@@ -3503,7 +3518,7 @@ fn transcript_renders_filesystem_edit_request_without_core_inline_preview() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 18));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let output = rendered_text(&buffer);
 
     assert!(output.contains("example.edit"), "{output}");
@@ -3546,7 +3561,7 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 18));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Shell run"));
@@ -3589,7 +3604,7 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 20));
     let mut frame = Frame::new(&mut buffer);
 
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Shell run"));
@@ -3619,7 +3634,7 @@ fn scroll_up_requests_older_history_only_after_top() {
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], true);
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_up(1));
     assert!(!app.should_load_older_history());
@@ -3645,12 +3660,12 @@ fn latest_bar_ignores_hidden_continuation_of_visible_message() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_up(usize::MAX / 2));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(!app.newer_transcript_content_below());
     drop(app);
@@ -3675,12 +3690,12 @@ fn latest_bar_shows_for_distinct_hidden_entry_below_visible_message() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_up(4));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.newer_transcript_content_below());
     drop(app);
@@ -3705,7 +3720,7 @@ fn scroll_down_at_bottom_enters_virtual_space() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert_eq!(app.scroll_offset(), 0);
     assert!(app.scroll_transcript_down(4));
@@ -3713,7 +3728,7 @@ fn scroll_down_at_bottom_enters_virtual_space() {
 
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert!(rendered_text(&buffer).contains("4 rows below latest"));
@@ -3734,12 +3749,12 @@ fn appended_rows_consume_virtual_space_until_following_catches_up() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_down(4));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert_eq!(app.bottom_overscroll(), 4);
     app.expire_manual_transcript_scroll_for_test();
 
@@ -3752,7 +3767,7 @@ fn appended_rows_consume_virtual_space_until_following_catches_up() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert!(app.bottom_overscroll() < 4);
 
     for sequence in 2..8 {
@@ -3766,7 +3781,7 @@ fn appended_rows_consume_virtual_space_until_following_catches_up() {
     }
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert_eq!(app.bottom_overscroll(), 0);
     assert_eq!(app.scroll_offset(), 0);
@@ -3789,7 +3804,7 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_down(4));
     app.expire_manual_transcript_scroll_for_test();
@@ -3802,7 +3817,7 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.bottom_overscroll() <= 4);
     drop(app);
@@ -3822,7 +3837,7 @@ fn manual_scroll_keeps_position_while_new_content_fills_virtual_space() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_down(4));
     app.absorb_session_event(&event(
@@ -3834,7 +3849,7 @@ fn manual_scroll_keeps_position_while_new_content_fills_virtual_space() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert_eq!(app.bottom_overscroll(), 1);
     drop(app);
@@ -3856,7 +3871,7 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_transcript_down(4));
     app.absorb_session_event(&event(
@@ -3868,7 +3883,7 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert_eq!(app.bottom_overscroll(), 1);
     assert!(app.manually_detached());
@@ -3893,17 +3908,17 @@ fn staged_user_message_does_not_navigate_before_semantic_acceptance() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.replace_composer_with("new prompt");
     app.stage_submission();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
@@ -3926,17 +3941,26 @@ fn user_submission_navigation_waits_for_accepted_semantic_message() {
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
 
     app.replace_composer_with("accepted prompt");
     app.stage_submission();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 
     app.mark_pending_submission_sent();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert!(output_line_y(&buffer, "You").is_none());
 
     app.absorb_session_event(&event(
@@ -3949,10 +3973,16 @@ fn user_submission_navigation_waits_for_accepted_semantic_message() {
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     drop(app);
 
     assert_eq!(output_line_y(&buffer, "You"), Some(1));
@@ -3977,7 +4007,7 @@ fn accepted_markdown_submission_preserves_submitted_user_message_transition() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.replace_composer_with(
         "# New prompt\n\n- first\n- second with **emphasis**\n\n```sh\ncargo test\n```",
@@ -3985,21 +4015,21 @@ fn accepted_markdown_submission_preserves_submitted_user_message_transition() {
     app.stage_submission();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 
     app.mark_pending_submission_sent();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_ne!(output_line_y(&buffer, "message 11"), Some(1));
@@ -4023,7 +4053,7 @@ fn cleared_submission_does_not_anchor() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.replace_composer_with("/help");
     app.stage_submission();
@@ -4031,7 +4061,7 @@ fn cleared_submission_does_not_anchor() {
     app.clear_pending_submission(&slash);
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_ne!(output_line_y(&buffer, "message 11"), Some(1));
@@ -4055,17 +4085,17 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.replace_composer_with("new prompt");
     app.stage_submission();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 
     app.absorb_session_event(&event(
@@ -4090,7 +4120,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert!(rendered_text(&buffer).contains("shell.run"));
@@ -4142,7 +4172,10 @@ fn every_utf8_markdown_prefix_streams_without_source_loss() {
         assert_eq!(assistant.text().as_bytes(), expected.as_bytes());
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 48, 14));
-        render::render(&mut app, &mut Frame::new(&mut buffer));
+        render::render(
+            &mut app,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
         let assistant = app
             .transcript()
             .iter()
@@ -4169,7 +4202,10 @@ fn assistant_navigation_waits_for_first_nonempty_segment_content_and_runs_once()
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
 
     let stream = |revision, expected_offset, text: &str| SessionLiveEvent {
         session_id,
@@ -4192,15 +4228,24 @@ fn assistant_navigation_waits_for_first_nonempty_segment_content_and_runs_once()
 
     app.absorb_session_live_event(&stream(1, 0, ""));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert!(!app.has_assistant_stream_anchor());
 
     app.absorb_session_live_event(&stream(2, 0, "first line"));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     let initial_y = output_line_y(&buffer, "Bcode …").expect("nonempty stream visible");
     let anchor_index = app
         .assistant_stream_anchor_index()
@@ -4208,7 +4253,10 @@ fn assistant_navigation_waits_for_first_nonempty_segment_content_and_runs_once()
 
     app.absorb_session_live_event(&stream(3, "first line".len(), "\nsecond\nthird"));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert_eq!(app.assistant_stream_anchor_index(), Some(anchor_index));
     drop(app);
     assert_eq!(output_line_y(&buffer, "Bcode …"), Some(initial_y));
@@ -4230,7 +4278,7 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4241,7 +4289,7 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let initial_y = output_line_y(&buffer, "Bcode …").expect("streaming heading is visible");
 
     app.absorb_session_event(&event(
@@ -4253,7 +4301,7 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_eq!(output_line_y(&buffer, "Bcode …"), Some(initial_y));
@@ -4275,7 +4323,7 @@ fn manual_scroll_from_stream_anchor_preserves_visual_position() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4295,16 +4343,16 @@ ninth"
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     output_line_y(&buffer, "Bcode …").expect("streaming heading is visible");
     assert!(app.scroll_transcript_up(3));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.manually_detached());
     drop(app);
@@ -4329,7 +4377,7 @@ fn streaming_assistant_response_does_not_anchor_when_scrolled_up() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert!(app.scroll_transcript_up(3));
 
     app.absorb_session_event(&event(
@@ -4341,7 +4389,7 @@ fn streaming_assistant_response_does_not_anchor_when_scrolled_up() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.scroll_offset() > 0);
     drop(app);
@@ -4364,7 +4412,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4375,11 +4423,11 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     let anchored_scroll_offset = app.scroll_offset();
 
     app.absorb_session_event(&event(
@@ -4395,7 +4443,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(rendered_text(&buffer).contains("shell.run"));
     assert_eq!(app.scroll_offset(), anchored_scroll_offset);
@@ -4418,7 +4466,7 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4429,11 +4477,11 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert!(app.scroll_transcript_down(3));
     app.expire_manual_transcript_scroll_for_test();
 
@@ -4446,7 +4494,7 @@ fn manual_scroll_cancels_stream_anchor_for_remaining_deltas() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.bottom_overscroll() > 0);
     drop(app);
@@ -4468,7 +4516,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4497,7 +4545,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4508,11 +4556,11 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert!(output_line_y(&buffer, "Bcode …").is_some());
@@ -4665,7 +4713,10 @@ fn structural_insertions_preserve_stable_transcript_anchor() {
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert!(app.scroll_transcript_up(18));
     let anchor_before = app.stable_transcript_anchor().expect("detached anchor");
 
@@ -4681,7 +4732,10 @@ fn structural_insertions_preserve_stable_transcript_anchor() {
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
 
     assert_eq!(app.stable_transcript_anchor(), Some(anchor_before));
     drop(app);
@@ -4703,7 +4757,7 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4714,11 +4768,11 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.absorb_session_event(&event(
         session_id,
@@ -4754,7 +4808,7 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert_eq!(
         app.stable_transcript_anchor().map(|(id, _)| id),
@@ -4781,17 +4835,17 @@ fn committed_user_echo_triggers_submitted_message_anchor_after_acceptance() {
     app.set_plugin_host(Arc::new(shell_plugin_host()));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     app.replace_composer_with("new prompt");
     app.stage_submission();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     std::thread::sleep(Duration::from_millis(220));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 
     app.absorb_session_event(&event(
@@ -4805,7 +4859,7 @@ fn committed_user_echo_triggers_submitted_message_anchor_after_acceptance() {
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
-    render::render(&mut app, &mut frame);
+    render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
     drop(app);
 
     assert_eq!(output_line_y(&buffer, "You"), Some(1));
@@ -5421,7 +5475,10 @@ fn viewport_anchor_on_canonical_entry_survives_structural_insertion() {
         .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert!(app.scroll_transcript_up(18));
     let anchor_before = app.stable_transcript_anchor().expect("detached anchor");
     let anchored_index = app
@@ -5436,7 +5493,10 @@ fn viewport_anchor_on_canonical_entry_survives_structural_insertion() {
 
     app.push_ephemeral_system_plain("local issue".to_owned());
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
 
     assert_eq!(
         app.stable_transcript_anchor(),
@@ -5471,7 +5531,10 @@ fn viewport_anchor_on_ephemeral_entry_survives_canonical_growth() {
         .transcript_presentation_id_for_test(notice_index)
         .expect("notice identity");
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
 
     let notice_start_row = app
         .transcript_layout()
@@ -5495,7 +5558,10 @@ fn viewport_anchor_on_ephemeral_entry_survives_canonical_growth() {
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
 
     assert_eq!(
         app.stable_transcript_anchor(),
@@ -5538,7 +5604,10 @@ fn latest_user_message_anchoring_targets_unified_document_order() {
         },
     ));
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
 
     let latest_user_index = app
         .transcript()
@@ -5634,18 +5703,30 @@ fn daemon_timeout_diagnostic_holds_its_chronological_place_through_the_whole_pro
     // Step 6: resize and re-layout without changing that order.
     for width in [80_u16, 40, 100, 24] {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, 14));
-        render::render(&mut app, &mut Frame::new(&mut buffer));
+        render::render(
+            &mut app,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
         assert_eq!(visible(&app), expected, "resize to {width} changed order");
     }
 
     // Step 7: scroll away and return to the bottom without relocating the diagnostic.
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 8));
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     app.scroll_transcript_up(6);
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert_eq!(visible(&app), expected, "scrolling up changed order");
     app.scroll_transcript_to_bottom();
-    render::render(&mut app, &mut Frame::new(&mut buffer));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
     assert_eq!(visible(&app), expected, "returning to bottom changed order");
 
     // Step 8: update a streaming canonical entry without moving the diagnostic.
@@ -6510,22 +6591,23 @@ fn live_filesystem_edit_request_draft_renders_progressive_diff_and_retains_compl
 #[test]
 fn live_vim_frames_preserve_scroll_and_render_in_narrow_layout() {
     let session_id = SessionId::new();
-    let mut history = Vec::new();
-    for sequence in 1..=80_u64 {
-        history.push(event(
-            session_id,
-            sequence,
-            SessionEventKind::SystemMessage {
-                text: format!("history row {sequence}"),
-            },
-        ));
-    }
+    let history = (1..=80_u64)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::SystemMessage {
+                    text: format!("history row {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
     app.set_plugin_host(Arc::new(vim_edit_plugin_host()));
     let mut narrow_buffer = Buffer::empty(Rect::new(0, 0, 42, 24));
-    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    render_into_buffer(&mut app, &mut narrow_buffer);
     assert!(app.scroll_transcript_up(12));
-    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    render_into_buffer(&mut app, &mut narrow_buffer);
     let scroll_before = app.scroll_offset();
     let anchor = rendered_text(&narrow_buffer)
         .lines()
@@ -6564,7 +6646,7 @@ fn live_vim_frames_preserve_scroll_and_render_in_narrow_layout() {
     };
 
     app.absorb_session_live_event(&progress(1, "first narrow frame"));
-    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    render_into_buffer(&mut app, &mut narrow_buffer);
     assert!(app.scroll_offset() >= scroll_before);
     assert!(rendered_text(&narrow_buffer).contains(&anchor));
     assert_eq!(
@@ -6580,7 +6662,7 @@ fn live_vim_frames_preserve_scroll_and_render_in_narrow_layout() {
     );
 
     app.absorb_session_live_event(&progress(2, "second narrow frame"));
-    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    render_into_buffer(&mut app, &mut narrow_buffer);
     assert!(app.scroll_offset() >= scroll_before);
     assert!(rendered_text(&narrow_buffer).contains(&anchor));
     assert_eq!(
@@ -6600,6 +6682,13 @@ fn live_vim_frames_preserve_scroll_and_render_in_narrow_layout() {
             if contribution.payload["context"]["lines"][0] == "first narrow frame"
     )));
     drop(app);
+}
+
+fn render_into_buffer(app: &mut BmuxApp, buffer: &mut Buffer) {
+    render::render(
+        app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(buffer)),
+    );
 }
 
 #[test]

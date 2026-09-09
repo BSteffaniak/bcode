@@ -8,28 +8,36 @@ use bcode_plugin_sdk::tui::{
 };
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
 use bmux_tui_components::action_row::{
-    ActionButton, ActionRow, ActionRowOutcome, ActionRowState, ActionRowStyles,
+    ActionButton, ActionRow, ActionRowComponent, ActionRowOutcome, ActionRowState, ActionRowStyles,
 };
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::pane::{
-    Pane, PaneMousePolicy, PanePolicy, PaneState, PaneStyles, ResizeHandles,
+    Pane, PaneComponent, PaneMousePolicy, PanePolicy, PaneState, PaneStyles, ResizeHandles,
 };
-use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::tab_bar::{
+    TabBar, TabBarComponent, TabBarOutcome, TabBarState, TabBarStyles, TabItem,
+};
 use bmux_tui_components::table::{
     Table, TableAlign, TableColumn, TableOutcome, TableRow, TableState, TableStyles,
 };
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
-    TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy, TextInputBoxStyles,
+    TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
 };
-use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
-use bmux_tui_components::tree_view::{TreeView, TreeViewItem, TreeViewState, TreeViewStyles};
+use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy, TextViewStyles};
+use bmux_tui_components::tree_view::{
+    TreeViewComponent, TreeViewItem, TreeViewState, TreeViewStyles,
+};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -182,7 +190,9 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
             Ok(Box::new(WorkflowStatusSurface {
                 options: request.options,
                 selected_approval: 0,
-                text_view: TextViewState::new(),
+                text_view: std::cell::Cell::new(
+                    bmux_tui_components::scroll_view::ScrollViewState::new(),
+                ),
                 catalog_table_state: TableState::new(None),
                 inspector_tab_state: TabBarState::new(Some(0)),
                 narrow_tab_state: TabBarState::new(Some(0)),
@@ -610,7 +620,7 @@ fn default_input_value(schema: Option<&serde_json::Value>) -> serde_json::Value 
 struct WorkflowStatusSurface {
     options: serde_json::Value,
     selected_approval: usize,
-    text_view: TextViewState,
+    text_view: std::cell::Cell<bmux_tui_components::scroll_view::ScrollViewState>,
     catalog_table_state: TableState,
     inspector_tab_state: TabBarState,
     narrow_tab_state: TabBarState,
@@ -963,7 +973,7 @@ impl WorkflowStatusSurface {
 
     fn render_focused_pane(
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         title: &'static str,
         focused: bool,
@@ -974,14 +984,17 @@ impl WorkflowStatusSurface {
         let pane = workflow_pane(title, theme);
         let mut state = PaneState::new(area);
         state.interaction = state.interaction.focused(focused);
-        pane.render(&state, frame);
+        let retained = std::cell::Cell::new(state);
+        let shell =
+            PaneComponent::new("workflow.pane", pane.clone(), &retained, TextBlock::new(""));
+        paint_workflow_component(&shell, state.area, frame);
         pane.inner_area(&state)
     }
 
     fn render_catalog_pane(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
         focused: bool,
@@ -993,7 +1006,7 @@ impl WorkflowStatusSurface {
     fn render_graph_pane(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         focused: bool,
     ) {
@@ -1004,7 +1017,7 @@ impl WorkflowStatusSurface {
     fn render_inspector_pane(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         tabbed: bool,
         focused: bool,
@@ -1016,7 +1029,7 @@ impl WorkflowStatusSurface {
     fn render_action_pane(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         focused: bool,
     ) {
@@ -1159,15 +1172,16 @@ impl WorkflowStatusSurface {
     fn render_workspace_modes(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
     ) {
         let modes = [
             TabItem::new("discover", "Discover"),
             TabItem::new("runs", "Runs"),
         ];
-        TabBar::new(&modes)
-            .styles(TabBarStyles {
+        let retained = std::cell::RefCell::new(self.workspace_mode_state.clone());
+        let component =
+            TabBarComponent::new("workflow.tabbar", &modes, &retained).styles(TabBarStyles {
                 normal: theme.muted,
                 selected: theme.selected,
                 focused: theme.focused,
@@ -1175,20 +1189,20 @@ impl WorkflowStatusSurface {
                 pressed: theme.selected,
                 disabled: theme.muted,
                 separator: theme.component.border,
-            })
-            .render(area, &self.workspace_mode_state, frame);
+            });
+        paint_workflow_component(&component, area, frame);
     }
 
     fn render_discover_workspace(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
     ) {
         self.render_workspace_modes(self.discover_areas.tabs, frame, theme);
         if let Some(search) = &self.launch_search_buffer {
             frame.write_line(
-                self.discover_areas.tabs,
+                LocalRect::terminal(self.discover_areas.tabs),
                 &Line::from_spans(vec![
                     Span::styled("Search › ", theme.focused),
                     Span::styled(search, theme.text),
@@ -1236,7 +1250,7 @@ impl WorkflowStatusSurface {
     fn render_launch_catalog(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
     ) {
         let query_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
@@ -1248,7 +1262,7 @@ impl WorkflowStatusSurface {
         );
         if self.live_status.contains("unavailable") || self.live_status.contains("disconnected") {
             frame.write_line(
-                query_area,
+                LocalRect::terminal(query_area),
                 &Line::from_spans(vec![Span::styled(
                     format!("Disconnected · {}", self.live_status),
                     theme.error,
@@ -1256,7 +1270,7 @@ impl WorkflowStatusSurface {
             );
         } else {
             frame.write_line(
-                query_area,
+                LocalRect::terminal(query_area),
                 &Line::from_spans(vec![Span::styled(
                     format!(
                         "Search: {}  Source: {}  Readiness: {}",
@@ -1280,7 +1294,7 @@ impl WorkflowStatusSurface {
                         "No launch catalog loaded"
                     });
             frame.write_line(
-                table_area,
+                LocalRect::terminal(table_area),
                 &Line::from_spans(vec![Span::styled(
                     message,
                     if self.launch_catalog_error.is_some() {
@@ -1294,7 +1308,7 @@ impl WorkflowStatusSurface {
         };
         if page.items.is_empty() {
             frame.write_line(
-                table_area,
+                LocalRect::terminal(table_area),
                 &Line::from_spans(vec![Span::styled(
                     "No workflows discovered in configured roots",
                     theme.muted,
@@ -1320,6 +1334,7 @@ impl WorkflowStatusSurface {
             .collect::<Vec<_>>();
         Table::new(&columns, &rows)
             .styles(TableStyles {
+                scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
                 header: theme.focused,
                 row: theme.text,
                 selected: theme.selected,
@@ -1330,10 +1345,15 @@ impl WorkflowStatusSurface {
                 separator: theme.component.border,
                 empty: theme.muted,
             })
-            .render(table_area, &self.launch_table_state, frame);
+            .paint(table_area, &self.launch_table_state, frame);
     }
 
-    fn render_launch_detail(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+    fn render_launch_detail(
+        &self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: WorkflowSurfaceTheme,
+    ) {
         let lines = if self.launch_start_pending {
             vec![Line::from_spans(vec![Span::styled(
                 "Starting exact published workflow…",
@@ -1411,18 +1431,27 @@ impl WorkflowStatusSurface {
                 Span::styled(" configure and start exact target", theme.text),
             ]));
         }
-        TextView::new(&lines)
-            .policy(TextViewPolicy::scrollable())
-            .styles(TextViewStyles {
-                text: theme.text,
-                empty: theme.muted,
-                background: theme.canvas,
-            })
-            .render(area, &self.text_view, frame);
+        paint_workflow_component(
+            &TextViewComponent::new("workflow.text", &lines, &self.text_view)
+                .policy(TextViewPolicy::scrollable())
+                .styles(TextViewStyles {
+                    text: theme.text,
+                    empty: theme.muted,
+                    background: theme.canvas,
+                    scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+                }),
+            area,
+            frame,
+        );
     }
 
     #[allow(clippy::too_many_lines)]
-    fn render_workspace(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+    fn render_workspace(
+        &self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: WorkflowSurfaceTheme,
+    ) {
         const GUTTER: u16 = 1;
         if area.height < 4 || area.width < 24 {
             return;
@@ -1433,7 +1462,7 @@ impl WorkflowStatusSurface {
                 .as_ref()
                 .map_or("Loading workflow catalog…", |error| error.as_str());
             frame.write_line(
-                Rect::new(area.x, area.y, area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
                 &Line::from_spans(vec![Span::styled(
                     message,
                     if self.catalog_error.is_some() {
@@ -1541,7 +1570,7 @@ impl WorkflowStatusSurface {
         }
         if let Some(search) = &self.catalog_search_buffer {
             frame.write_line(
-                footer,
+                LocalRect::terminal(footer),
                 &Line::from_spans(vec![
                     Span::styled("Search › ", theme.focused),
                     Span::styled(search, theme.text),
@@ -1590,22 +1619,22 @@ impl WorkflowStatusSurface {
         {
             hints.insert(0, KeyHint::new("F", "fork definition"));
         }
-        KeyHintBar::new(&hints)
-            .styles(KeyHintBarStyles {
+        let component =
+            KeyHintBarComponent::new("workflow.keyhintbar", &hints).styles(KeyHintBarStyles {
                 key: theme.focused,
                 label: theme.text,
                 separator: theme.muted,
                 disabled: theme.muted,
                 background: theme.canvas,
-            })
-            .render(footer, frame);
+            });
+        paint_workflow_component(&component, footer, frame);
     }
 
     #[allow(clippy::too_many_lines)]
     fn render_workspace_header(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
     ) {
@@ -1642,7 +1671,7 @@ impl WorkflowStatusSurface {
             .filter(|run| run.status == bcode_workflow_view_models::WorkflowRunStatus::Completed)
             .count();
         frame.write_line(
-            Rect::new(area.x, area.y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
             &Line::from_spans(vec![
                 Span::styled(" Workflows  ", theme.focused.add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{}  ", self.live_status), theme.info),
@@ -1669,7 +1698,7 @@ impl WorkflowStatusSurface {
         );
         if area.height > 1 {
             frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
                 &Line::from_spans(vec![Span::styled(
                     format!(
                         " Filter: {:?}  Sort: {:?}  Group: {:?}  Search: {}  Showing {}{}",
@@ -1686,7 +1715,7 @@ impl WorkflowStatusSurface {
         }
         if area.height > 2 {
             frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(2), area.width, 1)),
                 &workflow_breadcrumb_line(self, theme),
             );
         }
@@ -1717,7 +1746,7 @@ impl WorkflowStatusSurface {
                 |error| (error.clone(), theme.error),
             );
             frame.write_line(
-                Rect::new(area.x, area.y.saturating_add(3), area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(3), area.width, 1)),
                 &Line::from_spans(vec![Span::styled(message, style)]),
             );
         }
@@ -1726,7 +1755,7 @@ impl WorkflowStatusSurface {
     fn render_catalog(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
     ) {
@@ -1742,7 +1771,7 @@ impl WorkflowStatusSurface {
                 "No workflow runs yet"
             };
             frame.write_line(
-                Rect::new(area.x, area.y, area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
                 &Line::from_spans(vec![Span::styled(message, theme.muted)]),
             );
             return;
@@ -1794,6 +1823,7 @@ impl WorkflowStatusSurface {
             .collect::<Vec<_>>();
         Table::new(&columns, &rows)
             .styles(TableStyles {
+                scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
                 header: theme.focused,
                 row: theme.text,
                 selected: theme.selected,
@@ -1804,15 +1834,15 @@ impl WorkflowStatusSurface {
                 separator: theme.component.border,
                 empty: theme.muted,
             })
-            .render(area, &self.catalog_table_state, frame);
+            .paint(area, &self.catalog_table_state, frame);
     }
 
-    fn render_graph(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+    fn render_graph(&self, area: Rect, frame: &mut PaintCx<'_, '_>, theme: WorkflowSurfaceTheme) {
         if let Some(run_id) = self.selected_run_id.as_deref()
             && let Some(error) = self.detail_errors.get(run_id)
         {
             frame.write_line(
-                area,
+                LocalRect::terminal(area),
                 &Line::from_spans(vec![Span::styled(
                     format!("Run detail unavailable · {error}"),
                     theme.error,
@@ -1820,7 +1850,7 @@ impl WorkflowStatusSurface {
             );
         } else if self.detail_loading_run_id.as_deref() == self.selected_run_id.as_deref() {
             frame.write_line(
-                area,
+                LocalRect::terminal(area),
                 &Line::from_spans(vec![Span::styled("Loading selected run…", theme.muted)]),
             );
         } else if let Some(run) = self.selected_run_view() {
@@ -1875,14 +1905,17 @@ impl WorkflowStatusSurface {
                 );
             }
         } else {
-            frame.write_line(area, &Line::from("Select a workflow run"));
+            frame.write_line(
+                LocalRect::terminal(area),
+                &Line::from("Select a workflow run"),
+            );
         }
     }
 
     fn render_inspector(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         tabbed: bool,
     ) {
@@ -1900,8 +1933,9 @@ impl WorkflowStatusSurface {
         ];
         let tab_height = u16::from(tabbed || area.width < 44);
         if tab_height > 0 {
-            TabBar::new(&tabs)
-                .styles(TabBarStyles {
+            let retained = std::cell::RefCell::new(self.inspector_tab_state.clone());
+            let component =
+                TabBarComponent::new("workflow.tabbar", &tabs, &retained).styles(TabBarStyles {
                     normal: theme.muted,
                     selected: theme.selected,
                     focused: theme.focused,
@@ -1909,12 +1943,12 @@ impl WorkflowStatusSurface {
                     pressed: theme.selected,
                     disabled: theme.muted,
                     separator: theme.component.border,
-                })
-                .render(
-                    Rect::new(area.x, area.y, area.width, tab_height),
-                    &self.inspector_tab_state,
-                    frame,
-                );
+                });
+            paint_workflow_component(
+                &component,
+                Rect::new(area.x, area.y, area.width, tab_height),
+                frame,
+            );
         }
         let content = Rect::new(
             area.x,
@@ -1955,20 +1989,24 @@ impl WorkflowStatusSurface {
                 theme,
             )
         };
-        TextView::new(&lines)
-            .policy(TextViewPolicy::bare())
-            .styles(TextViewStyles {
-                text: theme.text,
-                empty: theme.muted,
-                background: theme.canvas,
-            })
-            .render(content, &self.text_view, frame);
+        paint_workflow_component(
+            &TextViewComponent::new("workflow.text", &lines, &self.text_view)
+                .policy(TextViewPolicy::bare())
+                .styles(TextViewStyles {
+                    text: theme.text,
+                    empty: theme.muted,
+                    background: theme.canvas,
+                    scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+                }),
+            content,
+            frame,
+        );
     }
 
     fn render_session_activity(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
     ) {
         let tabs = [
@@ -1980,8 +2018,9 @@ impl WorkflowStatusSurface {
             TabItem::new("attempts", "Attempts"),
         ];
         let tab_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
-        TabBar::new(&tabs)
-            .styles(TabBarStyles {
+        let retained = std::cell::RefCell::new(self.session_activity_tab_state.clone());
+        let component =
+            TabBarComponent::new("workflow.tabbar", &tabs, &retained).styles(TabBarStyles {
                 normal: theme.muted,
                 selected: theme.selected,
                 focused: theme.focused,
@@ -1989,8 +2028,8 @@ impl WorkflowStatusSurface {
                 pressed: theme.selected,
                 disabled: theme.muted,
                 separator: theme.component.border,
-            })
-            .render(tab_area, &self.session_activity_tab_state, frame);
+            });
+        paint_workflow_component(&component, tab_area, frame);
         let content = Rect::new(
             area.x,
             area.y.saturating_add(tab_area.height),
@@ -2014,20 +2053,29 @@ impl WorkflowStatusSurface {
                 Span::styled(format!(" open full session · {session_id}"), theme.text),
             ]));
         }
-        TextView::new(&lines)
-            .policy(TextViewPolicy::scrollable())
-            .styles(TextViewStyles {
-                text: theme.text,
-                empty: theme.muted,
-                background: theme.canvas,
-            })
-            .render(content, &self.text_view, frame);
+        paint_workflow_component(
+            &TextViewComponent::new("workflow.text", &lines, &self.text_view)
+                .policy(TextViewPolicy::scrollable())
+                .styles(TextViewStyles {
+                    text: theme.text,
+                    empty: theme.muted,
+                    background: theme.canvas,
+                    scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+                }),
+            content,
+            frame,
+        );
     }
 
-    fn render_action_panel(&self, area: Rect, frame: &mut Frame<'_>, theme: WorkflowSurfaceTheme) {
+    fn render_action_panel(
+        &self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: WorkflowSurfaceTheme,
+    ) {
         let Some(run) = self.selected_run_view() else {
             frame.write_line(
-                area,
+                LocalRect::terminal(area),
                 &Line::from_spans(vec![Span::styled(
                     if self.detail_loading_run_id.as_deref() == self.selected_run_id.as_deref() {
                         "Loading selected run…"
@@ -2059,26 +2107,28 @@ impl WorkflowStatusSurface {
                 .unwrap_or(u16::MAX)
                 .min(area.height),
         );
-        ActionRow::new(&actions)
-            .styles(ActionRowStyles {
+        let retained = std::cell::Cell::new(self.action_row_state);
+        let component = ActionRowComponent::new("workflow.actionrow", &actions, &retained).styles(
+            ActionRowStyles {
                 normal: theme.text,
                 focused: theme.focused,
                 hovered: theme.focused,
                 pressed: theme.selected,
                 disabled: theme.muted,
-            })
-            .render_state_with_fallback_style(
-                row_area,
-                &self.action_row_state,
-                frame,
-                theme.canvas,
-            );
+            },
+        );
+        paint_workflow_component(&component, row_area, frame);
         for (index, action) in run.actions.iter().enumerate() {
             if let Some(reason) = &action.unavailable_reason {
                 let row = u16::try_from(index).unwrap_or(u16::MAX).saturating_add(2);
                 if row < area.height {
                     frame.write_line(
-                        Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+                        LocalRect::terminal(Rect::new(
+                            area.x,
+                            area.y.saturating_add(row),
+                            area.width,
+                            1,
+                        )),
                         &Line::from_spans(vec![Span::styled(
                             format!("{:?}: {reason}", action.kind),
                             theme.muted,
@@ -2092,7 +2142,7 @@ impl WorkflowStatusSurface {
     fn render_narrow_page(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
     ) {
@@ -2105,8 +2155,9 @@ impl WorkflowStatusSurface {
             TabItem::new("inspector", "Inspector"),
             TabItem::new("actions", "Actions"),
         ];
-        TabBar::new(&pages)
-            .styles(TabBarStyles {
+        let retained = std::cell::RefCell::new(self.narrow_tab_state.clone());
+        let component =
+            TabBarComponent::new("workflow.tabbar", &pages, &retained).styles(TabBarStyles {
                 normal: theme.muted,
                 selected: theme.selected,
                 focused: theme.focused,
@@ -2114,12 +2165,8 @@ impl WorkflowStatusSurface {
                 pressed: theme.selected,
                 disabled: theme.muted,
                 separator: theme.component.border,
-            })
-            .render(
-                Rect::new(area.x, area.y, area.width, 1),
-                &self.narrow_tab_state,
-                frame,
-            );
+            });
+        paint_workflow_component(&component, Rect::new(area.x, area.y, area.width, 1), frame);
         let page_area = Rect::new(
             area.x,
             area.y.saturating_add(1),
@@ -3214,21 +3261,22 @@ impl WorkflowStatusSurface {
             } else {
                 &mut form.configuration
             };
-            let area = if editor.content_area().is_empty() {
+            let _area = if editor.content_area().is_empty() {
                 Rect::new(0, 0, 80, 8)
             } else {
                 editor.content_area()
             };
-            return match TextInputBox::new(TextInputPolicy::chat_composer())
-                .policy(TextInputBoxPolicy::bare().focused(true).rows(3, Some(12)))
-                .handle_event(area, editor, event)
+            return match bmux_tui_components::text_input::TextInputControl::new(
+                &TextInputPolicy::chat_composer(),
+            )
+            .handle_event(editor, event)
             {
-                TextInputBoxOutcome::Ignored => PluginTuiAction::None,
-                TextInputBoxOutcome::Edited
-                | TextInputBoxOutcome::Redraw
-                | TextInputBoxOutcome::Submitted
-                | TextInputBoxOutcome::EdgeUp
-                | TextInputBoxOutcome::EdgeDown => {
+                bmux_tui_components::text_input::TextInputOutcome::Ignored => PluginTuiAction::None,
+                bmux_tui_components::text_input::TextInputOutcome::Edited
+                | bmux_tui_components::text_input::TextInputOutcome::Redraw
+                | bmux_tui_components::text_input::TextInputOutcome::Submitted
+                | bmux_tui_components::text_input::TextInputOutcome::EdgeUp
+                | bmux_tui_components::text_input::TextInputOutcome::EdgeDown => {
                     form.error = None;
                     PluginTuiAction::Redraw
                 }
@@ -3473,41 +3521,45 @@ impl WorkflowStatusSurface {
                     return PluginTuiAction::Redraw;
                 }
                 let field = &mut form.fields[form.focused_field];
-                let area = if field.editor.content_area().is_empty() {
+                let _area = if field.editor.content_area().is_empty() {
                     Rect::new(0, 0, 80, 1)
                 } else {
                     field.editor.content_area()
                 };
-                return match TextInputBox::new(TextInputPolicy::chat_composer())
-                    .policy(TextInputBoxPolicy::bare().focused(true).rows(1, Some(1)))
-                    .handle_event(area, &mut field.editor, event)
+                return match bmux_tui_components::text_input::TextInputControl::new(
+                    &TextInputPolicy::chat_composer(),
+                )
+                .handle_event(&mut field.editor, event)
                 {
-                    TextInputBoxOutcome::Ignored => PluginTuiAction::None,
-                    TextInputBoxOutcome::Edited
-                    | TextInputBoxOutcome::Redraw
-                    | TextInputBoxOutcome::Submitted
-                    | TextInputBoxOutcome::EdgeUp
-                    | TextInputBoxOutcome::EdgeDown => {
+                    bmux_tui_components::text_input::TextInputOutcome::Ignored => {
+                        PluginTuiAction::None
+                    }
+                    bmux_tui_components::text_input::TextInputOutcome::Edited
+                    | bmux_tui_components::text_input::TextInputOutcome::Redraw
+                    | bmux_tui_components::text_input::TextInputOutcome::Submitted
+                    | bmux_tui_components::text_input::TextInputOutcome::EdgeUp
+                    | bmux_tui_components::text_input::TextInputOutcome::EdgeDown => {
                         form.error = None;
                         PluginTuiAction::Redraw
                     }
                 };
             }
-            let area = if form.editor.content_area().is_empty() {
+            let _area = if form.editor.content_area().is_empty() {
                 Rect::new(0, 0, 80, 8)
             } else {
                 form.editor.content_area()
             };
-            return match TextInputBox::new(TextInputPolicy::chat_composer())
-                .policy(TextInputBoxPolicy::bare().focused(true).rows(3, Some(8)))
-                .handle_event(area, &mut form.editor, event)
+            return match bmux_tui_components::text_input::TextInputControl::new(
+                &TextInputPolicy::chat_composer(),
+            )
+            .handle_event(&mut form.editor, event)
             {
-                TextInputBoxOutcome::Ignored => PluginTuiAction::None,
-                TextInputBoxOutcome::Edited
-                | TextInputBoxOutcome::Redraw
-                | TextInputBoxOutcome::Submitted
-                | TextInputBoxOutcome::EdgeUp
-                | TextInputBoxOutcome::EdgeDown => {
+                bmux_tui_components::text_input::TextInputOutcome::Ignored => PluginTuiAction::None,
+                bmux_tui_components::text_input::TextInputOutcome::Edited
+                | bmux_tui_components::text_input::TextInputOutcome::Redraw
+                | bmux_tui_components::text_input::TextInputOutcome::Submitted
+                | bmux_tui_components::text_input::TextInputOutcome::EdgeUp
+                | bmux_tui_components::text_input::TextInputOutcome::EdgeDown => {
                     form.error = None;
                     PluginTuiAction::Redraw
                 }
@@ -3864,7 +3916,7 @@ impl WorkflowStatusSurface {
 
     fn render_confirmation(
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         confirmation: &PendingWorkflowConfirmation,
     ) {
@@ -3878,15 +3930,23 @@ impl WorkflowStatusSurface {
             });
         let mut state = PaneState::new(area);
         state.interaction = state.interaction.focused(true);
-        pane.render(&state, frame);
+        let retained = std::cell::Cell::new(state);
+        let shell =
+            PaneComponent::new("workflow.pane", pane.clone(), &retained, TextBlock::new(""));
+        paint_workflow_component(&shell, state.area, frame);
         let inner = pane.inner_area(&state);
         frame.write_line(
-            Rect::new(inner.x, inner.y, inner.width, 1),
+            LocalRect::terminal(Rect::new(inner.x, inner.y, inner.width, 1)),
             &Line::from_spans(vec![Span::styled(&confirmation.detail, theme.warning)]),
         );
         if inner.height > 2 {
             frame.write_line(
-                Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+                LocalRect::terminal(Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(2),
+                    inner.width,
+                    1,
+                )),
                 &Line::from_spans(vec![
                     Span::styled("y/Enter", theme.focused),
                     Span::styled(" confirm  ", theme.text),
@@ -3900,7 +3960,7 @@ impl WorkflowStatusSurface {
     #[allow(clippy::too_many_lines)]
     fn render_launch_form(
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         form: &WorkflowLaunchForm,
     ) {
@@ -3914,10 +3974,13 @@ impl WorkflowStatusSurface {
             });
         let mut state = PaneState::new(area);
         state.interaction = state.interaction.focused(true);
-        pane.render(&state, frame);
+        let retained = std::cell::Cell::new(state);
+        let shell =
+            PaneComponent::new("workflow.pane", pane.clone(), &retained, TextBlock::new(""));
+        paint_workflow_component(&shell, state.area, frame);
         let inner = pane.inner_area(&state);
         frame.write_line(
-            Rect::new(inner.x, inner.y, inner.width, 1),
+            LocalRect::terminal(Rect::new(inner.x, inner.y, inner.width, 1)),
             &Line::from_spans(vec![
                 Span::styled("Target: ", theme.muted),
                 Span::styled(format!("{:?}", form.source), theme.focused),
@@ -3942,66 +4005,79 @@ impl WorkflowStatusSurface {
             focused_background: theme.canvas,
             disabled_background: theme.canvas,
         };
-        let mut configuration = form.configuration.clone();
-        TextInputBox::new(TextInputPolicy::chat_composer())
-            .label("Configuration JSON")
+        let retained = std::cell::RefCell::new(form.configuration.clone());
+        let component = TextInputBoxComponent::new(
+            "workflow.input",
+            TextInputPolicy::chat_composer(),
+            &retained,
+        )
+        .label("Configuration JSON")
+        .required(true)
+        .help(&form.configuration_schema.type_name)
+        .policy(
+            TextInputBoxPolicy::field()
+                .focused(form.focused_editor == 0)
+                .rows(3, Some(configuration_height.max(3))),
+        )
+        .styles(styles);
+        paint_workflow_component(
+            &component,
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(1),
+                inner.width,
+                configuration_height,
+            ),
+            frame,
+        );
+        if let (Some(input), Some(schema)) = (&form.input, &form.input_schema) {
+            let retained = std::cell::RefCell::new(input.clone());
+            let component = TextInputBoxComponent::new(
+                "workflow.input",
+                TextInputPolicy::chat_composer(),
+                &retained,
+            )
+            .label("Workflow input JSON")
             .required(true)
-            .help(&form.configuration_schema.type_name)
+            .help(&schema.type_name)
             .policy(
                 TextInputBoxPolicy::field()
-                    .focused(form.focused_editor == 0)
-                    .rows(3, Some(configuration_height.max(3))),
+                    .focused(form.focused_editor == 1)
+                    .rows(
+                        3,
+                        Some(available.saturating_sub(configuration_height).max(3)),
+                    ),
             )
-            .styles(styles)
-            .render(
+            .styles(styles);
+            paint_workflow_component(
+                &component,
                 Rect::new(
                     inner.x,
-                    inner.y.saturating_add(1),
+                    inner
+                        .y
+                        .saturating_add(1)
+                        .saturating_add(configuration_height),
                     inner.width,
-                    configuration_height,
+                    available.saturating_sub(configuration_height),
                 ),
-                &mut configuration,
                 frame,
             );
-        if let (Some(input), Some(schema)) = (&form.input, &form.input_schema) {
-            let mut input = input.clone();
-            TextInputBox::new(TextInputPolicy::chat_composer())
-                .label("Workflow input JSON")
-                .required(true)
-                .help(&schema.type_name)
-                .policy(
-                    TextInputBoxPolicy::field()
-                        .focused(form.focused_editor == 1)
-                        .rows(
-                            3,
-                            Some(available.saturating_sub(configuration_height).max(3)),
-                        ),
-                )
-                .styles(styles)
-                .render(
-                    Rect::new(
-                        inner.x,
-                        inner
-                            .y
-                            .saturating_add(1)
-                            .saturating_add(configuration_height),
-                        inner.width,
-                        available.saturating_sub(configuration_height),
-                    ),
-                    &mut input,
-                    frame,
-                );
         }
         let mut footer_y = inner.bottom().saturating_sub(1);
         if let Some(error) = &form.error {
             footer_y = footer_y.saturating_sub(1);
             frame.write_line(
-                Rect::new(inner.x, footer_y, inner.width, 1),
+                LocalRect::terminal(Rect::new(inner.x, footer_y, inner.width, 1)),
                 &Line::from_spans(vec![Span::styled(error, theme.error)]),
             );
         }
         frame.write_line(
-            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            LocalRect::terminal(Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(1),
+                inner.width,
+                1,
+            )),
             &Line::from_spans(vec![
                 Span::styled("Tab", theme.focused),
                 Span::styled(" switch  ", theme.text),
@@ -4016,7 +4092,7 @@ impl WorkflowStatusSurface {
     #[allow(clippy::too_many_lines)]
     fn render_input_form(
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: WorkflowSurfaceTheme,
         form: &WorkflowInputForm,
     ) {
@@ -4033,18 +4109,26 @@ impl WorkflowStatusSurface {
             });
         let mut state = PaneState::new(area);
         state.interaction = state.interaction.focused(true);
-        pane.render(&state, frame);
+        let retained = std::cell::Cell::new(state);
+        let shell =
+            PaneComponent::new("workflow.pane", pane.clone(), &retained, TextBlock::new(""));
+        paint_workflow_component(&shell, state.area, frame);
         let inner = pane.inner_area(&state);
         if inner.height == 0 {
             return;
         }
         frame.write_line(
-            Rect::new(inner.x, inner.y, inner.width, 1),
+            LocalRect::terminal(Rect::new(inner.x, inner.y, inner.width, 1)),
             &Line::from_spans(vec![Span::styled(&form.prompt, theme.text)]),
         );
         if inner.height > 1 {
             frame.write_line(
-                Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+                LocalRect::terminal(Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1),
+                    inner.width,
+                    1,
+                )),
                 &Line::from_spans(vec![Span::styled(
                     format!(
                         "Target · {} / {} / {}",
@@ -4056,7 +4140,12 @@ impl WorkflowStatusSurface {
         }
         if inner.height > 2 {
             frame.write_line(
-                Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+                LocalRect::terminal(Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(2),
+                    inner.width,
+                    1,
+                )),
                 &Line::from_spans(vec![Span::styled(
                     format!(
                         "Expected · {}",
@@ -4090,15 +4179,19 @@ impl WorkflowStatusSurface {
             disabled_background: theme.canvas,
         };
         if form.fields.is_empty() {
-            let mut editor = form.editor.clone();
-            TextInputBox::new(TextInputPolicy::chat_composer())
-                .label("JSON input")
-                .required(true)
-                .help("Complex schema JSON fallback")
-                .policy(TextInputBoxPolicy::field().focused(true).rows(3, Some(8)))
-                .styles(styles)
-                .error(form.error.as_deref().unwrap_or_default())
-                .render(editor_area, &mut editor, frame);
+            let retained = std::cell::RefCell::new(form.editor.clone());
+            let component = TextInputBoxComponent::new(
+                "workflow.input",
+                TextInputPolicy::chat_composer(),
+                &retained,
+            )
+            .label("JSON input")
+            .required(true)
+            .help("Complex schema JSON fallback")
+            .policy(TextInputBoxPolicy::field().focused(true).rows(3, Some(8)))
+            .styles(styles)
+            .error(form.error.as_deref().unwrap_or_default());
+            paint_workflow_component(&component, editor_area, frame);
         } else {
             let row_height = 3_u16;
             for (index, field) in form.fields.iter().enumerate() {
@@ -4107,45 +4200,55 @@ impl WorkflowStatusSurface {
                 if y >= inner.bottom().saturating_sub(footer_rows) {
                     break;
                 }
-                let mut editor = field.editor.clone();
+                let editor = field.editor.clone();
                 let kind = match field.kind {
                     WorkflowInputFieldKind::String => "text",
                     WorkflowInputFieldKind::Boolean => "true/false",
                     WorkflowInputFieldKind::Integer => "integer",
                     WorkflowInputFieldKind::Number => "number",
                 };
-                TextInputBox::new(TextInputPolicy::chat_composer())
-                    .label(&field.name)
-                    .required(field.required)
-                    .help(kind)
-                    .policy(
-                        TextInputBoxPolicy::field()
-                            .focused(index == form.focused_field)
-                            .rows(1, Some(1)),
-                    )
-                    .styles(styles)
-                    .render(
-                        Rect::new(
-                            inner.x,
-                            y,
-                            inner.width,
-                            row_height.min(inner.bottom().saturating_sub(y)),
-                        ),
-                        &mut editor,
-                        frame,
-                    );
+                let retained = std::cell::RefCell::new(editor);
+                let component = TextInputBoxComponent::new(
+                    "workflow.input",
+                    TextInputPolicy::chat_composer(),
+                    &retained,
+                )
+                .label(&field.name)
+                .required(field.required)
+                .help(kind)
+                .policy(
+                    TextInputBoxPolicy::field()
+                        .focused(index == form.focused_field)
+                        .rows(1, Some(1)),
+                )
+                .styles(styles);
+                paint_workflow_component(
+                    &component,
+                    Rect::new(
+                        inner.x,
+                        y,
+                        inner.width,
+                        row_height.min(inner.bottom().saturating_sub(y)),
+                    ),
+                    frame,
+                );
             }
         }
         let mut footer_y = inner.bottom().saturating_sub(1);
         if let Some(error) = &form.error {
             footer_y = footer_y.saturating_sub(1);
             frame.write_line(
-                Rect::new(inner.x, footer_y, inner.width, 1),
+                LocalRect::terminal(Rect::new(inner.x, footer_y, inner.width, 1)),
                 &Line::from_spans(vec![Span::styled(error, theme.error)]),
             );
         }
         frame.write_line(
-            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            LocalRect::terminal(Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(1),
+                inner.width,
+                1,
+            )),
             &Line::from_spans(vec![
                 Span::styled("Ctrl+Enter", theme.focused),
                 Span::styled(" submit  ", theme.text),
@@ -4158,11 +4261,11 @@ impl WorkflowStatusSurface {
     fn render_themed(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = WorkflowSurfaceTheme::resolve(theme);
-        frame.fill(area, " ", theme.canvas);
+        frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         let pane = Pane::new()
             .title(Line::from_spans(vec![Span::styled(
                 "Workflow Status",
@@ -4175,7 +4278,10 @@ impl WorkflowStatusSurface {
                 focused_border: theme.focused,
             });
         let pane_state = PaneState::new(area);
-        pane.render(&pane_state, frame);
+        let retained = std::cell::Cell::new(pane_state);
+        let shell =
+            PaneComponent::new("workflow.pane", pane.clone(), &retained, TextBlock::new(""));
+        paint_workflow_component(&shell, pane_state.area, frame);
         let content = pane.inner_area(&pane_state);
         let mode_tabs = Rect::new(content.x, content.y, content.width, 1);
         let mode_content = Rect::new(
@@ -4245,15 +4351,19 @@ impl WorkflowStatusSurface {
             .into_iter()
             .map(|row| Line::from_spans(vec![Span::styled(row, theme.text)]))
             .collect::<Vec<_>>();
-        TextView::new(&rows)
-            .policy(TextViewPolicy::bare())
-            .styles(TextViewStyles {
-                text: theme.text,
-                empty: theme.component.muted,
-                background: theme.canvas,
-            })
-            .empty("Workflow status unavailable")
-            .render(content, &self.text_view, frame);
+        paint_workflow_component(
+            &TextViewComponent::new("workflow.text", &rows, &self.text_view)
+                .policy(TextViewPolicy::bare())
+                .styles(TextViewStyles {
+                    text: theme.text,
+                    empty: theme.component.muted,
+                    background: theme.canvas,
+                    scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+                })
+                .empty("Workflow status unavailable"),
+            content,
+            frame,
+        );
     }
     fn reconcile_session_subscription(&mut self, host: &dyn PluginTuiHost) -> bool {
         let target = self.selected_run_view().and_then(|run| {
@@ -4331,14 +4441,14 @@ impl PluginTuiSurface for WorkflowStatusSurface {
         "Workflow Status"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.render_themed(area, frame, None);
     }
 
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
@@ -5621,7 +5731,7 @@ fn render_workflow_tree_fallback(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected_node_id: Option<&str>,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: WorkflowSurfaceTheme,
     state: &TreeViewState,
 ) {
@@ -5630,16 +5740,17 @@ fn render_workflow_tree_fallback(
     render_state.set_selected_visible(
         selected_node_id.and_then(|selected| items.iter().position(|item| item.id == selected)),
     );
-    TreeView::new(&items)
-        .styles(TreeViewStyles {
+    let retained = std::cell::RefCell::new(render_state.clone());
+    let component =
+        TreeViewComponent::new("workflow.treeview", &items, &retained).styles(TreeViewStyles {
             normal: theme.text,
             selected: theme.selected,
             hovered: theme.focused,
             pressed: theme.selected,
             disabled: theme.muted,
             marker: theme.component.border,
-        })
-        .render(area, &render_state, frame);
+        });
+    paint_workflow_component(&component, area, frame);
 }
 
 fn workflow_connector_presentation(
@@ -5677,14 +5788,14 @@ fn render_nested_workflows(
     run: &bcode_workflow_view_models::WorkflowRunView,
     expanded: bool,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: WorkflowSurfaceTheme,
 ) {
     if area.is_empty() {
         return;
     }
     frame.write_line(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![Span::styled(
             format!(
                 "{} Nested workflows · {} runs · {} sessions",
@@ -5705,13 +5816,13 @@ fn render_nested_workflows(
         .enumerate()
     {
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(u16::try_from(index).unwrap_or(u16::MAX) + 1),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![
                 Span::styled(
                     format!("{}↳ ", "  ".repeat(descendant.depth as usize)),
@@ -5736,21 +5847,23 @@ fn render_workflow_pipeline(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected_node_id: Option<&str>,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: WorkflowSurfaceTheme,
 ) -> WorkflowGraphLayout {
     let layout = workflow_graph_layout(run, area, selected_node_id);
     if layout.linear_fallback {
         let lines =
             workflow_graph_lines(run, selected_node_id, area.width, area.height, false, theme);
-        TextView::new(&lines)
+        let scroll = std::cell::Cell::new(bmux_tui_components::scroll_view::ScrollViewState::new());
+        let component = TextViewComponent::new("workflow.pipeline", &lines, &scroll)
             .policy(TextViewPolicy::bare())
             .styles(TextViewStyles {
                 text: theme.text,
                 empty: theme.muted,
                 background: theme.canvas,
-            })
-            .render(area, &TextViewState::new(), frame);
+                scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+            });
+        paint_workflow_component(&component, area, frame);
         return layout;
     }
     for connector in &layout.connectors {
@@ -5759,7 +5872,7 @@ fn render_workflow_pipeline(
         let y = from.y;
         for x in from.x.saturating_add(1)..to.x {
             frame.write_line(
-                Rect::new(x, y, 1, 1),
+                LocalRect::terminal(Rect::new(x, y, 1, 1)),
                 &Line::from_spans(vec![Span::styled("─", theme.component.border)]),
             );
         }
@@ -5768,7 +5881,7 @@ fn render_workflow_pipeline(
             let elbow_x = to.x.saturating_sub(2);
             for vertical_y in top.saturating_add(1)..bottom.saturating_add(1) {
                 frame.write_line(
-                    Rect::new(elbow_x, vertical_y, 1, 1),
+                    LocalRect::terminal(Rect::new(elbow_x, vertical_y, 1, 1)),
                     &Line::from_spans(vec![Span::styled("│", theme.component.border)]),
                 );
             }
@@ -5780,24 +5893,24 @@ fn render_workflow_pipeline(
             theme.component.border
         };
         frame.write_line(
-            Rect::new(to.x.saturating_sub(1), to.y, 1, 1),
+            LocalRect::terminal(Rect::new(to.x.saturating_sub(1), to.y, 1, 1)),
             &Line::from_spans(vec![Span::styled(connector_glyph, connector_style)]),
         );
         if connector.kind != "direct" && to.x.saturating_sub(from.x) > 4 {
             frame.write_line(
-                Rect::new(
+                LocalRect::terminal(Rect::new(
                     from.x.saturating_add(1),
                     y.saturating_sub(1),
                     to.x.saturating_sub(from.x).saturating_sub(2),
                     1,
-                ),
+                )),
                 &Line::from_spans(vec![Span::styled(connector_label, connector_style)]),
             );
         }
     }
     if layout.hidden_before > 0 {
         frame.write_line(
-            Rect::new(area.x, area.y, area.width.min(12), 1),
+            LocalRect::terminal(Rect::new(area.x, area.y, area.width.min(12), 1)),
             &Line::from_spans(vec![Span::styled(
                 format!("◀ {} stages", layout.hidden_before),
                 theme.muted,
@@ -5806,12 +5919,12 @@ fn render_workflow_pipeline(
     }
     if layout.hidden_after > 0 {
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.right().saturating_sub(area.width.min(12)),
                 area.y,
                 area.width.min(12),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 format!("{} stages ▶", layout.hidden_after),
                 theme.muted,
@@ -5823,7 +5936,7 @@ fn render_workflow_pipeline(
         let selected = selected_node_id == Some(node.node_id.as_str());
         let style = workflow_node_style(&node.status, theme);
         frame.fill(
-            card.area,
+            LocalRect::terminal(card.area),
             " ",
             if selected {
                 theme.selected
@@ -5837,7 +5950,7 @@ fn render_workflow_pipeline(
             theme.component.border
         };
         frame.write_line(
-            Rect::new(card.area.x, card.area.y, card.area.width, 1),
+            LocalRect::terminal(Rect::new(card.area.x, card.area.y, card.area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 format!(
                     "┌{}┐",
@@ -5847,36 +5960,36 @@ fn render_workflow_pipeline(
             )]),
         );
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 card.area.x,
                 card.area.y.saturating_add(1),
                 card.area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 format!("│{} {}", workflow_node_glyph(&node.status), node.name),
                 style,
             )]),
         );
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 card.area.x,
                 card.area.y.saturating_add(2),
                 card.area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 workflow_node_card_detail(run, node),
                 theme.muted,
             )]),
         );
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 card.area.x,
                 card.area.bottom().saturating_sub(1),
                 card.area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 format!(
                     "└{}┘",
@@ -6586,6 +6699,16 @@ fn inspector_definition_lines(run: &bcode_workflow_view_models::WorkflowRunView)
     lines
 }
 
+fn paint_workflow_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_lines)]
 fn workflow_view_lines(
@@ -7217,7 +7340,7 @@ mod tests {
     ) -> Buffer {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
-        surface.render_themed(area, &mut Frame::new(&mut buffer), theme);
+        surface.render_themed(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)), theme);
         buffer
     }
 
@@ -7632,7 +7755,9 @@ mod tests {
         WorkflowStatusSurface {
             options: serde_json::Value::Null,
             selected_approval: 0,
-            text_view: TextViewState::new(),
+            text_view: std::cell::Cell::new(
+                bmux_tui_components::scroll_view::ScrollViewState::new(),
+            ),
             catalog_table_state: TableState::new(Some(0)),
             inspector_tab_state: TabBarState::new(Some(0)),
             narrow_tab_state: TabBarState::new(Some(0)),
@@ -8807,7 +8932,7 @@ mod tests {
             run,
             true,
             area,
-            &mut Frame::new(&mut buffer),
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
             WorkflowSurfaceTheme::resolve(None),
         );
         let rendered_nested = buffer

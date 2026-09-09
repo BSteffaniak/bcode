@@ -1,14 +1,20 @@
 //! TUI permission dialog rendering.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::hit::{HitRegion, HitRole};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
-use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
-use bmux_tui_components::labeled_details::{DetailItem, LabeledDetails, LabeledDetailsStyles};
-use bmux_tui_components::modal_frame::ModalFrame;
+use bmux_tui_components::action_row::{
+    ActionButton, ActionRow, ActionRowComponent, ActionRowState, ActionRowStyles,
+};
+use bmux_tui_components::labeled_details::{
+    DetailItem, LabeledDetailsComponent, LabeledDetailsStyles,
+};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent};
 
 use super::permission_dialog::PermissionDialogState;
 use super::permission_present::{PermissionDetail, permission_presentation};
@@ -17,11 +23,11 @@ use super::render::TuiTheme;
 /// Render a permission approval dialog.
 pub fn render_permission_dialog(
     state: &PermissionDialogState,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
     let modal = modal_frame(theme);
-    let area = modal.panel_area(frame.area());
+    let area = modal.panel_area(Rect::new(0, 0, frame.area().width, frame.area().height));
     let permission = state.permission();
     let presentation = permission_presentation(&permission.tool_name, &permission.arguments_json);
     let rows = permission_rows(&PermissionRowsInput {
@@ -38,23 +44,24 @@ pub fn render_permission_dialog(
         theme,
     });
 
-    modal.render(frame.area(), frame);
-
-    let content = modal.content_area(frame.area());
+    let root = Rect::new(0, 0, frame.area().width, frame.area().height);
+    let content = modal.content_area(root);
+    let shell = ModalFrameComponent::new("permission", modal, TextBlock::new(""));
+    let layout = shell.layout(Constraints::tight(root.size()), &mut LayoutCx::new());
+    shell.paint(&layout, frame);
     let visible_body_rows = content.height.saturating_sub(2);
     for (row_index, line) in rows.iter().take(usize::from(visible_body_rows)).enumerate() {
         let Ok(row_offset) = u16::try_from(row_index) else {
             return;
         };
-        modal.render_line(
-            Rect::new(
+        frame.write_line(
+            LocalRect::terminal(Rect::new(
                 content.x,
                 content.y.saturating_add(row_offset),
                 content.width,
                 1,
-            ),
+            )),
             line,
-            frame,
         );
     }
 
@@ -144,7 +151,7 @@ fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
         .map(|detail| DetailItem::new(detail.label.clone(), detail.value.clone()))
         .collect::<Vec<_>>();
     rows.extend(
-        LabeledDetails::new(&detail_items)
+        LabeledDetailsComponent::new("permission.details", &detail_items)
             .styles(LabeledDetailsStyles {
                 label: input.theme.muted.add_modifier(Modifier::BOLD),
                 value: input.theme.text,
@@ -222,7 +229,7 @@ fn push_wrapped_rows(rows: &mut Vec<Line>, prefix: &[Span], text: &str, width: u
 fn render_actions(
     state: &PermissionDialogState,
     content: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
     let dialog = Rect::new(
@@ -245,11 +252,19 @@ fn render_actions(
         content.width,
         1,
     );
-    ActionRow::new(&buttons)
-        .focused(focused)
+    let mut actions = ActionRowState::new();
+    actions.set_focused(Some(focused));
+    let actions = std::cell::Cell::new(actions);
+    let component = ActionRowComponent::new("permission.actions", &buttons, &actions)
         .spacing(2)
-        .styles(action_styles(theme))
-        .render_with_fallback_style(row_area, frame, theme.modal_theme().text);
+        .styles(action_styles(theme));
+    let layout = component.layout(Constraints::tight(row_area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(row_area.x),
+        i64::from(row_area.y),
+        LocalRect::new(0, 0, row_area.width, row_area.height),
+        |cx| component.paint(&layout, cx),
+    );
     for (index, area) in areas.into_iter().enumerate() {
         frame.push_hit(
             HitRegion::new(format!("permission-action:{index}"), area)
@@ -350,7 +365,11 @@ mod tests {
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 120, 35));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
 
-        render_permission_dialog(&state, &mut frame, TuiTheme::for_agent("test", None, false));
+        render_permission_dialog(
+            &state,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            TuiTheme::for_agent("test", None, false),
+        );
 
         let action_hits = frame
             .hits()
@@ -395,7 +414,11 @@ mod tests {
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
 
-        render_permission_dialog(&state, &mut frame, TuiTheme::for_agent("test", None, false));
+        render_permission_dialog(
+            &state,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            TuiTheme::for_agent("test", None, false),
+        );
         let rendered = (0..30)
             .filter_map(|row| frame.buffer().row_symbols(row))
             .collect::<Vec<_>>()
@@ -429,7 +452,11 @@ mod tests {
         let mut buffer = Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
 
-        render_permission_dialog(&state, &mut frame, TuiTheme::for_agent("test", None, false));
+        render_permission_dialog(
+            &state,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            TuiTheme::for_agent("test", None, false),
+        );
         let rendered = (0..30)
             .filter_map(|row| frame.buffer().row_symbols(row))
             .collect::<Vec<_>>()

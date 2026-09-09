@@ -1,12 +1,15 @@
 //! Interactive theme picker rendering.
 
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::list::{List, ListItem};
-use bmux_tui::prelude::{Line, Span, StatefulWidget};
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
+use bmux_tui_components::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing,
+};
 
 use super::render::TuiTheme;
 use super::theme_picker::ThemePickerState;
@@ -16,10 +19,17 @@ const PREVIEW_GAP: u16 = 2;
 const PREVIEW_MIN_WIDTH: u16 = 26;
 
 /// Render the theme picker overlay.
-pub fn render_theme_picker(picker: &mut ThemePickerState, frame: &mut Frame<'_>, theme: TuiTheme) {
+pub fn render_theme_picker(
+    picker: &mut ThemePickerState,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+) {
     let modal = theme_picker_modal(theme);
-    modal.render(frame.area(), frame);
-    let content = modal.content_area(frame.area());
+    let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+    let content = modal.content_area(area);
+    let component = ModalFrameComponent::new("theme.modal", modal, TextBlock::new(""));
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    component.paint(&layout, frame);
     let diagnostics_height = u16::from(!picker.diagnostics().is_empty());
     let body = Rect::new(
         content.x,
@@ -43,7 +53,7 @@ pub fn render_theme_picker(picker: &mut ThemePickerState, frame: &mut Frame<'_>,
                 (false, true) => "light",
                 (false, false) => "fixed",
             };
-            ListItem::new(Line::from_spans(vec![
+            Line::from_spans(vec![
                 Span::styled(entry.display_name.clone(), theme.text),
                 Span::styled(
                     format!(
@@ -52,26 +62,22 @@ pub fn render_theme_picker(picker: &mut ThemePickerState, frame: &mut Frame<'_>,
                     ),
                     theme.muted,
                 ),
-            ]))
+            ])
         })
         .collect::<Vec<_>>();
     let list_state = picker.list_render_state(list_area.height);
-    List::new(&items)
-        .style(theme.text)
-        .highlight_symbol("› ")
-        .selected_style(theme.selection)
-        .render(list_area, frame, list_state);
+    super::picker_render::render_picker_list(&items, list_state, list_area, frame, theme);
     if let Some(preview_area) = preview_area {
         render_preview(picker, preview_area, frame, theme);
     }
     if let Some(diagnostic) = picker.diagnostics().first() {
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 content.x,
                 content.bottom().saturating_sub(1),
                 content.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 format!("Skipped: {diagnostic}"),
                 theme.muted,
@@ -81,8 +87,13 @@ pub fn render_theme_picker(picker: &mut ThemePickerState, frame: &mut Frame<'_>,
     }
 }
 
-fn render_preview(picker: &ThemePickerState, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
-    frame.fill(area, " ", theme.raised);
+fn render_preview(
+    picker: &ThemePickerState,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+) {
+    frame.fill(LocalRect::terminal(area), " ", theme.raised);
     let Some(entry) = picker.selected_entry() else {
         return;
     };
@@ -140,7 +151,12 @@ fn render_preview(picker: &ThemePickerState, area: Rect, frame: &mut Frame<'_>, 
             break;
         };
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, area.y.saturating_add(offset), area.width, 1),
+            LocalRect::terminal(Rect::new(
+                area.x,
+                area.y.saturating_add(offset),
+                area.width,
+                1,
+            )),
             row,
             theme.raised,
         );
@@ -264,7 +280,11 @@ mod tests {
         let area = Rect::new(0, 0, 120, 24);
         let mut picker = picker();
         let mut buffer = Buffer::empty(area);
-        render_theme_picker(&mut picker, &mut Frame::new(&mut buffer), theme);
+        render_theme_picker(
+            &mut picker,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+            theme,
+        );
         let modal = theme_picker_modal(theme);
         let content = modal.content_area(area);
         let (list, preview) = theme_picker_body_areas(content);
@@ -299,7 +319,11 @@ mod tests {
         let mut wide_picker = picker();
         let wide_area = Rect::new(0, 0, 120, 24);
         let mut wide = Buffer::empty(wide_area);
-        render_theme_picker(&mut wide_picker, &mut Frame::new(&mut wide), theme);
+        render_theme_picker(
+            &mut wide_picker,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut wide)),
+            theme,
+        );
         let text = (0..wide_area.height)
             .filter_map(|row| wide.row_symbols(row))
             .collect::<String>();
@@ -309,7 +333,11 @@ mod tests {
         let mut narrow_picker = picker();
         let narrow_area = Rect::new(0, 0, 60, 16);
         let mut narrow = Buffer::empty(narrow_area);
-        render_theme_picker(&mut narrow_picker, &mut Frame::new(&mut narrow), theme);
+        render_theme_picker(
+            &mut narrow_picker,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut narrow)),
+            theme,
+        );
         let text = (0..narrow_area.height)
             .filter_map(|row| narrow.row_symbols(row))
             .collect::<String>();
@@ -326,7 +354,11 @@ mod tests {
             vec!["a rejected candidate with a deliberately long diagnostic".to_owned()],
         );
         let mut buffer = Buffer::empty(area);
-        render_theme_picker(&mut picker, &mut Frame::new(&mut buffer), theme);
+        render_theme_picker(
+            &mut picker,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+            theme,
+        );
         let text = (0..area.height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<String>();
@@ -354,7 +386,11 @@ mod tests {
             ));
         }
         let mut buffer = Buffer::empty(area);
-        render_theme_picker(&mut picker, &mut Frame::new(&mut buffer), theme);
+        render_theme_picker(
+            &mut picker,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+            theme,
+        );
         let list = theme_picker_list_area(area, theme);
         let expected = picker.list_offset();
         assert!(expected > 0);

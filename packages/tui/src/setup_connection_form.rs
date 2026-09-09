@@ -3,11 +3,14 @@
 use super::theme::PresentedTheme;
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::Event;
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Span, Style, TextBlock, TextWrap, Widget};
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Span, Style, TextBlock, TextWrap};
+use bmux_tui_components::text_input::TextInputComponent;
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 use std::collections::BTreeMap;
 
@@ -358,8 +361,8 @@ impl ConnectionForm {
         Ok(())
     }
 
-    fn render_picker(&self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
-        let area = frame.area();
+    fn render_picker(&self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
+        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         write(
             frame,
             area,
@@ -413,8 +416,8 @@ impl ConnectionForm {
         );
     }
 
-    fn render_guided(&self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
-        let area = frame.area();
+    fn render_guided(&self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
+        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         let provider = self
             .providers
             .iter()
@@ -475,14 +478,14 @@ impl ConnectionForm {
         );
     }
 
-    pub fn render(&mut self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
+    pub fn render(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
         if self.picker.is_some() {
             self.render_picker(frame, theme);
             return;
         }
         if let Some(device) = &mut self.device {
             device.refresh();
-            let area = frame.area();
+            let area = Rect::new(0, 0, frame.area().width, frame.area().height);
             if render_auth_prompt(device, frame, area, theme) {
                 return;
             }
@@ -504,7 +507,7 @@ impl ConnectionForm {
             self.render_guided(frame, theme);
             return;
         }
-        let area = frame.area();
+        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         let labels = [
             "Provider",
             "Method",
@@ -532,10 +535,25 @@ impl ConnectionForm {
                 1,
             );
             input.set_content_area(rect, &TextInputPolicy::default());
-            TextInput::new(input.buffer())
-                .style(theme.text)
-                .cursor_visible(self.focus == index && !self.review)
-                .render(rect, frame);
+            let retained = std::cell::RefCell::new(input.clone());
+            let policy = TextInputPolicy::default();
+            let editor = TextInputComponent::new(
+                format!("setup_connection_form.{index}"),
+                &retained,
+                &policy,
+            )
+            .style(theme.text)
+            .selection_style(theme.focused)
+            .focused(self.focus == index && !self.review);
+            let layout = editor.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(rect.x),
+                i64::from(rect.y),
+                LocalRect::new(0, 0, rect.width, rect.height),
+                |cx| editor.paint(&layout, cx),
+            );
+            *input = retained.into_inner();
+            input.set_content_area(rect, &policy);
         }
         write(
             frame,
@@ -560,7 +578,7 @@ impl ConnectionForm {
 
 fn render_auth_prompt(
     device: &super::setup_device_login::DeviceLogin,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     area: Rect,
     theme: &PresentedTheme,
 ) -> bool {
@@ -647,28 +665,34 @@ fn load_connection_choices()
     Ok(providers)
 }
 
-fn render_login_text(frame: &mut Frame<'_>, area: Rect, lines: &[String], style: Style) {
+fn render_login_text(frame: &mut PaintCx<'_, '_>, area: Rect, lines: &[String], style: Style) {
     let content = Rect::new(
         area.x.saturating_add(1),
         area.y.saturating_add(2),
         area.width.saturating_sub(2),
         area.height.saturating_sub(5),
     );
-    TextBlock::new(lines.join("\n"))
+    let text = TextBlock::new(lines.join("\n"))
         .style(style)
-        .wrap(TextWrap::Word)
-        .render(content, frame);
+        .wrap(TextWrap::Word);
+    let layout = text.layout(Constraints::tight(content.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(content.x),
+        i64::from(content.y),
+        LocalRect::new(0, 0, content.width, content.height),
+        |cx| text.paint(&layout, cx),
+    );
 }
 
-fn write(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str, style: Style) {
+fn write(frame: &mut PaintCx<'_, '_>, area: Rect, row: u16, text: &str, style: Style) {
     if row < area.height {
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x.saturating_add(1),
                 area.y.saturating_add(row),
                 area.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(text, style)]),
             Style::new(),
         );
@@ -685,7 +709,7 @@ mod tests {
         let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 50, 20));
         let text = "The authentication provider rejected or could not complete the request. Return to method selection to retry.";
         render_login_text(
-            &mut Frame::new(&mut buffer),
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
             area,
             &[text.to_owned()],
             Style::new(),

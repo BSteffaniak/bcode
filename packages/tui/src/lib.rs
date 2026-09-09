@@ -234,7 +234,9 @@ pub enum TuiError {
 ///
 /// Returns I/O, settings, or config errors.
 pub async fn run_onboarding() -> Result<(), TuiError> {
-    run_onboarding_with_discovery_policy(true).await.map(|_| ())
+    Box::pin(run_onboarding_with_discovery_policy(true))
+        .await
+        .map(|_| ())
 }
 
 /// Run setup with a caller-supplied automatic credential discovery allowance.
@@ -245,7 +247,7 @@ pub async fn run_onboarding() -> Result<(), TuiError> {
 /// # Errors
 /// Returns I/O, settings, or configuration errors.
 pub async fn run_onboarding_with_discovery_policy(allow_discovery: bool) -> Result<bool, TuiError> {
-    run_setup_screen(allow_discovery)
+    Box::pin(run_setup_screen(allow_discovery))
         .await
         .map(|outcome| outcome == bcode_settings::SetupContinuation::Launch)
 }

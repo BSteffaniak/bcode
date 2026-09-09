@@ -31,10 +31,10 @@ def features(path: Path, name: str) -> set[str]:
 required_bmux = {
     Path("packages/tui/Cargo.toml"): {
         "action-row", "checkbox", "dialog", "form", "labeled-details", "modal-frame", "picker-frame",
-        "scroll-area", "stepper", "text-input",
+        "scroll-view", "selectable-list", "stepper", "text-input", "text-view",
     },
     Path("plugins/blims-plugin/Cargo.toml"): {"key-hint-bar", "modal-frame", "pane", "text-view"},
-    Path("plugins/code-review-plugin/Cargo.toml"): {"key-hint-bar", "modal-frame"},
+    Path("plugins/code-review-plugin/Cargo.toml"): {"key-hint-bar", "modal-frame", "text-input"},
     Path("plugins/eval-plugin/Cargo.toml"): {
         "action-row", "bar-chart", "dialog", "key-hint-bar", "sparkline", "tab-bar", "table",
         "text-input-box",
@@ -48,7 +48,7 @@ required_bmux = {
     Path("plugins/ralph-plugin/Cargo.toml"): {"key-hint-bar", "selectable-list"},
     Path("plugins/read-plugin/Cargo.toml"): {"key-hint-bar", "text-view"},
     Path("plugins/skills-plugin/Cargo.toml"): {"pane", "text-view"},
-    Path("plugins/workflow-plugin/Cargo.toml"): {"key-hint-bar", "pane", "text-view"},
+    Path("plugins/workflow-plugin/Cargo.toml"): {"action-row", "key-hint-bar", "pane", "tab-bar", "table", "text-input-box", "text-view", "tree-view"},
     Path("plugins/worktree-plugin/Cargo.toml"): {"key-hint-bar", "selectable-list", "text-input-box"},
 }
 

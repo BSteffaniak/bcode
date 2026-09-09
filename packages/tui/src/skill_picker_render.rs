@@ -1,9 +1,8 @@
 //! TUI skill picker rendering.
 
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Span, Style, Widget};
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
 use super::picker_render::{
@@ -14,7 +13,7 @@ use super::skill_picker::{SkillPickerApp, SkillPickerMode};
 use super::text_input_flow;
 
 /// Render the skill picker.
-pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>, theme: TuiTheme) {
+pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
     let Some((inner, list_y)) = render_picker_chrome(
         " Skills ",
         &Line::from_spans(vec![
@@ -46,7 +45,7 @@ pub fn render_skill_picker(app: &mut SkillPickerApp, frame: &mut Frame<'_>, them
 fn render_bottom(
     app: &mut SkillPickerApp,
     inner: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) -> u16 {
     let bottom_height = match app.mode() {
@@ -56,7 +55,7 @@ fn render_bottom(
     let bottom_y = inner.bottom().saturating_sub(bottom_height);
     if matches!(app.mode(), SkillPickerMode::Argument) {
         frame.write_line_with_fallback_style(
-            Rect::new(inner.x, bottom_y, inner.width, 1),
+            LocalRect::terminal(Rect::new(inner.x, bottom_y, inner.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 "Invocation arguments/display text:",
                 theme.muted,
@@ -66,16 +65,16 @@ fn render_bottom(
         let input_area = Rect::new(inner.x, bottom_y.saturating_add(1), inner.width, 1);
         app.argument_mut()
             .set_content_area(input_area, &text_input_flow::single_line_policy());
-        TextInput::new(app.argument().buffer())
-            .style(picker_base_style(theme))
-            .selection_style(theme.selection)
-            .placeholder("Optional arguments")
-            .placeholder_style(theme.muted)
-            .vertical_scroll(app.argument().vertical_scroll())
-            .render(input_area, frame);
+        super::picker_render::paint_picker_input(
+            app.argument_mut(),
+            input_area,
+            "Optional arguments",
+            frame,
+            theme,
+        );
     } else {
         frame.write_line_with_fallback_style(
-            Rect::new(inner.x, bottom_y, inner.width, 1),
+            LocalRect::terminal(Rect::new(inner.x, bottom_y, inner.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 "Use / palette to reopen. Activation persists for this session.",
                 theme.muted,

@@ -1,10 +1,14 @@
 //! TUI slash completion rendering.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
-use bmux_tui_components::picker_frame::{PickerFrame, PickerFramePolicy, PickerFrameStyles};
+use bmux_tui_components::picker_frame::{
+    PickerFrame, PickerFrameComponent, PickerFramePolicy, PickerFrameStyles,
+};
 
 use super::render::TuiTheme;
 use super::slash_palette::{SlashItem, SlashPalette};
@@ -17,16 +21,16 @@ const POPUP_SIDE_MARGIN: u16 = 2;
 pub fn render_palette(
     palette: &SlashPalette,
     composer_content_area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
-    let frame_area = frame.area();
+    let frame_area = Rect::new(0, 0, frame.area().width, frame.area().height);
     let composer = composer_panel_area(composer_content_area);
     let Some(area) = slash_palette_area(frame_area, composer, palette.item_count()) else {
         return;
     };
 
-    let layout = PickerFrame::new()
+    let shell = PickerFrame::new()
         .title(" Slash Commands  tab/enter accept · ↑/↓ select · esc hide ")
         .policy(PickerFramePolicy {
             chrome: true,
@@ -47,10 +51,23 @@ pub fn render_palette(
             input: theme.raised,
             list: theme.raised,
             footer: theme.raised,
-        })
-        .render(area, frame);
-
-    let inner = layout.list;
+        });
+    let component = PickerFrameComponent::new("slash", shell, TextBlock::new(""));
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+    let panel = &layout.children[0];
+    let list = panel.node.children.last().expect("list child");
+    let inner = Rect::new(
+        area.x + panel.x + list.x,
+        area.y + u16::try_from(panel.y + list.y).unwrap_or(u16::MAX),
+        list.node.size.width,
+        u16::try_from(list.node.size.height).unwrap_or(u16::MAX),
+    );
     if inner.is_empty() {
         return;
     }
@@ -61,7 +78,7 @@ pub fn render_palette(
         let y = inner.y.saturating_add(row);
         let selected = item.source_index == palette.selected_index();
         frame.write_line(
-            Rect::new(inner.x, y, inner.width, 1),
+            LocalRect::terminal(Rect::new(inner.x, y, inner.width, 1)),
             &slash_item_line(item.item, selected, inner.width, theme),
         );
     }

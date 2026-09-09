@@ -3446,7 +3446,7 @@ mod tests {
                 surface.render(
                     Rect::new(0, 0, frame.area().width, frame.area().height),
                     frame,
-                )
+                );
             })
             .expect("render authoring surface");
         drop(terminal);

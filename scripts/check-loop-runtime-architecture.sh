@@ -1555,8 +1555,8 @@ if rg -n '\bListState\b' packages/tui/src --glob '*.rs' \
   violations=1
 fi
 rm -f /tmp/bcode-tui-unapproved-list-state.txt
-if ! rg -q 'state: &mut ListState' packages/tui/src/picker_render.rs \
-  || ! rg -q '\.render\(area, frame, state\)' packages/tui/src/picker_render.rs; then
+if ! rg -q 'state: &SelectableListState' packages/tui/src/picker_render.rs \
+  || ! rg -q '\.paint\(area, state, theme.text, frame\)' packages/tui/src/picker_render.rs; then
   echo "Runtime architecture violation: the approved picker ListState adapter must remain a thin shared-list render boundary." >&2
   violations=1
 fi

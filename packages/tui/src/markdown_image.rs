@@ -1716,7 +1716,12 @@ mod tests {
         let mut buffer = bmux_tui::buffer::Buffer::empty(terminal);
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
 
-        assert!(store.present_ready("owner:image:1", destination, clip, &mut frame));
+        assert!(store.present_ready(
+            "owner:image:1",
+            destination,
+            clip,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame)
+        ));
         let [ImageContribution::Present(placement)] = frame.images() else {
             panic!("expected one presented image");
         };
@@ -1727,9 +1732,12 @@ mod tests {
             "owner:image:1",
             Rect::new(15, 8, 2, 2),
             Rect::new(0, 0, 1, 1),
-            &mut frame,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
         ));
-        MarkdownImagePresentationStore::remove_from_frame("owner:image:1", &mut frame);
+        MarkdownImagePresentationStore::remove_from_frame(
+            "owner:image:1",
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+        );
         assert!(matches!(
             frame.images().last(),
             Some(ImageContribution::Remove(key)) if key.as_str() == "markdown:owner:image:1"

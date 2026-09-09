@@ -8,13 +8,19 @@ use bcode_code_review_models::{
 };
 use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bcode_syntax_render::SyntaxHighlighter;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::{display_width, truncate_to_display_width};
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
+use bmux_tui_components::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
+};
 
 use crate::code_review_tui::{
     ReviewApp, ReviewFile, ReviewLineKind, ReviewMouseAction, ReviewPromptKind, ReviewPublishState,
@@ -118,16 +124,16 @@ const fn fallback_review_diff_theme() -> bcode_plugin_sdk::tui::PluginTuiDiffThe
 /// Render one full-screen code review frame.
 pub fn render(
     app: &mut ReviewApp,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
 ) {
-    let area = frame.area();
+    let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     if area.is_empty() {
         return;
     }
 
     let review_theme = theme.map_or_else(ReviewTheme::default, |theme| ReviewTheme::from(*theme));
-    frame.fill(area, " ", review_theme.canvas);
+    frame.fill(LocalRect::terminal(area), " ", review_theme.canvas);
     app.clear_mouse_regions();
     render_chrome(app, area, frame, review_theme);
     let diff_area = render_body(app, area, frame, review_theme);
@@ -135,7 +141,7 @@ pub fn render(
     render_overlays(app, area, frame, review_theme);
 }
 
-fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(app, header, frame, theme);
 
@@ -146,7 +152,7 @@ fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: 
 fn render_header_actions(
     app: &mut ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     if area.width == 0 {
@@ -227,7 +233,12 @@ fn render_header_actions(
     );
 }
 
-fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) -> Rect {
+fn render_body(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) -> Rect {
     let body = Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -253,7 +264,12 @@ fn render_body(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Re
     )
 }
 
-fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_sidebar(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
     render_header_actions(app, area, frame, theme);
     let content = Rect::new(
         area.x,
@@ -277,7 +293,7 @@ fn render_sidebar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme:
 fn render_main_content(
     app: &mut ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     review_theme: ReviewTheme,
 ) {
@@ -289,7 +305,12 @@ fn render_main_content(
     }
 }
 
-fn render_overlays(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_overlays(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
     if app.help_visible {
         render_help(app, area, frame, theme);
     }
@@ -309,7 +330,7 @@ fn render_overlays(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme
 
 fn render_header_button(
     app: &mut ReviewApp,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     x: u16,
     y: u16,
     label: &'static str,
@@ -320,7 +341,7 @@ fn render_header_button(
     let width = u16::try_from(text.chars().count().saturating_add(1)).unwrap_or(u16::MAX);
     let rect = Rect::new(x, y, width.saturating_sub(1), 1);
     frame.write_line_with_fallback_style(
-        rect,
+        LocalRect::terminal(rect),
         &Line::from_spans(vec![Span::styled(text, style)]),
         style,
     );
@@ -328,7 +349,7 @@ fn render_header_button(
     x.saturating_add(width)
 }
 
-fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
@@ -415,7 +436,7 @@ fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: 
         )
     };
     frame.write_line_with_fallback_style(
-        area,
+        LocalRect::terminal(area),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&text, usize::from(area.width)),
             theme.focused.add_modifier(Modifier::BOLD),
@@ -529,7 +550,7 @@ fn header_thread_label(app: &ReviewApp) -> String {
     }
 }
 
-fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_footer(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
@@ -597,7 +618,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Revi
         |message| format!(" {message}"),
     );
     frame.write_line_with_fallback_style(
-        area,
+        LocalRect::terminal(area),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&text, usize::from(area.width)),
             theme.muted,
@@ -609,7 +630,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Revi
 fn render_default_footer_hints(
     app: &ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) -> bool {
     if app.status_message.is_some()
@@ -648,15 +669,20 @@ fn render_default_footer_hints(
         ),
         KeyHint::new("q", "exit"),
     ];
-    KeyHintBar::new(&hints)
-        .styles(KeyHintBarStyles {
-            key: theme.focused,
-            label: theme.muted,
-            separator: theme.muted,
-            disabled: theme.muted,
-            background: theme.canvas,
-        })
-        .render(area, frame);
+    let hints = KeyHintBarComponent::new("review.hints", &hints).styles(KeyHintBarStyles {
+        key: theme.focused,
+        label: theme.muted,
+        separator: theme.muted,
+        disabled: theme.muted,
+        background: theme.canvas,
+    });
+    let layout = hints.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| hints.paint(&layout, cx),
+    );
     true
 }
 
@@ -680,21 +706,21 @@ fn build_footer_hint(app: &ReviewApp) -> String {
     )
 }
 
-fn render_separator(area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_separator(area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     for y in area.y..area.bottom() {
         frame.write_line(
-            Rect::new(area.x, y, 1, 1),
+            LocalRect::terminal(Rect::new(area.x, y, 1, 1)),
             &Line::from_spans(vec![Span::styled("│", theme.muted)]),
         );
     }
 }
 
-fn render_included(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_included(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
     frame.write_line(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![Span::styled(" Included", theme.focused)]),
     );
     let visible_rows = usize::from(area.height.saturating_sub(1));
@@ -705,14 +731,14 @@ fn render_included(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Re
         let marker = if source.included { "✓" } else { " " };
         let text = format!(" [{marker}] {}", source.label);
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(1)
                     .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&text, usize::from(area.width)),
                 theme.overlay,
@@ -721,17 +747,17 @@ fn render_included(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Re
     }
 }
 
-fn render_sources(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_sources(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
     frame.write_line(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![Span::styled(" Sources", theme.focused)]),
     );
     if app.workspace.sources.is_empty() {
         frame.write_line(
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 " A add source",
                 theme.muted.patch(theme.overlay),
@@ -759,14 +785,14 @@ fn render_sources(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Rev
             theme.muted.patch(theme.overlay)
         };
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(1)
                     .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&text, usize::from(area.width)),
                 style,
@@ -810,7 +836,7 @@ const fn diagnostic_severity_label(severity: ReviewSourceDiagnosticSeverity) -> 
     }
 }
 
-fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
@@ -875,7 +901,7 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: R
 fn render_file_tree(
     app: &mut ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     visible_rows: usize,
     theme: ReviewTheme,
 ) {
@@ -917,7 +943,7 @@ fn render_file_tree(
                     .unwrap_or_else(|| path.to_str().unwrap_or_default());
                 let text = format!(" {}{expanded} {name}/", "  ".repeat(*depth));
                 frame.write_line_with_fallback_style(
-                    line_area,
+                    LocalRect::terminal(line_area),
                     &Line::from_spans(vec![Span::styled(
                         truncate_to_display_width(&text, usize::from(area.width)),
                         style,
@@ -968,7 +994,7 @@ struct FileTreeFileRow<'a> {
 fn render_file_tree_file_row(
     row: &FileTreeFileRow<'_>,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let style = if row.focused {
@@ -993,7 +1019,7 @@ fn render_file_tree_file_row(
         "  ".repeat(row.depth)
     );
     frame.write_line_with_fallback_style(
-        area,
+        LocalRect::terminal(area),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&text, usize::from(area.width)),
             style,
@@ -1002,7 +1028,12 @@ fn render_file_tree_file_row(
     );
 }
 
-fn render_review_summary(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_review_summary(
+    app: &ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
     if area.is_empty() {
         return;
     }
@@ -1032,13 +1063,13 @@ fn render_review_summary(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, the
             theme.overlay
         };
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&line, usize::from(area.width)),
                 style,
@@ -1049,7 +1080,12 @@ fn render_review_summary(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, the
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_threads(
+    app: &mut ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
     if area.is_empty() {
         return;
     }
@@ -1077,7 +1113,7 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme:
             _ => app.thread_filter.label().to_string(),
         };
         frame.write_line(
-            list_area,
+            LocalRect::terminal(list_area),
             &Line::from_spans(vec![Span::styled(
                 format!(" no {label} review threads"),
                 theme.muted,
@@ -1137,7 +1173,7 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>, theme:
                 " {marker} [{state_tokens}] {kind}/{severity} {path_label}:{line_label} {external_status}{suggestion_status} {body}{agent_status}",
             );
             frame.write_line_with_fallback_style(
-                line_area,
+                LocalRect::terminal(line_area),
                 &Line::from_spans(vec![Span::styled(
                     truncate_to_display_width(&text, usize::from(list_area.width)),
                     style,
@@ -1235,7 +1271,7 @@ fn suggestion_sidebar_label(thread: &crate::code_review_tui::ReviewThreadSummary
 fn render_thread_detail(
     app: &mut ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     threads: &[crate::code_review_tui::ReviewThreadSummary],
     theme: ReviewTheme,
 ) {
@@ -1244,7 +1280,7 @@ fn render_thread_detail(
     };
     let border_style = theme.muted.patch(theme.overlay);
     frame.write_line(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![Span::styled(
             "─".repeat(usize::from(area.width)),
             border_style,
@@ -1259,7 +1295,7 @@ fn render_thread_detail(
         suggestion_sidebar_label(thread)
     );
     frame.write_line(
-        Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&title, usize::from(area.width)),
             theme.diff.hunk.patch(theme.overlay),
@@ -1326,7 +1362,7 @@ fn render_thread_detail(
             break;
         }
         frame.write_line(
-            Rect::new(area.x, y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&line, usize::from(area.width)),
                 style,
@@ -1335,7 +1371,7 @@ fn render_thread_detail(
     }
 }
 
-fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let mut x = area.x;
     x = render_header_button(
         app,
@@ -1388,7 +1424,7 @@ fn render_file_row(
     file: &ReviewFile,
     state: FileRowState<'_>,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let FileRowState {
@@ -1428,7 +1464,7 @@ fn render_file_row(
         Span::styled(path, style),
         Span::styled(counts, theme.muted.patch(style)),
     ]);
-    frame.write_line_with_fallback_style(area, &line, style);
+    frame.write_line_with_fallback_style(LocalRect::terminal(area), &line, style);
 }
 
 fn file_row_counts(file: &ReviewFile, draft_comments: usize, open_threads: usize) -> String {
@@ -1446,7 +1482,7 @@ fn file_row_counts(file: &ReviewFile, draft_comments: usize, open_threads: usize
 fn render_build_workspace(
     app: &mut ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     if area.is_empty() {
@@ -1494,7 +1530,7 @@ fn render_build_workspace(
             .y
             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&line, usize::from(area.width)),
                 style,
@@ -1696,7 +1732,7 @@ fn source_status_label(included: bool, surface_count: usize, diagnostic_count: u
 fn render_diff(
     app: &ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     review_theme: ReviewTheme,
 ) {
@@ -1734,7 +1770,7 @@ fn render_view_document(
     app: &ReviewApp,
     document: &ReviewViewDocument,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     review_theme: ReviewTheme,
 ) {
@@ -1775,7 +1811,7 @@ fn render_view_document(
             rendered.style = rendered.style.patch(review_theme.selection);
         }
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
             &rendered.line,
             rendered.style,
         );
@@ -2404,9 +2440,9 @@ fn selected_line(line: &Line, selection: Style) -> Line {
     line
 }
 
-fn render_empty(area: Rect, text: &str, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_empty(area: Rect, text: &str, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     frame.write_line(
-        area,
+        LocalRect::terminal(area),
         &Line::from_spans(vec![Span::styled(format!(" {text}"), theme.muted)]),
     );
 }
@@ -2421,7 +2457,7 @@ fn selected_surface_kind(app: &ReviewApp) -> Option<ReviewSurfaceKind> {
 fn render_materialized_file_surface(
     app: &ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let Some(file) = app.selected_file_data() else {
@@ -2461,7 +2497,12 @@ pub fn materialized_file_surface_rows(file: &ReviewFile) -> Vec<(Option<u32>, St
         .collect()
 }
 
-fn render_repository_file(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_repository_file(
+    app: &ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
     let Some(path) = app.selected_file_path() else {
         render_empty(area, "No files", frame, theme);
         return;
@@ -2646,7 +2687,7 @@ const fn syntax_style_to_tui(style: bcode_syntax_render::SyntaxStyle) -> Style {
     output
 }
 
-fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_help(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     let width = area.width.min(68);
     let height = 18;
     let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
@@ -2654,7 +2695,7 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Review
         .y
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
-    frame.fill(popup, " ", theme.overlay);
+    frame.fill(LocalRect::terminal(popup), " ", theme.overlay);
     let lines = help_lines(app);
     for (index, text) in lines.iter().enumerate() {
         let y = popup
@@ -2664,12 +2705,12 @@ fn render_help(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Review
             break;
         }
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 y,
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(text, usize::from(popup.width.saturating_sub(2))),
                 theme.overlay,
@@ -2783,7 +2824,7 @@ fn legacy_review_modal(
     area: Rect,
     width: u16,
     height: u16,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) -> Rect {
     legacy_review_modal_with_background(area, width, height, frame, theme.overlay, theme)
@@ -2793,7 +2834,7 @@ fn legacy_review_modal_with_background(
     area: Rect,
     width: u16,
     height: u16,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     background: Style,
     theme: ReviewTheme,
 ) -> Rect {
@@ -2813,14 +2854,22 @@ fn legacy_review_modal_with_background(
     )
     .placement(ModalPlacement::Centered)
     .padding(bmux_tui::geometry::Insets::all(0));
-    modal.render(area, frame);
-    modal.panel_area(area)
+    let panel = modal.panel_area(area);
+    let component = ModalFrameComponent::new("review.modal", modal, TextBlock::new(""));
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+    panel
 }
 
 fn legacy_review_modal_at(
     area: Rect,
     popup: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     background: Style,
     theme: ReviewTheme,
 ) -> Rect {
@@ -2840,11 +2889,24 @@ fn legacy_review_modal_at(
     )
     .placement(ModalPlacement::Anchored(Point::new(popup.x, popup.y)))
     .padding(bmux_tui::geometry::Insets::all(0));
-    modal.render(area, frame);
-    modal.panel_area(area)
+    let panel = modal.panel_area(area);
+    let component = ModalFrameComponent::new("review.modal", modal, TextBlock::new(""));
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+    panel
 }
 
-fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_import_modal(
+    app: &ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
     let Some(state) = &app.import_state else {
         return;
     };
@@ -2863,7 +2925,7 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme
     match state {
         crate::code_review_tui::ReviewImportState::Picker => {
             frame.write_line(
-                header,
+                LocalRect::terminal(header),
                 &Line::from_spans(vec![Span::styled(
                     " Import external review  j/k select  Enter configure/import  Esc cancel ",
                     theme.focused.add_modifier(Modifier::BOLD),
@@ -2881,7 +2943,7 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme
                     importer.label, importer.description, importer.id
                 );
                 frame.write_line_with_fallback_style(
-                    Rect::new(
+                    LocalRect::terminal(Rect::new(
                         popup.x.saturating_add(1),
                         popup
                             .y
@@ -2889,7 +2951,7 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme
                             .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
                         popup.width.saturating_sub(2),
                         1,
-                    ),
+                    )),
                     &Line::from_spans(vec![Span::styled(
                         truncate_to_display_width(
                             &line,
@@ -2905,7 +2967,7 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme
             options, selected, ..
         } => {
             frame.write_line(
-                header,
+                LocalRect::terminal(header),
                 &Line::from_spans(vec![Span::styled(
                     " Import options  Tab/j/k field  ←/→ choice  Enter import  Esc cancel ",
                     theme.focused.add_modifier(Modifier::BOLD),
@@ -2916,7 +2978,12 @@ fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme
     }
 }
 
-fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_publish_modal(
+    app: &ReviewApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
     let Some(state) = &app.publish_state else {
         return;
     };
@@ -2974,16 +3041,16 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, them
 fn render_publish_checklist(
     app: &ReviewApp,
     popup: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.y,
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             " Publish checklist  ↑/↓ thread  Space include/exclude  Enter continue  ! attention  W unviewed  P open  Esc cancel ",
             theme.selection.add_modifier(Modifier::BOLD),
@@ -3009,12 +3076,12 @@ fn render_publish_checklist(
             .y
             .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 y,
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(
                     &format!(" {line}"),
@@ -3030,16 +3097,16 @@ fn render_publish_checklist(
 fn render_publisher_picker(
     app: &ReviewApp,
     popup: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.y,
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             " Publish review  Enter preview  Esc cancel ",
             theme.focused.add_modifier(Modifier::BOLD),
@@ -3065,12 +3132,12 @@ fn render_publisher_picker(
             .y
             .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 y,
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&text, usize::from(popup.width.saturating_sub(2))),
                 style,
@@ -3084,16 +3151,16 @@ fn render_publish_options(
     options: &[crate::code_review_tui::ReviewPublishOption],
     selected: usize,
     popup: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.y,
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             " Publisher options  Enter preview  Tab next  ←/→ choice  Esc cancel ",
             theme.focused.add_modifier(Modifier::BOLD),
@@ -3120,12 +3187,12 @@ fn render_publish_options(
             .y
             .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 y,
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&text, usize::from(popup.width.saturating_sub(2))),
                 style,
@@ -3147,7 +3214,7 @@ struct PublishPreview<'a> {
 fn render_publish_preview(
     preview: PublishPreview<'_>,
     popup: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let PublishPreview {
@@ -3158,12 +3225,12 @@ fn render_publish_preview(
         confirming,
     } = preview;
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.y,
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             if confirming {
                 format!(" Confirm submit {publisher_id}  Enter publish  Esc cancel ")
@@ -3185,12 +3252,12 @@ fn render_publish_preview(
             .y
             .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 y,
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(line, usize::from(popup.width.saturating_sub(2))),
                 theme.overlay,
@@ -3200,12 +3267,12 @@ fn render_publish_preview(
     if confirming {
         let warning = " This will publish the review. Press Enter again to submit. ";
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 popup.bottom().saturating_sub(1),
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(warning, usize::from(popup.width.saturating_sub(2))),
                 theme.diff.hunk.patch(theme.overlay),
@@ -3217,7 +3284,7 @@ fn render_publish_preview(
 fn render_comment_editor(
     app: &mut ReviewApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let editor = app.comment_editor.clone();
@@ -3252,12 +3319,12 @@ fn render_comment_editor(
     render_comment_editor_body(editor, popup, text_height, frame, theme);
     if editor.buffer.text().is_empty() {
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 popup.y.saturating_add(2),
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 "write a review comment or question...",
                 theme.muted.patch(theme.overlay),
@@ -3296,12 +3363,12 @@ fn comment_editor_title(editor: &crate::code_review_tui::ReviewCommentEditor) ->
 fn render_comment_editor_header(
     editor: &crate::code_review_tui::ReviewCommentEditor,
     popup: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let title = comment_editor_title(editor);
     frame.write_line(
-        Rect::new(popup.x, popup.y, popup.width, 1),
+        LocalRect::terminal(Rect::new(popup.x, popup.y, popup.width, 1)),
         &Line::from_spans(vec![Span::styled(
             title,
             theme.focused.add_modifier(Modifier::BOLD),
@@ -3335,12 +3402,12 @@ fn render_comment_editor_header(
         }
     );
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.y.saturating_add(1),
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&anchor, usize::from(popup.width.saturating_sub(2))),
             theme.muted.patch(theme.overlay),
@@ -3352,17 +3419,17 @@ fn render_comment_editor_footer(
     app: &mut ReviewApp,
     editor: &crate::code_review_tui::ReviewCommentEditor,
     popup: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let footer = comment_editor_footer(editor);
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.bottom().saturating_sub(1),
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(&footer, usize::from(popup.width.saturating_sub(2))),
             theme.diff.hunk.patch(theme.overlay),
@@ -3474,7 +3541,7 @@ fn render_comment_editor_body(
     editor: &crate::code_review_tui::ReviewCommentEditor,
     popup: Rect,
     text_height: usize,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     if editor.preview {
@@ -3488,7 +3555,7 @@ fn render_comment_editor_preview(
     editor: &crate::code_review_tui::ReviewCommentEditor,
     popup: Rect,
     text_height: usize,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let preview_width = popup.width.saturating_sub(2).max(1);
@@ -3505,7 +3572,7 @@ fn render_comment_editor_preview(
             spans.push(Span::styled(String::new(), theme.overlay));
         }
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 popup
                     .y
@@ -3513,7 +3580,7 @@ fn render_comment_editor_preview(
                     .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
                 preview_width,
                 1,
-            ),
+            )),
             &Line::from_spans(spans),
             theme.overlay,
         );
@@ -3524,12 +3591,12 @@ fn render_comment_editor_text(
     editor: &crate::code_review_tui::ReviewCommentEditor,
     popup: Rect,
     text_height: usize,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     for (index, line) in editor.buffer.text().lines().take(text_height).enumerate() {
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 popup
                     .y
@@ -3537,7 +3604,7 @@ fn render_comment_editor_text(
                     .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(line, usize::from(popup.width.saturating_sub(2))),
                 theme.overlay,
@@ -3599,7 +3666,7 @@ fn render_add_source_menu(
     prompt: &crate::code_review_tui::ReviewPromptState,
     popup: Rect,
     height: u16,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     render_source_menu_items(prompt, add_source_menu_items(), popup, height, frame, theme);
@@ -3609,7 +3676,7 @@ fn render_advanced_source_menu(
     prompt: &crate::code_review_tui::ReviewPromptState,
     popup: Rect,
     height: u16,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     render_source_menu_items(
@@ -3627,7 +3694,7 @@ fn render_source_menu_items(
     items: &[crate::code_review_tui::AddSourceMenuItem],
     popup: Rect,
     height: u16,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     for (row, item) in items
@@ -3642,14 +3709,14 @@ fn render_source_menu_items(
         };
         let text = format!(" {:<16} {}", item.label, item.help);
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 popup
                     .y
                     .saturating_add(2 + u16::try_from(row).unwrap_or(u16::MAX)),
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(&text, usize::from(popup.width.saturating_sub(2))),
                 style,
@@ -3658,7 +3725,7 @@ fn render_source_menu_items(
     }
 }
 
-fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewTheme) {
+fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     let Some(prompt) = &app.prompt_state else {
         return;
     };
@@ -3671,7 +3738,7 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Revi
         legacy_review_modal_with_background(area, width, height, frame, theme.overlay, theme);
     let title = prompt_title(&prompt.kind);
     frame.write_line(
-        Rect::new(popup.x, popup.y, popup.width, 1),
+        LocalRect::terminal(Rect::new(popup.x, popup.y, popup.width, 1)),
         &Line::from_spans(vec![Span::styled(
             title,
             theme
@@ -3681,12 +3748,12 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Revi
     );
     let query = prompt.buffer.text();
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.y.saturating_add(1),
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(query, usize::from(popup.width.saturating_sub(2))),
             theme.overlay,
@@ -3717,12 +3784,12 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>, theme: Revi
         _ => {}
     }
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup.bottom().saturating_sub(1),
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             prompt_footer_text(&prompt.kind),
             theme.selection,
@@ -3736,7 +3803,7 @@ fn render_add_repository_file_picker(
     popup: Rect,
     height: u16,
     query: &str,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     for (row, path) in app
@@ -3755,7 +3822,7 @@ fn render_add_repository_commit_picker(
     popup: Rect,
     height: u16,
     query: &str,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     for (row, commit) in app
@@ -3781,7 +3848,7 @@ fn render_add_repository_branch_picker(
     popup: Rect,
     height: u16,
     query: &str,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     for (row, branch) in app
@@ -3800,7 +3867,7 @@ fn render_file_picker(
     popup: Rect,
     height: u16,
     query: &str,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     for (row, index) in app
@@ -3825,7 +3892,7 @@ fn render_prompt_choice(
     selected: usize,
     popup: Rect,
     text: &str,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
     let style = if row == selected {
@@ -3834,14 +3901,14 @@ fn render_prompt_choice(
         theme.overlay
     };
     frame.write_line(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             popup.x.saturating_add(1),
             popup
                 .y
                 .saturating_add(2 + u16::try_from(row).unwrap_or(u16::MAX)),
             popup.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             truncate_to_display_width(text, usize::from(popup.width.saturating_sub(2))),
             style,
@@ -3903,7 +3970,7 @@ mod tests {
     ) -> String {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
         let mut frame = Frame::new(&mut buffer);
-        render(app, &mut frame, theme);
+        render(app, &mut PaintCx::new(&mut frame), theme);
         (0..buffer.area().height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()
@@ -3924,7 +3991,11 @@ mod tests {
 
         let area = Rect::new(0, 0, 100, 24);
         let mut buffer = Buffer::empty(area);
-        render(&mut app, &mut Frame::new(&mut buffer), Some(&theme));
+        render(
+            &mut app,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            Some(&theme),
+        );
         let popup = Rect::new(16, 3, 68, 18);
 
         assert_eq!(

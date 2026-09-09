@@ -4655,7 +4655,7 @@ mod tests {
             fn render(
                 &mut self,
                 _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::frame::Frame<'_>,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
             ) {
             }
 
@@ -5053,7 +5053,7 @@ mod tests {
             fn render(
                 &mut self,
                 _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::frame::Frame<'_>,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
             ) {
             }
 
@@ -5127,6 +5127,7 @@ mod tests {
 
     #[tokio::test]
     async fn stable_interaction_redraw_matches_full_presentation() {
+        use bmux_tui::{geometry::Rect, paint::PaintCx, prelude::Line};
         struct CountingSurface(usize);
 
         impl bcode_plugin_sdk::tui::PluginTuiSurface for CountingSurface {
@@ -5138,12 +5139,11 @@ mod tests {
                 "Counting test"
             }
 
-            fn render(
-                &mut self,
-                area: bmux_tui::geometry::Rect,
-                frame: &mut bmux_tui::frame::Frame<'_>,
-            ) {
-                frame.write_line(area, &bmux_tui::prelude::Line::from(self.0.to_string()));
+            fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+                frame.write_line(
+                    bmux_tui::paint::LocalRect::terminal(area),
+                    &Line::from(self.0.to_string()),
+                );
             }
 
             fn handle_event(
@@ -5185,7 +5185,7 @@ mod tests {
             super::BcodeRuntimeModel::new(chat, settings, loop_state)
         }
 
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let area = Rect::new(0, 0, 80, 24);
         let mut partial = model();
         let mut full = model();
         let mut partial_bytes = Vec::new();
@@ -5593,7 +5593,7 @@ mod tests {
             fn render(
                 &mut self,
                 _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::frame::Frame<'_>,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
             ) {
             }
 
@@ -5748,7 +5748,7 @@ mod tests {
             fn render(
                 &mut self,
                 _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::frame::Frame<'_>,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
             ) {
             }
 
@@ -5812,7 +5812,7 @@ mod tests {
             fn render(
                 &mut self,
                 _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::frame::Frame<'_>,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
             ) {
             }
 
@@ -6335,7 +6335,7 @@ mod tests {
             fn render(
                 &mut self,
                 _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::frame::Frame<'_>,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
             ) {
             }
 
@@ -6398,7 +6398,7 @@ mod tests {
             fn render(
                 &mut self,
                 _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::frame::Frame<'_>,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
             ) {
             }
 

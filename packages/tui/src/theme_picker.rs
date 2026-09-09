@@ -1,7 +1,7 @@
 //! Interactive theme picker state.
 
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::list::ListState;
+use bmux_tui_components::selectable_list::SelectableListState as ListState;
 
 use std::collections::BTreeMap;
 

@@ -736,14 +736,14 @@ impl ChatLoopState {
     ) -> Option<CommandDispatchRequest> {
         let palette = self.palette.as_mut()?;
         match palette.handle_key(stroke, 12) {
-            bmux_tui::palette::CommandPaletteKeyOutcome::Ignored
-            | bmux_tui::palette::CommandPaletteKeyOutcome::QueryEdited
-            | bmux_tui::palette::CommandPaletteKeyOutcome::SelectionMoved => None,
-            bmux_tui::palette::CommandPaletteKeyOutcome::Canceled => {
+            super::command_palette::CommandPaletteKeyOutcome::Ignored
+            | super::command_palette::CommandPaletteKeyOutcome::QueryEdited
+            | super::command_palette::CommandPaletteKeyOutcome::SelectionMoved => None,
+            super::command_palette::CommandPaletteKeyOutcome::Canceled => {
                 self.palette = None;
                 None
             }
-            bmux_tui::palette::CommandPaletteKeyOutcome::Activated(index) => {
+            super::command_palette::CommandPaletteKeyOutcome::Activated(index) => {
                 let request = palette
                     .contribution_at(index)
                     .map(CommandDispatchRequest::from_contribution);
@@ -4138,7 +4138,11 @@ const fn markdown_mermaid_destination_rect(placeholder: Rect) -> Rect {
     placeholder
 }
 
-fn write_markdown_fallback(frame: &mut bmux_tui::frame::Frame<'_>, area: Rect, fallback: &str) {
+fn write_markdown_fallback(
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    area: Rect,
+    fallback: &str,
+) {
     if area.is_empty() {
         return;
     }
@@ -4148,7 +4152,12 @@ fn write_markdown_fallback(frame: &mut bmux_tui::frame::Frame<'_>, area: Rect, f
         let text = lines.get(usize::from(row)).copied().unwrap_or_default();
         let text = bmux_tui::text_width::truncate_to_display_width(text, width);
         frame.write_line(
-            Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+            bmux_tui::paint::LocalRect::terminal(Rect::new(
+                area.x,
+                area.y.saturating_add(row),
+                area.width,
+                1,
+            )),
             &bmux_tui::prelude::Line::raw(text),
         );
     }
@@ -4538,7 +4547,7 @@ pub fn draw_chat_frame<W: Write>(
         if let Some(configurator) = &mut loop_state.streaming_configurator {
             let geometry = super::streaming_configurator_render::streaming_configurator_geometry(
                 configurator,
-                frame.area(),
+                Rect::new(0, 0, frame.area().width, frame.area().height),
                 theme,
             );
             configurator.commit_geometry(geometry);
@@ -4564,7 +4573,11 @@ pub fn draw_chat_frame<W: Write>(
             && !surface_area.is_empty()
         {
             if pinned {
-                frame.fill(surface_area, " ", bmux_tui::prelude::Style::new());
+                frame.fill(
+                    bmux_tui::paint::LocalRect::terminal(surface_area),
+                    " ",
+                    bmux_tui::prelude::Style::new(),
+                );
                 surface.render_slice(
                     interaction_rows.unwrap_or(surface_area.height),
                     pinned_offset,
@@ -4584,7 +4597,7 @@ pub fn draw_chat_frame<W: Write>(
             super::session_picker_render::render_picker(picker, frame, theme);
         }
         if let Some(surface) = &mut loop_state.plugin_surface {
-            let area = frame.area();
+            let area = Rect::new(0, 0, frame.area().width, frame.area().height);
             let plugin_theme = render::plugin_theme_for_app(&chat.app);
             surface
                 .surface
@@ -4720,7 +4733,11 @@ fn draw_temporal_frame<W: Write>(
             && intersects(geometry.destination)
         {
             if geometry.placement == InteractiveSurfacePlacement::Pinned {
-                frame.fill(geometry.destination, " ", bmux_tui::prelude::Style::new());
+                frame.fill(
+                    bmux_tui::paint::LocalRect::terminal(geometry.destination),
+                    " ",
+                    bmux_tui::prelude::Style::new(),
+                );
             }
             surface.render_slice(
                 geometry.logical_height,
@@ -5480,7 +5497,7 @@ mod scheduler_tests {
             "Passive test"
         }
 
-        fn render(&mut self, _area: Rect, _frame: &mut bmux_tui::frame::Frame<'_>) {}
+        fn render(&mut self, _area: Rect, _frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {}
 
         fn handle_event(
             &mut self,

@@ -1,8 +1,10 @@
 //! Rendering for the onboarding setup-map shell.
 
 use bcode_settings::{SettingsDbHealth, SetupReadinessReport};
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
@@ -33,12 +35,12 @@ pub const fn onboarding_board_area(area: Rect) -> Rect {
 /// Render the onboarding shell into a terminal frame.
 pub fn render_onboarding(
     shell: &OnboardingShell,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     health: &SettingsDbHealth,
     readiness: Option<SetupReadinessReport>,
     theme: &PresentedTheme,
 ) {
-    let area = frame.area();
+    let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     let model = shell.render_model(health, readiness);
     render_hero_panel(area, frame, theme);
 
@@ -95,7 +97,7 @@ pub fn render_onboarding(
     }
 }
 
-fn render_hero_panel(area: Rect, frame: &mut Frame<'_>, theme: &PresentedTheme) {
+fn render_hero_panel(area: Rect, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
     let hero = Rect::new(
         area.x.saturating_add(1),
         area.y.saturating_add(1),
@@ -104,12 +106,12 @@ fn render_hero_panel(area: Rect, frame: &mut Frame<'_>, theme: &PresentedTheme) 
     );
     render_box(hero, "Welcome to Bcode", theme.focused, frame);
     frame.write_line_with_fallback_style(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             hero.x.saturating_add(2),
             hero.y.saturating_add(1),
             hero.width.saturating_sub(4),
             1,
-        ),
+        )),
         &Line::from_spans(vec![
             Span::styled(
                 "Set up your workspace",
@@ -123,12 +125,12 @@ fn render_hero_panel(area: Rect, frame: &mut Frame<'_>, theme: &PresentedTheme) 
         Style::new(),
     );
     frame.write_line_with_fallback_style(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             hero.x.saturating_add(2),
             hero.y.saturating_add(2),
             hero.width.saturating_sub(4),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             "Connect a provider, choose a model, and review permissions. Optional settings can wait.",
             theme.text,
@@ -141,7 +143,7 @@ fn render_setup_map_panel(
     shell: &OnboardingShell,
     board_area: Rect,
     panel_area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: &PresentedTheme,
 ) {
     render_box(panel_area, "Setup", theme.border, frame);
@@ -156,12 +158,12 @@ fn render_setup_map_panel(
         let label = section.section_id.as_str().replace('_', " ");
         let text = format!("{} {}", if selected { ">" } else { " " }, label);
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 board_area.x,
                 board_area.y.saturating_add(offset),
                 board_area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 text,
                 if selected { theme.focused } else { theme.text },
@@ -175,7 +177,7 @@ fn render_confirmation_modal(
     title: &str,
     body: &str,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: &PresentedTheme,
 ) {
     let modal_width = area.width.saturating_mul(2) / 3;
@@ -191,7 +193,7 @@ fn render_confirmation_modal(
     let lines = [body, "Press y to confirm, n or Esc to cancel."];
     for (offset, line) in lines.iter().enumerate() {
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 modal.x.saturating_add(2),
                 modal
                     .y
@@ -199,7 +201,7 @@ fn render_confirmation_modal(
                     .saturating_add(u16::try_from(offset).unwrap_or(0)),
                 modal.width.saturating_sub(4),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 (*line).to_owned(),
                 theme.warning.add_modifier(Modifier::BOLD),
@@ -215,7 +217,7 @@ fn render_detail_panel(
     status: &str,
     actions: &[String],
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: &PresentedTheme,
 ) {
     render_box(area, "Story Card", theme.border, frame);
@@ -231,7 +233,12 @@ fn render_detail_panel(
             return;
         }
         frame.write_line_with_fallback_style(
-            Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(4), 1),
+            LocalRect::terminal(Rect::new(
+                area.x.saturating_add(2),
+                y,
+                area.width.saturating_sub(4),
+                1,
+            )),
             &Line::from_spans(vec![Span::styled(line, theme.text)]),
             Style::new(),
         );
@@ -242,7 +249,12 @@ fn render_detail_panel(
             return;
         }
         frame.write_line_with_fallback_style(
-            Rect::new(area.x.saturating_add(4), y, area.width.saturating_sub(6), 1),
+            LocalRect::terminal(Rect::new(
+                area.x.saturating_add(4),
+                y,
+                area.width.saturating_sub(6),
+                1,
+            )),
             &Line::from_spans(vec![Span::styled(format!("• {action}"), theme.info)]),
             Style::new(),
         );
@@ -250,15 +262,20 @@ fn render_detail_panel(
     }
 }
 
-fn render_status_line(text: &str, y: u16, area: Rect, style: Style, frame: &mut Frame<'_>) {
+fn render_status_line(text: &str, y: u16, area: Rect, style: Style, frame: &mut PaintCx<'_, '_>) {
     frame.write_line_with_fallback_style(
-        Rect::new(area.x.saturating_add(2), y, area.width.saturating_sub(4), 1),
+        LocalRect::terminal(Rect::new(
+            area.x.saturating_add(2),
+            y,
+            area.width.saturating_sub(4),
+            1,
+        )),
         &Line::from_spans(vec![Span::styled(text.to_owned(), style)]),
         Style::new(),
     );
 }
 
-fn render_box(area: Rect, title: &str, style: Style, frame: &mut Frame<'_>) {
+fn render_box(area: Rect, title: &str, style: Style, frame: &mut PaintCx<'_, '_>) {
     if area.width < 4 || area.height < 2 {
         return;
     }
@@ -266,17 +283,17 @@ fn render_box(area: Rect, title: &str, style: Style, frame: &mut Frame<'_>) {
     let top = format!("╭{horizontal}╮");
     let bottom = format!("╰{horizontal}╯");
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![Span::styled(top, style)]),
         Style::new(),
     );
     frame.write_line_with_fallback_style(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             area.x.saturating_add(2),
             area.y,
             area.width.saturating_sub(4),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             format!(" {title} "),
             style.add_modifier(Modifier::BOLD),
@@ -285,23 +302,28 @@ fn render_box(area: Rect, title: &str, style: Style, frame: &mut Frame<'_>) {
     );
     for y in area.y.saturating_add(1)..area.y.saturating_add(area.height).saturating_sub(1) {
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, y, 1, 1),
+            LocalRect::terminal(Rect::new(area.x, y, 1, 1)),
             &Line::from_spans(vec![Span::styled("│", style)]),
             Style::new(),
         );
         frame.write_line_with_fallback_style(
-            Rect::new(area.x.saturating_add(area.width).saturating_sub(1), y, 1, 1),
+            LocalRect::terminal(Rect::new(
+                area.x.saturating_add(area.width).saturating_sub(1),
+                y,
+                1,
+                1,
+            )),
             &Line::from_spans(vec![Span::styled("│", style)]),
             Style::new(),
         );
     }
     frame.write_line_with_fallback_style(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             area.x,
             area.y.saturating_add(area.height).saturating_sub(1),
             area.width,
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(bottom, style)]),
         Style::new(),
     );
@@ -330,7 +352,7 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             render_onboarding(
                 shell,
-                &mut Frame::new(&mut buffer),
+                &mut PaintCx::new(&mut Frame::new(&mut buffer)),
                 &SettingsDbHealth::Available,
                 None,
                 &theme,

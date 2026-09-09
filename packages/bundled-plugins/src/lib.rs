@@ -418,6 +418,7 @@ fn question_plugin() -> bcode_plugin::StaticBundledPlugin {
 }
 
 #[cfg(feature = "static-bundled-loop-plugin")]
+#[must_use]
 pub fn static_loop_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/loop-plugin/bcode-plugin.toml"),
@@ -691,6 +692,7 @@ mod tests {
                 .any(|command| command.slash_name() == Some("clone"))
         );
 
+        drop(host);
         let selection = bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::All,
             enabled: std::collections::BTreeSet::new(),
@@ -707,6 +709,7 @@ mod tests {
                 .iter()
                 .all(|command| !matches!(command.slash_name(), Some("fork" | "clone")))
         );
+        drop(host);
     }
 
     #[cfg(feature = "static-bundled-loop-plugin")]
@@ -753,6 +756,7 @@ mod tests {
                 })
         );
 
+        drop(host);
         let selection = bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::All,
             enabled: std::collections::BTreeSet::new(),
@@ -790,6 +794,7 @@ mod tests {
                 .iter()
                 .all(|(plugin_id, _)| plugin_id != "bcode.loop")
         );
+        drop(host);
     }
 
     #[cfg(not(any(
@@ -1001,7 +1006,14 @@ mod tests {
                 )
                 .is_none()
         );
+    }
 
+    #[cfg(feature = "static-bundled-vim-edit-plugin")]
+    #[test]
+    fn vim_edit_explicit_selection_respects_disabling() {
+        let static_plugins = super::static_bundled_plugins();
+        let default_ids = bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)
+            .expect("manifests parse");
         let mut explicitly_enabled_config = bcode_config::BcodeConfig::default();
         explicitly_enabled_config
             .plugins

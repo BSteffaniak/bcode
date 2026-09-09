@@ -17,8 +17,8 @@ use bcode_code_review_models::{
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::Event;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 use bmux_tui::terminal::Terminal;
@@ -759,14 +759,14 @@ impl PluginTuiSurface for ReviewHomeSurface {
         "Code Review Home"
     }
 
-    fn render(&mut self, _area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, _area: Rect, frame: &mut PaintCx<'_, '_>) {
         render(&self.app, frame, ReviewHomeTheme::resolve(None));
     }
 
     fn render_with_theme(
         &mut self,
         _area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         render(&self.app, frame, ReviewHomeTheme::resolve(theme));
@@ -1579,9 +1579,9 @@ async fn create_workspace_with_sources(
     Ok(response.workspace)
 }
 
-fn render(app: &ReviewHomeApp, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
-    let area = frame.area();
-    frame.fill(area, " ", theme.canvas);
+fn render(app: &ReviewHomeApp, frame: &mut PaintCx<'_, '_>, theme: ReviewHomeTheme) {
+    let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+    frame.fill(LocalRect::terminal(area), " ", theme.canvas);
     render_header(app, area, frame, theme);
     let body = Rect::new(
         area.x,
@@ -1596,9 +1596,14 @@ fn render(app: &ReviewHomeApp, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
     }
 }
 
-fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
+fn render_header(
+    app: &ReviewHomeApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewHomeTheme,
+) {
     frame.write_line(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![Span::styled(
             format!(" Bcode Reviews  {} ", review_home_summary_label(app)),
             theme.focused.add_modifier(Modifier::BOLD),
@@ -1606,7 +1611,7 @@ fn render_header(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>, theme: 
     );
     let filter_label = active_filter_label(app);
     frame.write_line(
-        Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
         &Line::from_spans(vec![Span::styled(
             format!(
                 " {filter_label}  enter open   c latest   n new   u/s/w/l/v presets   S setup   F drafts   / search   ? help "
@@ -1703,7 +1708,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
 fn render_workspaces(
     app: &ReviewHomeApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
 ) {
     if app.details_visible && area.width >= 80 {
@@ -1726,7 +1731,7 @@ fn render_workspaces(
 fn render_empty_review_home(
     app: &ReviewHomeApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
 ) {
     let lines = [
@@ -1747,13 +1752,13 @@ fn render_empty_review_home(
             theme.text
         };
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(format!(" {line}"), style)]),
         );
     }
@@ -1764,7 +1769,7 @@ fn render_empty_review_home(
             .saturating_add(1);
         if y < area.bottom() {
             frame.write_line(
-                Rect::new(area.x, y, area.width, 1),
+                LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
                 &Line::from_spans(vec![Span::styled(format!(" {message}"), theme.focused)]),
             );
         }
@@ -1774,7 +1779,7 @@ fn render_empty_review_home(
 fn render_workspace_list(
     app: &ReviewHomeApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
 ) {
     let visible = app.visible_indices();
@@ -1784,7 +1789,7 @@ fn render_workspace_list(
     }
     if visible.is_empty() {
         frame.write_line(
-            Rect::new(area.x, area.y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 if app.draft_filter_active {
                     " No review workspaces with drafts match the active filters."
@@ -1819,13 +1824,13 @@ fn render_workspace_list(
         let status = workspace_health_label(item);
         let text = format!("{status:8}  {}", workspace_row_text(item));
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(text, style)]),
         );
     }
@@ -1834,12 +1839,12 @@ fn render_workspace_list(
 fn render_workspace_details(
     app: &ReviewHomeApp,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
 ) {
     let Some(index) = app.selected_workspace_index() else {
         frame.write_line(
-            Rect::new(area.x, area.y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
             &Line::from_spans(vec![Span::styled(" No review selected", theme.muted)]),
         );
         return;
@@ -1911,13 +1916,13 @@ fn render_workspace_details(
     }
     for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 line.clone(),
                 if row == 0 {
@@ -2189,7 +2194,7 @@ fn relative_time_label(timestamp_ms: u64) -> String {
     }
 }
 
-fn render_help(area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
+fn render_help(area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewHomeTheme) {
     let lines = review_home_help_lines();
     let width = area.width.min(72);
     let height = area.height.min(
@@ -2205,7 +2210,11 @@ fn render_help(area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
         .y
         .saturating_add(area.height.saturating_sub(height) / 2);
     let popup = Rect::new(x, y, width, height);
-    frame.fill(popup, " ", theme.canvas.patch(theme.text));
+    frame.fill(
+        LocalRect::terminal(popup),
+        " ",
+        theme.canvas.patch(theme.text),
+    );
     for (index, text) in lines.iter().enumerate() {
         let y = popup
             .y
@@ -2215,12 +2224,12 @@ fn render_help(area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
             break;
         }
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 popup.x.saturating_add(1),
                 y,
                 popup.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 text.to_string(),
                 theme.canvas.patch(theme.text),
@@ -2229,7 +2238,12 @@ fn render_help(area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
     }
 }
 
-fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>, theme: ReviewHomeTheme) {
+fn render_footer(
+    app: &ReviewHomeApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewHomeTheme,
+) {
     let text = app.new_review_buffer.as_ref().map_or_else(
         || {
             app.rename_buffer.as_ref().map_or_else(
@@ -2264,7 +2278,12 @@ fn render_footer(app: &ReviewHomeApp, area: Rect, frame: &mut Frame<'_>, theme: 
         },
     );
     frame.write_line(
-        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+        LocalRect::terminal(Rect::new(
+            area.x,
+            area.bottom().saturating_sub(1),
+            area.width,
+            1,
+        )),
         &Line::from_spans(vec![Span::styled(
             text.as_str(),
             theme.canvas.patch(theme.text),

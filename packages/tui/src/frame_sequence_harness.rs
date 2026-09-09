@@ -193,7 +193,7 @@ impl<'a> TranscriptFrameSequence<'a> {
         }
         let mut buffer = Buffer::empty(Rect::new(0, 0, self.width, self.height));
         let mut frame = Frame::new(&mut buffer);
-        render::render(self.app, &mut frame);
+        render::render(self.app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
         let text = (0..buffer.area().height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()

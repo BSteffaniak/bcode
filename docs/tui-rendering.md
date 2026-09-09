@@ -7,19 +7,21 @@ recipes from `bcode_tui_components`. Production consumers request exact componen
 repository checks those requests with `scripts/check-tui-component-features.sh` and prohibits the
 `all` convenience bundle in production manifests.
 
-Direct `bmux_tui` primitives remain valid only for thin terminal-boundary adaptation that shared
-components cannot own coherently: full-canvas underpaint, bounded scratch-frame clipping, terminal
-image placement, domain-specific map/diff drawing, and component internals. Two Bcode picker list
-adapters remain nested inside shared `PickerFrame`/`ModalFrame` composition, while Eval and Metrics
-adapt their domain rows into BMUX tables. `scripts/check-loop-runtime-architecture.sh` mechanically
-rejects new raw reusable controls outside these classified adapters.
+Terminal painting uses the root `PaintCx` supplied by BMUX and scoped child contexts. Cells,
+images, cursor, selection and hits pass through that boundary; application code does not regain
+mutable frame buffers. Measured `Surface`, `PickerFrameComponent`, `ModalFrameComponent`,
+`TextInputComponent`, lists, tables and charts replace removed area-assigned widgets. Native plugin
+surface painting uses `PaintCx`; serialized row adapters retain their portable fallback contract.
+The composer recipe owns its editor child, and interactive surface clipping uses child-context
+translation rather than copying scratch-buffer cells.
 
-The generic component crate intentionally retains `bmux_keyboard` and `bmux_text_edit` through
-`bmux_tui`'s baseline. The primitive crate's public event, focus, list, viewport, picker, palette,
-history, and text-input APIs expose those types directly; splitting them would be a separate
-primitive-API redesign, not component feature isolation. Component-owned optional dependencies such
-as terminal-grid and Unicode helpers remain feature-gated and are checked by BMUX's complete feature
-matrix.
+Picker filtering and command activation remain Bcode-owned. Generic selectable-list and scroll-view
+state provide viewport mechanics. The setup board retains domain-specific drag-to-pan gestures.
+Component-owned optional dependencies remain feature-gated; the repository checks exact consumer
+features, including `scroll-view`, `selectable-list`, and `text-input`.
+
+BMUX dependencies continue to follow `branch = "master"`. Cargo.lock records the resolved published
+commit; no local path override or fixed `rev` dependency is required.
 
 ## Theme ownership
 

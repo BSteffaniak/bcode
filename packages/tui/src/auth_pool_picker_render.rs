@@ -1,6 +1,6 @@
 //! TUI auth-pool picker rendering.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Span};
 
 use super::auth_pool_picker::AuthPoolPickerApp;
@@ -10,7 +10,7 @@ use super::render::TuiTheme;
 /// Render the auth-pool profile picker.
 pub fn render_auth_pool_picker(
     app: &mut AuthPoolPickerApp,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
     let mut unused_filter = super::text_input_flow::empty_state();

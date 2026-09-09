@@ -2,11 +2,12 @@
 
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::Event;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
-use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Span, Style, Widget};
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Span, Style};
+use bmux_tui_components::text_input::TextInputComponent;
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 
 use super::theme::PresentedTheme;
@@ -101,8 +102,8 @@ impl SetupSettingsForm {
     }
 
     /// Render form fields and review state within the existing terminal.
-    pub fn render(&mut self, frame: &mut Frame<'_>, theme: &PresentedTheme) {
-        let area = frame.area();
+    pub fn render(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
+        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         let policy = TextInputPolicy::default();
         let labels = [
             "Configuration file",
@@ -135,11 +136,22 @@ impl SetupSettingsForm {
             );
             let rect = Rect::new(area.x + 2, y + 1, area.width.saturating_sub(4), 1);
             input.set_content_area(rect, &policy);
-            TextInput::new(input.buffer())
-                .style(theme.text)
-                .selection_style(theme.focused)
-                .cursor_visible(index == self.focused && self.pending.is_none())
-                .render(rect, frame);
+            let retained = std::cell::RefCell::new(input.clone());
+            let policy = TextInputPolicy::default();
+            let editor =
+                TextInputComponent::new(format!("setup_settings_form.{index}"), &retained, &policy)
+                    .style(theme.text)
+                    .selection_style(theme.focused)
+                    .focused(index == self.focused && self.pending.is_none());
+            let layout = editor.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(rect.x),
+                i64::from(rect.y),
+                LocalRect::new(0, 0, rect.width, rect.height),
+                |cx| editor.paint(&layout, cx),
+            );
+            *input = retained.into_inner();
+            input.set_content_area(rect, &policy);
         }
         write(
             frame,
@@ -155,9 +167,9 @@ impl SetupSettingsForm {
     }
 }
 
-fn write(frame: &mut Frame<'_>, area: Rect, text: &str, style: Style) {
+fn write(frame: &mut PaintCx<'_, '_>, area: Rect, text: &str, style: Style) {
     frame.write_line_with_fallback_style(
-        area,
+        LocalRect::terminal(area),
         &Line::from_spans(vec![Span::styled(text, style)]),
         Style::new(),
     );

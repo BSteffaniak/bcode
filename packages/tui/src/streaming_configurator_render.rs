@@ -1,14 +1,17 @@
 //! Terminal rendering for the streaming presentation configurator.
 
-use bmux_tui::frame::Frame;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::{Surface, TextBlock};
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::prelude::{Border, Line, Panel, Span, Text, TextBlock, TextWrap, Widget};
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Border, Line, Span, Text, TextWrap};
 use bmux_tui::style::Modifier;
 use bmux_tui::text::wrap_line_word;
-use bmux_tui_components::action_row::ActionRow;
 use bmux_tui_components::button::ButtonStyles;
-use bmux_tui_components::checkbox::{Checkbox, CheckboxStyles};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing};
+use bmux_tui_components::checkbox::CheckboxStyles;
+use bmux_tui_components::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing,
+};
 
 use super::render::TuiTheme;
 use super::streaming_configurator::{
@@ -98,19 +101,21 @@ pub fn streaming_configurator_geometry(
 /// Render the opaque streaming configurator surface.
 pub fn render_streaming_configurator(
     state: &StreamingConfiguratorState,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
     let modal = configurator_modal(theme);
-    modal.render(frame.area(), frame);
-    let content = modal.content_area(frame.area());
+    let root = Rect::new(0, 0, frame.area().width, frame.area().height);
+    let content = modal.content_area(root);
+    let shell = ModalFrameComponent::new("streaming.modal", modal, TextBlock::new(""));
+    paint_component(&shell, root, frame);
     if content.width < MIN_USEFUL_WIDTH || content.height < MIN_USEFUL_HEIGHT {
-        TextBlock::new(
+        let notice = TextBlock::new(
             "The terminal is too small for the streaming comparison. Resize to at least 54 × 29.",
         )
         .style(theme.selection)
-        .wrap(TextWrap::Word)
-        .render(content, frame);
+        .wrap(TextWrap::Word);
+        paint_component(&notice, content, frame);
         return;
     }
 
@@ -199,18 +204,32 @@ fn render_preview(
     scroll_rows: usize,
     follow_latest: bool,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
-    let panel = Panel::new()
+    let shell = Surface::new(TextBlock::new(""))
         .border(Border::rounded())
-        .title(title)
         .padding(Insets::new(0, 1, 0, 1))
         .background(theme.overlay)
-        .title_style(theme.focused)
         .content_style(theme.text);
-    let inner = panel.inner_area(area);
-    panel.render(area, frame);
+    let layout = shell.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    let child = &layout.children[0];
+    let inner = Rect::new(
+        area.x + child.x,
+        area.y + u16::try_from(child.y).unwrap_or(u16::MAX),
+        child.node.size.width,
+        u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+    );
+    paint_component(&shell, area, frame);
+    frame.write_line(
+        LocalRect::new(
+            i32::from(area.x + 1),
+            i64::from(area.y),
+            area.width.saturating_sub(2),
+            1,
+        ),
+        &Line::from_spans(vec![Span::styled(title, theme.focused)]),
+    );
     let preview_text = preview_text(text);
     let base_scroll =
         wrapped_row_count(&preview_text, inner.width).saturating_sub(usize::from(inner.height));
@@ -219,18 +238,18 @@ fn render_preview(
     } else {
         base_scroll.saturating_sub(scroll_rows)
     };
-    TextBlock::new(preview_text)
+    let preview = TextBlock::new(preview_text)
         .style(theme.text)
         .wrap(TextWrap::Word)
-        .vertical_scroll(vertical_scroll)
-        .render(inner, frame);
+        .vertical_scroll(vertical_scroll);
+    paint_component(&preview, inner, frame);
 }
 
 #[allow(clippy::too_many_lines)]
 fn render_controls(
     state: &StreamingConfiguratorState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
     let policy = state.selected_policy();
@@ -311,24 +330,32 @@ fn render_controls(
         if offset >= area.height {
             break;
         }
-        frame.write_line(Rect::new(area.x, area.y + offset, area.width, 1), &row);
+        frame.write_line(
+            LocalRect::terminal(Rect::new(area.x, area.y + offset, area.width, 1)),
+            &row,
+        );
     }
-    let Some(geometry) = streaming_configurator_geometry(state, frame.area(), theme) else {
+    let Some(geometry) = streaming_configurator_geometry(
+        state,
+        Rect::new(0, 0, frame.area().width, frame.area().height),
+        theme,
+    ) else {
         return;
     };
-    let checkbox = Checkbox::new("Enabled").styles(CheckboxStyles {
+    let checkbox_state = std::cell::Cell::new(*state.enabled_checkbox());
+    let checkbox = bmux_tui_components::checkbox::CheckboxComponent::new(
+        "streaming.enabled",
+        "Enabled",
+        &checkbox_state,
+    )
+    .styles(CheckboxStyles {
         normal: theme.text,
         focused: theme.focused,
         hovered: theme.selection,
         pressed: theme.focused.add_modifier(Modifier::BOLD),
         disabled: theme.muted,
     });
-    checkbox.render_with_id(
-        "streaming.enabled",
-        geometry.enabled,
-        state.enabled_checkbox(),
-        frame,
-    );
+    paint_component(&checkbox, geometry.enabled, frame);
     let button_styles = ButtonStyles {
         normal: theme.text,
         focused: theme.focused,
@@ -337,30 +364,40 @@ fn render_controls(
         disabled: theme.muted,
     };
     let curve_actions = curve_action_buttons();
-    ActionRow::new(&curve_actions)
-        .styles(button_styles)
-        .render_state_with_id_prefix(
-            geometry.curve,
-            state.curve_actions(),
-            frame,
-            "streaming.curve",
-        );
+    paint_actions(
+        &curve_actions,
+        state.curve_actions(),
+        "streaming.curve",
+        geometry.curve,
+        button_styles,
+        frame,
+    );
     let numeric_actions = numeric_action_buttons();
-    ActionRow::new(&numeric_actions)
-        .styles(button_styles)
-        .render_state_with_id_prefix(geometry.rate, state.rate_actions(), frame, "streaming.rate");
-    ActionRow::new(&numeric_actions)
-        .styles(button_styles)
-        .render_state_with_id_prefix(geometry.lag, state.lag_actions(), frame, "streaming.lag");
+    paint_actions(
+        &numeric_actions,
+        state.rate_actions(),
+        "streaming.rate",
+        geometry.rate,
+        button_styles,
+        frame,
+    );
+    paint_actions(
+        &numeric_actions,
+        state.lag_actions(),
+        "streaming.lag",
+        geometry.lag,
+        button_styles,
+        frame,
+    );
     let preset_actions = source_preset_buttons();
-    ActionRow::new(&preset_actions)
-        .styles(button_styles)
-        .render_state_with_id_prefix(
-            geometry.source_preset,
-            state.source_preset_actions(),
-            frame,
-            "streaming.source.preset",
-        );
+    paint_actions(
+        &preset_actions,
+        state.source_preset_actions(),
+        "streaming.source.preset",
+        geometry.source_preset,
+        button_styles,
+        frame,
+    );
     for (area, action_state, id) in [
         (
             geometry.source_chunk_size,
@@ -383,19 +420,24 @@ fn render_controls(
             "streaming.source.interval-variation",
         ),
     ] {
-        ActionRow::new(&numeric_actions)
-            .styles(button_styles)
-            .render_state_with_id_prefix(area, action_state, frame, id);
+        paint_actions(
+            &numeric_actions,
+            action_state,
+            id,
+            area,
+            button_styles,
+            frame,
+        );
     }
     let outcome_actions = outcome_action_buttons(state.reset_pending());
-    ActionRow::new(&outcome_actions)
-        .styles(button_styles)
-        .render_state_with_id_prefix(
-            geometry.outcomes,
-            state.outcome_actions(),
-            frame,
-            "streaming.outcomes",
-        );
+    paint_actions(
+        &outcome_actions,
+        state.outcome_actions(),
+        "streaming.outcomes",
+        geometry.outcomes,
+        button_styles,
+        frame,
+    );
 }
 
 fn label_value_line(label: &str, value: &str, theme: TuiTheme) -> Line {
@@ -403,6 +445,31 @@ fn label_value_line(label: &str, value: &str, theme: TuiTheme) -> Line {
         Span::styled(format!("{label}: "), theme.muted),
         Span::styled(value.to_owned(), theme.text),
     ])
+}
+
+fn paint_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
+fn paint_actions(
+    actions: &[bmux_tui_components::action_row::ActionButton],
+    state: &bmux_tui_components::action_row::ActionRowState,
+    id: &str,
+    area: Rect,
+    styles: ButtonStyles,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    let state = std::cell::Cell::new(*state);
+    let component =
+        bmux_tui_components::action_row::ActionRowComponent::new(id.to_owned(), actions, &state)
+            .styles(styles);
+    paint_component(&component, area, cx);
 }
 
 #[cfg(test)]
@@ -415,7 +482,11 @@ mod tests {
     fn render_text(area: Rect, state: &StreamingConfiguratorState) -> String {
         let theme = TuiTheme::for_theme_id("bcode-dark");
         let mut buffer = Buffer::empty(area);
-        render_streaming_configurator(state, &mut Frame::new(&mut buffer), theme);
+        render_streaming_configurator(
+            state,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+            theme,
+        );
         (0..area.height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<String>()
@@ -446,7 +517,7 @@ mod tests {
                 0,
                 true,
                 area,
-                &mut Frame::new(&mut buffer),
+                &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
                 theme,
             );
             (0..area.height)
@@ -473,7 +544,11 @@ mod tests {
         let area = Rect::new(0, 0, 120, 40);
         let mut buffer = Buffer::empty(area);
         let mut frame = Frame::new(&mut buffer);
-        render_streaming_configurator(&state, &mut frame, theme);
+        render_streaming_configurator(
+            &state,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            theme,
+        );
         let ids = frame
             .hits()
             .regions()

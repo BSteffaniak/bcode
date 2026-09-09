@@ -740,7 +740,10 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 4));
         let mut frame = Frame::new(&mut buffer);
 
-        MarkdownMermaidPresentationStore::remove_from_frame("owner:diagram:1", &mut frame);
+        MarkdownMermaidPresentationStore::remove_from_frame(
+            "owner:diagram:1",
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+        );
 
         assert!(matches!(
             frame.images(),

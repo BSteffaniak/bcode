@@ -1,4 +1,7 @@
 #![allow(clippy::module_name_repetitions)]
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
+use bmux_tui::paint::{LocalRect, PaintCx};
 
 use bcode_client::BcodeClient;
 use bcode_plugin_sdk::path::display_from_current_dir;
@@ -9,13 +12,15 @@ use bcode_session_models::SessionId;
 use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse};
 use bmux_keyboard::KeyCode;
 use bmux_tui::prelude::{
-    Color, Constraint, Direction, Event, Frame, Insets, Line, Modifier, Point, Rect, Size, Span,
-    Style, Terminal, event_from_crossterm, split,
+    Color, Constraint, Direction, Event, Insets, Line, Modifier, Rect, Size, Span, Style, Terminal,
+    event_from_crossterm, split,
 };
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
-use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
-use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
+use bmux_tui_components::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
+};
+use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles};
+use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy, TextViewStyles};
 use clap::Subcommand;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
@@ -776,8 +781,8 @@ impl BlimsCeoDashboardState {
 
 async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome, CliError> {
     match command {
-        BlimsCommand::Status { json } => print_blims_status(json).await?,
-        BlimsCommand::Create { json } => create_blims_company(json).await?,
+        BlimsCommand::Status { json } => Box::pin(print_blims_status(json)).await?,
+        BlimsCommand::Create { json } => Box::pin(create_blims_company(json)).await?,
         BlimsCommand::Pause { json } => {
             print_company_lifecycle_update("company.pause", "Blims company paused", json).await?;
         }
@@ -793,7 +798,9 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome,
         | BlimsCommand::Suspend { .. }
         | BlimsCommand::Fire { .. }
         | BlimsCommand::Permissions { .. }
-        | BlimsCommand::SetPermission { .. } => handle_blims_agent_command(command).await?,
+        | BlimsCommand::SetPermission { .. } => {
+            Box::pin(handle_blims_agent_command(command)).await?;
+        }
         BlimsCommand::Agents { json } => {
             let response = call_blims_service("agent.list", blims_workspace_payload()?).await?;
             if json {
@@ -822,13 +829,21 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome,
             select_world_template(template_id, json).await?;
         }
         BlimsCommand::Enter => enter_blims_office().await?,
-        BlimsCommand::Talk { agent_id } => start_blims_agent_talk_cli(agent_id).await?,
-        BlimsCommand::AiWork { command } => handle_blims_ai_work_command(command).await?,
-        BlimsCommand::Task { command } => handle_blims_task_command(command).await?,
-        BlimsCommand::Artifact { command } => handle_blims_artifact_command(command).await?,
-        BlimsCommand::Proposal { command } => handle_blims_proposal_command(command).await?,
-        BlimsCommand::Initiative { command } => handle_blims_initiative_command(command).await?,
-        BlimsCommand::Guidance { command } => handle_blims_guidance_command(command).await?,
+        BlimsCommand::Talk { agent_id } => Box::pin(start_blims_agent_talk_cli(agent_id)).await?,
+        BlimsCommand::AiWork { command } => Box::pin(handle_blims_ai_work_command(command)).await?,
+        BlimsCommand::Task { command } => Box::pin(handle_blims_task_command(command)).await?,
+        BlimsCommand::Artifact { command } => {
+            Box::pin(handle_blims_artifact_command(command)).await?;
+        }
+        BlimsCommand::Proposal { command } => {
+            Box::pin(handle_blims_proposal_command(command)).await?;
+        }
+        BlimsCommand::Initiative { command } => {
+            Box::pin(handle_blims_initiative_command(command)).await?;
+        }
+        BlimsCommand::Guidance { command } => {
+            Box::pin(handle_blims_guidance_command(command)).await?;
+        }
         BlimsCommand::Report { json } => {
             let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
             print_report_response::<BlimsMorningReport>(response, json)?;
@@ -909,7 +924,7 @@ async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliErro
 }
 
 async fn enter_blims_office() -> Result<(), CliError> {
-    run_blims_tui().await
+    Box::pin(run_blims_tui()).await
 }
 
 async fn run_blims_tui() -> Result<(), CliError> {
@@ -964,9 +979,13 @@ async fn run_blims_tui() -> Result<(), CliError> {
     Ok(())
 }
 
-fn render_blims_loading(frame: &mut Frame<'_>) {
-    let area = frame.area();
-    frame.fill(area, " ", Style::new().bg(Color::Rgb(12, 10, 18)));
+fn render_blims_loading(frame: &mut PaintCx<'_, '_>) {
+    let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+    frame.fill(
+        LocalRect::terminal(area),
+        " ",
+        Style::new().bg(Color::Rgb(12, 10, 18)),
+    );
     let modal = ModalFrame::new(
         ModalSizing::fixed(Size::new(52, 7), Insets::all(0)),
         blims_modal_theme(Color::BrightMagenta, Color::Rgb(19, 16, 30)),
@@ -974,7 +993,8 @@ fn render_blims_loading(frame: &mut Frame<'_>) {
     .title(" Blims ")
     .placement(ModalPlacement::Centered)
     .padding(Insets::all(1));
-    modal.render(area, frame);
+    let shell = ModalFrameComponent::new("blims.modal", modal.clone(), TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let lines = vec![
         Line::from_spans(vec![Span::styled(
             "✨ Opening the office…",
@@ -984,10 +1004,11 @@ fn render_blims_loading(frame: &mut Frame<'_>) {
         )]),
         Line::raw("Loading world, agents, and reports."),
     ];
-    TextView::new(&lines)
+    let scroll = std::cell::Cell::new(bmux_tui_components::scroll_view::ScrollViewState::new());
+    let component = TextViewComponent::new("blims.textview", &lines, &scroll)
         .policy(blims_static_text_policy())
-        .styles(blims_text_view_styles(Color::Rgb(19, 16, 30)))
-        .render(modal.content_area(area), &TextViewState::new(), frame);
+        .styles(blims_text_view_styles(Color::Rgb(19, 16, 30)));
+    paint_blims_component(&component, modal.content_area(area), frame);
 }
 
 async fn should_show_world_picker() -> Result<bool, CliError> {
@@ -1916,9 +1937,13 @@ impl BlimsTuiApp {
             .map_or_else(|| "the hallway".to_string(), |room| room.name.clone())
     }
 
-    fn render(&self, frame: &mut Frame<'_>) {
-        let area = frame.area();
-        frame.fill(area, " ", Style::new().bg(Color::Rgb(12, 10, 18)));
+    fn render(&self, frame: &mut PaintCx<'_, '_>) {
+        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+        frame.fill(
+            LocalRect::terminal(area),
+            " ",
+            Style::new().bg(Color::Rgb(12, 10, 18)),
+        );
         let rows = split(
             area,
             Direction::Vertical,
@@ -2195,14 +2220,16 @@ fn conversation_line_from_session_event(
     }
 }
 
-fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let background = Color::Rgb(19, 16, 30);
     let pane = Pane::new()
         .border(true)
         .padding(Insets::new(1, 2, 0, 2))
         .styles(blims_pane_styles(Color::BrightMagenta, background));
     let state = PaneState::new(area);
-    pane.render(&state, frame);
+    let retained = std::cell::Cell::new(state);
+    let shell = PaneComponent::new("blims.pane", pane.clone(), &retained, TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let title = Line::from_spans(vec![
         Span::styled(
             " ✨ BLIMS ",
@@ -2222,20 +2249,22 @@ fn render_blims_header(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         ),
     ]);
     frame.write_line_with_fallback_style(
-        pane.inner_area(&state),
+        LocalRect::terminal(pane.inner_area(&state)),
         &title,
         Style::new().bg(background),
     );
 }
 
-fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let background = Color::Rgb(10, 14, 24);
     let pane = Pane::new()
         .border(true)
         .padding(Insets::new(1, 2, 0, 2))
         .styles(blims_pane_styles(Color::BrightBlue, background));
     let state = PaneState::new(area);
-    pane.render(&state, frame);
+    let retained = std::cell::Cell::new(state);
+    let shell = PaneComponent::new("blims.pane", pane.clone(), &retained, TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let status = app.status.clone();
     let hints = [
         KeyHint::new("arrows/hjkl", "walk"),
@@ -2247,23 +2276,25 @@ fn render_blims_footer(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         KeyHint::new("r/?/q", "report/help/quit"),
         KeyHint::new("", &status),
     ];
-    KeyHintBar::new(&hints)
-        .styles(blims_hint_styles(background))
-        .render(pane.inner_area(&state), frame);
+    let component =
+        KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
+    paint_blims_component(&component, pane.inner_area(&state), frame);
 }
 
-fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_blims_map(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let background = Color::Rgb(8, 18, 24);
     let pane = Pane::new()
         .title(" Pixel office ")
         .padding(Insets::all(1))
         .styles(blims_pane_styles(Color::BrightCyan, background));
     let state = PaneState::new(area);
-    pane.render(&state, frame);
+    let retained = std::cell::Cell::new(state);
+    let shell = PaneComponent::new("blims.pane", pane.clone(), &retained, TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     render_pixel_world(app, pane.inner_area(&state), frame);
 }
 
-fn render_pixel_world(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_pixel_world(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -2275,8 +2306,9 @@ fn render_pixel_world(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
                 y: viewport.origin.y + i64::from(screen_y),
             };
             let (glyph, style) = tile_glyph(app, tile);
-            frame.buffer_mut().set_cell(
-                Point::new(area.x + screen_x, area.y + screen_y),
+            frame.set_cell(
+                i32::from(area.x + screen_x),
+                i64::from(area.y + screen_y),
                 glyph,
                 style,
             );
@@ -2289,7 +2321,7 @@ fn render_agent_thought_bubbles(
     app: &BlimsTuiApp,
     area: Rect,
     viewport: &BlimsViewport,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     for agent in &app.world.agents {
         let Some(sprite) = app.agent_sprites.get(&agent.id) else {
@@ -2314,12 +2346,12 @@ fn render_agent_thought_bubbles(
         }
         let text = format!("“{}”", truncate_chars(&message, 20));
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x + screen_x,
                 area.y + screen_y,
                 area.width - screen_x,
                 1,
-            ),
+            )),
             &Line::raw(text),
             Style::new()
                 .fg(Color::BrightYellow)
@@ -2424,14 +2456,16 @@ fn room_symbol(room: &BlimsRoomSnapshot) -> &'static str {
     }
 }
 
-fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let background = Color::Rgb(13, 20, 18);
     let pane = Pane::new()
         .title(" CEO console ")
         .padding(Insets::all(1))
         .styles(blims_pane_styles(Color::BrightGreen, background));
     let state = PaneState::new(area);
-    pane.render(&state, frame);
+    let retained = std::cell::Cell::new(state);
+    let shell = PaneComponent::new("blims.pane", pane.clone(), &retained, TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let inner = pane.inner_area(&state);
     let rows = split(
         inner,
@@ -2454,7 +2488,7 @@ fn render_blims_sidebar(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     render_live_log_panel(app, rows[4], frame);
 }
 
-fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let room = app
         .world
         .rooms
@@ -2488,7 +2522,7 @@ fn render_current_room_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
     render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
-fn render_activity_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_activity_panel(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "🏢 Company pulse",
         Style::new()
@@ -2515,7 +2549,7 @@ fn render_activity_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
-fn render_inbox_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_inbox_panel(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "📬 CEO inbox",
         Style::new()
@@ -2542,7 +2576,7 @@ fn render_inbox_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
-fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "Interactions",
         Style::new()
@@ -2586,7 +2620,7 @@ fn render_interactions_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_
     render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
-fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "Live company",
         Style::new()
@@ -2602,7 +2636,7 @@ fn render_live_log_panel(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     render_blims_text_view(area, frame, &lines, Color::Rgb(13, 20, 18));
 }
 
-fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let background = Color::Rgb(32, 24, 42);
     let modal = ModalFrame::new(
         ModalSizing::fixed(Size::new(76, 18), Insets::all(0)),
@@ -2611,7 +2645,8 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
     .title(" Choose your Blims office ")
     .placement(ModalPlacement::Centered)
     .padding(Insets::all(1));
-    modal.render(area, frame);
+    let shell = ModalFrameComponent::new("blims.modal", modal.clone(), TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let content = modal.content_area(area);
     let inner = Rect::new(
         content.x,
@@ -2639,12 +2674,12 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         });
         let y = inner.y + row;
         frame.fill(
-            Rect::new(inner.x, y, inner.width, 3),
+            LocalRect::terminal(Rect::new(inner.x, y, inner.width, 3)),
             " ",
             Style::new().bg(bg),
         );
         frame.write_line_with_fallback_style(
-            Rect::new(inner.x, y, inner.width, 1),
+            LocalRect::terminal(Rect::new(inner.x, y, inner.width, 1)),
             &Line::from_spans(vec![
                 Span::styled(
                     if selected { "▶ " } else { "  " },
@@ -2659,12 +2694,22 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
             Style::new().bg(bg),
         );
         frame.write_line_with_fallback_style(
-            Rect::new(inner.x + 2, y + 1, inner.width.saturating_sub(2), 1),
+            LocalRect::terminal(Rect::new(
+                inner.x + 2,
+                y + 1,
+                inner.width.saturating_sub(2),
+                1,
+            )),
             &Line::raw(template.description.clone()),
             Style::new().bg(bg).fg(Color::White),
         );
         frame.write_line_with_fallback_style(
-            Rect::new(inner.x + 2, y + 2, inner.width.saturating_sub(2), 1),
+            LocalRect::terminal(Rect::new(
+                inner.x + 2,
+                y + 2,
+                inner.width.saturating_sub(2),
+                1,
+            )),
             &Line::from_spans(vec![Span::styled(
                 template.flavor.clone(),
                 Style::new().bg(bg).fg(Color::BrightCyan),
@@ -2677,23 +2722,24 @@ fn render_world_picker(app: &BlimsTuiApp, area: Rect, frame: &mut Frame<'_>) {
         KeyHint::new("↑/↓", "move"),
         KeyHint::new("q", "exit"),
     ];
-    KeyHintBar::new(&hints)
-        .styles(blims_hint_styles(background))
-        .render(
-            Rect::new(
-                content.x,
-                content.bottom().saturating_sub(1),
-                content.width,
-                1,
-            ),
-            frame,
-        );
+    let component =
+        KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
+    paint_blims_component(
+        &component,
+        Rect::new(
+            content.x,
+            content.bottom().saturating_sub(1),
+            content.width,
+            1,
+        ),
+        frame,
+    );
 }
 
 fn render_ceo_dashboard_modal(
     dashboard: &BlimsCeoDashboardState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     let background = Color::Rgb(16, 17, 28);
     let modal = ModalFrame::new(
@@ -2703,7 +2749,8 @@ fn render_ceo_dashboard_modal(
     .title(" CEO operating dashboard ")
     .placement(ModalPlacement::Centered)
     .padding(Insets::all(1));
-    modal.render(area, frame);
+    let shell = ModalFrameComponent::new("blims.modal", modal.clone(), TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let inner = modal.content_area(area);
     let rows = split(
         inner,
@@ -2763,15 +2810,15 @@ fn render_ceo_dashboard_modal(
         KeyHint::new("d/Esc", "close"),
         KeyHint::new("", &status_label),
     ];
-    KeyHintBar::new(&hints)
-        .styles(blims_hint_styles(background))
-        .render(rows[3], frame);
+    let component =
+        KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
+    paint_blims_component(&component, rows[3], frame);
 }
 
 fn render_dashboard_agent_work(
     dashboard: &BlimsCeoDashboardState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "Agent work",
@@ -2805,7 +2852,7 @@ fn render_dashboard_agent_work(
 fn render_dashboard_proposals(
     dashboard: &BlimsCeoDashboardState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "Proposal inbox",
@@ -2839,7 +2886,7 @@ fn render_dashboard_proposals(
 fn render_dashboard_artifacts(
     dashboard: &BlimsCeoDashboardState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "Review artifacts",
@@ -2873,7 +2920,7 @@ fn render_dashboard_artifacts(
 fn render_dashboard_guidance(
     dashboard: &BlimsCeoDashboardState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     let mut lines = vec![Line::from_spans(vec![Span::styled(
         "CEO guidance / initiatives",
@@ -2940,7 +2987,7 @@ fn dashboard_line(selected: bool, text: String) -> Line {
 fn render_conversation_modal(
     conversation: &BlimsConversationState,
     area: Rect,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     let background = Color::Rgb(18, 14, 28);
     let modal = ModalFrame::new(
@@ -2950,7 +2997,8 @@ fn render_conversation_modal(
     .title(format!(" Talking with {} ", conversation.agent_name))
     .placement(ModalPlacement::Centered)
     .padding(Insets::all(1));
-    modal.render(area, frame);
+    let shell = ModalFrameComponent::new("blims.modal", modal.clone(), TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let inner = modal.content_area(area);
     let rows = split(
         inner,
@@ -2979,10 +3027,11 @@ fn render_conversation_modal(
     if lines.is_empty() {
         lines.push(Line::raw("Conversation is starting…"));
     }
-    TextView::new(&lines)
+    let scroll = std::cell::Cell::new(bmux_tui_components::scroll_view::ScrollViewState::new());
+    let component = TextViewComponent::new("blims.textview", &lines, &scroll)
         .policy(blims_static_text_policy())
-        .styles(blims_text_view_styles(background))
-        .render(rows[0], &TextViewState::new(), frame);
+        .styles(blims_text_view_styles(background));
+    paint_blims_component(&component, rows[0], frame);
     let input_lines = vec![
         Line::from_spans(vec![
             Span::styled("You: ", Style::new().fg(Color::BrightCyan)),
@@ -2990,10 +3039,11 @@ fn render_conversation_modal(
         ]),
         Line::raw(conversation.status.clone()),
     ];
-    TextView::new(&input_lines)
+    let scroll = std::cell::Cell::new(bmux_tui_components::scroll_view::ScrollViewState::new());
+    let component = TextViewComponent::new("blims.textview", &input_lines, &scroll)
         .policy(blims_static_text_policy())
-        .styles(blims_text_view_styles(Color::Rgb(24, 18, 36)))
-        .render(rows[1], &TextViewState::new(), frame);
+        .styles(blims_text_view_styles(Color::Rgb(24, 18, 36)));
+    paint_blims_component(&component, rows[1], frame);
     let session_label = format!("session {}", conversation.handle.session);
     let hints = [
         KeyHint::new("Enter", "send"),
@@ -3001,12 +3051,12 @@ fn render_conversation_modal(
         KeyHint::new("d", "CEO dashboard"),
         KeyHint::new("", &session_label),
     ];
-    KeyHintBar::new(&hints)
-        .styles(blims_hint_styles(background))
-        .render(rows[2], frame);
+    let component =
+        KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
+    paint_blims_component(&component, rows[2], frame);
 }
 
-fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
+fn render_blims_help_modal(area: Rect, frame: &mut PaintCx<'_, '_>) {
     let background = Color::Rgb(18, 20, 38);
     let modal = ModalFrame::new(
         ModalSizing::fixed(Size::new(70, 10), Insets::all(0)),
@@ -3015,7 +3065,8 @@ fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
     .title(" Blims controls ")
     .placement(ModalPlacement::Centered)
     .padding(Insets::all(1));
-    modal.render(area, frame);
+    let shell = ModalFrameComponent::new("blims.modal", modal.clone(), TextBlock::new(""));
+    paint_blims_component(&shell, area, frame);
     let lines = vec![
         Line::raw("arrows/hjkl walk one tile around the top-down office"),
         Line::raw("e/enter uses the selected nearby interaction"),
@@ -3031,32 +3082,40 @@ fn render_blims_help_modal(area: Rect, frame: &mut Frame<'_>) {
         content.width,
         content.height.saturating_sub(1),
     );
-    TextView::new(&lines)
+    let scroll = std::cell::Cell::new(bmux_tui_components::scroll_view::ScrollViewState::new());
+    let component = TextViewComponent::new("blims.textview", &lines, &scroll)
         .policy(blims_static_text_policy())
-        .styles(blims_text_view_styles(background))
-        .render(help_area, &TextViewState::new(), frame);
+        .styles(blims_text_view_styles(background));
+    paint_blims_component(&component, help_area, frame);
     let hints = [
         KeyHint::new("?", "close help"),
         KeyHint::new("q", "exit office"),
     ];
-    KeyHintBar::new(&hints)
-        .styles(blims_hint_styles(background))
-        .render(
-            Rect::new(
-                content.x,
-                content.bottom().saturating_sub(1),
-                content.width,
-                1,
-            ),
-            frame,
-        );
+    let component =
+        KeyHintBarComponent::new("blims.keyhintbar", &hints).styles(blims_hint_styles(background));
+    paint_blims_component(
+        &component,
+        Rect::new(
+            content.x,
+            content.bottom().saturating_sub(1),
+            content.width,
+            1,
+        ),
+        frame,
+    );
 }
 
-fn render_blims_text_view(area: Rect, frame: &mut Frame<'_>, lines: &[Line], background: Color) {
-    TextView::new(lines)
+fn render_blims_text_view(
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    lines: &[Line],
+    background: Color,
+) {
+    let scroll = std::cell::Cell::new(bmux_tui_components::scroll_view::ScrollViewState::new());
+    let component = TextViewComponent::new("blims.textview", lines, &scroll)
         .policy(blims_static_text_policy())
-        .styles(blims_text_view_styles(background))
-        .render(area, &TextViewState::new(), frame);
+        .styles(blims_text_view_styles(background));
+    paint_blims_component(&component, area, frame);
 }
 
 const fn blims_pane_styles(accent: Color, background: Color) -> PaneStyles {
@@ -3091,8 +3150,9 @@ const fn blims_modal_theme(accent: Color, background: Color) -> ModalTheme {
     )
 }
 
-const fn blims_text_view_styles(background: Color) -> TextViewStyles {
+fn blims_text_view_styles(background: Color) -> TextViewStyles {
     TextViewStyles {
+        scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
         text: Style::new().fg(Color::BrightWhite).bg(background),
         empty: Style::new().fg(Color::BrightBlack).bg(background),
         background: Style::new().bg(background),
@@ -4834,4 +4894,13 @@ fn print_blims_service_response(response: bcode_ipc::PluginServiceResponse) {
     } else if !response.payload.is_empty() {
         println!("{}", String::from_utf8_lossy(&response.payload));
     }
+}
+fn paint_blims_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
 }

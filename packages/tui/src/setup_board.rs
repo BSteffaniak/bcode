@@ -126,6 +126,7 @@ pub struct SetupBoardState {
     pub hovered: Option<SetupSectionId>,
     /// Pressed spot, if any.
     pub pressed: Option<SetupSectionId>,
+    drag_origin: Option<(Point, usize, usize)>,
 }
 
 impl SetupBoardState {
@@ -137,6 +138,7 @@ impl SetupBoardState {
             focused,
             hovered: None,
             pressed: None,
+            drag_origin: None,
         }
     }
 }
@@ -362,10 +364,16 @@ impl<'a> SetupBoard<'a> {
                 Some(SetupBoardOutcome::Ignored)
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                state.drag_origin = Some((
+                    mouse.position,
+                    state.scroll.horizontal_offset(),
+                    state.scroll.vertical_offset(),
+                ));
                 state.pressed = hit;
                 hit.map(|_| SetupBoardOutcome::Redraw)
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                state.drag_origin = None;
                 let pressed = state.pressed.take();
                 if let (Some(pressed), Some(hit)) = (pressed, hit)
                     && pressed == hit
@@ -374,9 +382,24 @@ impl<'a> SetupBoard<'a> {
                 }
                 Some(SetupBoardOutcome::Redraw)
             }
-            MouseEventKind::Drag(MouseButton::Left) if state.pressed.is_some() => {
+            MouseEventKind::Drag(MouseButton::Left) if state.drag_origin.is_some() => {
+                let (origin, horizontal, vertical) = state.drag_origin.expect("drag origin");
                 state.pressed = None;
-                None
+                let shift = |offset: usize, from: u16, to: u16| {
+                    offset
+                        .saturating_add(usize::from(from.saturating_sub(to)))
+                        .saturating_sub(usize::from(to.saturating_sub(from)))
+                };
+                let layout = self.layout();
+                state.scroll.set_horizontal_offset(
+                    shift(horizontal, origin.x, mouse.position.x)
+                        .min(usize::from(layout.width.saturating_sub(area.width))),
+                );
+                state.scroll.set_vertical_offset(
+                    shift(vertical, origin.y, mouse.position.y)
+                        .min(usize::from(layout.height.saturating_sub(area.height))),
+                );
+                Some(SetupBoardOutcome::Panned)
             }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
@@ -822,6 +845,13 @@ const fn status_glyph(status: SetupSectionStatus) -> &'static str {
     }
 }
 
+const fn board_scroll_policy() -> TextViewPolicy {
+    TextViewPolicy {
+        wrap: bmux_tui::text_block::TextWrap::None,
+        ..TextViewPolicy::scrollable()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,12 +1123,5 @@ mod tests {
             ),
             SetupBoardOutcome::Selected(SetupSectionId::Welcome)
         );
-    }
-}
-
-fn board_scroll_policy() -> TextViewPolicy {
-    TextViewPolicy {
-        wrap: bmux_tui::text_block::TextWrap::None,
-        ..TextViewPolicy::scrollable()
     }
 }
