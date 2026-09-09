@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_session_models = { workspace = true }
 futures = { workspace = true }
 jsonschema = { workspace = true }
 schemars = { workspace = true }

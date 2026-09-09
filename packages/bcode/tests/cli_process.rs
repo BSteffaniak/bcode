@@ -56,15 +56,30 @@ fn run_cli_with_stdio(
         std::fs::write(root.path().join("bcode-state"), b"not a directory")
             .expect("blocked state fixture");
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bcode"))
-        .args(arguments)
+    run_cli_at_root(root.path(), arguments, stdout, stdin)
+}
+
+fn isolated_cli(root: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bcode"));
+    command
         .env_clear()
-        .env("HOME", root.path())
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
-        .env("XDG_STATE_HOME", root.path().join("state"))
-        .env("BCODE_STATE_DIR", root.path().join("bcode-state"))
-        .current_dir(root.path())
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("BCODE_STATE_DIR", root.join("bcode-state"))
+        .current_dir(root);
+    command
+}
+
+fn run_cli_at_root(
+    root: &std::path::Path,
+    arguments: &[&str],
+    stdout: Stdio,
+    stdin: Stdio,
+) -> Output {
+    let mut child = isolated_cli(root)
+        .args(arguments)
         .stdin(stdin)
         .stdout(stdout)
         .stderr(Stdio::piped())
@@ -107,6 +122,434 @@ fn run_cli_with_stdio(
         stdout: stdout.map_or_else(Vec::new, collect),
         stderr: collect(stderr),
     }
+}
+
+struct ForegroundDaemon(std::process::Child);
+
+impl Drop for ForegroundDaemon {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+fn graph_cli_json(root: &std::path::Path, arguments: &[&str]) -> serde_json::Value {
+    let output = run_cli_at_root(root, arguments, Stdio::piped(), Stdio::null());
+    assert!(
+        output.status.success(),
+        "{arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("one complete JSON result")
+}
+
+fn start_graph_test_daemon(root: &tempfile::TempDir) -> ForegroundDaemon {
+    let library = std::fs::canonicalize(
+        std::env::var_os("BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY")
+            .expect("set BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY"),
+    )
+    .unwrap();
+    let plugins = root.path().join(".bcode/plugins/default-agents");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(
+        plugins.join("bcode-plugin.toml"),
+        include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+    )
+    .unwrap();
+    std::fs::copy(
+        library,
+        plugins.join("libbcode_default_agents_plugin.dylib"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("bcode.toml"),
+        "[plugins]\ndefault = \"none\"\nenabled = [\"bcode.default-agents\"]\n",
+    )
+    .unwrap();
+    let log = std::fs::File::create(root.path().join("daemon.log")).unwrap();
+    let mut daemon = ForegroundDaemon(
+        isolated_cli(root.path())
+            .args(["server", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited: {}",
+            std::fs::read_to_string(root.path().join("daemon.log")).unwrap()
+        );
+        if run_cli_at_root(
+            root.path(),
+            &["server", "status"],
+            Stdio::piped(),
+            Stdio::null(),
+        )
+        .status
+        .success()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon startup timed out");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    daemon
+}
+
+fn prepare_graph_test_run(root: &tempfile::TempDir) {
+    let mut source: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/workflows/source-defined-input.workflow.json"
+    ))
+    .unwrap();
+    let mut second = source["definition"]["nodes"]["await_input"].clone();
+    second["id"] = serde_json::json!("second_input");
+    source["definition"]["nodes"]["second_input"] = second;
+    source["definition"]["exits"] = serde_json::json!(["second_input"]);
+    source["definition"]["edges"] = serde_json::json!([
+        {"from": "await_input", "to": "second_input"}
+    ]);
+    std::fs::write(
+        root.path().join("workflow.json"),
+        serde_json::to_vec(&source).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("input.json"),
+        r#"{"message":"graph test"}"#,
+    )
+    .unwrap();
+    let session = graph_cli_json(root.path(), &["session", "create", "graph-test", "--json"]);
+    let session_id = session["id"].as_str().unwrap();
+    graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "author",
+            "create",
+            "workflow.json",
+            "--draft-id",
+            "draft",
+        ],
+    );
+    graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "author",
+            "publish",
+            "--workflow-id",
+            "example/source-defined-input",
+            "--draft-id",
+            "draft",
+            "--expected-generation",
+            "1",
+            "--activate",
+        ],
+    );
+    graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "start",
+            "--parent-session-id",
+            session_id,
+            "--run-id",
+            "graph-test",
+            "--input",
+            "input.json",
+            "active",
+            "--workflow-id",
+            "example/source-defined-input",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn workflow_graph_cli_pages_real_daemon_and_rejects_stale_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    prepare_graph_test_run(&root);
+    let first = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "inspect-run-graph",
+            "--run-id",
+            "graph-test",
+            "--expected-revision",
+            "1",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(first["revision"], 1);
+    assert_eq!(first["nodes"].as_array().unwrap().len(), 1);
+    let node = first["nodes"][0]["node"]["id"].as_str().unwrap();
+    assert_eq!(first["edges"].as_array().unwrap().len(), 1);
+    let edge = first["edges"][0]["edge_id"].as_u64().unwrap().to_string();
+    let next = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "inspect-run-graph",
+            "--run-id",
+            "graph-test",
+            "--expected-revision",
+            "1",
+            "--after-node-id",
+            node,
+            "--after-edge-id",
+            &edge,
+            "--limit",
+            "1",
+        ],
+    );
+    assert_ne!(next["nodes"][0]["node"]["id"], node);
+    assert!(next["edges"].as_array().unwrap().is_empty());
+    assert_eq!(next["edges_complete"], true);
+    assert_eq!(next["revision"], 1);
+    let stale = run_cli_at_root(
+        root.path(),
+        &[
+            "workflow",
+            "inspect-run-graph",
+            "--run-id",
+            "graph-test",
+            "--expected-revision",
+            "2",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(stale.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("workflow_unavailable"));
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn auth_pool_daemon_status_returns_json_from_real_host() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let pools = graph_cli_json(root.path(), &["auth", "pool", "daemon-status"]);
+    assert!(pools.is_array());
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn auth_pool_preference_failure_is_secret_safe_through_real_host() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let output = run_cli_at_root(
+        root.path(),
+        &[
+            "session",
+            "set-auth-pool",
+            "private-pool-marker",
+            "--profile",
+            "private-profile-marker",
+            "--json",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    drop(daemon);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("auth_pool_preference"));
+    assert!(error.contains("could not be saved"));
+    assert!(!error.contains("private-pool-marker"));
+    assert!(!error.contains("private-profile-marker"));
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn auth_pool_preference_set_and_clear_preserves_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let path = root.path().join("bcode.toml");
+    let config = format!(
+        "{}\n[auth.profiles.first]\nbackend = \"sshenv\"\nscheme = \"chatgpt\"\n[auth.profiles.second]\nbackend = \"sshenv\"\nscheme = \"chatgpt\"\n[auth.pools.test]\nprofiles = [\"first\", \"second\"]\nstrategy = \"failover\"\n",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    std::fs::write(&path, &config).unwrap();
+    let set = graph_cli_json(
+        root.path(),
+        &[
+            "session",
+            "set-auth-pool",
+            "test",
+            "--profile",
+            "second",
+            "--json",
+        ],
+    );
+    assert_eq!(set["status"], "auth_pool_preference_set");
+    let pools = graph_cli_json(root.path(), &["auth", "pool", "daemon-status"]);
+    let pool = pools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pool| pool["pool"] == "test")
+        .unwrap();
+    assert_eq!(pool["preferred_profile"], "second");
+    assert_eq!(pool["preference_source"], "interactive_state");
+    graph_cli_json(
+        root.path(),
+        &["session", "set-auth-pool", "test", "--clear", "--json"],
+    );
+    let pools = graph_cli_json(root.path(), &["auth", "pool", "daemon-status"]);
+    let pool = pools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pool| pool["pool"] == "test")
+        .unwrap();
+    assert_eq!(pool["preferred_profile"], "first");
+    assert_eq!(pool["preference_source"], "pool_order");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), config);
+    drop(daemon);
+}
+
+#[test]
+fn auth_pool_daemon_status_reports_connection_failure_without_json() {
+    let output = run_cli_with_state(&["auth", "pool", "daemon-status"], true);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn plugin_contributions_returns_daemon_schema_without_invocation() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let value = graph_cli_json(root.path(), &["plugin", "contributions"]);
+    assert!(value["commands"].is_array());
+    assert!(value["command_contributions"].is_array());
+    assert!(value["config_extensions"].is_array());
+    assert_eq!(value.as_object().unwrap().len(), 3);
+    drop(daemon);
+}
+
+#[test]
+fn plugin_contributions_rejects_local_roots_and_reports_daemon_failure() {
+    let invalid = run_cli_with_state(&["plugin", "contributions", "--root", "unused"], true);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    let failed = run_cli_with_state(&["plugin", "contributions"], true);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(!failed.stderr.is_empty());
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn workflow_launch_detail_reads_source_through_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let source = root.path().join("source.workflow.json");
+    std::fs::write(
+        &source,
+        include_str!("../../../fixtures/workflows/source-defined-input.workflow.json"),
+    )
+    .unwrap();
+    let request = serde_json::json!({
+        "version": 1, "workspace": root.path(),
+        "source": {"source_kind":"explicit_source", "source_path": source, "source_format":"json"}
+    });
+    std::fs::write(
+        root.path().join("request.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let detail = graph_cli_json(
+        root.path(),
+        &["workflow", "launch-detail", "--request", "request.json"],
+    );
+    assert_eq!(detail["version"], 1);
+    assert!(detail.is_object());
+    drop(daemon);
+}
+
+#[test]
+fn workflow_launch_detail_rejects_future_version_before_dispatch() {
+    let output = run_cli_with_fixture(
+        &["workflow", "launch-detail", "--request", "request.json"],
+        true,
+        Stdio::piped(),
+        |root| {
+            std::fs::write(root.join("request.json"), serde_json::to_vec(&serde_json::json!({
+                "version": 999, "workspace": root,
+                "source": {"source_kind":"explicit_source", "source_path":"source.json", "source_format":"json"}
+            })).unwrap()).unwrap();
+        },
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workflow launch detail request"));
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn workflow_draft_edit_updates_and_rejects_stale_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let source: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/workflows/source-defined-input.workflow.json"
+    ))
+    .unwrap();
+    std::fs::write(
+        root.path().join("source.json"),
+        serde_json::to_vec(&source).unwrap(),
+    )
+    .unwrap();
+    graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "author",
+            "create",
+            "source.json",
+            "--draft-id",
+            "edit-draft",
+        ],
+    );
+    let mut node = source["definition"]["nodes"]["await_input"].clone();
+    node["name"] = serde_json::json!("Updated input");
+    let request = serde_json::json!({
+        "workflow_id":"example/source-defined-input", "draft_id":"edit-draft",
+        "batch":{"version":1,"expected_generation":1,"edits":[{"operation":"update_node","node":node}]},
+        "producer":{"kind":"human","producer_id":"cli-test"}
+    });
+    std::fs::write(
+        root.path().join("edit.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let args = ["workflow", "author", "edit", "--request", "edit.json"];
+    let updated = graph_cli_json(root.path(), &args);
+    assert_eq!(updated["updated"]["generation"], 2);
+    assert_eq!(
+        updated["updated"]["document"]["definition"]["nodes"]["await_input"]["name"],
+        "Updated input"
+    );
+    let stale = run_cli_at_root(root.path(), &args, Stdio::piped(), Stdio::null());
+    assert_eq!(stale.status.code(), Some(1));
+    let conflict: serde_json::Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(conflict["conflict"]["current_generation"], 2);
+    assert_eq!(conflict["conflict"]["expected_generation"], 1);
+    drop(daemon);
 }
 
 #[test]

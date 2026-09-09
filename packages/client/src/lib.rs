@@ -8,19 +8,19 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcStream, PluginContributions, PluginServiceResponse, PluginServiceSummary,
-    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest,
-    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
-    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
-    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
-    RalphStatusResponse, Request, Response, ResponsePayload, ServerStopMode,
-    SessionBulkMigrationOperationStatus, SessionBulkMigrationStartRequest,
-    SessionCompatibilityInventoryRequest, SessionCompatibilityInventoryResponse,
-    WorktreeCreateOperationStatus, WorktreeCreateRequest, WorktreeCreateResponse,
-    WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse,
-    current_working_directory, decode_event, decode_response, default_endpoint, recv_envelope,
-    request_envelope, send_envelope,
+    LocalIpcStream, PluginServiceResponse, PluginServiceSummary, RalphApproveRequest,
+    RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest, RalphListIterationsRequest,
+    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
+    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
+    RalphRunStatusResponse, RalphStatusRequest, RalphStatusResponse, Request, Response,
+    ResponsePayload, ServerStopMode, SessionBulkMigrationOperationStatus,
+    SessionBulkMigrationStartRequest, SessionCompatibilityInventoryRequest,
+    SessionCompatibilityInventoryResponse, WorktreeCreateOperationStatus, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest,
+    WorktreeRemoveResponse, current_working_directory, decode_event, decode_response,
+    default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
+use bcode_plugin_sdk::PluginContributions;
 use bcode_session_import::ImportWarning as SessionImportWarning;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, SessionCatalogSourceStatus, SessionCatalogStatus,
@@ -464,7 +464,98 @@ pub enum ClientError {
     UnexpectedEnvelope,
 }
 
+impl bcode_workflow::WorkflowRunApplication for BcodeClient {
+    async fn workflow_run_status(
+        &self,
+        run_id: String,
+    ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, Self::Error> {
+        Self::workflow_run_status(self, run_id).await
+    }
+    async fn pause_workflow_run(&self, run_id: String) -> Result<bool, Self::Error> {
+        Self::pause_workflow_run(self, run_id).await
+    }
+
+    async fn resume_workflow_run(&self, run_id: String) -> Result<bool, Self::Error> {
+        Self::resume_workflow_run(self, run_id).await
+    }
+    async fn cancel_workflow_run(&self, run_id: String) -> Result<bool, Self::Error> {
+        Self::cancel_workflow_run(self, run_id).await
+    }
+    async fn inspect_workflow_run(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<bcode_workflow::WorkflowRunInspection, Self::Error> {
+        Self::inspect_workflow_run(self, run_id, limit).await
+    }
+    type Error = ClientError;
+
+    async fn start_authored_workflow(
+        &self,
+        request: bcode_workflow::StartAuthoredWorkflowRequest,
+    ) -> Result<bcode_workflow::AuthoredWorkflowRunStartResponse, Self::Error> {
+        Self::start_authored_workflow(self, request).await
+    }
+}
+
+impl bcode_workflow::WorkflowAuthoringApplication for BcodeClient {
+    async fn publish_and_start_workflow(
+        &self,
+        request: bcode_workflow::PublishAndStartWorkflowRequest,
+    ) -> Result<bcode_workflow::WorkflowPublishAndStartResult, Self::Error> {
+        Self::publish_and_start_workflow(self, request).await
+    }
+    async fn publish_workflow_draft(
+        &self,
+        request: bcode_workflow::PublishWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowPublicationResult, Self::Error> {
+        Self::publish_workflow_draft(self, request).await
+    }
+    type Error = ClientError;
+
+    async fn apply_workflow_draft_edits(
+        &self,
+        request: bcode_workflow::ApplyWorkflowDraftEditsRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftEditResult, Self::Error> {
+        Self::apply_workflow_draft_edits(self, request).await
+    }
+
+    async fn update_workflow_draft(
+        &self,
+        request: bcode_workflow::UpdateWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftUpdateResult, Self::Error> {
+        Self::update_workflow_draft(self, request).await
+    }
+
+    async fn activate_workflow_revision(
+        &self,
+        request: bcode_workflow::ActivateWorkflowRevisionRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, Self::Error> {
+        Self::activate_workflow_revision(self, request).await
+    }
+
+    async fn discard_workflow_draft(
+        &self,
+        request: bcode_workflow::DiscardWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, Self::Error> {
+        Self::discard_workflow_draft(self, request).await
+    }
+}
+
 impl ClientError {
+    /// Return the domain-owned auth-pool failure for a recognized server code.
+    /// Transport failures and unknown future codes remain unclassified.
+    // Repository policy avoids redundant must_use on Option-returning functions.
+    #[allow(clippy::must_use_candidate)]
+    pub fn auth_pool_error(&self) -> Option<bcode_provider_auth_models::AuthPoolOperationError> {
+        match self {
+            Self::Server { code, .. } => {
+                bcode_provider_auth_models::AuthPoolOperationError::from_code(code)
+            }
+            _ => None,
+        }
+    }
+
     /// Return true when an optional domain is unavailable while unrelated daemon capabilities
     /// remain usable.
     #[must_use]
@@ -2769,6 +2860,22 @@ impl BcodeClient {
         pool: String,
         profile: Option<String>,
     ) -> Result<(), ClientError> {
+        self.apply_auth_pool_preference(bcode_provider_auth_models::SetAuthPoolPreferenceRequest {
+            pool,
+            profile,
+        })
+        .await
+    }
+
+    /// Apply a portable auth-pool preference request through the daemon boundary.
+    ///
+    /// # Errors
+    /// Returns an error if transport fails or the daemon rejects the preference.
+    pub async fn apply_auth_pool_preference(
+        &self,
+        request: bcode_provider_auth_models::SetAuthPoolPreferenceRequest,
+    ) -> Result<(), ClientError> {
+        let bcode_provider_auth_models::SetAuthPoolPreferenceRequest { pool, profile } = request;
         match self
             .send_request(Request::SetAuthPoolPreference { pool, profile })
             .await?
@@ -2938,11 +3045,11 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the authored document.
     pub async fn create_authored_workflow(
         &self,
-        request: bcode_ipc::CreateAuthoredWorkflowRequest,
+        request: bcode_workflow::CreateAuthoredWorkflowRequest,
     ) -> Result<
         (
-            bcode_ipc::AuthoredWorkflowSnapshot,
-            bcode_ipc::WorkflowDraftSnapshot,
+            bcode_workflow::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowDraftSnapshot,
         ),
         ClientError,
     > {
@@ -2973,7 +3080,7 @@ impl BcodeClient {
     ) -> Result<bcode_workflow::WorkflowSourceApplyResult, ClientError> {
         match self
             .send_request(Request::ApplyWorkflowSource(
-                bcode_ipc::ApplyWorkflowSourceRequest {
+                bcode_workflow::ApplyWorkflowSourceRequest {
                     source_format,
                     source,
                     draft_id,
@@ -2993,8 +3100,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the operation boundary.
     pub async fn apply_workflow_draft_edits(
         &self,
-        request: bcode_ipc::ApplyWorkflowDraftEditsRequest,
-    ) -> Result<bcode_ipc::WorkflowDraftEditResult, ClientError> {
+        request: bcode_workflow::ApplyWorkflowDraftEditsRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftEditResult, ClientError> {
         match self
             .send_request(Request::ApplyWorkflowDraftEdits(request))
             .await?
@@ -3011,8 +3118,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the authored document.
     pub async fn update_workflow_draft(
         &self,
-        request: bcode_ipc::UpdateWorkflowDraftRequest,
-    ) -> Result<bcode_ipc::WorkflowDraftUpdateResult, ClientError> {
+        request: bcode_workflow::UpdateWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftUpdateResult, ClientError> {
         match self
             .send_request(Request::UpdateWorkflowDraft(request))
             .await?
@@ -3029,8 +3136,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects publication.
     pub async fn publish_workflow_draft(
         &self,
-        request: bcode_ipc::PublishWorkflowDraftRequest,
-    ) -> Result<bcode_ipc::WorkflowPublicationResult, ClientError> {
+        request: bcode_workflow::PublishWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowPublicationResult, ClientError> {
         match self
             .send_request(Request::PublishWorkflowDraft(request))
             .await?
@@ -3048,8 +3155,8 @@ impl BcodeClient {
     /// publication outcome can be produced.
     pub async fn publish_and_start_workflow(
         &self,
-        request: bcode_ipc::PublishAndStartWorkflowRequest,
-    ) -> Result<bcode_ipc::WorkflowPublishAndStartResult, ClientError> {
+        request: bcode_workflow::PublishAndStartWorkflowRequest,
+    ) -> Result<bcode_workflow::WorkflowPublishAndStartResult, ClientError> {
         match self
             .send_request(Request::PublishAndStartWorkflow(Box::new(request)))
             .await?
@@ -3066,8 +3173,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects activation.
     pub async fn activate_workflow_revision(
         &self,
-        request: bcode_ipc::ActivateWorkflowRevisionRequest,
-    ) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, ClientError> {
+        request: bcode_workflow::ActivateWorkflowRevisionRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, ClientError> {
         match self
             .send_request(Request::ActivateWorkflowRevision(request))
             .await?
@@ -3084,8 +3191,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the mutation.
     pub async fn set_authored_workflow_archived(
         &self,
-        request: bcode_ipc::SetAuthoredWorkflowArchivedRequest,
-    ) -> Result<bcode_ipc::AuthoredWorkflowSnapshot, ClientError> {
+        request: bcode_workflow::SetAuthoredWorkflowArchivedRequest,
+    ) -> Result<bcode_workflow::AuthoredWorkflowSnapshot, ClientError> {
         match self
             .send_request(Request::SetAuthoredWorkflowArchived(request))
             .await?
@@ -3102,8 +3209,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the mutation.
     pub async fn discard_workflow_draft(
         &self,
-        request: bcode_ipc::DiscardWorkflowDraftRequest,
-    ) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, ClientError> {
+        request: bcode_workflow::DiscardWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, ClientError> {
         match self
             .send_request(Request::DiscardWorkflowDraft(request))
             .await?
@@ -3120,8 +3227,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the source/identity.
     pub async fn fork_workflow_draft(
         &self,
-        request: bcode_ipc::ForkWorkflowDraftRequest,
-    ) -> Result<bcode_ipc::WorkflowDraftSnapshot, ClientError> {
+        request: bcode_workflow::ForkWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftSnapshot, ClientError> {
         match self
             .send_request(Request::ForkWorkflowDraft(request))
             .await?
@@ -3138,8 +3245,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the preset.
     pub async fn create_workflow_preset(
         &self,
-        request: bcode_ipc::CreateWorkflowPresetRequest,
-    ) -> Result<bcode_ipc::WorkflowPresetSnapshot, ClientError> {
+        request: bcode_workflow::CreateWorkflowPresetRequest,
+    ) -> Result<bcode_workflow::WorkflowPresetSnapshot, ClientError> {
         match self
             .send_request(Request::CreateWorkflowPreset(request))
             .await?
@@ -3156,8 +3263,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the preset.
     pub async fn update_workflow_preset(
         &self,
-        request: bcode_ipc::UpdateWorkflowPresetRequest,
-    ) -> Result<bcode_ipc::WorkflowPresetUpdateResult, ClientError> {
+        request: bcode_workflow::UpdateWorkflowPresetRequest,
+    ) -> Result<bcode_workflow::WorkflowPresetUpdateResult, ClientError> {
         match self
             .send_request(Request::UpdateWorkflowPreset(request))
             .await?
@@ -3174,8 +3281,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects deletion.
     pub async fn delete_workflow_preset(
         &self,
-        request: bcode_ipc::DeleteWorkflowPresetRequest,
-    ) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, ClientError> {
+        request: bcode_workflow::DeleteWorkflowPresetRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, ClientError> {
         match self
             .send_request(Request::DeleteWorkflowPreset(request))
             .await?
@@ -3192,7 +3299,7 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or the revision is unavailable.
     pub async fn export_workflow_revision(
         &self,
-        request: bcode_ipc::ExportWorkflowRevisionRequest,
+        request: bcode_workflow::ExportWorkflowRevisionRequest,
     ) -> Result<bcode_workflow::WorkflowExportBundle, ClientError> {
         match self
             .send_request(Request::ExportWorkflowRevision(request))
@@ -3210,7 +3317,7 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or the bundle is incompatible.
     pub async fn preview_workflow_import(
         &self,
-        request: bcode_ipc::PreviewWorkflowImportRequest,
+        request: bcode_workflow::PreviewWorkflowImportRequest,
     ) -> Result<bcode_workflow::WorkflowImportPreview, ClientError> {
         match self
             .send_request(Request::PreviewWorkflowImport(request))
@@ -3228,11 +3335,11 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or import is incompatible/unauthorized.
     pub async fn import_workflow(
         &self,
-        request: bcode_ipc::ImportWorkflowRequest,
+        request: bcode_workflow::ImportWorkflowRequest,
     ) -> Result<
         (
-            bcode_ipc::AuthoredWorkflowSnapshot,
-            bcode_ipc::WorkflowDraftSnapshot,
+            bcode_workflow::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowDraftSnapshot,
         ),
         ClientError,
     > {
@@ -3249,8 +3356,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or import is incompatible/unauthorized.
     pub async fn import_workflow_draft(
         &self,
-        request: bcode_ipc::ImportWorkflowDraftRequest,
-    ) -> Result<bcode_ipc::WorkflowDraftImportResult, ClientError> {
+        request: bcode_workflow::ImportWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftImportResult, ClientError> {
         match self
             .send_request(Request::ImportWorkflowDraft(request))
             .await?
@@ -3267,8 +3374,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or import is incompatible/unauthorized.
     pub async fn import_workflow_revision(
         &self,
-        request: bcode_ipc::ImportWorkflowRevisionRequest,
-    ) -> Result<bcode_ipc::WorkflowRevisionImportResult, ClientError> {
+        request: bcode_workflow::ImportWorkflowRevisionRequest,
+    ) -> Result<bcode_workflow::WorkflowRevisionImportResult, ClientError> {
         match self
             .send_request(Request::ImportWorkflowRevision(request))
             .await?
@@ -3286,8 +3393,8 @@ impl BcodeClient {
     /// fails.
     pub async fn start_authored_workflow(
         &self,
-        request: bcode_ipc::StartAuthoredWorkflowRequest,
-    ) -> Result<bcode_ipc::AuthoredWorkflowRunStartResponse, ClientError> {
+        request: bcode_workflow::StartAuthoredWorkflowRequest,
+    ) -> Result<bcode_workflow::AuthoredWorkflowRunStartResponse, ClientError> {
         match self
             .send_request(Request::StartAuthoredWorkflow(request))
             .await?
@@ -3307,8 +3414,8 @@ impl BcodeClient {
         cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
     ) -> Result<
-        bcode_ipc::WorkflowAuthoringPage<
-            bcode_ipc::AuthoredWorkflowSnapshot,
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::AuthoredWorkflowSnapshot,
             bcode_workflow::WorkflowAuthoringListCursor,
         >,
         ClientError,
@@ -3330,7 +3437,7 @@ impl BcodeClient {
     pub async fn authored_workflow(
         &self,
         workflow_id: String,
-    ) -> Result<Option<bcode_ipc::AuthoredWorkflowSnapshot>, ClientError> {
+    ) -> Result<Option<bcode_workflow::AuthoredWorkflowSnapshot>, ClientError> {
         match self
             .send_request(Request::GetAuthoredWorkflow { workflow_id })
             .await?
@@ -3349,7 +3456,7 @@ impl BcodeClient {
         &self,
         workflow_id: String,
         limit: usize,
-    ) -> Result<Option<bcode_ipc::AuthoredWorkflowInspection>, ClientError> {
+    ) -> Result<Option<bcode_workflow::AuthoredWorkflowInspection>, ClientError> {
         match self
             .send_request(Request::InspectAuthoredWorkflow { workflow_id, limit })
             .await?
@@ -3372,8 +3479,8 @@ impl BcodeClient {
         cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
     ) -> Result<
-        bcode_ipc::WorkflowAuthoringPage<
-            bcode_ipc::WorkflowDraftSnapshot,
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::WorkflowDraftSnapshot,
             bcode_workflow::WorkflowAuthoringListCursor,
         >,
         ClientError,
@@ -3400,7 +3507,7 @@ impl BcodeClient {
         &self,
         workflow_id: String,
         draft_id: String,
-    ) -> Result<Option<bcode_ipc::WorkflowDraftSnapshot>, ClientError> {
+    ) -> Result<Option<bcode_workflow::WorkflowDraftSnapshot>, ClientError> {
         match self
             .send_request(Request::GetWorkflowDraft {
                 workflow_id,
@@ -3424,8 +3531,8 @@ impl BcodeClient {
         cursor: Option<bcode_workflow::WorkflowRevisionListCursor>,
         limit: usize,
     ) -> Result<
-        bcode_ipc::WorkflowAuthoringPage<
-            bcode_ipc::WorkflowRevisionSnapshot,
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::WorkflowRevisionSnapshot,
             bcode_workflow::WorkflowRevisionListCursor,
         >,
         ClientError,
@@ -3452,7 +3559,7 @@ impl BcodeClient {
         &self,
         workflow_id: String,
         revision: u64,
-    ) -> Result<Option<bcode_ipc::WorkflowRevisionSnapshot>, ClientError> {
+    ) -> Result<Option<bcode_workflow::WorkflowRevisionSnapshot>, ClientError> {
         match self
             .send_request(Request::GetWorkflowRevision {
                 workflow_id,
@@ -3476,7 +3583,7 @@ impl BcodeClient {
         &self,
         workflow_id: String,
         revision: u64,
-    ) -> Result<Option<bcode_ipc::WorkflowRevisionRequirementInspection>, ClientError> {
+    ) -> Result<Option<bcode_workflow::WorkflowRevisionRequirementInspection>, ClientError> {
         match self
             .send_request(Request::InspectWorkflowRevisionRequirements {
                 workflow_id,
@@ -3500,8 +3607,8 @@ impl BcodeClient {
         cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
     ) -> Result<
-        bcode_ipc::WorkflowAuthoringPage<
-            bcode_ipc::WorkflowPresetSnapshot,
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::WorkflowPresetSnapshot,
             bcode_workflow::WorkflowAuthoringListCursor,
         >,
         ClientError,
@@ -3528,7 +3635,7 @@ impl BcodeClient {
         &self,
         workflow_id: String,
         preset_id: String,
-    ) -> Result<Option<bcode_ipc::WorkflowPresetSnapshot>, ClientError> {
+    ) -> Result<Option<bcode_workflow::WorkflowPresetSnapshot>, ClientError> {
         match self
             .send_request(Request::GetWorkflowPreset {
                 workflow_id,
@@ -3617,7 +3724,7 @@ impl BcodeClient {
     /// the complete transaction cannot commit.
     pub async fn apply_workflow_package(
         &self,
-        request: bcode_ipc::ApplyWorkflowPackageRequest,
+        request: bcode_workflow::ApplyWorkflowPackageRequest,
     ) -> Result<bcode_workflow::WorkflowPackageMutationResult, ClientError> {
         match self
             .send_request(Request::ApplyWorkflowPackage(request))
@@ -3636,7 +3743,7 @@ impl BcodeClient {
     /// generations conflict, or the complete transaction cannot commit.
     pub async fn publish_workflow_package(
         &self,
-        request: bcode_ipc::PublishWorkflowPackageRequest,
+        request: bcode_workflow::PublishWorkflowPackageRequest,
     ) -> Result<bcode_workflow::WorkflowPackageMutationResult, ClientError> {
         match self
             .send_request(Request::PublishWorkflowPackage(request))
@@ -3654,8 +3761,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or package planning fails.
     pub async fn validate_workflow_package(
         &self,
-        request: bcode_ipc::WorkflowPackageComputationRequest,
-    ) -> Result<bcode_ipc::WorkflowPackageValidationResult, ClientError> {
+        request: bcode_workflow::WorkflowPackageComputationRequest,
+    ) -> Result<bcode_workflow::WorkflowPackageValidationResult, ClientError> {
         match self
             .send_request(Request::ValidateWorkflowPackage(request))
             .await?
@@ -3672,7 +3779,7 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or any package member cannot compile.
     pub async fn preview_workflow_package(
         &self,
-        request: bcode_ipc::WorkflowPackagePreviewRequest,
+        request: bcode_workflow::WorkflowPackagePreviewRequest,
     ) -> Result<bcode_workflow::WorkflowPackagePreview, ClientError> {
         match self
             .send_request(Request::PreviewWorkflowPackage(request))
@@ -3690,8 +3797,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or source lowering fails.
     pub async fn validate_workflow_source(
         &self,
-        request: bcode_ipc::WorkflowSourceComputationRequest,
-    ) -> Result<bcode_ipc::WorkflowSourceValidationResult, ClientError> {
+        request: bcode_workflow::WorkflowSourceComputationRequest,
+    ) -> Result<bcode_workflow::WorkflowSourceValidationResult, ClientError> {
         match self
             .send_request(Request::ValidateWorkflowSource(request))
             .await?
@@ -3708,8 +3815,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or source compilation fails.
     pub async fn preview_workflow_source(
         &self,
-        request: bcode_ipc::WorkflowSourcePreviewRequest,
-    ) -> Result<bcode_ipc::WorkflowSourcePreviewResult, ClientError> {
+        request: bcode_workflow::WorkflowSourcePreviewRequest,
+    ) -> Result<bcode_workflow::WorkflowSourcePreviewResult, ClientError> {
         match self
             .send_request(Request::PreviewWorkflowSource(request))
             .await?
@@ -3730,7 +3837,7 @@ impl BcodeClient {
     ) -> Result<bcode_workflow::WorkflowValidationReport, ClientError> {
         self.validate_workflow_authoring_with_control(
             document,
-            bcode_ipc::WorkflowComputationControl::default(),
+            bcode_workflow::WorkflowComputationControl::default(),
         )
         .await
     }
@@ -3744,7 +3851,7 @@ impl BcodeClient {
     pub async fn validate_workflow_authoring_with_control(
         &self,
         document: bcode_workflow::WorkflowAuthoringDocument,
-        control: bcode_ipc::WorkflowComputationControl,
+        control: bcode_workflow::WorkflowComputationControl,
     ) -> Result<bcode_workflow::WorkflowValidationReport, ClientError> {
         match self
             .send_request(Request::ValidateWorkflowAuthoring { document, control })
@@ -3768,7 +3875,7 @@ impl BcodeClient {
         self.preview_workflow_compilation_with_control(
             document,
             configuration,
-            bcode_ipc::WorkflowComputationControl::default(),
+            bcode_workflow::WorkflowComputationControl::default(),
         )
         .await
     }
@@ -3783,7 +3890,7 @@ impl BcodeClient {
         &self,
         document: bcode_workflow::WorkflowAuthoringDocument,
         configuration: Option<serde_json::Value>,
-        control: bcode_ipc::WorkflowComputationControl,
+        control: bcode_workflow::WorkflowComputationControl,
     ) -> Result<bcode_workflow::WorkflowCompilationPreview, ClientError> {
         match self
             .send_request(Request::PreviewWorkflowCompilation {
@@ -3891,8 +3998,8 @@ impl BcodeClient {
     /// daemon cannot register and start the exact compiled definition.
     pub async fn start_workflow_template(
         &self,
-        request: bcode_ipc::WorkflowTemplateStartRequest,
-    ) -> Result<bcode_ipc::WorkflowRunStartResponse, ClientError> {
+        request: bcode_workflow::WorkflowTemplateStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, ClientError> {
         match self
             .send_request(Request::StartWorkflowTemplate(request))
             .await?
@@ -3910,11 +4017,11 @@ impl BcodeClient {
     /// authored-state creation is rejected.
     pub async fn instantiate_workflow_template(
         &self,
-        request: bcode_ipc::WorkflowTemplateInstantiationRequest,
+        request: bcode_workflow::WorkflowTemplateInstantiationRequest,
     ) -> Result<
         (
-            bcode_ipc::AuthoredWorkflowSnapshot,
-            bcode_ipc::WorkflowDraftSnapshot,
+            bcode_workflow::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowDraftSnapshot,
         ),
         ClientError,
     > {
@@ -3957,8 +4064,8 @@ impl BcodeClient {
     /// binding, or execution context.
     pub async fn start_workflow(
         &self,
-        request: bcode_ipc::WorkflowStartRequest,
-    ) -> Result<bcode_ipc::WorkflowRunStartResponse, ClientError> {
+        request: bcode_workflow::WorkflowStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, ClientError> {
         match self.send_request(Request::StartWorkflow(request)).await? {
             ResponsePayload::WorkflowRunStarted(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
@@ -3973,8 +4080,8 @@ impl BcodeClient {
     /// authored revision cannot start.
     pub async fn start_workflow_package_export(
         &self,
-        request: bcode_ipc::StartWorkflowPackageExportRequest,
-    ) -> Result<bcode_ipc::WorkflowPackageExportRunStartResponse, ClientError> {
+        request: bcode_workflow::StartWorkflowPackageExportRequest,
+    ) -> Result<bcode_workflow::WorkflowPackageExportRunStartResponse, ClientError> {
         match self
             .send_request(Request::StartWorkflowPackageExport(request))
             .await?
@@ -3992,8 +4099,8 @@ impl BcodeClient {
     /// context, definition identity, or run limits.
     pub async fn start_workflow_run(
         &self,
-        request: bcode_ipc::WorkflowRunStartRequest,
-    ) -> Result<bcode_ipc::WorkflowRunStartResponse, ClientError> {
+        request: bcode_workflow::WorkflowRunStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, ClientError> {
         match self
             .send_request(Request::StartWorkflowRun(request))
             .await?
@@ -4132,8 +4239,8 @@ impl BcodeClient {
     /// cursors or limits, or an expected revision that is no longer current.
     pub async fn inspect_workflow_run_graph(
         &self,
-        request: bcode_ipc::WorkflowRunGraphPageRequest,
-    ) -> Result<bcode_ipc::WorkflowRunGraphInspection, ClientError> {
+        request: bcode_workflow::WorkflowRunGraphPageRequest,
+    ) -> Result<bcode_workflow::WorkflowRunGraphInspection, ClientError> {
         match self
             .send_request(Request::InspectWorkflowRunGraph { request })
             .await?
@@ -4153,7 +4260,7 @@ impl BcodeClient {
         &self,
         run_id: String,
         limit: usize,
-    ) -> Result<bcode_ipc::WorkflowRunInspection, ClientError> {
+    ) -> Result<bcode_workflow::WorkflowRunInspection, ClientError> {
         match self
             .send_request(Request::InspectWorkflowRun { run_id, limit })
             .await?
@@ -4188,7 +4295,7 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the bounded lookup.
     pub async fn associated_workflow_run(
         &self,
-        key: bcode_ipc::WorkflowRunBindingLookup,
+        key: bcode_workflow::WorkflowRunBindingLookup,
     ) -> Result<Option<bcode_workflow_store::WorkflowRunSummary>, ClientError> {
         match self
             .send_request(Request::AssociatedWorkflowRun { key })
@@ -4206,9 +4313,9 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or a bounded canonical query fails.
     pub async fn inspect_associated_workflow_run(
         &self,
-        key: bcode_ipc::WorkflowRunBindingLookup,
+        key: bcode_workflow::WorkflowRunBindingLookup,
         limit: usize,
-    ) -> Result<Option<bcode_ipc::WorkflowRunInspection>, ClientError> {
+    ) -> Result<Option<bcode_workflow::WorkflowRunInspection>, ClientError> {
         match self
             .send_request(Request::InspectAssociatedWorkflowRun { key, limit })
             .await?
@@ -4228,8 +4335,8 @@ impl BcodeClient {
     /// valid for the associated run.
     pub async fn control_associated_workflow_run(
         &self,
-        key: bcode_ipc::WorkflowRunBindingLookup,
-        action: bcode_ipc::WorkflowRunControlAction,
+        key: bcode_workflow::WorkflowRunBindingLookup,
+        action: bcode_workflow::WorkflowRunControlAction,
     ) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), ClientError> {
         match self
             .send_request(Request::ControlAssociatedWorkflowRun { key, action })
@@ -4304,7 +4411,7 @@ impl BcodeClient {
         &self,
         run_id: String,
         limit: usize,
-    ) -> Result<Vec<bcode_ipc::WorkflowOutputInspection>, ClientError> {
+    ) -> Result<Vec<bcode_workflow::WorkflowOutputInspection>, ClientError> {
         match self
             .send_request(Request::WorkflowRunOutputs { run_id, limit })
             .await?
@@ -4340,7 +4447,7 @@ impl BcodeClient {
         &self,
         apply: bool,
         limit: usize,
-    ) -> Result<bcode_ipc::OrphanedWorkflowRunReport, ClientError> {
+    ) -> Result<bcode_workflow::OrphanedWorkflowRunReport, ClientError> {
         match self
             .send_request(Request::ReconcileOrphanedWorkflowRuns { apply, limit })
             .await?
@@ -4416,7 +4523,7 @@ impl BcodeClient {
         &self,
         run_id: String,
         limit: usize,
-    ) -> Result<Vec<bcode_workflow_store::WaitingActivation>, ClientError> {
+    ) -> Result<Vec<bcode_workflow::WaitingActivation>, ClientError> {
         match self
             .send_request(Request::ListWorkflowWaits { run_id, limit })
             .await?
@@ -4486,7 +4593,7 @@ impl BcodeClient {
     pub async fn list_all_workflow_mutation_approvals(
         &self,
         limit: usize,
-    ) -> Result<Vec<bcode_workflow_store::WorkflowMutationApproval>, ClientError> {
+    ) -> Result<Vec<bcode_workflow::WorkflowMutationApprovalInspection>, ClientError> {
         match self
             .send_request(Request::ListWorkflowMutationApprovalsAll { limit })
             .await?
@@ -4505,7 +4612,7 @@ impl BcodeClient {
         &self,
         run_id: String,
         limit: usize,
-    ) -> Result<Vec<bcode_workflow_store::WorkflowMutationApproval>, ClientError> {
+    ) -> Result<Vec<bcode_workflow::WorkflowMutationApprovalInspection>, ClientError> {
         match self
             .send_request(Request::ListWorkflowMutationApprovals { run_id, limit })
             .await?
@@ -4523,8 +4630,8 @@ impl BcodeClient {
     pub async fn resolve_workflow_mutation_approval(
         &self,
         approval_id: String,
-        decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
-    ) -> Result<bcode_workflow_store::WorkflowMutationApprovalResolution, ClientError> {
+        decision: bcode_workflow::WorkflowMutationApprovalDecision,
+    ) -> Result<bcode_workflow::WorkflowMutationApprovalResolution, ClientError> {
         match self
             .send_request(Request::ResolveWorkflowMutationApproval {
                 approval_id,
@@ -4547,7 +4654,7 @@ impl BcodeClient {
         run_id: String,
         cursor: Option<bcode_workflow_store::AttemptCursor>,
         limit: usize,
-    ) -> Result<Vec<bcode_workflow_store::AttemptSummary>, ClientError> {
+    ) -> Result<Vec<bcode_workflow::AttemptSummary>, ClientError> {
         match self
             .send_request(Request::WorkflowAttemptHistory {
                 run_id,
@@ -4571,7 +4678,7 @@ impl BcodeClient {
         run_id: String,
         after_sequence: Option<u64>,
         limit: usize,
-    ) -> Result<Vec<bcode_workflow_store::WorkflowEventRow>, ClientError> {
+    ) -> Result<Vec<bcode_workflow::WorkflowHistoryEvent>, ClientError> {
         match self
             .send_request(Request::WorkflowEventHistory {
                 run_id,

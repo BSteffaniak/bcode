@@ -25,6 +25,20 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// Discovery snapshot of plugin-owned manifest metadata and registered commands.
+///
+/// Reading this snapshot does not invoke commands or execute returned effects.
+/// Missing collections decode as empty for compatibility with existing senders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginContributions {
+    #[serde(default)]
+    pub commands: Vec<bcode_plugin_models::PluginOwnedCommandContribution>,
+    #[serde(default)]
+    pub command_contributions: Vec<bcode_command::CommandContribution>,
+    #[serde(default)]
+    pub config_extensions: Vec<bcode_plugin_models::PluginConfigExtension>,
+}
+
 /// Versioned application service for generic session derivation operations.
 pub const SESSION_DERIVATION_INTERFACE_ID: &str = "bcode.session-derivation/v1";
 pub const OP_SESSION_DERIVATION_SNAPSHOT: &str = "snapshot";

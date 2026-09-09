@@ -797,18 +797,10 @@ pub struct PluginTuiSurfaceDeclaration {
     pub description: Option<String>,
 }
 
-/// Command palette/action contribution declared by a plugin manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginCommandContribution {
-    pub id: String,
-    pub title: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub category: Option<String>,
-    #[serde(default)]
-    pub surface: Option<String>,
-}
+pub use bcode_plugin_models::{
+    PluginCommandContribution, PluginConfigAlias, PluginConfigExtension,
+    PluginOwnedCommandContribution,
+};
 
 /// Service interface declared by a plugin manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -848,16 +840,6 @@ pub struct PluginManifestConfig {
     /// Lightweight ownership labels for plugin-owned config categories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
-}
-
-/// Plugin-owned config alias declaration from a plugin manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginConfigAlias {
-    /// User-facing top-level config section or dotted path.
-    pub section: String,
-    /// Optional reason, normally `legacy`, `compatibility`, or `short_name`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 impl PluginManifestConfig {
@@ -1018,29 +1000,6 @@ pub struct RegisteredPlugin {
     pub manifest: PluginManifest,
 }
 
-/// Resolved plugin config extension metadata with plugin ownership attached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginConfigExtension {
-    pub plugin_id: String,
-    pub section: Option<String>,
-    pub aliases: Vec<PluginConfigAlias>,
-    pub categories: Vec<String>,
-    pub schema_version: Option<u16>,
-    pub schema_file: Option<PathBuf>,
-}
-
-impl PluginConfigExtension {
-    /// Return the primary config section plus manifest-declared aliases.
-    #[must_use]
-    pub fn sections(&self) -> Vec<&str> {
-        self.section
-            .iter()
-            .map(String::as_str)
-            .chain(self.aliases.iter().map(|alias| alias.section.as_str()))
-            .collect()
-    }
-}
-
 impl RegisteredPlugin {
     /// Return this plugin's manifest-declared config extension metadata, if any.
     #[must_use]
@@ -1161,13 +1120,6 @@ pub fn plugin_command_contributions(
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-/// Command contribution with plugin ownership attached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginOwnedCommandContribution {
-    pub plugin_id: String,
-    pub command: PluginCommandContribution,
 }
 
 /// Return manifest-declared plugin config extension metadata for registered plugins.

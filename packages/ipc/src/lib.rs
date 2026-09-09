@@ -808,7 +808,7 @@ pub enum Request {
     /// Resolve one exact durable mutation approval by stable approval identity.
     ResolveWorkflowMutationApproval {
         approval_id: String,
-        decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+        decision: bcode_workflow::WorkflowMutationApprovalDecision,
     },
     /// Return one bounded page of durable workflow attempts.
     WorkflowAttemptHistory {
@@ -1399,16 +1399,8 @@ pub use bcode_session_models::SessionRuntimeSelection;
 /// Compatibility export of the model-owned application status contract.
 pub use bcode_model::SessionModelStatus;
 
-/// Manifest-declared plugin contributions available without executing plugin code.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginContributions {
-    #[serde(default)]
-    pub commands: Vec<bcode_plugin::PluginOwnedCommandContribution>,
-    #[serde(default)]
-    pub command_contributions: Vec<bcode_command::CommandContribution>,
-    #[serde(default)]
-    pub config_extensions: Vec<bcode_plugin::PluginConfigExtension>,
-}
+/// Compatibility export of the plugin SDK's discovery contract.
+pub use bcode_plugin_sdk::PluginContributions;
 
 /// Service interface provided by a loaded plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1779,705 +1771,185 @@ pub struct WorkflowTemplateDescription {
     pub diagnostics: Vec<WorkflowTemplateDiagnostic>,
 }
 
-/// Typed request to instantiate a maintainable template as normal mutable authored state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowTemplateInstantiationRequest {
-    pub owner_plugin_id: String,
-    pub template_id: String,
-    pub template_version: u32,
-    /// New stable logical authored-workflow identity.
-    pub workflow_id: String,
-    /// New mutable draft identity.
-    pub draft_id: String,
-}
+/// Compatibility export of the workflow-owned start contract.
+pub use bcode_workflow::WorkflowTemplateInstantiationRequest;
 
-/// Typed request to start one exact plugin-owned template.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowTemplateStartRequest {
-    pub owner_plugin_id: String,
-    pub template_id: String,
-    pub template_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    /// Optional immutable workspace snapshot override. Empty/absent derives the canonical parent
-    /// session working directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_snapshot: Option<String>,
-    pub parent_session_id: bcode_session_models::SessionId,
-    pub configuration: serde_json::Value,
-    #[serde(default)]
-    pub limits: bcode_workflow_store::WorkflowRunLimits,
-}
+/// Compatibility export of the workflow-owned start contract.
+pub use bcode_workflow::WorkflowTemplateStartRequest;
 
-/// Portable bounded keyset page.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowAuthoringPage<T, C> {
-    /// Items in stable query order.
-    pub items: Vec<T>,
-    /// Cursor for the next page, absent when this page exhausted the query.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<C>,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowAuthoringPage;
 
-/// Atomic package apply request through the daemon-owned workflow store.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyWorkflowPackageRequest {
-    pub request: bcode_workflow::WorkflowPackageApplyRequest,
-    pub applied_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::ApplyWorkflowPackageRequest;
 
-/// Atomic package publication request through the daemon-owned workflow store.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublishWorkflowPackageRequest {
-    pub request: bcode_workflow::WorkflowPackagePublishRequest,
-    pub published_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::PublishWorkflowPackageRequest;
 
-/// One bounded portable package validation/planning request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPackageComputationRequest {
-    /// One bounded portable transitive package closure.
-    pub closure: bcode_workflow::WorkflowPackageClosure,
-    #[serde(default)]
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowPackageComputationRequest;
 
-/// One side-effect-free preview request for an already planned package.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPackagePreviewRequest {
-    pub plan: bcode_workflow::WorkflowPackagePlan,
-    /// Exact dependency-before-importer closure plans used to make immutable child definitions
-    /// available while previewing the entry package.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dependency_plans: Vec<bcode_workflow::WorkflowPackagePlan>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub configurations: std::collections::BTreeMap<String, serde_json::Value>,
-    #[serde(default)]
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowPackagePreviewRequest;
 
-/// Portable successful package planning response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPackageValidationResult {
-    pub plan: bcode_workflow::WorkflowPackageClosurePlan,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowPackageValidationResult;
 
-/// One bounded raw-source validation/lowering request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowSourceComputationRequest {
-    pub source_format: bcode_workflow::WorkflowSourceFormat,
-    pub source: String,
-    #[serde(default)]
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowSourceComputationRequest;
 
-/// One bounded raw-source compilation preview request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowSourcePreviewRequest {
-    pub source_format: bcode_workflow::WorkflowSourceFormat,
-    pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configuration: Option<serde_json::Value>,
-    #[serde(default)]
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowSourcePreviewRequest;
 
-/// Portable source validation/lowering response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowSourceValidationResult {
-    pub source_format: bcode_workflow::WorkflowSourceFormat,
-    pub lowering: bcode_workflow::WorkflowSourceLoweringResult,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowSourceValidationResult;
 
-/// Portable source lowering plus canonical compilation preview.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowSourcePreviewResult {
-    pub source_format: bcode_workflow::WorkflowSourceFormat,
-    pub lowering: bcode_workflow::WorkflowSourceLoweringResult,
-    pub preview: bcode_workflow::WorkflowCompilationPreview,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowSourcePreviewResult;
 
-/// Default bounded deadline for authored-workflow validation and compilation.
-pub const DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS: u64 = 30_000;
-/// Maximum caller-selected authored-workflow computation deadline.
-pub const MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS: u64 = 120_000;
+/// Compatibility exports of workflow-owned computation controls.
+pub use bcode_workflow::{
+    DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS, MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS,
+    WorkflowComputationControl,
+};
 
-/// Explicit control for one bounded authored-workflow validation or compilation request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowComputationControl {
-    /// Stable caller identity used to target cancellation while the request is in flight.
-    pub operation_id: String,
-    /// Server-enforced computation deadline in milliseconds.
-    pub timeout_ms: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::AuthoredWorkflowSnapshot;
 
-impl Default for WorkflowComputationControl {
-    fn default() -> Self {
-        Self {
-            operation_id: String::new(),
-            timeout_ms: DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS,
-        }
-    }
-}
+/// Compatibility export of the workflow-owned draft snapshot.
+pub use bcode_workflow::WorkflowDraftSnapshot;
 
-/// Portable logical authored-workflow snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoredWorkflowSnapshot {
-    pub workflow_id: String,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub archived: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_revision: Option<u64>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowRevisionSnapshot;
 
-/// Portable mutable authored-workflow draft snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowDraftSnapshot {
-    pub identity: bcode_workflow::WorkflowDraftIdentity,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_revision: Option<u64>,
-    pub generation: u64,
-    pub checksum_sha256: String,
-    pub document: bcode_workflow::WorkflowAuthoringDocument,
-    pub producer: bcode_workflow::WorkflowProducerProvenance,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowRevisionRequirementInspection;
 
-/// Portable immutable published-revision snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRevisionSnapshot {
-    pub identity: bcode_workflow::WorkflowRevisionIdentity,
-    pub source_checksum_sha256: String,
-    pub executable_source_checksum_sha256: String,
-    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
-    pub document: bcode_workflow::WorkflowAuthoringDocument,
-    pub producer: bcode_workflow::WorkflowProducerProvenance,
-    pub published_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowAuthoringEventSnapshot;
 
-/// Immutable publication facts plus current derived requirement availability.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRevisionRequirementInspection {
-    pub revision: Box<WorkflowRevisionSnapshot>,
-    pub current_availability: bcode_workflow::WorkflowRequirementAvailabilityReport,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowAuthoringIssueSnapshot;
 
-/// One portable bounded authored lifecycle event with normalized, content-minimized facts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowAuthoringEventSnapshot {
-    pub event_seq: u64,
-    pub workflow_id: String,
-    pub event_type: String,
-    pub revision: Option<u64>,
-    pub definition_id: Option<String>,
-    pub definition_version: Option<u32>,
-    pub activated: Option<bool>,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowDraftInspectionSummary;
 
-/// One portable authored-state consistency issue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "issue", rename_all = "snake_case")]
-pub enum WorkflowAuthoringIssueSnapshot {
-    InvalidActiveRevision {
-        revision: u64,
-    },
-    MissingCompiledDefinition {
-        revision: u64,
-        definition_id: String,
-        definition_version: u32,
-    },
-    OrphanedPreset {
-        preset_id: String,
-        revision: u64,
-    },
-    StaleDraftBase {
-        draft_id: String,
-        base_revision: u64,
-    },
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowRevisionInspectionSummary;
 
-/// Content-minimized mutable draft summary for public diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowDraftInspectionSummary {
-    pub identity: bcode_workflow::WorkflowDraftIdentity,
-    pub base_revision: Option<u64>,
-    pub generation: u64,
-    pub checksum_sha256: String,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowPresetInspectionSummary;
 
-/// Content-minimized immutable revision summary for public diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRevisionInspectionSummary {
-    pub identity: bcode_workflow::WorkflowRevisionIdentity,
-    pub source_checksum_sha256: String,
-    pub executable_source_checksum_sha256: String,
-    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
-    pub published_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::AuthoredWorkflowInspection;
 
-/// Content-minimized preset summary for public diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPresetInspectionSummary {
-    pub workflow_id: String,
-    pub preset_id: String,
-    pub revision: u64,
-    pub generation: u64,
-    pub has_run_limit_override: bool,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowPresetSnapshot;
 
-/// Bounded aggregate authored-workflow inspection from canonical indexed rows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoredWorkflowInspection {
-    pub workflow: AuthoredWorkflowSnapshot,
-    pub drafts: Vec<WorkflowDraftInspectionSummary>,
-    pub revisions: Vec<WorkflowRevisionInspectionSummary>,
-    pub presets: Vec<WorkflowPresetInspectionSummary>,
-    pub events: Vec<WorkflowAuthoringEventSnapshot>,
-    pub issues: Vec<WorkflowAuthoringIssueSnapshot>,
-}
+/// Compatibility export of the workflow-owned optimistic conflict.
+pub use bcode_workflow::WorkflowAuthoringConflict;
 
-/// Portable reusable revision-bound preset snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPresetSnapshot {
-    pub workflow_id: String,
-    pub preset_id: String,
-    pub revision: u64,
-    pub name: String,
-    pub generation: u64,
-    pub configuration: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_limits: Option<bcode_workflow::WorkflowRunLimitPolicy>,
-    pub producer: bcode_workflow::WorkflowProducerProvenance,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowDraftUpdateResult;
 
-/// Portable optimistic authoring conflict.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowAuthoringConflict {
-    pub entity_id: String,
-    pub expected_generation: u64,
-    pub current_generation: u64,
-}
+/// Compatibility exports of workflow-owned draft edit contracts.
+pub use bcode_workflow::{ApplyWorkflowDraftEditsRequest, WorkflowDraftEditResult};
 
-/// Typed result of an optimistic draft replacement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowDraftUpdateResult {
-    Updated(Box<WorkflowDraftSnapshot>),
-    Conflict(WorkflowAuthoringConflict),
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::ApplyWorkflowSourceRequest;
 
-/// Typed result of an optimistic semantic draft edit batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowDraftEditResult {
-    Updated(Box<WorkflowDraftSnapshot>),
-    Conflict(WorkflowAuthoringConflict),
-    Rejected {
-        diagnostics: Vec<bcode_workflow::WorkflowValidationDiagnostic>,
-    },
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::CreateAuthoredWorkflowRequest;
 
-/// One generation-checked semantic draft edit request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyWorkflowDraftEditsRequest {
-    pub workflow_id: String,
-    pub draft_id: String,
-    pub batch: bcode_workflow::WorkflowAuthoringEditBatch,
-    pub producer: bcode_workflow::WorkflowProducerProvenance,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::UpdateWorkflowDraftRequest;
 
-/// One source-aware create-or-single-replace request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyWorkflowSourceRequest {
-    pub source_format: bcode_workflow::WorkflowSourceFormat,
-    pub source: String,
-    pub draft_id: String,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::PublishWorkflowDraftRequest;
 
-/// One typed authored-workflow creation request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateAuthoredWorkflowRequest {
-    pub document: bcode_workflow::WorkflowAuthoringDocument,
-    pub draft_id: String,
-}
+/// Compatibility export of the workflow-owned admission contract.
+pub use bcode_workflow::PublishAndStartWorkflowRequest;
 
-/// One generation-checked draft replacement request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateWorkflowDraftRequest {
-    pub workflow_id: String,
-    pub draft_id: String,
-    pub expected_generation: u64,
-    pub document: bcode_workflow::WorkflowAuthoringDocument,
-    pub producer: bcode_workflow::WorkflowProducerProvenance,
-}
+/// Compatibility export of the workflow-owned admission contract.
+pub use bcode_workflow::WorkflowRunAdmissionResult;
 
-/// One exact draft publication request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublishWorkflowDraftRequest {
-    pub workflow_id: String,
-    pub draft_id: String,
-    pub expected_generation: u64,
-    pub configuration: Option<serde_json::Value>,
-    pub activate: bool,
-    pub expected_active_revision: Option<u64>,
-    #[serde(default)]
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned admission contract.
+pub use bcode_workflow::WorkflowPublishAndStartResult;
 
-/// Publish one exact draft and then attempt a separately reported durable run admission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublishAndStartWorkflowRequest {
-    /// Exact publication operation.
-    pub publication: PublishWorkflowDraftRequest,
-    /// Caller-stable run identity when retrying run admission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    pub parent_session_id: bcode_session_models::SessionId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_snapshot: Option<String>,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::ActivateWorkflowRevisionRequest;
 
-/// Run-admission outcome following a successful publication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowRunAdmissionResult {
-    Started(Box<AuthoredWorkflowRunStartResponse>),
-    Failed(ErrorResponse),
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::SetAuthoredWorkflowArchivedRequest;
 
-/// Typed publish-and-start result preserving the publication boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowPublishAndStartResult {
-    PublicationConflict(WorkflowAuthoringConflict),
-    Published {
-        revision: Box<WorkflowRevisionSnapshot>,
-        active_revision: Option<u64>,
-        run_admission: WorkflowRunAdmissionResult,
-    },
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::DiscardWorkflowDraftRequest;
 
-/// Compare-and-set one exact immutable revision as active.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActivateWorkflowRevisionRequest {
-    pub workflow_id: String,
-    pub revision: u64,
-    pub expected_active_revision: Option<u64>,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowDraftForkSource;
 
-/// Archive or unarchive one logical authored workflow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SetAuthoredWorkflowArchivedRequest {
-    pub workflow_id: String,
-    pub archived: bool,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::ForkWorkflowDraftRequest;
 
-/// Discard one exact mutable draft generation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DiscardWorkflowDraftRequest {
-    pub workflow_id: String,
-    pub draft_id: String,
-    pub expected_generation: u64,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowAuthoringMutationResult;
 
-/// Exact source used to fork a new mutable generation-1 draft.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowDraftForkSource {
-    Draft { draft_id: String },
-    Revision { revision: u64 },
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowPublicationResult;
 
-/// Fork one exact draft or immutable revision into a new mutable draft.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForkWorkflowDraftRequest {
-    pub workflow_id: String,
-    pub source: WorkflowDraftForkSource,
-    pub draft_id: String,
-    pub producer: bcode_workflow::WorkflowProducerProvenance,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowPresetMutation;
 
-/// Typed optimistic mutation outcome without an entity payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowAuthoringMutationResult {
-    Applied,
-    Conflict(WorkflowAuthoringConflict),
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::CreateWorkflowPresetRequest;
 
-/// Typed atomic publication outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowPublicationResult {
-    Published {
-        revision: Box<WorkflowRevisionSnapshot>,
-        active_revision: Option<u64>,
-    },
-    Conflict(WorkflowAuthoringConflict),
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::UpdateWorkflowPresetRequest;
 
-/// One preset create/update payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPresetMutation {
-    pub workflow_id: String,
-    pub preset_id: String,
-    pub revision: u64,
-    pub name: String,
-    pub configuration: serde_json::Value,
-    pub run_limits: Option<bcode_workflow::WorkflowRunLimitPolicy>,
-    pub producer: bcode_workflow::WorkflowProducerProvenance,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::DeleteWorkflowPresetRequest;
 
-/// Create one revision-bound preset at generation 1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateWorkflowPresetRequest {
-    pub preset: WorkflowPresetMutation,
-}
+/// Compatibility export of the workflow-owned authoring contract.
+pub use bcode_workflow::WorkflowPresetUpdateResult;
 
-/// Replace one exact preset generation without changing its revision binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateWorkflowPresetRequest {
-    pub expected_generation: u64,
-    pub preset: WorkflowPresetMutation,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::ExportWorkflowRevisionRequest;
 
-/// Delete one exact preset generation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeleteWorkflowPresetRequest {
-    pub workflow_id: String,
-    pub preset_id: String,
-    pub expected_generation: u64,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::PreviewWorkflowImportRequest;
 
-/// Typed result of an optimistic preset replacement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowPresetUpdateResult {
-    Updated(WorkflowPresetSnapshot),
-    Conflict(WorkflowAuthoringConflict),
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowImportCollisionPolicy;
 
-/// Export one exact immutable authored revision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportWorkflowRevisionRequest {
-    pub workflow_id: String,
-    pub revision: u64,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::ImportWorkflowRequest;
 
-/// Preview one portable import without mutation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreviewWorkflowImportRequest {
-    pub bundle: bcode_workflow::WorkflowExportBundle,
-    pub target_workflow_id: String,
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::ImportWorkflowDraftRequest;
 
-/// Explicit collision policy for importing a bundle into authored state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowImportCollisionPolicy {
-    /// Require the target logical workflow identity to be absent.
-    RequireNewWorkflow,
-    /// Require the target logical workflow to exist and the requested draft identity to be absent.
-    RequireExistingWorkflowNewDraft,
-    /// Require the target logical workflow to exist and its next revision to match exactly.
-    RequireExistingWorkflowNextRevision,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::ImportWorkflowRevisionRequest;
 
-/// Import one portable bundle as a new logical workflow and generation-1 draft.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImportWorkflowRequest {
-    pub bundle: bcode_workflow::WorkflowExportBundle,
-    pub target_workflow_id: String,
-    pub draft_id: String,
-    /// Must be [`WorkflowImportCollisionPolicy::RequireNewWorkflow`].
-    pub collision_policy: WorkflowImportCollisionPolicy,
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowRevisionImportResult;
 
-/// Import one portable bundle as a generation-1 draft in an existing logical workflow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImportWorkflowDraftRequest {
-    pub bundle: bcode_workflow::WorkflowExportBundle,
-    pub workflow_id: String,
-    pub draft_id: String,
-    /// Must be [`WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft`].
-    pub collision_policy: WorkflowImportCollisionPolicy,
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowDraftImportResult;
 
-/// Import one portable bundle directly as the exact next immutable revision of an existing workflow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImportWorkflowRevisionRequest {
-    pub bundle: bcode_workflow::WorkflowExportBundle,
-    pub workflow_id: String,
-    pub revision: u64,
-    pub activate: bool,
-    pub expected_active_revision: Option<u64>,
-    /// Must be [`WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision`].
-    pub collision_policy: WorkflowImportCollisionPolicy,
-    pub control: WorkflowComputationControl,
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::AuthoredWorkflowRunSelection;
 
-/// Typed exact-revision import outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowRevisionImportResult {
-    Imported {
-        revision: Box<WorkflowRevisionSnapshot>,
-        active_revision: Option<u64>,
-    },
-    Conflict(WorkflowAuthoringConflict),
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::StartAuthoredWorkflowRequest;
 
-/// Typed existing-workflow import outcome with collision-safe draft identity handling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowDraftImportResult {
-    Imported {
-        workflow: AuthoredWorkflowSnapshot,
-        draft: Box<WorkflowDraftSnapshot>,
-    },
-    DraftAlreadyExists {
-        workflow_id: String,
-        draft_id: String,
-    },
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::StartWorkflowPackageExportRequest;
 
-/// Exact published authored-workflow selection used for a durable run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthoredWorkflowRunSelection {
-    Revision {
-        workflow_id: String,
-        revision: u64,
-    },
-    Active {
-        workflow_id: String,
-    },
-    Preset {
-        workflow_id: String,
-        preset_id: String,
-        preset_generation: u64,
-    },
-}
+/// Compatibility export of the workflow-owned application contract.
+pub use bcode_workflow::WorkflowPackageExportRunStartResponse;
 
-/// Start a durable run from an immutable authored-workflow revision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartAuthoredWorkflowRequest {
-    pub selection: AuthoredWorkflowRunSelection,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    pub parent_session_id: bcode_session_models::SessionId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_snapshot: Option<String>,
-    /// Exact accepted parent-session generation required when the published workflow contains
-    /// fixed-generation agents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_generation: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configuration: Option<serde_json::Value>,
-    /// Optional invocation-specific typed run input validated against the published interface.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartWorkflowPackageExportRequest {
-    pub package_export: bcode_workflow::WorkflowPackageExportIdentity,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    pub parent_session_id: bcode_session_models::SessionId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_snapshot: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_generation: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configuration: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<serde_json::Value>,
-}
-
-/// Successful package-export run start with exact publication provenance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowPackageExportRunStartResponse {
-    pub package_export: bcode_workflow::WorkflowPackageExportIdentity,
-    pub package_lock_digest_sha256: String,
-    pub exported: bcode_workflow::WorkflowPackageLockedExport,
-    pub started: AuthoredWorkflowRunStartResponse,
-}
-
-/// Successful authored-workflow run start with exact durable provenance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoredWorkflowRunStartResponse {
-    pub started: WorkflowRunStartResponse,
-    pub workflow_id: String,
-    pub revision: u64,
-    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_generation: Option<u64>,
-    pub configuration: serde_json::Value,
-}
+/// Compatibility export of the workflow-owned admission contract.
+pub use bcode_workflow::AuthoredWorkflowRunStartResponse;
 
 /// Request to durably register one compiled workflow definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2488,246 +1960,52 @@ pub struct WorkflowDefinitionRegistrationRequest {
 }
 
 /// Current bounded canonical terminal-output inspection contract version.
-pub const WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION: u32 = 1;
+pub use bcode_workflow::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION;
 
 /// Current bounded validated workflow-output inspection contract version.
-pub const WORKFLOW_OUTPUT_INSPECTION_VERSION: u32 = 1;
+pub use bcode_workflow::WORKFLOW_OUTPUT_INSPECTION_VERSION;
 
-/// Bounded canonical validated workflow output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowOutputInspection {
-    pub version: u32,
-    pub output_id: String,
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub schema_id: String,
-    pub schema_version: u32,
-    pub checksum_sha256: String,
-    pub value: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_reference: Option<String>,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned output contract.
+pub use bcode_workflow::WorkflowOutputInspection;
 
-/// Bounded canonical terminal value exposed through normal workflow inspection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowTerminalOutputInspection {
-    pub version: u32,
-    pub output_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub schema_id: String,
-    pub schema_version: u32,
-    pub checksum_sha256: String,
-    pub value: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_reference: Option<String>,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned output contract.
+pub use bcode_workflow::WorkflowTerminalOutputInspection;
 
-/// Result of one explicit orphaned-workflow-run reconciliation pass.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrphanedWorkflowRunReport {
-    /// Whether mutations were applied (`true`) or only planned (`false`).
-    pub applied: bool,
-    /// Runs whose coordinator verifiably ended and that were (or would be) reassigned and
-    /// cancelled.
-    pub reconciled: Vec<OrphanedWorkflowRun>,
-    /// Nonterminal runs that were inspected but left untouched, with the reason.
-    pub skipped: Vec<SkippedWorkflowRun>,
-}
+/// Compatibility export of the workflow-owned observation/control contract.
+pub use bcode_workflow::OrphanedWorkflowRunReport;
 
-/// One nonterminal run whose coordinator daemon verifiably ended.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrphanedWorkflowRun {
-    pub run_id: String,
-    pub workflow_kind: Option<String>,
-    pub parent_session_id: Option<String>,
-    pub status: bcode_workflow_store::RunStatus,
-    pub ended_daemon_instance_id: String,
-    pub ended_target_artifact_id: String,
-    pub artifact_image_available: bool,
-    pub updated_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned observation/control contract.
+pub use bcode_workflow::OrphanedWorkflowRun;
 
-/// One nonterminal run that reconciliation deliberately left alone.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkippedWorkflowRun {
-    pub run_id: String,
-    pub status: bcode_workflow_store::RunStatus,
-    pub reason: String,
-}
+/// Compatibility export of the workflow-owned observation/control contract.
+pub use bcode_workflow::SkippedWorkflowRun;
 
-/// Read independent node and edge pages from one expected graph revision.
-///
-/// A revision mismatch is rejected; callers must restart pagination. Cursors are
-/// exclusive stable identities from the previous page, not offsets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRunGraphPageRequest {
-    pub run_id: String,
-    pub expected_revision: u64,
-    pub after_node_id: Option<String>,
-    pub after_edge_id: Option<u64>,
-    pub limit: usize,
-}
+/// Compatibility exports for workflow-owned graph inspection contracts.
+pub use bcode_workflow::{
+    WorkflowRunGraphEdgeInspection, WorkflowRunGraphInspection, WorkflowRunGraphNodeInspection,
+    WorkflowRunGraphPageRequest,
+};
 
-/// Bounded run-owned graph page captured by workflow inspection.
-///
-/// The revision is an optimistic concurrency token, not a schema version. A
-/// complete flag means that collection has no rows after this page; when a
-/// cursor was supplied, earlier rows are deliberately omitted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRunGraphInspection {
-    pub revision: u64,
-    pub nodes: Vec<WorkflowRunGraphNodeInspection>,
-    pub edges: Vec<WorkflowRunGraphEdgeInspection>,
-    pub nodes_complete: bool,
-    pub edges_complete: bool,
-}
+/// Compatibility export of the workflow-owned bounded inspection contract.
+pub use bcode_workflow::WorkflowRunInspection;
 
-/// One immutable executable node in the inspected run graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRunGraphNodeInspection {
-    pub revision: u64,
-    pub node: bcode_workflow::NodeDefinition,
-    pub entry: bool,
-    pub exit: bool,
-}
+/// Compatibility export of the workflow-owned observation/control contract.
+pub use bcode_workflow::WorkflowCoordinatorStatus;
 
-/// One stable edge identity and its executable definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRunGraphEdgeInspection {
-    /// Revision that admitted this representation, not necessarily the graph revision.
-    pub revision: u64,
-    pub edge_id: u64,
-    pub edge: bcode_workflow::EdgeDefinition,
-}
+/// Compatibility export of the workflow-owned observation/control contract.
+pub use bcode_workflow::WorkflowRunControlAction;
 
-/// Bounded aggregate workflow inspection snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunInspection {
-    pub run: bcode_workflow_store::WorkflowRunSummary,
-    /// Absent for older senders; absence must not be interpreted as an empty graph.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graph: Option<WorkflowRunGraphInspection>,
-    pub definition: bcode_workflow_store::StoredWorkflowDefinition,
-    /// Canonical successful terminal value, present only for a completed run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_output: Option<WorkflowTerminalOutputInspection>,
-    pub activations: Vec<bcode_workflow_store::WorkflowActivationSummary>,
-    pub waits: Vec<bcode_workflow_store::WaitingActivation>,
-    pub mutation_approvals: Vec<bcode_workflow_store::WorkflowMutationApproval>,
-    pub attempts: Vec<bcode_workflow_store::AttemptSummary>,
-    pub events: Vec<bcode_workflow_store::WorkflowEventRow>,
-    pub decisions: Vec<bcode_workflow_store::WorkflowDecision>,
-    pub grants: Vec<bcode_workflow_store::WorkflowGrant>,
-    pub resource_leases: Vec<bcode_workflow_store::WorkflowResourceLease>,
-    pub outputs: Vec<bcode_workflow_store::WorkflowOutputSummary>,
-    /// Bounded direct child-run links.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub child_run_links: Vec<bcode_workflow_store::WorkflowRunLink>,
-    /// Bounded descendants across the complete composed run hierarchy.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub descendant_runs: Vec<bcode_workflow_store::WorkflowDescendantRunSummary>,
-    /// Typed repeat outcomes for the root and bounded descendants, projected by normalized queries.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub repeat_outcomes: Vec<bcode_workflow_store::WorkflowRepeatOutcomeSummary>,
-    pub child_sessions: Vec<SessionSummary>,
-    /// Which daemon currently coordinates this run and whether it is this daemon.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coordinator: Option<WorkflowCoordinatorStatus>,
-}
+/// Compatibility export of the workflow-owned observation/control contract.
+pub use bcode_workflow::WorkflowRunBindingLookup;
 
-/// Normalized ownership status of one workflow run's coordinator daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowCoordinatorStatus {
-    /// Artifact the run is fenced to.
-    pub target_artifact_id: String,
-    /// Daemon instance recorded as the current coordinator.
-    pub daemon_instance_id: String,
-    /// Whether the responding daemon is that coordinator.
-    pub owned_by_this_daemon: bool,
-    /// Whether the responding daemon could take control of the run on demand.
-    ///
-    /// `false` means another daemon still owns the run (or ownership cannot be verified), and
-    /// control requests from this daemon will be refused until that daemon ends.
-    pub controllable_from_this_daemon: bool,
-}
+/// Compatibility export of the workflow-owned start contract.
+pub use bcode_workflow::WorkflowStartRequest;
 
-/// Lifecycle transition applied to one workflow run found through a generic binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowRunControlAction {
-    Pause,
-    Resume,
-    Cancel,
-}
+/// Compatibility export of the workflow-owned start contract.
+pub use bcode_workflow::WorkflowRunStartRequest;
 
-/// Generic associated workflow run lookup key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunBindingLookup {
-    pub owner_plugin_id: String,
-    pub workflow_kind: String,
-    pub scope_key: String,
-}
-
-/// Generic request to register and start one exact durable workflow atomically from the caller's
-/// perspective.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowStartRequest {
-    pub identity: bcode_workflow::WorkflowDefinitionIdentity,
-    pub definition: bcode_workflow::WorkflowDefinition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    /// Optional immutable workspace snapshot override. Empty/absent derives the canonical parent
-    /// session working directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_snapshot: Option<String>,
-    pub parent_session_id: bcode_session_models::SessionId,
-    pub input: serde_json::Value,
-    pub binding: bcode_workflow_store::WorkflowRunBinding,
-    #[serde(default)]
-    pub limits: bcode_workflow_store::WorkflowRunLimits,
-}
-
-/// Generic request to start one durable workflow from a registered exact definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunStartRequest {
-    pub definition_id: String,
-    pub definition_version: u32,
-    /// Optional caller-stable identity used to make start retries idempotent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    /// Immutable repository/worktree snapshot identity required for every durable run.
-    pub workspace_snapshot: String,
-    /// Session used for compact generic runtime-work presentation.
-    pub parent_session_id: bcode_session_models::SessionId,
-    /// Exact accepted parent-session generation required by fixed-generation workflow prompts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_generation: Option<u64>,
-    /// Optional bounded product ownership and discovery association.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding: Option<bcode_workflow_store::WorkflowRunBinding>,
-    /// Optional typed input validated against the registered definition input schema.
-    #[serde(default)]
-    pub input: Option<serde_json::Value>,
-    #[serde(default)]
-    pub limits: bcode_workflow_store::WorkflowRunLimits,
-}
-
-/// Successful durable workflow run start.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunStartResponse {
-    pub run: bcode_workflow_store::WorkflowRunSummary,
-    pub runtime_work_id: WorkId,
-}
+/// Compatibility export of the workflow-owned admission contract.
+pub use bcode_workflow::WorkflowRunStartResponse;
 
 /// Domain-owned runtime-work snapshot, retained here for source compatibility.
 pub use bcode_session_models::RuntimeWorkSnapshot;
@@ -3127,22 +2405,22 @@ pub enum ResponsePayload {
         result: bcode_workflow_store::WorkflowNodeRetryResult,
     },
     WorkflowWaitList {
-        waits: Vec<bcode_workflow_store::WaitingActivation>,
+        waits: Vec<bcode_workflow::WaitingActivation>,
     },
     WorkflowWaitResolved {
         result: bcode_workflow_store::WaitingResolutionResult,
     },
     WorkflowMutationApprovalList {
-        approvals: Vec<bcode_workflow_store::WorkflowMutationApproval>,
+        approvals: Vec<bcode_workflow::WorkflowMutationApprovalInspection>,
     },
     WorkflowMutationApprovalResolved {
-        result: bcode_workflow_store::WorkflowMutationApprovalResolution,
+        result: bcode_workflow::WorkflowMutationApprovalResolution,
     },
     WorkflowAttemptHistory {
-        attempts: Vec<bcode_workflow_store::AttemptSummary>,
+        attempts: Vec<bcode_workflow::AttemptSummary>,
     },
     WorkflowEventHistory {
-        events: Vec<bcode_workflow_store::WorkflowEventRow>,
+        events: Vec<bcode_workflow::WorkflowHistoryEvent>,
     },
     WorkflowLiveEventCatchUp {
         page: bcode_workflow_view_models::WorkflowLiveEventPage,
@@ -4221,6 +3499,57 @@ mod tests {
     }
 
     #[test]
+    fn plugin_discovery_contract_preserves_populated_wire_shape() {
+        let json = serde_json::json!({
+            "commands": [{"plugin_id":"example", "command": {
+                "id":"inspect", "title":"Inspect", "description":null,
+                "category":"tools", "surface":"slash"
+            }}],
+            "command_contributions": [],
+            "config_extensions": [{"plugin_id":"example", "section":"example",
+                "aliases":[{"section":"legacy", "reason":"compatibility"}],
+                "categories":["tools"], "schema_version":1, "schema_file":"schema.json"
+            }]
+        });
+        let wire: PluginContributions = serde_json::from_value(json.clone()).unwrap();
+        let domain: bcode_plugin_sdk::PluginContributions = wire;
+        assert_eq!(
+            domain.config_extensions[0].sections(),
+            ["example", "legacy"]
+        );
+        assert_eq!(serde_json::to_value(domain).unwrap(), json);
+        let empty: PluginContributions = serde_json::from_str("{}").unwrap();
+        assert!(empty.commands.is_empty());
+        assert!(empty.command_contributions.is_empty());
+        assert!(empty.config_extensions.is_empty());
+    }
+
+    #[test]
+    fn graph_contracts_preserve_domain_identity_and_wire_shape() {
+        let request_json = serde_json::json!({
+            "run_id": "run-1", "expected_revision": 7,
+            "after_node_id": "node-2", "after_edge_id": 9, "limit": 12,
+        });
+        let wire: WorkflowRunGraphPageRequest =
+            serde_json::from_value(request_json.clone()).unwrap();
+        let domain: bcode_workflow::WorkflowRunGraphPageRequest = wire;
+        assert_eq!(serde_json::to_value(domain).unwrap(), request_json);
+        let page_json = serde_json::json!({
+            "revision": 7, "nodes": [], "edges": [],
+            "nodes_complete": true, "edges_complete": false,
+        });
+        let wire: WorkflowRunGraphInspection = serde_json::from_value(page_json.clone()).unwrap();
+        let domain: bcode_workflow::WorkflowRunGraphInspection = wire;
+        assert_eq!(serde_json::to_value(domain).unwrap(), page_json);
+        let mut unknown_request = request_json;
+        unknown_request["future_field"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkflowRunGraphPageRequest>(unknown_request).is_err());
+        let mut unknown_page = page_json;
+        unknown_page["future_field"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkflowRunGraphInspection>(unknown_page).is_err());
+    }
+
+    #[test]
     fn model_status_preserves_domain_identity_and_wire_shape() {
         let wire = serde_json::json!({
             "provider_plugin_id": "provider", "requested_model_id": "alias",
@@ -4867,7 +4196,7 @@ mod tests {
             },
             Request::ResolveWorkflowMutationApproval {
                 approval_id: "approval-1".to_string(),
-                decision: bcode_workflow_store::WorkflowMutationApprovalDecision::Approve,
+                decision: bcode_workflow::WorkflowMutationApprovalDecision::Approve,
             },
             Request::WorkflowAttemptHistory {
                 run_id: "run-1".to_string(),

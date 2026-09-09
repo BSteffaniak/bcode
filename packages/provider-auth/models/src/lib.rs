@@ -16,6 +16,63 @@ pub const AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION: u16 = 1;
 /// Current schema version for portable auth-pool management contracts.
 pub const AUTH_POOL_SCHEMA_VERSION: u16 = 1;
 
+/// Portable input for setting or clearing an interactive auth-pool preference.
+///
+/// Compatible within `AUTH_POOL_SCHEMA_VERSION`; an absent profile clears user state
+/// and does not change declarative configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAuthPoolPreferenceRequest {
+    /// Pool whose interactive preference is changed.
+    pub pool: String,
+    /// Preferred profile, or `None` to clear the interactive override.
+    pub profile: Option<String>,
+}
+
+/// Secret-safe failure of an auth-pool application operation.
+/// Serialized variant names are stable within `AUTH_POOL_SCHEMA_VERSION`;
+/// unsupported variants must be rejected rather than guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPoolOperationError {
+    /// Effective configuration could not be loaded.
+    Configuration,
+    /// Preference validation or persistence failed.
+    Preference,
+}
+
+impl AuthPoolOperationError {
+    /// Stable application transport code for this failure.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Configuration => "auth_pool_configuration",
+            Self::Preference => "auth_pool_preference",
+        }
+    }
+
+    /// Classify a known application code; unknown codes remain unclassified.
+    // Repository policy avoids redundant must_use on Option-returning functions.
+    #[allow(clippy::must_use_candidate)]
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "auth_pool_configuration" => Some(Self::Configuration),
+            "auth_pool_preference" => Some(Self::Preference),
+            _ => None,
+        }
+    }
+}
+
+impl Display for AuthPoolOperationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Configuration => "authentication pool configuration could not be loaded",
+            Self::Preference => "authentication pool preference could not be saved; verify the pool/profile and user-state access",
+        })
+    }
+}
+
+impl std::error::Error for AuthPoolOperationError {}
+
 /// Source of an auth pool's effective preferred profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1073,6 +1130,23 @@ fn validate_url(value: &str) -> Result<(), AuthContractError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_pool_codes_are_typed_and_unknown_codes_fail_closed() {
+        for error in [
+            super::AuthPoolOperationError::Configuration,
+            super::AuthPoolOperationError::Preference,
+        ] {
+            assert_eq!(
+                super::AuthPoolOperationError::from_code(error.code()),
+                Some(error)
+            );
+        }
+        assert_eq!(
+            super::AuthPoolOperationError::from_code("auth_pool_future"),
+            None
+        );
+    }
+
     use super::*;
 
     fn exa_contribution() -> AuthProviderContribution {

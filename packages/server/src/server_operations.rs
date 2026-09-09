@@ -9,6 +9,11 @@ const MAX_CLIENT_INTERACTION_ADAPTERS: usize = 64;
 pub const MAX_INTERACTION_ADAPTER_IDENTIFIER_BYTES: usize = 128;
 pub const MAX_CLIENT_EFFECTIVE_CONFIG_BYTES: usize = 1024 * 1024;
 
+// Provider-auth owns both execution and the portable error contract.
+pub use bcode_provider_auth::{
+    apply_auth_pool_preference as set_auth_pool_preference, list_auth_pools as auth_pools,
+};
+
 /// Return normalized daemon status without transport framing.
 pub async fn status(
     state: &ServerState,

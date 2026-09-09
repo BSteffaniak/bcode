@@ -22,6 +22,31 @@ pub mod operations;
 pub mod security;
 pub mod store;
 
+/// Load portable auth-pool status without exposing configuration diagnostics.
+///
+/// # Errors
+/// Returns a normalized configuration failure when effective configuration cannot load.
+pub fn list_auth_pools() -> Result<
+    Vec<bcode_provider_auth_models::AuthPoolSummary>,
+    bcode_provider_auth_models::AuthPoolOperationError,
+> {
+    let config = bcode_config::load_config()
+        .map_err(|_| bcode_provider_auth_models::AuthPoolOperationError::Configuration)?;
+    Ok(auth_pool_summaries(&config))
+}
+
+/// Apply an interactive preference without exposing storage paths or private diagnostics.
+///
+/// # Errors
+/// Returns a normalized preference failure for invalid pool/profile or user-state write failure.
+pub fn apply_auth_pool_preference(
+    request: &bcode_provider_auth_models::SetAuthPoolPreferenceRequest,
+) -> Result<(), bcode_provider_auth_models::AuthPoolOperationError> {
+    set_auth_pool_preference(&request.pool, request.profile.as_deref())
+        .map(|_| ())
+        .map_err(|_| bcode_provider_auth_models::AuthPoolOperationError::Preference)
+}
+
 /// Return portable, secret-free summaries for all configured or runtime auth pools.
 #[must_use]
 pub fn auth_pool_summaries(

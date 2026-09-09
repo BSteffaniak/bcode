@@ -616,7 +616,7 @@ pub enum RuntimeAndModelRequest {
     /// Resolve one exact durable mutation approval by stable approval identity.
     ResolveWorkflowMutationApproval {
         approval_id: String,
-        decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+        decision: bcode_workflow::WorkflowMutationApprovalDecision,
     },
     /// Return one bounded page of durable workflow attempts.
     WorkflowAttemptHistory {

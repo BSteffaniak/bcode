@@ -77,7 +77,7 @@ pub fn list_services(state: &ServerState) -> Vec<bcode_ipc::PluginServiceSummary
 }
 
 /// Return the current renderer-neutral plugin contributions without transport framing.
-pub fn list_contributions(state: &ServerState) -> bcode_ipc::PluginContributions {
+pub fn list_contributions(state: &ServerState) -> bcode_plugin_sdk::PluginContributions {
     let mut command_contributions = state
         .plugins
         .registered_command_contributions(&bcode_command::CommandSurface::Palette);
@@ -88,7 +88,7 @@ pub fn list_contributions(state: &ServerState) -> bcode_ipc::PluginContributions
     );
     command_contributions.sort_by(|left, right| left.id.cmp(&right.id));
     command_contributions.dedup_by(|left, right| left.id == right.id);
-    bcode_ipc::PluginContributions {
+    bcode_plugin_sdk::PluginContributions {
         command_contributions,
         commands: state.plugins.command_contributions(),
         config_extensions: state.plugins.config_extensions(),

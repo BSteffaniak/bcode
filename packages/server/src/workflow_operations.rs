@@ -40,6 +40,276 @@ impl std::fmt::Debug for WorkflowRunGraphEditPolicy {
     }
 }
 
+/// Host-bound authoring execution context. Adapters provide domain requests, not store handles.
+/// The borrow prevents this context from outliving its host; authorization is evaluated per call.
+#[derive(Clone, Copy)]
+pub struct WorkflowAuthoringApplication<'a> {
+    state: &'a std::sync::Arc<ServerState>,
+    client_id: super::ClientId,
+}
+
+impl<'a> WorkflowAuthoringApplication<'a> {
+    #[must_use]
+    pub(crate) const fn new(
+        state: &'a std::sync::Arc<ServerState>,
+        client_id: super::ClientId,
+    ) -> Self {
+        Self { state, client_id }
+    }
+
+    pub(crate) fn apply_draft_edits(
+        &self,
+        request: bcode_workflow::ApplyWorkflowDraftEditsRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftEditResult, bcode_workflow::WorkflowAuthoringFailure>
+    {
+        self.state
+            .require_workflow_store()
+            .map_err(authoring_failure)?;
+        apply_draft_edits(self.state, self.client_id, request).map_err(authoring_failure)
+    }
+
+    pub(crate) fn update_draft(
+        &self,
+        request: &bcode_workflow::UpdateWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftUpdateResult, bcode_workflow::WorkflowAuthoringFailure>
+    {
+        self.state
+            .require_workflow_store()
+            .map_err(authoring_failure)?;
+        update_draft(self.state, self.client_id, request).map_err(authoring_failure)
+    }
+
+    pub(crate) fn activate_revision(
+        &self,
+        request: &bcode_workflow::ActivateWorkflowRevisionRequest,
+    ) -> Result<
+        bcode_workflow::WorkflowAuthoringMutationResult,
+        bcode_workflow::WorkflowAuthoringFailure,
+    > {
+        self.state
+            .require_workflow_store()
+            .map_err(authoring_failure)?;
+        activate_revision(self.state, self.client_id, request).map_err(authoring_failure)
+    }
+
+    pub(crate) fn discard_draft(
+        &self,
+        request: &bcode_workflow::DiscardWorkflowDraftRequest,
+    ) -> Result<
+        bcode_workflow::WorkflowAuthoringMutationResult,
+        bcode_workflow::WorkflowAuthoringFailure,
+    > {
+        self.state
+            .require_workflow_store()
+            .map_err(authoring_failure)?;
+        discard_draft(self.state, self.client_id, request).map_err(authoring_failure)
+    }
+}
+
+fn run_operation_failure(error: super::ServerError) -> bcode_workflow::WorkflowRunOperationFailure {
+    let failure = super::request_error_response(&error);
+    drop(error);
+    bcode_workflow::WorkflowRunOperationFailure {
+        code: failure.code,
+        message: failure.message,
+    }
+}
+
+impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_> {
+    async fn workflow_run_status(
+        &self,
+        run_id: String,
+    ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        run_status(self.state, &run_id).map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn pause_workflow_run(&self, run_id: String) -> Result<bool, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        Box::pin(pause_run(self.state, &run_id))
+            .await
+            .map_err(run_operation_failure)
+    }
+
+    async fn resume_workflow_run(&self, run_id: String) -> Result<bool, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        Box::pin(resume_run(self.state, &run_id))
+            .await
+            .map_err(run_operation_failure)
+    }
+    async fn cancel_workflow_run(&self, run_id: String) -> Result<bool, Self::Error> {
+        let result = match self.state.require_workflow_store() {
+            Ok(()) => Box::pin(cancel_run(self.state, &run_id)).await,
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| {
+            let failure = super::request_error_response(&error);
+            bcode_workflow::WorkflowRunOperationFailure {
+                code: failure.code,
+                message: failure.message,
+            }
+        })
+    }
+    async fn inspect_workflow_run(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<bcode_workflow::WorkflowRunInspection, Self::Error> {
+        let result = match self.state.require_workflow_store() {
+            Ok(()) => Box::pin(inspect_run(self.state, &run_id, limit)).await,
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| {
+            let failure = super::request_error_response(&error);
+            bcode_workflow::WorkflowRunAdmissionFailure {
+                code: failure.code,
+                message: failure.message,
+            }
+        })
+    }
+    type Error = bcode_workflow::WorkflowRunOperationFailure;
+
+    async fn start_authored_workflow(
+        &self,
+        request: bcode_workflow::StartAuthoredWorkflowRequest,
+    ) -> Result<bcode_workflow::AuthoredWorkflowRunStartResponse, Self::Error> {
+        let result = match self.state.require_workflow_store() {
+            Ok(()) => Box::pin(start_authored(self.client_id, self.state, request, true)).await,
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| {
+            let failure = super::request_error_response(&error);
+            bcode_workflow::WorkflowRunAdmissionFailure {
+                code: failure.code,
+                message: failure.message,
+            }
+        })
+    }
+}
+
+impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplication<'_> {
+    async fn publish_and_start_workflow(
+        &self,
+        request: bcode_workflow::PublishAndStartWorkflowRequest,
+    ) -> Result<bcode_workflow::WorkflowPublishAndStartResult, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(authoring_failure)?;
+        Box::pin(publish_and_start(
+            String::new(),
+            self.client_id,
+            self.state,
+            request,
+        ))
+        .await
+        .map_err(authoring_failure)
+    }
+    async fn publish_workflow_draft(
+        &self,
+        request: bcode_workflow::PublishWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowPublicationResult, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(authoring_failure)?;
+        publish_draft(
+            String::new(),
+            self.client_id,
+            self.state,
+            request,
+            bcode_workflow::WorkflowApplicationOperation::PublishDraft,
+        )
+        .await
+        .map_err(authoring_failure)
+    }
+    type Error = bcode_workflow::WorkflowAuthoringFailure;
+
+    async fn apply_workflow_draft_edits(
+        &self,
+        request: bcode_workflow::ApplyWorkflowDraftEditsRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftEditResult, Self::Error> {
+        self.apply_draft_edits(request)
+    }
+
+    async fn update_workflow_draft(
+        &self,
+        request: bcode_workflow::UpdateWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftUpdateResult, Self::Error> {
+        self.update_draft(&request)
+    }
+
+    async fn activate_workflow_revision(
+        &self,
+        request: bcode_workflow::ActivateWorkflowRevisionRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, Self::Error> {
+        self.activate_revision(&request)
+    }
+
+    async fn discard_workflow_draft(
+        &self,
+        request: bcode_workflow::DiscardWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, Self::Error> {
+        self.discard_draft(&request)
+    }
+}
+
+#[cfg(test)]
+mod authoring_boundary_tests {
+    #[test]
+    fn failures_hide_host_details_and_preserve_authorization_code() {
+        let denied = super::authoring_failure(
+            super::super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "secret-marker".into(),
+            ),
+        );
+        assert_eq!(
+            denied,
+            bcode_workflow::WorkflowAuthoringFailure::Unauthorized
+        );
+        let response = super::super::request_error_response(&denied.into());
+        assert_eq!(response.code, "workflow_operation_unauthorized");
+        assert!(!response.message.contains("secret-marker"));
+        let invalid = super::authoring_failure(super::super::ServerError::WorkflowStore(
+            bcode_workflow_store::WorkflowStoreError::InvalidData("secret-marker".into()),
+        ));
+        assert_eq!(
+            invalid,
+            bcode_workflow::WorkflowAuthoringFailure::StateUnavailable
+        );
+        assert!(!invalid.to_string().contains("secret-marker"));
+    }
+}
+
+fn authoring_failure(error: super::ServerError) -> bcode_workflow::WorkflowAuthoringFailure {
+    use super::ServerError;
+    use bcode_workflow::WorkflowAuthoringFailure as Failure;
+    match error {
+        ServerError::WorkflowComputationTimedOut(_) => Failure::TimedOut,
+        ServerError::WorkflowComputationCancelled(_) => Failure::Cancelled,
+        ServerError::WorkflowComputationControlInvalid(_) => Failure::InvalidControl,
+        ServerError::Workflow(_) => Failure::InvalidContract,
+        ServerError::WorkflowDefinitionUnsupported(_) => Failure::UnsupportedDefinition,
+        ServerError::WorkflowCapabilityUnavailable(_)
+        | ServerError::WorkflowStorageUnavailable(_) => Failure::CapabilityUnavailable,
+        ServerError::WorkflowApplicationOperationUnauthorized(_) => Failure::Unauthorized,
+        ServerError::WorkflowStore(error) => match error {
+            bcode_workflow_store::WorkflowStoreError::AuthoringConflict { .. } => Failure::Conflict,
+            bcode_workflow_store::WorkflowStoreError::UpgradeOwnershipUnavailable => {
+                Failure::UpgradeBlocked
+            }
+            bcode_workflow_store::WorkflowStoreError::UnsupportedStore { .. } => {
+                Failure::MaintenanceRequired
+            }
+            _ => Failure::StateUnavailable,
+        },
+        _ => Failure::Failed,
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkflowApplicationAuthorizationPolicy {
     pub evaluator: std::sync::Arc<
@@ -331,8 +601,8 @@ use std::collections::BTreeMap;
 pub async fn start_package_export(
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::StartWorkflowPackageExportRequest,
-) -> Result<bcode_ipc::WorkflowPackageExportRunStartResponse, super::ServerError> {
+    request: bcode_workflow::StartWorkflowPackageExportRequest,
+) -> Result<bcode_workflow::WorkflowPackageExportRunStartResponse, super::ServerError> {
     request.package_export.validate()?;
     let receipt = state
         .workflow_store
@@ -367,8 +637,8 @@ pub async fn start_package_export(
     let started = start_authored(
         client_id,
         state,
-        bcode_ipc::StartAuthoredWorkflowRequest {
-            selection: bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+        bcode_workflow::StartAuthoredWorkflowRequest {
+            selection: bcode_workflow::AuthoredWorkflowRunSelection::Revision {
                 workflow_id: revision.workflow_id.clone(),
                 revision: revision.revision,
             },
@@ -382,7 +652,7 @@ pub async fn start_package_export(
         true,
     )
     .await?;
-    Ok(bcode_ipc::WorkflowPackageExportRunStartResponse {
+    Ok(bcode_workflow::WorkflowPackageExportRunStartResponse {
         package_export: request.package_export,
         package_lock_digest_sha256: receipt.package_lock_digest_sha256,
         exported,
@@ -437,7 +707,7 @@ pub fn record_authoring_conflict(
 
 pub async fn run_computation<T, F>(
     state: &ServerState,
-    control: bcode_ipc::WorkflowComputationControl,
+    control: bcode_workflow::WorkflowComputationControl,
     fallback_operation_id: String,
     compute: F,
 ) -> Result<T, super::ServerError>
@@ -453,7 +723,7 @@ where
     if operation_id.len() > 512
         || operation_id.is_empty()
         || control.timeout_ms == 0
-        || control.timeout_ms > bcode_ipc::MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS
+        || control.timeout_ms > bcode_workflow::MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS
     {
         return Err(super::ServerError::WorkflowComputationControlInvalid(
             "operation identity or timeout is outside supported bounds".to_string(),
@@ -506,13 +776,13 @@ pub fn cancel_computation(state: &ServerState, operation_id: &str) -> bool {
 
 pub fn authoring_conflict_result(
     error: bcode_workflow_store::WorkflowStoreError,
-) -> Result<bcode_ipc::WorkflowAuthoringConflict, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<bcode_workflow::WorkflowAuthoringConflict, bcode_workflow_store::WorkflowStoreError> {
     match error {
         bcode_workflow_store::WorkflowStoreError::AuthoringConflict {
             entity_id,
             expected,
             current,
-        } => Ok(bcode_ipc::WorkflowAuthoringConflict {
+        } => Ok(bcode_workflow::WorkflowAuthoringConflict {
             entity_id,
             expected_generation: expected,
             current_generation: current,
@@ -522,7 +792,7 @@ pub fn authoring_conflict_result(
 }
 
 fn workflow_preset_from_mutation(
-    mutation: bcode_ipc::WorkflowPresetMutation,
+    mutation: bcode_workflow::WorkflowPresetMutation,
     generation: u64,
     created_at_ms: u64,
 ) -> bcode_workflow_store::WorkflowPreset {
@@ -544,10 +814,10 @@ pub async fn import_revision(
     fallback_operation_id: String,
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::ImportWorkflowRevisionRequest,
-) -> Result<bcode_ipc::WorkflowRevisionImportResult, super::ServerError> {
+    request: bcode_workflow::ImportWorkflowRevisionRequest,
+) -> Result<bcode_workflow::WorkflowRevisionImportResult, super::ServerError> {
     if request.collision_policy
-        != bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision
+        != bcode_workflow::WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision
     {
         return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
             "revision import requires require_existing_workflow_next_revision collision policy"
@@ -598,12 +868,14 @@ pub async fn import_revision(
             super::current_time_ms(),
         );
     let result = match publication {
-        Ok(publication) => bcode_ipc::WorkflowRevisionImportResult::Imported {
+        Ok(publication) => bcode_workflow::WorkflowRevisionImportResult::Imported {
             revision: Box::new(workflow_revision_snapshot(publication.revision)),
             active_revision: publication.active_revision,
         },
         Err(error @ bcode_workflow_store::WorkflowStoreError::AuthoringConflict { .. }) => {
-            bcode_ipc::WorkflowRevisionImportResult::Conflict(authoring_conflict_result(error)?)
+            bcode_workflow::WorkflowRevisionImportResult::Conflict(authoring_conflict_result(
+                error,
+            )?)
         }
         Err(error) => return Err(error.into()),
     };
@@ -614,9 +886,9 @@ pub async fn publish_draft(
     fallback_operation_id: String,
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::PublishWorkflowDraftRequest,
+    request: bcode_workflow::PublishWorkflowDraftRequest,
     operation: bcode_workflow::WorkflowApplicationOperation,
-) -> Result<bcode_ipc::WorkflowPublicationResult, super::ServerError> {
+) -> Result<bcode_workflow::WorkflowPublicationResult, super::ServerError> {
     let draft = state
         .workflow_store
         .lock()
@@ -671,7 +943,7 @@ pub async fn publish_draft(
         );
     let (result, outcome) = match publication {
         Ok(publication) => (
-            bcode_ipc::WorkflowPublicationResult::Published {
+            bcode_workflow::WorkflowPublicationResult::Published {
                 revision: Box::new(workflow_revision_snapshot(publication.revision)),
                 active_revision: publication.active_revision,
             },
@@ -680,7 +952,9 @@ pub async fn publish_draft(
         Err(error) => {
             record_authoring_conflict(&state.metrics, "publish");
             (
-                bcode_ipc::WorkflowPublicationResult::Conflict(authoring_conflict_result(error)?),
+                bcode_workflow::WorkflowPublicationResult::Conflict(authoring_conflict_result(
+                    error,
+                )?),
                 "conflict",
             )
         }
@@ -698,9 +972,9 @@ pub async fn publish_and_start(
     fallback_operation_id: String,
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::PublishAndStartWorkflowRequest,
-) -> Result<bcode_ipc::WorkflowPublishAndStartResult, super::ServerError> {
-    let bcode_ipc::PublishAndStartWorkflowRequest {
+    request: bcode_workflow::PublishAndStartWorkflowRequest,
+) -> Result<bcode_workflow::WorkflowPublishAndStartResult, super::ServerError> {
+    let bcode_workflow::PublishAndStartWorkflowRequest {
         publication,
         run_id,
         parent_session_id,
@@ -717,18 +991,18 @@ pub async fn publish_and_start(
     )
     .await?;
     let result = match publication {
-        bcode_ipc::WorkflowPublicationResult::Conflict(conflict) => {
-            bcode_ipc::WorkflowPublishAndStartResult::PublicationConflict(conflict)
+        bcode_workflow::WorkflowPublicationResult::Conflict(conflict) => {
+            bcode_workflow::WorkflowPublishAndStartResult::PublicationConflict(conflict)
         }
-        bcode_ipc::WorkflowPublicationResult::Published {
+        bcode_workflow::WorkflowPublicationResult::Published {
             revision,
             active_revision,
         } => {
             let run_admission = match start_authored(
                 client_id,
                 state,
-                bcode_ipc::StartAuthoredWorkflowRequest {
-                    selection: bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+                bcode_workflow::StartAuthoredWorkflowRequest {
+                    selection: bcode_workflow::AuthoredWorkflowRunSelection::Revision {
                         workflow_id,
                         revision: revision.identity.revision,
                     },
@@ -743,12 +1017,20 @@ pub async fn publish_and_start(
             )
             .await
             {
-                Ok(started) => bcode_ipc::WorkflowRunAdmissionResult::Started(Box::new(started)),
-                Err(error) => bcode_ipc::WorkflowRunAdmissionResult::Failed(
-                    super::request_error_response(&error),
-                ),
+                Ok(started) => {
+                    bcode_workflow::WorkflowRunAdmissionResult::Started(Box::new(started))
+                }
+                Err(error) => {
+                    let failure = super::request_error_response(&error);
+                    bcode_workflow::WorkflowRunAdmissionResult::Failed(
+                        bcode_workflow::WorkflowRunAdmissionFailure {
+                            code: failure.code,
+                            message: failure.message,
+                        },
+                    )
+                }
             };
-            bcode_ipc::WorkflowPublishAndStartResult::Published {
+            bcode_workflow::WorkflowPublishAndStartResult::Published {
                 revision,
                 active_revision,
                 run_admission,
@@ -760,7 +1042,7 @@ pub async fn publish_and_start(
 
 pub fn resolve_authored_run(
     state: &std::sync::Arc<ServerState>,
-    selection: &bcode_ipc::AuthoredWorkflowRunSelection,
+    selection: &bcode_workflow::AuthoredWorkflowRunSelection,
 ) -> Result<
     (
         String,
@@ -776,14 +1058,14 @@ pub fn resolve_authored_run(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match selection {
-            bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+            bcode_workflow::AuthoredWorkflowRunSelection::Revision {
                 workflow_id,
                 revision,
             } => {
                 drop(store);
                 (workflow_id.clone(), *revision, None)
             }
-            bcode_ipc::AuthoredWorkflowRunSelection::Active { workflow_id } => {
+            bcode_workflow::AuthoredWorkflowRunSelection::Active { workflow_id } => {
                 let workflow = store.authored_workflow(workflow_id)?.ok_or_else(|| {
                     bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
                         "authored workflow not found: {workflow_id}"
@@ -797,7 +1079,7 @@ pub fn resolve_authored_run(
                 drop(store);
                 (workflow_id.clone(), revision, None)
             }
-            bcode_ipc::AuthoredWorkflowRunSelection::Preset {
+            bcode_workflow::AuthoredWorkflowRunSelection::Preset {
                 workflow_id,
                 preset_id,
                 preset_generation,
@@ -841,9 +1123,9 @@ pub fn resolve_authored_run(
 pub async fn start_authored(
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::StartAuthoredWorkflowRequest,
+    request: bcode_workflow::StartAuthoredWorkflowRequest,
     authorize: bool,
-) -> Result<bcode_ipc::AuthoredWorkflowRunStartResponse, super::ServerError> {
+) -> Result<bcode_workflow::AuthoredWorkflowRunStartResponse, super::ServerError> {
     let resolution_started_at = std::time::Instant::now();
     let (workflow_id, revision_number, revision, preset) =
         resolve_authored_run(state, &request.selection)?;
@@ -852,9 +1134,9 @@ pub async fn start_authored(
         "workflow.authoring.start_resolution.duration_ms",
         resolution_started_at,
         match &request.selection {
-            bcode_ipc::AuthoredWorkflowRunSelection::Revision { .. } => "revision",
-            bcode_ipc::AuthoredWorkflowRunSelection::Active { .. } => "active",
-            bcode_ipc::AuthoredWorkflowRunSelection::Preset { .. } => "preset",
+            bcode_workflow::AuthoredWorkflowRunSelection::Revision { .. } => "revision",
+            bcode_workflow::AuthoredWorkflowRunSelection::Active { .. } => "active",
+            bcode_workflow::AuthoredWorkflowRunSelection::Preset { .. } => "preset",
         },
     );
     let configuration = preset
@@ -882,13 +1164,13 @@ pub async fn start_authored(
             client_id,
             LocalApplicationOperationRequest {
                 operation: match request.selection {
-                    bcode_ipc::AuthoredWorkflowRunSelection::Revision { .. } => {
+                    bcode_workflow::AuthoredWorkflowRunSelection::Revision { .. } => {
                         bcode_workflow::WorkflowApplicationOperation::StartRevision
                     }
-                    bcode_ipc::AuthoredWorkflowRunSelection::Active { .. } => {
+                    bcode_workflow::AuthoredWorkflowRunSelection::Active { .. } => {
                         bcode_workflow::WorkflowApplicationOperation::StartActiveRevision
                     }
-                    bcode_ipc::AuthoredWorkflowRunSelection::Preset { .. } => {
+                    bcode_workflow::AuthoredWorkflowRunSelection::Preset { .. } => {
                         bcode_workflow::WorkflowApplicationOperation::StartPreset
                     }
                 },
@@ -896,7 +1178,7 @@ pub async fn start_authored(
                 draft_id: None,
                 revision: matches!(
                     request.selection,
-                    bcode_ipc::AuthoredWorkflowRunSelection::Revision { .. }
+                    bcode_workflow::AuthoredWorkflowRunSelection::Revision { .. }
                 )
                 .then_some(revision_number),
                 preset_id: preset.as_ref().map(|preset| preset.preset_id.clone()),
@@ -936,7 +1218,7 @@ pub async fn start_authored(
         })?;
     let started = start_run(
         state,
-        bcode_ipc::WorkflowRunStartRequest {
+        bcode_workflow::WorkflowRunStartRequest {
             definition_id: revision.definition_identity.definition_id.clone(),
             definition_version: revision.definition_identity.definition_version,
             run_id: request.run_id,
@@ -962,7 +1244,7 @@ pub async fn start_authored(
         Some(provenance),
     )
     .await?;
-    Ok(bcode_ipc::AuthoredWorkflowRunStartResponse {
+    Ok(bcode_workflow::AuthoredWorkflowRunStartResponse {
         started,
         workflow_id,
         revision: revision_number,
@@ -1030,7 +1312,11 @@ pub fn run_view(
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let failure_events = store.failure_history(run_id, limit)?;
+        let failure_events = store
+            .failure_history(run_id, limit)?
+            .into_iter()
+            .map(|event| verified_history_event(&store, event))
+            .collect::<Result<Vec<_>, _>>()?;
         let descendant_runs = store.descendant_run_summaries(run_id, limit)?;
         let child_sessions = store.execution_session_links_for_run(run_id, limit)?;
         let run_item = run_list_item(&store, &run)?;
@@ -1050,10 +1336,10 @@ pub fn run_view(
                     ))
                 })?;
                 let kind = match wait.kind {
-                    bcode_workflow_store::WorkflowWaitKind::Input => {
+                    bcode_workflow::WorkflowWaitKind::Input => {
                         bcode_workflow_view_models::WorkflowWaitKind::Input
                     }
-                    bcode_workflow_store::WorkflowWaitKind::Approval => {
+                    bcode_workflow::WorkflowWaitKind::Approval => {
                         bcode_workflow_view_models::WorkflowWaitKind::Approval
                     }
                 };
@@ -1141,13 +1427,13 @@ pub fn run_view(
                         status: activation.status,
                         has_output: activation.has_output,
                         input_summary: match activation.input_summary {
-                            bcode_workflow_store::WorkflowActivationInputSummary::Absent => {
+                            bcode_workflow::WorkflowActivationInputSummary::Absent => {
                                 bcode_workflow_view_models::WorkflowInputSummary::Absent
                             }
-                            bcode_workflow_store::WorkflowActivationInputSummary::Inline {
+                            bcode_workflow::WorkflowActivationInputSummary::Inline {
                                 value,
                             } => bcode_workflow_view_models::WorkflowInputSummary::Inline { value },
-                            bcode_workflow_store::WorkflowActivationInputSummary::Omitted {
+                            bcode_workflow::WorkflowActivationInputSummary::Omitted {
                                 byte_count,
                             } => bcode_workflow_view_models::WorkflowInputSummary::Omitted {
                                 byte_count,
@@ -1353,8 +1639,8 @@ fn run_list_item_with_summary(
 fn authored_workflow_page(
     page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::AuthoredWorkflow>,
     _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::AuthoredWorkflowSnapshot,
+) -> bcode_workflow::WorkflowAuthoringPage<
+    bcode_workflow::AuthoredWorkflowSnapshot,
     bcode_workflow::WorkflowAuthoringListCursor,
 > {
     let bcode_workflow_store::WorkflowAuthoringStorePage {
@@ -1370,7 +1656,7 @@ fn authored_workflow_page(
             entity_id: last.workflow_id.clone(),
         }
     });
-    bcode_ipc::WorkflowAuthoringPage {
+    bcode_workflow::WorkflowAuthoringPage {
         items: workflows
             .into_iter()
             .map(authored_workflow_snapshot)
@@ -1382,8 +1668,8 @@ fn authored_workflow_page(
 fn workflow_draft_page(
     page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::WorkflowDraft>,
     _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::WorkflowDraftSnapshot,
+) -> bcode_workflow::WorkflowAuthoringPage<
+    bcode_workflow::WorkflowDraftSnapshot,
     bcode_workflow::WorkflowAuthoringListCursor,
 > {
     let bcode_workflow_store::WorkflowAuthoringStorePage {
@@ -1397,7 +1683,7 @@ fn workflow_draft_page(
             entity_id: last.draft_id.clone(),
         }
     });
-    bcode_ipc::WorkflowAuthoringPage {
+    bcode_workflow::WorkflowAuthoringPage {
         items: drafts.into_iter().map(workflow_draft_snapshot).collect(),
         next_cursor,
     }
@@ -1408,8 +1694,8 @@ fn workflow_revision_page(
         bcode_workflow_store::PublishedWorkflowRevision,
     >,
     _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::WorkflowRevisionSnapshot,
+) -> bcode_workflow::WorkflowAuthoringPage<
+    bcode_workflow::WorkflowRevisionSnapshot,
     bcode_workflow::WorkflowRevisionListCursor,
 > {
     let bcode_workflow_store::WorkflowAuthoringStorePage {
@@ -1422,7 +1708,7 @@ fn workflow_revision_page(
             .expect("a page with more items is non-empty")
             .revision,
     });
-    bcode_ipc::WorkflowAuthoringPage {
+    bcode_workflow::WorkflowAuthoringPage {
         items: revisions
             .into_iter()
             .map(workflow_revision_snapshot)
@@ -1434,8 +1720,8 @@ fn workflow_revision_page(
 fn workflow_preset_page(
     page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::WorkflowPreset>,
     _limit: usize,
-) -> bcode_ipc::WorkflowAuthoringPage<
-    bcode_ipc::WorkflowPresetSnapshot,
+) -> bcode_workflow::WorkflowAuthoringPage<
+    bcode_workflow::WorkflowPresetSnapshot,
     bcode_workflow::WorkflowAuthoringListCursor,
 > {
     let bcode_workflow_store::WorkflowAuthoringStorePage {
@@ -1449,7 +1735,7 @@ fn workflow_preset_page(
             entity_id: last.preset_id.clone(),
         }
     });
-    bcode_ipc::WorkflowAuthoringPage {
+    bcode_workflow::WorkflowAuthoringPage {
         items: presets.into_iter().map(workflow_preset_snapshot).collect(),
         next_cursor,
     }
@@ -1459,7 +1745,7 @@ fn authored_workflow_inspection(
     state: &ServerState,
     workflow_id: &str,
     limit: usize,
-) -> Result<Option<bcode_ipc::AuthoredWorkflowInspection>, super::ServerError> {
+) -> Result<Option<bcode_workflow::AuthoredWorkflowInspection>, super::ServerError> {
     let store = state
         .workflow_store
         .lock()
@@ -1470,7 +1756,7 @@ fn authored_workflow_inspection(
     let drafts = store
         .list_workflow_drafts(workflow_id, limit)?
         .into_iter()
-        .map(|draft| bcode_ipc::WorkflowDraftInspectionSummary {
+        .map(|draft| bcode_workflow::WorkflowDraftInspectionSummary {
             identity: bcode_workflow::WorkflowDraftIdentity {
                 workflow_id: draft.workflow_id,
                 draft_id: draft.draft_id,
@@ -1485,21 +1771,23 @@ fn authored_workflow_inspection(
     let revisions = store
         .list_workflow_revisions(workflow_id, limit)?
         .into_iter()
-        .map(|revision| bcode_ipc::WorkflowRevisionInspectionSummary {
-            identity: bcode_workflow::WorkflowRevisionIdentity {
-                workflow_id: revision.workflow_id,
-                revision: revision.revision,
+        .map(
+            |revision| bcode_workflow::WorkflowRevisionInspectionSummary {
+                identity: bcode_workflow::WorkflowRevisionIdentity {
+                    workflow_id: revision.workflow_id,
+                    revision: revision.revision,
+                },
+                source_checksum_sha256: revision.source_checksum_sha256,
+                executable_source_checksum_sha256: revision.executable_source_checksum_sha256,
+                definition_identity: revision.definition_identity,
+                published_at_ms: revision.published_at_ms,
             },
-            source_checksum_sha256: revision.source_checksum_sha256,
-            executable_source_checksum_sha256: revision.executable_source_checksum_sha256,
-            definition_identity: revision.definition_identity,
-            published_at_ms: revision.published_at_ms,
-        })
+        )
         .collect();
     let presets = store
         .list_workflow_presets(workflow_id, limit)?
         .into_iter()
-        .map(|preset| bcode_ipc::WorkflowPresetInspectionSummary {
+        .map(|preset| bcode_workflow::WorkflowPresetInspectionSummary {
             workflow_id: preset.workflow_id,
             preset_id: preset.preset_id,
             revision: preset.revision,
@@ -1512,7 +1800,7 @@ fn authored_workflow_inspection(
     let events = store
         .workflow_authoring_events(workflow_id, None, limit)?
         .into_iter()
-        .map(|event| bcode_ipc::WorkflowAuthoringEventSnapshot {
+        .map(|event| bcode_workflow::WorkflowAuthoringEventSnapshot {
             event_seq: event.event_seq,
             workflow_id: event.workflow_id,
             event_type: event.event_type,
@@ -1543,7 +1831,7 @@ fn authored_workflow_inspection(
         .map(workflow_authoring_issue_snapshot)
         .collect();
     drop(store);
-    Ok(Some(bcode_ipc::AuthoredWorkflowInspection {
+    Ok(Some(bcode_workflow::AuthoredWorkflowInspection {
         workflow: authored_workflow_snapshot(workflow),
         drafts,
         revisions,
@@ -1555,16 +1843,16 @@ fn authored_workflow_inspection(
 
 fn workflow_authoring_issue_snapshot(
     issue: bcode_workflow_store::WorkflowAuthoringIssue,
-) -> bcode_ipc::WorkflowAuthoringIssueSnapshot {
+) -> bcode_workflow::WorkflowAuthoringIssueSnapshot {
     match issue {
         bcode_workflow_store::WorkflowAuthoringIssue::InvalidActiveRevision { revision } => {
-            bcode_ipc::WorkflowAuthoringIssueSnapshot::InvalidActiveRevision { revision }
+            bcode_workflow::WorkflowAuthoringIssueSnapshot::InvalidActiveRevision { revision }
         }
         bcode_workflow_store::WorkflowAuthoringIssue::MissingCompiledDefinition {
             revision,
             definition_id,
             definition_version,
-        } => bcode_ipc::WorkflowAuthoringIssueSnapshot::MissingCompiledDefinition {
+        } => bcode_workflow::WorkflowAuthoringIssueSnapshot::MissingCompiledDefinition {
             revision,
             definition_id,
             definition_version,
@@ -1572,14 +1860,14 @@ fn workflow_authoring_issue_snapshot(
         bcode_workflow_store::WorkflowAuthoringIssue::OrphanedPreset {
             preset_id,
             revision,
-        } => bcode_ipc::WorkflowAuthoringIssueSnapshot::OrphanedPreset {
+        } => bcode_workflow::WorkflowAuthoringIssueSnapshot::OrphanedPreset {
             preset_id,
             revision,
         },
         bcode_workflow_store::WorkflowAuthoringIssue::StaleDraftBase {
             draft_id,
             base_revision,
-        } => bcode_ipc::WorkflowAuthoringIssueSnapshot::StaleDraftBase {
+        } => bcode_workflow::WorkflowAuthoringIssueSnapshot::StaleDraftBase {
             draft_id,
             base_revision,
         },
@@ -1588,8 +1876,8 @@ fn workflow_authoring_issue_snapshot(
 
 pub fn authored_workflow_snapshot(
     workflow: bcode_workflow_store::AuthoredWorkflow,
-) -> bcode_ipc::AuthoredWorkflowSnapshot {
-    bcode_ipc::AuthoredWorkflowSnapshot {
+) -> bcode_workflow::AuthoredWorkflowSnapshot {
+    bcode_workflow::AuthoredWorkflowSnapshot {
         workflow_id: workflow.workflow_id,
         title: workflow.title,
         description: workflow.description,
@@ -1602,8 +1890,8 @@ pub fn authored_workflow_snapshot(
 
 pub fn workflow_draft_snapshot(
     draft: bcode_workflow_store::WorkflowDraft,
-) -> bcode_ipc::WorkflowDraftSnapshot {
-    bcode_ipc::WorkflowDraftSnapshot {
+) -> bcode_workflow::WorkflowDraftSnapshot {
+    bcode_workflow::WorkflowDraftSnapshot {
         identity: bcode_workflow::WorkflowDraftIdentity {
             workflow_id: draft.workflow_id,
             draft_id: draft.draft_id,
@@ -1620,8 +1908,8 @@ pub fn workflow_draft_snapshot(
 
 pub fn workflow_revision_snapshot(
     revision: bcode_workflow_store::PublishedWorkflowRevision,
-) -> bcode_ipc::WorkflowRevisionSnapshot {
-    bcode_ipc::WorkflowRevisionSnapshot {
+) -> bcode_workflow::WorkflowRevisionSnapshot {
+    bcode_workflow::WorkflowRevisionSnapshot {
         identity: bcode_workflow::WorkflowRevisionIdentity {
             workflow_id: revision.workflow_id,
             revision: revision.revision,
@@ -1637,8 +1925,8 @@ pub fn workflow_revision_snapshot(
 
 pub fn workflow_preset_snapshot(
     preset: bcode_workflow_store::WorkflowPreset,
-) -> bcode_ipc::WorkflowPresetSnapshot {
-    bcode_ipc::WorkflowPresetSnapshot {
+) -> bcode_workflow::WorkflowPresetSnapshot {
+    bcode_workflow::WorkflowPresetSnapshot {
         workflow_id: preset.workflow_id,
         preset_id: preset.preset_id,
         revision: preset.revision,
@@ -1658,8 +1946,8 @@ pub fn list_authored_workflows(
     cursor: Option<&bcode_workflow::WorkflowAuthoringListCursor>,
     limit: usize,
 ) -> Result<
-    bcode_ipc::WorkflowAuthoringPage<
-        bcode_ipc::AuthoredWorkflowSnapshot,
+    bcode_workflow::WorkflowAuthoringPage<
+        bcode_workflow::AuthoredWorkflowSnapshot,
         bcode_workflow::WorkflowAuthoringListCursor,
     >,
     bcode_workflow_store::WorkflowStoreError,
@@ -1676,7 +1964,10 @@ pub fn list_authored_workflows(
 pub fn authored_workflow(
     state: &ServerState,
     workflow_id: &str,
-) -> Result<Option<bcode_ipc::AuthoredWorkflowSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<
+    Option<bcode_workflow::AuthoredWorkflowSnapshot>,
+    bcode_workflow_store::WorkflowStoreError,
+> {
     state
         .workflow_store
         .lock()
@@ -1690,7 +1981,7 @@ pub fn inspect_authored_workflow(
     state: &ServerState,
     workflow_id: &str,
     limit: usize,
-) -> Result<Option<bcode_ipc::AuthoredWorkflowInspection>, super::ServerError> {
+) -> Result<Option<bcode_workflow::AuthoredWorkflowInspection>, super::ServerError> {
     authored_workflow_inspection(state, workflow_id, limit)
 }
 
@@ -1701,8 +1992,8 @@ pub fn list_drafts(
     cursor: Option<&bcode_workflow::WorkflowAuthoringListCursor>,
     limit: usize,
 ) -> Result<
-    bcode_ipc::WorkflowAuthoringPage<
-        bcode_ipc::WorkflowDraftSnapshot,
+    bcode_workflow::WorkflowAuthoringPage<
+        bcode_workflow::WorkflowDraftSnapshot,
         bcode_workflow::WorkflowAuthoringListCursor,
     >,
     bcode_workflow_store::WorkflowStoreError,
@@ -1720,7 +2011,8 @@ pub fn draft(
     state: &ServerState,
     workflow_id: &str,
     draft_id: &str,
-) -> Result<Option<bcode_ipc::WorkflowDraftSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<Option<bcode_workflow::WorkflowDraftSnapshot>, bcode_workflow_store::WorkflowStoreError>
+{
     state
         .workflow_store
         .lock()
@@ -1736,8 +2028,8 @@ pub fn list_revisions(
     cursor: Option<bcode_workflow::WorkflowRevisionListCursor>,
     limit: usize,
 ) -> Result<
-    bcode_ipc::WorkflowAuthoringPage<
-        bcode_ipc::WorkflowRevisionSnapshot,
+    bcode_workflow::WorkflowAuthoringPage<
+        bcode_workflow::WorkflowRevisionSnapshot,
         bcode_workflow::WorkflowRevisionListCursor,
     >,
     bcode_workflow_store::WorkflowStoreError,
@@ -1755,7 +2047,10 @@ pub fn revision(
     state: &ServerState,
     workflow_id: &str,
     revision: u64,
-) -> Result<Option<bcode_ipc::WorkflowRevisionSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<
+    Option<bcode_workflow::WorkflowRevisionSnapshot>,
+    bcode_workflow_store::WorkflowStoreError,
+> {
     state
         .workflow_store
         .lock()
@@ -1771,8 +2066,8 @@ pub fn list_presets(
     cursor: Option<&bcode_workflow::WorkflowAuthoringListCursor>,
     limit: usize,
 ) -> Result<
-    bcode_ipc::WorkflowAuthoringPage<
-        bcode_ipc::WorkflowPresetSnapshot,
+    bcode_workflow::WorkflowAuthoringPage<
+        bcode_workflow::WorkflowPresetSnapshot,
         bcode_workflow::WorkflowAuthoringListCursor,
     >,
     bcode_workflow_store::WorkflowStoreError,
@@ -1790,7 +2085,8 @@ pub fn preset(
     state: &ServerState,
     workflow_id: &str,
     preset_id: &str,
-) -> Result<Option<bcode_ipc::WorkflowPresetSnapshot>, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<Option<bcode_workflow::WorkflowPresetSnapshot>, bcode_workflow_store::WorkflowStoreError>
+{
     state
         .workflow_store
         .lock()
@@ -2500,7 +2796,7 @@ fn launch_source_key(source: &bcode_workflow::WorkflowLaunchSourceIdentity) -> S
 /// Atomically apply one validated workflow package to the canonical workflow store.
 pub fn apply_package(
     state: &ServerState,
-    request: &bcode_ipc::ApplyWorkflowPackageRequest,
+    request: &bcode_workflow::ApplyWorkflowPackageRequest,
 ) -> Result<bcode_workflow::WorkflowPackageMutationResult, bcode_workflow_store::WorkflowStoreError>
 {
     state
@@ -2513,7 +2809,7 @@ pub fn apply_package(
 /// Atomically publish one workflow package in the canonical workflow store.
 pub fn publish_package(
     state: &ServerState,
-    request: &bcode_ipc::PublishWorkflowPackageRequest,
+    request: &bcode_workflow::PublishWorkflowPackageRequest,
 ) -> Result<bcode_workflow::WorkflowPackageMutationResult, bcode_workflow_store::WorkflowStoreError>
 {
     state
@@ -2526,21 +2822,21 @@ pub fn publish_package(
 /// Validate and plan one bounded workflow package closure.
 pub async fn validate_package(
     state: &ServerState,
-    request: bcode_ipc::WorkflowPackageComputationRequest,
+    request: bcode_workflow::WorkflowPackageComputationRequest,
     fallback_operation_id: String,
-) -> Result<bcode_ipc::WorkflowPackageValidationResult, super::ServerError> {
+) -> Result<bcode_workflow::WorkflowPackageValidationResult, super::ServerError> {
     let catalog = authoring_catalog(state).await?;
     let plan = run_computation(state, request.control, fallback_operation_id, move || {
         bcode_workflow::plan_workflow_package_closure(&request.closure, &catalog)
     })
     .await??;
-    Ok(bcode_ipc::WorkflowPackageValidationResult { plan })
+    Ok(bcode_workflow::WorkflowPackageValidationResult { plan })
 }
 
 /// Preview one already planned workflow package without persistence side effects.
 pub async fn preview_package(
     state: &ServerState,
-    request: bcode_ipc::WorkflowPackagePreviewRequest,
+    request: bcode_workflow::WorkflowPackagePreviewRequest,
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowPackagePreview, super::ServerError> {
     let mut catalog = authoring_catalog(state).await?;
@@ -2562,16 +2858,16 @@ pub async fn preview_package(
 /// Lower and validate one bounded authored-workflow source document.
 pub async fn validate_source(
     state: &ServerState,
-    request: bcode_ipc::WorkflowSourceComputationRequest,
+    request: bcode_workflow::WorkflowSourceComputationRequest,
     fallback_operation_id: String,
-) -> Result<bcode_ipc::WorkflowSourceValidationResult, super::ServerError> {
+) -> Result<bcode_workflow::WorkflowSourceValidationResult, super::ServerError> {
     let catalog = authoring_catalog(state).await?;
     let source_format = request.source_format;
     let lowering = run_computation(state, request.control, fallback_operation_id, move || {
         bcode_workflow::lower_workflow_authoring_source(&request.source, source_format, &catalog)
     })
     .await??;
-    Ok(bcode_ipc::WorkflowSourceValidationResult {
+    Ok(bcode_workflow::WorkflowSourceValidationResult {
         source_format,
         lowering,
     })
@@ -2580,9 +2876,9 @@ pub async fn validate_source(
 /// Lower and preview compilation for one bounded authored-workflow source document.
 pub async fn preview_source(
     state: &ServerState,
-    request: bcode_ipc::WorkflowSourcePreviewRequest,
+    request: bcode_workflow::WorkflowSourcePreviewRequest,
     fallback_operation_id: String,
-) -> Result<bcode_ipc::WorkflowSourcePreviewResult, super::ServerError> {
+) -> Result<bcode_workflow::WorkflowSourcePreviewResult, super::ServerError> {
     let catalog = authoring_catalog(state).await?;
     let source_format = request.source_format;
     let configuration = request.configuration;
@@ -2599,7 +2895,7 @@ pub async fn preview_source(
             Ok::<_, bcode_workflow::WorkflowError>((lowering, preview))
         })
         .await??;
-    Ok(bcode_ipc::WorkflowSourcePreviewResult {
+    Ok(bcode_workflow::WorkflowSourcePreviewResult {
         source_format,
         lowering,
         preview,
@@ -2610,7 +2906,7 @@ pub async fn preview_source(
 pub async fn validate_authoring(
     state: &ServerState,
     document: bcode_workflow::WorkflowAuthoringDocument,
-    control: bcode_ipc::WorkflowComputationControl,
+    control: bcode_workflow::WorkflowComputationControl,
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowValidationReport, super::ServerError> {
     let started_at = std::time::Instant::now();
@@ -2632,7 +2928,7 @@ pub async fn preview_compilation(
     state: &ServerState,
     document: bcode_workflow::WorkflowAuthoringDocument,
     configuration: Option<serde_json::Value>,
-    control: bcode_ipc::WorkflowComputationControl,
+    control: bcode_workflow::WorkflowComputationControl,
     fallback_operation_id: String,
 ) -> Result<bcode_workflow::WorkflowCompilationPreview, super::ServerError> {
     let started_at = std::time::Instant::now();
@@ -3004,7 +3300,7 @@ fn find_workflow_template<'a>(
 pub async fn instantiate_template(
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::WorkflowTemplateInstantiationRequest,
+    request: bcode_workflow::WorkflowTemplateInstantiationRequest,
 ) -> Result<
     (
         bcode_workflow_store::AuthoredWorkflow,
@@ -3152,9 +3448,9 @@ fn persist_exact_template_call_dependencies(
 #[allow(clippy::too_many_lines)]
 pub async fn start_run(
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::WorkflowRunStartRequest,
+    request: bcode_workflow::WorkflowRunStartRequest,
     authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
-) -> Result<bcode_ipc::WorkflowRunStartResponse, super::ServerError> {
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
     let stored_definition = state
         .workflow_store
         .lock()
@@ -3300,7 +3596,7 @@ pub async fn start_run(
     .await;
     super::drive_workflow_run(state, &run_id).await?;
     drop(workflow_session_ownership);
-    Ok(bcode_ipc::WorkflowRunStartResponse {
+    Ok(bcode_workflow::WorkflowRunStartResponse {
         run,
         runtime_work_id,
     })
@@ -3309,8 +3605,8 @@ pub async fn start_run(
 /// Validate, persist, and admit one exact workflow definition.
 pub async fn start(
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::WorkflowStartRequest,
-) -> Result<bcode_ipc::WorkflowRunStartResponse, super::ServerError> {
+    request: bcode_workflow::WorkflowStartRequest,
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
     let started_at = std::time::Instant::now();
     validate_workflow_definition_for_production(state, &request.definition)?;
     if request.identity.kind != request.binding.workflow_kind {
@@ -3349,7 +3645,7 @@ pub async fn start(
     }
     let result = start_run(
         state,
-        bcode_ipc::WorkflowRunStartRequest {
+        bcode_workflow::WorkflowRunStartRequest {
             definition_id: request.identity.definition_id,
             definition_version: request.identity.definition_version,
             run_id: request.run_id,
@@ -3377,8 +3673,8 @@ pub async fn start(
 /// Compile and start one exact enabled workflow template.
 pub async fn start_template(
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::WorkflowTemplateStartRequest,
-) -> Result<bcode_ipc::WorkflowRunStartResponse, super::ServerError> {
+    request: bcode_workflow::WorkflowTemplateStartRequest,
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
     let template = find_workflow_template(
         state,
         &request.owner_plugin_id,
@@ -3425,7 +3721,7 @@ pub async fn start_template(
     .map_err(|error| bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string()))?;
     start(
         state,
-        bcode_ipc::WorkflowStartRequest {
+        bcode_workflow::WorkflowStartRequest {
             identity,
             definition,
             run_id: request.run_id,
@@ -3493,18 +3789,18 @@ pub async fn reconcile_orphaned_runs(
     state: &std::sync::Arc<ServerState>,
     apply: bool,
     limit: usize,
-) -> Result<bcode_ipc::OrphanedWorkflowRunReport, super::ServerError> {
+) -> Result<bcode_workflow::OrphanedWorkflowRunReport, super::ServerError> {
     let runs = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .nonterminal_runs(limit)?;
-    let mut report = bcode_ipc::OrphanedWorkflowRunReport {
+    let mut report = bcode_workflow::OrphanedWorkflowRunReport {
         applied: apply,
         ..Default::default()
     };
     for run in runs {
-        let skip = |reason: String| bcode_ipc::SkippedWorkflowRun {
+        let skip = |reason: String| bcode_workflow::SkippedWorkflowRun {
             run_id: run.run_id.clone(),
             status: run.status,
             reason,
@@ -3542,7 +3838,7 @@ pub async fn reconcile_orphaned_runs(
             }
             PriorOwnerLiveness::ObservedEnded | PriorOwnerLiveness::NoLiveTrace => {}
         }
-        let orphan = bcode_ipc::OrphanedWorkflowRun {
+        let orphan = bcode_workflow::OrphanedWorkflowRun {
             run_id: run.run_id.clone(),
             workflow_kind: run
                 .binding
@@ -3709,8 +4005,7 @@ pub fn list_waits(
     state: &ServerState,
     run_id: &str,
     limit: usize,
-) -> Result<Vec<bcode_workflow_store::WaitingActivation>, bcode_workflow_store::WorkflowStoreError>
-{
+) -> Result<Vec<bcode_workflow::WaitingActivation>, bcode_workflow_store::WorkflowStoreError> {
     state
         .workflow_store
         .lock()
@@ -3783,14 +4078,17 @@ pub fn list_mutation_approvals_all(
     state: &ServerState,
     limit: usize,
 ) -> Result<
-    Vec<bcode_workflow_store::WorkflowMutationApproval>,
+    Vec<bcode_workflow::WorkflowMutationApprovalInspection>,
     bcode_workflow_store::WorkflowStoreError,
 > {
-    state
+    Ok(state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pending_mutation_approvals_all(limit)
+        .pending_mutation_approvals_all(limit)?
+        .into_iter()
+        .map(mutation_approval_inspection)
+        .collect())
 }
 
 /// Return bounded pending mutation approvals for one workflow run.
@@ -3799,44 +4097,89 @@ pub fn list_mutation_approvals(
     run_id: &str,
     limit: usize,
 ) -> Result<
-    Vec<bcode_workflow_store::WorkflowMutationApproval>,
+    Vec<bcode_workflow::WorkflowMutationApprovalInspection>,
     bcode_workflow_store::WorkflowStoreError,
 > {
-    state
+    Ok(state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pending_mutation_approvals(run_id, limit)
+        .pending_mutation_approvals(run_id, limit)?
+        .into_iter()
+        .map(mutation_approval_inspection)
+        .collect())
 }
 
 /// Resolve one mutation approval and continue an approved workflow.
 pub async fn resolve_mutation_approval(
     state: &std::sync::Arc<ServerState>,
     approval_id: &str,
-    decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
-) -> Result<bcode_workflow_store::WorkflowMutationApprovalResolution, super::ServerError> {
+    decision: bcode_workflow::WorkflowMutationApprovalDecision,
+) -> Result<bcode_workflow::WorkflowMutationApprovalResolution, super::ServerError> {
+    resolve_mutation_approval_with_continuation(state, approval_id, decision, |run_id| async move {
+        super::drive_workflow_run_and_parents(state, &run_id).await
+    })
+    .await
+}
+
+// Keep durable resolution and post-commit outcome handling shared across execution adapters.
+// The continuation is invoked only after approval admits pending work; it must retain
+// the runtime's ownership fencing and must not independently resolve the approval.
+pub async fn resolve_mutation_approval_with_continuation<F, Fut>(
+    state: &std::sync::Arc<ServerState>,
+    approval_id: &str,
+    decision: bcode_workflow::WorkflowMutationApprovalDecision,
+    continue_run: F,
+) -> Result<bcode_workflow::WorkflowMutationApprovalResolution, super::ServerError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), super::ServerError>>,
+{
     let started_at = std::time::Instant::now();
-    let resolved_at_ms = super::current_unix_millis();
     let approval_context = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .mutation_approval_context(approval_id)?;
-    let result = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resolve_mutation_approval(approval_id, decision, resolved_at_ms)?;
-    if matches!(
-        decision,
-        bcode_workflow_store::WorkflowMutationApprovalDecision::Approve
-    ) && let Some((run_id, _)) = approval_context.as_ref()
-    {
-        super::drive_workflow_run_and_parents(state, run_id).await?;
-    }
+    // Resolution mutates active workflow state even when no continuation follows
+    // (denial or expiration). Hold verified execution ownership across both steps.
+    let authority = if let Some((run_id, _)) = approval_context.as_ref() {
+        execution_authority(state, run_id).await?
+    } else {
+        None
+    };
+    let mut resolved_at_ms = 0;
+    let mut result = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.resolve_mutation_approval_with_clock(
+            approval_id,
+            decision,
+            authority.as_ref().map(|guard| &guard.authority),
+            || {
+                resolved_at_ms = super::current_unix_millis();
+                resolved_at_ms
+            },
+        )?
+    };
+    result.continuation = Some(if result.admits_continuation() {
+        if let Some((run_id, _)) = approval_context.as_ref() {
+            if continue_run(run_id.clone()).await.is_ok() {
+                bcode_workflow::WorkflowApprovalContinuation::Driven
+            } else {
+                bcode_workflow::WorkflowApprovalContinuation::Failed
+            }
+        } else {
+            bcode_workflow::WorkflowApprovalContinuation::Failed
+        }
+    } else {
+        bcode_workflow::WorkflowApprovalContinuation::NotRequired
+    });
     let decision_label = match decision {
-        bcode_workflow_store::WorkflowMutationApprovalDecision::Approve => "approve",
-        bcode_workflow_store::WorkflowMutationApprovalDecision::Deny => "deny",
+        bcode_workflow::WorkflowMutationApprovalDecision::Approve => "approve",
+        bcode_workflow::WorkflowMutationApprovalDecision::Deny => "deny",
     };
     state.metrics.record_histogram_with_labels(
         "workflow.approval.wait.duration_ms",
@@ -3862,7 +4205,7 @@ pub fn attempt_history(
     run_id: &str,
     cursor: Option<&bcode_workflow_store::AttemptCursor>,
     limit: usize,
-) -> Result<Vec<bcode_workflow_store::AttemptSummary>, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<Vec<bcode_workflow::AttemptSummary>, bcode_workflow_store::WorkflowStoreError> {
     state
         .workflow_store
         .lock()
@@ -3870,18 +4213,1249 @@ pub fn attempt_history(
         .attempt_history(run_id, cursor, limit)
 }
 
-/// Return bounded keyset-paged event history for one workflow run.
+fn mutation_approval_inspection(
+    approval: bcode_workflow::WorkflowMutationApproval,
+) -> bcode_workflow::WorkflowMutationApprovalInspection {
+    let scope = approval.scope;
+    bcode_workflow::WorkflowMutationApprovalInspection {
+        approval_id: approval.approval_id,
+        run_id: approval.run_id,
+        node_id: approval.node_id,
+        activation_id: approval.activation_id,
+        requested_at_ms: approval.requested_at_ms,
+        expires_at_ms: approval.expires_at_ms,
+        scope: mutation_scope_inspection(scope),
+    }
+}
+
+fn mutation_scope_inspection(
+    scope: bcode_workflow::WorkflowMutationGrantScope,
+) -> bcode_workflow::WorkflowMutationApprovalScopeInspection {
+    bcode_workflow::WorkflowMutationApprovalScopeInspection {
+        plugin_id: scope.plugin_id,
+        block_id: scope.block_id,
+        block_version: scope.block_version,
+        operation: scope.operation,
+        workspace_snapshot: scope.workspace_snapshot,
+        input_summary: scope.input_summary,
+        resource_claims: scope.resource_claims,
+        reconciliation: scope.reconciliation,
+        capability: scope.capability,
+    }
+}
+
+fn decision_inspection(
+    decision: bcode_workflow::WorkflowDecision,
+) -> bcode_workflow::WorkflowDecisionInspection {
+    let value = mutation_approval_decision_disclosure(&decision);
+    bcode_workflow::WorkflowDecisionInspection {
+        decision_id: decision.decision_id,
+        run_id: decision.run_id,
+        node_id: decision.node_id,
+        decision_type: decision.decision_type,
+        value,
+        created_at_ms: decision.created_at_ms,
+    }
+}
+
+fn mutation_approval_decision_disclosure(
+    decision: &bcode_workflow::WorkflowDecision,
+) -> bcode_workflow::WorkflowDecisionValueDisclosure {
+    let observation = (|| {
+        if decision.decision_type != "mutation_approval" {
+            return None;
+        }
+        let approval_id = decision.value.get("approval_id")?.as_str()?;
+        if approval_id.trim().is_empty()
+            || decision.decision_id != format!("mutation-approval:{approval_id}")
+        {
+            return None;
+        }
+        let approved = match decision.value.get("decision")?.as_str()? {
+            "approved" => true,
+            "denied" => false,
+            _ => return None,
+        };
+        let scope: bcode_workflow::WorkflowMutationGrantScope =
+            serde_json::from_value(decision.value.get("scope")?.clone()).ok()?;
+        if scope.validate().is_err()
+            || scope.run_id != decision.run_id
+            || decision.node_id.as_ref() != Some(&scope.node_id)
+        {
+            return None;
+        }
+        Some(
+            bcode_workflow::WorkflowDecisionValueDisclosure::MutationApproval {
+                approval_id: approval_id.to_owned(),
+                approved,
+            },
+        )
+    })();
+    observation.unwrap_or(bcode_workflow::WorkflowDecisionValueDisclosure::Withheld)
+}
+
+fn grant_inspection(
+    grant: bcode_workflow::WorkflowGrant,
+) -> bcode_workflow::WorkflowGrantInspection {
+    let scope = if grant.scope.get("version").is_some() {
+        serde_json::from_value::<bcode_workflow::WorkflowMutationGrantScope>(grant.scope.clone())
+            .ok()
+            .filter(|scope| {
+                scope.validate().is_ok()
+                    && scope.run_id == grant.run_id
+                    && scope.node_id == grant.node_id
+            })
+            .map_or(
+                bcode_workflow::WorkflowGrantScopeDisclosure::Withheld,
+                |scope| bcode_workflow::WorkflowGrantScopeDisclosure::Mutation {
+                    scope: Box::new(mutation_scope_inspection(scope)),
+                },
+            )
+    } else {
+        policy_grant_disclosure(&grant)
+    };
+    bcode_workflow::WorkflowGrantInspection {
+        grant_id: grant.grant_id,
+        run_id: grant.run_id,
+        node_id: grant.node_id,
+        scope,
+        granted_at_ms: grant.granted_at_ms,
+        expires_at_ms: grant.expires_at_ms,
+        max_uses: grant.max_uses,
+        uses_consumed: grant.uses_consumed,
+    }
+}
+
+fn policy_grant_disclosure(
+    grant: &bcode_workflow::WorkflowGrant,
+) -> bcode_workflow::WorkflowGrantScopeDisclosure {
+    // This unversioned representation has exactly these known fields. Do not guess an
+    // extended/future representation or reinterpret a malformed mutation scope as policy.
+    let known = grant.scope.as_object().is_some_and(|object| {
+        object.len() == 3
+            && object
+                .keys()
+                .all(|key| matches!(key.as_str(), "grant_id" | "scope" | "capability"))
+    }) && grant
+        .scope
+        .get("scope")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|object| {
+            object.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "definition" | "definition_version" | "workspace" | "node" | "run"
+                )
+            })
+        });
+    if !known {
+        return bcode_workflow::WorkflowGrantScopeDisclosure::Withheld;
+    }
+    serde_json::from_value::<bcode_workflow::WorkflowPolicyGrant>(grant.scope.clone())
+        .ok()
+        .filter(|policy| {
+            policy.validate().is_ok()
+                && policy.grant_id == grant.grant_id
+                && policy.scope.node == grant.node_id
+                && policy
+                    .scope
+                    .run
+                    .as_ref()
+                    .is_none_or(|run| run == &grant.run_id)
+        })
+        .map_or(
+            bcode_workflow::WorkflowGrantScopeDisclosure::Withheld,
+            |policy| bcode_workflow::WorkflowGrantScopeDisclosure::Policy {
+                scope: policy.scope,
+                capability: policy.capability,
+            },
+        )
+}
+
+fn verified_history_event(
+    store: &bcode_workflow_store::WorkflowStore,
+    row: bcode_workflow_store::WorkflowEventRow,
+) -> Result<bcode_workflow::WorkflowHistoryEvent, bcode_workflow_store::WorkflowStoreError> {
+    let mut event = history_event(row);
+    if let Some(identity) = event
+        .payload
+        .get("dispatch_identity")
+        .and_then(serde_json::Value::as_str)
+    {
+        let attempt = store.attempt_by_dispatch_identity(identity)?;
+        correlate_history_attempt(&mut event, attempt);
+    }
+    Ok(event)
+}
+
+fn correlate_history_attempt(
+    event: &mut bcode_workflow::WorkflowHistoryEvent,
+    attempt: Option<bcode_workflow::AttemptSummary>,
+) {
+    if let Some(attempt) = attempt.filter(|attempt| attempt.run_id == event.run_id) {
+        event.payload["attempt_correlation"] =
+            serde_json::json!(bcode_workflow::WorkflowHistoryAttemptCorrelation {
+                run_id: attempt.run_id,
+                node_id: attempt.node_id,
+                activation_id: attempt.activation_id,
+                attempt: attempt.attempt,
+            });
+    } else {
+        event
+            .payload
+            .as_object_mut()
+            .expect("projected payload object")
+            .remove("dispatch_identity");
+        event.payload["correlation_unavailable"] = serde_json::json!("unverified_attempt");
+    }
+}
+
+fn run_lifecycle_observation(kind: &str) -> Option<serde_json::Value> {
+    use bcode_workflow::RunStatus;
+    let status = match kind {
+        "run_created" | "run_resumed" => RunStatus::Running,
+        "run_paused" => RunStatus::Paused,
+        "run_completed" => RunStatus::Completed,
+        "run_cancelled" => RunStatus::Cancelled,
+        _ => return None,
+    };
+    Some(serde_json::json!(
+        bcode_workflow::WorkflowRunLifecycleObservation { status }
+    ))
+}
+
+fn output_validation_observation(payload: &serde_json::Value) -> serde_json::Value {
+    let facts = (|| {
+        let schema_version = u32::try_from(payload.get("schema_version")?.as_u64()?).ok()?;
+        let artifact = payload.get("artifact_reference")?;
+        if !artifact.is_null() && !artifact.is_string() {
+            return None;
+        }
+        Some(bcode_workflow::WorkflowOutputValidationObservation {
+            schema_version,
+            has_artifact: !artifact.is_null(),
+            created_at_ms: payload.get("created_at_ms")?.as_u64()?,
+        })
+    })();
+    facts.map_or_else(
+        || serde_json::json!({"unavailable": "invalid_output_validation"}),
+        |facts| serde_json::json!(facts),
+    )
+}
+
+fn authority_transfer_observation(payload: &serde_json::Value) -> serde_json::Value {
+    // Only audited numeric facts cross the boundary, never fencing credentials or evidence.
+    let facts = (|| {
+        Some(bcode_workflow::WorkflowAuthorityTransferObservation {
+            previous_generation: payload.get("from")?.get("generation")?.as_u64()?,
+            generation: payload.get("to")?.get("generation")?.as_u64()?,
+            reassigned_at_ms: payload.get("reassigned_at_ms")?.as_u64()?,
+        })
+    })();
+    facts.map_or_else(
+        || serde_json::json!({"unavailable": "invalid_authority_transfer"}),
+        |facts| serde_json::json!(facts),
+    )
+}
+
+fn mutation_approval_observation(
+    row: &bcode_workflow_store::WorkflowEventRow,
+) -> serde_json::Value {
+    serde_json::from_value::<bcode_workflow::WorkflowMutationApproval>(row.payload.clone())
+        .ok()
+        .filter(|approval| {
+            approval.scope.validate().is_ok()
+                && approval.run_id == row.run_id
+                && approval.scope.run_id == approval.run_id
+                && approval.scope.node_id == approval.node_id
+                && approval.scope.activation_id == approval.activation_id
+                && !approval.approval_id.trim().is_empty()
+        })
+        .map_or_else(
+            || serde_json::json!({"unavailable":"invalid_mutation_approval"}),
+            |approval| serde_json::json!(mutation_approval_inspection(approval)),
+        )
+}
+
+fn activation_observation(row: &bcode_workflow_store::WorkflowEventRow) -> serde_json::Value {
+    let facts = (|| {
+        let activation = row.payload.get("activation")?;
+        let node_id = activation.get("node_id")?.as_str()?;
+        let activation_id = activation.get("activation_id")?.as_str()?;
+        let generation = activation.get("dependency_generation")?.as_u64()?;
+        let waiting = row.event_type == "activation_waiting";
+        let status = row.payload.get("status")?.as_str()?;
+        let wait_kind = match status {
+            "waiting_input" => Some(bcode_workflow::WorkflowWaitKind::Input),
+            "waiting_approval" => Some(bcode_workflow::WorkflowWaitKind::Approval),
+            "pending" => None,
+            _ => return None,
+        };
+        if activation.get("run_id")?.as_str()? != row.run_id
+            || activation_id
+                != bcode_workflow_store::activation_identity(&row.run_id, node_id, generation)
+            || (waiting && !matches!(status, "waiting_input" | "waiting_approval"))
+            || (!waiting && status != "pending")
+        {
+            return None;
+        }
+        Some(bcode_workflow::WorkflowActivationObservation {
+            node_id: node_id.to_owned(),
+            activation_id: activation_id.to_owned(),
+            dependency_generation: generation,
+            created_at_ms: activation.get("created_at_ms")?.as_u64()?,
+            waiting,
+            wait_kind,
+        })
+    })();
+    facts.map_or_else(
+        || serde_json::json!({"unavailable":"invalid_activation"}),
+        |facts| serde_json::json!(facts),
+    )
+}
+
+fn attempt_admission_observation(payload: &serde_json::Value) -> serde_json::Value {
+    serde_json::from_value::<bcode_workflow::WorkflowAttemptAdmissionObservation>(payload.clone())
+        .ok()
+        .filter(|observation| observation.attempt > 0)
+        .map_or_else(
+            || serde_json::json!({"unavailable":"invalid_attempt_admission"}),
+            |observation| serde_json::json!(observation),
+        )
+}
+
+fn attempt_preparation_observation(payload: &serde_json::Value) -> serde_json::Value {
+    serde_json::from_value::<bcode_workflow::WorkflowAttemptPreparationObservation>(payload.clone())
+        .ok()
+        .filter(|observation| observation.attempt > 0)
+        .map_or_else(
+            || serde_json::json!({"unavailable": "invalid_attempt_preparation"}),
+            |observation| serde_json::json!(observation),
+        )
+}
+
+fn approval_resolution_history(row: &bcode_workflow_store::WorkflowEventRow) -> serde_json::Value {
+    let approval_id = row
+        .payload
+        .get("approval_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let decision = bcode_workflow::WorkflowDecision {
+        decision_id: format!("mutation-approval:{approval_id}"),
+        run_id: row.run_id.clone(),
+        node_id: row
+            .payload
+            .get("scope")
+            .and_then(|scope| scope.get("node_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        decision_type: "mutation_approval".to_owned(),
+        value: row.payload.clone(),
+        created_at_ms: row.created_at_ms,
+    };
+    let observation = mutation_approval_decision_disclosure(&decision);
+    let mut payload = serde_json::json!({});
+    if row.event_type == "mutation_approval_denied" {
+        payload["reason"] =
+            serde_json::json!(bcode_workflow::WorkflowHistoryDiagnostic::MutationApprovalDenied);
+    }
+    if let bcode_workflow::WorkflowDecisionValueDisclosure::MutationApproval { approved, .. } =
+        &observation
+        && *approved == (row.event_type == "mutation_approval_approved")
+    {
+        payload["resolution"] = serde_json::json!(observation);
+    } else {
+        payload["unavailable"] = serde_json::json!("invalid_mutation_approval_resolution");
+    }
+    payload
+}
+
+fn history_diagnostic(
+    row: &bcode_workflow_store::WorkflowEventRow,
+) -> Option<bcode_workflow::WorkflowHistoryDiagnostic> {
+    use bcode_workflow::WorkflowHistoryDiagnostic as Diagnostic;
+    match row.event_type.as_str() {
+        "attempt_failed" => Some(Diagnostic::AttemptFailed),
+        "fan_out_member_failed" => Some(Diagnostic::FanOutMemberFailed),
+        "run_failed" => Some(Diagnostic::RunFailed),
+        "parallel_join_failed" => Some(Diagnostic::ParallelJoinFailed),
+        "mutation_approval_denied" => Some(Diagnostic::MutationApprovalDenied),
+        "mutation_approval_expired" => Some(Diagnostic::MutationApprovalExpired),
+        "run_deadline_elapsed" => Some(Diagnostic::RunDeadlineElapsed),
+        "fan_out_failed" => Some(Diagnostic::FanOutFailed),
+        "attempt_paused" => Some(
+            match row
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("provider_unavailable") => Diagnostic::ProviderUnavailable,
+                Some("idle_timeout") => Diagnostic::IdleTimeout,
+                Some("tool_round_limit_reached") => Diagnostic::ToolRoundLimitReached,
+                Some("steering") => Diagnostic::Steering,
+                _ => Diagnostic::PauseReasonUnavailable,
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// Adapt a durable diagnostic row without interpreting opaque producer content.
+fn history_event(
+    row: bcode_workflow_store::WorkflowEventRow,
+) -> bcode_workflow::WorkflowHistoryEvent {
+    let diagnostic = history_diagnostic(&row);
+    let payload = if matches!(
+        row.event_type.as_str(),
+        "mutation_approval_approved" | "mutation_approval_denied"
+    ) {
+        approval_resolution_history(&row)
+    } else if let Some(diagnostic) = diagnostic {
+        // Keep the established reason field consumable by the portable failure projection,
+        // but expose only a closed semantic classification, never owner-supplied text.
+        serde_json::json!({"reason": diagnostic})
+    } else if let Some(lifecycle) = run_lifecycle_observation(&row.event_type) {
+        lifecycle
+    } else if row.event_type == "output_validated" {
+        output_validation_observation(&row.payload)
+    } else if row.event_type == "authority_reassigned" {
+        authority_transfer_observation(&row.payload)
+    } else if row.event_type == "waiting_activation_resolved" {
+        serde_json::from_value::<bcode_workflow::WorkflowWaitResolutionObservation>(
+            row.payload.clone(),
+        )
+        .map_or_else(
+            |_| serde_json::json!({"unavailable": "invalid_wait_resolution"}),
+            |observation| serde_json::json!(observation),
+        )
+    } else if matches!(
+        row.event_type.as_str(),
+        "activation_created" | "activation_waiting"
+    ) {
+        activation_observation(&row)
+    } else if row.event_type == "mutation_approval_requested" {
+        mutation_approval_observation(&row)
+    } else if row.event_type == "attempt_prepared" {
+        attempt_preparation_observation(&row.payload)
+    } else if row.event_type == "attempt_admitted" {
+        attempt_admission_observation(&row.payload)
+    } else if matches!(row.event_type.as_str(), "grant_recorded" | "grant_consumed") {
+        serde_json::from_value::<bcode_workflow::WorkflowGrantUseObservation>(row.payload.clone())
+            .ok()
+            .filter(|grant| {
+                grant
+                    .max_uses
+                    .is_none_or(|limit| limit > 0 && grant.uses_consumed <= limit)
+            })
+            .map_or_else(
+                || serde_json::json!({"unavailable": "invalid_grant_use"}),
+                |observation| serde_json::json!(observation),
+            )
+    } else if row.event_type == "control_node_settled" {
+        serde_json::from_value::<bcode_workflow::WorkflowRepeatSettlementObservation>(
+            row.payload.clone(),
+        )
+        .map_or_else(
+            |_| serde_json::json!({"unavailable": "invalid_repeat_settlement"}),
+            |observation| serde_json::json!(observation),
+        )
+    } else if row.event_type == "fan_out_materialized" {
+        serde_json::from_value::<bcode_workflow::WorkflowFanOutObservation>(row.payload.clone())
+            .map_or_else(
+                |_| serde_json::json!({"unavailable": "invalid_fan_out_materialization"}),
+                |observation| serde_json::json!(observation),
+            )
+    } else {
+        // New producer kinds must be reviewed before their payloads cross this boundary.
+        // Preserve the row/cursor, but explicitly report unavailable diagnostic details.
+        serde_json::json!({"unavailable": "unreviewed_event_payload"})
+    };
+    let mut payload = payload;
+    // Dispatch identities are SHA-256 digests generated by the store, not owner prose.
+    // Preserve this bounded correlation fact for existing failure-view consumers.
+    if let Some(identity) = row
+        .payload
+        .get("dispatch_identity")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        && diagnostic.is_some()
+    {
+        payload["dispatch_identity"] = serde_json::Value::String(identity.to_owned());
+    }
+    bcode_workflow::WorkflowHistoryEvent {
+        event_seq: row.event_seq,
+        run_id: row.run_id,
+        event_type: row.event_type,
+        payload,
+        created_at_ms: row.created_at_ms,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_failure_and_pause_diagnostics_exclude_owner_content() {
+    for kind in [
+        "attempt_failed",
+        "fan_out_member_failed",
+        "run_failed",
+        "parallel_join_failed",
+        "mutation_approval_denied",
+        "mutation_approval_expired",
+        "run_deadline_elapsed",
+        "fan_out_failed",
+        "attempt_paused",
+    ] {
+        for payload in [
+            serde_json::json!({"message": "SECRET", "reason": "SECRET", "dispatch_identity": "SECRET"}),
+            serde_json::Value::Null,
+        ] {
+            let observation = history_event(bcode_workflow_store::WorkflowEventRow {
+                event_seq: 1,
+                run_id: "run".to_owned(),
+                event_type: kind.to_owned(),
+                payload,
+                created_at_ms: 2,
+            });
+            assert!(
+                !serde_json::to_string(&observation)
+                    .unwrap()
+                    .contains("SECRET")
+            );
+            let _: bcode_workflow::WorkflowHistoryDiagnostic =
+                serde_json::from_value(observation.payload["reason"].clone()).unwrap();
+        }
+    }
+    for reason in [
+        "provider_unavailable",
+        "idle_timeout",
+        "tool_round_limit_reached",
+        "steering",
+    ] {
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 1,
+            run_id: "run".to_owned(),
+            event_type: "attempt_paused".to_owned(),
+            payload: serde_json::json!({"reason": reason, "message": "SECRET"}),
+            created_at_ms: 2,
+        });
+        assert_eq!(event.payload, serde_json::json!({"reason": reason}));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_authority_transfer_excludes_credentials_and_fails_closed() {
+    for payload in [
+        serde_json::json!({"from": {"generation": 1, "fencing_token": "SECRET"},
+            "to": {"generation": 2, "fencing_token": "SECRET"},
+            "evidence": {"private": "SECRET"}, "reassigned_at_ms": 123}),
+        serde_json::json!({"from": "SECRET", "reassigned_at_ms": "SECRET"}),
+    ] {
+        let valid = payload["from"].is_object();
+        let observation = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 7,
+            run_id: "run".to_owned(),
+            event_type: "authority_reassigned".to_owned(),
+            payload,
+            created_at_ms: 123,
+        });
+        assert!(
+            !serde_json::to_string(&observation)
+                .unwrap()
+                .contains("SECRET")
+        );
+        if valid {
+            let transfer: bcode_workflow::WorkflowAuthorityTransferObservation =
+                serde_json::from_value(observation.payload).unwrap();
+            assert_eq!(transfer.previous_generation, 1);
+            assert_eq!(transfer.generation, 2);
+            assert_eq!(transfer.reassigned_at_ms, 123);
+        } else {
+            assert_eq!(
+                observation.payload,
+                serde_json::json!({"unavailable": "invalid_authority_transfer"})
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_lifecycle_uses_recorded_kind_not_arbitrary_payload_status() {
+    for (kind, status) in [
+        ("run_created", "running"),
+        ("run_resumed", "running"),
+        ("run_paused", "paused"),
+        ("run_completed", "completed"),
+        ("run_cancelled", "cancelled"),
+    ] {
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            run_id: "run".to_owned(),
+            event_seq: 1,
+            event_type: kind.to_owned(),
+            payload: serde_json::json!({"status": "SECRET", "input": "SECRET"}),
+            created_at_ms: 2,
+        });
+        assert_eq!(event.payload, serde_json::json!({"status": status}));
+    }
+    assert!(run_lifecycle_observation("future_transition").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn history_output_validation_omits_value_and_artifact_location() {
+    for artifact in [None, Some("SECRET".to_owned())] {
+        let output = bcode_workflow_store::ValidatedOutput {
+            output_id: "output".to_owned(),
+            run_id: "run".to_owned(),
+            node_id: "node".to_owned(),
+            activation_id: "activation".to_owned(),
+            schema_id: "schema".to_owned(),
+            schema_version: 1,
+            value: serde_json::json!({"private": "SECRET"}),
+            artifact_reference: artifact.clone(),
+            created_at_ms: 42,
+        };
+        let observed = output_validation_observation(&serde_json::to_value(output).unwrap());
+        assert_eq!(
+            observed,
+            serde_json::json!({"schema_version": 1, "has_artifact": artifact.is_some(), "created_at_ms": 42})
+        );
+    }
+    for payload in [
+        serde_json::Value::Null,
+        serde_json::json!({"schema_version": 1, "artifact_reference": 123, "created_at_ms": 42}),
+    ] {
+        assert_eq!(
+            output_validation_observation(&payload),
+            serde_json::json!({"unavailable": "invalid_output_validation"})
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_wait_resolution_rejects_unknown_kind_and_preserves_denial() {
+    for (kind, accepted) in [("approval", false), ("input", true), ("future", true)] {
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 1,
+            run_id: "run".to_owned(),
+            event_type: "waiting_activation_resolved".to_owned(),
+            payload: serde_json::json!({"kind": kind, "accepted": accepted, "input": "SECRET"}),
+            created_at_ms: 2,
+        });
+        if kind == "future" {
+            assert_eq!(
+                event.payload,
+                serde_json::json!({"unavailable": "invalid_wait_resolution"})
+            );
+        } else {
+            assert_eq!(
+                event.payload,
+                serde_json::json!({"kind": kind, "accepted": accepted})
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_admission_excludes_receipt_and_rejects_zero_attempt() {
+    for attempt in [0, 1, 2] {
+        let receipt = bcode_workflow_store::DispatchReceipt {
+            run_id: "run".to_owned(),
+            node_id: "node".to_owned(),
+            activation_id: "activation".to_owned(),
+            attempt,
+            dispatch_identity: "identity".to_owned(),
+            receipt: serde_json::json!({"private": "SECRET"}),
+            admitted_at_ms: 42,
+        };
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            run_id: "run".to_owned(),
+            event_seq: 3,
+            event_type: "attempt_admitted".to_owned(),
+            payload: serde_json::to_value(receipt).unwrap(),
+            created_at_ms: 42,
+        });
+        assert!(!event.payload.to_string().contains("SECRET"));
+        if attempt == 0 {
+            assert!(event.payload.get("unavailable").is_some());
+        } else {
+            assert_eq!(
+                event.payload,
+                serde_json::json!({"attempt": attempt, "admitted_at_ms": 42})
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn assert_mutation_approval_history(private: &bcode_workflow::WorkflowMutationApproval) {
+    for (status, approved) in [("approved", true), ("denied", false)] {
+        let decision = bcode_workflow::WorkflowDecision {
+            decision_id: format!("mutation-approval:{}", private.approval_id),
+            run_id: private.run_id.clone(),
+            node_id: Some(private.node_id.clone()),
+            decision_type: "mutation_approval".to_owned(),
+            value: serde_json::json!({"approval_id":private.approval_id,"decision":status,"scope":private.scope}),
+            created_at_ms: 9,
+        };
+        let view = decision_inspection(decision.clone());
+        assert_eq!(
+            view.value,
+            bcode_workflow::WorkflowDecisionValueDisclosure::MutationApproval {
+                approval_id: private.approval_id.clone(),
+                approved
+            }
+        );
+        assert!(
+            !serde_json::to_string(&view)
+                .expect("wire")
+                .contains("PRIVATE_FACT")
+        );
+        let event = bcode_workflow_store::WorkflowEventRow {
+            event_seq: 1,
+            run_id: decision.run_id.clone(),
+            event_type: format!("mutation_approval_{status}"),
+            payload: decision.value.clone(),
+            created_at_ms: decision.created_at_ms,
+        };
+        let history = history_event(event.clone());
+        assert_eq!(
+            history.payload["resolution"],
+            serde_json::to_value(&view.value).expect("outcome")
+        );
+        assert!(!history.payload.to_string().contains("PRIVATE_FACT"));
+        if !approved {
+            assert_eq!(history.payload["reason"], "mutation_approval_denied");
+        }
+        let mut conflicting = event;
+        conflicting.event_type = format!(
+            "mutation_approval_{}",
+            if approved { "denied" } else { "approved" }
+        );
+        assert!(
+            history_event(conflicting)
+                .payload
+                .get("resolution")
+                .is_none()
+        );
+        let mut invalid = decision;
+        invalid.value["scope"]["run_id"] = serde_json::json!("foreign");
+        assert_eq!(
+            decision_inspection(invalid).value,
+            bcode_workflow::WorkflowDecisionValueDisclosure::Withheld
+        );
+    }
+    let row = bcode_workflow_store::WorkflowEventRow {
+        event_seq: 1,
+        run_id: private.run_id.clone(),
+        event_type: "mutation_approval_requested".to_owned(),
+        payload: serde_json::to_value(private).expect("private event"),
+        created_at_ms: private.requested_at_ms,
+    };
+    let observed_event = history_event(row.clone());
+    let review: bcode_workflow::WorkflowMutationApprovalInspection =
+        serde_json::from_value(observed_event.payload.clone()).expect("history review consumer");
+    assert_eq!(review, mutation_approval_inspection(private.clone()));
+    assert!(!observed_event.payload.to_string().contains("PRIVATE_FACT"));
+    for key in ["run_id", "node_id", "activation_id"] {
+        let mut invalid = row.clone();
+        invalid.payload["scope"][key] = serde_json::json!("foreign");
+        assert_eq!(
+            history_event(invalid).payload,
+            serde_json::json!({"unavailable":"invalid_mutation_approval"})
+        );
+    }
+    let mut invalid = row;
+    invalid.payload["scope"]["version"] = serde_json::json!(999);
+    assert_eq!(
+        history_event(invalid).payload,
+        serde_json::json!({"unavailable":"invalid_mutation_approval"})
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn mutation_approval_projection_preserves_review_content_not_authorization_facts() {
+    let private = bcode_workflow::WorkflowMutationApproval {
+        approval_id: "approval".to_owned(),
+        run_id: "run".to_owned(),
+        node_id: "node".to_owned(),
+        activation_id: "activation".to_owned(),
+        requested_at_ms: 7,
+        expires_at_ms: Some(10),
+        scope: bcode_workflow::WorkflowMutationGrantScope {
+            version: bcode_workflow::WORKFLOW_MUTATION_GRANT_SCOPE_VERSION,
+            definition_id: "definition".to_owned(),
+            definition_version: 1,
+            run_id: "run".to_owned(),
+            node_id: "node".to_owned(),
+            activation_id: "activation".to_owned(),
+            workspace_snapshot: "/workspace".to_owned(),
+            plugin_id: "owner".to_owned(),
+            block_id: "write".to_owned(),
+            block_version: 1,
+            operation: "write".to_owned(),
+            input_checksum_sha256: "a".repeat(64),
+            operation_facts: Some(serde_json::json!({"credential": "PRIVATE_FACT"})),
+            preparation_descriptor_sha256: Some("b".repeat(64)),
+            input_summary: serde_json::json!({"path": "review.txt"}),
+            resource_claims: vec![],
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::RepairRequired,
+            capability: bcode_workflow::WorkflowToolCapability::Mutating,
+        },
+    };
+    private.scope.validate().expect("valid private scope");
+    assert_mutation_approval_history(&private);
+    let grant = bcode_workflow::WorkflowGrant {
+        grant_id: "grant".to_owned(),
+        run_id: private.run_id.clone(),
+        node_id: private.node_id.clone(),
+        scope: serde_json::to_value(&private.scope).expect("scope"),
+        granted_at_ms: 8,
+        expires_at_ms: Some(10),
+        max_uses: Some(1),
+        uses_consumed: 0,
+    };
+    let grant_view = grant_inspection(grant.clone());
+    let bcode_workflow::WorkflowGrantScopeDisclosure::Mutation { scope } = &grant_view.scope else {
+        panic!("valid mutation scope must have review content");
+    };
+    assert_eq!(scope.input_summary, private.scope.input_summary);
+    assert_eq!(scope.operation, private.scope.operation);
+    let grant_wire = serde_json::to_value(&grant_view).expect("grant wire");
+    assert!(!grant_wire.to_string().contains("PRIVATE_FACT"));
+    assert_eq!(
+        serde_json::from_value::<bcode_workflow::WorkflowGrantInspection>(grant_wire)
+            .expect("grant consumer"),
+        grant_view
+    );
+    for (key, value) in [
+        ("version", serde_json::json!(999)),
+        ("run_id", serde_json::json!("foreign")),
+        ("node_id", serde_json::json!("foreign")),
+        ("input_checksum_sha256", serde_json::json!("invalid")),
+    ] {
+        let mut invalid = grant.clone();
+        invalid.scope[key] = value;
+        assert_eq!(
+            grant_inspection(invalid).scope,
+            bcode_workflow::WorkflowGrantScopeDisclosure::Withheld
+        );
+    }
+    let observed = mutation_approval_inspection(private.clone());
+    assert_eq!(observed.approval_id, private.approval_id);
+    assert_eq!(observed.run_id, private.run_id);
+    assert_eq!(observed.node_id, private.node_id);
+    assert_eq!(observed.activation_id, private.activation_id);
+    assert_eq!(observed.requested_at_ms, private.requested_at_ms);
+    assert_eq!(observed.expires_at_ms, private.expires_at_ms);
+    assert_eq!(observed.scope.input_summary, private.scope.input_summary);
+    assert_eq!(observed.scope.reconciliation, private.scope.reconciliation);
+    assert_eq!(observed.scope.capability, private.scope.capability);
+    let wire = serde_json::to_value(&observed).expect("public wire");
+    assert!(wire["scope"].get("operation_facts").is_none());
+    assert!(wire["scope"].get("preparation_descriptor_sha256").is_none());
+    assert!(wire["scope"].get("input_checksum_sha256").is_none());
+    assert!(!wire.to_string().contains("PRIVATE_FACT"));
+    let decoded: bcode_workflow::WorkflowMutationApprovalInspection =
+        serde_json::from_value(wire.clone()).expect("public consumer");
+    assert_eq!(decoded, observed);
+    assert!(serde_json::from_value::<bcode_workflow::WorkflowMutationApproval>(wire).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn policy_grant_inspection_discloses_only_known_correlated_scopes() {
+    let mut grant = bcode_workflow::WorkflowGrant {
+        grant_id: "grant".to_owned(),
+        run_id: "run".to_owned(),
+        node_id: "node".to_owned(),
+        scope: serde_json::json!({"grant_id":"grant", "capability":"mutating", "scope": {
+            "definition":"definition", "definition_version":1, "workspace":"workspace", "node":"node", "run":"run"
+        }}),
+        granted_at_ms: 1,
+        expires_at_ms: None,
+        max_uses: Some(1),
+        uses_consumed: 0,
+    };
+    let view = grant_inspection(grant.clone());
+    assert!(matches!(
+        view.scope,
+        bcode_workflow::WorkflowGrantScopeDisclosure::Policy { .. }
+    ));
+    let wire = serde_json::to_value(&view).expect("wire");
+    assert_eq!(wire["scope"]["capability"], "mutating");
+    assert_eq!(
+        serde_json::from_value::<bcode_workflow::WorkflowGrantInspection>(wire).expect("consumer"),
+        view
+    );
+    for (key, value) in [
+        ("grant_id", serde_json::json!("foreign")),
+        ("version", serde_json::json!(999)),
+        ("extension", serde_json::json!(true)),
+    ] {
+        let mut invalid = grant.clone();
+        invalid.scope[key] = value;
+        assert_eq!(
+            grant_inspection(invalid).scope,
+            bcode_workflow::WorkflowGrantScopeDisclosure::Withheld
+        );
+    }
+    for (key, value) in [
+        ("run", serde_json::json!("foreign")),
+        ("node", serde_json::json!("foreign")),
+        ("definition_version", serde_json::json!(0)),
+        ("workspace", serde_json::json!("")),
+        ("extension", serde_json::json!(true)),
+    ] {
+        let mut invalid = grant.clone();
+        invalid.scope["scope"][key] = value;
+        assert_eq!(
+            grant_inspection(invalid).scope,
+            bcode_workflow::WorkflowGrantScopeDisclosure::Withheld
+        );
+    }
+    grant.scope["scope"]
+        .as_object_mut()
+        .expect("scope")
+        .remove("run");
+    assert!(matches!(
+        grant_inspection(grant).scope,
+        bcode_workflow::WorkflowGrantScopeDisclosure::Policy { .. }
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn history_attempt_correlation_uses_verified_coordinates_and_withholds_foreign_links() {
+    let attempt = bcode_workflow::AttemptSummary {
+        run_id: "run".to_owned(),
+        node_id: "node".to_owned(),
+        activation_id: "activation".to_owned(),
+        attempt: 2,
+        dispatch_identity: "a".repeat(64),
+        side_effect: bcode_workflow::DispatchSideEffect::ReadOnly,
+        status: "prepared".to_owned(),
+        has_receipt: false,
+        prepared_at_ms: 1,
+        admitted_at_ms: None,
+        terminal_at_ms: None,
+    };
+    for (candidate, expected) in [
+        (Some(attempt.clone()), true),
+        (None, false),
+        (
+            Some(bcode_workflow::AttemptSummary {
+                run_id: "foreign".to_owned(),
+                ..attempt
+            }),
+            false,
+        ),
+    ] {
+        let mut event = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 1,
+            run_id: "run".to_owned(),
+            event_type: "attempt_failed".to_owned(),
+            payload: serde_json::json!({"dispatch_identity": "a".repeat(64), "node_id": "untrusted", "attempt_correlation": {"node_id":"untrusted"}}),
+            created_at_ms: 3,
+        });
+        correlate_history_attempt(&mut event, candidate);
+        assert_eq!(event.payload.get("dispatch_identity").is_some(), expected);
+        assert_eq!(event.payload.get("attempt_correlation").is_some(), expected);
+        assert_eq!(
+            event.payload.get("correlation_unavailable").is_some(),
+            !expected
+        );
+        assert!(!event.payload.to_string().contains("untrusted"));
+        if expected {
+            let correlation: bcode_workflow::WorkflowHistoryAttemptCorrelation =
+                serde_json::from_value(event.payload["attempt_correlation"].clone())
+                    .expect("typed correlation");
+            assert_eq!(correlation.node_id, "node");
+            assert_eq!(correlation.activation_id, "activation");
+            assert_eq!(correlation.attempt, 2);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn activation_history_preserves_wait_kind_and_rejects_inconsistent_coordinates() {
+    for (kind, status, expected) in [
+        ("activation_created", "pending", None),
+        (
+            "activation_waiting",
+            "waiting_input",
+            Some(bcode_workflow::WorkflowWaitKind::Input),
+        ),
+        (
+            "activation_waiting",
+            "waiting_approval",
+            Some(bcode_workflow::WorkflowWaitKind::Approval),
+        ),
+    ] {
+        let row = bcode_workflow_store::WorkflowEventRow {
+            event_seq: 1,
+            run_id: "run".to_owned(),
+            event_type: kind.to_owned(),
+            created_at_ms: 1,
+            payload: serde_json::json!({"status": status, "activation": {
+                "run_id":"run", "node_id":"node", "activation_id": bcode_workflow_store::activation_identity("run", "node", 1),
+                "dependency_generation":1, "created_at_ms":1, "input":{"private":"SECRET"}
+            }}),
+        };
+        let event = history_event(row.clone());
+        let observation: bcode_workflow::WorkflowActivationObservation =
+            serde_json::from_value(event.payload.clone()).expect("observation");
+        assert_eq!(observation.wait_kind, expected);
+        assert_eq!(observation.waiting, expected.is_some());
+        assert!(!event.payload.to_string().contains("SECRET"));
+        for (key, value) in [
+            ("run_id", serde_json::json!("foreign")),
+            ("activation_id", serde_json::json!("wrong")),
+            ("dependency_generation", serde_json::json!(2)),
+            ("created_at_ms", serde_json::json!(-1)),
+        ] {
+            let mut invalid = row.clone();
+            invalid.payload["activation"][key] = value;
+            assert_eq!(
+                history_event(invalid).payload,
+                serde_json::json!({"unavailable":"invalid_activation"})
+            );
+        }
+        let mut invalid = row;
+        invalid.payload["status"] = serde_json::json!(if expected.is_some() {
+            "pending"
+        } else {
+            "waiting_input"
+        });
+        assert_eq!(
+            history_event(invalid).payload,
+            serde_json::json!({"unavailable":"invalid_activation"})
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_preparation_exposes_facts_without_dispatch_intent() {
+    let row = bcode_workflow_store::WorkflowEventRow {
+        event_seq: 1,
+        run_id: "run".to_owned(),
+        event_type: "attempt_prepared".to_owned(),
+        payload: serde_json::json!({"attempt":2, "side_effect":"mutating", "prepared_at_ms":7, "intent":{"credential":"SECRET"}}),
+        created_at_ms: 7,
+    };
+    let observed = history_event(row.clone());
+    assert_eq!(
+        observed.payload,
+        serde_json::json!({"attempt":2,"side_effect":"mutating","prepared_at_ms":7})
+    );
+    let typed: bcode_workflow::WorkflowAttemptPreparationObservation =
+        serde_json::from_value(observed.payload).expect("public observation");
+    assert_eq!(typed.attempt, 2);
+    for (key, value) in [
+        ("attempt", serde_json::json!(0)),
+        ("attempt", serde_json::json!(u64::MAX)),
+        ("side_effect", serde_json::json!("future")),
+        ("prepared_at_ms", serde_json::json!(-1)),
+    ] {
+        let mut invalid = row.clone();
+        invalid.payload[key] = value;
+        assert_eq!(
+            history_event(invalid).payload,
+            serde_json::json!({"unavailable":"invalid_attempt_preparation"})
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn aggregate_decision_projection_withholds_private_value() {
+    let observed = decision_inspection(bcode_workflow::WorkflowDecision {
+        decision_id: "decision".to_owned(),
+        run_id: "run".to_owned(),
+        node_id: Some("node".to_owned()),
+        decision_type: "branch".to_owned(),
+        value: serde_json::json!({"private": "SECRET"}),
+        created_at_ms: 7,
+    });
+    let wire = serde_json::to_value(observed).unwrap();
+    assert_eq!(wire["decision_id"], "decision");
+    assert_eq!(wire["decision_type"], "branch");
+    assert_eq!(wire["created_at_ms"], 7);
+    assert_eq!(
+        wire["value"],
+        serde_json::json!({"availability": "withheld"})
+    );
+    assert!(!wire.to_string().contains("SECRET"));
+}
+
+#[cfg(test)]
+#[test]
+fn aggregate_grant_projection_preserves_identity_and_withholds_scope() {
+    let observed = grant_inspection(bcode_workflow::WorkflowGrant {
+        grant_id: "grant".to_owned(),
+        run_id: "run".to_owned(),
+        node_id: "node".to_owned(),
+        scope: serde_json::json!({"operation_facts": "SECRET", "input_summary": "SECRET"}),
+        granted_at_ms: 1,
+        expires_at_ms: Some(10),
+        max_uses: Some(3),
+        uses_consumed: 2,
+    });
+    assert_eq!(observed.grant_id, "grant");
+    assert_eq!(observed.run_id, "run");
+    assert_eq!(observed.node_id, "node");
+    assert_eq!(observed.uses_consumed, 2);
+    let wire = serde_json::to_value(observed).unwrap();
+    assert_eq!(
+        wire["scope"],
+        serde_json::json!({"availability": "withheld"})
+    );
+    assert!(!wire.to_string().contains("SECRET"));
+}
+
+#[cfg(test)]
+#[test]
+fn history_grant_use_preserves_limits_without_scope() {
+    for kind in ["grant_recorded", "grant_consumed"] {
+        for limit in [None, Some(3)] {
+            let grant = bcode_workflow::WorkflowGrant {
+                grant_id: "grant".to_owned(),
+                run_id: "run".to_owned(),
+                node_id: "node".to_owned(),
+                scope: serde_json::json!({"credential": "SECRET"}),
+                granted_at_ms: 2,
+                expires_at_ms: Some(10),
+                max_uses: limit,
+                uses_consumed: 2,
+            };
+            let event = history_event(bcode_workflow_store::WorkflowEventRow {
+                event_seq: 3,
+                run_id: "run".to_owned(),
+                event_type: kind.to_owned(),
+                payload: serde_json::to_value(grant).unwrap(),
+                created_at_ms: 4,
+            });
+            assert!(!event.payload.to_string().contains("SECRET"));
+            let observed: bcode_workflow::WorkflowGrantUseObservation =
+                serde_json::from_value(event.payload).unwrap();
+            assert_eq!(observed.max_uses, limit);
+            assert_eq!(observed.uses_consumed, 2);
+            assert_eq!(observed.expires_at_ms, Some(10));
+        }
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 3,
+            run_id: "run".to_owned(),
+            event_type: kind.to_owned(),
+            payload: serde_json::json!({"granted_at_ms": 2, "max_uses": 1, "uses_consumed": 2}),
+            created_at_ms: 4,
+        });
+        assert_eq!(
+            event.payload,
+            serde_json::json!({"unavailable": "invalid_grant_use"})
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_composition_projects_progress_without_private_content() {
+    for (kind, facts) in [
+        (
+            "fan_out_materialized",
+            serde_json::json!({"member_count": 8, "max_concurrency": 3}),
+        ),
+        (
+            "control_node_settled",
+            serde_json::json!({"repeat": false, "generation": 4,
+            "iterations_completed": 5, "next_generation": null, "max_iterations": 5,
+            "cycle_cap": 10, "effective_iteration_bound": 5, "iteration_bound_exhausted": true,
+            "exhaustion_policy": "fail", "outcome": null}),
+        ),
+    ] {
+        let mut payload = facts.clone();
+        payload["private"] = serde_json::json!({"token": "SECRET"});
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 11,
+            run_id: "run".to_owned(),
+            event_type: kind.to_owned(),
+            payload,
+            created_at_ms: 12,
+        });
+        assert_eq!(event.payload, facts);
+        let invalid = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 11,
+            run_id: "run".to_owned(),
+            event_type: kind.to_owned(),
+            payload: serde_json::json!({"private": "SECRET"}),
+            created_at_ms: 12,
+        });
+        assert!(invalid.payload.get("unavailable").is_some());
+        assert!(!invalid.payload.to_string().contains("SECRET"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_failure_preserves_digest_correlation_only() {
+    let identity = bcode_workflow_store::dispatch_identity("run", "node", "activation", 1);
+    let event = history_event(bcode_workflow_store::WorkflowEventRow {
+        event_seq: 1,
+        run_id: "run".to_owned(),
+        event_type: "attempt_failed".to_owned(),
+        payload: serde_json::json!({"dispatch_identity": identity, "message": "SECRET"}),
+        created_at_ms: 2,
+    });
+    assert_eq!(event.payload["dispatch_identity"], identity);
+    assert_eq!(event.payload["reason"], "attempt_failed");
+    assert!(event.payload.get("message").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn history_observation_withholds_unreviewed_payload_and_preserves_cursor() {
+    let row = bcode_workflow_store::WorkflowEventRow {
+        event_seq: 17,
+        run_id: "run-history".to_owned(),
+        event_type: "future_diagnostic".to_owned(),
+        payload: serde_json::json!({"unknown": {"number": 42, "text": "diagnostic"}}),
+        created_at_ms: 123,
+    };
+    let observation = history_event(row);
+    assert_eq!(observation.event_seq, 17);
+    assert_eq!(observation.run_id, "run-history");
+    assert_eq!(observation.created_at_ms, 123);
+    assert_eq!(observation.event_type, "future_diagnostic");
+    assert_eq!(
+        observation.payload,
+        serde_json::json!({"unavailable": "unreviewed_event_payload"})
+    );
+}
+
+/// Return bounded keyset-paged diagnostic event observations for one workflow run.
+///
+/// # Errors
+/// Returns store availability, query, or decoding errors without repairing history.
 pub fn event_history(
     state: &ServerState,
     run_id: &str,
     after_sequence: Option<u64>,
     limit: usize,
-) -> Result<Vec<bcode_workflow_store::WorkflowEventRow>, bcode_workflow_store::WorkflowStoreError> {
-    state
+) -> Result<Vec<bcode_workflow::WorkflowHistoryEvent>, bcode_workflow_store::WorkflowStoreError> {
+    let store = state
         .workflow_store
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .event_history(run_id, after_sequence, limit)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    store
+        .event_history(run_id, after_sequence, limit)?
+        .into_iter()
+        .map(|event| verified_history_event(&store, event))
+        .collect()
 }
 
 /// Return bounded workflow live-event catch-up state without transport framing.
@@ -3963,7 +5537,7 @@ pub async fn inspect_associated_run(
     state: &ServerState,
     key: &bcode_workflow_store::WorkflowRunBindingKey,
     limit: usize,
-) -> Result<Option<Box<bcode_ipc::WorkflowRunInspection>>, super::ServerError> {
+) -> Result<Option<Box<bcode_workflow::WorkflowRunInspection>>, super::ServerError> {
     let Some(run) = associated_run(state, key)? else {
         return Ok(None);
     };
@@ -3976,14 +5550,18 @@ pub async fn inspect_associated_run(
 pub async fn control_associated_run(
     state: &std::sync::Arc<ServerState>,
     key: &bcode_workflow_store::WorkflowRunBindingKey,
-    action: bcode_ipc::WorkflowRunControlAction,
+    action: bcode_workflow::WorkflowRunControlAction,
 ) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), super::ServerError> {
     let run = associated_run(state, key)?;
     let changed = if let Some(run) = &run {
         match action {
-            bcode_ipc::WorkflowRunControlAction::Pause => pause_run(state, &run.run_id).await?,
-            bcode_ipc::WorkflowRunControlAction::Resume => resume_run(state, &run.run_id).await?,
-            bcode_ipc::WorkflowRunControlAction::Cancel => {
+            bcode_workflow::WorkflowRunControlAction::Pause => {
+                pause_run(state, &run.run_id).await?
+            }
+            bcode_workflow::WorkflowRunControlAction::Resume => {
+                resume_run(state, &run.run_id).await?
+            }
+            bcode_workflow::WorkflowRunControlAction::Cancel => {
                 let _authority =
                     execution_authority(state, &run.run_id)
                         .await?
@@ -4125,7 +5703,7 @@ pub fn catalog_view(
 pub async fn apply_source(
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
-    request: bcode_ipc::ApplyWorkflowSourceRequest,
+    request: bcode_workflow::ApplyWorkflowSourceRequest,
 ) -> Result<bcode_workflow::WorkflowSourceApplyResult, super::ServerError> {
     let catalog = authoring_catalog(state).await?;
     let lowering = bcode_workflow::lower_workflow_authoring_source(
@@ -4484,7 +6062,7 @@ pub async fn revision_requirement_inspection(
     state: &ServerState,
     workflow_id: &str,
     revision: u64,
-) -> Result<Option<bcode_ipc::WorkflowRevisionRequirementInspection>, super::ServerError> {
+) -> Result<Option<bcode_workflow::WorkflowRevisionRequirementInspection>, super::ServerError> {
     let revision = state
         .workflow_store
         .lock()
@@ -4498,17 +6076,19 @@ pub async fn revision_requirement_inspection(
         &revision.document.requirements,
         &catalog,
     )?;
-    Ok(Some(bcode_ipc::WorkflowRevisionRequirementInspection {
-        revision: Box::new(workflow_revision_snapshot(revision)),
-        current_availability,
-    }))
+    Ok(Some(
+        bcode_workflow::WorkflowRevisionRequirementInspection {
+            revision: Box::new(workflow_revision_snapshot(revision)),
+            current_availability,
+        },
+    ))
 }
 
 /// Authorize and create one workflow preset without transport framing.
 pub fn create_preset(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: bcode_ipc::CreateWorkflowPresetRequest,
+    request: bcode_workflow::CreateWorkflowPresetRequest,
 ) -> Result<bcode_workflow_store::WorkflowPreset, super::ServerError> {
     state.authorize_local_workflow_application_operation(
         client_id,
@@ -4538,8 +6118,8 @@ pub fn create_preset(
 pub fn update_preset(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: bcode_ipc::UpdateWorkflowPresetRequest,
-) -> Result<bcode_ipc::WorkflowPresetUpdateResult, super::ServerError> {
+    request: bcode_workflow::UpdateWorkflowPresetRequest,
+) -> Result<bcode_workflow::WorkflowPresetUpdateResult, super::ServerError> {
     state.authorize_local_workflow_application_operation(
         client_id,
         LocalApplicationOperationRequest {
@@ -4571,12 +6151,12 @@ pub fn update_preset(
             super::current_time_ms(),
         );
     match update {
-        Ok(preset) => Ok(bcode_ipc::WorkflowPresetUpdateResult::Updated(
+        Ok(preset) => Ok(bcode_workflow::WorkflowPresetUpdateResult::Updated(
             workflow_preset_snapshot(preset),
         )),
         Err(error) => {
             record_authoring_conflict(&state.metrics, "update_preset");
-            Ok(bcode_ipc::WorkflowPresetUpdateResult::Conflict(
+            Ok(bcode_workflow::WorkflowPresetUpdateResult::Conflict(
                 authoring_conflict_result(error)?,
             ))
         }
@@ -4587,8 +6167,8 @@ pub fn update_preset(
 pub fn delete_preset(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: &bcode_ipc::DeleteWorkflowPresetRequest,
-) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, super::ServerError> {
+    request: &bcode_workflow::DeleteWorkflowPresetRequest,
+) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, super::ServerError> {
     state.authorize_local_workflow_application_operation(
         client_id,
         LocalApplicationOperationRequest {
@@ -4614,10 +6194,10 @@ pub fn delete_preset(
             request.expected_generation,
         );
     match deletion {
-        Ok(()) => Ok(bcode_ipc::WorkflowAuthoringMutationResult::Applied),
+        Ok(()) => Ok(bcode_workflow::WorkflowAuthoringMutationResult::Applied),
         Err(error) => {
             record_authoring_conflict(&state.metrics, "delete_preset");
-            Ok(bcode_ipc::WorkflowAuthoringMutationResult::Conflict(
+            Ok(bcode_workflow::WorkflowAuthoringMutationResult::Conflict(
                 authoring_conflict_result(error)?,
             ))
         }
@@ -4628,7 +6208,7 @@ pub fn delete_preset(
 pub fn set_archived(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: &bcode_ipc::SetAuthoredWorkflowArchivedRequest,
+    request: &bcode_workflow::SetAuthoredWorkflowArchivedRequest,
 ) -> Result<bcode_workflow_store::AuthoredWorkflow, super::ServerError> {
     state.authorize_local_workflow_application_operation(
         client_id,
@@ -4664,11 +6244,11 @@ pub fn set_archived(
 }
 
 /// Authorize and activate one exact authored workflow revision.
-pub fn activate_revision(
+fn activate_revision(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: &bcode_ipc::ActivateWorkflowRevisionRequest,
-) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, super::ServerError> {
+    request: &bcode_workflow::ActivateWorkflowRevisionRequest,
+) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, super::ServerError> {
     state.authorize_local_workflow_application_operation(
         client_id,
         LocalApplicationOperationRequest {
@@ -4695,10 +6275,10 @@ pub fn activate_revision(
             super::current_time_ms(),
         );
     match update {
-        Ok(()) => Ok(bcode_ipc::WorkflowAuthoringMutationResult::Applied),
+        Ok(()) => Ok(bcode_workflow::WorkflowAuthoringMutationResult::Applied),
         Err(error) => {
             record_authoring_conflict(&state.metrics, "activate");
-            Ok(bcode_ipc::WorkflowAuthoringMutationResult::Conflict(
+            Ok(bcode_workflow::WorkflowAuthoringMutationResult::Conflict(
                 authoring_conflict_result(error)?,
             ))
         }
@@ -4706,11 +6286,11 @@ pub fn activate_revision(
 }
 
 /// Authorize and discard one exact workflow draft.
-pub fn discard_draft(
+fn discard_draft(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: &bcode_ipc::DiscardWorkflowDraftRequest,
-) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, super::ServerError> {
+    request: &bcode_workflow::DiscardWorkflowDraftRequest,
+) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, super::ServerError> {
     state.authorize_local_workflow_application_operation(
         client_id,
         LocalApplicationOperationRequest {
@@ -4736,10 +6316,10 @@ pub fn discard_draft(
             request.expected_generation,
         );
     match discard {
-        Ok(()) => Ok(bcode_ipc::WorkflowAuthoringMutationResult::Applied),
+        Ok(()) => Ok(bcode_workflow::WorkflowAuthoringMutationResult::Applied),
         Err(error) => {
             record_authoring_conflict(&state.metrics, "discard_draft");
-            Ok(bcode_ipc::WorkflowAuthoringMutationResult::Conflict(
+            Ok(bcode_workflow::WorkflowAuthoringMutationResult::Conflict(
                 authoring_conflict_result(error)?,
             ))
         }
@@ -4750,7 +6330,7 @@ pub fn discard_draft(
 pub fn fork_draft(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: bcode_ipc::ForkWorkflowDraftRequest,
+    request: bcode_workflow::ForkWorkflowDraftRequest,
 ) -> Result<bcode_workflow_store::WorkflowDraft, super::ServerError> {
     state.authorize_local_workflow_application_operation(
         client_id,
@@ -4772,7 +6352,7 @@ pub fn fork_draft(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match request.source {
-        bcode_ipc::WorkflowDraftForkSource::Draft { draft_id } => store
+        bcode_workflow::WorkflowDraftForkSource::Draft { draft_id } => store
             .fork_workflow_draft(
                 &request.workflow_id,
                 &draft_id,
@@ -4781,7 +6361,7 @@ pub fn fork_draft(
                 super::current_time_ms(),
             )
             .map_err(super::ServerError::from),
-        bcode_ipc::WorkflowDraftForkSource::Revision { revision } => store
+        bcode_workflow::WorkflowDraftForkSource::Revision { revision } => store
             .fork_workflow_revision(
                 &request.workflow_id,
                 revision,
@@ -4797,7 +6377,7 @@ pub fn fork_draft(
 pub fn create_authored_workflow(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: bcode_ipc::CreateAuthoredWorkflowRequest,
+    request: bcode_workflow::CreateAuthoredWorkflowRequest,
 ) -> Result<
     (
         bcode_workflow_store::AuthoredWorkflow,
@@ -4853,11 +6433,11 @@ pub fn create_authored_workflow(
 }
 
 /// Authorize and update one complete workflow draft document.
-pub fn update_draft(
+fn update_draft(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: &bcode_ipc::UpdateWorkflowDraftRequest,
-) -> Result<bcode_ipc::WorkflowDraftUpdateResult, super::ServerError> {
+    request: &bcode_workflow::UpdateWorkflowDraftRequest,
+) -> Result<bcode_workflow::WorkflowDraftUpdateResult, super::ServerError> {
     request.document.validate()?;
     if request.document.workflow_id != request.workflow_id {
         return Err(super::ServerError::WorkflowDefinitionUnsupported(
@@ -4892,17 +6472,17 @@ pub fn update_draft(
             super::current_time_ms(),
         );
     match update {
-        Ok(draft) => Ok(bcode_ipc::WorkflowDraftUpdateResult::Updated(Box::new(
-            workflow_draft_snapshot(draft),
-        ))),
+        Ok(draft) => Ok(bcode_workflow::WorkflowDraftUpdateResult::Updated(
+            Box::new(workflow_draft_snapshot(draft)),
+        )),
         Err(bcode_workflow_store::WorkflowStoreError::AuthoringConflict {
             entity_id,
             expected,
             current,
         }) => {
             record_authoring_conflict(&state.metrics, "update_draft");
-            Ok(bcode_ipc::WorkflowDraftUpdateResult::Conflict(
-                bcode_ipc::WorkflowAuthoringConflict {
+            Ok(bcode_workflow::WorkflowDraftUpdateResult::Conflict(
+                bcode_workflow::WorkflowAuthoringConflict {
                     entity_id,
                     expected_generation: expected,
                     current_generation: current,
@@ -4914,11 +6494,11 @@ pub fn update_draft(
 }
 
 /// Apply one validated semantic edit batch to an exact workflow draft generation.
-pub fn apply_draft_edits(
+fn apply_draft_edits(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
-    request: bcode_ipc::ApplyWorkflowDraftEditsRequest,
-) -> Result<bcode_ipc::WorkflowDraftEditResult, super::ServerError> {
+    request: bcode_workflow::ApplyWorkflowDraftEditsRequest,
+) -> Result<bcode_workflow::WorkflowDraftEditResult, super::ServerError> {
     request.batch.validate()?;
     let current = state
         .workflow_store
@@ -4932,8 +6512,8 @@ pub fn apply_draft_edits(
             ))
         })?;
     if current.generation != request.batch.expected_generation {
-        return Ok(bcode_ipc::WorkflowDraftEditResult::Conflict(
-            bcode_ipc::WorkflowAuthoringConflict {
+        return Ok(bcode_workflow::WorkflowDraftEditResult::Conflict(
+            bcode_workflow::WorkflowAuthoringConflict {
                 entity_id: request.draft_id,
                 expected_generation: request.batch.expected_generation,
                 current_generation: current.generation,
@@ -4946,7 +6526,7 @@ pub fn apply_draft_edits(
     ) {
         Ok(document) => document,
         Err(bcode_workflow::WorkflowError::Build { path, message }) => {
-            return Ok(bcode_ipc::WorkflowDraftEditResult::Rejected {
+            return Ok(bcode_workflow::WorkflowDraftEditResult::Rejected {
                 diagnostics: vec![bcode_workflow::WorkflowValidationDiagnostic {
                     code: "semantic_edit_rejected".to_string(),
                     severity: bcode_workflow::WorkflowValidationSeverity::Error,
@@ -4991,15 +6571,15 @@ pub fn apply_draft_edits(
             super::current_time_ms(),
         );
     match update {
-        Ok(draft) => Ok(bcode_ipc::WorkflowDraftEditResult::Updated(Box::new(
+        Ok(draft) => Ok(bcode_workflow::WorkflowDraftEditResult::Updated(Box::new(
             workflow_draft_snapshot(draft),
         ))),
         Err(bcode_workflow_store::WorkflowStoreError::AuthoringConflict {
             entity_id,
             expected,
             current,
-        }) => Ok(bcode_ipc::WorkflowDraftEditResult::Conflict(
-            bcode_ipc::WorkflowAuthoringConflict {
+        }) => Ok(bcode_workflow::WorkflowDraftEditResult::Conflict(
+            bcode_workflow::WorkflowAuthoringConflict {
                 entity_id,
                 expected_generation: expected,
                 current_generation: current,
@@ -5031,7 +6611,7 @@ pub fn portable_revision(
 /// Export one exact published workflow revision as a validated portable bundle.
 pub fn export_revision(
     state: &ServerState,
-    request: &bcode_ipc::ExportWorkflowRevisionRequest,
+    request: &bcode_workflow::ExportWorkflowRevisionRequest,
 ) -> Result<bcode_workflow::WorkflowExportBundle, super::ServerError> {
     let revision = state
         .workflow_store
@@ -5060,7 +6640,7 @@ pub async fn import_preview(
     operation_id: String,
     bundle: bcode_workflow::WorkflowExportBundle,
     target_workflow_id: String,
-    control: bcode_ipc::WorkflowComputationControl,
+    control: bcode_workflow::WorkflowComputationControl,
 ) -> Result<
     (
         bcode_workflow::WorkflowImportPreview,
@@ -5110,7 +6690,7 @@ pub async fn import_new_workflow(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
     operation_id: String,
-    request: bcode_ipc::ImportWorkflowRequest,
+    request: bcode_workflow::ImportWorkflowRequest,
 ) -> Result<
     (
         bcode_workflow_store::AuthoredWorkflow,
@@ -5118,7 +6698,8 @@ pub async fn import_new_workflow(
     ),
     super::ServerError,
 > {
-    if request.collision_policy != bcode_ipc::WorkflowImportCollisionPolicy::RequireNewWorkflow {
+    if request.collision_policy != bcode_workflow::WorkflowImportCollisionPolicy::RequireNewWorkflow
+    {
         return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
             "new-workflow import requires require_new_workflow collision policy".to_string(),
         )
@@ -5186,10 +6767,10 @@ pub async fn import_draft(
     state: &std::sync::Arc<ServerState>,
     client_id: super::ClientId,
     operation_id: String,
-    request: bcode_ipc::ImportWorkflowDraftRequest,
-) -> Result<bcode_ipc::WorkflowDraftImportResult, super::ServerError> {
+    request: bcode_workflow::ImportWorkflowDraftRequest,
+) -> Result<bcode_workflow::WorkflowDraftImportResult, super::ServerError> {
     if request.collision_policy
-        != bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft
+        != bcode_workflow::WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft
     {
         return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
             "existing-workflow import requires require_existing_workflow_new_draft collision policy"
@@ -5253,10 +6834,12 @@ pub async fn import_draft(
         .workflow_draft(&request.workflow_id, &request.draft_id)?
         .is_some()
     {
-        return Ok(bcode_ipc::WorkflowDraftImportResult::DraftAlreadyExists {
-            workflow_id: request.workflow_id,
-            draft_id: request.draft_id,
-        });
+        return Ok(
+            bcode_workflow::WorkflowDraftImportResult::DraftAlreadyExists {
+                workflow_id: request.workflow_id,
+                draft_id: request.draft_id,
+            },
+        );
     }
     let created = store.create_workflow_draft(&draft)?;
     drop(store);
@@ -5264,7 +6847,7 @@ pub async fn import_draft(
         created,
         "draft absence was checked while holding the store lock"
     );
-    Ok(bcode_ipc::WorkflowDraftImportResult::Imported {
+    Ok(bcode_workflow::WorkflowDraftImportResult::Imported {
         workflow: authored_workflow_snapshot(workflow),
         draft: Box::new(workflow_draft_snapshot(draft)),
     })
@@ -5288,7 +6871,8 @@ pub fn run_outputs(
     state: &ServerState,
     run_id: &str,
     limit: usize,
-) -> Result<Vec<bcode_ipc::WorkflowOutputInspection>, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<Vec<bcode_workflow::WorkflowOutputInspection>, bcode_workflow_store::WorkflowStoreError>
+{
     let store = state
         .workflow_store
         .lock()
@@ -5301,8 +6885,8 @@ pub fn run_outputs(
     Ok(store
         .validated_outputs(run_id, limit)?
         .into_iter()
-        .map(|output| bcode_ipc::WorkflowOutputInspection {
-            version: bcode_ipc::WORKFLOW_OUTPUT_INSPECTION_VERSION,
+        .map(|output| bcode_workflow::WorkflowOutputInspection {
+            version: bcode_workflow::WORKFLOW_OUTPUT_INSPECTION_VERSION,
             checksum_sha256: checksums
                 .get(&output.output_id)
                 .cloned()
@@ -5322,8 +6906,8 @@ pub fn run_outputs(
 
 pub fn inspect_graph_page(
     state: &ServerState,
-    request: &bcode_ipc::WorkflowRunGraphPageRequest,
-) -> Result<bcode_ipc::WorkflowRunGraphInspection, bcode_workflow_store::WorkflowStoreError> {
+    request: &bcode_workflow::WorkflowRunGraphPageRequest,
+) -> Result<bcode_workflow::WorkflowRunGraphInspection, bcode_workflow_store::WorkflowStoreError> {
     let store = state
         .workflow_store
         .lock()
@@ -5345,7 +6929,7 @@ fn inspect_run_graph(
     after_edge_id: Option<u64>,
     expected_revision: Option<u64>,
     limit: usize,
-) -> Result<bcode_ipc::WorkflowRunGraphInspection, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<bcode_workflow::WorkflowRunGraphInspection, bcode_workflow_store::WorkflowStoreError> {
     let page = store.current_run_graph_page(
         run_id,
         expected_revision,
@@ -5358,11 +6942,11 @@ fn inspect_run_graph(
     let edges = page.edges;
     let nodes_complete = page.nodes_complete;
     let edges_complete = page.edges_complete;
-    Ok(bcode_ipc::WorkflowRunGraphInspection {
+    Ok(bcode_workflow::WorkflowRunGraphInspection {
         revision,
         nodes: nodes
             .into_iter()
-            .map(|record| bcode_ipc::WorkflowRunGraphNodeInspection {
+            .map(|record| bcode_workflow::WorkflowRunGraphNodeInspection {
                 revision: record.revision,
                 node: record.node,
                 entry: record.entry,
@@ -5371,7 +6955,7 @@ fn inspect_run_graph(
             .collect(),
         edges: edges
             .into_iter()
-            .map(|record| bcode_ipc::WorkflowRunGraphEdgeInspection {
+            .map(|record| bcode_workflow::WorkflowRunGraphEdgeInspection {
                 revision: record.revision,
                 edge_id: record.edge_id,
                 edge: record.edge,
@@ -5387,7 +6971,7 @@ pub async fn inspect_run(
     state: &ServerState,
     run_id: &str,
     limit: usize,
-) -> Result<bcode_ipc::WorkflowRunInspection, super::ServerError> {
+) -> Result<bcode_workflow::WorkflowRunInspection, super::ServerError> {
     let (
         run,
         graph,
@@ -5424,9 +7008,22 @@ pub async fn inspect_run(
                     run.definition_id, run.definition_version
                 ))
             })?;
+        let definition = bcode_workflow::WorkflowDefinitionSnapshot {
+            definition: bcode_workflow::WorkflowDefinitionRepresentation::parse(
+                definition.definition_json,
+            )
+            .map_err(|_| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "invalid workflow definition representation".to_string(),
+                )
+            })?,
+            definition_id: definition.definition_id,
+            version: definition.version,
+            checksum_sha256: definition.checksum_sha256,
+        };
         let terminal_output = store.canonical_terminal_output(run_id)?.map(|output| {
-            bcode_ipc::WorkflowTerminalOutputInspection {
-                version: bcode_ipc::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION,
+            bcode_workflow::WorkflowTerminalOutputInspection {
+                version: bcode_workflow::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION,
                 checksum_sha256: run
                     .terminal_output_checksum_sha256
                     .clone()
@@ -5458,11 +7055,27 @@ pub async fn inspect_run(
             terminal_output,
             store.activations_for_run(run_id, limit)?,
             store.waiting_activations(run_id, limit)?,
-            store.pending_mutation_approvals(run_id, limit)?,
+            store
+                .pending_mutation_approvals(run_id, limit)?
+                .into_iter()
+                .map(mutation_approval_inspection)
+                .collect(),
             store.attempt_history(run_id, None, limit)?,
-            store.event_history(run_id, None, limit)?,
-            store.decisions_for_run(run_id, limit)?,
-            store.grants_for_run(run_id, limit)?,
+            store
+                .event_history(run_id, None, limit)?
+                .into_iter()
+                .map(|event| verified_history_event(&store, event))
+                .collect::<Result<Vec<_>, _>>()?,
+            store
+                .decisions_for_run(run_id, limit)?
+                .into_iter()
+                .map(decision_inspection)
+                .collect(),
+            store
+                .grants_for_run(run_id, limit)?
+                .into_iter()
+                .map(grant_inspection)
+                .collect(),
             store.resource_leases_for_run(run_id, limit)?,
             store.output_summaries(run_id, limit)?,
             store.child_run_links(run_id, limit)?,
@@ -5520,7 +7133,7 @@ pub async fn inspect_run(
                     None => false,
                 }
             };
-            Some(bcode_ipc::WorkflowCoordinatorStatus {
+            Some(bcode_workflow::WorkflowCoordinatorStatus {
                 target_artifact_id: authority.target_artifact_id,
                 daemon_instance_id: authority.daemon_instance_id,
                 owned_by_this_daemon,
@@ -5529,7 +7142,7 @@ pub async fn inspect_run(
         }
         None => None,
     };
-    Ok(bcode_ipc::WorkflowRunInspection {
+    Ok(bcode_workflow::WorkflowRunInspection {
         run,
         graph: Some(graph),
         definition,

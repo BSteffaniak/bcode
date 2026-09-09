@@ -9,6 +9,65 @@
 //! Execution is intentionally host-neutral: agent, plugin, and application behavior enters through
 //! ordinary typed steps instead of scheduler-specific branches.
 
+mod run_contracts;
+pub use run_contracts::{
+    AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION, AttemptSummary, AuthoredWorkflowRunProvenance,
+    AuthoredWorkflowRunSelection, AuthoredWorkflowRunStartResponse, DispatchSideEffect,
+    OrphanedWorkflowRun, OrphanedWorkflowRunReport, PublishAndStartWorkflowRequest,
+    ResourceLeaseMode, RunStatus, SkippedWorkflowRun, StartAuthoredWorkflowRequest,
+    StartWorkflowPackageExportRequest, WORKFLOW_OUTPUT_INSPECTION_VERSION,
+    WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION, WaitingActivation, WorkflowActivationInputSummary,
+    WorkflowActivationObservation, WorkflowActivationSummary, WorkflowApprovalContinuation,
+    WorkflowAttemptAdmissionObservation, WorkflowAttemptPreparationObservation,
+    WorkflowAuthorityTransferObservation, WorkflowCoordinatorStatus, WorkflowDecision,
+    WorkflowDecisionInspection, WorkflowDecisionValueDisclosure, WorkflowDefinitionRepresentation,
+    WorkflowDefinitionSnapshot, WorkflowDescendantRunSummary, WorkflowFanOutObservation,
+    WorkflowGrant, WorkflowGrantInspection, WorkflowGrantScopeDisclosure,
+    WorkflowGrantUseObservation, WorkflowHistoryAttemptCorrelation, WorkflowHistoryDiagnostic,
+    WorkflowHistoryEvent, WorkflowMutationApproval, WorkflowMutationApprovalDecision,
+    WorkflowMutationApprovalInspection, WorkflowMutationApprovalResolution,
+    WorkflowMutationApprovalScopeInspection, WorkflowOutputInspection, WorkflowOutputSummary,
+    WorkflowOutputValidationObservation, WorkflowPackageExportRunStartResponse,
+    WorkflowPublishAndStartResult, WorkflowRepeatOutcomeSummary,
+    WorkflowRepeatSettlementObservation, WorkflowResourceLease, WorkflowRunAdmissionFailure,
+    WorkflowRunAdmissionResult, WorkflowRunApplication, WorkflowRunBinding,
+    WorkflowRunBindingLookup, WorkflowRunControlAction, WorkflowRunInspection,
+    WorkflowRunLifecycleObservation, WorkflowRunLimits, WorkflowRunLink,
+    WorkflowRunOperationFailure, WorkflowRunStartRequest, WorkflowRunStartResponse,
+    WorkflowRunSummary, WorkflowStartRequest, WorkflowTemplateInstantiationRequest,
+    WorkflowTemplateStartRequest, WorkflowTerminalOutputInspection, WorkflowWaitKind,
+    WorkflowWaitResolutionObservation,
+};
+
+mod authoring_contracts;
+pub use authoring_contracts::{
+    ActivateWorkflowRevisionRequest, ApplyWorkflowPackageRequest, ApplyWorkflowSourceRequest,
+    AuthoredWorkflowInspection, AuthoredWorkflowSnapshot, CreateAuthoredWorkflowRequest,
+    CreateWorkflowPresetRequest, DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS,
+    DeleteWorkflowPresetRequest, DiscardWorkflowDraftRequest, ExportWorkflowRevisionRequest,
+    ForkWorkflowDraftRequest, ImportWorkflowDraftRequest, ImportWorkflowRequest,
+    ImportWorkflowRevisionRequest, MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS,
+    PreviewWorkflowImportRequest, PublishWorkflowDraftRequest, PublishWorkflowPackageRequest,
+    SetAuthoredWorkflowArchivedRequest, UpdateWorkflowDraftRequest, UpdateWorkflowPresetRequest,
+    WorkflowAuthoringApplication, WorkflowAuthoringEventSnapshot, WorkflowAuthoringFailure,
+    WorkflowAuthoringIssueSnapshot, WorkflowAuthoringMutationResult, WorkflowAuthoringPage,
+    WorkflowComputationControl, WorkflowDraftForkSource, WorkflowDraftImportResult,
+    WorkflowDraftInspectionSummary, WorkflowDraftUpdateResult, WorkflowImportCollisionPolicy,
+    WorkflowPackageComputationRequest, WorkflowPackagePreviewRequest,
+    WorkflowPackageValidationResult, WorkflowPresetInspectionSummary, WorkflowPresetMutation,
+    WorkflowPresetSnapshot, WorkflowPresetUpdateResult, WorkflowPublicationResult,
+    WorkflowRevisionImportResult, WorkflowRevisionInspectionSummary,
+    WorkflowRevisionRequirementInspection, WorkflowRevisionSnapshot,
+    WorkflowSourceComputationRequest, WorkflowSourcePreviewRequest, WorkflowSourcePreviewResult,
+    WorkflowSourceValidationResult,
+};
+
+mod draft_edit;
+pub use draft_edit::{
+    ApplyWorkflowDraftEditsRequest, WorkflowAuthoringConflict, WorkflowDraftEditResult,
+    WorkflowDraftSnapshot,
+};
+
 use futures::{StreamExt as _, stream::FuturesUnordered};
 use schemars::JsonSchema;
 use serde::{
@@ -29,6 +88,57 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
+
+/// Read independent node and edge pages from one expected graph revision.
+///
+/// A revision mismatch is rejected; callers must restart pagination. Cursors are
+/// exclusive stable identities from the previous page, not offsets. Unknown
+/// fields are rejected; the revision is a concurrency token, not a schema version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphPageRequest {
+    pub run_id: String,
+    pub expected_revision: u64,
+    pub after_node_id: Option<String>,
+    pub after_edge_id: Option<u64>,
+    pub limit: usize,
+}
+
+/// Bounded run-owned graph page captured by workflow inspection.
+///
+/// The revision is an optimistic concurrency token, not a schema version. A
+/// complete flag means that collection has no rows after this page; when a
+/// cursor was supplied, earlier rows are deliberately omitted. Unknown fields
+/// are rejected rather than interpreted as an older representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphInspection {
+    pub revision: u64,
+    pub nodes: Vec<WorkflowRunGraphNodeInspection>,
+    pub edges: Vec<WorkflowRunGraphEdgeInspection>,
+    pub nodes_complete: bool,
+    pub edges_complete: bool,
+}
+
+/// One immutable executable node in the inspected run graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphNodeInspection {
+    pub revision: u64,
+    pub node: NodeDefinition,
+    pub entry: bool,
+    pub exit: bool,
+}
+
+/// One stable edge identity and its executable definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphEdgeInspection {
+    /// Revision that admitted this representation, not necessarily the graph revision.
+    pub revision: u64,
+    pub edge_id: u64,
+    pub edge: EdgeDefinition,
+}
 
 /// Boxed asynchronous workflow operation.
 pub type StepFuture<T> = Pin<Box<dyn Future<Output = Result<T, WorkflowError>> + Send>>;
@@ -10946,6 +11056,21 @@ pub struct WorkflowPolicyGrant {
     pub scope: WorkflowGrantScope,
     /// Maximum capability approved by the grant.
     pub capability: WorkflowToolCapability,
+}
+
+impl WorkflowPolicyGrant {
+    /// Validate the grant's identity and scope without authorizing an operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty or oversized identities or an invalid definition version.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_grant_scope(&self.scope)?;
+        if self.grant_id.trim().is_empty() || self.grant_id.len() > MAX_POLICY_GRANT_ID_BYTES {
+            return Err("invalid workflow policy grant identity".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Immutable policy inputs for one workflow-node preflight.

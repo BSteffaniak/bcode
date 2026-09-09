@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable plugin discovery metadata for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "plugin", "metadata"]
+license     = { workspace = true }
+name        = "bcode_plugin_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -47,14 +47,14 @@ struct BcodePluginTuiHost {
 
 fn workflow_start_request(
     request: PluginWorkflowStartRequest,
-) -> Result<bcode_ipc::WorkflowStartRequest, PluginTuiHostError> {
+) -> Result<bcode_workflow::WorkflowStartRequest, PluginTuiHostError> {
     let parent_scope = request.parent_session_id.to_string();
     if request.binding.scope_key != parent_scope {
         return Err(PluginTuiHostError::InvalidRequest(
             "workflow binding scope must match the active parent session".to_string(),
         ));
     }
-    Ok(bcode_ipc::WorkflowStartRequest {
+    Ok(bcode_workflow::WorkflowStartRequest {
         identity: request.identity,
         definition: request.definition,
         run_id: request.run_id,
@@ -74,8 +74,8 @@ fn workflow_start_request(
 
 fn workflow_package_export_start_request(
     request: PluginWorkflowPackageExportStartRequest,
-) -> bcode_ipc::StartWorkflowPackageExportRequest {
-    bcode_ipc::StartWorkflowPackageExportRequest {
+) -> bcode_workflow::StartWorkflowPackageExportRequest {
+    bcode_workflow::StartWorkflowPackageExportRequest {
         package_export: request.package_export,
         run_id: request.run_id,
         parent_session_id: request.parent_session_id,
@@ -191,13 +191,13 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     workflow_lookup(lookup),
                     match action {
                         PluginWorkflowControlAction::Pause => {
-                            bcode_ipc::WorkflowRunControlAction::Pause
+                            bcode_workflow::WorkflowRunControlAction::Pause
                         }
                         PluginWorkflowControlAction::Resume => {
-                            bcode_ipc::WorkflowRunControlAction::Resume
+                            bcode_workflow::WorkflowRunControlAction::Resume
                         }
                         PluginWorkflowControlAction::Cancel => {
-                            bcode_ipc::WorkflowRunControlAction::Cancel
+                            bcode_workflow::WorkflowRunControlAction::Cancel
                         }
                     },
                 )
@@ -356,7 +356,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
             }
             if let Some(target) = candidate.target {
                 return client
-                    .update_workflow_draft(bcode_ipc::UpdateWorkflowDraftRequest {
+                    .update_workflow_draft(bcode_workflow::UpdateWorkflowDraftRequest {
                         workflow_id: target.workflow_id,
                         draft_id: target.draft_id,
                         expected_generation: target.expected_generation,
@@ -365,12 +365,12 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     })
                     .await
                     .map(|result| match result {
-                        bcode_ipc::WorkflowDraftUpdateResult::Updated(draft) => {
+                        bcode_workflow::WorkflowDraftUpdateResult::Updated(draft) => {
                             PluginWorkflowGeneratedCandidateAcceptance::Updated(Box::new(
                                 plugin_workflow_authoring_draft(*draft),
                             ))
                         }
-                        bcode_ipc::WorkflowDraftUpdateResult::Conflict(conflict) => {
+                        bcode_workflow::WorkflowDraftUpdateResult::Conflict(conflict) => {
                             PluginWorkflowGeneratedCandidateAcceptance::Conflict {
                                 expected_generation: conflict.expected_generation,
                                 current_generation: conflict.current_generation,
@@ -380,7 +380,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     .map_err(|error| PluginTuiHostError::Internal(error.to_string()));
             }
             let (_, draft) = client
-                .create_authored_workflow(bcode_ipc::CreateAuthoredWorkflowRequest {
+                .create_authored_workflow(bcode_workflow::CreateAuthoredWorkflowRequest {
                     document: candidate.document,
                     draft_id: candidate.draft_id,
                 })
@@ -399,13 +399,15 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let client = self.client.clone();
         Box::pin(async move {
             let (_, draft) = client
-                .instantiate_workflow_template(bcode_ipc::WorkflowTemplateInstantiationRequest {
-                    owner_plugin_id: request.owner_plugin_id,
-                    template_id: request.template_id,
-                    template_version: request.template_version,
-                    workflow_id: request.workflow_id,
-                    draft_id: request.draft_id,
-                })
+                .instantiate_workflow_template(
+                    bcode_workflow::WorkflowTemplateInstantiationRequest {
+                        owner_plugin_id: request.owner_plugin_id,
+                        template_id: request.template_id,
+                        template_version: request.template_version,
+                        workflow_id: request.workflow_id,
+                        draft_id: request.draft_id,
+                    },
+                )
                 .await
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
             Ok(plugin_workflow_authoring_draft(draft))
@@ -437,9 +439,9 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let client = self.client.clone();
         Box::pin(async move {
             client
-                .fork_workflow_draft(bcode_ipc::ForkWorkflowDraftRequest {
+                .fork_workflow_draft(bcode_workflow::ForkWorkflowDraftRequest {
                     workflow_id,
-                    source: bcode_ipc::WorkflowDraftForkSource::Revision { revision },
+                    source: bcode_workflow::WorkflowDraftForkSource::Revision { revision },
                     draft_id,
                     producer,
                 })
@@ -474,7 +476,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let client = self.client.clone();
         Box::pin(async move {
             client
-                .apply_workflow_draft_edits(bcode_ipc::ApplyWorkflowDraftEditsRequest {
+                .apply_workflow_draft_edits(bcode_workflow::ApplyWorkflowDraftEditsRequest {
                     workflow_id,
                     draft_id,
                     batch,
@@ -538,14 +540,14 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let client = self.client.clone();
         Box::pin(async move {
             client
-                .publish_workflow_draft(bcode_ipc::PublishWorkflowDraftRequest {
+                .publish_workflow_draft(bcode_workflow::PublishWorkflowDraftRequest {
                     workflow_id,
                     draft_id,
                     expected_generation,
                     configuration: None,
                     activate,
                     expected_active_revision: None,
-                    control: bcode_ipc::WorkflowComputationControl::default(),
+                    control: bcode_workflow::WorkflowComputationControl::default(),
                 })
                 .await
                 .map(plugin_workflow_authoring_publish_result)
@@ -564,8 +566,8 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let client = self.client.clone();
         Box::pin(async move {
             client
-                .start_authored_workflow(bcode_ipc::StartAuthoredWorkflowRequest {
-                    selection: bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+                .start_authored_workflow(bcode_workflow::StartAuthoredWorkflowRequest {
+                    selection: bcode_workflow::AuthoredWorkflowRunSelection::Revision {
                         workflow_id,
                         revision,
                     },
@@ -609,7 +611,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
         let client = self.client.clone();
         Box::pin(async move {
             client
-                .start_workflow_template(bcode_ipc::WorkflowTemplateStartRequest {
+                .start_workflow_template(bcode_workflow::WorkflowTemplateStartRequest {
                     owner_plugin_id: request.owner_plugin_id,
                     template_id: request.template_id,
                     template_version: request.template_version,
@@ -660,7 +662,7 @@ pub fn root_host(
 }
 
 fn plugin_workflow_authoring_draft(
-    draft: bcode_ipc::WorkflowDraftSnapshot,
+    draft: bcode_workflow::WorkflowDraftSnapshot,
 ) -> PluginWorkflowAuthoringDraft {
     PluginWorkflowAuthoringDraft {
         workflow_id: draft.identity.workflow_id,
@@ -673,7 +675,7 @@ fn plugin_workflow_authoring_draft(
 }
 
 fn plugin_workflow_authoring_revision(
-    revision: bcode_ipc::WorkflowRevisionSnapshot,
+    revision: bcode_workflow::WorkflowRevisionSnapshot,
 ) -> PluginWorkflowAuthoringRevision {
     PluginWorkflowAuthoringRevision {
         workflow_id: revision.identity.workflow_id,
@@ -683,38 +685,38 @@ fn plugin_workflow_authoring_revision(
 }
 
 fn plugin_workflow_authoring_edit_result(
-    result: bcode_ipc::WorkflowDraftEditResult,
+    result: bcode_workflow::WorkflowDraftEditResult,
 ) -> PluginWorkflowAuthoringEditResult {
     match result {
-        bcode_ipc::WorkflowDraftEditResult::Updated(draft) => {
+        bcode_workflow::WorkflowDraftEditResult::Updated(draft) => {
             PluginWorkflowAuthoringEditResult::Updated(Box::new(plugin_workflow_authoring_draft(
                 *draft,
             )))
         }
-        bcode_ipc::WorkflowDraftEditResult::Conflict(conflict) => {
+        bcode_workflow::WorkflowDraftEditResult::Conflict(conflict) => {
             PluginWorkflowAuthoringEditResult::Conflict {
                 expected_generation: conflict.expected_generation,
                 current_generation: conflict.current_generation,
             }
         }
-        bcode_ipc::WorkflowDraftEditResult::Rejected { diagnostics } => {
+        bcode_workflow::WorkflowDraftEditResult::Rejected { diagnostics } => {
             PluginWorkflowAuthoringEditResult::Rejected { diagnostics }
         }
     }
 }
 
 fn plugin_workflow_authoring_publish_result(
-    result: bcode_ipc::WorkflowPublicationResult,
+    result: bcode_workflow::WorkflowPublicationResult,
 ) -> PluginWorkflowAuthoringPublishResult {
     match result {
-        bcode_ipc::WorkflowPublicationResult::Published {
+        bcode_workflow::WorkflowPublicationResult::Published {
             revision,
             active_revision,
         } => PluginWorkflowAuthoringPublishResult::Published {
             revision: revision.identity.revision,
             activated: active_revision == Some(revision.identity.revision),
         },
-        bcode_ipc::WorkflowPublicationResult::Conflict(conflict) => {
+        bcode_workflow::WorkflowPublicationResult::Conflict(conflict) => {
             PluginWorkflowAuthoringPublishResult::Conflict {
                 expected_generation: conflict.expected_generation,
                 current_generation: conflict.current_generation,
@@ -723,8 +725,8 @@ fn plugin_workflow_authoring_publish_result(
     }
 }
 
-fn workflow_lookup(lookup: PluginWorkflowLookup) -> bcode_ipc::WorkflowRunBindingLookup {
-    bcode_ipc::WorkflowRunBindingLookup {
+fn workflow_lookup(lookup: PluginWorkflowLookup) -> bcode_workflow::WorkflowRunBindingLookup {
+    bcode_workflow::WorkflowRunBindingLookup {
         owner_plugin_id: lookup.owner_plugin_id,
         workflow_kind: lookup.workflow_kind,
         scope_key: lookup.scope_key,
@@ -759,8 +761,7 @@ fn workflow_inspection(
 ) -> Result<PluginWorkflowInspection, bcode_client::ClientError> {
     Ok(PluginWorkflowInspection {
         run: workflow_summary(inspection.run),
-        definition: serde_json::from_str(&inspection.definition.definition_json)
-            .map_err(|_| bcode_client::ClientError::UnexpectedResponse)?,
+        definition: inspection.definition.definition.into_definition(),
         waits: inspection
             .waits
             .into_iter()

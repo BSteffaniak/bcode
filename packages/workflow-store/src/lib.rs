@@ -46,7 +46,7 @@ pub const WORKFLOW_STORE_MIGRATION_RECEIPT_VERSION: u32 = 1;
 /// Current durable workflow execution-session link contract version.
 pub const WORKFLOW_EXECUTION_SESSION_LINK_VERSION: u32 = 1;
 /// Current durable authored-run provenance contract version.
-pub const AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION: u32 = 1;
+pub use bcode_workflow::AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION;
 const MAX_ID_BYTES: usize = 512;
 const MAX_DISPLAY_LABEL_BYTES: usize = 512;
 const MAX_INLINE_JSON_BYTES: usize = 1_048_576;
@@ -71,61 +71,11 @@ fn finish_authoring_store_page<T>(
     WorkflowAuthoringStorePage { items, has_more }
 }
 
-/// Durable workflow run status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    /// Run may produce new activations.
-    Running,
-    /// Run is paused for external input or explicit operator action.
-    Paused,
-    /// Run is terminal and successful.
-    Completed,
-    /// Run is terminal and failed.
-    Failed,
-    /// Run is terminal and cancelled.
-    Cancelled,
-    /// Run cannot continue automatically without explicit repair.
-    RepairRequired,
-}
+/// Compatibility export of the workflow-owned run contract.
+pub use bcode_workflow::RunStatus;
 
-impl std::fmt::Display for RunStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl RunStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Paused => "paused",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::RepairRequired => "repair_required",
-        }
-    }
-}
-
-/// Side-effect classification persisted before external dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DispatchSideEffect {
-    /// Operation cannot mutate external state.
-    ReadOnly,
-    /// Operation may mutate external state and must never be blindly duplicated.
-    Mutating,
-}
-
-impl DispatchSideEffect {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read_only",
-            Self::Mutating => "mutating",
-        }
-    }
-}
+/// Compatibility export of the workflow-owned inspection contract.
+pub use bcode_workflow::DispatchSideEffect;
 
 /// Deterministic fault boundaries for atomic package mutation tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,86 +112,11 @@ impl WorkflowPackageMutationFault for NoopWorkflowPackageMutationFault {
     }
 }
 
-/// Exact authored-workflow source and resolved configuration used to create one durable run.
-///
-/// This is diagnostic provenance only. Runtime dispatch and authorization continue to use the
-/// compiled definition and normalized operation facts rather than this metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoredWorkflowRunProvenance {
-    /// Provenance contract version.
-    pub version: u32,
-    /// Stable authored workflow identity.
-    pub workflow_id: String,
-    /// Exact immutable published revision.
-    pub revision: u64,
-    /// Exact compiled definition identity recorded redundantly for bounded consistency checks.
-    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
-    /// Optional exact preset identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_id: Option<String>,
-    /// Optional exact preset generation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset_generation: Option<u64>,
-    /// Exact resolved, schema-validated runtime configuration.
-    pub configuration: serde_json::Value,
-}
+/// Compatibility export of the workflow-owned run contract.
+pub use bcode_workflow::AuthoredWorkflowRunProvenance;
 
-impl AuthoredWorkflowRunProvenance {
-    /// Construct current-version authored-run provenance.
-    #[must_use]
-    pub const fn new(
-        workflow_id: String,
-        revision: u64,
-        definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
-        preset_id: Option<String>,
-        preset_generation: Option<u64>,
-        configuration: serde_json::Value,
-    ) -> Self {
-        Self {
-            version: AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION,
-            workflow_id,
-            revision,
-            definition_identity,
-            preset_id,
-            preset_generation,
-            configuration,
-        }
-    }
-}
-
-/// Bounded run summary used by normal list/status paths.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunSummary {
-    pub run_id: String,
-    pub definition_id: String,
-    pub definition_version: u32,
-    pub workspace_snapshot: String,
-    pub parent_session_id: Option<String>,
-    /// Exact accepted parent generation for fixed-generation workflow prompt contexts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_generation: Option<u64>,
-    #[serde(default)]
-    pub binding: Option<WorkflowRunBinding>,
-    /// Exact authored source when this run originated from a published authored workflow.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authored_provenance: Option<AuthoredWorkflowRunProvenance>,
-    /// Canonical successful terminal output identity, absent for non-successful or active runs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_output_id: Option<String>,
-    /// Checksum of the canonical successful terminal output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_output_checksum_sha256: Option<String>,
-    /// Persisted immutable normalized policy/profile identity for this run and descendants.
-    pub authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity,
-    /// Persisted immutable pinned authorization profile for this run and its descendants.
-    #[serde(default)]
-    pub authorization_ceiling: bcode_workflow::WorkflowToolCapability,
-    pub status: RunStatus,
-    pub cancellation_requested_at_ms: Option<u64>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned run contract.
+pub use bcode_workflow::WorkflowRunSummary;
 
 /// Bounded derived counts used by workflow catalog presentation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -327,55 +202,17 @@ pub struct PendingActivation {
     pub created_at_ms: u64,
 }
 
-/// Durable waiting-gate kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowWaitKind {
-    Input,
-    Approval,
-}
+/// Compatibility export of the workflow-owned inspection contract.
+pub use bcode_workflow::WorkflowWaitKind;
 
-impl WorkflowWaitKind {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Input => "input",
-            Self::Approval => "approval",
-        }
-    }
-}
+/// Compatibility export of the workflow-owned inspection contract.
+pub use bcode_workflow::WaitingActivation;
 
-/// Bounded durable waiting activation summary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaitingActivation {
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub kind: WorkflowWaitKind,
-    pub input: Option<serde_json::Value>,
-    pub requested_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned inspection contract.
+pub use bcode_workflow::WorkflowActivationInputSummary;
 
-/// Bounded canonical activation input available to normal status projections.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "availability", rename_all = "snake_case")]
-pub enum WorkflowActivationInputSummary {
-    Absent,
-    Inline { value: serde_json::Value },
-    Omitted { byte_count: usize },
-}
-
-/// Bounded activation summary for workflow status and next-action projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowActivationSummary {
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub dependency_generation: u64,
-    pub status: String,
-    pub has_output: bool,
-    pub input_summary: WorkflowActivationInputSummary,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned inspection contract.
+pub use bcode_workflow::WorkflowActivationSummary;
 
 /// Result of resolving one exact durable waiting activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,21 +232,8 @@ pub struct AttemptCursor {
     pub dispatch_identity: String,
 }
 
-/// Bounded durable attempt summary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttemptSummary {
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub attempt: u32,
-    pub dispatch_identity: String,
-    pub side_effect: DispatchSideEffect,
-    pub status: String,
-    pub has_receipt: bool,
-    pub prepared_at_ms: u64,
-    pub admitted_at_ms: Option<u64>,
-    pub terminal_at_ms: Option<u64>,
-}
+/// Compatibility export of the workflow-owned inspection contract.
+pub use bcode_workflow::AttemptSummary;
 
 /// Persisted automatic-retry backoff schedule for one exact next attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,42 +259,11 @@ pub struct WorkflowEventRow {
     pub created_at_ms: u64,
 }
 
-/// Persisted workflow execution limits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunLimits {
-    /// Absolute wall-clock deadline, when configured.
-    pub deadline_at_ms: Option<u64>,
-    /// Maximum total node attempts in the run.
-    pub node_execution_cap: u64,
-    /// Maximum concurrently running nodes.
-    pub concurrency_cap: u32,
-    /// Maximum cycle/repeat activations.
-    pub cycle_cap: u32,
-    /// Maximum attempts per activation.
-    pub retry_cap: u32,
-}
+/// Compatibility export of workflow-owned run allowance data.
+pub use bcode_workflow::WorkflowRunLimits;
 
-impl Default for WorkflowRunLimits {
-    fn default() -> Self {
-        Self {
-            deadline_at_ms: None,
-            node_execution_cap: 1_000,
-            concurrency_cap: 8,
-            cycle_cap: 100,
-            retry_cap: 3,
-        }
-    }
-}
-
-/// Bounded product ownership and discovery association for one workflow run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunBinding {
-    pub owner_plugin_id: String,
-    pub workflow_kind: String,
-    pub scope_key: String,
-    pub display_label: Option<String>,
-    pub single_active: bool,
-}
+/// Compatibility export of the workflow-owned run contract.
+pub use bcode_workflow::WorkflowRunBinding;
 
 /// Generic associated-run lookup key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,20 +304,8 @@ pub const MAX_WORKFLOW_RUN_DEPTH: u32 = bcode_workflow::MAX_WORKFLOW_CALL_DEPTH;
 /// Current maximum descendants beneath one root run.
 pub const MAX_WORKFLOW_RUN_DESCENDANTS: u32 = bcode_workflow::MAX_WORKFLOW_CALL_DESCENDANTS;
 
-/// Immutable parent activation/attempt to child run relationship.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunLink {
-    pub version: u32,
-    pub root_run_id: String,
-    pub parent_run_id: String,
-    pub parent_node_id: String,
-    pub parent_activation_id: String,
-    pub parent_attempt: u32,
-    pub child_run_id: String,
-    pub target: bcode_workflow::WorkflowCallTarget,
-    pub depth: u32,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned composition observation contract.
+pub use bcode_workflow::WorkflowRunLink;
 
 /// Atomic exact child-run creation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,12 +314,8 @@ pub struct NewChildWorkflowRun {
     pub run: NewWorkflowRun,
 }
 
-/// Bounded durable descendant status joined to its immutable parent/child link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowDescendantRunSummary {
-    pub link: WorkflowRunLink,
-    pub run: WorkflowRunSummary,
-}
+/// Compatibility export of the workflow-owned composition observation contract.
+pub use bcode_workflow::WorkflowDescendantRunSummary;
 
 /// Durable authority required to mutate one active workflow run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,92 +535,23 @@ pub trait AttemptCancellationOwner: Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), WorkflowStoreError>> + Send + 'a>>;
 }
 
-/// One explicit durable workflow decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowDecision {
-    pub decision_id: String,
-    pub run_id: String,
-    pub node_id: Option<String>,
-    pub decision_type: String,
-    pub value: serde_json::Value,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned observation contract.
+pub use bcode_workflow::WorkflowDecision;
 
-/// One bounded durable workflow grant record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowGrant {
-    pub grant_id: String,
-    pub run_id: String,
-    pub node_id: String,
-    pub scope: serde_json::Value,
-    pub granted_at_ms: u64,
-    pub expires_at_ms: Option<u64>,
-    /// Maximum permitted consumptions for a scoped static plan. `None` retains legacy unlimited use.
-    #[serde(default)]
-    pub max_uses: Option<u32>,
-    /// Durable successful consumption count.
-    #[serde(default)]
-    pub uses_consumed: u32,
-}
+/// Compatibility export of the workflow-owned observation contract.
+pub use bcode_workflow::WorkflowGrant;
 
-/// One exact pending workflow mutation approval request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowMutationApproval {
-    pub approval_id: String,
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub scope: bcode_workflow::WorkflowMutationGrantScope,
-    pub requested_at_ms: u64,
-    pub expires_at_ms: Option<u64>,
-}
+/// Compatibility export of the workflow-owned observation contract.
+pub use bcode_workflow::WorkflowMutationApproval;
 
-/// Terminal decision applied to one exact pending mutation approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowMutationApprovalDecision {
-    Approve,
-    Deny,
-}
+/// Compatibility exports of workflow-owned mutation resolution contracts.
+pub use bcode_workflow::{WorkflowMutationApprovalDecision, WorkflowMutationApprovalResolution};
 
-/// Result of atomically resolving one mutation approval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowMutationApprovalResolution {
-    pub approval_id: String,
-    pub status: String,
-    pub grant_id: Option<String>,
-    pub activation_status: String,
-}
+/// Compatibility export of the workflow-owned observation contract.
+pub use bcode_workflow::ResourceLeaseMode;
 
-/// Access mode for one durable workflow resource lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceLeaseMode {
-    Read,
-    Write,
-}
-
-impl ResourceLeaseMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-        }
-    }
-}
-
-/// One durable workflow resource lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowResourceLease {
-    pub lease_id: String,
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub resource_key: String,
-    pub mode: ResourceLeaseMode,
-    pub acquired_at_ms: u64,
-    pub expires_at_ms: Option<u64>,
-}
+/// Compatibility export of the workflow-owned observation contract.
+pub use bcode_workflow::WorkflowResourceLease;
 
 /// One durable workflow projection checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1202,35 +910,11 @@ pub struct OutputPersistenceResult {
     pub run_status: RunStatus,
 }
 
-/// Bounded durable repeat outcome returned by normal inspection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRepeatOutcomeSummary {
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub output_id: String,
-    pub outcome: bcode_workflow::WorkflowRepeatOutcomeKind,
-    pub iterations_completed: u64,
-    pub max_iterations: u64,
-    pub cycle_cap: u64,
-    pub effective_iteration_bound: u64,
-    pub checksum_sha256: String,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned composition observation contract.
+pub use bcode_workflow::WorkflowRepeatOutcomeSummary;
 
-/// Bounded persisted output summary for workflow inspection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowOutputSummary {
-    pub output_id: String,
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub schema_id: String,
-    pub schema_version: u32,
-    pub artifact_reference: Option<String>,
-    pub checksum_sha256: String,
-    pub created_at_ms: u64,
-}
+/// Compatibility export of the workflow-owned output contract.
+pub use bcode_workflow::WorkflowOutputSummary;
 
 /// Durable validated output persisted before downstream activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5674,15 +5358,54 @@ impl WorkflowStore {
     ///
     /// Returns an error for stale/expired/wrong identity, conflicting duplicate decisions, or
     /// storage failure. Any error rolls back decision, grant, and activation state together.
-    #[allow(clippy::too_many_lines)]
     pub fn resolve_mutation_approval(
         &mut self,
         approval_id: &str,
         decision: WorkflowMutationApprovalDecision,
         resolved_at_ms: u64,
     ) -> Result<WorkflowMutationApprovalResolution, WorkflowStoreError> {
+        self.resolve_mutation_approval_with_authority(approval_id, decision, resolved_at_ms, None)
+    }
+
+    /// Resolve an approval with authority checked in the decision's write transaction.
+    /// `None` permits only a run without durable execution authority.
+    ///
+    /// # Errors
+    /// Returns an error for missing, incomplete, stale or foreign authority, invalid
+    /// approval identity, conflicting decisions, or storage failure. No decision is
+    /// committed on error.
+    pub fn resolve_mutation_approval_with_authority(
+        &mut self,
+        approval_id: &str,
+        decision: WorkflowMutationApprovalDecision,
+        resolved_at_ms: u64,
+        authority: Option<&WorkflowExecutionAuthority>,
+    ) -> Result<WorkflowMutationApprovalResolution, WorkflowStoreError> {
+        self.resolve_mutation_approval_with_clock(approval_id, decision, authority, || {
+            resolved_at_ms
+        })
+    }
+
+    /// Resolve with decision time sampled after acquiring the `SQLite` write transaction.
+    /// The clock returns Unix milliseconds and must not perform database work.
+    /// Authority and all decision changes are checked in that same transaction.
+    ///
+    /// # Errors
+    /// Returns an error for invalid approval identity, stale or missing authority,
+    /// conflicting decisions, or storage failure, without committing a decision.
+    #[allow(clippy::too_many_lines)]
+    pub fn resolve_mutation_approval_with_clock(
+        &mut self,
+        approval_id: &str,
+        decision: WorkflowMutationApprovalDecision,
+        authority: Option<&WorkflowExecutionAuthority>,
+        clock: impl FnOnce() -> u64,
+    ) -> Result<WorkflowMutationApprovalResolution, WorkflowStoreError> {
         validate_id("approval_id", approval_id)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let resolved_at_ms = clock();
         let row = transaction
             .query_row(
                 "SELECT approval.run_id, approval.node_id, approval.activation_id, \
@@ -5746,12 +5469,31 @@ impl WorkflowStore {
             cancellation_requested_at_ms,
             definition_json,
         ) = row;
+        let stored_authority = transaction.query_row(
+            "SELECT target_artifact_id, coordinator_daemon_instance_id, coordinator_generation, coordinator_fencing_token FROM workflow_runs WHERE run_id = ?1",
+            [&run_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<u64>>(2)?, row.get::<_, Option<String>>(3)?)),
+        )?;
+        let expected_authority = authority.map_or((None, None, None, None), |owner| {
+            (
+                Some(owner.target_artifact_id.clone()),
+                Some(owner.daemon_instance_id.clone()),
+                Some(owner.generation),
+                Some(owner.fencing_token.clone()),
+            )
+        });
+        if stored_authority != expected_authority {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow execution authority is missing, stale or foreign".to_owned(),
+            ));
+        }
         let expected_status = match decision {
             WorkflowMutationApprovalDecision::Approve => "approved",
             WorkflowMutationApprovalDecision::Deny => "denied",
         };
         if status == expected_status {
             return Ok(WorkflowMutationApprovalResolution {
+                continuation: None,
                 approval_id: approval_id.to_string(),
                 status,
                 grant_id: existing_grant_id,
@@ -5796,6 +5538,7 @@ impl WorkflowStore {
             )?;
             transaction.commit()?;
             return Ok(WorkflowMutationApprovalResolution {
+                continuation: None,
                 approval_id: approval_id.to_string(),
                 status: "expired".to_string(),
                 grant_id: None,
@@ -5889,6 +5632,7 @@ impl WorkflowStore {
                 )?;
                 transaction.commit()?;
                 Ok(WorkflowMutationApprovalResolution {
+                    continuation: None,
                     approval_id: approval_id.to_string(),
                     status: "approved".to_string(),
                     grant_id: Some(grant_id),
@@ -5921,6 +5665,7 @@ impl WorkflowStore {
                 )?;
                 transaction.commit()?;
                 Ok(WorkflowMutationApprovalResolution {
+                    continuation: None,
                     approval_id: approval_id.to_string(),
                     status: "denied".to_string(),
                     grant_id: None,
@@ -10554,6 +10299,28 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Look up one attempt by its indexed dispatch identity and verify its coordinates.
+    ///
+    /// # Errors
+    /// Returns invalid-data or database errors without repairing stored state.
+    pub fn attempt_by_dispatch_identity(
+        &self,
+        identity: &str,
+    ) -> Result<Option<AttemptSummary>, WorkflowStoreError> {
+        validate_id("dispatch_identity", identity)?;
+        self.connection
+            .query_row(
+                "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
+             status, receipt_json IS NOT NULL, prepared_at_ms, admitted_at_ms, terminal_at_ms \
+             FROM workflow_attempts WHERE dispatch_identity = ?1",
+                [identity],
+                attempt_summary_from_row,
+            )
+            .optional()?
+            .map(parse_attempt_summary)
+            .transpose()
+    }
+
     /// Return the newest bounded canonical failure events for one run in chronological order.
     ///
     /// # Errors
@@ -13927,6 +13694,11 @@ fn parse_attempt_summary(raw: RawAttemptSummary) -> Result<AttemptSummary, Workf
     validate_id("node_id", &node_id)?;
     validate_id("activation_id", &activation_id)?;
     validate_id("dispatch_identity", &dispatch_identity)?;
+    if dispatch_identity != self::dispatch_identity(&run_id, &node_id, &activation_id, attempt) {
+        return Err(WorkflowStoreError::InvalidData(
+            "stored workflow attempt identity conflicts with its coordinates".to_string(),
+        ));
+    }
     if attempt == 0 {
         return Err(WorkflowStoreError::InvalidData(
             "stored workflow attempt number must be positive".to_string(),
@@ -17450,6 +17222,82 @@ mod tests {
     }
 
     #[test]
+    fn mutation_approval_clock_waits_for_write_lock() {
+        let temp = tempfile::tempdir().expect("temp");
+        let input = serde_json::json!({"expected_head": "abc"});
+        let approval = mutation_approval(&input);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "mutation-run".to_owned(),
+                definition_id: "mutation-definition".to_owned(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_owned(),
+                parent_session_id: None,
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(input),
+                execution_authority: None,
+                created_at_ms: 10,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".to_owned(),
+                    profile_id: "build".to_owned(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        store
+            .request_mutation_approval(&approval)
+            .expect("approval");
+        let mut blocker = WorkflowStore::open_in_state_dir(temp.path()).expect("blocker");
+        let transaction = blocker
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("write lock");
+        let sampled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let now = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(30));
+        let worker_sampled = std::sync::Arc::clone(&sampled);
+        let worker_now = std::sync::Arc::clone(&now);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            let result = store
+                .resolve_mutation_approval_with_clock(
+                    &approval.approval_id,
+                    WorkflowMutationApprovalDecision::Approve,
+                    None,
+                    || {
+                        worker_sampled.store(true, std::sync::atomic::Ordering::SeqCst);
+                        worker_now.load(std::sync::atomic::Ordering::SeqCst)
+                    },
+                )
+                .expect("resolution");
+            drop(store);
+            result
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let sampled_while_locked = sampled.load(std::sync::atomic::Ordering::SeqCst);
+        now.store(100, std::sync::atomic::Ordering::SeqCst);
+        transaction.commit().expect("release lock");
+        drop(blocker);
+        let result = worker.join().expect("worker");
+        assert!(!sampled_while_locked);
+        assert!(sampled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(result.status, "expired");
+        assert!(result.grant_id.is_none());
+    }
+
+    #[test]
     fn mutation_approval_deny_and_expiry_never_dispatch() {
         for (decision, resolved_at_ms, expected) in [
             (WorkflowMutationApprovalDecision::Deny, 30, "denied"),
@@ -19104,6 +18952,47 @@ mod tests {
         ).expect("preserved activation");
         assert_eq!(attempt_status, "prepared");
         assert_eq!(activation_status, "running");
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn indexed_attempt_lookup_is_bounded_and_rejects_corrupt_coordinates() {
+        let (_temp, mut store) = initialized_store();
+        let attempt = PreparedAttempt {
+            run_id: "run-1".to_owned(),
+            node_id: "review".to_owned(),
+            activation_id: activation_id(),
+            attempt: 1,
+            side_effect: DispatchSideEffect::ReadOnly,
+            intent: serde_json::json!({}),
+            prepared_at_ms: 12,
+        };
+        let identity = store.prepare_attempt(&attempt).expect("prepare");
+        let before = store.connection.total_changes();
+        let observed = store
+            .attempt_by_dispatch_identity(&identity)
+            .expect("lookup")
+            .expect("attempt");
+        assert_eq!(observed.run_id, attempt.run_id);
+        assert_eq!(observed.node_id, attempt.node_id);
+        assert_eq!(observed.activation_id, attempt.activation_id);
+        assert_eq!(observed.attempt, attempt.attempt);
+        assert!(
+            store
+                .attempt_by_dispatch_identity(&"f".repeat(64))
+                .expect("missing lookup")
+                .is_none()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_attempts SET attempt = 3 WHERE dispatch_identity = ?1",
+                [&identity],
+            )
+            .expect("corrupt fixture");
+        let before = store.connection.total_changes();
+        assert!(store.attempt_by_dispatch_identity(&identity).is_err());
         assert_eq!(store.connection.total_changes(), before);
     }
 
@@ -31228,6 +31117,29 @@ mod tests {
         );
     }
 
+    fn assert_attempt_coordinate_corruption_is_non_mutating(store: &WorkflowStore, identity: &str) {
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_attempts SET attempt = 3 WHERE dispatch_identity = ?1",
+                [identity],
+            )
+            .unwrap();
+        let before = store.connection.total_changes();
+        let error = store
+            .attempt_history("run-1", None, 1)
+            .expect_err("reject inconsistent identity");
+        assert!(error.to_string().contains("identity conflicts"));
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_attempts SET attempt = 2 WHERE dispatch_identity = ?1",
+                [identity],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn explicit_abandonment_is_required_before_retrying_ambiguous_mutation() {
         let (_temp, mut store) = initialized_store();
@@ -31298,6 +31210,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(store.connection.total_changes(), before);
+        assert_attempt_coordinate_corruption_is_non_mutating(&store, &newest[0].dispatch_identity);
         store.connection.execute(
             "UPDATE workflow_attempts SET status = 'unsupported_future_status' WHERE dispatch_identity = ?1",
             [&newest[0].dispatch_identity],
@@ -33436,6 +33349,8 @@ mod tests {
                 [number],
                 super::attempt_summary_from_row,
             ).expect("representable attempt fixture");
+            let mut raw = raw;
+            raw.4 = super::dispatch_identity(&raw.0, &raw.1, &raw.2, raw.3);
             let result = super::parse_attempt_summary(raw);
             if number == 0 {
                 assert!(matches!(result, Err(WorkflowStoreError::InvalidData(_))));
@@ -33474,6 +33389,8 @@ mod tests {
                 [status],
                 super::attempt_summary_from_row,
             ).expect("supported status fixture");
+            let mut raw = raw;
+            raw.4 = super::dispatch_identity(&raw.0, &raw.1, &raw.2, raw.3);
             let summary = super::parse_attempt_summary(raw).expect("supported status");
             assert_eq!(summary.status, status);
             assert_eq!(connection.total_changes(), 0);
@@ -33534,8 +33451,12 @@ mod tests {
                         super::attempt_summary_from_row,
                     )
                     .expect("identity fixture");
+                let mut raw = raw;
+                if column != 4 {
+                    raw.4 = super::dispatch_identity(&raw.0, &raw.1, &raw.2, raw.3);
+                }
                 let result = super::parse_attempt_summary(raw);
-                if valid {
+                if valid && column != 4 {
                     assert!(result.is_ok());
                 } else {
                     assert!(matches!(result, Err(WorkflowStoreError::InvalidData(_))));
