@@ -36365,10 +36365,14 @@ mod tests {
             }
         });
         let client = bcode_client::BcodeClient::new(endpoint);
-        client
+        let denied = client
             .publish_workflow_package(publication_request.clone())
             .await
             .expect_err("policy denial must reject publication");
+        assert!(
+            matches!(denied, bcode_client::ClientError::Server { ref code, .. } if code == bcode_workflow::WorkflowAuthoringFailure::Unauthorized.code()),
+            "{denied:?}"
+        );
         assert!(
             client
                 .workflow_package_publication("example/package".to_string())
@@ -36378,6 +36382,18 @@ mod tests {
         );
         {
             let store = state.workflow_store.lock().expect("workflow store");
+            assert_eq!(
+                store
+                    .workflow_draft(&draft.workflow_id, "package")
+                    .expect("first draft"),
+                Some(draft.clone())
+            );
+            assert_eq!(
+                store
+                    .workflow_draft(&second_draft.workflow_id, "package")
+                    .expect("second draft"),
+                Some(second_draft.clone())
+            );
             for workflow_id in [&workflow.workflow_id, &second_workflow.workflow_id] {
                 assert!(
                     store
@@ -67359,27 +67375,151 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    #[tokio::test]
+    async fn package_apply_denial_over_ipc_creates_no_workflows() {
+        let mut state = Arc::new(test_server_state(SessionManager::default()));
+        let catalog = workflow_operations::authoring_catalog(&state)
+            .await
+            .expect("catalog");
+        let source = serde_json::json!({
+            "workflow_source_version": 3, "workflow_id": "example/member", "title": "Member",
+            "input": {"type_name": "value/v1", "schema": {"type": "string"}},
+            "output": {"type_name": "value/v1", "schema": {"type": "string"}},
+            "steps": [{"id": "input", "input": {"schema": {"type_name": "value/v1", "schema": {"type": "string"}}}}]
+        });
+        let manifest = bcode_workflow::WorkflowPackageManifest {
+            version: bcode_workflow::WORKFLOW_PACKAGE_MANIFEST_VERSION,
+            package_id: "example/package".into(),
+            exports: BTreeMap::from([("main".into(), "member".into())]),
+            external_dependencies: BTreeMap::new(),
+            imports: Vec::new(),
+            members: vec![bcode_workflow::WorkflowPackageMember {
+                member_id: "member".into(),
+                source_name: "member.json".into(),
+                format: bcode_workflow::WorkflowSourceFormat::Json,
+                source: source.to_string(),
+                dependencies: Vec::new(),
+                external_dependencies: Vec::new(),
+            }],
+        };
+        let plan = bcode_workflow::plan_workflow_package(&manifest, &catalog).expect("valid plan");
+        Arc::get_mut(&mut state)
+            .expect("exclusive fixture")
+            .workflow_application_authorization =
+            workflow_operations::WorkflowApplicationAuthorizationPolicy {
+                evaluator: Arc::new(|facts| {
+                    assert_eq!(
+                        facts.operation,
+                        bcode_workflow::WorkflowApplicationOperation::ApplyPackage
+                    );
+                    workflow_operations::WorkflowApplicationAuthorizationDecision::Deny {
+                        reason: "private policy detail".into(),
+                    }
+                }),
+            };
+        let root = tempfile::tempdir().expect("socket root");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(root.path().join("apply.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let error = client
+            .apply_workflow_package(bcode_workflow::ApplyWorkflowPackageRequest {
+                request: bcode_workflow::WorkflowPackageApplyRequest {
+                    version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
+                    plan,
+                    expected_generations: Vec::new(),
+                },
+                applied_at_ms: 1,
+            })
+            .await
+            .expect_err("denied");
+        let failure = bcode_workflow::WorkflowAuthoringFailure::Unauthorized;
+        assert!(
+            matches!(error, bcode_client::ClientError::Server { code, message } if code == failure.code() && message == failure.to_string())
+        );
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .list_authored_workflows(1)
+                .expect("workflows")
+                .is_empty()
+        );
+        shutdown.send(()).expect("shutdown");
+        server.await.expect("server");
+        drop(state);
+    }
+
+    fn unavailable_workflow_sentinel() -> (
+        bcode_workflow_store::AuthoredWorkflow,
+        bcode_workflow_store::WorkflowDraft,
+    ) {
+        let document = test_workflow_authoring_document();
+        let workflow = bcode_workflow_store::AuthoredWorkflow {
+            workflow_id: document.workflow_id.clone(),
+            title: document.metadata.title.clone(),
+            description: document.metadata.description.clone(),
+            archived: false,
+            active_revision: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let draft = bcode_workflow_store::WorkflowDraft {
+            workflow_id: document.workflow_id.clone(),
+            draft_id: "sentinel".into(),
+            base_revision: None,
+            generation: 1,
+            checksum_sha256: document.source_digest_sha256().expect("digest"),
+            producer: document.producer.clone(),
+            document,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        (workflow, draft)
+    }
+
     fn assert_workflow_creation_absent(state: &ServerState) {
         let store = state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(store.list_definitions(1).expect("definitions").is_empty());
-        assert!(
+        let (workflow, draft) = unavailable_workflow_sentinel();
+        assert_eq!(
             store
-                .list_authored_workflows(1)
-                .expect("authored workflows")
-                .is_empty()
+                .list_authored_workflows(10)
+                .expect("authored workflows"),
+            vec![workflow]
+        );
+        assert_eq!(
+            store
+                .workflow_draft(&draft.workflow_id, "sentinel")
+                .expect("sentinel draft"),
+            Some(draft)
         );
         assert!(store.list_runs(1).expect("runs").is_empty());
         drop(store);
     }
 
     fn unavailable_workflow_state() -> Arc<ServerState> {
-        Arc::new(ServerState {
+        let state = Arc::new(ServerState {
             workflow_store_unavailable: Some("private storage diagnostic".into()),
             ..test_server_state(SessionManager::default())
-        })
+        });
+        let (workflow, draft) = unavailable_workflow_sentinel();
+        state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .create_authored_workflow_with_initial_draft(&workflow, &draft)
+            .expect("sentinel");
+        state
     }
 
     #[tokio::test]
@@ -67550,6 +67690,37 @@ event_symbol = "bcode_plugin_handle_event_v1"
         Arc::new(state)
     }
 
+    async fn drive_template_cancellations(
+        state: &Arc<ServerState>,
+        client: &bcode_client::BcodeClient,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for run_id in ["template-start", "template-direct"] {
+                loop {
+                    drive_workflow_run(state, run_id)
+                        .await
+                        .expect("drive cancellation");
+                    let observed = client
+                        .workflow_run_status(run_id.into())
+                        .await
+                        .expect("status")
+                        .expect("run");
+                    if observed.status == bcode_workflow::RunStatus::Cancelled {
+                        break;
+                    }
+                    assert_eq!(
+                        observed.status,
+                        bcode_workflow::RunStatus::Running,
+                        "{observed:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        })
+        .await
+        .expect("terminal cancellation");
+    }
+
     #[tokio::test]
     async fn external_template_start_is_inspectable_over_ipc() {
         let root = tempfile::tempdir().expect("plugin root");
@@ -67581,6 +67752,40 @@ event_symbol = "bcode_plugin_handle_event_v1"
             })
             .await
             .expect("template admission");
+        let direct = bcode_workflow::WorkflowRunApplication::start_workflow_template(
+            &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
+            bcode_workflow::WorkflowTemplateStartRequest {
+                owner_plugin_id: "bcode.shell".into(),
+                template_id: "external".into(),
+                template_version: 1,
+                run_id: Some("template-direct".into()),
+                workspace_snapshot: None,
+                parent_session_id: parent.id,
+                configuration: serde_json::json!({}),
+                limits: bcode_workflow::WorkflowRunLimits::default(),
+            },
+        )
+        .await
+        .expect("direct template admission");
+        assert_eq!(direct.run.definition_id, started.run.definition_id);
+        assert_eq!(
+            direct.run.definition_version,
+            started.run.definition_version
+        );
+        assert_eq!(direct.run.binding, started.run.binding);
+        assert_eq!(
+            direct.run.workspace_snapshot,
+            started.run.workspace_snapshot
+        );
+        assert_eq!(direct.run.parent_session_id, started.run.parent_session_id);
+        assert_eq!(
+            direct.run.authorization_profile,
+            started.run.authorization_profile
+        );
+        client
+            .cancel_workflow_run("template-direct".into())
+            .await
+            .expect("direct cleanup");
         assert_eq!(started.run.run_id, "template-start");
         assert!(
             client
@@ -67593,6 +67798,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .cancel_workflow_run("template-start".into())
             .await
             .expect("cancel cleanup");
+        let terminal = client
+            .workflow_run_status("template-start".into())
+            .await
+            .expect("terminal status")
+            .expect("run");
+        assert!(
+            terminal.cancellation_requested_at_ms.is_some(),
+            "{terminal:?}"
+        );
+        drive_template_cancellations(&state, &client).await;
         shutdown.send(()).expect("shutdown");
         server.await.expect("server");
         drop(state);
