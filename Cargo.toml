@@ -78,6 +78,7 @@ members = [
     "packages/project-instructions",
     "packages/provider-auth/models",
     "packages/ralph",
+    "packages/ralph/models",
     "packages/server",
     "packages/settings",
     "packages/session",
@@ -220,6 +221,7 @@ bcode_provider_auth_models              = { version = "0.0.1-alpha.0", default-f
 bcode_question_dynamic_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "examples/question-dynamic-plugin" }
 bcode_question_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/question-plugin" }
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }
+bcode_ralph_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph/models" }
 bcode_ralph_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/ralph-plugin" }
 bcode_read_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/read-plugin" }
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }

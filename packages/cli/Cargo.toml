@@ -29,6 +29,7 @@ bcode_plugin_sdk = { workspace = true }
 bcode_prompt_cache = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
+bcode_ralph_models = { workspace = true }
 bcode_server = { workspace = true }
 bcode_session = { workspace = true }
 bcode_session_import = { workspace = true }

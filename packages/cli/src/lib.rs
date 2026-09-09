@@ -504,6 +504,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Interaction { command } => handle_interaction_command(command).await?,
         Commands::Worktree { command } => handle_worktree_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
+        Commands::Ralph { command } => handle_ralph_command(command).await?,
         Commands::Workflow { command } => handle_workflow_command(Box::new(command)).await?,
         command => Box::pin(handle_session_io_command(command, launch_options)).await?,
     }
@@ -755,6 +756,45 @@ fn handle_workflow_template_command(
             ),
         }
     })
+}
+
+#[derive(Debug, Subcommand)]
+enum RalphCommand {
+    /// Print the latest loop summary as JSON.
+    Status {
+        #[arg(long)]
+        repo_root: PathBuf,
+    },
+    /// Print active and interrupted run status as JSON (not a resume receipt).
+    RunStatus {
+        #[arg(long)]
+        repo_root: PathBuf,
+        #[arg(long)]
+        loop_state_dir: Option<PathBuf>,
+    },
+}
+
+async fn handle_ralph_command(command: RalphCommand) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    match command {
+        RalphCommand::Status { repo_root } => print_json(
+            &client
+                .ralph_status(bcode_ralph_models::RalphStatusRequest { repo_root })
+                .await?,
+        )?,
+        RalphCommand::RunStatus {
+            repo_root,
+            loop_state_dir,
+        } => print_json(
+            &client
+                .ralph_run_status(bcode_ralph_models::RalphRunStatusRequest {
+                    repo_root,
+                    loop_state_dir,
+                })
+                .await?,
+        )?,
+    }
+    Ok(())
 }
 
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
@@ -3224,6 +3264,7 @@ async fn handle_session_io_command(
         | Commands::Interaction { .. }
         | Commands::Worktree { .. }
         | Commands::RuntimeWork { .. }
+        | Commands::Ralph { .. }
         | Commands::Workflow { .. } => unreachable!("handled by handle_cli"),
         #[cfg(feature = "web-renderer")]
         Commands::Web { .. } => unreachable!("handled by handle_cli"),
@@ -3623,6 +3664,11 @@ enum Commands {
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
+    },
+    /// Inspect Ralph through the daemon-owned application API.
+    Ralph {
+        #[command(subcommand)]
+        command: RalphCommand,
     },
     Workflow {
         #[command(subcommand)]

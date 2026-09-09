@@ -451,6 +451,39 @@ fn plugin_contributions_returns_daemon_schema_without_invocation() {
 }
 
 #[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn ralph_status_reads_live_daemon_and_missing_run_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let repo = root.path().to_str().unwrap();
+    let value = graph_cli_json(root.path(), &["ralph", "status", "--repo-root", repo]);
+    assert_eq!(value, serde_json::json!({"loop_summary": null}));
+    let missing = run_cli_at_root(
+        root.path(),
+        &["ralph", "run-status", "--repo-root", repo],
+        Stdio::piped(),
+        Stdio::piped(),
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty());
+    assert!(!missing.stderr.is_empty());
+    drop(daemon);
+}
+
+#[test]
+fn ralph_status_requires_identity_and_reports_daemon_failure() {
+    let invalid = run_cli_with_state(&["ralph", "status"], true);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    for action in ["status", "run-status"] {
+        let failed = run_cli_with_state(&["ralph", action, "--repo-root", "/unused"], true);
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(failed.stdout.is_empty());
+        assert!(!failed.stderr.is_empty());
+    }
+}
+
+#[test]
 fn plugin_contributions_rejects_local_roots_and_reports_daemon_failure() {
     let invalid = run_cli_with_state(&["plugin", "contributions", "--root", "unused"], true);
     assert_eq!(invalid.status.code(), Some(2));

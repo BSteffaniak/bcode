@@ -11,6 +11,25 @@ use std::{
     sync::Arc,
 };
 
+/// Recover abandoned work and reserve the caller's namespace before domain attachment.
+///
+/// The caller must reject ambiguous session locations first. The returned timestamp marks
+/// namespace activation after recovery, preserving adapter timing measurements.
+/// A successful reservation must subsequently be completed or cancelled by the attach lifecycle.
+pub async fn prepare_attachment(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    client_id: bcode_session_models::ClientId,
+) -> (std::time::Instant, Result<(), String>) {
+    super::recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
+    let started_at = std::time::Instant::now();
+    let namespace = state.client_session_namespace(client_id).await;
+    let result = state
+        .try_activate_session_namespace(session_id, namespace)
+        .await;
+    (started_at, result)
+}
+
 /// Attach bounded recent history after the caller has reserved the session namespace.
 ///
 /// # Errors
@@ -67,11 +86,9 @@ pub async fn attach(
     session_id: bcode_session_models::SessionId,
     client_id: bcode_session_models::ClientId,
 ) -> Result<bcode_session::SessionAttachment, AttachError> {
-    super::recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
-    let namespace = state.client_session_namespace(client_id).await;
-    state
-        .try_activate_session_namespace(session_id, namespace)
+    prepare_attachment(state, session_id, client_id)
         .await
+        .1
         .map_err(AttachError::Namespace)?;
     let attachment = state
         .sessions

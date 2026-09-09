@@ -5557,6 +5557,29 @@ fn write_runtime_auth_subscriptions(
     Ok(())
 }
 
+/// Return an explicitly selected state root, without opting into default persistence.
+///
+/// Process selection takes precedence over a nonempty `BCODE_STATE_DIR`. This
+/// performs no filesystem access or validation and never falls back to XDG/home.
+#[allow(clippy::must_use_candidate)] // Option already carries must-use semantics.
+pub fn explicit_state_dir() -> Option<PathBuf> {
+    explicit_state_dir_with_environment(&ProcessConfigEnvironment)
+}
+
+/// Return an explicitly selected state root for the supplied environment.
+///
+/// Like [`explicit_state_dir`], this is a non-validating selection lookup.
+pub fn explicit_state_dir_with_environment(
+    environment: &impl ConfigEnvironment,
+) -> Option<PathBuf> {
+    process_state_location_root().or_else(|| {
+        environment
+            .var(BCODE_STATE_DIR_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
 /// Return the default Bcode state directory.
 #[must_use]
 pub fn default_state_dir() -> PathBuf {
@@ -5611,6 +5634,33 @@ pub fn default_state_dir_with_environment(environment: &impl ConfigEnvironment) 
             .join("bcode");
     }
     env::temp_dir().join("bcode")
+}
+
+#[cfg(test)]
+mod explicit_state_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_state_lookup_does_not_enable_default_persistence() {
+        let environment = ConfigEnvironmentSnapshot::new(
+            BTreeMap::from([("HOME".to_owned(), OsString::from("/home/test"))]),
+            PathBuf::from("/"),
+        );
+        assert_eq!(
+            explicit_state_dir_with_environment(&environment),
+            process_state_location_root()
+        );
+        for (value, expected) in [("", None), ("/selected", Some(PathBuf::from("/selected")))] {
+            let environment = ConfigEnvironmentSnapshot::new(
+                BTreeMap::from([(BCODE_STATE_DIR_ENV.to_owned(), OsString::from(value))]),
+                PathBuf::from("/"),
+            );
+            assert_eq!(
+                explicit_state_dir_with_environment(&environment),
+                process_state_location_root().or(expected)
+            );
+        }
+    }
 }
 
 /// Process-scoped explicit state selection.

@@ -1,5 +1,20 @@
 # Application operation parity
 
+Ralph operation requests and results are owned by the lightweight `bcode_ralph_models`
+crate. IPC retains compatibility re-exports and unchanged wire shapes; the client,
+server routing/execution, and TUI use the domain contracts directly. This ownership
+boundary does not imply complete authorization parity, a public host adapter, or
+bounded history guarantees for the existing Ralph queries. `latest_loop_in_store`
+now selects by descending update time with SQL LIMIT 1 instead of materializing
+all matching loop rows. This bounds returned row materialization, not database
+scan/sort work without an appropriate index. `with_database` still runs migration
+coordination on each access. Read-path separation and indexed bounded selection
+remain required; CLI exposure does not resolve these limitations.
+
+The live-daemon process test `ralph_status_reads_live_daemon_and_missing_run_fails`
+checks the absent-loop JSON envelope and missing-run error/empty stdout through the
+real CLI. It does not establish populated-run or large-history acceptance.
+
 Mutation approval CLI commands print the resolution and exit 1 when the requested decision was not applied (including expiration). Explicit denial recorded as denied is a successful decision, not a successful workflow execution. Decision matching is workflow-owned and independent of continuation.
 
 Mutation resolution includes optional request-local `continuation`: `not_required`, `driven`, or `failed`. Absence means unavailable (older/store-only result). A continuation failure does not erase the committed approval resolution. CLI prints the result and exits 1 on `failed`; inspect before retrying. `driven` does not mean the run completed, and continuation metadata is not persisted.
@@ -351,7 +366,7 @@ The architecture guard requires every current variant below to remain named in t
 
 ### Top-level `Commands`
 
-`Onboard`, `ArtifactId`, `Server`, `State`, `Session`, `Web`, `Plugin`, `Theme`, `Model`, `Auth`, `Login`, `Permission`, `Interaction`, `Worktree`, `Workflow`, `RuntimeWork`, `Cancel`, `Attach`, `Tui`, `Send`.
+`Onboard`, `ArtifactId`, `Server`, `State`, `Session`, `Web`, `Plugin`, `Theme`, `Model`, `Auth`, `Login`, `Permission`, `Interaction`, `Worktree`, `Ralph`, `Workflow`, `RuntimeWork`, `Cancel`, `Attach`, `Tui`, `Send`.
 
 ### Top-level CLI ownership classification
 
@@ -374,6 +389,7 @@ Every current top-level command family has one explicit primary owner. Subcomman
 | `Interaction` | Shared application | Pending exchange inspection and schema-aware resolution use typed daemon operations; semantic-controller automation remains tracked work. |
 | `Worktree` | Shared application | Daemon-owned worktree operations and canonical session attachment. |
 | `Workflow` | Shared application, with local package validation | Runtime/authoring/import/export operations are daemon-backed; source-controlled package discovery/validation is explicit local artifact work. |
+| `Ralph` | Shared application; Ralph domain | `status --repo-root PATH` and `run-status --repo-root PATH [--loop-state-dir PATH]` return finite JSON through typed client operations. No local storage access, mutation, or resume guarantee. Existing status queries are not thereby proven bounded. |
 | `RuntimeWork` | Shared application | Bounded runtime-work inspection, watch, and cancellation through the daemon API. |
 | `Cancel` | Shared application | Canonical turn cancellation through the daemon API. |
 | `Attach` | Shared application / TUI adapter | Opens a canonical daemon session in the TUI without owning session semantics. |

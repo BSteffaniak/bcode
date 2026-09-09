@@ -80,14 +80,9 @@ use bcode_agent_runtime::{
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, DaemonStatus, EnvelopeKind, ErrorResponse, Event,
     IpcEndpoint, LocalIpcListener, LocalIpcStream, PermissionBatchCorrelation, PluginServiceError,
-    PluginServiceResponse, RalphApproveRequest, RalphCancelRequest, RalphCancelResponse,
-    RalphIterationSummary, RalphLifecycleRequest, RalphListIterationsRequest,
-    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
-    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
-    RalphRunStatusResponse, RalphRunSummary, RalphStatusRequest, RalphStatusResponse,
-    RalphStatusSummary, RalphValidationSummary, Request, Response, ResponsePayload, ServerStatus,
-    ServerStopMode, WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest,
-    decode_request, encode_envelope_frames, event_envelope, recv_envelope, response_envelope,
+    PluginServiceResponse, Request, Response, ResponsePayload, ServerStatus, ServerStopMode,
+    WorktreeCreateRequest, WorktreeListRequest, WorktreeRemoveRequest, decode_request,
+    encode_envelope_frames, event_envelope, recv_envelope, response_envelope,
     write_encoded_envelope_frames,
 };
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
@@ -105,6 +100,14 @@ use bcode_plugin::{
 };
 use bcode_plugin_sdk::path::{display, display_from_current_dir};
 use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
+use bcode_ralph_models::{
+    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphIterationSummary,
+    RalphLifecycleRequest, RalphListIterationsRequest, RalphListIterationsResponse,
+    RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse,
+    RalphRunRequest, RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse,
+    RalphRunSummary, RalphStatusRequest, RalphStatusResponse, RalphStatusSummary,
+    RalphValidationSummary,
+};
 use bcode_session::{
     AppendToolCallRequestedInput, CatalogLoadStatus, SessionError, SessionManager,
     lease::SessionLeaseOwnerContext,
@@ -8660,18 +8663,27 @@ async fn handle_list_worktrees(
     }
 }
 
+fn ralph_status(
+    state: &ServerState,
+    request: &RalphStatusRequest,
+) -> Result<RalphStatusResponse, String> {
+    let loop_summary = state
+        .ralph_store
+        .latest_loop(&request.repo_root)
+        .map_err(|error| error.to_string())?;
+    Ok(RalphStatusResponse {
+        loop_summary: loop_summary.map(|summary| ralph_status_summary(&state.ralph_store, summary)),
+    })
+}
+
 async fn handle_ralph_status(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
     request: RalphStatusRequest,
 ) -> Result<(), ServerError> {
-    match state.ralph_store.latest_loop(&request.repo_root) {
-        Ok(loop_summary) => {
-            let response = RalphStatusResponse {
-                loop_summary: loop_summary
-                    .map(|summary| ralph_status_summary(&state.ralph_store, summary)),
-            };
+    match ralph_status(state, &request) {
+        Ok(response) => {
             send_response(
                 writer,
                 request_id,
@@ -8683,7 +8695,7 @@ async fn handle_ralph_status(
             send_response(
                 writer,
                 request_id,
-                Response::Err(ErrorResponse::new("ralph_status_failed", error.to_string())),
+                Response::Err(ErrorResponse::new("ralph_status_failed", error)),
             )
             .await
         }
@@ -10076,58 +10088,62 @@ async fn run_ralph_runner_skeleton(
     state.active_ralph_runs.lock().await.remove(&run.state_dir);
 }
 
+enum RalphCancelError {
+    Operation(String),
+    Dispatch(ServerError),
+}
+
+async fn cancel_ralph_loop(
+    state: &Arc<ServerState>,
+    request: RalphCancelRequest,
+) -> Result<RalphCancelResponse, RalphCancelError> {
+    let summary = resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )
+    .map_err(RalphCancelError::Operation)?;
+    let run = resolve_ralph_cancel_target(&state.ralph_store, &summary.state_dir, request.run_id)
+        .map_err(RalphCancelError::Operation)?;
+    state
+        .ralph_store
+        .request_run_cancel(&run.run_id)
+        .map_err(|error| RalphCancelError::Operation(error.to_string()))?;
+    if let Some(session_id) = run
+        .session_id
+        .as_deref()
+        .and_then(|session_id| session_id.parse::<SessionId>().ok())
+    {
+        let _cancelled = enqueue_cancel_turn_command(state, session_id, true, None)
+            .await
+            .map_err(RalphCancelError::Dispatch)?;
+    }
+    Ok(RalphCancelResponse {
+        run: RalphRunSummary {
+            cancel_requested: true,
+            updated_at_ms: current_time_ms(),
+            ..ralph_run_summary(run)
+        },
+        cancel_requested: true,
+    })
+}
+
 async fn handle_cancel_ralph_loop(
     request_id: u64,
     state: &Arc<ServerState>,
     writer: &SharedWriter,
     request: RalphCancelRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(
-        &state.ralph_store,
-        &request.repo_root,
-        request.loop_state_dir.as_deref(),
-    )
-    .and_then(|summary| {
-        resolve_ralph_cancel_target(&state.ralph_store, &summary.state_dir, request.run_id)
-    }) {
-        Ok(run) => match state.ralph_store.request_run_cancel(&run.run_id) {
-            Ok(()) => {
-                if let Some(session_id) = run
-                    .session_id
-                    .as_deref()
-                    .and_then(|session_id| session_id.parse::<SessionId>().ok())
-                {
-                    let _cancelled =
-                        enqueue_cancel_turn_command(state, session_id, true, None).await?;
-                }
-                let response = RalphCancelResponse {
-                    run: RalphRunSummary {
-                        cancel_requested: true,
-                        updated_at_ms: current_time_ms(),
-                        ..ralph_run_summary(run)
-                    },
-                    cancel_requested: true,
-                };
-                send_response(
-                    writer,
-                    request_id,
-                    Response::Ok(ResponsePayload::RalphRunCancelled(response)),
-                )
-                .await
-            }
-            Err(error) => {
-                send_response(
-                    writer,
-                    request_id,
-                    Response::Err(ErrorResponse::new(
-                        "ralph_run_cancel_failed",
-                        error.to_string(),
-                    )),
-                )
-                .await
-            }
-        },
-        Err(error) => {
+    match cancel_ralph_loop(state, request).await {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RalphRunCancelled(response)),
+            )
+            .await
+        }
+        Err(RalphCancelError::Operation(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -10135,7 +10151,30 @@ async fn handle_cancel_ralph_loop(
             )
             .await
         }
+        Err(RalphCancelError::Dispatch(error)) => Err(error),
     }
+}
+
+fn list_ralph_runs(
+    state: &ServerState,
+    request: &RalphListRunsRequest,
+) -> Result<RalphListRunsResponse, String> {
+    let summary = resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )?;
+    let runs = state
+        .ralph_store
+        .list_runs_for_loop(&summary.state_dir)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(ralph_run_summary)
+        .collect();
+    Ok(RalphListRunsResponse {
+        loop_summary: Some(ralph_status_summary(&state.ralph_store, summary)),
+        runs,
+    })
 }
 
 async fn handle_list_ralph_runs(
@@ -10144,24 +10183,7 @@ async fn handle_list_ralph_runs(
     writer: &SharedWriter,
     request: RalphListRunsRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(
-        &state.ralph_store,
-        &request.repo_root,
-        request.loop_state_dir.as_deref(),
-    )
-    .and_then(|summary| {
-        let runs = state
-            .ralph_store
-            .list_runs_for_loop(&summary.state_dir)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(ralph_run_summary)
-            .collect();
-        Ok(RalphListRunsResponse {
-            loop_summary: Some(ralph_status_summary(&state.ralph_store, summary)),
-            runs,
-        })
-    }) {
+    match list_ralph_runs(state, &request) {
         Ok(response) => {
             send_response(
                 writer,
@@ -10181,13 +10203,11 @@ async fn handle_list_ralph_runs(
     }
 }
 
-async fn handle_list_ralph_iterations(
-    request_id: u64,
+fn list_ralph_iterations(
     state: &ServerState,
-    writer: &SharedWriter,
-    request: RalphListIterationsRequest,
-) -> Result<(), ServerError> {
-    match resolve_ralph_loop(
+    request: &RalphListIterationsRequest,
+) -> Result<RalphListIterationsResponse, String> {
+    resolve_ralph_loop(
         &state.ralph_store,
         &request.repo_root,
         request.loop_state_dir.as_deref(),
@@ -10235,7 +10255,16 @@ async fn handle_list_ralph_iterations(
             iterations,
             validations,
         })
-    }) {
+    })
+}
+
+async fn handle_list_ralph_iterations(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: RalphListIterationsRequest,
+) -> Result<(), ServerError> {
+    match list_ralph_iterations(state, &request) {
         Ok(response) => {
             send_response(
                 writer,
@@ -10255,36 +10284,41 @@ async fn handle_list_ralph_iterations(
     }
 }
 
+fn ralph_run_status(
+    state: &ServerState,
+    request: &RalphRunStatusRequest,
+) -> Result<RalphRunStatusResponse, String> {
+    let summary = resolve_ralph_loop(
+        &state.ralph_store,
+        &request.repo_root,
+        request.loop_state_dir.as_deref(),
+    )?;
+    let active_run = state
+        .ralph_store
+        .active_run_for_loop(&summary.state_dir)
+        .map_err(|error| error.to_string())?
+        .map(ralph_run_summary);
+    let interrupted_runs = state
+        .ralph_store
+        .interrupted_runs_for_loop(&summary.state_dir)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(ralph_run_summary)
+        .collect();
+    Ok(RalphRunStatusResponse {
+        loop_summary: Some(ralph_status_summary(&state.ralph_store, summary)),
+        active_run,
+        interrupted_runs,
+    })
+}
+
 async fn handle_ralph_run_status(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
     request: RalphRunStatusRequest,
 ) -> Result<(), ServerError> {
-    match resolve_ralph_loop(
-        &state.ralph_store,
-        &request.repo_root,
-        request.loop_state_dir.as_deref(),
-    )
-    .and_then(|summary| {
-        let active_run = state
-            .ralph_store
-            .active_run_for_loop(&summary.state_dir)
-            .map_err(|error| error.to_string())?
-            .map(ralph_run_summary);
-        let interrupted_runs = state
-            .ralph_store
-            .interrupted_runs_for_loop(&summary.state_dir)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(ralph_run_summary)
-            .collect();
-        Ok(RalphRunStatusResponse {
-            loop_summary: Some(ralph_status_summary(&state.ralph_store, summary)),
-            active_run,
-            interrupted_runs,
-        })
-    }) {
+    match ralph_run_status(state, &request) {
         Ok(response) => {
             send_response(
                 writer,
@@ -10412,13 +10446,11 @@ fn ralph_iteration_summary(iteration: bcode_ralph::RalphIterationRecord) -> Ralp
     }
 }
 
-async fn handle_record_ralph_lifecycle(
-    request_id: u64,
+async fn record_ralph_lifecycle(
     state: &ServerState,
-    writer: &SharedWriter,
     request: RalphLifecycleRequest,
-) -> Result<(), ServerError> {
-    match state
+) -> Result<bcode_session_models::SessionEvent, bcode_session::SessionError> {
+    let event = state
         .sessions
         .append_event(
             request.session_id,
@@ -10430,10 +10462,19 @@ async fn handle_record_ralph_lifecycle(
                 occurred_at_ms: request.occurred_at_ms,
             },
         )
-        .await
-    {
+        .await?;
+    publish_session_event(state, &event).await;
+    Ok(event)
+}
+
+async fn handle_record_ralph_lifecycle(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: RalphLifecycleRequest,
+) -> Result<(), ServerError> {
+    match record_ralph_lifecycle(state, request).await {
         Ok(event) => {
-            publish_session_event(state, &event).await;
             send_response(
                 writer,
                 request_id,
@@ -12352,13 +12393,9 @@ async fn handle_attach_session_recent(
     if let Some(response) = ambiguous_session_location_response(state, session_id).await {
         return send_response(writer, request_id, response).await;
     }
-    recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
-    let namespace_started_at = Instant::now();
-    let client_namespace = state.client_session_namespace(client_id).await;
-    if let Err(active_namespace) = state
-        .try_activate_session_namespace(session_id, client_namespace)
-        .await
-    {
+    let (namespace_started_at, activation) =
+        session_operations::prepare_attachment(state, session_id, client_id).await;
+    if let Err(active_namespace) = activation {
         state.metrics.record_histogram(
             "server.attach_recent.namespace_activation_duration_ms",
             elapsed_ms(namespace_started_at),
@@ -12437,13 +12474,9 @@ async fn handle_attach_session_projection_window(
     if let Some(response) = ambiguous_session_location_response(state, session_id).await {
         return send_response(writer, request_id, response).await;
     }
-    recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
-    let namespace_started_at = Instant::now();
-    let client_namespace = state.client_session_namespace(client_id).await;
-    if let Err(active_namespace) = state
-        .try_activate_session_namespace(session_id, client_namespace)
-        .await
-    {
+    let (namespace_started_at, activation) =
+        session_operations::prepare_attachment(state, session_id, client_id).await;
+    if let Err(active_namespace) = activation {
         state.metrics.record_histogram(
             "server.attach_projection_window.namespace_activation_duration_ms",
             elapsed_ms(namespace_started_at),
@@ -42340,7 +42373,7 @@ library = "test"
         let response = start_ralph_runner(
             &state,
             RalphRunRequest {
-                repo_root,
+                repo_root: repo_root.clone(),
                 loop_state_dir: None,
                 max_iterations: Some(1),
                 no_progress_limit: Some(1),
@@ -42351,10 +42384,19 @@ library = "test"
         .await
         .expect("run should prepare");
 
-        ralph
-            .store
-            .request_run_cancel(&response.run.run_id)
-            .expect("cancel should persist");
+        let cancelled = cancel_ralph_loop(
+            &state,
+            RalphCancelRequest {
+                repo_root,
+                loop_state_dir: Some(summary.state_dir.clone()),
+                run_id: Some(response.run.run_id.clone()),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("cancel should persist"));
+        assert!(cancelled.cancel_requested);
+        assert!(cancelled.run.cancel_requested);
+        assert_eq!(cancelled.run.run_id, response.run.run_id);
         let active = ralph
             .store
             .active_run_for_loop(&summary.state_dir)

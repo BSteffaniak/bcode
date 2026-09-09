@@ -8,11 +8,7 @@ use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
-    LocalIpcStream, PluginServiceResponse, PluginServiceSummary, RalphApproveRequest,
-    RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest, RalphListIterationsRequest,
-    RalphListIterationsResponse, RalphListRunsRequest, RalphListRunsResponse, RalphResumeRequest,
-    RalphResumeResponse, RalphRunRequest, RalphRunResponse, RalphRunStatusRequest,
-    RalphRunStatusResponse, RalphStatusRequest, RalphStatusResponse, Request, Response,
+    LocalIpcStream, PluginServiceResponse, PluginServiceSummary, Request, Response,
     ResponsePayload, ServerStopMode, SessionBulkMigrationOperationStatus,
     SessionBulkMigrationStartRequest, SessionCompatibilityInventoryRequest,
     SessionCompatibilityInventoryResponse, WorktreeCreateOperationStatus, WorktreeCreateRequest,
@@ -21,6 +17,13 @@ use bcode_ipc::{
     default_endpoint, recv_envelope, request_envelope, send_envelope,
 };
 use bcode_plugin_sdk::PluginContributions;
+use bcode_ralph_models::{
+    RalphApproveRequest, RalphCancelRequest, RalphCancelResponse, RalphLifecycleRequest,
+    RalphListIterationsRequest, RalphListIterationsResponse, RalphListRunsRequest,
+    RalphListRunsResponse, RalphResumeRequest, RalphResumeResponse, RalphRunRequest,
+    RalphRunResponse, RalphRunStatusRequest, RalphRunStatusResponse, RalphStatusRequest,
+    RalphStatusResponse,
+};
 use bcode_session_import::ImportWarning as SessionImportWarning;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, SessionCatalogSourceStatus, SessionCatalogStatus,

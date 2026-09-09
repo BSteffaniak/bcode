@@ -1410,6 +1410,22 @@ fn latest_loop_in_store(
     store: &RalphStateStore,
     repo_root: &Path,
 ) -> Result<Option<RalphLoopSummary>, RalphStateError> {
+    match std::fs::metadata(store.database_path()) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Only a wholly absent store is an empty result. An existing root
+            // without its database may represent damage and must not be repaired
+            // implicitly by a status query.
+            match std::fs::metadata(store.ralph_state_root()) {
+                Err(root_error) if root_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(root_error) => return Err(root_error.into()),
+                Ok(_) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
     let repo_root = repo_root.to_path_buf();
     let db_summary = store.with_database(move |database| {
         Box::pin(async move {
@@ -1432,15 +1448,14 @@ fn latest_loop_in_store(
                     "repo_root",
                     repo_root.display().to_string(),
                 )))
+                .sort(
+                    "updated_at_ms",
+                    switchy::database::query::SortDirection::Desc,
+                )
+                .limit(1)
                 .execute(database)
                 .await?;
-            rows.into_iter()
-                .map(|row| summary_from_loop_row(&row))
-                .collect::<Result<Vec<_>, _>>()
-                .map(|mut summaries| {
-                    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
-                    summaries.into_iter().next()
-                })
+            rows.first().map(summary_from_loop_row).transpose()
         })
     })?;
     Ok(db_summary)
@@ -4320,6 +4335,41 @@ mod tests {
             interrupted[0].stop_reason.as_deref(),
             Some("daemon restart")
         );
+    }
+
+    #[test]
+    fn latest_loop_does_not_create_absent_store_or_repair_missing_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ralph");
+        let store = RalphStateStore::from_ralph_state_root(&root);
+        assert!(store.latest_loop(temp.path()).unwrap().is_none());
+        assert!(!root.exists());
+        std::fs::create_dir(&root).unwrap();
+        assert!(store.latest_loop(temp.path()).is_err());
+        assert!(!store.database_path().exists());
+    }
+
+    #[test]
+    fn latest_loop_selects_newest_matching_repository() {
+        let (temp, store) = test_store();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let first = store
+            .create_initial_loop_state("first", &repo, None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let second = store
+            .create_initial_loop_state("second", &repo, None)
+            .unwrap();
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        store
+            .create_initial_loop_state("other", &other, None)
+            .unwrap();
+        let latest = store.latest_loop(&repo).unwrap().unwrap();
+        assert_ne!(latest.state_dir, first.state_dir);
+        assert_eq!(latest.state_dir, second.state_dir);
     }
 
     #[test]

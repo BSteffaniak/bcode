@@ -32,6 +32,7 @@ bcode_prompt_profile = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_ralph = { workspace = true }
+bcode_ralph_models = { workspace = true }
 bcode_session = { workspace = true }
 bcode_session_import = { workspace = true }
 bcode_session_migration = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable Ralph operation contracts for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "ralph", "models"]
+license     = { workspace = true }
+name        = "bcode_ralph_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

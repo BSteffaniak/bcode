@@ -21,10 +21,8 @@ use bcode_ipc::{
     DiscardWorkflowDraftRequest, ExportWorkflowRevisionRequest, ForkWorkflowDraftRequest,
     ImportWorkflowDraftRequest, ImportWorkflowRequest, ImportWorkflowRevisionRequest,
     PreviewWorkflowImportRequest, PromptPlacement, PublishAndStartWorkflowRequest,
-    PublishWorkflowDraftRequest, PublishWorkflowPackageRequest, RalphApproveRequest,
-    RalphCancelRequest, RalphLifecycleRequest, RalphListIterationsRequest, RalphListRunsRequest,
-    RalphResumeRequest, RalphRunRequest, RalphRunStatusRequest, RalphStatusRequest, Request,
-    ServerStopMode, SessionBulkMigrationStartRequest, SessionCompatibilityInventoryRequest,
+    PublishWorkflowDraftRequest, PublishWorkflowPackageRequest, Request, ServerStopMode,
+    SessionBulkMigrationStartRequest, SessionCompatibilityInventoryRequest,
     SetAuthoredWorkflowArchivedRequest, StartAuthoredWorkflowRequest,
     StartWorkflowPackageExportRequest, UpdateWorkflowDraftRequest, UpdateWorkflowPresetRequest,
     WorkflowComputationControl, WorkflowDefinitionRegistrationRequest,
@@ -33,6 +31,11 @@ use bcode_ipc::{
     WorkflowSourcePreviewRequest, WorkflowStartRequest, WorkflowTemplateInstantiationRequest,
     WorkflowTemplateStartRequest, WorktreeCreateRequest, WorktreeListRequest,
     WorktreeRemoveRequest,
+};
+use bcode_ralph_models::{
+    RalphApproveRequest, RalphCancelRequest, RalphLifecycleRequest, RalphListIterationsRequest,
+    RalphListRunsRequest, RalphResumeRequest, RalphRunRequest, RalphRunStatusRequest,
+    RalphStatusRequest,
 };
 use bcode_session_models::{
     ProjectionWindowRequest, SessionHistoryAroundQuery, SessionHistoryQuery, SessionId,
