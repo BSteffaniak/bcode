@@ -654,72 +654,9 @@ pub struct ReceiptReconciliationSummary {
     pub unresolved_read_only: Vec<String>,
 }
 
-/// One bounded inconsistency found by an explicit workflow doctor operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "issue", rename_all = "snake_case")]
-pub enum WorkflowDoctorIssue {
-    /// A run and its repair-required attempts disagree about whether repair is needed.
-    RepairStatusMismatch {
-        run_status: RunStatus,
-        repair_required_attempts: u64,
-    },
-    /// A persisted workflow grant is expired or its scope/row identity is inconsistent.
-    InvalidGrant { grant_id: String, reason: String },
-    /// An active external attempt has no receipt proving accepted owner identity.
-    OrphanedAttempt {
-        dispatch_identity: String,
-        status: String,
-        side_effect: DispatchSideEffect,
-        guidance: String,
-    },
-    /// A completed activation has no matching validated output, or a non-completed activation
-    /// references one.
-    ActivationOutputMismatch {
-        node_id: String,
-        activation_id: String,
-        activation_status: String,
-        output_id: Option<String>,
-    },
-    /// Persisted attempt identity does not match its stable identity components.
-    AttemptIdentityMismatch {
-        dispatch_identity: String,
-        expected_dispatch_identity: String,
-    },
-}
+pub use bcode_workflow::{WorkflowDoctorIssue, WorkflowDoctorReport};
 
-/// Bounded, non-mutating result of an explicit workflow doctor operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowDoctorReport {
-    pub run_id: String,
-    pub issues: Vec<WorkflowDoctorIssue>,
-    /// The requested bound prevented a complete inspection, so additional issues may exist.
-    pub truncated: bool,
-}
-
-/// Explicit operator resolution for one ambiguous mutating attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "resolution", rename_all = "snake_case")]
-pub enum RepairResolution {
-    /// The owner or operator proved the operation succeeded and supplies its validated output.
-    ConfirmSucceeded { output: ValidatedOutput },
-    /// The owner or operator proved the operation failed terminally.
-    ConfirmFailed { message: String },
-    /// The owner or operator proved the operation was cancelled.
-    ConfirmCancelled { message: String },
-    /// Explicitly abandon the ambiguous operation and permit a later, higher-numbered attempt.
-    ///
-    /// This is the only repair resolution that allows retry after an ambiguous mutation. It does
-    /// not dispatch work itself.
-    AbandonForExplicitRetry { reason: String },
-}
-
-/// Result of an explicit repair operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepairResult {
-    pub dispatch_identity: String,
-    pub attempt_status: String,
-    pub run_status: RunStatus,
-}
+pub use bcode_workflow::{RepairResolution, RepairResult};
 
 /// Optional fault hook used by deterministic output/downstream crash-boundary acceptance tests.
 pub trait WorkflowOutputFault: Sync {
@@ -883,19 +820,7 @@ pub use bcode_workflow::WorkflowRepeatOutcomeSummary;
 /// Compatibility export of the workflow-owned output contract.
 pub use bcode_workflow::WorkflowOutputSummary;
 
-/// Durable validated output persisted before downstream activation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidatedOutput {
-    pub output_id: String,
-    pub run_id: String,
-    pub node_id: String,
-    pub activation_id: String,
-    pub schema_id: String,
-    pub schema_version: u32,
-    pub value: serde_json::Value,
-    pub artifact_reference: Option<String>,
-    pub created_at_ms: u64,
-}
+pub use bcode_workflow::ValidatedOutput;
 
 /// Errors returned by durable workflow persistence.
 /// Actionable identity and schema detail for one target-input validation failure.
@@ -999,18 +924,8 @@ pub struct WorkflowStoreResetReceipt {
     pub reset_at_ms: u64,
 }
 
-/// Canonical persisted definition identity and content.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredWorkflowDefinition {
-    /// Stable definition identity.
-    pub definition_id: String,
-    /// Positive definition version.
-    pub version: u32,
-    /// SHA-256 of canonical serialized definition JSON.
-    pub checksum_sha256: String,
-    /// Canonical serialized definition.
-    pub definition_json: String,
-}
+/// Compatibility export of the workflow-owned registered definition value.
+pub use bcode_workflow::StoredWorkflowDefinition;
 
 /// Durable logical runtime-authored workflow metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1610,9 +1525,10 @@ impl WorkflowStore {
             ));
         }
         let definition_json = serde_json::to_string(definition)?;
-        if definition_json.len() > MAX_INLINE_JSON_BYTES {
+        if definition_json.len() > bcode_workflow::MAX_REGISTERED_WORKFLOW_DEFINITION_BYTES {
             return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow definition exceeds {MAX_INLINE_JSON_BYTES} bytes"
+                "workflow definition exceeds {} bytes",
+                bcode_workflow::MAX_REGISTERED_WORKFLOW_DEFINITION_BYTES
             )));
         }
         let checksum_sha256 = sha256_hex(definition_json.as_bytes());

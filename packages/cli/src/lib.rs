@@ -665,7 +665,57 @@ async fn handle_workflow_launch_detail(client: &BcodeClient, path: &Path) -> Res
             "unsupported or invalid workflow launch detail request".to_string(),
         )
     })?;
-    print_json(&client.workflow_launch_detail(request).await?)
+    print_json(
+        &bcode_workflow::WorkflowAuthoringApplication::workflow_launch_detail(client, request)
+            .await?,
+    )
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowTemplateCommand {
+    /// List bounded normalized template descriptions as JSON.
+    List {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Inspect one exact template as JSON; missing templates return null.
+    Inspect {
+        #[arg(long)]
+        owner_plugin_id: String,
+        #[arg(long)]
+        template_id: String,
+        #[arg(long)]
+        template_version: u32,
+    },
+}
+
+fn handle_workflow_template_command(
+    client: &BcodeClient,
+    command: WorkflowTemplateCommand,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CliError>> + Send + '_>> {
+    Box::pin(async move {
+        match command {
+            WorkflowTemplateCommand::List { limit } => print_json(
+                &bcode_workflow::WorkflowAuthoringApplication::inspect_workflow_templates(
+                    client, limit,
+                )
+                .await?,
+            ),
+            WorkflowTemplateCommand::Inspect {
+                owner_plugin_id,
+                template_id,
+                template_version,
+            } => print_json(
+                &bcode_workflow::WorkflowAuthoringApplication::inspect_workflow_template(
+                    client,
+                    owner_plugin_id,
+                    template_id,
+                    template_version,
+                )
+                .await?,
+            ),
+        }
+    })
 }
 
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
@@ -679,6 +729,31 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
     Box::pin(dispatch_workflow_command(command)).await
 }
 
+async fn print_workflow_definition(
+    client: &BcodeClient,
+    definition_id: String,
+    version: u32,
+    typed: bool,
+) -> Result<(), CliError> {
+    if typed {
+        print_json(
+            &bcode_workflow::WorkflowAuthoringApplication::inspect_workflow_definition(
+                client,
+                definition_id,
+                version,
+            )
+            .await?,
+        )?;
+    } else {
+        print_json(
+            &client
+                .describe_workflow_definition(definition_id, version)
+                .await?,
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
@@ -690,6 +765,9 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             print_json(
                 &serde_json::json!({"staged": true, "created": created, "published": false}),
             )?;
+        }
+        WorkflowCommand::Template { command } => {
+            Box::pin(handle_workflow_template_command(&client, *command)).await?;
         }
         WorkflowCommand::Author { command } => {
             Box::pin(handle_workflow_author_command(&client, command)).await?;
@@ -738,13 +816,23 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         WorkflowCommand::DescribeDefinition {
             definition_id,
             version,
+            typed,
         } => {
-            print_json(
-                &Box::pin(client.describe_workflow_definition(definition_id, version)).await?,
-            )?;
+            Box::pin(print_workflow_definition(
+                &client,
+                definition_id,
+                version,
+                typed,
+            ))
+            .await?;
         }
         WorkflowCommand::Doctor { run_id, limit } => {
-            print_json(&Box::pin(client.doctor_workflow_run(run_id, limit)).await?)?;
+            print_json(
+                &Box::pin(bcode_workflow::WorkflowRunApplication::doctor_workflow_run(
+                    &client, run_id, limit,
+                ))
+                .await?,
+            )?;
         }
         WorkflowCommand::LaunchDetail { .. } => unreachable!("handled before dispatch"),
         WorkflowCommand::CatalogView { query } => {
@@ -932,12 +1020,19 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             print_json(&approvals)?;
         }
         WorkflowCommand::CancelComputation { operation_id } => {
-            print_json(&client.cancel_workflow_computation(operation_id).await?)?;
+            print_json(
+                &bcode_workflow::WorkflowAuthoringApplication::cancel_workflow_computation(
+                    &client,
+                    operation_id,
+                )
+                .await?,
+            )?;
         }
         WorkflowCommand::ReconcileOrphans { apply, limit, json } => {
-            let report = client
-                .reconcile_orphaned_workflow_runs(apply, limit)
-                .await?;
+            let report = bcode_workflow::WorkflowRunApplication::reconcile_orphaned_workflow_runs(
+                &client, apply, limit,
+            )
+            .await?;
             if json {
                 print_json(&report)?;
             } else {
@@ -1086,12 +1181,11 @@ fn handle_workflow_author_command(
                     read_workflow_authoring_document(client, &file, source_format.as_deref())
                         .await?;
                 print_json(
-                    &client
-                        .create_authored_workflow(bcode_workflow::CreateAuthoredWorkflowRequest {
-                            document,
-                            draft_id,
-                        })
-                        .await?,
+                    &bcode_workflow::WorkflowAuthoringApplication::create_authored_workflow(
+                        client,
+                        bcode_workflow::CreateAuthoredWorkflowRequest { document, draft_id },
+                    )
+                    .await?,
                 )?;
             }
             WorkflowAuthorCommand::Apply {
@@ -1101,9 +1195,15 @@ fn handle_workflow_author_command(
             } => {
                 let loaded = read_workflow_source_file(&file, source_format.as_deref())?;
                 print_json(
-                    &client
-                        .apply_workflow_source(loaded.source_format, loaded.source, draft_id)
-                        .await?,
+                    &bcode_workflow::WorkflowAuthoringApplication::apply_workflow_source(
+                        client,
+                        bcode_workflow::ApplyWorkflowSourceRequest {
+                            source_format: loaded.source_format,
+                            source: loaded.source,
+                            draft_id,
+                        },
+                    )
+                    .await?,
                 )?;
             }
             WorkflowAuthorCommand::List {
@@ -1111,18 +1211,31 @@ fn handle_workflow_author_command(
                 cursor_workflow_id,
                 limit,
             } => print_json(
-                &client
-                    .list_authored_workflows(
-                        authoring_list_cursor(cursor_updated_at_ms, cursor_workflow_id)?,
+                &bcode_workflow::WorkflowAuthoringApplication::list_authored_workflows(
+                    client,
+                    authoring_list_cursor(cursor_updated_at_ms, cursor_workflow_id)?,
+                    limit,
+                )
+                .await?,
+            )?,
+            WorkflowAuthorCommand::Get { workflow_id } => {
+                print_json(
+                    &bcode_workflow::WorkflowAuthoringApplication::authored_workflow(
+                        client,
+                        workflow_id,
+                    )
+                    .await?,
+                )?;
+            }
+            WorkflowAuthorCommand::Inspect { workflow_id, limit } => {
+                print_json(
+                    &bcode_workflow::WorkflowAuthoringApplication::inspect_authored_workflow(
+                        client,
+                        workflow_id,
                         limit,
                     )
                     .await?,
-            )?,
-            WorkflowAuthorCommand::Get { workflow_id } => {
-                print_json(&client.authored_workflow(workflow_id).await?)?;
-            }
-            WorkflowAuthorCommand::Inspect { workflow_id, limit } => {
-                print_json(&client.inspect_authored_workflow(workflow_id, limit).await?)?;
+                )?;
             }
             WorkflowAuthorCommand::Draft { command } => {
                 handle_workflow_draft_command(client, command).await?;
@@ -1240,14 +1353,14 @@ fn handle_workflow_author_command(
                 workflow_id,
                 archived,
             } => print_json(
-                &client
-                    .set_authored_workflow_archived(
-                        bcode_workflow::SetAuthoredWorkflowArchivedRequest {
-                            workflow_id,
-                            archived,
-                        },
-                    )
-                    .await?,
+                &bcode_workflow::WorkflowAuthoringApplication::set_authored_workflow_archived(
+                    client,
+                    bcode_workflow::SetAuthoredWorkflowArchivedRequest {
+                        workflow_id,
+                        archived,
+                    },
+                )
+                .await?,
             )?,
             WorkflowAuthorCommand::Discard {
                 workflow_id,
@@ -1283,14 +1396,16 @@ fn handle_workflow_author_command(
                     }
                 };
                 print_json(
-                    &client
-                        .fork_workflow_draft(bcode_workflow::ForkWorkflowDraftRequest {
+                    &bcode_workflow::WorkflowAuthoringApplication::fork_workflow_draft(
+                        client,
+                        bcode_workflow::ForkWorkflowDraftRequest {
                             workflow_id,
                             source,
                             draft_id,
                             producer: cli_workflow_producer(),
-                        })
-                        .await?,
+                        },
+                    )
+                    .await?,
                 )?;
             }
             WorkflowAuthorCommand::Preset { command } => {
@@ -1300,12 +1415,14 @@ fn handle_workflow_author_command(
                 workflow_id,
                 revision,
             } => print_json(
-                &client
-                    .export_workflow_revision(bcode_workflow::ExportWorkflowRevisionRequest {
+                &bcode_workflow::WorkflowAuthoringApplication::export_workflow_revision(
+                    client,
+                    bcode_workflow::ExportWorkflowRevisionRequest {
                         workflow_id,
                         revision,
-                    })
-                    .await?,
+                    },
+                )
+                .await?,
             )?,
             WorkflowAuthorCommand::ImportPreview {
                 file,
@@ -1315,13 +1432,15 @@ fn handle_workflow_author_command(
             } => {
                 let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
                 print_json(
-                    &client
-                        .preview_workflow_import(bcode_workflow::PreviewWorkflowImportRequest {
+                    &bcode_workflow::WorkflowAuthoringApplication::preview_workflow_import(
+                        client,
+                        bcode_workflow::PreviewWorkflowImportRequest {
                             bundle,
                             target_workflow_id,
                             control: workflow_computation_control(operation_id, timeout_ms),
-                        })
-                        .await?,
+                        },
+                    )
+                    .await?,
                 )?;
             }
             WorkflowAuthorCommand::Import {
@@ -1333,16 +1452,18 @@ fn handle_workflow_author_command(
             } => {
                 let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
                 print_json(
-                    &client
-                        .import_workflow(bcode_workflow::ImportWorkflowRequest {
+                    &bcode_workflow::WorkflowAuthoringApplication::import_workflow(
+                        client,
+                        bcode_workflow::ImportWorkflowRequest {
                             bundle,
                             target_workflow_id,
                             draft_id,
                             collision_policy:
                                 bcode_workflow::WorkflowImportCollisionPolicy::RequireNewWorkflow,
                             control: workflow_computation_control(operation_id, timeout_ms),
-                        })
-                        .await?,
+                        },
+                    )
+                    .await?,
                 )?;
             }
             WorkflowAuthorCommand::ImportDraft {
@@ -1373,8 +1494,7 @@ fn handle_workflow_author_command(
             } => {
                 let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
                 print_json(
-                    &client
-                        .import_workflow_revision(bcode_workflow::ImportWorkflowRevisionRequest {
+                    &bcode_workflow::WorkflowAuthoringApplication::import_workflow_revision(client, bcode_workflow::ImportWorkflowRevisionRequest {
                             bundle,
                             workflow_id,
                             revision,
@@ -1387,7 +1507,12 @@ fn handle_workflow_author_command(
                 )?;
             }
             WorkflowAuthorCommand::Catalog => {
-                print_json(&client.workflow_authoring_catalog().await?)?;
+                print_json(
+                    &bcode_workflow::WorkflowAuthoringApplication::workflow_authoring_catalog(
+                        client,
+                    )
+                    .await?,
+                )?;
             }
             WorkflowAuthorCommand::Validate {
                 file,
@@ -1397,15 +1522,15 @@ fn handle_workflow_author_command(
             } => {
                 let loaded = read_workflow_source_file(&file, source_format.as_deref())?;
                 print_json(
-                    &client
-                        .validate_workflow_source(
-                            bcode_workflow::WorkflowSourceComputationRequest {
-                                source_format: loaded.source_format,
-                                source: loaded.source,
-                                control: workflow_computation_control(operation_id, timeout_ms),
-                            },
-                        )
-                        .await?,
+                    &bcode_workflow::WorkflowAuthoringApplication::validate_workflow_source(
+                        client,
+                        bcode_workflow::WorkflowSourceComputationRequest {
+                            source_format: loaded.source_format,
+                            source: loaded.source,
+                            control: workflow_computation_control(operation_id, timeout_ms),
+                        },
+                    )
+                    .await?,
                 )?;
             }
             WorkflowAuthorCommand::Preview {
@@ -1427,14 +1552,16 @@ fn handle_workflow_author_command(
                     .map(read_bounded_json)
                     .transpose()?;
                 print_json(
-                    &client
-                        .preview_workflow_source(bcode_workflow::WorkflowSourcePreviewRequest {
+                    &bcode_workflow::WorkflowAuthoringApplication::preview_workflow_source(
+                        client,
+                        bcode_workflow::WorkflowSourcePreviewRequest {
                             source_format: loaded.source_format,
                             source: loaded.source,
                             configuration,
                             control: workflow_computation_control(operation_id, timeout_ms),
-                        })
-                        .await?,
+                        },
+                    )
+                    .await?,
                 )?;
             }
         }
@@ -1453,8 +1580,7 @@ fn handle_workflow_import_draft_command(
     Box::pin(async move {
         let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
         print_json(
-            &client
-                .import_workflow_draft(bcode_workflow::ImportWorkflowDraftRequest {
+            &bcode_workflow::WorkflowAuthoringApplication::import_workflow_draft(client, bcode_workflow::ImportWorkflowDraftRequest {
                     bundle,
                     workflow_id,
                     draft_id,
@@ -1479,18 +1605,25 @@ async fn handle_workflow_draft_command(
             cursor_draft_id,
             limit,
         } => print_json(
-            &client
-                .list_workflow_drafts(
-                    workflow_id,
-                    authoring_list_cursor(cursor_updated_at_ms, cursor_draft_id)?,
-                    limit,
-                )
-                .await?,
+            &bcode_workflow::WorkflowAuthoringApplication::list_workflow_drafts(
+                client,
+                workflow_id,
+                authoring_list_cursor(cursor_updated_at_ms, cursor_draft_id)?,
+                limit,
+            )
+            .await?,
         )?,
         WorkflowDraftCommand::Get {
             workflow_id,
             draft_id,
-        } => print_json(&client.workflow_draft(workflow_id, draft_id).await?)?,
+        } => print_json(
+            &bcode_workflow::WorkflowAuthoringApplication::workflow_draft(
+                client,
+                workflow_id,
+                draft_id,
+            )
+            .await?,
+        )?,
     }
     Ok(())
 }
@@ -1505,27 +1638,33 @@ async fn handle_workflow_revision_command(
             before_revision,
             limit,
         } => print_json(
-            &client
-                .list_workflow_revisions(
-                    workflow_id,
-                    before_revision
-                        .map(|revision| bcode_workflow::WorkflowRevisionListCursor { revision }),
-                    limit,
-                )
-                .await?,
+            &bcode_workflow::WorkflowAuthoringApplication::list_workflow_revisions(
+                client,
+                workflow_id,
+                before_revision
+                    .map(|revision| bcode_workflow::WorkflowRevisionListCursor { revision }),
+                limit,
+            )
+            .await?,
         )?,
         WorkflowRevisionCommand::Inspect {
             workflow_id,
             revision,
         } => print_json(
-            &client
-                .workflow_revision_requirement_inspection(workflow_id, revision)
+            &bcode_workflow::WorkflowAuthoringApplication::workflow_revision_requirement_inspection(client, workflow_id, revision)
                 .await?,
         )?,
         WorkflowRevisionCommand::Get {
             workflow_id,
             revision,
-        } => print_json(&client.workflow_revision(workflow_id, revision).await?)?,
+        } => print_json(
+            &bcode_workflow::WorkflowAuthoringApplication::workflow_revision(
+                client,
+                workflow_id,
+                revision,
+            )
+            .await?,
+        )?,
     }
     Ok(())
 }
@@ -1577,24 +1716,33 @@ async fn handle_workflow_preset_command(
             cursor_preset_id,
             limit,
         } => print_json(
-            &client
-                .list_workflow_presets(
-                    workflow_id,
-                    authoring_list_cursor(cursor_updated_at_ms, cursor_preset_id)?,
-                    limit,
-                )
-                .await?,
+            &bcode_workflow::WorkflowAuthoringApplication::list_workflow_presets(
+                client,
+                workflow_id,
+                authoring_list_cursor(cursor_updated_at_ms, cursor_preset_id)?,
+                limit,
+            )
+            .await?,
         )?,
         WorkflowPresetCommand::Get {
             workflow_id,
             preset_id,
-        } => print_json(&client.workflow_preset(workflow_id, preset_id).await?)?,
+        } => print_json(
+            &bcode_workflow::WorkflowAuthoringApplication::workflow_preset(
+                client,
+                workflow_id,
+                preset_id,
+            )
+            .await?,
+        )?,
         WorkflowPresetCommand::Create { file } => {
             let preset = serde_json::from_value(read_bounded_json(&file)?)?;
             print_json(
-                &client
-                    .create_workflow_preset(bcode_workflow::CreateWorkflowPresetRequest { preset })
-                    .await?,
+                &bcode_workflow::WorkflowAuthoringApplication::create_workflow_preset(
+                    client,
+                    bcode_workflow::CreateWorkflowPresetRequest { preset },
+                )
+                .await?,
             )?;
         }
         WorkflowPresetCommand::Update {
@@ -1603,12 +1751,14 @@ async fn handle_workflow_preset_command(
         } => {
             let preset = serde_json::from_value(read_bounded_json(&file)?)?;
             print_json(
-                &client
-                    .update_workflow_preset(bcode_workflow::UpdateWorkflowPresetRequest {
+                &bcode_workflow::WorkflowAuthoringApplication::update_workflow_preset(
+                    client,
+                    bcode_workflow::UpdateWorkflowPresetRequest {
                         expected_generation,
                         preset,
-                    })
-                    .await?,
+                    },
+                )
+                .await?,
             )?;
         }
         WorkflowPresetCommand::Delete {
@@ -1616,13 +1766,15 @@ async fn handle_workflow_preset_command(
             preset_id,
             expected_generation,
         } => print_json(
-            &client
-                .delete_workflow_preset(bcode_workflow::DeleteWorkflowPresetRequest {
+            &bcode_workflow::WorkflowAuthoringApplication::delete_workflow_preset(
+                client,
+                bcode_workflow::DeleteWorkflowPresetRequest {
                     workflow_id,
                     preset_id,
                     expected_generation,
-                })
-                .await?,
+                },
+            )
+            .await?,
         )?,
     }
     Ok(())
@@ -1693,8 +1845,9 @@ async fn handle_workflow_package_command(
 ) -> Result<(), CliError> {
     if let WorkflowPackageCommand::Discover { workspace, limit } = command {
         let workspace = workspace.map_or_else(std::env::current_dir, Ok)?;
-        let page = client
-            .workflow_launch_catalog(bcode_workflow::WorkflowLaunchCatalogRequest {
+        let page = bcode_workflow::WorkflowAuthoringApplication::workflow_launch_catalog(
+            client,
+            bcode_workflow::WorkflowLaunchCatalogRequest {
                 version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
                 workspace,
                 limit,
@@ -1702,8 +1855,9 @@ async fn handle_workflow_package_command(
                 search: None,
                 source_kind: None,
                 readiness: None,
-            })
-            .await?;
+            },
+        )
+        .await?;
         print_json(&page)?;
         return Ok(());
     }
@@ -1724,12 +1878,14 @@ async fn handle_workflow_package_command(
             .validate()
             .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
         print_json(
-            &client
-                .publish_workflow_package(bcode_workflow::PublishWorkflowPackageRequest {
+            &bcode_workflow::WorkflowAuthoringApplication::publish_workflow_package(
+                client,
+                bcode_workflow::PublishWorkflowPackageRequest {
                     request,
                     published_at_ms: current_unix_time_ms()?,
-                })
-                .await?,
+                },
+            )
+            .await?,
         )?;
         return Ok(());
     }
@@ -1770,12 +1926,14 @@ async fn handle_workflow_package_command(
         }
     };
     let closure = read_workflow_package_closure(&manifest_path)?;
-    let result = client
-        .validate_workflow_package(bcode_workflow::WorkflowPackageComputationRequest {
+    let result = bcode_workflow::WorkflowAuthoringApplication::validate_workflow_package(
+        client,
+        bcode_workflow::WorkflowPackageComputationRequest {
             closure,
             control: workflow_computation_control(operation_id.clone(), timeout_ms),
-        })
-        .await?;
+        },
+    )
+    .await?;
     match operation {
         PackageCliOperation::Validate => print_json(&result)?,
         PackageCliOperation::Preview => {
@@ -1795,14 +1953,16 @@ async fn handle_workflow_package_command(
                 .map(|package| package.plan.clone())
                 .collect();
             print_json(
-                &client
-                    .preview_workflow_package(bcode_workflow::WorkflowPackagePreviewRequest {
+                &bcode_workflow::WorkflowAuthoringApplication::preview_workflow_package(
+                    client,
+                    bcode_workflow::WorkflowPackagePreviewRequest {
                         plan: entry_plan,
                         dependency_plans,
                         configurations: std::collections::BTreeMap::new(),
                         control: workflow_computation_control(operation_id, timeout_ms),
-                    })
-                    .await?,
+                    },
+                )
+                .await?,
             )?;
         }
         PackageCliOperation::Apply(expected_generations) => {
@@ -1815,16 +1975,18 @@ async fn handle_workflow_package_command(
                         Vec::new()
                     };
                 applied.push(
-                    client
-                        .apply_workflow_package(bcode_workflow::ApplyWorkflowPackageRequest {
+                    bcode_workflow::WorkflowAuthoringApplication::apply_workflow_package(
+                        client,
+                        bcode_workflow::ApplyWorkflowPackageRequest {
                             request: bcode_workflow::WorkflowPackageApplyRequest {
                                 version: bcode_workflow::WORKFLOW_PACKAGE_MUTATION_VERSION,
                                 plan: package.plan.clone(),
                                 expected_generations: package_expected_generations,
                             },
                             applied_at_ms: current_unix_time_ms()?,
-                        })
-                        .await?,
+                        },
+                    )
+                    .await?,
                 );
             }
             print_json(&applied)?;
@@ -2206,7 +2368,8 @@ async fn read_workflow_source_lowering(
         )
         .map_err(|error| CliError::InvalidArguments(error.to_string()))?,
     };
-    let catalog = client.workflow_authoring_catalog().await?;
+    let catalog =
+        bcode_workflow::WorkflowAuthoringApplication::workflow_authoring_catalog(client).await?;
     let lowering = bcode_workflow::lower_workflow_authoring_source(source, format, &catalog)
         .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
     Ok(LoadedWorkflowSource { lowering })
@@ -3518,6 +3681,11 @@ enum WorkflowCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Inspect loaded workflow templates without mutation.
+    Template {
+        #[command(subcommand)]
+        command: Box<WorkflowTemplateCommand>,
+    },
     /// Runtime-authored workflow operations.
     Author {
         #[command(subcommand)]
@@ -3588,6 +3756,9 @@ enum WorkflowCommand {
         definition_id: String,
         #[arg(long)]
         version: u32,
+        /// Return validated structured content instead of the compatibility storage envelope.
+        #[arg(long)]
+        typed: bool,
     },
     /// Inspect one workflow run for damage or ambiguous attempts without repairing it.
     Doctor {
@@ -19771,6 +19942,28 @@ mod web_command_tests {
         assert!(matches!(cli.command,
             Some(Commands::Workflow { command: WorkflowCommand::StageRunEdit { file } })
             if file == Path::new("edit.json")));
+    }
+
+    #[test]
+    fn workflow_definition_typed_output_is_explicit() {
+        for typed in [false, true] {
+            let mut args = vec![
+                "bcode",
+                "workflow",
+                "describe-definition",
+                "--definition-id",
+                "definition",
+                "--version",
+                "1",
+            ];
+            if typed {
+                args.push("--typed");
+            }
+            let cli = Cli::try_parse_from(args).expect("definition command");
+            assert!(matches!(cli.command, Some(Commands::Workflow {
+                command: WorkflowCommand::DescribeDefinition { typed: actual, .. }
+            }) if actual == typed));
+        }
     }
 
     #[test]

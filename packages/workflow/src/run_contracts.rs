@@ -110,13 +110,145 @@ pub enum WorkflowRunWatchEvent {
     },
 }
 
-/// Connected application operations for workflow run admission.
-///
-/// Implementations own caller identity and authorization. An error does not promise rollback
-/// or permit automatic retry; successful admission is not a terminal run outcome.
+/// One bounded inconsistency found by an explicit workflow doctor operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "issue", rename_all = "snake_case")]
+pub enum WorkflowDoctorIssue {
+    /// A run and its repair-required attempts disagree about whether repair is needed.
+    RepairStatusMismatch {
+        run_status: RunStatus,
+        repair_required_attempts: u64,
+    },
+    /// A persisted workflow grant is expired or its scope/row identity is inconsistent.
+    InvalidGrant { grant_id: String, reason: String },
+    /// An active external attempt has no receipt proving accepted owner identity.
+    OrphanedAttempt {
+        dispatch_identity: String,
+        status: String,
+        side_effect: DispatchSideEffect,
+        guidance: String,
+    },
+    /// An activation's completion status and validated output disagree.
+    ActivationOutputMismatch {
+        node_id: String,
+        activation_id: String,
+        activation_status: String,
+        output_id: Option<String>,
+    },
+    /// Persisted attempt identity does not match its stable identity components.
+    AttemptIdentityMismatch {
+        dispatch_identity: String,
+        expected_dispatch_identity: String,
+    },
+}
+
+/// Bounded, non-mutating result of an explicit workflow doctor operation.
+/// Existing tagged issue representations are preserved; unknown variants are rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDoctorReport {
+    /// Inspected run identity.
+    pub run_id: String,
+    /// Inconsistencies found within the requested bound.
+    pub issues: Vec<WorkflowDoctorIssue>,
+    /// The requested bound prevented a complete inspection, so additional issues may exist.
+    pub truncated: bool,
+}
+
+/// Output supplied for validated workflow completion. Construction alone does not prove validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatedOutput {
+    /// Output identity.
+    pub output_id: String,
+    /// Owning run.
+    pub run_id: String,
+    /// Producing node.
+    pub node_id: String,
+    /// Producing activation.
+    pub activation_id: String,
+    /// Output schema identity.
+    pub schema_id: String,
+    /// Output schema version.
+    pub schema_version: u32,
+    /// Output value checked by the accepting operation.
+    pub value: serde_json::Value,
+    /// Optional artifact reference.
+    pub artifact_reference: Option<String>,
+    /// Creation time in Unix milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Explicit operator resolution for an ambiguous attempt. Existing tagged wire forms are
+/// preserved; unknown resolution variants are rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "resolution", rename_all = "snake_case")]
+pub enum RepairResolution {
+    /// Confirm success with output that the accepting operation must validate.
+    ConfirmSucceeded { output: ValidatedOutput },
+    /// Confirm terminal failure.
+    ConfirmFailed { message: String },
+    /// Confirm cancellation.
+    ConfirmCancelled { message: String },
+    /// Abandon ambiguity to permit a later explicit retry; does not dispatch work.
+    AbandonForExplicitRetry { reason: String },
+}
+
+/// Result of an explicit repair operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairResult {
+    /// Repaired dispatch identity.
+    pub dispatch_identity: String,
+    /// Resulting attempt status.
+    pub attempt_status: String,
+    /// Resulting run status.
+    pub run_status: RunStatus,
+}
+
+/// Connected workflow operations retaining caller identity and authorization.
+/// Errors do not promise rollback or permit automatic retry.
 pub trait WorkflowRunApplication: Sync {
+    /// Start one exact plugin-owned template through the normal workflow execution path.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable storage, missing/disabled templates, invalid configuration,
+    /// denied authorization, or failure to start execution.
+    fn start_workflow_template(
+        &self,
+        request: WorkflowTemplateStartRequest,
+    ) -> impl std::future::Future<Output = Result<WorkflowRunStartResponse, Self::Error>> + Send;
+
+    /// Apply an explicit repair resolution without dispatching a retry.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable state, unverifiable ownership, invalid resolution or transport failure.
+    fn repair_workflow_attempt(
+        &self,
+        dispatch_identity: String,
+        resolution: RepairResolution,
+    ) -> impl std::future::Future<Output = Result<RepairResult, Self::Error>> + Send;
+    /// Inspect a run for bounded inconsistencies without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, missing run, or transport failure.
+    fn doctor_workflow_run(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<WorkflowDoctorReport, Self::Error>> + Send;
+
     /// Adapter-owned transport or normalized domain failure.
     type Error;
+
+    /// Inspect orphaned runs, or explicitly reconcile them when `apply` is true.
+    ///
+    /// Implementations must preserve ownership verification and defer live or unverifiable owners.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, failed ownership checks, or transport failure.
+    fn reconcile_orphaned_workflow_runs(
+        &self,
+        apply: bool,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<OrphanedWorkflowRunReport, Self::Error>> + Send;
 
     /// List bounded pending mutation approvals across runs without repair.
     ///

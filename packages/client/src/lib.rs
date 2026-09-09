@@ -465,6 +465,35 @@ pub enum ClientError {
 }
 
 impl bcode_workflow::WorkflowRunApplication for BcodeClient {
+    async fn start_workflow_template(
+        &self,
+        request: bcode_workflow::WorkflowTemplateStartRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, Self::Error> {
+        Self::start_workflow_template(self, request).await
+    }
+
+    async fn repair_workflow_attempt(
+        &self,
+        dispatch_identity: String,
+        resolution: bcode_workflow::RepairResolution,
+    ) -> Result<bcode_workflow::RepairResult, Self::Error> {
+        Self::repair_workflow_attempt(self, dispatch_identity, resolution).await
+    }
+    async fn doctor_workflow_run(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<bcode_workflow::WorkflowDoctorReport, Self::Error> {
+        Self::doctor_workflow_run(self, run_id, limit).await
+    }
+    async fn reconcile_orphaned_workflow_runs(
+        &self,
+        apply: bool,
+        limit: usize,
+    ) -> Result<bcode_workflow::OrphanedWorkflowRunReport, Self::Error> {
+        Self::reconcile_orphaned_workflow_runs(self, apply, limit).await
+    }
+
     async fn list_all_workflow_mutation_approvals(
         &self,
         limit: usize,
@@ -637,6 +666,366 @@ impl bcode_workflow::WorkflowRunApplication for BcodeClient {
 }
 
 impl bcode_workflow::WorkflowAuthoringApplication for BcodeClient {
+    async fn instantiate_workflow_template(
+        &self,
+        request: bcode_workflow::WorkflowTemplateInstantiationRequest,
+    ) -> Result<
+        (
+            bcode_workflow::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowDraftSnapshot,
+        ),
+        Self::Error,
+    > {
+        Self::instantiate_workflow_template(self, request).await
+    }
+
+    async fn inspect_workflow_definition(
+        &self,
+        definition_id: String,
+        version: u32,
+    ) -> Result<Option<bcode_workflow::WorkflowDefinitionInspection>, Self::Error> {
+        let stored =
+            Self::describe_workflow_definition(self, definition_id.clone(), version).await?;
+        if stored
+            .as_ref()
+            .is_some_and(|value| value.definition_id != definition_id || value.version != version)
+        {
+            let failure = bcode_workflow::WorkflowAuthoringFailure::StateUnavailable;
+            return Err(ClientError::Server {
+                code: failure.code().to_string(),
+                message: failure.to_string(),
+            });
+        }
+        stored
+            .map(bcode_workflow::WorkflowDefinitionInspection::try_from)
+            .transpose()
+            .map_err(|failure| ClientError::Server {
+                code: failure.code().to_string(),
+                message: failure.to_string(),
+            })
+    }
+
+    async fn register_workflow_definition(
+        &self,
+        request: bcode_workflow::WorkflowDefinitionRegistrationRequest,
+    ) -> Result<bcode_workflow::StoredWorkflowDefinition, Self::Error> {
+        Self::register_workflow_definition(self, request).await
+    }
+
+    async fn list_workflow_definitions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::StoredWorkflowDefinition>, Self::Error> {
+        Self::list_workflow_definitions(self, limit).await
+    }
+    async fn describe_workflow_definition(
+        &self,
+        definition_id: String,
+        version: u32,
+    ) -> Result<Option<bcode_workflow::StoredWorkflowDefinition>, Self::Error> {
+        Self::describe_workflow_definition(self, definition_id, version).await
+    }
+
+    async fn publish_workflow_package(
+        &self,
+        request: bcode_workflow::PublishWorkflowPackageRequest,
+    ) -> Result<bcode_workflow::WorkflowPackageMutationResult, Self::Error> {
+        Self::publish_workflow_package(self, request).await
+    }
+    async fn apply_workflow_package(
+        &self,
+        request: bcode_workflow::ApplyWorkflowPackageRequest,
+    ) -> Result<bcode_workflow::WorkflowPackageMutationResult, Self::Error> {
+        Self::apply_workflow_package(self, request).await
+    }
+    async fn inspect_workflow_templates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowTemplateInspection>, Self::Error> {
+        match self
+            .send_request(Request::InspectWorkflowTemplates { limit })
+            .await?
+        {
+            ResponsePayload::WorkflowTemplateInspections { templates } => Ok(templates),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+    async fn inspect_workflow_template(
+        &self,
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    ) -> Result<Option<bcode_workflow::WorkflowTemplateInspection>, Self::Error> {
+        match self
+            .send_request(Request::InspectWorkflowTemplate {
+                owner_plugin_id,
+                template_id,
+                template_version,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowTemplateInspection { template } => {
+                Ok(template.map(|template| *template))
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+    async fn workflow_package_publication(
+        &self,
+        package_id: String,
+    ) -> Result<Option<bcode_workflow::WorkflowPackagePublicationReceipt>, Self::Error> {
+        Self::workflow_package_publication(self, package_id).await
+    }
+    async fn workflow_launch_catalog(
+        &self,
+        request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    ) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, Self::Error> {
+        Self::workflow_launch_catalog(self, request).await
+    }
+    async fn workflow_launch_detail(
+        &self,
+        request: bcode_workflow::WorkflowLaunchDetailRequest,
+    ) -> Result<bcode_workflow::WorkflowLaunchDetail, Self::Error> {
+        Self::workflow_launch_detail(self, request).await
+    }
+    async fn validate_workflow_authoring_with_control(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        control: bcode_workflow::WorkflowComputationControl,
+    ) -> Result<bcode_workflow::WorkflowValidationReport, Self::Error> {
+        Self::validate_workflow_authoring_with_control(self, document, control).await
+    }
+    async fn preview_workflow_compilation_with_control(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        configuration: Option<serde_json::Value>,
+        control: bcode_workflow::WorkflowComputationControl,
+    ) -> Result<bcode_workflow::WorkflowCompilationPreview, Self::Error> {
+        Self::preview_workflow_compilation_with_control(self, document, configuration, control)
+            .await
+    }
+    async fn validate_workflow_package(
+        &self,
+        request: bcode_workflow::WorkflowPackageComputationRequest,
+    ) -> Result<bcode_workflow::WorkflowPackageValidationResult, Self::Error> {
+        Self::validate_workflow_package(self, request).await
+    }
+    async fn preview_workflow_package(
+        &self,
+        request: bcode_workflow::WorkflowPackagePreviewRequest,
+    ) -> Result<bcode_workflow::WorkflowPackagePreview, Self::Error> {
+        Self::preview_workflow_package(self, request).await
+    }
+    async fn validate_workflow_source(
+        &self,
+        request: bcode_workflow::WorkflowSourceComputationRequest,
+    ) -> Result<bcode_workflow::WorkflowSourceValidationResult, Self::Error> {
+        Self::validate_workflow_source(self, request).await
+    }
+    async fn preview_workflow_source(
+        &self,
+        request: bcode_workflow::WorkflowSourcePreviewRequest,
+    ) -> Result<bcode_workflow::WorkflowSourcePreviewResult, Self::Error> {
+        Self::preview_workflow_source(self, request).await
+    }
+    async fn workflow_revision_requirement_inspection(
+        &self,
+        workflow_id: String,
+        revision: u64,
+    ) -> Result<Option<bcode_workflow::WorkflowRevisionRequirementInspection>, Self::Error> {
+        Self::workflow_revision_requirement_inspection(self, workflow_id, revision).await
+    }
+    async fn workflow_authoring_catalog(
+        &self,
+    ) -> Result<bcode_workflow::WorkflowAuthoringCatalogSnapshot, Self::Error> {
+        Self::workflow_authoring_catalog(self).await
+    }
+    async fn list_workflow_presets(
+        &self,
+        workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> Result<
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::WorkflowPresetSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
+        Self::Error,
+    > {
+        Self::list_workflow_presets(self, workflow_id, cursor, limit).await
+    }
+    async fn workflow_preset(
+        &self,
+        workflow_id: String,
+        preset_id: String,
+    ) -> Result<Option<bcode_workflow::WorkflowPresetSnapshot>, Self::Error> {
+        Self::workflow_preset(self, workflow_id, preset_id).await
+    }
+    async fn list_workflow_revisions(
+        &self,
+        workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowRevisionListCursor>,
+        limit: usize,
+    ) -> Result<
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::WorkflowRevisionSnapshot,
+            bcode_workflow::WorkflowRevisionListCursor,
+        >,
+        Self::Error,
+    > {
+        Self::list_workflow_revisions(self, workflow_id, cursor, limit).await
+    }
+    async fn workflow_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+    ) -> Result<Option<bcode_workflow::WorkflowRevisionSnapshot>, Self::Error> {
+        Self::workflow_revision(self, workflow_id, revision).await
+    }
+    async fn list_workflow_drafts(
+        &self,
+        workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> Result<
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::WorkflowDraftSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
+        Self::Error,
+    > {
+        Self::list_workflow_drafts(self, workflow_id, cursor, limit).await
+    }
+    async fn workflow_draft(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+    ) -> Result<Option<bcode_workflow::WorkflowDraftSnapshot>, Self::Error> {
+        Self::workflow_draft(self, workflow_id, draft_id).await
+    }
+    async fn list_authored_workflows(
+        &self,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> Result<
+        bcode_workflow::WorkflowAuthoringPage<
+            bcode_workflow::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
+        Self::Error,
+    > {
+        Self::list_authored_workflows(self, cursor, limit).await
+    }
+    async fn authored_workflow(
+        &self,
+        workflow_id: String,
+    ) -> Result<Option<bcode_workflow::AuthoredWorkflowSnapshot>, Self::Error> {
+        Self::authored_workflow(self, workflow_id).await
+    }
+    async fn inspect_authored_workflow(
+        &self,
+        workflow_id: String,
+        limit: usize,
+    ) -> Result<Option<bcode_workflow::AuthoredWorkflowInspection>, Self::Error> {
+        Self::inspect_authored_workflow(self, workflow_id, limit).await
+    }
+    async fn import_workflow_draft(
+        &self,
+        request: bcode_workflow::ImportWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftImportResult, Self::Error> {
+        Self::import_workflow_draft(self, request).await
+    }
+    async fn import_workflow_revision(
+        &self,
+        request: bcode_workflow::ImportWorkflowRevisionRequest,
+    ) -> Result<bcode_workflow::WorkflowRevisionImportResult, Self::Error> {
+        Self::import_workflow_revision(self, request).await
+    }
+    async fn import_workflow(
+        &self,
+        request: bcode_workflow::ImportWorkflowRequest,
+    ) -> Result<
+        (
+            bcode_workflow::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowDraftSnapshot,
+        ),
+        Self::Error,
+    > {
+        Self::import_workflow(self, request).await
+    }
+    async fn preview_workflow_import(
+        &self,
+        request: bcode_workflow::PreviewWorkflowImportRequest,
+    ) -> Result<bcode_workflow::WorkflowImportPreview, Self::Error> {
+        Self::preview_workflow_import(self, request).await
+    }
+    async fn export_workflow_revision(
+        &self,
+        request: bcode_workflow::ExportWorkflowRevisionRequest,
+    ) -> Result<bcode_workflow::WorkflowExportBundle, Self::Error> {
+        Self::export_workflow_revision(self, request).await
+    }
+    async fn create_workflow_preset(
+        &self,
+        request: bcode_workflow::CreateWorkflowPresetRequest,
+    ) -> Result<bcode_workflow::WorkflowPresetSnapshot, Self::Error> {
+        Self::create_workflow_preset(self, request).await
+    }
+    async fn update_workflow_preset(
+        &self,
+        request: bcode_workflow::UpdateWorkflowPresetRequest,
+    ) -> Result<bcode_workflow::WorkflowPresetUpdateResult, Self::Error> {
+        Self::update_workflow_preset(self, request).await
+    }
+    async fn delete_workflow_preset(
+        &self,
+        request: bcode_workflow::DeleteWorkflowPresetRequest,
+    ) -> Result<bcode_workflow::WorkflowAuthoringMutationResult, Self::Error> {
+        Self::delete_workflow_preset(self, request).await
+    }
+    async fn fork_workflow_draft(
+        &self,
+        request: bcode_workflow::ForkWorkflowDraftRequest,
+    ) -> Result<bcode_workflow::WorkflowDraftSnapshot, Self::Error> {
+        Self::fork_workflow_draft(self, request).await
+    }
+    async fn apply_workflow_source(
+        &self,
+        request: bcode_workflow::ApplyWorkflowSourceRequest,
+    ) -> Result<bcode_workflow::WorkflowSourceApplyResult, Self::Error> {
+        Self::apply_workflow_source(
+            self,
+            request.source_format,
+            request.source,
+            request.draft_id,
+        )
+        .await
+    }
+
+    async fn set_authored_workflow_archived(
+        &self,
+        request: bcode_workflow::SetAuthoredWorkflowArchivedRequest,
+    ) -> Result<bcode_workflow::AuthoredWorkflowSnapshot, Self::Error> {
+        Self::set_authored_workflow_archived(self, request).await
+    }
+
+    async fn cancel_workflow_computation(&self, operation_id: String) -> Result<bool, Self::Error> {
+        Self::cancel_workflow_computation(self, operation_id).await
+    }
+
+    async fn create_authored_workflow(
+        &self,
+        request: bcode_workflow::CreateAuthoredWorkflowRequest,
+    ) -> Result<
+        (
+            bcode_workflow::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowDraftSnapshot,
+        ),
+        Self::Error,
+    > {
+        Self::create_authored_workflow(self, request).await
+    }
+
     async fn publish_and_start_workflow(
         &self,
         request: bcode_workflow::PublishAndStartWorkflowRequest,
@@ -4191,8 +4580,8 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the definition contract.
     pub async fn register_workflow_definition(
         &self,
-        request: bcode_ipc::WorkflowDefinitionRegistrationRequest,
-    ) -> Result<bcode_workflow_store::StoredWorkflowDefinition, ClientError> {
+        request: bcode_workflow::WorkflowDefinitionRegistrationRequest,
+    ) -> Result<bcode_workflow::StoredWorkflowDefinition, ClientError> {
         match self
             .send_request(Request::RegisterWorkflowDefinition(request))
             .await?
@@ -4266,7 +4655,7 @@ impl BcodeClient {
         &self,
         run_id: String,
         limit: usize,
-    ) -> Result<bcode_workflow_store::WorkflowDoctorReport, ClientError> {
+    ) -> Result<bcode_workflow::WorkflowDoctorReport, ClientError> {
         match self
             .send_request(Request::DoctorWorkflowRun { run_id, limit })
             .await?
@@ -4284,8 +4673,8 @@ impl BcodeClient {
     pub async fn repair_workflow_attempt(
         &self,
         dispatch_identity: String,
-        resolution: bcode_workflow_store::RepairResolution,
-    ) -> Result<bcode_workflow_store::RepairResult, ClientError> {
+        resolution: bcode_workflow::RepairResolution,
+    ) -> Result<bcode_workflow::RepairResult, ClientError> {
         match self
             .send_request(Request::RepairWorkflowAttempt {
                 dispatch_identity,
@@ -4306,7 +4695,7 @@ impl BcodeClient {
     pub async fn list_workflow_definitions(
         &self,
         limit: usize,
-    ) -> Result<Vec<bcode_workflow_store::StoredWorkflowDefinition>, ClientError> {
+    ) -> Result<Vec<bcode_workflow::StoredWorkflowDefinition>, ClientError> {
         match self
             .send_request(Request::ListWorkflowDefinitions { limit })
             .await?
@@ -4325,7 +4714,7 @@ impl BcodeClient {
         &self,
         definition_id: String,
         version: u32,
-    ) -> Result<Option<bcode_workflow_store::StoredWorkflowDefinition>, ClientError> {
+    ) -> Result<Option<bcode_workflow::StoredWorkflowDefinition>, ClientError> {
         match self
             .send_request(Request::DescribeWorkflowDefinition {
                 definition_id,
@@ -6724,6 +7113,81 @@ mod client_timeout_tests {
     };
     use std::path::Path;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn typed_definition_inspection_rejects_untrusted_responses() {
+        use bcode_workflow::WorkflowAuthoringApplication as _;
+        for (identity, version) in [("requested", 1), ("wrong", 1), ("requested", 2)] {
+            let workflow = bcode_workflow::WorkflowBuilder::new(
+                "requested",
+                bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+            )
+            .build()
+            .expect("valid workflow");
+            let value = serde_json::to_value(workflow.definition()).expect("definition value");
+            let mut definition = bcode_workflow::StoredWorkflowDefinition {
+                definition_id: identity.to_string(),
+                version,
+                checksum_sha256: bcode_workflow::workflow_canonical_value_sha256(&value)
+                    .expect("checksum"),
+                definition_json: serde_json::to_string(&value).expect("definition JSON"),
+            };
+            assert!(
+                definition.definition().is_ok(),
+                "mismatch fixtures must otherwise validate"
+            );
+            if identity == "requested" && version == 1 {
+                definition.definition_json = "private malformed content".to_string();
+            }
+            let directory =
+                std::path::PathBuf::from(format!("/tmp/bci-{}", SessionOpenOperationId::new()));
+            std::fs::create_dir_all(&directory).expect("socket directory");
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("inspect.sock"));
+            let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.expect("accept");
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response)
+                        .expect("hello envelope"),
+                )
+                .await
+                .expect("hello reply");
+                let request = bcode_ipc::recv_envelope(&mut stream)
+                    .await
+                    .expect("inspect request");
+                let response = bcode_ipc::Response::Ok(
+                    bcode_ipc::ResponsePayload::WorkflowDefinitionDescription {
+                        definition: Some(definition),
+                    },
+                );
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &response)
+                        .expect("response envelope"),
+                )
+                .await
+                .expect("reply");
+            });
+            let error = BcodeClient::new(endpoint)
+                .inspect_workflow_definition("requested".to_string(), 1)
+                .await
+                .expect_err("reject untrusted content");
+            let failure = bcode_workflow::WorkflowAuthoringFailure::StateUnavailable;
+            assert!(
+                matches!(error, ClientError::Server { code, message } if code == failure.code() && message == failure.to_string())
+            );
+            server.await.expect("server");
+        }
+    }
 
     fn matching_daemon_status() -> bcode_ipc::DaemonStatus {
         let (_path, digest) = bcode_daemon_lifecycle::current_executable_identity()

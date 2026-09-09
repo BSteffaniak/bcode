@@ -657,6 +657,16 @@ pub enum Request {
         #[serde(default)]
         control: WorkflowComputationControl,
     },
+    /// List bounded normalized template inspections.
+    InspectWorkflowTemplates {
+        limit: usize,
+    },
+    /// Inspect one exact template without plugin loading details.
+    InspectWorkflowTemplate {
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    },
     /// List bounded plugin-owned workflow templates and requirement diagnostics.
     ListWorkflowTemplates {
         limit: usize,
@@ -747,7 +757,7 @@ pub enum Request {
     /// Apply one explicit typed resolution to a repair-required attempt.
     RepairWorkflowAttempt {
         dispatch_identity: String,
-        resolution: bcode_workflow_store::RepairResolution,
+        resolution: bcode_workflow::RepairResolution,
     },
     /// Explicitly retry one exact latest failed workflow node attempt.
     RetryWorkflowNode {
@@ -1771,6 +1781,51 @@ pub struct WorkflowTemplateDescription {
     pub diagnostics: Vec<WorkflowTemplateDiagnostic>,
 }
 
+impl WorkflowTemplateDescription {
+    /// Normalize a validated catalog entry without exposing plugin loading details.
+    ///
+    /// # Errors
+    /// Returns an error when the entry has no normalized definition or configuration schema.
+    pub fn into_inspection(
+        self,
+    ) -> Result<bcode_workflow::WorkflowTemplateInspection, &'static str> {
+        let document = self.authoring_document.or(self.template.authoring_document);
+        let (definition, configuration_schema) = if let Some(document) = document {
+            (document.definition, document.configuration_schema)
+        } else {
+            (
+                self.template
+                    .definition
+                    .ok_or("template definition unavailable")?,
+                self.template
+                    .configuration_schema
+                    .ok_or("template configuration unavailable")?,
+            )
+        };
+        Ok(bcode_workflow::WorkflowTemplateInspection {
+            owner_plugin_id: self.owner_plugin_id,
+            template_id: self.template.template_id,
+            template_version: self.template.template_version,
+            title: self.template.title,
+            description: self.template.description,
+            definition,
+            configuration_schema,
+            identity: self.identity,
+            diagnostics: self
+                .diagnostics
+                .into_iter()
+                .map(
+                    |diagnostic| bcode_workflow::WorkflowTemplateAvailabilityDiagnostic {
+                        code: diagnostic.code,
+                        requirement: diagnostic.requirement,
+                        message: diagnostic.message,
+                    },
+                )
+                .collect(),
+        })
+    }
+}
+
 /// Compatibility export of the workflow-owned start contract.
 pub use bcode_workflow::WorkflowTemplateInstantiationRequest;
 
@@ -1951,13 +2006,8 @@ pub use bcode_workflow::WorkflowPackageExportRunStartResponse;
 /// Compatibility export of the workflow-owned admission contract.
 pub use bcode_workflow::AuthoredWorkflowRunStartResponse;
 
-/// Request to durably register one compiled workflow definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowDefinitionRegistrationRequest {
-    pub definition_id: String,
-    pub version: u32,
-    pub definition: bcode_workflow::WorkflowDefinition,
-}
+/// Compatibility export of the workflow-owned definition registration request.
+pub use bcode_workflow::WorkflowDefinitionRegistrationRequest;
 
 /// Current bounded canonical terminal-output inspection contract version.
 pub use bcode_workflow::WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION;
@@ -2327,6 +2377,14 @@ pub enum ResponsePayload {
     WorkflowCompilationPreview {
         preview: Box<bcode_workflow::WorkflowCompilationPreview>,
     },
+    /// Bounded normalized template inspections.
+    WorkflowTemplateInspections {
+        templates: Vec<bcode_workflow::WorkflowTemplateInspection>,
+    },
+    /// Optional exact normalized template inspection.
+    WorkflowTemplateInspection {
+        template: Option<Box<bcode_workflow::WorkflowTemplateInspection>>,
+    },
     WorkflowTemplateList {
         templates: Vec<WorkflowTemplateDescription>,
     },
@@ -2335,14 +2393,14 @@ pub enum ResponsePayload {
     },
     WorkflowTemplateStarted(WorkflowRunStartResponse),
     WorkflowDefinitionRegistered {
-        definition: bcode_workflow_store::StoredWorkflowDefinition,
+        definition: bcode_workflow::StoredWorkflowDefinition,
     },
     WorkflowRunStarted(WorkflowRunStartResponse),
     WorkflowDefinitionList {
-        definitions: Vec<bcode_workflow_store::StoredWorkflowDefinition>,
+        definitions: Vec<bcode_workflow::StoredWorkflowDefinition>,
     },
     WorkflowDefinitionDescription {
-        definition: Option<bcode_workflow_store::StoredWorkflowDefinition>,
+        definition: Option<bcode_workflow::StoredWorkflowDefinition>,
     },
     /// Committed graph revision, including for identical duplicate publication.
     WorkflowRunGraphEditPublished {
@@ -2384,10 +2442,10 @@ pub enum ResponsePayload {
         outputs: Vec<WorkflowOutputInspection>,
     },
     WorkflowDoctorReport {
-        report: bcode_workflow_store::WorkflowDoctorReport,
+        report: bcode_workflow::WorkflowDoctorReport,
     },
     WorkflowAttemptRepaired {
-        result: bcode_workflow_store::RepairResult,
+        result: bcode_workflow::RepairResult,
     },
     WorkflowRunCancellationRequested {
         recorded: bool,
@@ -3811,7 +3869,63 @@ mod tests {
             },
             presentation: None,
         };
+        let template_description = WorkflowTemplateDescription {
+            owner_plugin_id: "owner".to_string(),
+            template: bcode_plugin::WorkflowTemplateContribution {
+                contribution_version: bcode_plugin::WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION,
+                template_id: "review".to_string(),
+                template_version: 1,
+                title: "Review".to_string(),
+                description: "Review source".to_string(),
+                configuration_schema: Some(authoring_document.configuration_schema.clone()),
+                definition: Some(definition.clone()),
+                document_source: None,
+                authoring_document: None,
+                required_plugins: Vec::new(),
+                required_capabilities: Vec::new(),
+                presentation: std::collections::BTreeMap::new(),
+            },
+            authoring_document: None,
+            identity: bcode_workflow::WorkflowDefinitionIdentity {
+                kind: "review".to_string(),
+                definition_id: "review-definition".to_string(),
+                definition_version: definition.schema_version,
+            },
+            diagnostics: vec![WorkflowTemplateDiagnostic {
+                code: "missing-plugin".to_string(),
+                requirement: "optional-plugin".to_string(),
+                message: "Plugin unavailable".to_string(),
+            }],
+        };
+        let inline = template_description
+            .clone()
+            .into_inspection()
+            .expect("inline inspection");
+        assert_eq!(inline.definition, definition);
+        assert_eq!(inline.diagnostics[0].requirement, "optional-plugin");
+        let mut external = template_description;
+        external.template.definition = None;
+        external.template.configuration_schema = None;
+        external.authoring_document = Some(authoring_document.clone());
+        assert_eq!(
+            external
+                .clone()
+                .into_inspection()
+                .expect("external inspection"),
+            inline
+        );
+        external.authoring_document = None;
+        assert!(external.into_inspection().is_err());
+        let encoded = serde_json::to_value(&inline).expect("inspection JSON");
+        assert!(encoded.get("template").is_none());
+        assert!(encoded.get("document_source").is_none());
         let requests = vec![
+            Request::InspectWorkflowTemplates { limit: 10 },
+            Request::InspectWorkflowTemplate {
+                owner_plugin_id: "owner".to_string(),
+                template_id: "review".to_string(),
+                template_version: 1,
+            },
             Request::CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest {
                 document: authoring_document.clone(),
                 draft_id: "draft-1".to_string(),
@@ -4264,7 +4378,7 @@ mod tests {
         );
 
         let response = Response::Ok(ResponsePayload::WorkflowDefinitionRegistered {
-            definition: bcode_workflow_store::StoredWorkflowDefinition {
+            definition: bcode_workflow::StoredWorkflowDefinition {
                 definition_id: "review".to_string(),
                 version: 1,
                 checksum_sha256: "checksum".to_string(),

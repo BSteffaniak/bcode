@@ -14,25 +14,27 @@ pub use run_contracts::{
     AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION, AttemptCursor, AttemptSummary,
     AuthoredWorkflowRunProvenance, AuthoredWorkflowRunSelection, AuthoredWorkflowRunStartResponse,
     DispatchSideEffect, NewActivation, OrphanedWorkflowRun, OrphanedWorkflowRunReport,
-    PublishAndStartWorkflowRequest, ResourceLeaseMode, RunStatus, SkippedWorkflowRun,
-    StartAuthoredWorkflowRequest, StartWorkflowPackageExportRequest,
-    WORKFLOW_OUTPUT_INSPECTION_VERSION, WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION,
-    WaitingActivation, WaitingResolutionResult, WorkflowActivationInputSummary,
-    WorkflowActivationObservation, WorkflowActivationSummary, WorkflowApprovalContinuation,
-    WorkflowAttemptAdmissionObservation, WorkflowAttemptPreparationObservation,
-    WorkflowAuthorityTransferObservation, WorkflowCoordinatorStatus, WorkflowDecision,
-    WorkflowDecisionInspection, WorkflowDecisionValueDisclosure, WorkflowDefinitionRepresentation,
-    WorkflowDefinitionSnapshot, WorkflowDescendantRunSummary, WorkflowFanOutObservation,
-    WorkflowGrant, WorkflowGrantInspection, WorkflowGrantScopeDisclosure,
-    WorkflowGrantUseObservation, WorkflowHistoryAttemptCorrelation, WorkflowHistoryDiagnostic,
-    WorkflowHistoryEvent, WorkflowMutationApproval, WorkflowMutationApprovalDecision,
-    WorkflowMutationApprovalInspection, WorkflowMutationApprovalResolution,
-    WorkflowMutationApprovalScopeInspection, WorkflowNodeRetryResult, WorkflowOutputInspection,
-    WorkflowOutputSummary, WorkflowOutputValidationObservation,
-    WorkflowPackageExportRunStartResponse, WorkflowPublishAndStartResult,
-    WorkflowRepeatOutcomeSummary, WorkflowRepeatSettlementObservation, WorkflowResourceLease,
-    WorkflowRunAdmissionFailure, WorkflowRunAdmissionResult, WorkflowRunApplication,
-    WorkflowRunBinding, WorkflowRunBindingLookup, WorkflowRunControlAction, WorkflowRunInspection,
+    PublishAndStartWorkflowRequest, RepairResolution, RepairResult, ResourceLeaseMode, RunStatus,
+    SkippedWorkflowRun, StartAuthoredWorkflowRequest, StartWorkflowPackageExportRequest,
+    ValidatedOutput, WORKFLOW_OUTPUT_INSPECTION_VERSION,
+    WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION, WaitingActivation, WaitingResolutionResult,
+    WorkflowActivationInputSummary, WorkflowActivationObservation, WorkflowActivationSummary,
+    WorkflowApprovalContinuation, WorkflowAttemptAdmissionObservation,
+    WorkflowAttemptPreparationObservation, WorkflowAuthorityTransferObservation,
+    WorkflowCoordinatorStatus, WorkflowDecision, WorkflowDecisionInspection,
+    WorkflowDecisionValueDisclosure, WorkflowDefinitionRepresentation, WorkflowDefinitionSnapshot,
+    WorkflowDescendantRunSummary, WorkflowDoctorIssue, WorkflowDoctorReport,
+    WorkflowFanOutObservation, WorkflowGrant, WorkflowGrantInspection,
+    WorkflowGrantScopeDisclosure, WorkflowGrantUseObservation, WorkflowHistoryAttemptCorrelation,
+    WorkflowHistoryDiagnostic, WorkflowHistoryEvent, WorkflowMutationApproval,
+    WorkflowMutationApprovalDecision, WorkflowMutationApprovalInspection,
+    WorkflowMutationApprovalResolution, WorkflowMutationApprovalScopeInspection,
+    WorkflowNodeRetryResult, WorkflowOutputInspection, WorkflowOutputSummary,
+    WorkflowOutputValidationObservation, WorkflowPackageExportRunStartResponse,
+    WorkflowPublishAndStartResult, WorkflowRepeatOutcomeSummary,
+    WorkflowRepeatSettlementObservation, WorkflowResourceLease, WorkflowRunAdmissionFailure,
+    WorkflowRunAdmissionResult, WorkflowRunApplication, WorkflowRunBinding,
+    WorkflowRunBindingLookup, WorkflowRunControlAction, WorkflowRunInspection,
     WorkflowRunLifecycleObservation, WorkflowRunLimits, WorkflowRunLink,
     WorkflowRunObservationApplication, WorkflowRunOperationFailure, WorkflowRunStartRequest,
     WorkflowRunStartResponse, WorkflowRunSubscription, WorkflowRunSummary, WorkflowRunWatchEvent,
@@ -47,20 +49,22 @@ pub use authoring_contracts::{
     CreateWorkflowPresetRequest, DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS,
     DeleteWorkflowPresetRequest, DiscardWorkflowDraftRequest, ExportWorkflowRevisionRequest,
     ForkWorkflowDraftRequest, ImportWorkflowDraftRequest, ImportWorkflowRequest,
-    ImportWorkflowRevisionRequest, MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS,
-    PreviewWorkflowImportRequest, PublishWorkflowDraftRequest, PublishWorkflowPackageRequest,
-    SetAuthoredWorkflowArchivedRequest, UpdateWorkflowDraftRequest, UpdateWorkflowPresetRequest,
-    WorkflowAuthoringApplication, WorkflowAuthoringEventSnapshot, WorkflowAuthoringFailure,
-    WorkflowAuthoringIssueSnapshot, WorkflowAuthoringMutationResult, WorkflowAuthoringPage,
-    WorkflowComputationControl, WorkflowDraftForkSource, WorkflowDraftImportResult,
-    WorkflowDraftInspectionSummary, WorkflowDraftUpdateResult, WorkflowImportCollisionPolicy,
-    WorkflowPackageComputationRequest, WorkflowPackagePreviewRequest,
-    WorkflowPackageValidationResult, WorkflowPresetInspectionSummary, WorkflowPresetMutation,
-    WorkflowPresetSnapshot, WorkflowPresetUpdateResult, WorkflowPublicationResult,
-    WorkflowRevisionImportResult, WorkflowRevisionInspectionSummary,
-    WorkflowRevisionRequirementInspection, WorkflowRevisionSnapshot,
-    WorkflowSourceComputationRequest, WorkflowSourcePreviewRequest, WorkflowSourcePreviewResult,
-    WorkflowSourceValidationResult,
+    ImportWorkflowRevisionRequest, MAX_REGISTERED_WORKFLOW_DEFINITION_BYTES,
+    MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS, PreviewWorkflowImportRequest, PublishWorkflowDraftRequest,
+    PublishWorkflowPackageRequest, SetAuthoredWorkflowArchivedRequest, StoredWorkflowDefinition,
+    UpdateWorkflowDraftRequest, UpdateWorkflowPresetRequest, WorkflowAuthoringApplication,
+    WorkflowAuthoringEventSnapshot, WorkflowAuthoringFailure, WorkflowAuthoringIssueSnapshot,
+    WorkflowAuthoringMutationResult, WorkflowAuthoringPage, WorkflowComputationControl,
+    WorkflowDefinitionInspection, WorkflowDefinitionRegistrationRequest, WorkflowDraftForkSource,
+    WorkflowDraftImportResult, WorkflowDraftInspectionSummary, WorkflowDraftUpdateResult,
+    WorkflowImportCollisionPolicy, WorkflowPackageComputationRequest,
+    WorkflowPackagePreviewRequest, WorkflowPackageValidationResult,
+    WorkflowPresetInspectionSummary, WorkflowPresetMutation, WorkflowPresetSnapshot,
+    WorkflowPresetUpdateResult, WorkflowPublicationResult, WorkflowRevisionImportResult,
+    WorkflowRevisionInspectionSummary, WorkflowRevisionRequirementInspection,
+    WorkflowRevisionSnapshot, WorkflowSourceComputationRequest, WorkflowSourcePreviewRequest,
+    WorkflowSourcePreviewResult, WorkflowSourceValidationResult,
+    WorkflowTemplateAvailabilityDiagnostic, WorkflowTemplateInspection,
 };
 
 mod draft_edit;
@@ -2464,7 +2468,10 @@ pub const WORKFLOW_EXPORT_BUNDLE_VERSION: u32 = 1;
 /// Portable authored-workflow import preview contract version.
 pub const WORKFLOW_IMPORT_PREVIEW_VERSION: u32 = 1;
 /// Normalized authored-workflow application-operation fact version.
-pub const WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION: u32 = 1;
+///
+/// Version 2 adds exact compiled-definition registration targets. Policy consumers must
+/// explicitly support this version; version-1 facts are not interpreted as version 2.
+pub const WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION: u32 = 2;
 
 /// Authenticated class of actor requesting an authored-workflow application operation.
 ///
@@ -2506,6 +2513,16 @@ impl WorkflowApplicationActor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowApplicationOperation {
+    /// Register an exact compiled definition without activation or execution.
+    RegisterDefinition,
+    /// Apply one package member as part of an atomic draft mutation.
+    ///
+    /// Like draft editing, policy receives declared requirements and no compiled execution
+    /// effects. Applying does not publish, activate, or execute the definition; publication
+    /// separately requires compilation and authorizes its derived requirements and effects.
+    ApplyPackage,
+    /// Publish canonical package drafts as one atomic mutation.
+    PublishPackage,
     CreateWorkflow,
     UpdateWorkflowMetadata,
     ArchiveWorkflow,
@@ -2533,6 +2550,7 @@ impl WorkflowApplicationOperation {
         matches!(
             self,
             Self::CreateDraft
+                | Self::PublishPackage
                 | Self::ForkDraft
                 | Self::UpdateDraft
                 | Self::DiscardDraft
@@ -2589,7 +2607,10 @@ pub struct WorkflowApplicationOperationFacts {
     pub operation: WorkflowApplicationOperation,
     /// Authenticated actor assigned by the application boundary.
     pub actor: WorkflowApplicationActor,
-    /// Target logical workflow.
+    /// Exact registration target; absent for authored-workflow operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_registration: Option<WorkflowDefinitionRegistrationRequest>,
+    /// Target logical workflow; empty only for definition registration.
     pub workflow_id: String,
     /// Exact draft target when the operation acts on a draft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2634,7 +2655,33 @@ impl WorkflowApplicationOperationFacts {
             ));
         }
         self.actor.validate()?;
-        validate_authoring_id("application_operation.workflow_id", &self.workflow_id)?;
+        if self.operation == WorkflowApplicationOperation::RegisterDefinition {
+            let registration = self.definition_registration.as_ref().ok_or_else(|| {
+                authoring_error(
+                    "application_operation.definition_registration",
+                    "registration requires an exact definition target",
+                )
+            })?;
+            validate_authoring_id(
+                "definition_registration.definition_id",
+                &registration.definition_id,
+            )?;
+            if registration.version == 0 || !self.workflow_id.is_empty() {
+                return Err(authoring_error(
+                    "application_operation.definition_registration",
+                    "registration requires a positive version and no authored workflow target",
+                ));
+            }
+            registration.definition.validate()?;
+        } else {
+            if self.definition_registration.is_some() {
+                return Err(authoring_error(
+                    "application_operation.definition_registration",
+                    "unrelated definition registration target",
+                ));
+            }
+            validate_authoring_id("application_operation.workflow_id", &self.workflow_id)?;
+        }
         validate_optional_operation_id(
             "application_operation.draft_id",
             self.draft_id.as_deref(),
@@ -10152,6 +10199,25 @@ fn validate_declared_authoring_requirements(
         ));
     }
     Ok(())
+}
+
+/// Resolve normalized requirements and effects for an already compiled definition.
+///
+/// # Errors
+/// Returns an error for invalid definitions/catalogs or unavailable referenced contracts.
+pub fn workflow_definition_policy_summaries(
+    definition: &WorkflowDefinition,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<(WorkflowRequirementSummary, WorkflowEffectSummary), WorkflowError> {
+    definition.validate()?;
+    catalog.validate()?;
+    let (requirements, effects, _) = resolve_authoring_catalog(
+        definition,
+        &WorkflowRequirementSummary::default(),
+        &BTreeMap::new(),
+        catalog,
+    )?;
+    Ok((requirements, effects))
 }
 
 fn resolve_authoring_catalog(
@@ -20158,6 +20224,7 @@ steps:
                 kind: WorkflowApplicationActorKind::LocalClient,
                 actor_id: "local-client/1".to_string(),
             },
+            definition_registration: None,
             workflow_id: document.workflow_id.clone(),
             draft_id: Some("draft/1".to_string()),
             revision: None,
@@ -20184,6 +20251,51 @@ steps:
         missing_draft.draft_id = None;
         assert!(missing_draft.validate().is_err());
 
+        let mut package = facts.clone();
+        package.operation = WorkflowApplicationOperation::PublishPackage;
+        package.activates = false;
+        package
+            .validate()
+            .expect("package publication requires canonical draft identity");
+        package.draft_id = None;
+        assert!(package.validate().is_err());
+        package.operation = WorkflowApplicationOperation::ApplyPackage;
+        package
+            .validate()
+            .expect("package apply identifies target workflow");
+        package.activates = true;
+        assert!(package.validate().is_err());
+
+        let mut registration = facts.clone();
+        registration.operation = WorkflowApplicationOperation::RegisterDefinition;
+        registration.workflow_id.clear();
+        registration.draft_id = None;
+        registration.activates = false;
+        registration.definition_registration = Some(WorkflowDefinitionRegistrationRequest {
+            definition_id: "definition/policy-test".to_string(),
+            version: 1,
+            definition: authored_document().definition,
+        });
+        registration.validate().expect("exact registration target");
+        let encoded_registration =
+            serde_json::to_value(&registration).expect("encode registration");
+        assert_eq!(
+            serde_json::from_value::<WorkflowApplicationOperationFacts>(encoded_registration)
+                .expect("decode registration"),
+            registration
+        );
+        registration.version = 1;
+        assert!(registration.validate().is_err());
+        registration.version = WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION;
+        registration.workflow_id = "unrelated/workflow".to_string();
+        assert!(registration.validate().is_err());
+        registration.operation = WorkflowApplicationOperation::CreateWorkflow;
+        assert!(registration.validate().is_err());
+        registration.operation = WorkflowApplicationOperation::RegisterDefinition;
+        registration.workflow_id.clear();
+        registration.definition_registration = None;
+        assert!(registration.validate().is_err());
+
         let mut forged_execution = facts;
         forged_execution.executes = true;
         assert!(forged_execution.validate().is_err());
@@ -20191,6 +20303,55 @@ steps:
         let mut unknown = encoded;
         unknown["transport_private"] = serde_json::json!(true);
         assert!(serde_json::from_value::<WorkflowApplicationOperationFacts>(unknown).is_err());
+    }
+
+    #[test]
+    fn registered_definition_decoding_rejects_damage_future_schema_and_oversize() {
+        fn stored(json: String) -> StoredWorkflowDefinition {
+            StoredWorkflowDefinition {
+                definition_id: "definition/test".to_string(),
+                version: 1,
+                checksum_sha256: format!("{:x}", Sha256::digest(json.as_bytes())),
+                definition_json: json,
+            }
+        }
+        let definition = authored_document().definition;
+        let valid = stored(serde_json::to_string(&definition).expect("encode"));
+        assert_eq!(valid.definition().expect("decode"), definition);
+        let mut damaged = valid.clone();
+        damaged.definition_json.push(' ');
+        assert!(
+            damaged
+                .definition()
+                .expect_err("checksum")
+                .to_string()
+                .contains("checksum mismatch")
+        );
+        assert_eq!(
+            WorkflowDefinitionInspection::try_from(damaged),
+            Err(WorkflowAuthoringFailure::StateUnavailable)
+        );
+        assert_eq!(
+            WorkflowDefinitionInspection::try_from(stored("not JSON".to_string())),
+            Err(WorkflowAuthoringFailure::StateUnavailable)
+        );
+        assert!(stored("not JSON".to_string()).definition().is_err());
+        let mut future = definition;
+        future.schema_version = WORKFLOW_DEFINITION_SCHEMA_VERSION + 1;
+        assert!(
+            stored(serde_json::to_string(&future).expect("future JSON"))
+                .definition()
+                .is_err()
+        );
+        let mut oversized = valid;
+        oversized.definition_json = " ".repeat(MAX_REGISTERED_WORKFLOW_DEFINITION_BYTES + 1);
+        assert!(
+            oversized
+                .definition()
+                .expect_err("bound precedes checksum")
+                .to_string()
+                .contains("byte limit")
+        );
     }
 
     #[test]

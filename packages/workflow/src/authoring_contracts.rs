@@ -2,10 +2,145 @@
 //!
 //! Established JSON names, defaults, and externally tagged outcomes are preserved. Document
 //! compatibility is governed by its version; computation control is not durable resume state.
-//! Unknown request fields and unknown outcome variants are rejected rather than guessed.
+//! Unknown outcome variants are rejected rather than guessed. Request field handling preserves
+//! each established wire contract; registration remains permissive for extra envelope fields.
 
 use crate::{WorkflowAuthoringConflict, WorkflowDraftSnapshot};
 use serde::{Deserialize, Serialize};
+
+/// Registered definition identity and canonical content returned by definition operations.
+///
+/// Field names and serialized JSON content preserve the established inspection contract.
+/// The embedded definition carries its schema version; this value contains no storage handles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWorkflowDefinition {
+    /// Stable definition identity.
+    pub definition_id: String,
+    /// Positive definition version.
+    pub version: u32,
+    /// SHA-256 of canonical serialized definition JSON.
+    pub checksum_sha256: String,
+    /// Canonical serialized definition.
+    pub definition_json: String,
+}
+
+/// Typed inspection of one registered definition. Compatibility follows the embedded schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDefinitionInspection {
+    /// Registered identity.
+    pub definition_id: String,
+    /// Registered version.
+    pub version: u32,
+    /// Validated compiled definition content.
+    pub definition: crate::WorkflowDefinition,
+}
+
+impl TryFrom<StoredWorkflowDefinition> for WorkflowDefinitionInspection {
+    type Error = WorkflowAuthoringFailure;
+
+    fn try_from(stored: StoredWorkflowDefinition) -> Result<Self, Self::Error> {
+        let definition = stored
+            .definition()
+            .map_err(|_| WorkflowAuthoringFailure::StateUnavailable)?;
+        Ok(Self {
+            definition_id: stored.definition_id,
+            version: stored.version,
+            definition,
+        })
+    }
+}
+
+/// Maximum encoded registered-definition size accepted by persistence and typed inspection.
+pub const MAX_REGISTERED_WORKFLOW_DEFINITION_BYTES: usize = 1_048_576;
+
+impl StoredWorkflowDefinition {
+    /// Decode and validate the registered definition without persistence access.
+    ///
+    /// # Errors
+    /// Returns an error for oversized content, invalid identity/version, checksum mismatch, malformed JSON,
+    /// unsupported definition schema, or invalid definition structure.
+    pub fn definition(&self) -> Result<crate::WorkflowDefinition, crate::WorkflowError> {
+        use sha2::Digest as _;
+        if self.definition_json.len() > MAX_REGISTERED_WORKFLOW_DEFINITION_BYTES {
+            return Err(crate::authoring_error(
+                "definition.definition_json",
+                "registered definition exceeds byte limit",
+            ));
+        }
+        crate::validate_authoring_id("definition.definition_id", &self.definition_id)?;
+        if self.version == 0 {
+            return Err(crate::authoring_error(
+                "definition.version",
+                "definition version must be positive",
+            ));
+        }
+        crate::validate_sha256("definition.checksum_sha256", &self.checksum_sha256)?;
+        let digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(self.definition_json.as_bytes())
+        );
+        if digest != self.checksum_sha256 {
+            return Err(crate::authoring_error(
+                "definition.checksum_sha256",
+                "definition checksum mismatch",
+            ));
+        }
+        let definition: crate::WorkflowDefinition = serde_json::from_str(&self.definition_json)
+            .map_err(|_| {
+                crate::authoring_error("definition.definition_json", "invalid definition JSON")
+            })?;
+        definition.validate()?;
+        Ok(definition)
+    }
+}
+
+/// Request to durably register one compiled workflow definition.
+///
+/// The definition carries its schema version. Field names and permissive handling of extra
+/// envelope fields preserve the established registration wire contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDefinitionRegistrationRequest {
+    /// Exact identity assigned to the compiled definition.
+    pub definition_id: String,
+    /// Version used to address the registered definition.
+    pub version: u32,
+    /// Compiled workflow to register.
+    pub definition: crate::WorkflowDefinition,
+}
+
+/// Normalized template inspection without plugin loading or source-path details.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowTemplateInspection {
+    /// Plugin that owns the template.
+    pub owner_plugin_id: String,
+    /// Stable owner-local identity.
+    pub template_id: String,
+    /// Exact owner-controlled version.
+    pub template_version: u32,
+    /// Display title.
+    pub title: String,
+    /// Display summary.
+    pub description: String,
+    /// Normalized configuration contract.
+    pub configuration_schema: crate::ValueSchema,
+    /// Exact normalized compiled definition.
+    pub definition: crate::WorkflowDefinition,
+    /// Exact definition identity.
+    pub identity: crate::WorkflowDefinitionIdentity,
+    /// Current unavailable requirements.
+    pub diagnostics: Vec<WorkflowTemplateAvailabilityDiagnostic>,
+}
+
+/// One current unavailable template requirement.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowTemplateAvailabilityDiagnostic {
+    /// Stable diagnostic code.
+    pub code: String,
+    /// Requirement identity.
+    pub requirement: String,
+    /// Human-readable explanation.
+    pub message: String,
+}
 
 /// Typed authoring operations supplied by a connected application adapter.
 ///
@@ -13,8 +148,462 @@ use serde::{Deserialize, Serialize};
 /// domain requests. Errors are adapter-owned to preserve transport failures without pretending
 /// a disconnected request was rejected by the domain. Completion does not imply retry safety.
 pub trait WorkflowAuthoringApplication: Sync {
+    /// Instantiate a plugin-owned template as mutable authored state.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable storage, invalid or disabled templates, denied authorization,
+    /// or failure to persist the authored workflow and draft.
+    fn instantiate_workflow_template(
+        &self,
+        request: crate::WorkflowTemplateInstantiationRequest,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (
+                crate::AuthoredWorkflowSnapshot,
+                crate::WorkflowDraftSnapshot,
+            ),
+            Self::Error,
+        >,
+    > + Send;
+
+    /// Inspect validated typed content for one exact registered definition.
+    ///
+    /// # Errors
+    /// Returns an error for damaged or unsupported content, unavailable state, or transport failure.
+    fn inspect_workflow_definition(
+        &self,
+        definition_id: String,
+        version: u32,
+    ) -> impl std::future::Future<Output = Result<Option<WorkflowDefinitionInspection>, Self::Error>>
+    + Send;
+
+    /// Register one compiled definition without activating or executing it.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or unsupported definitions, unavailable state,
+    /// conflicting registration, or transport failure.
+    fn register_workflow_definition(
+        &self,
+        request: WorkflowDefinitionRegistrationRequest,
+    ) -> impl std::future::Future<Output = Result<StoredWorkflowDefinition, Self::Error>> + Send;
+
+    /// List registered definitions with bounded result count.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable state or transport failure.
+    fn list_workflow_definitions(
+        &self,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<StoredWorkflowDefinition>, Self::Error>> + Send;
+
+    /// Inspect one exact registered definition version without mutation.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable state or transport failure.
+    fn describe_workflow_definition(
+        &self,
+        definition_id: String,
+        version: u32,
+    ) -> impl std::future::Future<Output = Result<Option<StoredWorkflowDefinition>, Self::Error>> + Send;
+
+    /// Authorize canonical package drafts and atomically publish without activation or execution.
+    ///
+    /// # Errors
+    /// Returns an error on denial, invalid input, draft conflict, unavailable state, or transport failure.
+    fn publish_workflow_package(
+        &self,
+        request: crate::PublishWorkflowPackageRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowPackageMutationResult, Self::Error>>
+    + Send;
+    /// Authorize all members and atomically apply a package without activation or execution.
+    ///
+    /// # Errors
+    /// Returns an error on authorization denial, invalid input, unavailable state, or transport failure.
+    fn apply_workflow_package(
+        &self,
+        request: crate::ApplyWorkflowPackageRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowPackageMutationResult, Self::Error>>
+    + Send;
+    /// List bounded normalized template inspections.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid bounds, discovery or transport failure.
+    fn inspect_workflow_templates(
+        &self,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<WorkflowTemplateInspection>, Self::Error>> + Send;
+
+    /// Inspect one exact template without mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid identity, discovery or transport failure.
+    fn inspect_workflow_template(
+        &self,
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    ) -> impl std::future::Future<Output = Result<Option<WorkflowTemplateInspection>, Self::Error>> + Send;
+    /// Read a bounded derived package publication receipt without mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, invalid identity, or transport failure.
+    fn workflow_package_publication(
+        &self,
+        package_id: String,
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::WorkflowPackagePublicationReceipt>, Self::Error>,
+    > + Send;
+    /// Discover a bounded launch catalog without mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid request, discovery failure, or transport failure.
+    fn workflow_launch_catalog(
+        &self,
+        request: crate::WorkflowLaunchCatalogRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowLaunchCatalogPage, Self::Error>> + Send;
+
+    /// Inspect an exact launch target without mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or stale sources, invalid request, or transport failure.
+    fn workflow_launch_detail(
+        &self,
+        request: crate::WorkflowLaunchDetailRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowLaunchDetail, Self::Error>> + Send;
+    /// Validate an authoring document without durable mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid input, cancellation, timeout, or transport failure.
+    fn validate_workflow_authoring_with_control(
+        &self,
+        document: crate::WorkflowAuthoringDocument,
+        control: WorkflowComputationControl,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowValidationReport, Self::Error>> + Send;
+
+    /// Preview document compilation without persistence or dispatch.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid input, cancellation, timeout, or transport failure.
+    fn preview_workflow_compilation_with_control(
+        &self,
+        document: crate::WorkflowAuthoringDocument,
+        configuration: Option<serde_json::Value>,
+        control: WorkflowComputationControl,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowCompilationPreview, Self::Error>> + Send;
+    /// Validate a package closure without durable mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid package, cancellation, timeout, or transport failure.
+    fn validate_workflow_package(
+        &self,
+        request: crate::WorkflowPackageComputationRequest,
+    ) -> impl std::future::Future<
+        Output = Result<crate::WorkflowPackageValidationResult, Self::Error>,
+    > + Send;
+
+    /// Preview a planned package without durable mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid package, cancellation, timeout, or transport failure.
+    fn preview_workflow_package(
+        &self,
+        request: crate::WorkflowPackagePreviewRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowPackagePreview, Self::Error>> + Send;
+    /// Validate source using current authoring capabilities without durable mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid source, cancellation, timeout, or transport failure.
+    fn validate_workflow_source(
+        &self,
+        request: crate::WorkflowSourceComputationRequest,
+    ) -> impl std::future::Future<
+        Output = Result<crate::WorkflowSourceValidationResult, Self::Error>,
+    > + Send;
+
+    /// Preview source compilation without durable mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid source, cancellation, timeout, or transport failure.
+    fn preview_workflow_source(
+        &self,
+        request: crate::WorkflowSourcePreviewRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowSourcePreviewResult, Self::Error>> + Send;
+    /// Inspect revision requirements against current availability without mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, catalog failure, or transport failure.
+    fn workflow_revision_requirement_inspection(
+        &self,
+        workflow_id: String,
+        revision: u64,
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::WorkflowRevisionRequirementInspection>, Self::Error>,
+    > + Send;
+
+    /// Discover current authoring capabilities without creating workflow state.
+    ///
+    /// # Errors
+    /// Returns an error on catalog discovery or transport failure.
+    fn workflow_authoring_catalog(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<crate::WorkflowAuthoringCatalogSnapshot, Self::Error>,
+    > + Send;
+    /// List a bounded preset page without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, invalid cursor, or transport failure.
+    fn list_workflow_presets(
+        &self,
+        workflow_id: String,
+        cursor: Option<crate::WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<
+            crate::WorkflowAuthoringPage<
+                crate::WorkflowPresetSnapshot,
+                crate::WorkflowAuthoringListCursor,
+            >,
+            Self::Error,
+        >,
+    > + Send;
+
+    /// Look up a preset without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, or transport failure.
+    fn workflow_preset(
+        &self,
+        workflow_id: String,
+        preset_id: String,
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::WorkflowPresetSnapshot>, Self::Error>,
+    > + Send;
+    /// List a bounded immutable revision page without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, invalid cursor, or transport failure.
+    fn list_workflow_revisions(
+        &self,
+        workflow_id: String,
+        cursor: Option<crate::WorkflowRevisionListCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<
+            crate::WorkflowAuthoringPage<
+                crate::WorkflowRevisionSnapshot,
+                crate::WorkflowRevisionListCursor,
+            >,
+            Self::Error,
+        >,
+    > + Send;
+
+    /// Look up an immutable revision without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, or transport failure.
+    fn workflow_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::WorkflowRevisionSnapshot>, Self::Error>,
+    > + Send;
+    /// List a bounded draft page without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, invalid cursor, or transport failure.
+    fn list_workflow_drafts(
+        &self,
+        workflow_id: String,
+        cursor: Option<crate::WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<
+            crate::WorkflowAuthoringPage<WorkflowDraftSnapshot, crate::WorkflowAuthoringListCursor>,
+            Self::Error,
+        >,
+    > + Send;
+
+    /// Look up a draft without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, or transport failure.
+    fn workflow_draft(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+    ) -> impl std::future::Future<Output = Result<Option<WorkflowDraftSnapshot>, Self::Error>> + Send;
+    /// List one bounded page of authored workflows without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, invalid cursor, or transport failure.
+    fn list_authored_workflows(
+        &self,
+        cursor: Option<crate::WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<
+            crate::WorkflowAuthoringPage<
+                crate::AuthoredWorkflowSnapshot,
+                crate::WorkflowAuthoringListCursor,
+            >,
+            Self::Error,
+        >,
+    > + Send;
+    /// Look up an authored workflow without mutation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, or transport failure.
+    fn authored_workflow(
+        &self,
+        workflow_id: String,
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::AuthoredWorkflowSnapshot>, Self::Error>,
+    > + Send;
+
+    /// Inspect an authored workflow within the requested bound without repair.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or inconsistent state, or transport failure.
+    fn inspect_authored_workflow(
+        &self,
+        workflow_id: String,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::AuthoredWorkflowInspection>, Self::Error>,
+    > + Send;
+    /// Import a draft into an existing workflow without execution.
+    ///
+    /// # Errors
+    /// Returns an error on incompatible input, collision, denied authorization, unavailable state,
+    /// cancellation, timeout, or transport failure.
+    fn import_workflow_draft(
+        &self,
+        request: ImportWorkflowDraftRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowDraftImportResult, Self::Error>> + Send;
+
+    /// Import a revision through the canonical publication path.
+    ///
+    /// # Errors
+    /// Returns an error on incompatible input, collision, denied authorization, unavailable state,
+    /// cancellation, timeout, or transport failure.
+    fn import_workflow_revision(
+        &self,
+        request: ImportWorkflowRevisionRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowRevisionImportResult, Self::Error>> + Send;
+    /// Import a bundle as a new workflow and initial draft without execution.
+    ///
+    /// # Errors
+    /// Returns an error on incompatible input, collision, denied authorization, unavailable state,
+    /// cancellation, timeout, or transport failure.
+    fn import_workflow(
+        &self,
+        request: ImportWorkflowRequest,
+    ) -> impl std::future::Future<
+        Output = Result<(crate::AuthoredWorkflowSnapshot, WorkflowDraftSnapshot), Self::Error>,
+    > + Send;
+    /// Preview an import without changing authored state.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, incompatible bundle, cancellation, timeout, or transport failure.
+    fn preview_workflow_import(
+        &self,
+        request: PreviewWorkflowImportRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowImportPreview, Self::Error>> + Send;
+    /// Export one immutable revision without changing authored state.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, missing revision, incompatible data, or transport failure.
+    fn export_workflow_revision(
+        &self,
+        request: ExportWorkflowRevisionRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowExportBundle, Self::Error>> + Send;
+    /// Create a preset without starting execution.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid input, denied authorization, or transport failure.
+    fn create_workflow_preset(
+        &self,
+        request: CreateWorkflowPresetRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowPresetSnapshot, Self::Error>> + Send;
+
+    /// Update one exact preset generation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid input, denied authorization, or transport failure.
+    fn update_workflow_preset(
+        &self,
+        request: UpdateWorkflowPresetRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowPresetUpdateResult, Self::Error>> + Send;
+
+    /// Delete one exact preset generation.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, denied authorization, or transport failure.
+    fn delete_workflow_preset(
+        &self,
+        request: DeleteWorkflowPresetRequest,
+    ) -> impl std::future::Future<
+        Output = Result<crate::WorkflowAuthoringMutationResult, Self::Error>,
+    > + Send;
+    /// Fork an existing draft or revision into a new mutable draft without execution.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, missing source, denied authorization, conflict, or transport failure.
+    fn fork_workflow_draft(
+        &self,
+        request: ForkWorkflowDraftRequest,
+    ) -> impl std::future::Future<Output = Result<WorkflowDraftSnapshot, Self::Error>> + Send;
     /// Domain or transport failure returned by this adapter.
     type Error;
+
+    /// Apply source by creating or updating its canonical authored draft without execution.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, invalid source, denied authorization, or transport failure.
+    fn apply_workflow_source(
+        &self,
+        request: crate::ApplyWorkflowSourceRequest,
+    ) -> impl std::future::Future<Output = Result<crate::WorkflowSourceApplyResult, Self::Error>> + Send;
+
+    /// Archive or unarchive an authored workflow without starting execution.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, denied authorization, missing workflow, or transport failure.
+    fn set_authored_workflow_archived(
+        &self,
+        request: SetAuthoredWorkflowArchivedRequest,
+    ) -> impl std::future::Future<Output = Result<crate::AuthoredWorkflowSnapshot, Self::Error>> + Send;
+
+    /// Request cancellation of an active authoring computation by operation identity.
+    ///
+    /// Returns false when no matching computation is registered. A true acknowledgement
+    /// does not prove that blocking computation work has stopped or roll back committed changes.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state or transport failure.
+    fn cancel_workflow_computation(
+        &self,
+        operation_id: String,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
+
+    /// Create an authored workflow and its initial draft without activating or executing it.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state, denied authorization, invalid input, or transport failure.
+    fn create_authored_workflow(
+        &self,
+        request: CreateAuthoredWorkflowRequest,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (
+                crate::AuthoredWorkflowSnapshot,
+                crate::WorkflowDraftSnapshot,
+            ),
+            Self::Error,
+        >,
+    > + Send;
 
     /// Apply semantic edits against an exact draft generation.
     ///

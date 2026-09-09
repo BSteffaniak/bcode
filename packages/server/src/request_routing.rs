@@ -448,7 +448,9 @@ pub enum WorkflowDefinitionRequest {
     /// Inspect one exact launch source without mutation.
     WorkflowLaunchDetail(bcode_workflow::WorkflowLaunchDetailRequest),
     /// Read one bounded derived package publication receipt without mutation.
-    GetWorkflowPackagePublication { package_id: String },
+    GetWorkflowPackagePublication {
+        package_id: String,
+    },
     /// Atomically apply one previously validated package plan as canonical package drafts.
     ApplyWorkflowPackage(ApplyWorkflowPackageRequest),
     /// Atomically publish every exact package draft generation.
@@ -473,7 +475,17 @@ pub enum WorkflowDefinitionRequest {
         control: WorkflowComputationControl,
     },
     /// List bounded plugin-owned workflow templates and requirement diagnostics.
-    ListWorkflowTemplates { limit: usize },
+    InspectWorkflowTemplates {
+        limit: usize,
+    },
+    InspectWorkflowTemplate {
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    },
+    ListWorkflowTemplates {
+        limit: usize,
+    },
     /// Describe one exact loaded plugin-owned workflow template.
     DescribeWorkflowTemplate {
         owner_plugin_id: String,
@@ -491,9 +503,14 @@ pub enum WorkflowDefinitionRequest {
     /// Start one durable workflow from an existing exact definition.
     StartWorkflowRun(WorkflowRunStartRequest),
     /// List bounded, checksum-verified durable workflow definitions.
-    ListWorkflowDefinitions { limit: usize },
+    ListWorkflowDefinitions {
+        limit: usize,
+    },
     /// Describe one exact durable workflow definition version.
-    DescribeWorkflowDefinition { definition_id: String, version: u32 },
+    DescribeWorkflowDefinition {
+        definition_id: String,
+        version: u32,
+    },
 }
 
 /// Requests owned by the `RuntimeAndModel` dispatcher (31 variants).
@@ -1116,6 +1133,20 @@ impl RoutedRequest {
                     document,
                     configuration,
                     control,
+                },
+            )),
+            Request::InspectWorkflowTemplates { limit } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::InspectWorkflowTemplates { limit },
+            )),
+            Request::InspectWorkflowTemplate {
+                owner_plugin_id,
+                template_id,
+                template_version,
+            } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::InspectWorkflowTemplate {
+                    owner_plugin_id,
+                    template_id,
+                    template_version,
                 },
             )),
             Request::ListWorkflowTemplates { limit } => Self::WorkflowDefinition(Box::new(
