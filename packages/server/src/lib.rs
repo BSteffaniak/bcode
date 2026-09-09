@@ -193,6 +193,9 @@ pub const SESSION_EVENT_PLUGIN_TOPIC: &str = "bcode.session.event";
 /// Errors returned by the local server.
 #[derive(Debug, Error)]
 pub enum ServerError {
+    /// An embedded application callback panicked; its payload is not disclosed.
+    #[error("embedded workflow application callback failed")]
+    EmbeddedWorkflowCallbackFailed,
     /// The owned session-search ingestion worker failed to finish normally.
     #[error("session search ingestion failed during shutdown")]
     SessionSearchIngestionShutdown,
@@ -4317,6 +4320,8 @@ pub type EmbeddedWorkflowReady = Box<
 /// The callback is skipped if shutdown is requested before readiness. Request cancellation
 /// through the supplied shutdown token and continue polling this function to drain cleanup.
 /// No concurrent transport or durable-resume guarantee is provided by this callback.
+/// Unwinding callback panics trigger normal cleanup and a normalized error. The process panic
+/// hook still runs; aborting panics cannot be recovered. In-flight operations are not rolled back.
 ///
 /// # Errors
 /// Returns the same initialization, client handling, and shutdown failures as
@@ -4685,9 +4690,24 @@ async fn run_constructed_server(
         return shutdown_constructed_server(state, Ok(())).await;
     }
     if let Some(ready) = workflow_ready {
-        let application =
-            workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
-        ready(&application).await;
+        use futures::FutureExt as _;
+        let callback_result = {
+            let application =
+                workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
+            // Include callback construction as well as future polling in the unwind boundary.
+            // Do not reuse the callback after a panic; drain the host through normal cleanup.
+            std::panic::AssertUnwindSafe(async { ready(&application).await })
+                .catch_unwind()
+                .await
+        };
+        if callback_result.is_err() {
+            drop(listener);
+            return shutdown_constructed_server(
+                state,
+                Err(ServerError::EmbeddedWorkflowCallbackFailed),
+            )
+            .await;
+        }
     }
     state.metrics.record_histogram(
         "server.startup.ready_ms",
@@ -76881,6 +76901,42 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("background tasks release state after shutdown");
             ingestion.await.expect("ingestion exits cleanly");
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_workflow_callback_panic_drains_host() {
+        for panic_on_poll in [false, true] {
+            let (state,) = (Arc::new(test_server_state(SessionManager::default())),);
+            let weak = Arc::downgrade(&state);
+            let directory = tempfile::tempdir().expect("socket directory");
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("panic.sock"));
+            let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+            let ready: EmbeddedWorkflowReady = Box::new(move |_| {
+                assert!(panic_on_poll, "callback construction panic");
+                Box::pin(async { panic!("callback polling panic") })
+            });
+            let result = run_constructed_server(
+                state,
+                listener,
+                &bcode_config::DaemonConfig::default(),
+                false,
+                &[],
+                bcode_agent_runtime::CancellationToken::new(),
+                Some(ready),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(ServerError::EmbeddedWorkflowCallbackFailed)
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while weak.strong_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("host state released after callback panic");
         }
     }
 

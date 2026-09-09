@@ -85,9 +85,12 @@ tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 bcode_build_info      = { workspace = true }
+bcode_config          = { workspace = true }
 bcode_hello_plugin    = { workspace = true }
+bcode_ipc             = { workspace = true }
 bcode_plugin          = { workspace = true }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_server          = { workspace = true }
 bcode_shell_plugin    = { workspace = true, features = ["static-bundled"] }
 sshenv_vault          = { workspace = true }
 tempfile              = { workspace = true }

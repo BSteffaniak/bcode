@@ -8,6 +8,87 @@ use std::io::Read as _;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[test]
+fn embedded_workflow_public_entry_external_consumer() {
+    const CHILD: &str = "BCODE_TEST_EMBEDDED_WORKFLOW_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use bcode_workflow::WorkflowRunApplication as _;
+            let (plugins,) = (
+                bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                    &bcode_plugin::PluginSelection {
+                        mode: bcode_plugin::PluginSelectionMode::Explicit,
+                        enabled: std::collections::BTreeSet::new(),
+                        disabled: std::collections::BTreeSet::new(),
+                    },
+                    &[],
+                )
+                .unwrap(),
+            );
+            let shutdown = bcode_agent_runtime::CancellationToken::new();
+            let signal = shutdown.clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let ready: bcode_server::EmbeddedWorkflowReady = Box::new(move |application| {
+                Box::pin(async move {
+                    let result = application
+                        .associated_workflow_run(bcode_workflow::WorkflowRunBindingLookup {
+                            owner_plugin_id: "external-test".to_owned(),
+                            workflow_kind: "test".to_owned(),
+                            scope_key: "missing".to_owned(),
+                        })
+                        .await;
+                    sender.send(result).unwrap();
+                    signal.cancel();
+                })
+            });
+            bcode_server::run_embedded_with_workflow_application(
+                bcode_ipc::IpcEndpoint::unix_socket(
+                    std::env::current_dir().unwrap().join("embedded.sock"),
+                ),
+                bcode_config::BcodeConfig::default(),
+                plugins,
+                bcode_model_catalog::ModelCatalogResolver::embedded(),
+                Vec::new(),
+                shutdown,
+                ready,
+            )
+            .await
+            .unwrap();
+            assert!(receiver.await.unwrap().unwrap().is_none());
+        });
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "embedded_workflow_public_entry_external_consumer",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env(CHILD, "1")
+        .env("HOME", root.path())
+        .env("BCODE_STATE_DIR", root.path().join("state"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .current_dir(root.path())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("embedded public entry timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn capture_output(mut pipe: impl std::io::Read) -> std::io::Result<(Vec<u8>, bool)> {
     let mut retained = Vec::new();
     let mut truncated = false;
