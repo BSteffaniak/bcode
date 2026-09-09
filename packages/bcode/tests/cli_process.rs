@@ -483,6 +483,62 @@ fn workflow_launch_detail_reads_source_through_daemon() {
 }
 
 #[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn workflow_package_cli_applies_and_publishes_exact_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    std::fs::write(
+        root.path().join("member.json"),
+        include_str!("../../../fixtures/workflows/source-defined-input.workflow.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 3, "package_id": "cli/package", "exports": {"main": "member"},
+            "members": [{"member_id": "member", "source_name": "member.json"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let applied = graph_cli_json(
+        root.path(),
+        &["workflow", "package", "apply", "package.json"],
+    );
+    assert_eq!(applied[0]["outcome"], "applied");
+    std::fs::write(
+        root.path().join("lock.json"),
+        serde_json::to_vec(&applied[0]["lock"]).unwrap(),
+    )
+    .unwrap();
+    let duplicate = run_cli_at_root(
+        root.path(),
+        &["workflow", "package", "apply", "package.json"],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert_eq!(duplicate.status.code(), Some(1));
+    let published = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "package",
+            "publish",
+            "--lock",
+            "lock.json",
+            "--expected-generation",
+            "member=1",
+        ],
+    );
+    assert_eq!(published["outcome"], "published");
+    assert_eq!(
+        published["lock"]["members"][0]["published_revision"]["revision"],
+        1
+    );
+    drop(daemon);
+}
+
+#[test]
 fn workflow_launch_detail_rejects_future_version_before_dispatch() {
     let output = run_cli_with_fixture(
         &["workflow", "launch-detail", "--request", "request.json"],
