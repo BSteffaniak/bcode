@@ -11,6 +11,79 @@ use std::{
     sync::Arc,
 };
 
+/// Attach bounded recent history after the caller has reserved the session namespace.
+///
+/// # Errors
+/// Returns the domain attachment error; the caller retains failure cleanup and response ordering.
+pub async fn attach_recent(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    client_id: bcode_session_models::ClientId,
+    limit: usize,
+) -> Result<bcode_session::SessionAttachment, bcode_session::SessionError> {
+    let attachment = state
+        .sessions
+        .attach_session_recent(session_id, client_id, limit)
+        .await?;
+    state.complete_session_namespace_attach(session_id).await;
+    Ok(attachment)
+}
+
+/// Attach a bounded projection window after the caller has reserved the session namespace.
+///
+/// # Errors
+/// Returns the domain attachment error; the caller retains failure cleanup and response ordering.
+pub async fn attach_projection_window(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    client_id: bcode_session_models::ClientId,
+    request: bcode_session_models::ProjectionWindowRequest,
+) -> Result<bcode_session::SessionProjectionWindowAttachment, bcode_session::SessionError> {
+    let attachment = state
+        .sessions
+        .attach_session_projection_window(session_id, client_id, request)
+        .await?;
+    state.complete_session_namespace_attach(session_id).await;
+    Ok(attachment)
+}
+
+/// Failure to prepare a full session attachment.
+pub enum AttachError {
+    /// Another active namespace owns the session.
+    Namespace(String),
+    /// Domain attachment failed; the caller must cancel the pending namespace attach.
+    Session(bcode_session::SessionError),
+}
+
+/// Prepare a full attachment without registering a transport or writing a response.
+///
+/// The caller must reject ambiguous session locations before invoking this operation.
+/// On session failure, retain existing response-before-namespace-cleanup ordering.
+///
+/// # Errors
+/// Returns a namespace conflict or a domain attachment failure.
+pub async fn attach(
+    state: &Arc<ServerState>,
+    session_id: bcode_session_models::SessionId,
+    client_id: bcode_session_models::ClientId,
+) -> Result<bcode_session::SessionAttachment, AttachError> {
+    super::recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
+    let namespace = state.client_session_namespace(client_id).await;
+    state
+        .try_activate_session_namespace(session_id, namespace)
+        .await
+        .map_err(AttachError::Namespace)?;
+    let attachment = state
+        .sessions
+        .attach_session(session_id, client_id)
+        .await
+        .map_err(AttachError::Session)?;
+    record_history_access(state, session_id).await;
+    state.complete_session_namespace_attach(session_id).await;
+    super::restore_active_skills_from_history(&attachment.history, state, session_id).await;
+    Ok(attachment)
+}
+
 /// Failure to prepare a session for opening.
 pub enum PrepareOpenError {
     /// Historical writer cannot be upgraded by the migration coordinator.

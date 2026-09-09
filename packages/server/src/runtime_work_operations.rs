@@ -4,6 +4,34 @@ use super::{ClientId, ServerState, WorkId};
 use bcode_session_models::RuntimeWorkSnapshot;
 use bcode_session_models::{SessionEvent, SessionId};
 
+/// Prepared runtime-work observation, before a transport installs its forwarder.
+pub struct RuntimeWorkSubscription {
+    /// Initial projected durable work events.
+    pub initial_events: Vec<SessionEvent>,
+    /// Subscription acquired before reading the initial snapshot to avoid a delivery gap.
+    pub subscription: bcode_session::SessionEventSubscription,
+}
+
+/// Subscribe before reading active work, without choosing a transport or spawning a forwarder.
+///
+/// # Errors
+/// Returns the session error when subscription or active-work projection is unavailable.
+pub async fn subscribe(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<RuntimeWorkSubscription, bcode_session::SessionError> {
+    let subscription = state.sessions.subscribe_session_events(session_id).await?;
+    let runtime_work = state.sessions.active_runtime_work(session_id).await?;
+    let initial_events = runtime_work
+        .into_iter()
+        .flat_map(|work| super::runtime_work_projection_to_events(session_id, work))
+        .collect();
+    Ok(RuntimeWorkSubscription {
+        initial_events,
+        subscription,
+    })
+}
+
 /// Return bounded durable runtime-work history without transport framing.
 ///
 /// Limits are clamped to the session history read budget; zero requests one event,

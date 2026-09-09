@@ -12264,20 +12264,8 @@ async fn handle_attach_session(
     if let Some(response) = ambiguous_session_location_response(state, session_id).await {
         return send_response(writer, request_id, response).await;
     }
-    recover_abandoned_session_runtime_work_best_effort(state, session_id).await;
-    let client_namespace = state.client_session_namespace(client_id).await;
-    if let Err(active_namespace) = state
-        .try_activate_session_namespace(session_id, client_namespace)
-        .await
-    {
-        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
-            .await;
-    }
-    match state.sessions.attach_session(session_id, client_id).await {
+    match session_operations::attach(state, session_id, client_id).await {
         Ok(attachment) => {
-            session_operations::record_history_access(state, session_id).await;
-            state.complete_session_namespace_attach(session_id).await;
-            restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
             state.attach_client_session(client_id, session_id).await;
             let draft = state.sessions.session_composer_draft(session_id).await?;
@@ -12305,7 +12293,10 @@ async fn handle_attach_session(
             state.register_client_forwarder(client_id, handle).await;
             Ok(())
         }
-        Err(error) => {
+        Err(session_operations::AttachError::Namespace(active_namespace)) => {
+            send_incompatible_active_session_response(writer, request_id, &active_namespace).await
+        }
+        Err(session_operations::AttachError::Session(error)) => {
             send_response(
                 writer,
                 request_id,
@@ -12384,13 +12375,8 @@ async fn handle_attach_session_recent(
         elapsed_ms(namespace_started_at),
     );
     let attach_started_at = Instant::now();
-    match state
-        .sessions
-        .attach_session_recent(session_id, client_id, limit)
-        .await
-    {
+    match session_operations::attach_recent(state, session_id, client_id, limit).await {
         Ok(attachment) => {
-            state.complete_session_namespace_attach(session_id).await;
             finish_attach_session_recent_success(
                 AttachRecentSuccessContext {
                     request_id,
@@ -12474,13 +12460,9 @@ async fn handle_attach_session_projection_window(
         elapsed_ms(namespace_started_at),
     );
     let attach_started_at = Instant::now();
-    match state
-        .sessions
-        .attach_session_projection_window(session_id, client_id, request)
-        .await
+    match session_operations::attach_projection_window(state, session_id, client_id, request).await
     {
         Ok(window_attachment) => {
-            state.complete_session_namespace_attach(session_id).await;
             finish_attach_session_projection_window_success(
                 AttachProjectionWindowSuccessContext {
                     request_id,
@@ -15738,15 +15720,11 @@ async fn handle_subscribe_runtime_work(
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let subscription = state.sessions.subscribe_session_events(session_id).await?;
-    let runtime_work = state.sessions.active_runtime_work(session_id).await?;
+    let observation = runtime_work_operations::subscribe(state, session_id).await?;
     let handle = forward_runtime_work_events(
         ClientEventSink::new(client_id, writer.clone(), state.metrics.clone()),
-        runtime_work
-            .into_iter()
-            .flat_map(|work| runtime_work_projection_to_events(session_id, work))
-            .collect(),
-        subscription.events,
+        observation.initial_events,
+        observation.subscription.events,
     );
     state.register_client_forwarder(client_id, handle).await;
     send_response(
