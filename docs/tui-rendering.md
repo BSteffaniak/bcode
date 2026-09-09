@@ -128,6 +128,26 @@ Incomplete Markdown is renderer-local. Streaming projections visibly preserve ac
 content, redact unsafe unfinished destinations, and converge to the normal projection once syntax is
 complete. Semantic text remains unchanged in `SessionView`.
 
+## Viewport reconciliation
+
+Virtual space below the transcript is an explicit `TailSpace` viewport state, not bottom-follow
+with a mutable growth allowance. It retains a top-origin reading position and derives remaining
+blank rows from the current geometry. New content fills that space regardless of the manual-input
+grace timer; reaching the viewport boundary resumes bottom-follow. Alternating growth and shrinkage
+must not accumulate scroll drift.
+
+Latest-content chrome is measured against the full body using a copy of viewport/history state.
+The bar cannot create its own visibility condition by reducing the viewport. Layout preparation
+then synchronizes the actual viewport once. Stable item anchors are captured before layout
+synchronization as well as before semantic adaptation, covering asynchronous presentation acceptance
+and width changes. Restored row offsets are confined to the surviving item, and manual input clears
+pending correspondence from the preceding navigation intent.
+
+This is an incremental foundation, not the completed viewport-controller migration. Application
+reveal policy and viewport navigation remain separate; successful-presentation transaction ownership,
+intra-item semantic correspondence, unified tool-surface composition, and versioned plugin anchor
+metadata still require implementation. Existing generic plugin fallbacks remain unchanged.
+
 ## Accepted Markdown projection scheduling
 
 Transcript Markdown has one TUI-owned accepted projection per resident item. Rows, contribution

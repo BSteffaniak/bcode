@@ -9,6 +9,10 @@ enum TranscriptViewportMode {
     AnchoredTop {
         top_row: usize,
     },
+    /// A stationary reading position with virtual space remaining below the tail.
+    TailSpace {
+        top_row: usize,
+    },
 }
 
 /// Rendered transcript viewport state.
@@ -113,7 +117,8 @@ impl TranscriptViewport {
                 .saturating_add(self.bottom_overscroll)
                 .min(total_rows.saturating_add(self.max_bottom_overscroll))
                 .saturating_sub(viewport_height),
-            TranscriptViewportMode::AnchoredTop { top_row } => top_row.min(total_rows),
+            TranscriptViewportMode::AnchoredTop { top_row }
+            | TranscriptViewportMode::TailSpace { top_row } => top_row.min(total_rows),
         }
     }
 
@@ -147,7 +152,7 @@ impl TranscriptViewport {
         let previous = *self;
         let viewport_height = usize::from(self.viewport_height);
         match self.mode {
-            TranscriptViewportMode::FollowBottom => {
+            TranscriptViewportMode::FollowBottom | TranscriptViewportMode::TailSpace { .. } => {
                 if history.has_newer_history() && !history.loading_newer() {
                     let previous_request = history.newer_reveal_request();
                     history.request_load_newer(rows.max(1));
@@ -182,6 +187,14 @@ impl TranscriptViewport {
                 }
             }
         }
+        if self.bottom_overscroll > 0 {
+            self.mode = TranscriptViewportMode::TailSpace {
+                top_row: self
+                    .previous_total_rows
+                    .saturating_add(self.bottom_overscroll)
+                    .saturating_sub(viewport_height),
+            };
+        }
         self.refresh_offset_cache();
         *self != previous
     }
@@ -204,23 +217,15 @@ impl TranscriptViewport {
         max_bottom_overscroll: usize,
         total_rows: usize,
         viewport_height: u16,
-        manual_scroll_active: bool,
+        _manual_scroll_active: bool,
         older_history: &mut OlderHistoryState,
     ) {
-        let previous_total_rows = self.previous_total_rows;
         let previous_max = self.max_offset;
-        let appended_rows = total_rows.saturating_sub(previous_total_rows);
         self.previous_total_rows = total_rows;
         self.viewport_height = viewport_height;
         self.max_offset = max_offset;
         self.max_bottom_overscroll = max_bottom_overscroll;
-        if !manual_scroll_active
-            && matches!(self.mode, TranscriptViewportMode::FollowBottom)
-            && self.bottom_overscroll > 0
-            && appended_rows > 0
-        {
-            self.bottom_overscroll = self.bottom_overscroll.saturating_sub(appended_rows);
-        }
+        self.resolve_tail_space();
         if let Some(requested_rows) = older_history.take_reveal_request() {
             let inserted_rows = max_offset.saturating_sub(previous_max);
             let reveal_rows = requested_rows.min(inserted_rows);
@@ -233,6 +238,34 @@ impl TranscriptViewport {
         self.refresh_offset_cache();
     }
 
+    /// Restore content correspondence without changing the user's navigation intent.
+    pub fn restore_anchor(&mut self, top_row: usize) {
+        let top_row = top_row.min(self.previous_total_rows);
+        self.mode = match self.mode {
+            TranscriptViewportMode::FollowBottom => return,
+            TranscriptViewportMode::AnchoredTop { .. } => {
+                TranscriptViewportMode::AnchoredTop { top_row }
+            }
+            TranscriptViewportMode::TailSpace { .. } => {
+                TranscriptViewportMode::TailSpace { top_row }
+            }
+        };
+        self.resolve_tail_space();
+        self.refresh_offset_cache();
+    }
+
+    fn resolve_tail_space(&mut self) {
+        if let TranscriptViewportMode::TailSpace { top_row } = self.mode {
+            let bottom = top_row.saturating_add(usize::from(self.viewport_height));
+            self.bottom_overscroll = bottom
+                .saturating_sub(self.previous_total_rows)
+                .min(self.max_bottom_overscroll);
+            if bottom <= self.previous_total_rows {
+                self.mode = TranscriptViewportMode::FollowBottom;
+            }
+        }
+    }
+
     fn clamp_anchor(&mut self) {
         if let TranscriptViewportMode::AnchoredTop { top_row } = &mut self.mode {
             *top_row = (*top_row).min(self.previous_total_rows);
@@ -241,7 +274,7 @@ impl TranscriptViewport {
 
     fn refresh_offset_cache(&mut self) {
         self.offset = match self.mode {
-            TranscriptViewportMode::FollowBottom => 0,
+            TranscriptViewportMode::FollowBottom | TranscriptViewportMode::TailSpace { .. } => 0,
             TranscriptViewportMode::AnchoredTop { top_row } => self
                 .previous_total_rows
                 .saturating_sub(top_row.saturating_add(usize::from(self.viewport_height)))
@@ -263,6 +296,64 @@ mod tests {
 
     fn older_history() -> OlderHistoryState {
         OlderHistoryState::new(&[], false)
+    }
+
+    #[test]
+    fn tail_space_restore_preserves_intent_and_derives_blank_rows() {
+        let mut viewport = TranscriptViewport::default();
+        let mut older = older_history();
+        viewport.sync_max(20, 9, 30, 10, false, &mut older);
+        viewport.scroll_down(4, &mut older);
+        viewport.sync_max(21, 9, 31, 10, false, &mut older);
+        viewport.restore_anchor(25);
+        assert_eq!(viewport.bottom_overscroll(), 4);
+        assert!(!viewport.follows_bottom());
+        assert_eq!(viewport.top_row(31, 10), 25);
+    }
+
+    #[test]
+    fn tail_space_does_not_ratchet_when_existing_geometry_oscillates() {
+        let mut viewport = TranscriptViewport::default();
+        let mut older = older_history();
+        viewport.sync_max(20, 9, 30, 10, false, &mut older);
+        viewport.scroll_down(4, &mut older);
+        let top = viewport.top_row(30, 10);
+        for _ in 0..20 {
+            viewport.sync_max(21, 9, 31, 10, false, &mut older);
+            assert_eq!(viewport.top_row(31, 10), top);
+            viewport.sync_max(20, 9, 30, 10, false, &mut older);
+            assert_eq!(viewport.top_row(30, 10), top);
+            assert_eq!(viewport.bottom_overscroll(), 4);
+        }
+    }
+
+    #[test]
+    fn tail_space_exhaustion_is_independent_of_manual_scroll_timing() {
+        for manual_scroll_active in [false, true] {
+            let mut viewport = TranscriptViewport::default();
+            let mut older = older_history();
+            viewport.sync_max(20, 9, 30, 10, false, &mut older);
+            viewport.scroll_down(4, &mut older);
+            assert!(!viewport.follows_bottom());
+            viewport.sync_max(22, 9, 32, 10, manual_scroll_active, &mut older);
+            assert_eq!(viewport.top_row(32, 10), 24);
+            assert_eq!(viewport.bottom_overscroll(), 2);
+            viewport.sync_max(25, 9, 35, 10, manual_scroll_active, &mut older);
+            assert!(viewport.follows_bottom());
+            assert_eq!(viewport.top_row(35, 10), 25);
+        }
+    }
+
+    #[test]
+    fn tail_space_repeated_measurement_is_idempotent() {
+        let mut viewport = TranscriptViewport::default();
+        let mut older = older_history();
+        viewport.sync_max(20, 9, 30, 10, false, &mut older);
+        viewport.scroll_down(4, &mut older);
+        viewport.sync_max(21, 9, 31, 10, false, &mut older);
+        let resolved = viewport;
+        viewport.sync_max(21, 9, 31, 10, false, &mut older);
+        assert_eq!(viewport, resolved);
     }
 
     #[test]

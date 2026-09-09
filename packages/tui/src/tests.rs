@@ -3809,7 +3809,7 @@ fn streaming_delta_fills_virtual_space_instead_of_top_anchoring() {
 }
 
 #[test]
-fn manual_scroll_grace_prevents_virtual_space_catch_up() {
+fn manual_scroll_keeps_position_while_new_content_fills_virtual_space() {
     let session_id = SessionId::new();
     let history = [event(
         session_id,
@@ -3836,7 +3836,7 @@ fn manual_scroll_grace_prevents_virtual_space_catch_up() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(app.bottom_overscroll(), 4);
+    assert_eq!(app.bottom_overscroll(), 1);
     drop(app);
 }
 
@@ -3870,7 +3870,8 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(app.bottom_overscroll(), 4);
+    assert_eq!(app.bottom_overscroll(), 1);
+    assert!(app.manually_detached());
     drop(app);
 }
 

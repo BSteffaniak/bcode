@@ -2013,6 +2013,41 @@ impl BmuxApp {
         self.hidden_entry_start_row_below_viewport().is_some()
     }
 
+    /// Measure latest-content chrome without consuming navigation state.
+    pub(crate) fn needs_latest_bar_at_height(&self, height: u16) -> bool {
+        let total_rows = self.transcript_layout.total_rows();
+        let mut viewport = self.viewport;
+        let mut history = self.older_history.clone();
+        viewport.sync_max(
+            total_rows.saturating_sub(usize::from(height)),
+            usize::from(height).saturating_sub(1),
+            total_rows,
+            height,
+            false,
+            &mut history,
+        );
+        if let Some(anchor) = &self.pending_stable_transcript_anchor
+            && let Some(index) = self.transcript.presentation_index(anchor.item_id)
+            && let Some(start) = self
+                .transcript_layout
+                .entry_start_row(VisibleTranscriptSource::Transcript, index)
+        {
+            let rows = self
+                .transcript_layout
+                .entry_row_count(VisibleTranscriptSource::Transcript, index)
+                .unwrap_or_default();
+            viewport.restore_anchor(
+                start.saturating_add(anchor.row_in_item.min(rows.saturating_sub(1))),
+            );
+        }
+        let bottom = viewport.bottom_row(total_rows);
+        bottom < total_rows
+            && self
+                .transcript_layout
+                .first_entry_start_at_or_after_row(bottom)
+                .is_some()
+    }
+
     fn hidden_entry_start_row_below_viewport(&self) -> Option<usize> {
         let total_rows = self.transcript_layout.total_rows();
         let viewport_bottom = self.viewport.bottom_row(total_rows);
@@ -2809,6 +2844,9 @@ impl BmuxApp {
     }
 
     fn mark_manual_transcript_scroll(&mut self) {
+        // A pending correspondence belongs to the previous navigation intent.
+        // It must not undo input received between semantic updates and preparation.
+        self.pending_stable_transcript_anchor = None;
         self.manual_transcript_scroll_until = Some(Instant::now() + MANUAL_TRANSCRIPT_SCROLL_GRACE);
     }
 
@@ -3825,7 +3863,7 @@ impl BmuxApp {
         }
     }
 
-    fn capture_stable_transcript_anchor(&mut self) {
+    pub(crate) fn capture_stable_transcript_anchor(&mut self) {
         if self.viewport.follows_bottom() || self.pending_stable_transcript_anchor.is_some() {
             return;
         }
@@ -3865,8 +3903,13 @@ impl BmuxApp {
         else {
             return;
         };
-        self.viewport
-            .follow_anchor(start_row.saturating_add(anchor.row_in_item));
+        let row_count = self
+            .transcript_layout
+            .entry_row_count(VisibleTranscriptSource::Transcript, index)
+            .unwrap_or_default();
+        self.viewport.restore_anchor(
+            start_row.saturating_add(anchor.row_in_item.min(row_count.saturating_sub(1))),
+        );
     }
 
     fn apply_session_view_terminal_adapter(&mut self) -> TranscriptDocumentDamage {

@@ -22,11 +22,10 @@ const MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC: usize = 64;
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
     let initial_transcript_area = render::transcript_area_for_body(app, body);
     sync_layout(app, initial_transcript_area.width);
-    sync_viewport(app, initial_transcript_area);
-    let latest_bar_height = u16::from(app.newer_transcript_content_below());
-    if latest_bar_height == 0 {
-        return;
-    }
+    // Chrome is decided against the full body. A bar cannot create its own reason
+    // to exist by reducing the viewport, and measurement never consumes navigation.
+    let latest_bar_height =
+        u16::from(app.needs_latest_bar_at_height(initial_transcript_area.height));
     let body = Rect::new(
         body.x,
         body.y,
@@ -34,7 +33,6 @@ pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
         body.height.saturating_sub(latest_bar_height),
     );
     let transcript_area = render::transcript_area_for_body(app, body);
-    sync_layout(app, transcript_area.width);
     sync_viewport(app, transcript_area);
 }
 
@@ -92,6 +90,9 @@ fn transcript_item_rows(
 }
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {
+    // Include asynchronous adapter/Markdown acceptance and width changes, not
+    // just semantic event application, in the anchor reconciliation boundary.
+    app.capture_stable_transcript_anchor();
     render::set_markdown_details_open(app.markdown_details_open());
     render::set_plugin_visual_theme(&app.presented_theme());
     let started = Instant::now();
