@@ -535,7 +535,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -546,7 +546,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4253,7 +4253,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4909,6 +4909,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4917,7 +4926,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5184,7 +5193,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7979,7 +7988,7 @@ name = "moosicbox_log_runtime"
 version = "0.4.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#9a59d6e2af9f700e04d80d2b8b518e3e44f4216b"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
  "thiserror 2.0.20",
  "tracing-appender",
  "tracing-log",
@@ -8137,7 +8146,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9365,7 +9374,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10023,7 +10032,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10036,7 +10045,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10781,7 +10790,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10866,7 +10875,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault"
 version = "0.0.1-alpha.3"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#f5fae01dd0a4ff16d6d4e326670cee786186e60d"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#4a4242c2c7aae6b2ddd903215ad3e5e31d0cd78d"
 dependencies = [
  "aes-siv",
  "age",
@@ -10874,11 +10883,11 @@ dependencies = [
  "base64 0.23.1",
  "core-foundation",
  "core-foundation-sys",
- "dirs",
+ "dirs 7.0.0",
+ "getrandom 0.4.3",
  "hex",
  "hkdf 0.13.0",
  "libc",
- "rand_core 0.6.4",
  "rpassword",
  "security-framework",
  "security-framework-sys",
@@ -10897,7 +10906,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault_models"
 version = "0.0.1-alpha.3"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#f5fae01dd0a4ff16d6d4e326670cee786186e60d"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#4a4242c2c7aae6b2ddd903215ad3e5e31d0cd78d"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -10919,7 +10928,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12226,10 +12235,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13671,7 +13680,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13994,7 +14003,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfd9dcd572d35abcfb25da214eb600647ee3106d5fbf14d1822cd09a3a35c8da"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
  "glob",
  "jwalk",
  "log 0.4.33",
