@@ -410,6 +410,7 @@ switchy_database = { git = "https://github.com/MoosicBox/MoosicBox.git", branch 
 switchy_database_connection = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
     "sqlite-rusqlite",
 ] }
+switchy_fs = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "236ceefc2f11454aa7aca3739e48ebdc5584b8d1", default-features = false }
 syntect = { version = "5.3.0", default-features = false, features = [
     "default-syntaxes",
     "default-themes",

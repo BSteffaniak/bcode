@@ -299,6 +299,28 @@ impl<'a> AuthVaultLifecycle<'a> {
         &self,
         credentials: BTreeMap<String, Option<String>>,
     ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
+        self.update_with(credentials, |changes| self.persist_storage_updates(changes))
+    }
+
+    /// Apply credential changes through caller-selected vault custody.
+    ///
+    /// Ownership is checked at construction and credential IDs are validated and mapped to
+    /// storage keys before `persist` is invoked. The supplied effect must atomically apply the
+    /// changes to this lifecycle's owned profile, preserve unrelated values, and enforce its
+    /// device-seal policy. This method performs no native vault access itself.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared credentials or a failure of the selected custody effect.
+    pub fn update_with(
+        &self,
+        credentials: BTreeMap<String, Option<String>>,
+        persist: impl FnOnce(
+            BTreeMap<String, Option<String>>,
+        ) -> Result<
+            Vec<crate::security::AuthSecurityDiagnostic>,
+            AuthVaultLifecycleError,
+        >,
+    ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
         let storage_keys = self.credential_storage_keys()?;
         for credential in credentials.keys() {
             if !storage_keys.contains_key(credential) {
@@ -308,6 +330,18 @@ impl<'a> AuthVaultLifecycle<'a> {
                 });
             }
         }
+        persist(
+            credentials
+                .into_iter()
+                .map(|(credential, value)| (storage_keys[&credential].clone(), value))
+                .collect(),
+        )
+    }
+
+    fn persist_storage_updates(
+        &self,
+        changes: BTreeMap<String, Option<String>>,
+    ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
         let (store, recipient_key) = self.open_or_initialize_store()?;
         let mut values = match store.get_profile(self.storage_profile()) {
             Ok(Some(values)) => values,
@@ -318,12 +352,11 @@ impl<'a> AuthVaultLifecycle<'a> {
                 ));
             }
         };
-        for (credential, value) in credentials {
-            let key = &storage_keys[&credential];
+        for (key, value) in changes {
             if let Some(value) = value {
-                values.insert(key.clone(), Zeroizing::new(value));
+                values.insert(key, Zeroizing::new(value));
             } else {
-                values.remove(key);
+                values.remove(&key);
             }
         }
         store
@@ -601,6 +634,42 @@ mod tests {
             supports_verification: false,
             supports_revocation: false,
         }
+    }
+
+    #[test]
+    fn selected_update_custody_receives_only_validated_storage_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = directory.path().join("unused.vault");
+        let resolved = resolved(&vault);
+        let method = method();
+        let lifecycle =
+            AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method).unwrap();
+        let mut calls = 0;
+        for value in [Some("controlled".to_owned()), None] {
+            lifecycle
+                .update_with(
+                    BTreeMap::from([("api_key".to_owned(), value.clone())]),
+                    |changes| {
+                        calls += 1;
+                        assert_eq!(
+                            changes,
+                            BTreeMap::from([("TEST_PROVIDER_API_KEY".to_owned(), value)])
+                        );
+                        Ok(Vec::new())
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(calls, 2);
+        let result = lifecycle.update_with(
+            BTreeMap::from([("undeclared".to_owned(), Some("rejected".to_owned()))]),
+            |_| panic!("invalid credentials must not reach custody"),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthVaultLifecycleError::UnknownCredential { .. })
+        ));
+        assert!(!vault.exists());
     }
 
     fn interactive_method() -> AuthMethodContribution {

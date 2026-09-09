@@ -14,6 +14,53 @@ use bcode_model::{
 };
 use std::collections::BTreeSet;
 
+#[test]
+fn owned_store_initializes_sdk_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store =
+        bcode_provider_auth::store::AuthStore::create(&root.path().join("auth")).unwrap();
+    store
+        .update(|state| {
+            state.subscriptions.pools.insert(
+                "pool".into(),
+                bcode_config::RuntimeAuthSubscriptionPool {
+                    profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
+                        auth_profile: "owned".into(),
+                        storage_profile: "stored".into(),
+                        vault: "/not-accessed".into(),
+                        provider: "openai".into(),
+                        scheme: "api_key".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    let mut config = BcodeConfig::default();
+    config.model.auth_pool = Some("pool".into());
+    let sdk = Bcode::builder()
+        .provider_defaults_from_store(
+            &config,
+            &ConfigEnvironmentSnapshot::isolated("owned-store"),
+            &store,
+            |name, _| {
+                assert_eq!(name, "owned");
+                bcode_provider_auth::ResolvedProviderAuth {
+                    auth: bcode_model::ProviderAuthContext::default(),
+                    env: std::collections::BTreeMap::new(),
+                }
+            },
+        )
+        .unwrap()
+        .build();
+    assert_eq!(
+        sdk.provider_context().auth_profile.as_deref(),
+        Some("owned")
+    );
+}
+
 #[tokio::test]
 async fn explicit_sdk_inputs_materialize_auth_pool_and_model_defaults() {
     let mut config = BcodeConfig::default();

@@ -17,6 +17,26 @@ pub struct AuthCredentialUpdateContext<'a> {
     pub method: &'a AuthMethodContribution,
 }
 
+/// Selected host credential custody, invoked only after canonical authorization and mapping.
+///
+/// Implementations must atomically apply storage-key changes to the resolved profile, preserve
+/// unrelated values, enforce its device-seal policy, and return secret-safe errors. This is a
+/// trusted host service, never a plugin-supplied authorization hook.
+pub trait AuthCredentialCustody: Send + Sync {
+    /// Persist validated changes for the host-resolved owner and profile.
+    ///
+    /// # Errors
+    /// Returns an error if ownership, policy, or atomic persistence cannot be satisfied.
+    fn persist(
+        &self,
+        resolved: &ResolvedAuthProfile,
+        changes: std::collections::BTreeMap<String, Option<String>>,
+    ) -> Result<
+        Vec<crate::security::AuthSecurityDiagnostic>,
+        crate::lifecycle::AuthVaultLifecycleError,
+    >;
+}
+
 /// Host credential-update failure.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthCredentialUpdateError {
@@ -41,6 +61,18 @@ pub fn update_credentials(
     context: AuthCredentialUpdateContext<'_>,
     request: AuthCredentialUpdateRequest,
 ) -> Result<AuthCredentialUpdateResponse, AuthCredentialUpdateError> {
+    update_credentials_with_custody(context, request, None)
+}
+
+/// Update credentials using canonical authorization and optionally selected host custody.
+///
+/// # Errors
+/// Returns payload, ownership, credential-shape, or custody errors before reporting success.
+pub fn update_credentials_with_custody(
+    context: AuthCredentialUpdateContext<'_>,
+    request: AuthCredentialUpdateRequest,
+    custody: Option<&dyn AuthCredentialCustody>,
+) -> Result<AuthCredentialUpdateResponse, AuthCredentialUpdateError> {
     request
         .validate()
         .map_err(|error| AuthCredentialUpdateError::InvalidRequest(error.to_string()))?;
@@ -63,13 +95,19 @@ pub fn update_credentials(
     }
     let mut updated_credentials = request.credentials.keys().cloned().collect::<Vec<_>>();
     updated_credentials.sort();
-    AuthVaultLifecycle::new(
+    let lifecycle = AuthVaultLifecycle::new(
         context.resolved,
         context.provider_id,
         context.caller_plugin_id,
         context.method,
-    )?
-    .update(request.credentials)?;
+    )?;
+    if let Some(custody) = custody {
+        lifecycle.update_with(request.credentials, |changes| {
+            custody.persist(context.resolved, changes)
+        })?;
+    } else {
+        lifecycle.update(request.credentials)?;
+    }
     Ok(AuthCredentialUpdateResponse {
         schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
         updated_credentials,
@@ -107,6 +145,29 @@ pub fn resolve_credential_update_service_request<'registry>(
     caller_plugin_id: &str,
     registered_provider: impl FnOnce(&str) -> Option<RegisteredAuthProviderOwner<'registry>>,
     request: bcode_tool::ToolInvocationServiceRequest,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    resolve_credential_update_service_request_with_custody(
+        config,
+        runtime,
+        caller_plugin_id,
+        registered_provider,
+        request,
+        None,
+    )
+}
+
+/// Resolve a plugin credential update with optionally selected trusted host custody.
+///
+/// Uses the same registry ownership, profile resolution, and credential validation as the
+/// native entry point; custody cannot override authorization.
+#[must_use]
+pub fn resolve_credential_update_service_request_with_custody<'registry>(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    caller_plugin_id: &str,
+    registered_provider: impl FnOnce(&str) -> Option<RegisteredAuthProviderOwner<'registry>>,
+    request: bcode_tool::ToolInvocationServiceRequest,
+    custody: Option<&dyn AuthCredentialCustody>,
 ) -> bcode_tool::ToolInvocationServiceResolution {
     use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_UPDATE_CREDENTIALS};
     use bcode_tool::ToolInvocationServiceResolution as Resolution;
@@ -159,7 +220,7 @@ pub fn resolve_credential_update_service_request<'registry>(
             message: "owned auth profile method is not registered".to_owned(),
         };
     };
-    match update_credentials(
+    match update_credentials_with_custody(
         AuthCredentialUpdateContext {
             caller_plugin_id,
             provider_id: &provider_id,
@@ -167,6 +228,7 @@ pub fn resolve_credential_update_service_request<'registry>(
             method,
         },
         update,
+        custody,
     ) {
         Ok(response) => serde_json::to_value(response).map_or_else(
             |_| Resolution::Failed {
@@ -391,6 +453,57 @@ mod tests {
                 AuthProfileResolutionError::OwnerMismatch { .. }
             ))
         ));
+        assert!(!vault.exists());
+    }
+
+    #[test]
+    fn selected_custody_cannot_bypass_owner_or_credential_validation() {
+        struct UnavailableCustody(std::sync::atomic::AtomicUsize);
+        impl AuthCredentialCustody for UnavailableCustody {
+            fn persist(
+                &self,
+                resolved: &ResolvedAuthProfile,
+                changes: BTreeMap<String, Option<String>>,
+            ) -> Result<
+                Vec<crate::security::AuthSecurityDiagnostic>,
+                crate::lifecycle::AuthVaultLifecycleError,
+            > {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(resolved.profile_name, "openai");
+                assert_eq!(changes.len(), 1);
+                Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                    "custody unavailable".into(),
+                ))
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("unused");
+        let resolved = resolved(&vault);
+        let method = method();
+        let custody = UnavailableCustody(std::sync::atomic::AtomicUsize::new(0));
+        for (owner, credential) in [
+            ("other", "access_token"),
+            ("bcode.openai-compatible", "unknown"),
+            ("bcode.openai-compatible", "access_token"),
+        ] {
+            let result = update_credentials_with_custody(
+                AuthCredentialUpdateContext {
+                    caller_plugin_id: owner,
+                    provider_id: "openai",
+                    resolved: &resolved,
+                    method: &method,
+                },
+                AuthCredentialUpdateRequest {
+                    schema_version: AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                    provider_id: "openai".into(),
+                    profile: "openai".into(),
+                    credentials: BTreeMap::from([(credential.into(), Some("value".into()))]),
+                },
+                Some(&custody),
+            );
+            assert!(result.is_err());
+        }
+        assert_eq!(custody.0.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(!vault.exists());
     }
 

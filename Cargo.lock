@@ -2453,6 +2453,7 @@ dependencies = [
  "sha2 0.10.9",
  "ssh-key",
  "sshenv_vault",
+ "switchy_fs 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1)",
  "tempfile",
  "thiserror 2.0.20",
  "zeroize",
@@ -6275,7 +6276,7 @@ dependencies = [
  "moosicbox_assert",
  "serde",
  "serde_json",
- "switchy_time",
+ "switchy_time 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
 ]
 
 [[package]]
@@ -6385,7 +6386,7 @@ dependencies = [
  "log 0.4.33",
  "serde",
  "serde_json",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "thiserror 2.0.20",
  "url 2.5.8",
 ]
@@ -6459,8 +6460,8 @@ dependencies = [
  "moosicbox_env_utils",
  "serde",
  "serde_json",
- "switchy_async",
- "switchy_fs",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
+ "switchy_fs 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "thiserror 2.0.20",
 ]
 
@@ -6549,7 +6550,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "switchy",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "thiserror 2.0.20",
 ]
 
@@ -6630,7 +6631,7 @@ dependencies = [
  "serde_json",
  "strum 0.28.0",
  "switchy_env",
- "switchy_time",
+ "switchy_time 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "thiserror 2.0.20",
  "tl",
 ]
@@ -8005,7 +8006,7 @@ dependencies = [
  "futures-util",
  "log 0.4.33",
  "moosicbox_assert",
- "switchy_time",
+ "switchy_time 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "tracing",
 ]
 
@@ -8018,7 +8019,7 @@ dependencies = [
  "futures 0.3.34",
  "moosicbox_assert",
  "qstring",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
 ]
 
 [[package]]
@@ -11603,19 +11604,19 @@ name = "switchy"
 version = "0.4.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#67c0dafe860778e150da6a8280c40bd082193d62"
 dependencies = [
- "switchy_async",
- "switchy_async_macros",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
+ "switchy_async_macros 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_database",
  "switchy_database_connection",
- "switchy_fs",
+ "switchy_fs 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_http",
  "switchy_http_models",
  "switchy_mdns",
- "switchy_random",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_schema",
  "switchy_tcp",
  "switchy_telemetry",
- "switchy_time",
+ "switchy_time 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_upnp",
  "switchy_uuid",
  "switchy_web_server",
@@ -11632,9 +11633,27 @@ dependencies = [
  "log 0.4.33",
  "pin-project-lite",
  "scoped-tls",
- "switchy_async_macros",
- "switchy_random",
- "switchy_time",
+ "switchy_async_macros 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
+ "switchy_time 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "switchy_async"
+version = "0.4.0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1#236ceefc2f11454aa7aca3739e48ebdc5584b8d1"
+dependencies = [
+ "flume 0.12.0",
+ "futures 0.3.34",
+ "log 0.4.33",
+ "pin-project-lite",
+ "scoped-tls",
+ "switchy_async_macros 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1)",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1)",
+ "switchy_time 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1)",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -11644,6 +11663,18 @@ dependencies = [
 name = "switchy_async_macros"
 version = "0.4.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#67c0dafe860778e150da6a8280c40bd082193d62"
+dependencies = [
+ "log 0.4.33",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "switchy_async_macros"
+version = "0.4.0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1#236ceefc2f11454aa7aca3739e48ebdc5584b8d1"
 dependencies = [
  "log 0.4.33",
  "proc-macro-crate",
@@ -11664,8 +11695,8 @@ dependencies = [
  "moosicbox_profiles",
  "regex",
  "rusqlite",
- "switchy_async",
- "switchy_time",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
+ "switchy_time 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "thiserror 2.0.20",
  "tokio",
  "turso",
@@ -11678,7 +11709,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#67c0dafe8
 dependencies = [
  "log 0.4.33",
  "rusqlite",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_database",
  "switchy_env",
  "thiserror 2.0.20",
@@ -11700,8 +11731,19 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#67c0dafe8
 dependencies = [
  "bytes 1.12.1",
  "log 0.4.33",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "tokio",
+]
+
+[[package]]
+name = "switchy_fs"
+version = "0.4.0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1#236ceefc2f11454aa7aca3739e48ebdc5584b8d1"
+dependencies = [
+ "bytes 1.12.1",
+ "log 0.4.33",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1)",
+ "tempfile",
 ]
 
 [[package]]
@@ -11753,6 +11795,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchy_random"
+version = "0.4.0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1#236ceefc2f11454aa7aca3739e48ebdc5584b8d1"
+dependencies = [
+ "log 0.4.33",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "switchy_schema"
 version = "0.4.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#67c0dafe860778e150da6a8280c40bd082193d62"
@@ -11764,7 +11815,7 @@ dependencies = [
  "log 0.4.33",
  "moosicbox_json_utils",
  "sha2 0.11.0",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_database",
  "thiserror 2.0.20",
 ]
@@ -11780,7 +11831,7 @@ dependencies = [
  "log 0.4.33",
  "paste",
  "scoped-tls",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -11811,7 +11862,17 @@ dependencies = [
  "chrono",
  "log 0.4.33",
  "scoped-tls",
- "switchy_random",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
+]
+
+[[package]]
+name = "switchy_time"
+version = "0.4.0"
+source = "git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1#236ceefc2f11454aa7aca3739e48ebdc5584b8d1"
+dependencies = [
+ "log 0.4.33",
+ "scoped-tls",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?rev=236ceefc2f11454aa7aca3739e48ebdc5584b8d1)",
 ]
 
 [[package]]
@@ -11830,7 +11891,7 @@ dependencies = [
  "roxmltree 0.21.1",
  "rupnp",
  "serde",
- "switchy_async",
+ "switchy_async 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "thiserror 2.0.20",
  "tokio",
  "xml",
@@ -11843,7 +11904,7 @@ source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#67c0dafe8
 dependencies = [
  "log 0.4.33",
  "switchy_env",
- "switchy_random",
+ "switchy_random 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "uuid",
 ]
 
@@ -11865,7 +11926,7 @@ dependencies = [
  "paste",
  "serde",
  "serde-querystring",
- "switchy_fs",
+ "switchy_fs 0.4.0 (git+https://github.com/MoosicBox/MoosicBox.git?branch=master)",
  "switchy_http_models",
  "switchy_web_server_core",
  "switchy_web_server_cors",

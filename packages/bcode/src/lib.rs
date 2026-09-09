@@ -4246,6 +4246,7 @@ fn provider_auth_bridge_resolution(
         bcode_config::BcodeConfig,
         bcode_config::RuntimeAuthSubscriptions,
     )>,
+    custody: Option<&dyn bcode_provider_auth::operations::AuthCredentialCustody>,
 ) -> bcode_tool::ToolInvocationServiceResolution {
     let acquired;
     let (config, runtime) = if let Some(inputs) = inputs {
@@ -4260,7 +4261,7 @@ fn provider_auth_bridge_resolution(
         acquired = (config, bcode_config::load_runtime_auth_subscriptions());
         &acquired
     };
-    bcode_provider_auth::operations::resolve_credential_update_service_request(
+    bcode_provider_auth::operations::resolve_credential_update_service_request_with_custody(
         config,
         runtime,
         caller_plugin_id,
@@ -4273,6 +4274,7 @@ fn provider_auth_bridge_resolution(
             })
         },
         request,
+        custody,
     )
 }
 
@@ -4286,6 +4288,10 @@ fn provider_invocation_bridge(
             bcode_config::BcodeConfig,
             bcode_config::RuntimeAuthSubscriptions,
         )>,
+    >,
+    #[cfg(feature = "config")] auth_store: Option<Arc<bcode_provider_auth::store::AuthStore>>,
+    #[cfg(feature = "config")] custody: Option<
+        Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>,
     >,
 ) -> bcode_plugin::PluginInvocationBridge {
     bcode_plugin::PluginInvocationBridge::new(move |request, _| {
@@ -4304,11 +4310,28 @@ fn provider_invocation_bridge(
             ));
         }
         #[cfg(feature = "config")]
+        let current_inputs = if let Some(store) = &auth_store {
+            match (store.snapshot(), auth_inputs.as_deref()) {
+                (Ok(snapshot), Some((config, _))) => Some((config.clone(), snapshot.subscriptions)),
+                _ => {
+                    return Ok(ServiceBridgeResponse::Service(
+                        bcode_tool::ToolInvocationServiceResolution::Failed {
+                            code: "auth_state_unavailable".to_owned(),
+                            message: "authentication state is unavailable".to_owned(),
+                        },
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "config")]
         let resolution = provider_auth_bridge_resolution(
             &plugins,
             &caller_plugin_id,
             request,
-            auth_inputs.as_deref(),
+            current_inputs.as_ref().or(auth_inputs.as_deref()),
+            custody.as_deref(),
         );
         #[cfg(not(feature = "config"))]
         let resolution = {
@@ -4331,6 +4354,10 @@ pub struct PluginModelProviderInvoker {
             bcode_config::RuntimeAuthSubscriptions,
         )>,
     >,
+    #[cfg(feature = "config")]
+    auth_store: Option<Arc<bcode_provider_auth::store::AuthStore>>,
+    #[cfg(feature = "config")]
+    custody: Option<Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>>,
 }
 
 #[cfg(feature = "embedded-plugins")]
@@ -4351,6 +4378,10 @@ impl PluginModelProviderInvoker {
             plugins,
             #[cfg(feature = "config")]
             auth_inputs: None,
+            #[cfg(feature = "config")]
+            auth_store: None,
+            #[cfg(feature = "config")]
+            custody: None,
         }
     }
 
@@ -4366,7 +4397,41 @@ impl PluginModelProviderInvoker {
         config: bcode_config::BcodeConfig,
         subscriptions: bcode_config::RuntimeAuthSubscriptions,
     ) -> Self {
+        self.auth_store = None;
         self.auth_inputs = Some(Arc::new((config, subscriptions)));
+        self
+    }
+
+    /// Select trusted host custody for credential updates without changing authorization.
+    ///
+    /// The service must enforce profile confinement, atomic persistence, and device-seal policy.
+    /// This does not select a credential materializer for model requests.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn credential_custody(
+        mut self,
+        custody: Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>,
+    ) -> Self {
+        self.custody = Some(custody);
+        self
+    }
+
+    /// Retain an owned subscription store for each credential-update bridge request.
+    ///
+    /// Native credential custody and canonical provider ownership validation remain active.
+    /// This replaces snapshot inputs; unavailable store data fails closed without discovery.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn auth_store(
+        mut self,
+        config: bcode_config::BcodeConfig,
+        store: Arc<bcode_provider_auth::store::AuthStore>,
+    ) -> Self {
+        self.auth_inputs = Some(Arc::new((
+            config,
+            bcode_config::RuntimeAuthSubscriptions::default(),
+        )));
+        self.auth_store = Some(store);
         self
     }
 
@@ -4436,6 +4501,27 @@ mod explicit_provider_auth_tests {
     }
 
     #[test]
+    fn sdk_retains_owned_auth_store_until_invoker_release() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth");
+        let store = Arc::new(bcode_provider_auth::store::AuthStore::create(&path).unwrap());
+        let weak = Arc::downgrade(&store);
+        let plugins = bcode_plugin::PluginRuntimeHost::from(
+            bcode_plugin::PluginHost::load_static_plugins(&[]).unwrap(),
+        );
+        let provider = PluginModelProviderInvoker::new(plugins)
+            .auth_store(bcode_config::BcodeConfig::default(), store);
+        let sdk = Bcode::builder().provider_invoker(provider).build();
+        let agent = sdk.agent();
+        drop(sdk);
+        assert!(weak.upgrade().is_some());
+        assert!(bcode_provider_auth::store::AuthStore::open(&path).is_err());
+        drop(agent);
+        assert!(weak.upgrade().is_none());
+        assert!(bcode_provider_auth::store::AuthStore::open(&path).is_ok());
+    }
+
+    #[test]
     fn explicit_inputs_use_shared_auth_validation_without_discovery() {
         let plugins = bcode_plugin::PluginRuntimeHost::from(
             bcode_plugin::PluginHost::load_static_plugins(&[]).expect("empty plugin host"),
@@ -4449,6 +4535,8 @@ mod explicit_provider_auth_tests {
             "unregistered".to_owned(),
             "turn".to_owned(),
             provider.auth_inputs.clone(),
+            provider.auth_store.clone(),
+            provider.custody.clone(),
         );
         let resolution = bridge
             .request(
@@ -4490,6 +4578,10 @@ impl ModelProviderInvoker for PluginModelProviderInvoker {
                 request.turn_id.clone(),
                 #[cfg(feature = "config")]
                 self.auth_inputs.clone(),
+                #[cfg(feature = "config")]
+                self.auth_store.clone(),
+                #[cfg(feature = "config")]
+                self.custody.clone(),
             );
             let mut invocation = self
                 .plugins
@@ -5850,6 +5942,34 @@ impl BcodeBuilder {
             resolve,
         );
         self
+    }
+
+    /// Configure model and auth defaults from an exclusively owned auth store.
+    ///
+    /// Resolves one current snapshot without ambient subscription or credential discovery.
+    /// This configures initial defaults; it does not retain the store or refresh per turn.
+    /// The caller retains ownership and supplies credential materialization effects.
+    ///
+    /// # Errors
+    /// Returns storage access or snapshot validation errors without ambient fallback.
+    #[cfg(feature = "config")]
+    pub fn provider_defaults_from_store(
+        mut self,
+        config: &bcode_config::BcodeConfig,
+        environment: &impl bcode_config::ConfigEnvironment,
+        store: &bcode_provider_auth::store::AuthStore,
+        resolve: impl FnMut(
+            &str,
+            &bcode_config::AuthProfileConfig,
+        ) -> bcode_provider_auth::ResolvedProviderAuth,
+    ) -> std::result::Result<Self, bcode_provider_auth::store::AuthStoreError> {
+        let selection = config.resolved_model_selection_with_environment(environment);
+        self.provider_registry = ProviderRegistry::from_resolved_model_selection(&selection);
+        self.provider_context = store.resolve_provider_context(
+            bcode_provider_auth::ProviderRequestContextResolution { config, selection },
+            resolve,
+        )?;
+        Ok(self)
     }
 
     /// Load Bcode's layered configuration and configure its provider/model defaults.
