@@ -4,11 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_settings::{SetupSectionId, SetupSectionStatus};
 use bmux_keyboard::KeyCode;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui_components::scroll_area::{ScrollArea, ScrollAreaOutcome, ScrollAreaState};
+use bmux_tui_components::scroll_view::{ScrollViewOutcome, ScrollViewState};
+use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
+use std::cell::Cell;
 
 use super::theme::PresentedTheme;
 
@@ -116,7 +119,7 @@ impl Default for SetupBoardPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupBoardState {
     /// Pannable virtual-board scroll state.
-    pub scroll: ScrollAreaState,
+    pub scroll: ScrollViewState,
     /// Currently focused spot.
     pub focused: SetupSectionId,
     /// Hovered spot, if any.
@@ -130,7 +133,7 @@ impl SetupBoardState {
     #[must_use]
     pub const fn new(focused: SetupSectionId) -> Self {
         Self {
-            scroll: ScrollAreaState::new(),
+            scroll: ScrollViewState::new(),
             focused,
             hovered: None,
             pressed: None,
@@ -190,9 +193,18 @@ impl<'a> SetupBoard<'a> {
     }
 
     /// Render this board in `area`.
-    pub fn render(self, area: Rect, state: &SetupBoardState, frame: &mut Frame<'_>) {
+    pub fn render(self, area: Rect, state: &SetupBoardState, frame: &mut PaintCx<'_, '_>) {
         let lines = self.render_lines(state);
-        ScrollArea::new(&lines).render(area, &state.scroll, frame);
+        let scroll = Cell::new(state.scroll);
+        let component =
+            TextViewComponent::new("setup.board", &lines, &scroll).policy(board_scroll_policy());
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            bmux_tui::paint::LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
     }
 
     /// Handle input for this board.
@@ -203,7 +215,10 @@ impl<'a> SetupBoard<'a> {
         event: &Event,
     ) -> SetupBoardOutcome {
         let lines = self.render_lines(state);
-        let scroll_area = ScrollArea::new(&lines);
+        let scroll = Cell::new(state.scroll);
+        let scroll_area =
+            TextViewComponent::new("setup.board", &lines, &scroll).policy(board_scroll_policy());
+        let layout = scroll_area.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
         let scroll_outcome = match event {
             Event::Mouse(mouse)
                 if matches!(
@@ -211,9 +226,9 @@ impl<'a> SetupBoard<'a> {
                     MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 ) =>
             {
-                scroll_area.handle_event(area, &mut state.scroll, event)
+                scroll_area.handle_event(area, &layout, event)
             }
-            _ => ScrollAreaOutcome::Ignored,
+            _ => ScrollViewOutcome::Ignored,
         };
         if let Event::Mouse(mouse) = event
             && let Some(outcome) = self.handle_mouse(area, state, *mouse)
@@ -225,15 +240,15 @@ impl<'a> SetupBoard<'a> {
         {
             return outcome;
         }
-        let scroll_outcome = if matches!(scroll_outcome, ScrollAreaOutcome::Ignored) {
-            scroll_area.handle_event(area, &mut state.scroll, event)
+        let scroll_outcome = if matches!(scroll_outcome, ScrollViewOutcome::Ignored) {
+            scroll_area.handle_event(area, &layout, event)
         } else {
             scroll_outcome
         };
+        state.scroll = scroll.get();
         match scroll_outcome {
-            ScrollAreaOutcome::Ignored => SetupBoardOutcome::Ignored,
-            ScrollAreaOutcome::Handled => SetupBoardOutcome::Redraw,
-            ScrollAreaOutcome::Scrolled { .. } | ScrollAreaOutcome::HorizontalScrolled { .. } => {
+            ScrollViewOutcome::Ignored => SetupBoardOutcome::Ignored,
+            ScrollViewOutcome::Scrolled { .. } | ScrollViewOutcome::HorizontalScrolled { .. } => {
                 SetupBoardOutcome::Panned
             }
         }
@@ -329,12 +344,12 @@ impl<'a> SetupBoard<'a> {
             mouse.position.y.saturating_sub(area.y),
         );
         let virtual_point = Point::new(
-            relative_point
-                .x
-                .saturating_add(state.scroll.horizontal_offset()),
+            relative_point.x.saturating_add(
+                u16::try_from(state.scroll.horizontal_offset()).unwrap_or(u16::MAX),
+            ),
             relative_point
                 .y
-                .saturating_add(state.scroll.vertical_offset()),
+                .saturating_add(u16::try_from(state.scroll.vertical_offset()).unwrap_or(u16::MAX)),
         );
         let layout = self.layout();
         let hit = layout.spot_at(virtual_point).map(|spot| spot.model.id);
@@ -1078,5 +1093,12 @@ mod tests {
             ),
             SetupBoardOutcome::Selected(SetupSectionId::Welcome)
         );
+    }
+}
+
+fn board_scroll_policy() -> TextViewPolicy {
+    TextViewPolicy {
+        wrap: bmux_tui::text_block::TextWrap::None,
+        ..TextViewPolicy::scrollable()
     }
 }

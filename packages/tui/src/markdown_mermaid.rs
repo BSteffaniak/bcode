@@ -446,7 +446,7 @@ impl MarkdownMermaidPresentationStore {
     }
 
     /// Emit explicit removal for a stable diagram key no longer present in this frame.
-    pub fn remove_from_frame(contribution_id: &str, frame: &mut bmux_tui::frame::Frame<'_>) {
+    pub fn remove_from_frame(contribution_id: &str, frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {
         frame.push_image(ImageContribution::Remove(ImageKey::new(format!(
             "markdown-mermaid:{contribution_id}"
         ))));

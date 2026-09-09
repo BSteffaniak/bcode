@@ -26,17 +26,25 @@ use bcode_plugin_sdk::tui::{
 use bcode_session_models::SessionId;
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, MouseEventKind};
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect, Size};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Style;
 use bmux_tui::style::Color;
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
-use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
-use bmux_tui_components::status_bar::{StatusBar, StatusBarStyles, StatusSegment, StatusSeverity};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
+use bmux_tui_components::modal_frame::{
+    ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
+};
+use bmux_tui_components::status_bar::{
+    StatusBarComponent, StatusBarStyles, StatusSegment, StatusSeverity,
+};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
-    TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy, TextInputBoxStyles,
+    TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -897,9 +905,48 @@ impl LoopSurface {
         action
     }
 
+    fn paint_footer(&self, content: Rect, frame: &mut PaintCx<'_, '_>) {
+        let status_y = self.limit_area.bottom().saturating_add(1);
+        if status_y < content.bottom() {
+            let status = [StatusSegment::new(&self.status).severity(StatusSeverity::Muted)];
+            let status = StatusBarComponent::new("loop.status")
+                .left(&status)
+                .styles(loop_status_styles(self.theme.as_ref()));
+            let layout = status.layout(
+                Constraints::tight(Size::new(content.width, 1)),
+                &mut LayoutCx::new(),
+            );
+            frame.with_child(
+                i32::from(content.x),
+                i64::from(status_y),
+                LocalRect::new(0, 0, content.width, 1),
+                |cx| status.paint(&layout, cx),
+            );
+        }
+        let hints_y = status_y.saturating_add(1);
+        if hints_y < content.bottom() {
+            let hints = [
+                KeyHint::new("Tab/Shift-Tab", "field"),
+                KeyHint::new("Ctrl-Enter", "start"),
+                KeyHint::new("Esc", "close"),
+            ];
+            let hints = KeyHintBarComponent::new("loop.hints", &hints)
+                .styles(loop_hint_styles(self.theme.as_ref()));
+            let layout = hints.layout(
+                Constraints::tight(Size::new(content.width, 1)),
+                &mut LayoutCx::new(),
+            );
+            frame.with_child(
+                i32::from(content.x),
+                i64::from(hints_y),
+                LocalRect::new(0, 0, content.width, 1),
+                |cx| hints.paint(&layout, cx),
+            );
+        }
+    }
     fn render_input(
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         label: &'static str,
         state: &mut TextInputState,
         focused: bool,
@@ -918,7 +965,8 @@ impl LoopSurface {
             focused_background: theme.canvas,
             disabled_background: theme.canvas,
         });
-        TextInputBox::new(TextInputPolicy::chat_composer())
+        let retained = std::cell::RefCell::new(state.clone());
+        let input = TextInputBoxComponent::new(label, TextInputPolicy::chat_composer(), &retained)
             .styles(styles)
             .label(label)
             .policy(TextInputBoxPolicy {
@@ -930,8 +978,25 @@ impl LoopSurface {
                 disabled: false,
                 min_rows: rows,
                 max_rows: Some(rows),
-            })
-            .render(area, state, frame);
+            });
+        let layout = input.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| input.paint(&layout, cx),
+        );
+        *state = retained.into_inner();
+        let local = state.content_area();
+        state.set_content_area(
+            Rect::new(
+                area.x.saturating_add(local.x),
+                area.y.saturating_add(local.y),
+                local.width,
+                local.height,
+            ),
+            &TextInputPolicy::chat_composer(),
+        );
     }
 }
 
@@ -948,7 +1013,7 @@ impl PluginTuiSurface for LoopSurface {
         24
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let modal_theme = self.theme.map_or_else(
             || ModalTheme::dark(Color::Cyan),
             |theme| {
@@ -969,8 +1034,15 @@ impl PluginTuiSurface for LoopSurface {
         .title(" Start deterministic loop ")
         .padding(Insets::new(1, 2, 1, 2))
         .placement(ModalPlacement::Centered);
-        modal.render(area, frame);
         let content = modal.content_area(area);
+        let shell = ModalFrameComponent::new("loop.modal", modal, TextBlock::new(""));
+        let layout = shell.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| shell.paint(&layout, cx),
+        );
         let available = content.height.saturating_sub(8);
         let prompt_rows = available.saturating_mul(3) / 5;
         let condition_rows = available.saturating_sub(prompt_rows).max(3);
@@ -1014,31 +1086,13 @@ impl PluginTuiSurface for LoopSurface {
             1,
             self.theme.as_ref(),
         );
-        let status_y = self.limit_area.bottom().saturating_add(1);
-        if status_y < content.bottom() {
-            let status = [StatusSegment::new(&self.status).severity(StatusSeverity::Muted)];
-            StatusBar::new()
-                .left(&status)
-                .styles(loop_status_styles(self.theme.as_ref()))
-                .render(Rect::new(content.x, status_y, content.width, 1), frame);
-        }
-        let hints_y = status_y.saturating_add(1);
-        if hints_y < content.bottom() {
-            let hints = [
-                KeyHint::new("Tab/Shift-Tab", "field"),
-                KeyHint::new("Ctrl-Enter", "start"),
-                KeyHint::new("Esc", "close"),
-            ];
-            KeyHintBar::new(&hints)
-                .styles(loop_hint_styles(self.theme.as_ref()))
-                .render(Rect::new(content.x, hints_y, content.width, 1), frame);
-        }
+        self.paint_footer(content, frame);
     }
 
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         self.theme = theme.copied();
@@ -1102,18 +1156,18 @@ impl PluginTuiSurface for LoopSurface {
             state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
             return PluginTuiAction::Redraw;
         }
-        let area = self.active_area();
         let state = self.active_state_mut();
-        match TextInputBox::new(TextInputPolicy::chat_composer())
-            .label("")
-            .policy(TextInputBoxPolicy::labeled_field())
-            .handle_event(area, state, event)
+        match bmux_tui_components::text_input::TextInputControl::new(
+            &TextInputPolicy::chat_composer(),
+        )
+        .handle_event(state, event)
         {
-            TextInputBoxOutcome::Edited | TextInputBoxOutcome::Redraw => PluginTuiAction::Redraw,
-            TextInputBoxOutcome::Submitted
-            | TextInputBoxOutcome::Ignored
-            | TextInputBoxOutcome::EdgeUp
-            | TextInputBoxOutcome::EdgeDown => PluginTuiAction::None,
+            bmux_tui_components::text_input::TextInputOutcome::Edited
+            | bmux_tui_components::text_input::TextInputOutcome::Redraw => PluginTuiAction::Redraw,
+            bmux_tui_components::text_input::TextInputOutcome::Submitted
+            | bmux_tui_components::text_input::TextInputOutcome::Ignored
+            | bmux_tui_components::text_input::TextInputOutcome::EdgeUp
+            | bmux_tui_components::text_input::TextInputOutcome::EdgeDown => PluginTuiAction::None,
         }
     }
 }
@@ -2155,7 +2209,11 @@ mod tests {
         };
         let area = Rect::new(0, 0, 80, 28);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
+        surface.render_with_theme(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            Some(&theme),
+        );
 
         assert_eq!(surface.theme, Some(theme));
         assert!(buffer.cells().iter().any(|cell| cell.style.bg == canvas.bg));

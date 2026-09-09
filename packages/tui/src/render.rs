@@ -300,15 +300,18 @@ use bcode_markdown_render::{
 };
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
 use bcode_session_view_models::TextFormat;
-use bmux_tui::chrome::Panel;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
-use bmux_tui::input::TextInput;
-use bmux_tui::prelude::{Line, Span, Style, Widget};
+use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::prelude::{Line, Span, Style};
 #[cfg(test)]
 use bmux_tui::style::Color;
 use bmux_tui::style::Modifier;
+use bmux_tui_components::text_input::TextInputComponent;
 use bmux_tui_components::text_input::TextInputControl;
 
 use super::activity::ActivityState;
@@ -514,15 +517,18 @@ pub fn prepare_frame_with_bottom_dock(
 
 /// Render one TUI frame.
 #[cfg(test)]
-pub fn render(app: &mut BmuxApp, frame: &mut Frame<'_>) {
-    if let Some(layout) = prepare_frame(app, frame.area()) {
+pub fn render(app: &mut BmuxApp, frame: &mut PaintCx<'_, '_>) {
+    if let Some(layout) = prepare_frame(
+        app,
+        Rect::new(0, 0, frame.area().width, frame.area().height),
+    ) {
         render_prepared(app, frame, layout);
     }
 }
 
 /// Render one TUI frame after [`prepare_frame`] has synchronized projections.
 #[cfg(test)]
-pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLayout) {
+pub fn render_prepared(app: &mut BmuxApp, frame: &mut PaintCx<'_, '_>, layout: FrameLayout) {
     render_prepared_damage(app, frame, layout, |_| true);
     app.commit_transcript_presentation();
 }
@@ -530,7 +536,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
 /// Render only prepared layout regions selected by terminal-space damage.
 pub fn render_prepared_damage(
     app: &mut BmuxApp,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     layout: FrameLayout,
     intersects: impl Fn(Rect) -> bool,
 ) {
@@ -540,15 +546,27 @@ pub fn render_prepared_damage(
 
     let theme = TuiTheme::for_app(app);
     if intersects(layout.header) {
-        frame.fill(layout.header, " ", app.presented_theme().canvas);
+        frame.fill(
+            LocalRect::terminal(layout.header),
+            " ",
+            app.presented_theme().canvas,
+        );
         render_header(app, layout.header, frame, theme);
     }
     if intersects(layout.composer) {
-        frame.fill(layout.composer, " ", app.presented_theme().canvas);
+        frame.fill(
+            LocalRect::terminal(layout.composer),
+            " ",
+            app.presented_theme().canvas,
+        );
         render_composer(app, layout.composer, frame, theme);
     }
     if intersects(layout.body) {
-        frame.fill(layout.body, " ", app.presented_theme().canvas);
+        frame.fill(
+            LocalRect::terminal(layout.body),
+            " ",
+            app.presented_theme().canvas,
+        );
         app.transcript_markdown_cache().retain_resident_iter(
             app.transcript().iter(),
             app.transcript_projection_revision(),
@@ -582,7 +600,11 @@ pub fn render_prepared_damage(
         render_latest_bar(app, latest_bar, frame, Instant::now());
     }
     if intersects(layout.status) {
-        frame.fill(layout.status, " ", app.presented_theme().canvas);
+        frame.fill(
+            LocalRect::terminal(layout.status),
+            " ",
+            app.presented_theme().canvas,
+        );
         render_status(app, layout.status, frame, theme);
     }
 }
@@ -669,7 +691,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         latest_bar,
         status,
         composer,
-        composer_content: composer_panel(TuiTheme::for_app(app)).inner_area(composer),
+        composer_content: composer_content_area(composer, TuiTheme::for_app(app)),
     })
 }
 
@@ -1227,7 +1249,7 @@ fn zero_height_bottom_dock_preserves_normal_layout() {
     assert_eq!(dock.height, 0);
 }
 
-fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Instant) {
+fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, now: Instant) {
     if area.is_empty() {
         return;
     }
@@ -1244,8 +1266,16 @@ fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, now: Inst
         app.latest_bar_animation_started_at(),
         now,
     );
-    frame.fill(area, " ", latest_bar_background_style());
-    frame.write_line_with_fallback_style(area, &line, latest_bar_background_style());
+    frame.fill(
+        LocalRect::terminal(area),
+        " ",
+        latest_bar_background_style(),
+    );
+    frame.write_line_with_fallback_style(
+        LocalRect::terminal(area),
+        &line,
+        latest_bar_background_style(),
+    );
 }
 
 fn latest_bar_line(
@@ -1437,20 +1467,32 @@ const fn composer_area(area: Rect, composer_height: u16) -> Rect {
     )
 }
 
-fn composer_panel(theme: TuiTheme) -> Panel {
-    bcode_tui_components::composer::composer_panel(bcode_tui_components::composer::ComposerStyle {
-        border: theme.focused,
-        surface: theme.raised,
-    })
+fn composer_content_area(area: Rect, theme: TuiTheme) -> Rect {
+    let component = bcode_tui_components::composer::composer_panel(
+        bcode_tui_components::composer::ComposerStyle {
+            border: theme.focused,
+            surface: theme.raised,
+        },
+        TextBlock::new(""),
+    );
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    let child = &layout.children[0];
+    Rect::new(
+        area.x.saturating_add(child.x),
+        area.y
+            .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
+        child.node.size.width,
+        u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
+    )
 }
 
-fn render_header(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
+fn render_header(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
     if area.is_empty() {
         return;
     }
 
     let line = Line::from_spans(header_spans(app, usize::from(area.width), theme));
-    frame.write_line(area, &line);
+    frame.write_line(LocalRect::terminal(area), &line);
 }
 
 fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
@@ -1534,7 +1576,7 @@ mod header_tests {
     }
 }
 
-fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     let Some((_, source)) = app.markdown_source_view() else {
         return;
     };
@@ -1547,26 +1589,29 @@ fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>)
     if area.is_empty() {
         return;
     }
-    frame.fill(area, " ", app.presented_theme().canvas);
+    frame.fill(LocalRect::terminal(area), " ", app.presented_theme().canvas);
     let title = Line::from_spans(vec![Span::styled(
         " Mermaid source · Alt+Enter closes ",
         TuiTheme::for_app(app).info.add_modifier(Modifier::BOLD),
     )]);
-    frame.write_line(Rect::new(area.x, area.y, area.width, 1), &title);
+    frame.write_line(
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
+        &title,
+    );
     for (offset, line) in source
         .lines()
         .take(usize::from(area.height.saturating_sub(1)))
         .enumerate()
     {
         frame.write_line(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x,
                 area.y
                     .saturating_add(1)
                     .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
                 area.width,
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 truncate_to_display_width(line, usize::from(area.width)),
                 TuiTheme::for_app(app).text,
@@ -1575,7 +1620,7 @@ fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>)
     }
 }
 
-fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_body(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     if area.is_empty() {
         return;
     }
@@ -1624,7 +1669,7 @@ pub fn markdown_render_options(
     options.with_details_open(details_open)
 }
 
-fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
     if area.is_empty() {
         return;
     }
@@ -1633,6 +1678,13 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     }
 
     let top_row = app.transcript_top_row(area.height);
+    let focused = transcript_markdown_regions(app, area)
+        .into_iter()
+        .filter(|region| {
+            app.focused_markdown_contribution() == Some(region.contribution_id.as_str())
+        })
+        .map(|region| region.rect)
+        .collect::<Vec<_>>();
     let mut y = area.y;
     for visible in app
         .transcript_layout()
@@ -1642,7 +1694,40 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
             break;
         }
         if let Some(row) = app.transcript_layout().line(visible) {
-            frame.write_line(Rect::new(area.x, y, area.width, 1), row);
+            use unicode_segmentation::UnicodeSegmentation as _;
+            let mut styled = row.clone();
+            let mut x = usize::from(area.x);
+            styled.spans = row
+                .spans
+                .iter()
+                .flat_map(|span| {
+                    span.content
+                        .graphemes(true)
+                        .map(|grapheme| {
+                            let end = x.saturating_add(text_display_width(grapheme));
+                            let highlight = focused.iter().any(|rect| {
+                                y >= rect.y
+                                    && y < rect.bottom()
+                                    && x < usize::from(rect.right())
+                                    && end > usize::from(rect.x)
+                            });
+                            x = end;
+                            Span::styled(
+                                grapheme.to_owned(),
+                                if highlight {
+                                    span.style.add_modifier(Modifier::REVERSED)
+                                } else {
+                                    span.style
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            frame.write_line(
+                LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
+                &styled,
+            );
             y = y.saturating_add(1);
         }
     }
@@ -1672,21 +1757,9 @@ fn render_transcript_markdown_hits(
     app: &BmuxApp,
     area: Rect,
     _top_row: usize,
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
 ) {
     for region in transcript_markdown_regions(app, area) {
-        if app.focused_markdown_contribution() == Some(region.contribution_id.as_str()) {
-            for y in region.rect.y..region.rect.bottom() {
-                for x in region.rect.x..region.rect.right() {
-                    if let Some(cell) = frame
-                        .buffer_mut()
-                        .get_mut(bmux_tui::geometry::Point::new(x, y))
-                    {
-                        cell.style = cell.style.add_modifier(Modifier::REVERSED);
-                    }
-                }
-            }
-        }
         frame.push_hit(
             HitRegion::new(
                 format!("markdown:{}:{}", region.contribution_id, region.rect_index),
@@ -5096,13 +5169,13 @@ fn pending_label(state: PendingSubmissionState) -> String {
     }
 }
 
-fn render_status(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
+fn render_status(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
     if area.is_empty() {
         return;
     }
 
     let spans = statusline_spans(app, usize::from(area.width), theme);
-    frame.write_line(area, &Line::from_spans(spans));
+    frame.write_line(LocalRect::terminal(area), &Line::from_spans(spans));
 }
 
 use bcode_tui_components::chrome::ChromeLine;
@@ -5315,31 +5388,42 @@ const fn spinner_frame(activity_frame: usize) -> &'static str {
     SPINNER_FRAMES[activity_frame % SPINNER_FRAMES.len()]
 }
 
-fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut Frame<'_>, theme: TuiTheme) {
+fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
     if area.is_empty() {
         return;
     }
-    let panel = composer_panel(theme);
-    panel.render(area, frame);
-    let inner = panel.inner_area(area);
+    let state = RefCell::new(app.composer_state().clone());
+    let policy = composer_policy();
+    let input = TextInputComponent::new("composer.editor", &state, &policy)
+        .placeholder("Ask Bcode…", theme.muted)
+        .style(theme.text)
+        .selection_style(theme.selection)
+        .focused(app.cursor_visible());
+    let panel = bcode_tui_components::composer::composer_panel(
+        bcode_tui_components::composer::ComposerStyle {
+            border: theme.focused,
+            surface: theme.raised,
+        },
+        input,
+    );
+    let layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| panel.paint(&layout, cx),
+    );
+    drop(panel);
+    *app.composer_state_mut() = state.into_inner();
+    let inner = composer_content_area(area, theme);
     app.set_composer_content_area(inner);
     frame.push_hit(
         HitRegion::new("composer", inner)
             .role(HitRole::TextInput)
             .layer(1),
     );
-    TextInput::new(app.composer())
-        .placeholder("Ask Bcode…")
-        .placeholder_style(theme.muted)
-        .style(theme.text)
-        .selection_style(theme.selection)
-        .vertical_scroll(app.composer_scroll_offset_for_render())
-        .cursor_visible(app.cursor_visible())
-        .render(inner, frame);
     if !app.cursor_visible() {
-        frame.set_cursor(bmux_tui::frame::Cursor::hidden(
-            bmux_tui::geometry::Point::new(inner.x, inner.y),
-        ));
+        frame.set_cursor(bmux_tui::geometry::Point::new(inner.x, inner.y), false);
     }
 }
 

@@ -9,17 +9,24 @@ use bcode_metrics::{MetricsEventLogConfig, MetricsRegistry, MetricsReport};
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
 use bmux_keyboard::KeyCode;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseEventKind};
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::{Color, Modifier, Style};
-use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowOutcome, ActionRowState};
+use bmux_tui_components::action_row::{
+    ActionButton, ActionRow, ActionRowComponent, ActionRowOutcome, ActionRowState,
+};
 use bmux_tui_components::bar_chart::{BarChartItem, BarChartStyles};
 use bmux_tui_components::button::ButtonStyles;
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
-use bmux_tui_components::sparkline::{Sparkline, SparklinePolicy, SparklineStyles};
-use bmux_tui_components::tab_bar::{TabBar, TabBarOutcome, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
+use bmux_tui_components::sparkline::{SparklineComponent, SparklinePolicy, SparklineStyles};
+use bmux_tui_components::tab_bar::{
+    TabBar, TabBarComponent, TabBarOutcome, TabBarState, TabBarStyles, TabItem,
+};
 use bmux_tui_components::table::{
     Table, TableColumn, TableOutcome, TableRow, TableState, TableStyles,
 };
@@ -221,7 +228,7 @@ impl MetricsDashboardSurface {
         }
     }
 
-    fn render_dashboard(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_dashboard(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_header(area, frame, "Metrics Dashboard", &self.status);
         self.tab_area = Rect::new(
             area.x,
@@ -229,9 +236,11 @@ impl MetricsDashboardSurface {
             area.width,
             TAB_HEIGHT,
         );
-        TabBar::new(&dashboard_tabs())
-            .styles(metric_tab_styles())
-            .render(self.tab_area, &self.tab_state, frame);
+        let tabs = dashboard_tabs();
+        let state = std::cell::RefCell::new(self.tab_state.clone());
+        let component =
+            TabBarComponent::new("metrics.tabs", &tabs, &state).styles(metric_tab_styles());
+        paint_dashboard_component(&component, self.tab_area, frame);
         let body = Rect::new(
             area.x,
             area.y.saturating_add(TITLE_HEIGHT + TAB_HEIGHT),
@@ -242,15 +251,15 @@ impl MetricsDashboardSurface {
         self.content_area = content_area;
         self.action_area = action_area;
         self.render_domain(content_area, frame);
-        themed_action_row(&dashboard_actions()).render_state(
-            action_area,
-            &self.action_state,
-            frame,
-        );
+        let actions = dashboard_actions();
+        let state = std::cell::Cell::new(self.action_state);
+        let component = ActionRowComponent::new("metrics.actions", &actions, &state)
+            .styles(metric_button_styles());
+        paint_dashboard_component(&component, action_area, frame);
         render_status(status_area, frame);
     }
 
-    fn render_domain(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_domain(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let Some(summary) = self.selected_summary().cloned() else {
             render_panel_title(area, frame, "No metrics loaded");
             return;
@@ -303,19 +312,24 @@ impl MetricsDashboardSurface {
         }
     }
 
-    fn render_series(&self, area: Rect, frame: &mut Frame<'_>, summary: &MetricDomainSummary) {
+    fn render_series(
+        &self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        summary: &MetricDomainSummary,
+    ) {
         render_panel_title(area, frame, "Recent timeline");
         let area = inset_top(area, 1);
         let Some(series) = summary.series.first() else {
             return;
         };
-        let spark = Sparkline::new(&series.points)
+        let spark = SparklineComponent::new("metrics.series", &series.points)
             .policy(SparklinePolicy::default())
             .styles(metric_sparkline_styles());
-        spark.render(area, frame);
+        paint_dashboard_component(&spark, area, frame);
     }
 
-    fn render_facets(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render_facets(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         render_panel_title(area, frame, "Label facets");
         let rows = self
             .facets
@@ -349,7 +363,7 @@ impl MetricsDashboardSurface {
     fn render_main_table(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         summary: &MetricDomainSummary,
     ) {
         render_panel_title(area, frame, "Metric groups");
@@ -549,7 +563,7 @@ impl PluginTuiSurface for MetricsDashboardSurface {
         "Metrics Dashboard"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         ACTIVE_THEME.with(|active| active.set(None));
         self.render_dashboard(area, frame);
     }
@@ -557,12 +571,12 @@ impl PluginTuiSurface for MetricsDashboardSurface {
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         ACTIVE_THEME.with(|active| active.set(theme.copied()));
         if let Some(theme) = theme {
-            frame.fill(area, " ", theme.canvas);
+            frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         }
         self.render_dashboard(area, frame);
         ACTIVE_THEME.with(|active| active.set(None));
@@ -751,7 +765,11 @@ fn themed_action_row<'a>(actions: &'a [ActionButton]) -> ActionRow<'a> {
     ActionRow::new(actions).styles(metric_button_styles())
 }
 
-fn render_cards(frame: &mut Frame<'_>, area: Rect, cards: &[bcode_metrics::dashboard::MetricCard]) {
+fn render_cards(
+    frame: &mut PaintCx<'_, '_>,
+    area: Rect,
+    cards: &[bcode_metrics::dashboard::MetricCard],
+) {
     let rects = split_columns(area, 4, 1);
     for (index, card) in cards.iter().take(4).enumerate() {
         if let Some(rect) = rects.get(index).copied() {
@@ -768,7 +786,7 @@ fn render_cards(frame: &mut Frame<'_>, area: Rect, cards: &[bcode_metrics::dashb
 }
 
 fn render_kpi_card(
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     area: Rect,
     label: &str,
     value: &str,
@@ -780,12 +798,12 @@ fn render_kpi_card(
     }
     fill_rect(frame, area, panel_alt());
     frame.write_line_with_fallback_style(
-        Rect::new(
+        LocalRect::terminal(Rect::new(
             area.x.saturating_add(1),
             area.y,
             area.width.saturating_sub(2),
             1,
-        ),
+        )),
         &Line::from_spans(vec![Span::styled(
             label,
             Style::new()
@@ -797,12 +815,12 @@ fn render_kpi_card(
     );
     if area.height > 1 {
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x.saturating_add(1),
                 area.y.saturating_add(1),
                 area.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 value,
                 Style::new()
@@ -815,12 +833,12 @@ fn render_kpi_card(
     }
     if area.height > 2 {
         frame.write_line_with_fallback_style(
-            Rect::new(
+            LocalRect::terminal(Rect::new(
                 area.x.saturating_add(1),
                 area.y.saturating_add(2),
                 area.width.saturating_sub(2),
                 1,
-            ),
+            )),
             &Line::from_spans(vec![Span::styled(
                 detail,
                 Style::new().fg(text()).bg(panel_alt()),
@@ -830,7 +848,7 @@ fn render_kpi_card(
     }
 }
 
-fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
+fn render_header(area: Rect, frame: &mut PaintCx<'_, '_>, title: &str, status: &str) {
     fill_rect(frame, area, dashboard_bg());
     let title_line = Line::from_spans(vec![
         Span::styled("  ", Style::new().bg(dashboard_bg())),
@@ -845,13 +863,13 @@ fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
         Span::styled(status, Style::new().fg(muted()).bg(dashboard_bg())),
     ]);
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &title_line,
         Style::new().bg(dashboard_bg()),
     );
     if area.height > 1 {
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 "─".repeat(usize::from(area.width)),
                 Style::new().fg(border()).bg(dashboard_bg()),
@@ -861,7 +879,7 @@ fn render_header(area: Rect, frame: &mut Frame<'_>, title: &str, status: &str) {
     }
 }
 
-fn render_status(area: Rect, frame: &mut Frame<'_>) {
+fn render_status(area: Rect, frame: &mut PaintCx<'_, '_>) {
     let hints = [
         KeyHint::new("r", "refresh"),
         KeyHint::new("s/d", "sort"),
@@ -870,17 +888,16 @@ fn render_status(area: Rect, frame: &mut Frame<'_>) {
         KeyHint::new("1-8", "tab"),
         KeyHint::new("q", "close"),
     ];
-    KeyHintBar::new(&hints)
-        .styles(metric_hint_styles())
-        .render(area, frame);
+    let hints = KeyHintBarComponent::new("metrics.hints", &hints).styles(metric_hint_styles());
+    paint_dashboard_component(&hints, area, frame);
 }
 
-fn render_panel_title(area: Rect, frame: &mut Frame<'_>, title: &str) {
+fn render_panel_title(area: Rect, frame: &mut PaintCx<'_, '_>, title: &str) {
     if area.height == 0 {
         return;
     }
     frame.write_line_with_fallback_style(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![
             Span::styled(
                 " ▸ ",
@@ -910,13 +927,13 @@ fn metric_table<'a>(columns: &'a [TableColumn<'a>], rows: &'a [TableRow]) -> Tab
 }
 
 fn render_metric_table(
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     area: Rect,
     columns: &[TableColumn<'_>],
     rows: &[TableRow],
     state: &TableState,
 ) {
-    metric_table(columns, rows).render(area, state, frame);
+    metric_table(columns, rows).paint(area, state, frame);
 }
 
 fn handle_metric_table_event(
@@ -1002,10 +1019,10 @@ fn inset_top(area: Rect, top: u16) -> Rect {
     )
 }
 
-fn fill_rect(frame: &mut Frame<'_>, area: Rect, color: Color) {
+fn fill_rect(frame: &mut PaintCx<'_, '_>, area: Rect, color: Color) {
     for y in area.y..area.bottom() {
         frame.write_line_with_fallback_style(
-            Rect::new(area.x, y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 " ".repeat(usize::from(area.width)),
                 Style::new().bg(color),
@@ -1017,6 +1034,7 @@ fn fill_rect(frame: &mut Frame<'_>, area: Rect, color: Color) {
 
 fn metric_table_styles() -> TableStyles {
     TableStyles {
+        scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
         header: Style::new()
             .fg(accent())
             .bg(panel())
@@ -1178,6 +1196,16 @@ fn format_count(value: u64) -> String {
     }
 }
 
+fn paint_dashboard_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use bcode_plugin_sdk::tui::{
@@ -1245,7 +1273,11 @@ mod tests {
         let area = Rect::new(0, 0, 36, 14);
         let mut buffer = Buffer::empty(area);
         let theme = plugin_theme();
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
+        surface.render_with_theme(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            Some(&theme),
+        );
 
         assert!(
             buffer
@@ -1269,7 +1301,7 @@ mod tests {
     fn status_uses_bounded_shared_key_hints() {
         let area = Rect::new(0, 0, 24, 1);
         let mut buffer = Buffer::empty(area);
-        render_status(area, &mut Frame::new(&mut buffer));
+        render_status(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
 
         let text = buffer.row_symbols(0).expect("status row");
         assert!(text.starts_with("r refresh"));

@@ -15,13 +15,15 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_skill::{SkillRegistry, SkillRegistryOptions, SkillSourceRoot};
 use bcode_skill_models::SkillSourceKind;
 use bmux_keyboard::KeyCode;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::{Column, TextBlock};
 use bmux_tui::event::Event;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Rect};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
-use bmux_tui_components::pane::{Pane, PaneState, PaneStyles};
-use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
+use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles};
+use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy, TextViewStyles};
 use serde::Serialize;
 
 /// skills command plugin.
@@ -171,7 +173,9 @@ impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for SkillsCommandSurfaceFact
                 id: surface_kind,
                 title,
                 lines: skills_surface_lines(surface_kind, &request.options),
-                text_view: TextViewState::new(),
+                text_view: std::cell::Cell::new(
+                    bmux_tui_components::scroll_view::ScrollViewState::default(),
+                ),
             })
                 as bcode_plugin_sdk::tui::BoxedPluginTuiSurface)
         })
@@ -182,7 +186,7 @@ struct SkillsCommandSurface {
     id: &'static str,
     title: &'static str,
     lines: Vec<String>,
-    text_view: TextViewState,
+    text_view: std::cell::Cell<bmux_tui_components::scroll_view::ScrollViewState>,
 }
 
 struct SkillsSurfaceTheme {
@@ -224,11 +228,11 @@ impl SkillsCommandSurface {
     fn render_themed(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = SkillsSurfaceTheme::resolve(theme);
-        frame.fill(area, " ", theme.canvas);
+        frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         let pane = Pane::new()
             .title(Line::from_spans(vec![Span::styled(
                 self.title,
@@ -240,42 +244,32 @@ impl SkillsCommandSurface {
                 border: theme.component.border,
                 focused_border: theme.focused,
             });
-        let pane_state = PaneState::new(area);
-        pane.render(&pane_state, frame);
-        let content = pane.inner_area(&pane_state);
-        if content.is_empty() {
-            return;
-        }
-        let footer = Rect::new(
-            content.x,
-            content.bottom().saturating_sub(1),
-            content.width,
-            1,
-        );
-        let body = Rect::new(
-            content.x,
-            content.y,
-            content.width,
-            content.height.saturating_sub(1),
-        );
+        let pane_state =
+            std::cell::Cell::new(PaneState::new(Rect::new(0, 0, area.width, area.height)));
         let lines = self
             .lines
             .iter()
             .map(|line| Line::from_spans(vec![Span::styled(line.clone(), theme.text)]))
             .collect::<Vec<_>>();
-        TextView::new(&lines)
+        let text = TextViewComponent::new("skills.status.body", &lines, &self.text_view)
             .policy(TextViewPolicy::bare())
             .styles(TextViewStyles {
                 text: theme.text,
                 empty: theme.muted,
                 background: theme.canvas,
+                scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
             })
-            .empty("No skills available")
-            .render(body, &self.text_view, frame);
-        frame.write_line_with_fallback_style(
-            footer,
-            &Line::from_spans(vec![Span::styled("Enter/Esc/q closes", theme.muted)]),
-            theme.canvas,
+            .empty("No skills available");
+        let body = Column::new()
+            .child(text)
+            .child(TextBlock::new("Enter/Esc/q closes"));
+        let component = PaneComponent::new("skills.status", pane, &pane_state, body);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
         );
     }
 }
@@ -289,14 +283,14 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for SkillsCommandSurface {
         self.title
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.render_themed(area, frame, None);
     }
 
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);

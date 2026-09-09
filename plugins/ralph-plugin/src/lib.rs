@@ -16,14 +16,17 @@ use bcode_plugin_sdk::tui::{
     PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
 };
 use bmux_keyboard::KeyCode;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::Event;
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 #[cfg(test)]
 use bmux_tui::prelude::Color;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
     SelectableListStyles,
@@ -444,7 +447,7 @@ impl RalphHomeSurface {
 
     fn render_current_draft(
         &self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         area: Rect,
         mut y: u16,
         theme: &RalphSurfaceTheme,
@@ -493,7 +496,7 @@ impl RalphHomeSurface {
 
     fn render_runs(
         &self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         area: Rect,
         mut y: u16,
         theme: &RalphSurfaceTheme,
@@ -548,7 +551,7 @@ impl RalphHomeSurface {
 
     fn render_current_loop(
         &self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         area: Rect,
         mut y: u16,
         theme: &RalphSurfaceTheme,
@@ -622,7 +625,7 @@ impl RalphHomeSurface {
 
     fn render_actions(
         &mut self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         area: Rect,
         mut y: u16,
         theme: &RalphSurfaceTheme,
@@ -661,10 +664,15 @@ impl RalphHomeSurface {
             list_height.min(area.bottom().saturating_sub(y).saturating_sub(2)),
         );
         let state = ralph_list_state(self.selected_action);
-        list.render_with_fallback_style(self.action_area, &state, frame, theme.canvas);
+        list.paint(self.action_area, &state, theme.canvas, frame);
         self.action_area.bottom().saturating_add(1)
     }
-    fn render_rebuild_intro(&self, frame: &mut Frame<'_>, area: Rect, theme: &RalphSurfaceTheme) {
+    fn render_rebuild_intro(
+        &self,
+        frame: &mut PaintCx<'_, '_>,
+        area: Rect,
+        theme: &RalphSurfaceTheme,
+    ) {
         let mut y = area.y;
         write_line(
             frame,
@@ -753,11 +761,11 @@ impl RalphHomeSurface {
     fn render_themed(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = RalphSurfaceTheme::resolve(theme);
-        frame.fill(area, " ", theme.canvas);
+        frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         if self.screen == RalphHomeScreen::RebuildIntro {
             self.render_rebuild_intro(frame, area, &theme);
             return;
@@ -810,9 +818,18 @@ impl RalphHomeSurface {
             KeyHint::new("r", "refresh"),
             KeyHint::new("q", "close"),
         ];
-        KeyHintBar::new(&hints)
-            .styles(ralph_hint_styles(&theme))
-            .render(Rect::new(area.x, status_y, area.width, 1), frame);
+        let hints =
+            KeyHintBarComponent::new("ralph.hints", &hints).styles(ralph_hint_styles(&theme));
+        let layout = hints.layout(
+            Constraints::tight(bmux_tui::geometry::Size::new(area.width, 1)),
+            &mut LayoutCx::new(),
+        );
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(status_y),
+            LocalRect::new(0, 0, area.width, 1),
+            |cx| hints.paint(&layout, cx),
+        );
         if let Some(message) = &self.status_message {
             write_line(
                 frame,
@@ -824,8 +841,10 @@ impl RalphHomeSurface {
     }
 }
 
-const fn ralph_list_styles(theme: &RalphSurfaceTheme) -> SelectableListStyles {
+fn ralph_list_styles(theme: &RalphSurfaceTheme) -> SelectableListStyles {
     SelectableListStyles {
+        background: theme.canvas,
+        scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
         normal: theme.text,
         focused: theme.selection,
         selected: theme.selection,
@@ -860,14 +879,14 @@ impl PluginTuiSurface for RalphHomeSurface {
         "Ralph"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.render_themed(area, frame, None);
     }
 
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
@@ -957,12 +976,15 @@ fn compact_message(message: &str) -> String {
     }
 }
 
-fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {
+fn write_line(frame: &mut PaintCx<'_, '_>, area: Rect, y: u16, line: impl Into<Line>) {
     if y >= area.y.saturating_add(area.height) {
         return;
     }
     let line = line.into();
-    frame.write_line(Rect::new(area.x, y, area.width, 1), &line);
+    frame.write_line(
+        LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
+        &line,
+    );
 }
 
 #[cfg(feature = "static-bundled")]
@@ -1039,7 +1061,11 @@ mod tests {
         let area = Rect::new(0, 0, 20, 24);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
         let theme = test_plugin_theme();
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
+        surface.render_with_theme(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            Some(&theme),
+        );
 
         assert!(
             buffer

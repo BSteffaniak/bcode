@@ -19,12 +19,13 @@ use bcode_workflow::{
     WorkflowValidationDiagnostic,
 };
 use bmux_keyboard::KeyCode;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
@@ -1124,7 +1125,12 @@ impl WorkflowAuthorSurface {
         }
     }
 
-    fn render_palette(&mut self, area: Rect, frame: &mut Frame<'_>, theme: AuthorSurfaceTheme) {
+    fn render_palette(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: AuthorSurfaceTheme,
+    ) {
         draw_pane(
             frame,
             area,
@@ -1168,7 +1174,12 @@ impl WorkflowAuthorSurface {
         }
     }
 
-    fn render_canvas(&mut self, area: Rect, frame: &mut Frame<'_>, theme: AuthorSurfaceTheme) {
+    fn render_canvas(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: AuthorSurfaceTheme,
+    ) {
         draw_pane(
             frame,
             area,
@@ -1258,7 +1269,7 @@ impl WorkflowAuthorSurface {
         }
     }
 
-    fn render_inspector(&self, area: Rect, frame: &mut Frame<'_>, theme: AuthorSurfaceTheme) {
+    fn render_inspector(&self, area: Rect, frame: &mut PaintCx<'_, '_>, theme: AuthorSurfaceTheme) {
         draw_pane(
             frame,
             area,
@@ -1318,12 +1329,12 @@ impl WorkflowAuthorSurface {
     fn render_themed(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = AuthorSurfaceTheme::resolve(theme);
         self.last_area = area;
-        frame.fill(area, " ", theme.canvas);
+        frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         let (palette, canvas, inspector, footer) = editor_rects(area);
         self.render_palette(palette, frame, theme);
         self.render_canvas(canvas, frame, theme);
@@ -1331,7 +1342,7 @@ impl WorkflowAuthorSurface {
         if footer.height > 0 {
             let status_width = footer.width.saturating_sub(1).min(36);
             frame.write_line(
-                Rect::new(footer.x, footer.y, status_width, 1),
+                LocalRect::terminal(Rect::new(footer.x, footer.y, status_width, 1)),
                 &Line::from_spans(vec![Span::styled(self.status.clone(), theme.muted)]),
             );
             let hint_area = Rect::new(
@@ -1347,15 +1358,22 @@ impl WorkflowAuthorSurface {
                 KeyHint::new("p", "publish"),
                 KeyHint::new("s", "start"),
             ];
-            KeyHintBar::new(&hints)
-                .styles(KeyHintBarStyles {
+            let hints = KeyHintBarComponent::new("workflow.author.hints", &hints).styles(
+                KeyHintBarStyles {
                     key: theme.focused,
                     label: theme.text,
                     separator: theme.muted,
                     disabled: theme.muted,
                     background: theme.canvas,
-                })
-                .render(hint_area, frame);
+                },
+            );
+            let layout = hints.layout(Constraints::tight(hint_area.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(hint_area.x),
+                i64::from(hint_area.y),
+                LocalRect::new(0, 0, hint_area.width, hint_area.height),
+                |cx| hints.paint(&layout, cx),
+            );
         }
     }
 }
@@ -1369,14 +1387,14 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
         "Workflow Graph Editor"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.render_themed(area, frame, None);
     }
 
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
@@ -3362,7 +3380,7 @@ const fn editor_rects(area: Rect) -> (Rect, Rect, Rect, Rect) {
 }
 
 fn draw_pane(
-    frame: &mut Frame<'_>,
+    frame: &mut PaintCx<'_, '_>,
     area: Rect,
     title: &str,
     focused: bool,
@@ -3373,7 +3391,7 @@ fn draw_pane(
     }
     let prefix = if focused { "▶ " } else { "  " };
     frame.write_line(
-        Rect::new(area.x, area.y, area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
         &Line::from_spans(vec![Span::styled(
             format!("{prefix}{title}"),
             if focused { theme.focused } else { theme.muted },
@@ -3381,12 +3399,12 @@ fn draw_pane(
     );
 }
 
-fn write_row(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str, style: Style) {
+fn write_row(frame: &mut PaintCx<'_, '_>, area: Rect, row: u16, text: &str, style: Style) {
     if row >= area.height || area.width == 0 {
         return;
     }
     frame.write_line(
-        Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+        LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(row), area.width, 1)),
         &Line::from_spans(vec![Span::styled(text.to_string(), style)]),
     );
 }
@@ -3424,7 +3442,12 @@ mod tests {
         let mut output = Vec::new();
         let mut terminal = Terminal::new(&mut output, Rect::new(0, 0, width, height));
         terminal
-            .draw(|frame| surface.render(frame.area(), frame))
+            .draw(|frame| {
+                surface.render(
+                    Rect::new(0, 0, frame.area().width, frame.area().height),
+                    frame,
+                )
+            })
             .expect("render authoring surface");
         drop(terminal);
         String::from_utf8(output).expect("terminal UTF-8")

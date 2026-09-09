@@ -8,8 +8,10 @@ use bcode_plugin_sdk::tui::{
 };
 use bcode_session_models::ToolExchangeResolution;
 use bmux_tui::event::Event;
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -341,7 +343,7 @@ impl InteractiveSurfaceState {
         logical_height: u16,
         logical_row_offset: u16,
         destination: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
     ) {
         let logical_height = logical_height.min(MAX_INTERACTION_LOGICAL_ROWS);
         if logical_row_offset >= logical_height {
@@ -366,7 +368,7 @@ impl InteractiveSurfaceState {
 
     /// Render the interactive surface.
     #[cfg(test)]
-    pub fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    pub fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.surface.render(area, frame);
     }
 
@@ -377,7 +379,7 @@ impl InteractiveSurfaceState {
         full_area: Rect,
         visible_content_offset: u16,
         destination: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
     ) {
         if full_area.is_empty() || destination.is_empty() {
             return;
@@ -387,60 +389,21 @@ impl InteractiveSurfaceState {
         if visible_content_offset >= bounded_height {
             return;
         }
-        let mut buffer = bmux_tui::buffer::Buffer::empty(full_area);
-        let mut scratch = Frame::new(&mut buffer);
-        self.surface.render(full_area, &mut scratch);
-        for destination_y in destination.y..destination.bottom() {
-            let source_y = full_area
-                .y
-                .saturating_add(visible_content_offset)
-                .saturating_add(destination_y.saturating_sub(destination.y));
-            for destination_x in destination.x..destination.right() {
-                let source_x = full_area
-                    .x
-                    .saturating_add(destination_x.saturating_sub(destination.x));
-                let Some(cell) = scratch
-                    .buffer()
-                    .get(bmux_tui::geometry::Point::new(source_x, source_y))
-                else {
-                    continue;
-                };
-                frame.buffer_mut().set_cell(
-                    bmux_tui::geometry::Point::new(destination_x, destination_y),
-                    cell.symbol.clone(),
-                    cell.style,
-                );
-            }
-        }
-        if let Some(cursor) = scratch.cursor()
-            && cursor.visible
-            && cursor.position.y >= full_area.y.saturating_add(visible_content_offset)
-            && cursor.position.y
-                < full_area
-                    .y
-                    .saturating_add(visible_content_offset)
-                    .saturating_add(destination.height)
-        {
-            frame.set_cursor(bmux_tui::frame::Cursor {
-                position: bmux_tui::geometry::Point::new(
-                    destination
-                        .x
-                        .saturating_add(cursor.position.x.saturating_sub(full_area.x)),
-                    destination.y.saturating_add(
-                        cursor
-                            .position
-                            .y
-                            .saturating_sub(full_area.y)
-                            .saturating_sub(visible_content_offset),
-                    ),
-                ),
-                visible: true,
-            });
-        }
+        frame.with_child(
+            i32::from(destination.x) - i32::from(full_area.x),
+            i64::from(destination.y) - i64::from(full_area.y) - i64::from(visible_content_offset),
+            LocalRect::new(
+                i32::from(full_area.x),
+                i64::from(full_area.y) + i64::from(visible_content_offset),
+                destination.width,
+                destination.height,
+            ),
+            |cx| self.surface.render(full_area, cx),
+        );
     }
 
     #[cfg(test)]
-    pub(crate) fn render_for_test(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    pub(crate) fn render_for_test(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.render(area, frame);
     }
 
@@ -658,7 +621,8 @@ mod tests {
         underpaint: bool,
     ) -> (String, Option<bmux_tui::frame::Cursor>) {
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        let mut frame = Frame::new(&mut buffer);
+        let mut backend = Frame::new(&mut buffer);
+        let mut frame = PaintCx::new(&mut backend);
         if underpaint {
             frame.fill(area, " ", bmux_tui::prelude::Style::new());
         }
@@ -689,7 +653,7 @@ mod tests {
             self.height.max(1)
         }
 
-        fn render(&mut self, _area: Rect, _frame: &mut Frame<'_>) {}
+        fn render(&mut self, _area: Rect, _frame: &mut PaintCx<'_, '_>) {}
 
         fn handle_event(
             &mut self,
@@ -781,7 +745,8 @@ mod tests {
 
         let area = Rect::new(0, 0, 8, 600);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        let mut frame = Frame::new(&mut buffer);
+        let mut backend = Frame::new(&mut buffer);
+        let mut frame = PaintCx::new(&mut backend);
         frame.fill(area, ".", bmux_tui::prelude::Style::new());
         surface.render_slice(MAX_INTERACTION_LOGICAL_ROWS, 0, area, &mut frame);
 
@@ -818,7 +783,8 @@ mod tests {
         ] {
             let destination = Rect::new(3, 4, full_area.width, height.max(1));
             let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 40, 20));
-            let mut frame = Frame::new(&mut buffer);
+            let mut backend = Frame::new(&mut buffer);
+            let mut frame = PaintCx::new(&mut backend);
             surface.render_clipped(full_area, offset, destination, &mut frame);
             assert_eq!(frame.cursor().is_some_and(|cursor| cursor.visible), visible);
         }
@@ -1017,12 +983,14 @@ mod tests {
         let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 30, 15));
         buffer.fill(area, "x", sentinel);
         {
-            let mut frame = Frame::new(&mut buffer);
+            let mut backend = Frame::new(&mut buffer);
+            let mut frame = PaintCx::new(&mut backend);
             frame.fill(area, " ", bmux_tui::prelude::Style::new());
             large.render(area, &mut frame);
         }
         {
-            let mut frame = Frame::new(&mut buffer);
+            let mut backend = Frame::new(&mut buffer);
+            let mut frame = PaintCx::new(&mut backend);
             frame.fill(area, " ", bmux_tui::prelude::Style::new());
             small.render(area, &mut frame);
         }

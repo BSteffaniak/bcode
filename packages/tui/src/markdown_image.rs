@@ -406,7 +406,7 @@ impl MarkdownImagePresentationStore {
         contribution_id: &str,
         destination: Rect,
         clip: Rect,
-        frame: &mut bmux_tui::frame::Frame<'_>,
+        frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
     ) -> bool {
         let Some(MarkdownImagePresentationState::Ready(image)) = self.state(contribution_id) else {
             return false;
@@ -424,7 +424,7 @@ impl MarkdownImagePresentationStore {
     }
 
     /// Emit explicit removals for stable keys no longer present in this frame.
-    pub fn remove_from_frame(contribution_id: &str, frame: &mut bmux_tui::frame::Frame<'_>) {
+    pub fn remove_from_frame(contribution_id: &str, frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {
         frame.push_image(ImageContribution::Remove(ImageKey::new(format!(
             "markdown:{contribution_id}"
         ))));

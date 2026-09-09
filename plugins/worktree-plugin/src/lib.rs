@@ -23,19 +23,22 @@ use bcode_worktree_models::{
 };
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::Event;
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListItem, SelectableListOutcome, SelectableListState,
     SelectableListStyles,
 };
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
-    TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy, TextInputBoxStyles,
+    TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -897,11 +900,11 @@ impl WorktreeCommandSurface {
     fn render_themed(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let theme = WorktreeSurfaceTheme::resolve(theme);
-        frame.fill(area, " ", theme.canvas);
+        frame.fill(LocalRect::terminal(area), " ", theme.canvas);
         write_line(
             frame,
             area,
@@ -946,7 +949,7 @@ impl WorktreeCommandSurface {
                 list_height.min(area.bottom().saturating_sub(y).saturating_sub(2)),
             );
             let state = worktree_list_state(self.selected);
-            list.render_with_fallback_style(self.list_area, &state, frame, theme.canvas);
+            list.paint(self.list_area, &state, theme.canvas, frame);
         } else {
             self.list_area = Rect::new(0, 0, 0, 0);
             for line in &self.lines {
@@ -960,17 +963,37 @@ impl WorktreeCommandSurface {
             }
         }
         if self.id == "command.work-tree.createSession" {
-            let input = TextInputBox::new(single_line_text_policy())
-                .label("Name")
-                .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)))
-                .styles(worktree_input_styles(&theme));
+            let retained = std::cell::RefCell::new(self.create_input.clone());
+            let input =
+                TextInputBoxComponent::new("worktree.name", single_line_text_policy(), &retained)
+                    .label("Name")
+                    .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)))
+                    .styles(worktree_input_styles(&theme));
             self.input_area = Rect::new(
                 area.x,
                 y,
                 area.width,
                 4.min(area.bottom().saturating_sub(y).saturating_sub(2)),
             );
-            input.render(self.input_area, &mut self.create_input, frame);
+            let area = self.input_area;
+            let layout = input.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| input.paint(&layout, cx),
+            );
+            self.create_input = retained.into_inner();
+            let local = self.create_input.content_area();
+            self.create_input.set_content_area(
+                Rect::new(
+                    area.x.saturating_add(local.x),
+                    area.y.saturating_add(local.y),
+                    local.width,
+                    local.height,
+                ),
+                &single_line_text_policy(),
+            );
             self.create_name = self.create_input.buffer().text().to_owned();
         } else {
             self.input_area = Rect::new(0, 0, 0, 0);
@@ -978,7 +1001,7 @@ impl WorktreeCommandSurface {
         self.render_footer(area, frame, &theme);
     }
 
-    fn render_footer(&self, area: Rect, frame: &mut Frame<'_>, theme: &WorktreeSurfaceTheme) {
+    fn render_footer(&self, area: Rect, frame: &mut PaintCx<'_, '_>, theme: &WorktreeSurfaceTheme) {
         if let Some(status) = &self.status {
             write_line(
                 frame,
@@ -1001,22 +1024,25 @@ impl WorktreeCommandSurface {
         } else {
             vec![KeyHint::new("Enter/Esc/q", "close")]
         };
-        KeyHintBar::new(&hints)
-            .styles(worktree_hint_styles(theme))
-            .render(
-                Rect::new(
-                    area.x,
-                    area.y.saturating_add(area.height.saturating_sub(1)),
-                    area.width,
-                    1,
-                ),
-                frame,
-            );
+        let hints =
+            KeyHintBarComponent::new("worktree.hints", &hints).styles(worktree_hint_styles(theme));
+        let layout = hints.layout(
+            Constraints::tight(bmux_tui::geometry::Size::new(area.width, 1)),
+            &mut LayoutCx::new(),
+        );
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.bottom().saturating_sub(1)),
+            LocalRect::new(0, 0, area.width, 1),
+            |cx| hints.paint(&layout, cx),
+        );
     }
 }
 
-const fn worktree_list_styles(theme: &WorktreeSurfaceTheme) -> SelectableListStyles {
+fn worktree_list_styles(theme: &WorktreeSurfaceTheme) -> SelectableListStyles {
     SelectableListStyles {
+        background: theme.canvas,
+        scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
         normal: theme.text,
         focused: theme.selection,
         selected: theme.selection,
@@ -1073,14 +1099,14 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
         self.title
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.render_themed(area, frame, None);
     }
 
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_themed(area, frame, theme);
@@ -1097,20 +1123,23 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for WorktreeCommandSurface {
             return bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None };
         }
         if self.id == "command.work-tree.createSession" {
-            let input = TextInputBox::new(single_line_text_policy())
-                .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)));
-            return match input.handle_event(self.input_area, &mut self.create_input, event) {
-                TextInputBoxOutcome::Submitted => {
+            let policy = single_line_text_policy();
+            let input = bmux_tui_components::text_input::TextInputControl::new(&policy);
+            return match input.handle_event(&mut self.create_input, event) {
+                bmux_tui_components::text_input::TextInputOutcome::Submitted => {
                     self.create_name = self.create_input.buffer().text().to_owned();
                     self.create_worktree()
                 }
-                TextInputBoxOutcome::Edited | TextInputBoxOutcome::Redraw => {
+                bmux_tui_components::text_input::TextInputOutcome::Edited
+                | bmux_tui_components::text_input::TextInputOutcome::Redraw => {
                     self.create_name = self.create_input.buffer().text().to_owned();
                     bcode_plugin_sdk::tui::PluginTuiAction::Redraw
                 }
-                TextInputBoxOutcome::Ignored
-                | TextInputBoxOutcome::EdgeUp
-                | TextInputBoxOutcome::EdgeDown => bcode_plugin_sdk::tui::PluginTuiAction::None,
+                bmux_tui_components::text_input::TextInputOutcome::Ignored
+                | bmux_tui_components::text_input::TextInputOutcome::EdgeUp
+                | bmux_tui_components::text_input::TextInputOutcome::EdgeDown => {
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
             };
         }
         if self.is_selectable() {
@@ -1282,11 +1311,14 @@ fn worktree_surface_state(
     }
 }
 
-fn write_line(frame: &mut Frame<'_>, area: Rect, y: u16, line: impl Into<Line>) {
+fn write_line(frame: &mut PaintCx<'_, '_>, area: Rect, y: u16, line: impl Into<Line>) {
     if y >= area.y.saturating_add(area.height) {
         return;
     }
-    frame.write_line(Rect::new(area.x, y, area.width, 1), &line.into());
+    frame.write_line(
+        LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
+        &line.into(),
+    );
 }
 
 #[cfg(not(feature = "static-bundled"))]
@@ -1376,7 +1408,11 @@ mod tests {
         let area = Rect::new(0, 0, 18, 8);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
         let theme = test_plugin_theme();
-        surface.render_with_theme(area, &mut Frame::new(&mut buffer), Some(&theme));
+        surface.render_with_theme(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            Some(&theme),
+        );
 
         assert!(
             buffer
@@ -1432,13 +1468,12 @@ mod tests {
     #[test]
     fn worktree_name_input_handles_unicode_editing() {
         let mut state = TextInputState::new(TextEditBuffer::from_text("tree"));
-        let input = TextInputBox::new(single_line_text_policy())
-            .policy(TextInputBoxPolicy::field().focused(true).rows(1, Some(1)));
-        let area = Rect::new(0, 0, 24, 3);
+        let policy = single_line_text_policy();
+        let input = bmux_tui_components::text_input::TextInputControl::new(&policy);
 
         assert_eq!(
-            input.handle_event(area, &mut state, &Event::Paste("-🙂".to_owned())),
-            TextInputBoxOutcome::Edited
+            input.handle_event(&mut state, &Event::Paste("-🙂".to_owned())),
+            bmux_tui_components::text_input::TextInputOutcome::Edited
         );
         assert_eq!(state.buffer().text(), "tree-🙂");
     }

@@ -2,11 +2,15 @@ use bcode_markdown_render::{MarkdownRenderOptions, MarkdownTheme, render_markdow
 #[cfg(test)]
 use bmux_keyboard::Modifiers;
 use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutNode};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::LocalRect;
 use bmux_tui::prelude::{Color, Line, Style, Terminal};
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
-use bmux_tui_components::text_view::{TextView, TextViewPolicy, TextViewState, TextViewStyles};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
+use bmux_tui_components::scroll_view::ScrollViewState;
+use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy, TextViewStyles};
+use std::cell::{Cell, RefCell};
 
 const FOOTER_HEIGHT: u16 = 1;
 
@@ -16,7 +20,8 @@ pub(crate) struct Pager {
     lines: Vec<Line>,
     width: u16,
     height: u16,
-    view_state: TextViewState,
+    view_state: Cell<ScrollViewState>,
+    presented_layout: RefCell<Option<LayoutNode>>,
     styled: bool,
 }
 
@@ -27,7 +32,12 @@ impl Pager {
             lines: Vec::new(),
             width: width.max(1),
             height: height.max(1),
-            view_state: TextViewState::new(),
+            view_state: Cell::new({
+                let mut state = ScrollViewState::new();
+                state.interaction.focused = true;
+                state
+            }),
+            presented_layout: RefCell::new(None),
             styled,
         };
         pager.render_markdown();
@@ -43,11 +53,13 @@ impl Pager {
         self.width = width;
         self.height = height;
         self.render_markdown();
-        self.view_state
-            .set_vertical_scroll(self.view_state.vertical_scroll().min(self.max_offset()));
+        let mut state = self.view_state.get();
+        state.set_vertical_offset(state.vertical_offset().min(self.max_offset()));
+        self.view_state.set(state);
+        self.presented_layout.replace(None);
     }
 
-    pub(crate) fn handle_key(&mut self, stroke: KeyStroke) -> bool {
+    pub(crate) fn handle_key(&self, stroke: KeyStroke) -> bool {
         if !stroke.modifiers.is_empty() {
             return false;
         }
@@ -64,8 +76,18 @@ impl Pager {
             _ => Event::Key(stroke),
         };
         let area = Rect::new(0, 0, self.width, self.content_height());
-        let view = TextView::new(&self.lines).policy(TextViewPolicy::scrollable());
-        let _ = view.handle_event(area, &mut self.view_state, &event);
+        let view = TextViewComponent::new("read.body", &self.lines, &self.view_state)
+            .policy(TextViewPolicy::scrollable());
+        let retained = self.presented_layout.borrow();
+        let layout = retained.as_ref().map_or_else(
+            || {
+                std::borrow::Cow::Owned(
+                    view.layout(Constraints::tight(area.size()), &mut LayoutCx::new()),
+                )
+            },
+            std::borrow::Cow::Borrowed,
+        );
+        let _ = view.handle_event(area, &layout, &event);
         false
     }
 
@@ -73,19 +95,26 @@ impl Pager {
         &self,
         terminal: &mut Terminal<W>,
     ) -> std::io::Result<()> {
-        terminal
+        let mut candidate = None;
+        let result = terminal
             .draw(|frame| {
                 let area = frame.area();
                 frame.fill(area, " ", Style::new());
                 let content_area = Rect::new(0, 0, self.width, self.content_height());
-                TextView::new(&self.lines)
+                let view = TextViewComponent::new("read.body", &self.lines, &self.view_state)
                     .policy(TextViewPolicy::scrollable())
                     .styles(TextViewStyles {
                         text: Style::new(),
                         empty: Style::new(),
                         background: Style::new(),
-                    })
-                    .render(content_area, &self.view_state, frame);
+                        scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+                    });
+                let layout = view.layout(
+                    Constraints::tight(content_area.size()),
+                    &mut LayoutCx::new(),
+                );
+                view.paint(&layout, frame);
+                candidate = Some(layout);
                 if self.height > 1 {
                     let hints = [
                         KeyHint::new("j/k", "scroll"),
@@ -95,20 +124,35 @@ impl Pager {
                     ];
                     let styles = pager_hint_styles(self.styled);
                     let footer_area = Rect::new(0, self.height - 1, self.width, 1);
-                    KeyHintBar::new(&hints)
-                        .styles(styles)
-                        .render(footer_area, frame);
+                    let hints = KeyHintBarComponent::new("read.hints", &hints).styles(styles);
+                    let layout =
+                        hints.layout(Constraints::tight(footer_area.size()), &mut LayoutCx::new());
+                    frame.with_child(
+                        0,
+                        i64::from(footer_area.y),
+                        LocalRect::new(0, 0, footer_area.width, 1),
+                        |cx| hints.paint(&layout, cx),
+                    );
                     let position = self.position_label();
                     let x = self
                         .width
                         .saturating_sub(u16::try_from(position.len()).unwrap_or(u16::MAX));
                     frame.write_line(
-                        Rect::new(x, self.height - 1, self.width.saturating_sub(x), 1),
+                        LocalRect::new(
+                            i32::from(x),
+                            i64::from(self.height - 1),
+                            self.width.saturating_sub(x),
+                            1,
+                        ),
                         &Line::from(position),
                     );
                 }
             })
-            .map(|_| ())
+            .map(|_| ());
+        if result.is_ok() {
+            self.presented_layout.replace(candidate);
+        }
+        result
     }
 
     fn render_markdown(&mut self) {
@@ -145,7 +189,8 @@ impl Pager {
             0
         } else {
             self.view_state
-                .vertical_scroll()
+                .get()
+                .vertical_offset()
                 .saturating_add(1)
                 .min(total)
         };
@@ -214,38 +259,38 @@ mod tests {
 
     #[test]
     fn navigation_saturates_at_document_bounds() {
-        let mut pager = long_pager();
+        let pager = long_pager();
         pager.handle_key(key(KeyCode::Up));
-        assert_eq!(pager.view_state.vertical_scroll(), 0);
+        assert_eq!(pager.view_state.get().vertical_offset(), 0);
         pager.handle_key(key(KeyCode::End));
-        assert_eq!(pager.view_state.vertical_scroll(), pager.max_offset());
+        assert_eq!(pager.view_state.get().vertical_offset(), pager.max_offset());
         pager.handle_key(key(KeyCode::Down));
-        assert_eq!(pager.view_state.vertical_scroll(), pager.max_offset());
+        assert_eq!(pager.view_state.get().vertical_offset(), pager.max_offset());
         pager.handle_key(key(KeyCode::Home));
-        assert_eq!(pager.view_state.vertical_scroll(), 0);
+        assert_eq!(pager.view_state.get().vertical_offset(), 0);
     }
 
     #[test]
     fn page_navigation_uses_content_height() {
-        let mut pager = long_pager();
+        let pager = long_pager();
         pager.handle_key(key(KeyCode::Space));
-        assert_eq!(pager.view_state.vertical_scroll(), 5);
+        assert_eq!(pager.view_state.get().vertical_offset(), 5);
         pager.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(pager.view_state.vertical_scroll(), 0);
+        assert_eq!(pager.view_state.get().vertical_offset(), 0);
     }
 
     #[test]
     fn resize_reflows_and_clamps_offset() {
         let mut pager = Pager::new("word ".repeat(100), 10, 4, true);
         pager.handle_key(key(KeyCode::End));
-        assert!(pager.view_state.vertical_scroll() > 0);
+        assert!(pager.view_state.get().vertical_offset() > 0);
         pager.resize(200, 50);
-        assert_eq!(pager.view_state.vertical_scroll(), 0);
+        assert_eq!(pager.view_state.get().vertical_offset(), 0);
     }
 
     #[test]
     fn quit_keys_exit() {
-        let mut pager = long_pager();
+        let pager = long_pager();
         assert!(pager.handle_key(key(KeyCode::Escape)));
         assert!(pager.handle_key(key(KeyCode::Char('q'))));
         assert!(!pager.handle_key(key(KeyCode::Char('x'))));
@@ -258,14 +303,14 @@ mod tests {
             ("short".to_owned(), 80, 24),
             ("word ".repeat(20), 1, 1),
         ] {
-            let mut pager = Pager::new(markdown, width, height, true);
+            let pager = Pager::new(markdown, width, height, true);
             pager.handle_key(key(KeyCode::Down));
             pager.handle_key(key(KeyCode::PageDown));
-            assert!(pager.view_state.vertical_scroll() <= pager.max_offset());
+            assert!(pager.view_state.get().vertical_offset() <= pager.max_offset());
             pager.handle_key(key(KeyCode::End));
-            assert_eq!(pager.view_state.vertical_scroll(), pager.max_offset());
+            assert_eq!(pager.view_state.get().vertical_offset(), pager.max_offset());
             pager.handle_key(key(KeyCode::Home));
-            assert_eq!(pager.view_state.vertical_scroll(), 0);
+            assert_eq!(pager.view_state.get().vertical_offset(), 0);
         }
     }
 
@@ -279,22 +324,22 @@ mod tests {
             (KeyCode::Home, KeyCode::Char('g')),
             (KeyCode::End, KeyCode::Char('G')),
         ] {
-            let mut left = long_pager();
-            let mut right = long_pager();
+            let left = long_pager();
+            let right = long_pager();
             left.handle_key(key(KeyCode::End));
             right.handle_key(key(KeyCode::End));
             left.handle_key(key(first));
             right.handle_key(key(second));
             assert_eq!(
-                left.view_state.vertical_scroll(),
-                right.view_state.vertical_scroll()
+                left.view_state.get().vertical_offset(),
+                right.view_state.get().vertical_offset()
             );
         }
     }
 
     #[test]
     fn modified_keys_are_ignored() {
-        let mut pager = long_pager();
+        let pager = long_pager();
         let stroke = KeyStroke::with_modifiers(
             KeyCode::Char('q'),
             Modifiers {
@@ -303,7 +348,7 @@ mod tests {
             },
         );
         assert!(!pager.handle_key(stroke));
-        assert_eq!(pager.view_state.vertical_scroll(), 0);
+        assert_eq!(pager.view_state.get().vertical_offset(), 0);
     }
 
     #[test]

@@ -15,8 +15,12 @@ use bcode_session_view_models::{ReasoningPresentationPolicy, SessionViewSnapshot
 use bmux_keyboard::KeyStroke;
 use bmux_text_edit::{TextEditCommand, TextMotion};
 use bmux_tui::event::Event;
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+#[cfg(test)]
+use bmux_tui::paint::LocalRect;
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Style};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
@@ -1521,7 +1525,7 @@ pub trait PluginTuiSurface: Send {
     }
 
     /// Render this surface inside the host-assigned area.
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>);
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>);
 
     /// Render one bounded logical row slice into a host-assigned destination.
     ///
@@ -1533,7 +1537,7 @@ pub trait PluginTuiSurface: Send {
         _logical_height: u16,
         _logical_row_offset: u16,
         destination: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
     ) {
         self.render(destination, frame);
     }
@@ -1550,7 +1554,7 @@ pub trait PluginTuiSurface: Send {
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         _theme: Option<&PluginTuiTheme>,
     ) {
         self.render(area, frame);
@@ -1623,7 +1627,7 @@ where
     fn preferred_height(&mut self, snapshot: &C::Snapshot, width: u16) -> u16;
 
     /// Render the snapshot.
-    fn render(&mut self, snapshot: &C::Snapshot, area: Rect, frame: &mut Frame<'_>);
+    fn render(&mut self, snapshot: &C::Snapshot, area: Rect, frame: &mut PaintCx<'_, '_>);
 
     /// Render one bounded logical row slice.
     fn render_slice(
@@ -1632,7 +1636,7 @@ where
         logical_height: u16,
         logical_row_offset: u16,
         destination: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
     ) {
         let _ = (logical_height, logical_row_offset);
         self.render(snapshot, destination, frame);
@@ -1655,7 +1659,7 @@ where
         &mut self,
         snapshot: &C::Snapshot,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         _theme: Option<&PluginTuiTheme>,
     ) {
         self.render(snapshot, area, frame);
@@ -1754,7 +1758,7 @@ where
         height
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.renderer.render(&self.snapshot, area, frame);
     }
 
@@ -1763,7 +1767,7 @@ where
         logical_height: u16,
         logical_row_offset: u16,
         destination: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
     ) {
         self.renderer.render_slice(
             &self.snapshot,
@@ -1790,7 +1794,7 @@ where
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         self.renderer
@@ -1881,8 +1885,8 @@ mod typed_interaction_surface_tests {
             Some(row..row.saturating_add(1))
         }
 
-        fn render(&mut self, snapshot: &usize, area: Rect, frame: &mut Frame<'_>) {
-            frame.write_line(area, &Line::from(snapshot.to_string()));
+        fn render(&mut self, snapshot: &usize, area: Rect, frame: &mut PaintCx<'_, '_>) {
+            frame.write_line(LocalRect::terminal(area), &Line::from(snapshot.to_string()));
         }
 
         fn input(
@@ -1930,8 +1934,11 @@ mod typed_interaction_surface_tests {
             1
         }
 
-        fn render(&mut self, snapshot: &usize, area: Rect, frame: &mut Frame<'_>) {
-            frame.write_line(area, &Line::from(format!("fallback:{snapshot}")));
+        fn render(&mut self, snapshot: &usize, area: Rect, frame: &mut PaintCx<'_, '_>) {
+            frame.write_line(
+                LocalRect::terminal(area),
+                &Line::from(format!("fallback:{snapshot}")),
+            );
         }
 
         fn input(
@@ -1954,14 +1961,14 @@ mod typed_interaction_surface_tests {
 
         let area = Rect::new(0, 0, 24, 1);
         let mut sliced = bmux_tui::buffer::Buffer::empty(area);
-        surface.render_slice(8, 7, area, &mut Frame::new(&mut sliced));
+        surface.render_slice(8, 7, area, &mut PaintCx::new(&mut Frame::new(&mut sliced)));
         assert_eq!(
             sliced.row_symbols(0).as_deref(),
             Some("fallback:0              ")
         );
 
         let mut themed = bmux_tui::buffer::Buffer::empty(area);
-        surface.render_with_theme(area, &mut Frame::new(&mut themed), None);
+        surface.render_with_theme(area, &mut PaintCx::new(&mut Frame::new(&mut themed)), None);
         assert_eq!(themed, sliced);
         assert_eq!(
             surface.handle_event(&Event::Tick, &TestHost),
@@ -1986,7 +1993,7 @@ mod typed_interaction_surface_tests {
         assert_eq!(FOCUSED_ROWS.load(Ordering::Relaxed), 1);
         let area = Rect::new(0, 0, 10, 1);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        surface.render(area, &mut Frame::new(&mut buffer));
+        surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
         assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), 1);
 
         assert_eq!(

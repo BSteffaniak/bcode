@@ -21,8 +21,8 @@ use bcode_session_models::{
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::Event;
-use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
 use std::collections::{BTreeMap, BTreeSet};
@@ -387,7 +387,7 @@ impl ForkSelectSurface {
     fn render_with_presentation(
         &self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         let canvas = theme.map_or_else(Style::new, |theme| theme.canvas);
@@ -400,9 +400,9 @@ impl ForkSelectSurface {
             || Style::new().add_modifier(Modifier::REVERSED),
             |theme| theme.selection,
         );
-        frame.fill(area, " ", canvas);
+        frame.fill(LocalRect::terminal(area), " ", canvas);
         frame.write_line(
-            Rect::new(area.x, area.y, area.width, 1),
+            LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
             &Line::from_spans(vec![Span::styled(
                 "Select the prompt to edit in the fork",
                 focused,
@@ -420,13 +420,13 @@ impl ForkSelectSurface {
                 text
             };
             frame.write_line(
-                Rect::new(
+                LocalRect::terminal(Rect::new(
                     area.x,
                     area.y
                         .saturating_add(u16::try_from(index + 2).unwrap_or(u16::MAX)),
                     area.width,
                     1,
-                ),
+                )),
                 &Line::from_spans(vec![Span::styled(
                     format!(
                         "{}  {}",
@@ -449,14 +449,14 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
         "Fork Session"
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.render_with_presentation(area, frame, None);
     }
 
     fn render_with_theme(
         &mut self,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
     ) {
         self.render_with_presentation(area, frame, theme);

@@ -9,16 +9,21 @@ use bcode_plugin_sdk::tui::{
 use bcode_tool::{InteractionControlId, InteractionInput, InteractionNavigation, InteractionValue};
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
+#[cfg(test)]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
 use bmux_tui::text_width::wrap_text_with_continuation;
-use bmux_tui_components::action_row::{ActionButton, ActionRow, ActionRowStyles};
-use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBar, KeyHintBarStyles};
+use bmux_tui_components::action_row::{
+    ActionButton, ActionRow, ActionRowComponent, ActionRowState, ActionRowStyles,
+};
+use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
-use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxPolicy};
+use bmux_tui_components::text_input_box::{TextInputBoxComponent, TextInputBoxPolicy};
 
 use super::question_interaction::{
     QuestionFocusTarget, QuestionInteractionController, QuestionSnapshot, custom_control_id,
@@ -181,10 +186,15 @@ impl QuestionTerminalRenderer {
         self.measurement.as_ref().expect("measurement initialized")
     }
 
-    fn render_line(&self, frame: &mut Frame<'_>, content_y: &mut u16, line: &Line) {
+    fn render_line(&self, frame: &mut PaintCx<'_, '_>, content_y: &mut u16, line: &Line) {
         if let Some(screen_y) = self.screen_y(*content_y) {
             frame.write_line(
-                Rect::new(self.last_area.x, screen_y, self.last_area.width, 1),
+                LocalRect::terminal(Rect::new(
+                    self.last_area.x,
+                    screen_y,
+                    self.last_area.width,
+                    1,
+                )),
                 line,
             );
         }
@@ -215,7 +225,7 @@ impl QuestionTerminalRenderer {
 
     fn render_wrapped(
         &self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         content_y: &mut u16,
         wrapped: &WrappedText,
         first_prefix: &str,
@@ -241,7 +251,7 @@ impl QuestionTerminalRenderer {
         }
     }
 
-    fn render_title(&self, frame: &mut Frame<'_>, content_y: &mut u16) {
+    fn render_title(&self, frame: &mut PaintCx<'_, '_>, content_y: &mut u16) {
         self.render_line(
             frame,
             content_y,
@@ -254,7 +264,7 @@ impl QuestionTerminalRenderer {
 
     fn render_question(
         &mut self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         content_y: &mut u16,
         snapshot: &QuestionSnapshot,
         question_index: usize,
@@ -345,7 +355,7 @@ impl QuestionTerminalRenderer {
 
     fn render_custom_answer(
         &mut self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         content_y: &mut u16,
         snapshot: &QuestionSnapshot,
         question_index: usize,
@@ -397,24 +407,46 @@ impl QuestionTerminalRenderer {
                 .get_mut(&question_index)
                 .expect("custom input initialized above");
             state.set_content_area(area, &TextInputPolicy::chat_composer());
-            TextInputBox::new(TextInputPolicy::chat_composer())
-                .label(label)
-                .policy(TextInputBoxPolicy {
-                    field_chrome: true,
-                    panel_chrome: false,
-                    background: false,
-                    cursor: true,
-                    focused: matches!(
-                        snapshot.focus,
-                        QuestionFocusTarget::Custom { question_index: focused }
-                            if focused == question_index
-                    ),
-                    disabled: false,
-                    min_rows: area.height,
-                    max_rows: Some(area.height),
-                })
-                .styles(question_input_styles(&self.theme))
-                .render(area, state, frame);
+            let retained = std::cell::RefCell::new(state.clone());
+            let input = TextInputBoxComponent::new(
+                format!("question.answer.{question_index}"),
+                TextInputPolicy::chat_composer(),
+                &retained,
+            )
+            .label(label)
+            .policy(TextInputBoxPolicy {
+                field_chrome: true,
+                panel_chrome: false,
+                background: false,
+                cursor: true,
+                focused: matches!(
+                    snapshot.focus,
+                    QuestionFocusTarget::Custom { question_index: focused }
+                        if focused == question_index
+                ),
+                disabled: false,
+                min_rows: area.height,
+                max_rows: Some(area.height),
+            })
+            .styles(question_input_styles(&self.theme));
+            let layout = input.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| input.paint(&layout, cx),
+            );
+            *state = retained.into_inner();
+            let local = state.content_area();
+            state.set_content_area(
+                Rect::new(
+                    area.x.saturating_add(local.x),
+                    area.y.saturating_add(local.y),
+                    local.width,
+                    local.height,
+                ),
+                &TextInputPolicy::chat_composer(),
+            );
             self.custom_areas.insert(question_index, area);
             self.controls.push(ControlRegion { area, control_id });
         }
@@ -422,7 +454,7 @@ impl QuestionTerminalRenderer {
 
     fn render_actions(
         &mut self,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         content_y: &mut u16,
         snapshot: &QuestionSnapshot,
     ) {
@@ -432,16 +464,25 @@ impl QuestionTerminalRenderer {
         ];
         let focused = usize::from(snapshot.focus == QuestionFocusTarget::Cancel);
         if let Some(area) = self.control_area(*content_y, 1) {
-            let row = ActionRow::new(&actions)
-                .focused(focused)
-                .styles(question_action_styles(&self.theme));
+            let row = ActionRow::new(&actions).styles(question_action_styles(&self.theme));
             for (index, action_area) in row.action_areas(area).into_iter().enumerate() {
                 self.controls.push(ControlRegion {
                     area: action_area,
                     control_id: InteractionControlId::new(actions[index].id.clone()),
                 });
             }
-            row.render_with_fallback_style(area, frame, self.theme.canvas);
+            let mut state = ActionRowState::new();
+            state.set_focused(Some(focused));
+            let state = std::cell::Cell::new(state);
+            let component = ActionRowComponent::new("question.actions", &actions, &state)
+                .styles(question_action_styles(&self.theme));
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| component.paint(&layout, cx),
+            );
         }
         *content_y = content_y.saturating_add(1);
         let hints = [
@@ -450,14 +491,25 @@ impl QuestionTerminalRenderer {
             KeyHint::new("Esc", "dismiss"),
         ];
         if let Some(area) = self.control_area(*content_y, 1) {
-            KeyHintBar::new(&hints)
-                .styles(question_hint_styles(&self.theme))
-                .render(area, frame);
+            let hints = KeyHintBarComponent::new("question.hints", &hints)
+                .styles(question_hint_styles(&self.theme));
+            let layout = hints.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(area.x),
+                i64::from(area.y),
+                LocalRect::new(0, 0, area.width, area.height),
+                |cx| hints.paint(&layout, cx),
+            );
         }
         *content_y = content_y.saturating_add(1);
     }
 
-    fn render_snapshot(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
+    fn render_snapshot(
+        &mut self,
+        snapshot: &QuestionSnapshot,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+    ) {
         if let Some(question_index) = self.pending_custom_mouse_focus
             && matches!(
                 snapshot.focus,
@@ -774,7 +826,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         self.measurement(snapshot, width).height
     }
 
-    fn render(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut Frame<'_>) {
+    fn render(&mut self, snapshot: &QuestionSnapshot, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.theme = QuestionSurfaceTheme::default();
         self.render_snapshot(snapshot, area, frame);
     }
@@ -785,7 +837,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         logical_height: u16,
         logical_row_offset: u16,
         destination: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
     ) {
         self.logical_origin = logical_row_offset.min(logical_height.saturating_sub(1));
         self.render(snapshot, destination, frame);
@@ -804,7 +856,7 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
         &mut self,
         snapshot: &QuestionSnapshot,
         area: Rect,
-        frame: &mut Frame<'_>,
+        frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
         self.theme = QuestionSurfaceTheme::resolve(theme);
@@ -1145,7 +1197,8 @@ mod tests {
         area: Rect,
     ) -> Buffer {
         let mut buffer = Buffer::empty(area);
-        let mut frame = Frame::new(&mut buffer);
+        let mut backend = Frame::new(&mut buffer);
+        let mut frame = PaintCx::new(&mut backend);
         renderer.render(snapshot, area, &mut frame);
         buffer
     }
@@ -1157,7 +1210,8 @@ mod tests {
         theme: &PluginTuiTheme,
     ) -> Buffer {
         let mut buffer = Buffer::empty(area);
-        let mut frame = Frame::new(&mut buffer);
+        let mut backend = Frame::new(&mut buffer);
+        let mut frame = PaintCx::new(&mut backend);
         renderer.render_with_theme(snapshot, area, &mut frame, Some(theme));
         buffer
     }
@@ -1647,7 +1701,8 @@ mod tests {
 
         let area = Rect::new(0, 0, 80, 12);
         let mut buffer = Buffer::empty(area);
-        let mut frame = Frame::new(&mut buffer);
+        let mut backend = Frame::new(&mut buffer);
+        let mut frame = PaintCx::new(&mut backend);
         renderer.render_slice(&snapshot, logical_height, 4_000, area, &mut frame);
         assert!(renderer.rendered_questions <= 1);
         assert_eq!(renderer.visited_question_spans, renderer.rendered_questions);
@@ -1708,7 +1763,7 @@ mod tests {
             logical_height,
             logical_height.saturating_sub(area.height),
             area,
-            &mut Frame::new(&mut buffer),
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
         );
 
         assert!(renderer.rendered_questions <= 2);
@@ -1754,7 +1809,8 @@ mod tests {
 
         let logical_height = renderer.preferred_height(&focused, area.width);
         let mut buffer = Buffer::empty(area);
-        let mut frame = Frame::new(&mut buffer);
+        let mut backend = Frame::new(&mut buffer);
+        let mut frame = PaintCx::new(&mut backend);
         renderer.render_slice(&focused, logical_height, 7, area, &mut frame);
         assert_ne!(rendered_text(&initial), rendered_text(&buffer));
         assert!(!rendered_text(&buffer).contains("more"));
