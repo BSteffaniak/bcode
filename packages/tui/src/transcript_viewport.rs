@@ -8,11 +8,10 @@ enum TranscriptViewportMode {
     FollowBottom,
     AnchoredTop {
         top_row: usize,
+        reveal: Option<bool>,
     },
     /// A stationary reading position with virtual space remaining below the tail.
-    TailSpace {
-        top_row: usize,
-    },
+    TailSpace { top_row: usize },
 }
 
 /// Rendered transcript viewport state.
@@ -28,6 +27,75 @@ pub struct TranscriptViewport {
 }
 
 impl TranscriptViewport {
+    /// Whether automatic segment reveals may replace the current intent.
+    #[must_use]
+    pub const fn allows_reveal(&self) -> bool {
+        matches!(
+            self.mode,
+            TranscriptViewportMode::FollowBottom
+                | TranscriptViewportMode::AnchoredTop {
+                    reveal: Some(_),
+                    ..
+                }
+        )
+    }
+
+    /// Whether a revealed entry hands off to tail following when it overflows.
+    #[must_use]
+    pub const fn allows_overflow(&self) -> bool {
+        matches!(
+            self.mode,
+            TranscriptViewportMode::FollowBottom
+                | TranscriptViewportMode::AnchoredTop {
+                    reveal: Some(false),
+                    ..
+                }
+        )
+    }
+
+    /// Set reveal policy on the current reading position.
+    pub fn reveal(&mut self, sticky: bool) {
+        let top_row = self.top_row(self.previous_total_rows, self.viewport_height);
+        self.mode = TranscriptViewportMode::AnchoredTop {
+            top_row,
+            reveal: Some(sticky),
+        };
+    }
+
+    /// Release a sticky reveal after the owning semantic segment ends.
+    pub const fn release_sticky_reveal(&mut self) {
+        if let TranscriptViewportMode::AnchoredTop { reveal, .. } = &mut self.mode
+            && matches!(reveal, Some(true))
+        {
+            *reveal = Some(false);
+        }
+    }
+
+    /// Detach navigation without altering its current coordinates.
+    pub fn detach(&mut self) {
+        if let TranscriptViewportMode::TailSpace { .. } = self.mode {
+            return;
+        }
+        let top_row = self.top_row(self.previous_total_rows, self.viewport_height);
+        self.mode = TranscriptViewportMode::AnchoredTop {
+            top_row,
+            reveal: None,
+        };
+    }
+
+    /// Name of the resolved navigation intent for diagnostics.
+    #[must_use]
+    #[cfg(test)]
+    pub const fn intent_name(&self) -> &'static str {
+        match self.mode {
+            TranscriptViewportMode::FollowBottom => "bottom_follow",
+            TranscriptViewportMode::AnchoredTop {
+                reveal: Some(_), ..
+            } => "anchored_to_entry",
+            _ => "manual_detached",
+        }
+    }
+
     /// Return whether the viewport follows the newest transcript rows.
     #[must_use]
     pub const fn follows_bottom(&self) -> bool {
@@ -69,6 +137,7 @@ impl TranscriptViewport {
     pub fn follow_anchor(&mut self, top_row: usize) {
         self.mode = TranscriptViewportMode::AnchoredTop {
             top_row: top_row.min(self.previous_total_rows),
+            reveal: None,
         };
         self.bottom_overscroll = 0;
         self.refresh_offset_cache();
@@ -76,8 +145,13 @@ impl TranscriptViewport {
 
     /// Materialize a top-origin viewport row into normal scroll state.
     pub fn materialize_top_row(&mut self, top_row: usize) {
+        let reveal = match self.mode {
+            TranscriptViewportMode::AnchoredTop { reveal, .. } => reveal,
+            _ => None,
+        };
         self.mode = TranscriptViewportMode::AnchoredTop {
             top_row: top_row.min(self.previous_total_rows),
+            reveal,
         };
         self.bottom_overscroll = 0;
         self.refresh_offset_cache();
@@ -108,7 +182,7 @@ impl TranscriptViewport {
                 .saturating_add(self.bottom_overscroll)
                 .min(total_rows.saturating_add(self.max_bottom_overscroll))
                 .saturating_sub(viewport_height),
-            TranscriptViewportMode::AnchoredTop { top_row }
+            TranscriptViewportMode::AnchoredTop { top_row, .. }
             | TranscriptViewportMode::TailSpace { top_row } => top_row.min(total_rows),
         }
     }
@@ -129,7 +203,10 @@ impl TranscriptViewport {
                 return true;
             }
         }
-        self.mode = TranscriptViewportMode::AnchoredTop { top_row: new_top };
+        self.mode = TranscriptViewportMode::AnchoredTop {
+            top_row: new_top,
+            reveal: None,
+        };
         self.bottom_overscroll = 0;
         self.refresh_offset_cache();
         *self != previous
@@ -173,7 +250,10 @@ impl TranscriptViewport {
                         .saturating_sub(bottom_top)
                         .min(self.max_bottom_overscroll);
                 } else {
-                    self.mode = TranscriptViewportMode::AnchoredTop { top_row: next_top };
+                    self.mode = TranscriptViewportMode::AnchoredTop {
+                        top_row: next_top,
+                        reveal: None,
+                    };
                     self.bottom_overscroll = 0;
                 }
             }
@@ -220,7 +300,7 @@ impl TranscriptViewport {
         if let Some(requested_rows) = older_history.take_reveal_request() {
             let inserted_rows = max_offset.saturating_sub(previous_max);
             let reveal_rows = requested_rows.min(inserted_rows);
-            if let TranscriptViewportMode::AnchoredTop { top_row } = &mut self.mode {
+            if let TranscriptViewportMode::AnchoredTop { top_row, .. } = &mut self.mode {
                 *top_row = top_row.saturating_add(reveal_rows);
             }
         }
@@ -240,8 +320,8 @@ impl TranscriptViewport {
         if let Some(top_row) = anchor {
             self.mode = match self.mode {
                 TranscriptViewportMode::FollowBottom => TranscriptViewportMode::FollowBottom,
-                TranscriptViewportMode::AnchoredTop { .. } => {
-                    TranscriptViewportMode::AnchoredTop { top_row }
+                TranscriptViewportMode::AnchoredTop { reveal, .. } => {
+                    TranscriptViewportMode::AnchoredTop { top_row, reveal }
                 }
                 TranscriptViewportMode::TailSpace { .. } => {
                     TranscriptViewportMode::TailSpace { top_row }
@@ -275,8 +355,8 @@ impl TranscriptViewport {
         let top_row = top_row.min(self.previous_total_rows);
         self.mode = match self.mode {
             TranscriptViewportMode::FollowBottom => return,
-            TranscriptViewportMode::AnchoredTop { .. } => {
-                TranscriptViewportMode::AnchoredTop { top_row }
+            TranscriptViewportMode::AnchoredTop { reveal, .. } => {
+                TranscriptViewportMode::AnchoredTop { top_row, reveal }
             }
             TranscriptViewportMode::TailSpace { .. } => {
                 TranscriptViewportMode::TailSpace { top_row }
@@ -301,7 +381,7 @@ impl TranscriptViewport {
     }
 
     fn clamp_anchor(&mut self) {
-        if let TranscriptViewportMode::AnchoredTop { top_row } = &mut self.mode {
+        if let TranscriptViewportMode::AnchoredTop { top_row, .. } = &mut self.mode {
             *top_row = (*top_row).min(self.previous_total_rows);
         }
     }
@@ -309,7 +389,7 @@ impl TranscriptViewport {
     fn refresh_offset_cache(&mut self) {
         self.offset = match self.mode {
             TranscriptViewportMode::FollowBottom | TranscriptViewportMode::TailSpace { .. } => 0,
-            TranscriptViewportMode::AnchoredTop { top_row } => self
+            TranscriptViewportMode::AnchoredTop { top_row, .. } => self
                 .previous_total_rows
                 .saturating_sub(top_row.saturating_add(usize::from(self.viewport_height)))
                 .min(self.max_offset),
@@ -330,6 +410,34 @@ mod tests {
 
     fn older_history() -> OlderHistoryState {
         OlderHistoryState::new(&[], false)
+    }
+
+    #[test]
+    fn exhausted_tail_space_reenables_reveal_policy() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        viewport.sync_max(20, 9, 30, 10, false, &mut history);
+        viewport.scroll_down(4, &mut history);
+        assert!(!viewport.allows_reveal());
+        viewport.sync_with_anchor((25, 9, 35, 10), None, &mut history);
+        assert!(viewport.follows_bottom());
+        assert!(viewport.allows_reveal());
+    }
+
+    #[test]
+    fn manual_input_removes_reveal_policy() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        viewport.sync_max(20, 9, 30, 10, false, &mut history);
+        viewport.reveal(true);
+        viewport.materialize_top_row(12);
+        assert!(viewport.allows_reveal());
+        assert!(!viewport.allows_overflow());
+        viewport.release_sticky_reveal();
+        assert!(viewport.allows_overflow());
+        viewport.scroll_up(1, &mut history);
+        assert!(!viewport.allows_reveal());
+        assert!(!viewport.allows_overflow());
     }
 
     #[test]

@@ -13,4 +13,8 @@ rg -q 'push_routed_tool_surface' packages/tui/src/render.rs || fail 'tool lifecy
 if rg -n 'filesystem|shell_run|SHELL_RUN_SCHEMA' packages/tui/src/transcript_viewport.rs; then
   fail 'viewport must not interpret tool domains'
 fi
+if rg -n 'enum TranscriptScrollMode|scroll_mode: TranscriptScrollMode' packages/tui/src/app.rs; then
+  fail 'application must not retain a second viewport intent authority'
+fi
+rg -q 'begin_transcript_presentation' packages/tui/src/transcript_projection.rs || fail 'preparation requires a navigation checkpoint'
 echo 'Transcript viewport architecture guard passed'

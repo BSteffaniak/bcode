@@ -162,10 +162,17 @@ write/edit previews and results declare full-block ownership consistently in nat
 manifests, preventing completion from adding a second host header. Other adapters retain explicit
 inline/transcript/full-block composition and generic fallbacks.
 
-The broader controller migration is not complete: application reveal policy and viewport navigation
-still have separate modes, preparation still mutates navigation before presenter acknowledgment,
-and correspondence is region/heading-level rather than source-line-level across arbitrary reflow.
-These remaining boundaries must not be described as fully transactional or fully content-stable.
+The viewport is the sole owner of follow-tail, manual reading, tail-space, and sticky/non-sticky
+reveal policy; the former application `TranscriptScrollMode` has been removed. Candidate preparations
+checkpoint navigation, reveal requests, animation state, and history reveal state. Repeated
+preparations restore the checkpoint, and successful presentation commits it. New semantic events
+restore uncommitted navigation before applying their effects. Manual input supersedes the candidate.
+Animation cadence remains separate from navigation intent.
+
+The migration still requires broader source correspondence: current keys identify regions and
+Markdown headings rather than arbitrary source lines across reflow. Presentation checkpoints also
+need comprehensive coverage of all asynchronous geometry and input paths before claiming a fully
+transactional presentation contract.
 
 ## Accepted Markdown projection scheduling
 

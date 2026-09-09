@@ -20,6 +20,7 @@ const MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC: usize = 64;
 
 /// Prepare transcript layout and viewport projections for a frame body.
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
+    app.begin_transcript_presentation();
     let initial_transcript_area = render::transcript_area_for_body(app, body);
     app.begin_transcript_geometry_update();
     sync_layout(app, initial_transcript_area.width);
