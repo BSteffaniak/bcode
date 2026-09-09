@@ -53,6 +53,37 @@ pub trait AuthRequestCustody: Send + Sync {
     ) -> Result<crate::ResolvedProviderAuth, crate::lifecycle::AuthVaultLifecycleError>;
 }
 
+/// Caller-selected retrieval of an existing device factor.
+///
+/// Parameters are untrusted persisted metadata, not authorization. Implementations must verify
+/// factor ownership and backend policy before accessing secrets; no native fallback is implied.
+pub trait AuthDeviceFactorSource: Send + Sync {
+    /// Retrieve the key bound to the supplied factor metadata.
+    ///
+    /// # Errors
+    /// Rejects unknown factors, unsupported parameters, or unverifiable device custody.
+    fn retrieve(
+        &self,
+        id: &str,
+        recipient_fingerprint: Option<&str>,
+        parameters: &std::collections::BTreeMap<String, String>,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, crate::lifecycle::AuthVaultLifecycleError>;
+}
+
+/// Selected source of profile encryption keys for retained custody writes.
+///
+/// Production implementations must return fresh cryptographically secure keys. Deterministic
+/// sources are only appropriate for isolated simulations with no real credentials.
+pub trait AuthCustodyKeySource: Send + Sync {
+    /// Acquire a fresh encryption key without falling back to another source.
+    ///
+    /// # Errors
+    /// Returns a secret-safe error when key acquisition is unavailable.
+    fn generate(
+        &self,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, crate::lifecycle::AuthVaultLifecycleError>;
+}
+
 /// Retained encrypted custody for one explicitly bound profile.
 ///
 /// Pools are intentionally unsupported by this single-profile service. Identities are zeroized
@@ -60,15 +91,34 @@ pub trait AuthRequestCustody: Send + Sync {
 /// remote-factor limitations remain those of the lifecycle custody reader.
 #[cfg(unix)]
 pub struct RetainedAuthRequestCustody {
-    storage: crate::custody_storage::CredentialCustodyStorage,
+    storage: std::sync::Mutex<crate::custody_storage::CredentialCustodyStorage>,
     resolved: ResolvedAuthProfile,
     method: AuthMethodContribution,
     identities: Vec<zeroize::Zeroizing<String>>,
     passphrase: Option<zeroize::Zeroizing<String>>,
+    key_source: Option<std::sync::Arc<dyn AuthCustodyKeySource>>,
+    device_source: Option<std::sync::Arc<dyn AuthDeviceFactorSource>>,
 }
 
 #[cfg(unix)]
 impl RetainedAuthRequestCustody {
+    /// Select trusted retrieval for existing device factors on credential reads.
+    ///
+    /// This does not enable factor creation, remote custody, or device-protected writes.
+    #[must_use]
+    pub fn device_source(mut self, source: std::sync::Arc<dyn AuthDeviceFactorSource>) -> Self {
+        self.device_source = Some(source);
+        self
+    }
+    /// Select profile-key acquisition for subsequent writes, with no native fallback.
+    ///
+    /// The source must meet [`AuthCustodyKeySource`]'s security contract. Other custody effects
+    /// are unchanged; selecting this source alone does not establish deterministic execution.
+    #[must_use]
+    pub fn key_source(mut self, source: std::sync::Arc<dyn AuthCustodyKeySource>) -> Self {
+        self.key_source = Some(source);
+        self
+    }
     /// Bind retained storage and identities to a registered provider/profile owner.
     ///
     /// # Errors
@@ -84,11 +134,13 @@ impl RetainedAuthRequestCustody {
     ) -> Result<Self, crate::lifecycle::AuthVaultLifecycleError> {
         AuthVaultLifecycle::new(&resolved, provider_id, plugin_id, &method)?;
         Ok(Self {
-            storage,
+            storage: std::sync::Mutex::new(storage),
             resolved,
             method,
             identities,
             passphrase,
+            key_source: None,
+            device_source: None,
         })
     }
 }
@@ -122,10 +174,59 @@ impl AuthRequestCustody for RetainedAuthRequestCustody {
             .iter()
             .map(|value| value.as_str())
             .collect::<Vec<_>>();
-        lifecycle.materialize_from_custody(
-            &self.storage,
+        let storage = self.storage.lock().map_err(|_| {
+            crate::lifecycle::AuthVaultLifecycleError::VaultUnavailable(
+                "custody owner unavailable".into(),
+            )
+        })?;
+        lifecycle.materialize_from_custody_with_device(
+            &storage,
             &identities,
             self.passphrase.as_ref().map(|value| value.as_str()),
+            self.device_source.as_deref(),
+        )
+    }
+}
+
+#[cfg(unix)]
+impl AuthCredentialCustody for RetainedAuthRequestCustody {
+    fn persist(
+        &self,
+        resolved: &ResolvedAuthProfile,
+        changes: std::collections::BTreeMap<String, Option<String>>,
+    ) -> Result<
+        Vec<crate::security::AuthSecurityDiagnostic>,
+        crate::lifecycle::AuthVaultLifecycleError,
+    > {
+        if resolved.profile_name != self.resolved.profile_name
+            || resolved.provider_id != self.resolved.provider_id
+            || resolved.owner_plugin_id != self.resolved.owner_plugin_id
+            || resolved.profile != self.resolved.profile
+        {
+            return Err(crate::lifecycle::AuthVaultLifecycleError::InvalidCredential);
+        }
+        let lifecycle = AuthVaultLifecycle::new(
+            &self.resolved,
+            &self.resolved.provider_id,
+            &self.resolved.owner_plugin_id,
+            &self.method,
+        )?;
+        let identities = self
+            .identities
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        let mut storage = self.storage.lock().map_err(|_| {
+            crate::lifecycle::AuthVaultLifecycleError::VaultUnavailable(
+                "custody owner unavailable".into(),
+            )
+        })?;
+        lifecycle.persist_to_custody(
+            &mut storage,
+            &identities,
+            self.passphrase.as_ref().map(|value| value.as_str()),
+            changes,
+            self.key_source.as_deref(),
         )
     }
 }
