@@ -104,7 +104,7 @@ if ! rg -q 'pub struct WorkflowStructuredSourceConcisePrompt' packages/workflow/
   violations=1
 fi
 
-if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 26' packages/workflow-store/src/lib.rs \
+if ! rg -q 'pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 27' packages/workflow-store/src/lib.rs \
   || ! rg -q 'UnsupportedStore' packages/workflow-store/src/lib.rs \
   || ! rg -q 'reset_incompatible_store_in_state_dir' packages/workflow-store/src/lib.rs \
   || ! rg -q 'WorkflowStoreResetReceipt' packages/workflow-store/src/lib.rs \

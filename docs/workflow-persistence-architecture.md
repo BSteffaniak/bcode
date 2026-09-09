@@ -1,5 +1,19 @@
 # Workflow Persistence Architecture
 
+## Quiescent leaf publication
+
+Schema 27 adds durable publication outcomes keyed by staged mutation identity. The store's
+`publish_quiescent_run_graph_edit` revalidates candidates inside the publication transaction,
+checks current execution authority, rejects active activations and explicit reconciliation,
+and atomically retires/replaces node revisions, advances the expected graph revision, records
+the outcome, and appends an event. Duplicate publication returns the original revision without
+writes, including after reopen. Exclusive backup-verified upgrades now include schema 26.
+
+This is a restricted store capability, not the complete live-edit application path. It rejects
+runs with any historical edges and candidates with surviving edges because revised successor
+settlement is not implemented. Active-work dispositions, result bindings, operation-owner
+coordination, and application integration remain outstanding; existing execution gates stay in place.
+
 ## Staged live graph edits
 
 Schema 19 adds workflow-owned edit candidates. `stage_run_graph_edit` atomically retains a
@@ -16,9 +30,9 @@ not yet implemented. Schema 20 persists successful bounded structural validation
 identity and expected graph revision; duplicate validation replaces the same record after revalidation.
 The existing exclusive migration coordinator upgrades schema 19 without changing candidate requests
 or activation bindings. These records are not publication authority and cannot bypass ownership,
-revision, permission, or reconciliation checks. Candidate
-publication, lifecycle management, and application integration remain unimplemented; dispatch safety
-gates remain in place.
+revision, permission, or reconciliation checks. General candidate
+publication, lifecycle management, and application integration remain unimplemented; the restricted
+quiescent leaf publisher above is the only publication path. Dispatch safety gates remain in place.
 
 ## Retired graph entities
 

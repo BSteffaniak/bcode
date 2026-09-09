@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 26;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 27;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1579,7 +1579,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=25),
+                                actual: Some(14..=26),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1609,7 +1609,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=25),
+                                actual: Some(14..=26),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1758,7 +1758,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=25) {
+        if !matches!(previous_schema_version, 14..=26) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -21899,6 +21899,89 @@ mod tests {
         assert!(!root.join(MIGRATION_RECEIPT_FILE).exists());
         assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
         assert_eq!(detected_store_schema(&connection), Some(14));
+    }
+
+    #[test]
+    fn quiescent_graph_publication_is_atomic_and_idempotent() {
+        let (temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("owner");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let node = store
+            .current_run_graph_node("run-1", "review")
+            .expect("node")
+            .expect("review");
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run-1".to_string(),
+            mutation_id: "publish-leaf".to_string(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::ReplaceNode {
+                node: node.node,
+                entry: true,
+                exit: true,
+            }],
+            reconciliation: vec![],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .expect("stage");
+        assert!(
+            store
+                .publish_quiescent_run_graph_edit("run-1", "publish-leaf", &authority, 21)
+                .is_err()
+        );
+        assert_eq!(
+            store.run_graph_revision("run-1").expect("revision"),
+            Some(1)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'cancelled' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("quiescent fixture");
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .publish_quiescent_run_graph_edit("run-1", "publish-leaf", &stale, 22)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .publish_quiescent_run_graph_edit("run-1", "publish-leaf", &authority, 23)
+                .expect("publish"),
+            2
+        );
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "review")
+                .expect("node")
+                .expect("review")
+                .revision,
+            2
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .publish_quiescent_run_graph_edit("run-1", "publish-leaf", &authority, 24)
+                .expect("duplicate"),
+            2
+        );
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]

@@ -161,6 +161,14 @@ pub fn initialize_edit_candidates(connection: &Connection) -> Result<(), Workflo
             created_at_ms INTEGER NOT NULL,
             PRIMARY KEY (run_id, mutation_id)
         );
+        CREATE TABLE IF NOT EXISTS workflow_graph_edit_publications (
+            run_id TEXT NOT NULL,
+            mutation_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 1),
+            PRIMARY KEY (run_id, mutation_id),
+            FOREIGN KEY (run_id, mutation_id)
+                REFERENCES workflow_graph_edit_candidates(run_id, mutation_id)
+        );
         CREATE TABLE IF NOT EXISTS workflow_graph_edit_validations (
             run_id TEXT NOT NULL,
             mutation_id TEXT NOT NULL,
@@ -272,13 +280,30 @@ impl WorkflowStore {
         authority: &super::WorkflowExecutionAuthority,
     ) -> Result<RunGraphCandidateValidation, WorkflowStoreError> {
         let transaction = self.connection.unchecked_transaction()?;
+        let result = self.validate_run_graph_edit_in_transaction(
+            run_id,
+            mutation_id,
+            authority,
+            &transaction,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    fn validate_run_graph_edit_in_transaction(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        transaction: &Transaction<'_>,
+    ) -> Result<RunGraphCandidateValidation, WorkflowStoreError> {
         let request = self
             .staged_run_graph_edit(run_id, mutation_id, authority)?
             .ok_or_else(|| {
                 WorkflowStoreError::InvalidData("graph edit candidate not found".to_string())
             })?;
-        ensure_run_accepts_graph_edits(&transaction, run_id)?;
-        validate_reconciliation_targets(&transaction, &request)?;
+        ensure_run_accepts_graph_edits(transaction, run_id)?;
+        validate_reconciliation_targets(transaction, &request)?;
         let page = self.current_run_graph_page(
             run_id,
             Some(request.expected_revision),
@@ -289,7 +314,7 @@ impl WorkflowStore {
         if !page.nodes_complete || !page.edges_complete {
             return Ok(RunGraphCandidateValidation::RequiresIncrementalValidation);
         }
-        validate_affected_work(&transaction, &request, &page.edges)?;
+        validate_affected_work(transaction, &request, &page.edges)?;
         let payload: String = transaction.query_row(
             "SELECT CASE WHEN typeof(definition_json) = 'text'
              AND length(CAST(definition_json AS BLOB)) <= ?2 THEN definition_json END
@@ -320,7 +345,7 @@ impl WorkflowStore {
             apply_candidate_edit(&mut graph, &mut edges, edit)?;
         }
         graph.edges = edges.values().cloned().collect();
-        validate_retained_bindings(&transaction, &request, &graph, &edges)?;
+        validate_retained_bindings(transaction, &request, &graph, &edges)?;
         graph
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -331,8 +356,7 @@ impl WorkflowStore {
              SET expected_revision = excluded.expected_revision",
             rusqlite::params![run_id, mutation_id, request.expected_revision],
         )?;
-        persist_candidate_delta(&transaction, &request, &graph, &edges)?;
-        transaction.commit()?;
+        persist_candidate_delta(transaction, &request, &graph, &edges)?;
         Ok(RunGraphCandidateValidation::Validated)
     }
 
@@ -406,6 +430,108 @@ impl WorkflowStore {
             transaction.commit()?;
         }
         Ok(request)
+    }
+
+    /// Publish a validated leaf-only graph while the run has no active activations.
+    ///
+    /// This deliberately rejects connected graphs and reconciliation requests until their
+    /// settlement paths support published bindings. Returns the committed revision, including
+    /// on duplicate delivery. The caller must authorize the edit before calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale authority/revision, active work, unsupported topology,
+    /// invalid candidates, or persistence failure. Failed publication leaves no partial graph.
+    pub fn publish_quiescent_run_graph_edit(
+        &mut self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        created_at_ms: u64,
+    ) -> Result<u64, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let request = self
+            .staged_run_graph_edit(run_id, mutation_id, authority)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("graph edit candidate not found".to_string())
+            })?;
+        let published: Option<u64> = transaction.query_row(
+            "SELECT revision FROM workflow_graph_edit_publications WHERE run_id = ?1 AND mutation_id = ?2",
+            (run_id, mutation_id), |row| row.get(0),
+        ).optional()?;
+        if let Some(revision) = published {
+            transaction.commit()?;
+            return Ok(revision);
+        }
+        ensure_run_accepts_graph_edits(&transaction, run_id)?;
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1
+             AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped'))",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if active || !request.reconciliation.is_empty() {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication requires execution reconciliation".to_string(),
+            ));
+        }
+        // Revalidate in this same transaction, never trusting a historical validation marker.
+        if self.validate_run_graph_edit_in_transaction(
+            run_id,
+            mutation_id,
+            authority,
+            &transaction,
+        )? != RunGraphCandidateValidation::Validated
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication requires incremental graph validation".to_string(),
+            ));
+        }
+        let connected: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_run_graph_edges WHERE run_id = ?1)
+             OR EXISTS(SELECT 1 FROM workflow_graph_edit_edges WHERE run_id = ?1 AND mutation_id = ?2 AND edge_json IS NOT NULL)",
+            (run_id, mutation_id), |row| row.get(0),
+        )?;
+        if connected {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication requires binding-aware successor settlement".to_string(),
+            ));
+        }
+        let revision = request.expected_revision + 1;
+        transaction.execute(
+            "UPDATE workflow_run_graph_nodes SET retired_at_revision = ?3
+             WHERE run_id = ?1 AND retired_at_revision IS NULL AND node_id IN
+             (SELECT node_id FROM workflow_graph_edit_nodes WHERE run_id = ?1 AND mutation_id = ?2)",
+            rusqlite::params![run_id, mutation_id, revision],
+        )?;
+        transaction.execute(
+            "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
+             SELECT run_id, node_id, ?3, node_json, is_entry, is_exit FROM workflow_graph_edit_nodes
+             WHERE run_id = ?1 AND mutation_id = ?2 AND node_json IS NOT NULL",
+            rusqlite::params![run_id, mutation_id, revision],
+        )?;
+        if transaction.execute(
+            "UPDATE workflow_run_graphs SET revision = ?2 WHERE run_id = ?1 AND revision = ?3",
+            rusqlite::params![run_id, revision, request.expected_revision],
+        )? != 1
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow graph revision conflict".to_string(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO workflow_graph_edit_publications (run_id, mutation_id, revision) VALUES (?1, ?2, ?3)",
+            rusqlite::params![run_id, mutation_id, revision],
+        )?;
+        super::append_event(
+            &transaction,
+            run_id,
+            "graph_edit_published",
+            &serde_json::json!({"mutation_id": mutation_id, "revision": revision}).to_string(),
+            created_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(revision)
     }
 
     /// Durably stage a live graph edit without publishing executable topology.
