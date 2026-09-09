@@ -90,7 +90,11 @@ struct NativeAuthStorage {
 }
 
 #[cfg(unix)]
-fn open_owned_entry(directory: &File, name: &std::ffi::CStr, flags: i32) -> std::io::Result<File> {
+pub(crate) fn open_owned_entry(
+    directory: &File,
+    name: &std::ffi::CStr,
+    flags: i32,
+) -> std::io::Result<File> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     // SAFETY: directory is live, name is NUL-terminated, and mode is supplied for creation.
     let fd = unsafe {

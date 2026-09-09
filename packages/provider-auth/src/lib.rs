@@ -10,6 +10,8 @@
 
 pub mod auth_pool_routing;
 pub mod auth_pool_state;
+#[cfg(unix)]
+pub mod custody_storage;
 pub mod discovery;
 pub mod enrollment;
 pub mod interactive;
