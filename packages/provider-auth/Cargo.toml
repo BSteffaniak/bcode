@@ -45,6 +45,9 @@ sshenv_vault = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[dev-dependencies]
+sshenv_vault = { workspace = true, features = ["passphrase-factor"] }
+
 [features]
 default          = []
 fail-on-warnings = []

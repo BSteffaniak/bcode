@@ -4358,6 +4358,8 @@ pub struct PluginModelProviderInvoker {
     auth_store: Option<Arc<bcode_provider_auth::store::AuthStore>>,
     #[cfg(feature = "config")]
     custody: Option<Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>>,
+    #[cfg(feature = "config")]
+    request_custody: Option<Arc<dyn bcode_provider_auth::operations::AuthRequestCustody>>,
 }
 
 #[cfg(feature = "embedded-plugins")]
@@ -4382,6 +4384,8 @@ impl PluginModelProviderInvoker {
             auth_store: None,
             #[cfg(feature = "config")]
             custody: None,
+            #[cfg(feature = "config")]
+            request_custody: None,
         }
     }
 
@@ -4399,6 +4403,21 @@ impl PluginModelProviderInvoker {
     ) -> Self {
         self.auth_store = None;
         self.auth_inputs = Some(Arc::new((config, subscriptions)));
+        self
+    }
+
+    /// Retain trusted custody and materialize fresh credentials before every provider start.
+    ///
+    /// The service verifies destination/profile ownership. Failure prevents dispatch rather
+    /// than falling back to request credentials. Selected custody replaces the auth environment;
+    /// unrelated request settings remain unchanged. This does not configure credential writes.
+    #[cfg(feature = "config")]
+    #[must_use]
+    pub fn request_custody(
+        mut self,
+        custody: Arc<dyn bcode_provider_auth::operations::AuthRequestCustody>,
+    ) -> Self {
+        self.request_custody = Some(custody);
         self
     }
 
@@ -4570,6 +4589,24 @@ impl ModelProviderInvoker for PluginModelProviderInvoker {
     ) -> RuntimeFuture<'a, StartTurnResponse> {
         Box::pin(async move {
             let provider_plugin_id = self.resolve_provider(provider_plugin_id)?;
+            #[cfg(feature = "config")]
+            let materialized_request = if let Some(custody) = &self.request_custody {
+                let auth = custody
+                    .materialize(&provider_plugin_id, &request.provider_context)
+                    .map_err(|_| {
+                        RuntimeError::ProviderInvocation(
+                            "request credential custody unavailable".into(),
+                        )
+                    })?;
+                let mut fresh = request.clone();
+                fresh.provider_context.env = auth.env;
+                fresh.provider_context.auth = Some(auth.auth);
+                Some(fresh)
+            } else {
+                None
+            };
+            #[cfg(feature = "config")]
+            let request = materialized_request.as_ref().unwrap_or(request);
             let payload = serde_json::to_vec(request)
                 .map_err(|error| RuntimeError::ProviderInvocation(error.to_string()))?;
             let bridge = provider_invocation_bridge(
@@ -5942,6 +5979,50 @@ impl BcodeBuilder {
             resolve,
         );
         self
+    }
+
+    /// Configure defaults with fallible, caller-selected credential materialization.
+    ///
+    /// Uses canonical model and auth-pool selection. A materialization failure aborts the
+    /// builder operation; it never substitutes native credentials or returns partial defaults.
+    /// This snapshots credentials at initialization, not on every request.
+    ///
+    /// # Errors
+    /// Returns the first selected resolver error, without invoking it for further candidates.
+    #[cfg(feature = "config")]
+    pub fn try_provider_defaults_with_auth_resolver<E>(
+        self,
+        config: &bcode_config::BcodeConfig,
+        environment: &impl bcode_config::ConfigEnvironment,
+        subscriptions: &bcode_config::RuntimeAuthSubscriptions,
+        mut resolve: impl FnMut(
+            &str,
+            &bcode_config::AuthProfileConfig,
+        )
+            -> std::result::Result<bcode_provider_auth::ResolvedProviderAuth, E>,
+    ) -> std::result::Result<Self, E> {
+        let mut failure = None;
+        let builder = self.provider_defaults_with_auth_resolver(
+            config,
+            environment,
+            subscriptions,
+            |name, profile| {
+                if failure.is_some() {
+                    return bcode_provider_auth::ResolvedProviderAuth::default();
+                }
+                match resolve(name, profile) {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        failure = Some(error);
+                        bcode_provider_auth::ResolvedProviderAuth::default()
+                    }
+                }
+            },
+        );
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(builder),
+        }
     }
 
     /// Configure model and auth defaults from an exclusively owned auth store.

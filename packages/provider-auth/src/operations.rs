@@ -37,6 +37,99 @@ pub trait AuthCredentialCustody: Send + Sync {
     >;
 }
 
+/// Trusted request-time credential source selected by the host.
+///
+/// Implementations verify the destination and profile before reading secrets. Errors must be
+/// secret-safe; callers must not dispatch with stale request credentials after failure.
+pub trait AuthRequestCustody: Send + Sync {
+    /// Materialize credentials for the selected destination and request context.
+    ///
+    /// # Errors
+    /// Returns an error when destination ownership, selection, or custody cannot be verified.
+    fn materialize(
+        &self,
+        plugin_id: &str,
+        context: &bcode_model::ProviderRequestContext,
+    ) -> Result<crate::ResolvedProviderAuth, crate::lifecycle::AuthVaultLifecycleError>;
+}
+
+/// Retained encrypted custody for one explicitly bound profile.
+///
+/// Pools are intentionally unsupported by this single-profile service. Identities are zeroized
+/// on release; directory ownership is released with storage. Device factors fail closed and
+/// remote-factor limitations remain those of the lifecycle custody reader.
+#[cfg(unix)]
+pub struct RetainedAuthRequestCustody {
+    storage: crate::custody_storage::CredentialCustodyStorage,
+    resolved: ResolvedAuthProfile,
+    method: AuthMethodContribution,
+    identities: Vec<zeroize::Zeroizing<String>>,
+    passphrase: Option<zeroize::Zeroizing<String>>,
+}
+
+#[cfg(unix)]
+impl RetainedAuthRequestCustody {
+    /// Bind retained storage and identities to a registered provider/profile owner.
+    ///
+    /// # Errors
+    /// Rejects mismatched provider, plugin, backend, or method ownership.
+    pub fn new(
+        storage: crate::custody_storage::CredentialCustodyStorage,
+        resolved: ResolvedAuthProfile,
+        provider_id: &str,
+        plugin_id: &str,
+        method: AuthMethodContribution,
+        identities: Vec<zeroize::Zeroizing<String>>,
+        passphrase: Option<zeroize::Zeroizing<String>>,
+    ) -> Result<Self, crate::lifecycle::AuthVaultLifecycleError> {
+        AuthVaultLifecycle::new(&resolved, provider_id, plugin_id, &method)?;
+        Ok(Self {
+            storage,
+            resolved,
+            method,
+            identities,
+            passphrase,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl AuthRequestCustody for RetainedAuthRequestCustody {
+    fn materialize(
+        &self,
+        plugin_id: &str,
+        context: &bcode_model::ProviderRequestContext,
+    ) -> Result<crate::ResolvedProviderAuth, crate::lifecycle::AuthVaultLifecycleError> {
+        if plugin_id != self.resolved.owner_plugin_id
+            || context.auth_profile.as_deref() != Some(self.resolved.profile_name.as_str())
+            || context.auth_pool.is_some()
+            || !context.auth_candidates.is_empty()
+        {
+            return Err(
+                crate::lifecycle::AuthVaultLifecycleError::ProfileUnavailable(
+                    "request does not match retained credential ownership".into(),
+                ),
+            );
+        }
+        let lifecycle = AuthVaultLifecycle::new(
+            &self.resolved,
+            &self.resolved.provider_id,
+            plugin_id,
+            &self.method,
+        )?;
+        let identities = self
+            .identities
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        lifecycle.materialize_from_custody(
+            &self.storage,
+            &identities,
+            self.passphrase.as_ref().map(|value| value.as_str()),
+        )
+    }
+}
+
 /// Host credential-update failure.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthCredentialUpdateError {

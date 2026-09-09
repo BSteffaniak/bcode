@@ -221,6 +221,111 @@ impl<'a> AuthVaultLifecycle<'a> {
             .collect())
     }
 
+    /// Read canonical credentials from an explicitly retained custody owner.
+    ///
+    /// Only the supplied identities and passphrase are used for recipient/passphrase unlock.
+    /// Device factors are rejected rather than discovered. Remote-factor behavior remains
+    /// owned by the vault library; this API is not yet a fully controlled simulation boundary.
+    /// Damaged ciphertext and unlock failures never select another vault location.
+    /// The caller must authorize secret delivery before invoking this operation.
+    ///
+    /// # Errors
+    /// Returns ownership mapping, custody storage, or unlock errors without changing storage.
+    #[cfg(unix)]
+    pub fn read_from_custody(
+        &self,
+        custody: &crate::custody_storage::CredentialCustodyStorage,
+        identities: &[&str],
+        passphrase: Option<&str>,
+    ) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
+        self.read_with(|| {
+            let bytes = custody.read().map_err(|_| {
+                AuthVaultLifecycleError::VaultUnavailable("credential custody unavailable".into())
+            })?;
+            let ciphertext = sshenv_vault::Vault::decode_ciphertext(&bytes).map_err(|_| {
+                AuthVaultLifecycleError::VaultUnavailable("invalid credential custody".into())
+            })?;
+            let key = sshenv_vault::recipient::unwrap_data_key_with_strings(
+                &ciphertext.recipients,
+                identities,
+            )
+            .map_err(|_| {
+                AuthVaultLifecycleError::ProfileUnavailable(
+                    "could not unlock credential custody".into(),
+                )
+            })?;
+            let (mut vault, key) =
+                sshenv_vault::Vault::unlock_metadata_with_data_key_and_device_factor(
+                    ciphertext,
+                    key,
+                    passphrase,
+                    |_| {
+                        Err(
+                            std::io::Error::other("device custody must be explicitly selected")
+                                .into(),
+                        )
+                    },
+                )
+                .map_err(|_| {
+                    AuthVaultLifecycleError::ProfileUnavailable(
+                        "could not unlock credential custody".into(),
+                    )
+                })?;
+            vault
+                .unlock_profile_with_device_factor(self.storage_profile(), &key, passphrase, |_| {
+                    Err(std::io::Error::other("device custody must be explicitly selected").into())
+                })
+                .map_err(|_| {
+                    AuthVaultLifecycleError::ProfileUnavailable(
+                        "could not unlock selected credential profile".into(),
+                    )
+                })?;
+            let selected = vault.profiles.profiles.remove(self.storage_profile());
+            for values in vault.profiles.profiles.values_mut() {
+                for value in values.values_mut() {
+                    value.zeroize();
+                }
+            }
+            selected.ok_or_else(|| {
+                AuthVaultLifecycleError::ProfileUnavailable(
+                    "credential custody profile unavailable".into(),
+                )
+            })
+        })
+    }
+
+    /// Materialize this validated profile for an SDK auth resolver using retained custody.
+    ///
+    /// Credential IDs are mapped back to their declared storage/environment keys. No process
+    /// environment or settings-based secret overrides are merged. Factor limitations are those
+    /// of [`Self::read_from_custody`]. Callers must authorize delivery before calling this method.
+    ///
+    /// # Errors
+    /// Returns custody, credential mapping, or unlock failures without native fallback.
+    #[cfg(unix)]
+    pub fn materialize_from_custody(
+        &self,
+        custody: &crate::custody_storage::CredentialCustodyStorage,
+        identities: &[&str],
+        passphrase: Option<&str>,
+    ) -> Result<crate::ResolvedProviderAuth, AuthVaultLifecycleError> {
+        let keys = self.credential_storage_keys()?;
+        let credentials = self.read_from_custody(custody, identities, passphrase)?;
+        let env = credentials
+            .into_iter()
+            .map(|(id, value)| (keys[&id].clone(), value))
+            .collect();
+        let auth = crate::provider_auth_context(
+            &self.resolved.profile_name,
+            &self.resolved.profile,
+            self.storage_profile(),
+            None,
+            &env,
+            Vec::new(),
+        );
+        Ok(crate::ResolvedProviderAuth { auth, env })
+    }
+
     /// Import static fields only after an explicit review; never replace existing fields.
     ///
     /// # Errors
@@ -740,6 +845,92 @@ mod tests {
             Err(AuthVaultLifecycleError::DeviceSealRequired(_))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retained_custody_reads_canonical_credentials_without_native_fallback() {
+        use crate::operations::AuthRequestCustody as _;
+        let directory = tempfile::tempdir().unwrap();
+        let unused = directory.path().join("unused.vault");
+        let resolved = resolved(&unused);
+        let method = method();
+        let lifecycle =
+            AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method).unwrap();
+        let key_path = directory.path().join("identity-source");
+        let public = crate::security::ensure_vault_recipient_key(&key_path).unwrap();
+        let identity = Zeroizing::new(
+            std::fs::read_to_string(crate::security::vault_private_key_path(&key_path)).unwrap(),
+        );
+        let (mut vault, key) = sshenv_vault::Vault::create(&public).unwrap();
+        vault.profiles.profiles.insert(
+            lifecycle.storage_profile().into(),
+            BTreeMap::from([
+                ("TEST_PROVIDER_API_KEY".into(), "controlled".into()),
+                ("unrelated".into(), "excluded".into()),
+            ]),
+        );
+        vault.migrate_to_v2(&[public]).unwrap();
+        vault.enable_profile_keys().unwrap();
+        vault.profiles.profiles.insert(
+            "unrelated-protected".into(),
+            BTreeMap::from([("SECRET".into(), "not-authorized".into())]),
+        );
+        vault
+            .require_profile_passphrase("unrelated-protected", "unrelated-passphrase")
+            .unwrap();
+        let mut bytes = Vec::new();
+        vault
+            .save_with_storage(&key, |value, _| {
+                bytes = value.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        let custody = crate::custody_storage::CredentialCustodyStorage::create(
+            &directory.path().join("custody"),
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            lifecycle
+                .read_from_custody(&custody, &[identity.as_str()], None)
+                .unwrap(),
+            BTreeMap::from([("api_key".into(), "controlled".into())])
+        );
+        let materialized = lifecycle
+            .materialize_from_custody(&custody, &[identity.as_str()], None)
+            .unwrap();
+        assert_eq!(
+            materialized.env,
+            BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), "controlled".into())])
+        );
+        assert!(lifecycle.read_from_custody(&custody, &[], None).is_err());
+        assert_eq!(custody.read().unwrap(), bytes);
+        assert!(!unused.exists());
+        let retained = crate::operations::RetainedAuthRequestCustody::new(
+            custody,
+            resolved,
+            "exa",
+            "bcode.web-search",
+            method,
+            vec![identity],
+            None,
+        )
+        .unwrap();
+        let mut context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("exa".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            retained
+                .materialize("bcode.web-search", &context)
+                .unwrap()
+                .env,
+            BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), "controlled".into())])
+        );
+        assert!(retained.materialize("foreign.plugin", &context).is_err());
+        context.auth_pool = Some("unsupported-pool".into());
+        assert!(retained.materialize("bcode.web-search", &context).is_err());
     }
 
     #[test]

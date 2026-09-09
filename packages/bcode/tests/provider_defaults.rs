@@ -14,6 +14,138 @@ use bcode_model::{
 };
 use std::collections::BTreeSet;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn encrypted_custody_reaches_sdk_provider_turn() {
+    use bcode_provider_auth::{
+        AuthProfileSource, ResolvedAuthProfile, lifecycle::AuthVaultLifecycle,
+    };
+    use bcode_provider_auth_models::{
+        AuthMethodContribution, AuthSecretField, AuthSecretValidation,
+    };
+    use std::collections::BTreeMap;
+    let root = tempfile::tempdir().unwrap();
+    let key_path = root.path().join("identity-source");
+    let public = bcode_provider_auth::security::ensure_vault_recipient_key(&key_path).unwrap();
+    let identity = zeroize::Zeroizing::new(
+        std::fs::read_to_string(bcode_provider_auth::security::vault_private_key_path(
+            &key_path,
+        ))
+        .unwrap(),
+    );
+    let (mut vault, key) = sshenv_vault::Vault::create(&public).unwrap();
+    vault.profiles.profiles.insert(
+        "selected".into(),
+        BTreeMap::from([
+            ("TEST_PROVIDER_API_KEY".into(), "custody-test-secret".into()),
+            ("UNRELATED".into(), "must-not-deliver".into()),
+        ]),
+    );
+    let mut ciphertext = Vec::new();
+    vault
+        .save_with_storage(&key, |bytes, _| {
+            ciphertext = bytes.to_vec();
+            Ok(())
+        })
+        .unwrap();
+    let custody = bcode_provider_auth::custody_storage::CredentialCustodyStorage::create(
+        &root.path().join("owned"),
+        &ciphertext,
+    )
+    .unwrap();
+    let unused = root.path().join("must-not-open.vault");
+    let mut config = BcodeConfig::default();
+    config.model.provider_plugin_id = Some("example.provider".into());
+    config.model.model_id = Some("example-model".into());
+    config.model.auth_profile = Some("selected".into());
+    config.auth.profiles.insert(
+        "selected".into(),
+        bcode_config::AuthProfileConfig {
+            backend: "sshenv".into(),
+            provider_id: Some("example".into()),
+            owner_plugin_id: Some("example.provider".into()),
+            scheme: Some("api_key".into()),
+            map: BTreeMap::new(),
+            settings: BTreeMap::from([
+                ("profile".into(), "selected".into()),
+                ("vault".into(), unused.display().to_string()),
+                ("device_seal".into(), "off".into()),
+            ]),
+        },
+    );
+    let method = AuthMethodContribution::SecretFields {
+        method_id: "api_key".into(),
+        display_name: "API key".into(),
+        fields: vec![AuthSecretField {
+            credential_id: "api_key".into(),
+            storage_key: "TEST_PROVIDER_API_KEY".into(),
+            prompt: "API key".into(),
+            optional: false,
+            validation: AuthSecretValidation::default(),
+            discovery_sources: Vec::new(),
+        }],
+        supports_verification: false,
+        supports_revocation: false,
+    };
+    let sdk = Bcode::builder()
+        .try_provider_defaults_with_auth_resolver(
+            &config,
+            &ConfigEnvironmentSnapshot::isolated("custody-sdk"),
+            &bcode_config::RuntimeAuthSubscriptions::default(),
+            |name, profile| {
+                let resolved = ResolvedAuthProfile {
+                    profile_name: name.into(),
+                    provider_id: "example".into(),
+                    owner_plugin_id: "example.provider".into(),
+                    profile: profile.clone(),
+                    source: AuthProfileSource::Declarative,
+                };
+                AuthVaultLifecycle::new(&resolved, "example", "example.provider", &method)?
+                    .materialize_from_custody(&custody, &[identity.as_str()], None)
+            },
+        )
+        .unwrap()
+        .build();
+    struct CredentialProvider;
+    impl bcode::InProcessModelProvider for CredentialProvider {
+        fn run_turn(
+            &self,
+            request: ModelTurnRequest,
+            _: bcode::InProcessProviderContext,
+        ) -> bcode::InProcessProviderFuture<'_> {
+            assert_eq!(
+                request
+                    .provider_context
+                    .env
+                    .get("TEST_PROVIDER_API_KEY")
+                    .map(String::as_str),
+                Some("custody-test-secret")
+            );
+            assert!(!request.provider_context.env.contains_key("UNRELATED"));
+            assert_eq!(request.model_id, "example-model");
+            Box::pin(async { Ok(bcode::InProcessProviderOutcome::EndTurn) })
+        }
+    }
+    let agent = sdk
+        .agent_from_context(
+            "00000000-0000-4000-8000-000000000026".parse().unwrap(),
+            root.path().into(),
+        )
+        .build();
+    let mut provider = bcode::InProcessModelProviderAdapter::new(CredentialProvider);
+    let response = agent
+        .generate_text_with_provider(&mut provider, "verify custody delivery")
+        .await
+        .unwrap();
+    assert_eq!(
+        response.runtime.stop_reason,
+        Some(bcode::StopReason::EndTurn)
+    );
+    provider.shutdown_wait().await.unwrap();
+    assert_eq!(custody.read().unwrap(), ciphertext);
+    assert!(!unused.exists());
+}
+
 #[test]
 fn owned_store_initializes_sdk_defaults() {
     let root = tempfile::tempdir().unwrap();
@@ -59,6 +191,28 @@ fn owned_store_initializes_sdk_defaults() {
         sdk.provider_context().auth_profile.as_deref(),
         Some("owned")
     );
+}
+
+#[test]
+fn fallible_sdk_auth_does_not_return_partial_defaults() {
+    let mut config = BcodeConfig::default();
+    config.model.auth_profile = Some("selected".into());
+    config
+        .auth
+        .profiles
+        .insert("selected".into(), Default::default());
+    let mut calls = 0;
+    let result = Bcode::builder().try_provider_defaults_with_auth_resolver(
+        &config,
+        &ConfigEnvironmentSnapshot::isolated("fallible-auth"),
+        &bcode_config::RuntimeAuthSubscriptions::default(),
+        |_, _| {
+            calls += 1;
+            Err("custody unavailable")
+        },
+    );
+    assert!(matches!(result, Err("custody unavailable")));
+    assert_eq!(calls, 1);
 }
 
 #[tokio::test]
