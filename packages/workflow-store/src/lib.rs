@@ -22127,6 +22127,30 @@ mod tests {
                 .expect("duplicate"),
             2
         );
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "retained-output".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: node_id.clone(),
+                activation_id: activation_id.clone(),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(1),
+                artifact_reference: None,
+                created_at_ms: 23,
+            })
+            .expect("commit retained output");
+        let status: String = store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND activation_id = ?1",
+            [&activation_id], |row| row.get(0),
+        ).expect("retained status");
+        assert_eq!(status, "completed");
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision("run-1", &node_id, &activation_id)
+                .expect("historical admission"),
+            Some(1)
+        );
     }
 
     #[test]
