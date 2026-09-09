@@ -4565,6 +4565,17 @@ enum SessionCommand {
         #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=100_000))]
         entry_budget: u32,
     },
+    /// Read persisted composer text as a JSON string or null without submitting it.
+    ComposerDraft {
+        #[arg(
+            long,
+            required_unless_present = "launch_working_directory",
+            conflicts_with = "launch_working_directory"
+        )]
+        session_id: Option<SessionId>,
+        #[arg(long, required_unless_present = "session_id")]
+        launch_working_directory: Option<PathBuf>,
+    },
     /// Read a bounded artifact byte range as JSON, including reference and availability metadata.
     ArtifactRange(ArtifactRangeArgs),
     /// List agent profiles available from the daemon for session selection.
@@ -6115,6 +6126,27 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
                 .session_storage_usage(session_id, entry_budget)
                 .await?;
             print_json(&usage)?;
+        }
+        SessionCommand::ComposerDraft {
+            session_id,
+            launch_working_directory,
+        } => {
+            let scope = match (session_id, launch_working_directory) {
+                (Some(session_id), None) => {
+                    bcode_session_models::ComposerDraftScope::Session { session_id }
+                }
+                (None, Some(launch_working_directory)) => {
+                    bcode_session_models::ComposerDraftScope::DraftSession {
+                        launch_working_directory,
+                    }
+                }
+                _ => unreachable!("clap requires exactly one composer draft scope"),
+            };
+            print_json(
+                &BcodeClient::default_endpoint()
+                    .composer_draft(scope)
+                    .await?,
+            )?;
         }
         SessionCommand::ArtifactRange(args) => {
             Box::pin(read_artifact_range_to(

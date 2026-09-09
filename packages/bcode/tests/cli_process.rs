@@ -471,6 +471,38 @@ fn ralph_status_reads_live_daemon_and_missing_run_fails() {
 }
 
 #[test]
+fn composer_draft_requires_one_scope_and_reports_daemon_failure() {
+    let missing = run_cli_with_state(&["session", "composer-draft"], true);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    let conflicting = run_cli_with_state(
+        &[
+            "session",
+            "composer-draft",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--launch-working-directory",
+            "/unused",
+        ],
+        true,
+    );
+    assert_eq!(conflicting.status.code(), Some(2));
+    assert!(conflicting.stdout.is_empty());
+    let failed = run_cli_with_state(
+        &[
+            "session",
+            "composer-draft",
+            "--launch-working-directory",
+            "/unused",
+        ],
+        true,
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(!failed.stderr.is_empty());
+}
+
+#[test]
 fn ralph_status_requires_identity_and_reports_daemon_failure() {
     let invalid = run_cli_with_state(&["ralph", "status"], true);
     assert_eq!(invalid.status.code(), Some(2));
