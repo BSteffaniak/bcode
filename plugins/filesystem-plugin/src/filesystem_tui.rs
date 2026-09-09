@@ -1,6 +1,6 @@
 //! Native TUI rendering for filesystem request and result visuals.
 
-use crate::file_change_tui::file_change_rows;
+use crate::file_change_tui::file_change_layout;
 use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_lines};
 use bcode_tui_components::source_viewer::{
     SourceViewerInput, SourceViewerStyle, source_viewer_rows_with_style,
@@ -57,23 +57,25 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         }
     }
 
-    fn anchors(
+    fn layout(
         &self,
         kind: &str,
-        _payload: &Value,
-        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
-        rows: &[Line],
-    ) -> Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor> {
-        if matches!(
-            kind,
-            "bcode.filesystem.request-draft.write"
-                | "bcode.filesystem.request-draft.edit"
-                | "bcode.filesystem.request"
-        ) {
-            crate::file_change_tui::file_change_anchors(rows)
-        } else {
-            Vec::new()
-        }
+        payload: &Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> (
+        Vec<Line>,
+        Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    ) {
+        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
+        let result = match kind {
+            "bcode.filesystem.request" => request_layout(payload, context),
+            "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
+                request_draft_layout(kind, payload, context)
+            }
+            _ => (self.rows(kind, payload, context), Vec::new()),
+        };
+        ACTIVE_THEME.with(|theme| theme.set(None));
+        result
     }
 
     fn rows(
@@ -115,6 +117,17 @@ fn request_draft_rows(
     _width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
+    request_draft_layout(kind, payload, context).0
+}
+
+fn request_draft_layout(
+    kind: &str,
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+) {
     let operation = if kind == "bcode.filesystem.request-draft.edit" {
         "edit"
     } else {
@@ -145,7 +158,7 @@ fn request_draft_rows(
         let label_path = path.as_deref().unwrap_or("<path pending>");
         let old_text = old_text.as_deref().unwrap_or_default();
         let new_text = new_text.as_deref().unwrap_or_default();
-        return file_change_rows(
+        return file_change_layout(
             &serde_json::json!({
                 "path": label_path,
                 "old_text": old_text,
@@ -182,7 +195,7 @@ fn request_draft_rows(
         _ => "waiting for file path",
     };
     push_kv(&mut rows, "state", Some(state));
-    rows
+    (rows, Vec::new())
 }
 
 fn partial_json_object_strings(input: &str) -> BTreeMap<String, String> {
@@ -331,6 +344,16 @@ fn request_rows(
     payload: &Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
+    request_layout(payload, context).0
+}
+
+fn request_layout(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+) {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let operation = text(payload, "operation")
         .or_else(|| {
@@ -342,7 +365,7 @@ fn request_rows(
     if operation == "filesystem.write"
         && let (Some(path), Some(contents)) = (text(arguments, "path"), text(arguments, "contents"))
     {
-        return file_change_rows(
+        return file_change_layout(
             &serde_json::json!({
                 "path": path,
                 "old_text": "",
@@ -362,7 +385,7 @@ fn request_rows(
             text(arguments, "new_text"),
         )
     {
-        return file_change_rows(
+        return file_change_layout(
             &serde_json::json!({
                 "path": path,
                 "old_text": old_text,
@@ -389,7 +412,7 @@ fn request_rows(
         bool_text(arguments, "ignore_case"),
     );
     push_kv(&mut rows, "from end", bool_text(arguments, "from_end"));
-    rows
+    (rows, Vec::new())
 }
 
 fn read_rows(
@@ -840,6 +863,32 @@ fn muted() -> Style {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draft_layout_emits_source_lines_not_border_guesses() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffLayout, PluginTuiVisualAdapter, PluginTuiVisualRenderContext,
+        };
+        let context = PluginTuiVisualRenderContext::new(80, PluginTuiDiffLayout::SideBySide, None);
+        let payload = serde_json::json!({"preview": "{\"path\":\"test.rs\",\"old_text\":\"old alpha\\nold beta\",\"new_text\":\"new alpha\\nnew beta\"}", "argument_bytes": 90});
+        let (rows, anchors) = FilesystemTuiVisualAdapter.layout(
+            "bcode.filesystem.request-draft.edit",
+            &payload,
+            &context,
+        );
+        assert_eq!(anchors.len(), 4);
+        for anchor in anchors {
+            let text = rows[anchor.row]
+                .spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            assert!(text.contains(if anchor.key.ends_with(":0") {
+                "alpha"
+            } else {
+                "beta"
+            }));
+        }
+    }
     use super::*;
 
     fn terminal_native_syntax_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {

@@ -133,7 +133,11 @@ pub struct TuiVisualAnchor {
 /// # Errors
 /// Returns an error for excessive, duplicate, empty, or out-of-range anchors.
 pub fn validate_visual_anchors(anchors: &[TuiVisualAnchor], rows: usize) -> Result<(), String> {
-    if anchors.len() > rows.min(MAX_SERIALIZED_TUI_VISUAL_ROWS) {
+    if anchors.len()
+        > rows
+            .saturating_mul(2)
+            .min(MAX_SERIALIZED_TUI_VISUAL_ROWS.saturating_mul(2))
+    {
         return Err("too many visual anchors".to_owned());
     }
     let mut keys = std::collections::BTreeSet::new();
@@ -221,6 +225,22 @@ impl RenderTuiVisualResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_row_old_and_new_source_keys_are_valid() {
+        let anchors = vec![
+            TuiVisualAnchor {
+                key: "old:0".to_owned(),
+                row: 0,
+            },
+            TuiVisualAnchor {
+                key: "new:0".to_owned(),
+                row: 0,
+            },
+        ];
+        assert!(validate_visual_anchors(&anchors, 1).is_ok());
+        assert!(validate_visual_anchors(&anchors, 0).is_err());
+    }
+
     #[test]
     fn visual_correspondence_is_bounded_and_versioned() {
         use super::*;

@@ -24,7 +24,7 @@ done
 
 if ! rg -q 'source_viewer_rows_with_style' plugins/filesystem-plugin/src/filesystem_tui.rs \
   || ! rg -q 'tool_card_header' plugins/filesystem-plugin/src/filesystem_tui.rs \
-  || ! rg -q 'diff_viewer_rows_with_style' plugins/filesystem-plugin/src/file_change_tui.rs; then
+  || ! rg -q 'diff_viewer_layout_with_style' plugins/filesystem-plugin/src/file_change_tui.rs; then
   fail "filesystem visuals must use shared tool-card, source-viewer, and diff-viewer recipes"
 fi
 

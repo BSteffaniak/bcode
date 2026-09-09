@@ -179,9 +179,24 @@ so wrapped paragraphs do not rely on the old intra-item row. The retained projec
 `Arc`; provenance is requested only when capturing or resolving a reading anchor, not for every
 follow-tail update. Missing source geometry falls back to the existing region/item policy.
 
-Remaining coverage includes plugin source-line correspondence across layout modes and all
-asynchronous geometry/input interactions with presentation checkpoints. Region-level plugin
-fallback must not be described as exact source correspondence.
+Filesystem diff correspondence is emitted by the BMUX diff layout pass for both unified and
+side-by-side layouts. Keys identify old/new fragment-relative source lines, including while draft
+line numbers are unknown; completion's absolute file line numbers do not change those keys.
+Chrome, omission rows, and clipped lines do not receive source identity. Two sides may map to the
+same rendered row. Native adapters return rows and correspondence together through `layout`;
+legacy adapters retain the default rows/anchors bridge. Wrapped positions resolve to their owning
+source line, not an invented byte-perfect position within the line. Shell terminal correspondence
+remains terminal-region based because terminal screen mutation is not immutable file source.
+
+### Local BMUX integration
+
+The source-line API is implemented in `../bmux/packages/tui-components/src/diff_viewer.rs` and
+backported to the clean pinned-base worktree `../bmux-bcode-source-lines` (base `5e044224`).
+`.cargo/config.toml` temporarily patches BMUX packages to that worktree so ordinary local Cargo
+commands use consistent primitive types. This is a local integration, not a publishable dependency
+update: publish the BMUX change, update the Git lock revision, then remove the local patch block.
+The primary BMUX checkout has unrelated newer API changes and must not be substituted for the
+pinned-base worktree as an incidental upgrade.
 
 ## Accepted Markdown projection scheduling
 

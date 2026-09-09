@@ -7,8 +7,8 @@ use bmux_tui::prelude::Line;
 use bmux_tui::prelude::{Modifier, Style};
 
 pub use bmux_tui_components::diff_viewer::{
-    ChangedRange, DiffDocument, DiffLine, DiffLineKind, DiffSyntaxSpan, DiffViewerLayout,
-    DiffViewerStyle,
+    ChangedRange, DiffDocument, DiffLine, DiffLineKind, DiffSourceLine, DiffSourceSide,
+    DiffSyntaxSpan, DiffViewerLayout, DiffViewerProjection, DiffViewerStyle,
 };
 
 /// Derive generic diff-viewer styles from a component theme.
@@ -98,6 +98,16 @@ pub fn diff_viewer_rows_with_style(
     width: u16,
     style: DiffViewerStyle,
 ) -> Vec<Line> {
+    diff_viewer_layout_with_style(input, width, style).rows
+}
+
+/// Render rows and exact source-line correspondence in one component layout pass.
+#[must_use]
+pub fn diff_viewer_layout_with_style(
+    input: DiffViewerInput<'_>,
+    width: u16,
+    style: DiffViewerStyle,
+) -> DiffViewerProjection {
     let document = diff_from_text_at_lines_with_palette(
         input.label,
         input.old_text,
@@ -107,7 +117,7 @@ pub fn diff_viewer_rows_with_style(
         #[cfg(feature = "syntax")]
         input.syntax_palette,
     );
-    bmux_tui_components::diff_viewer::diff_viewer_document_rows_with_style(
+    bmux_tui_components::diff_viewer::diff_viewer_document_layout_with_style(
         generic_input(input),
         document,
         width,

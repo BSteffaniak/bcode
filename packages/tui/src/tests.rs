@@ -6319,7 +6319,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     assert!(!draft.contains("File change · duration"), "{draft}");
     let draft_body = app
         .transcript_layout()
-        .content_anchor_row(0, "bcode.filesystem:diff-body")
+        .content_anchor_row(0, "bcode.filesystem:diff:new:0")
         .expect("draft diff body correspondence");
     let draft_rows = app
         .transcript_layout()
@@ -6400,7 +6400,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     assert_eq!(final_item.id(), draft_id);
     let final_body = app
         .transcript_layout()
-        .content_anchor_row(0, "bcode.filesystem:diff-body")
+        .content_anchor_row(0, "bcode.filesystem:diff:new:0")
         .expect("final diff body correspondence");
     let final_rows = app
         .transcript_layout()

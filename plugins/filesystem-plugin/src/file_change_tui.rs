@@ -1,7 +1,7 @@
 //! Native TUI rendering for filesystem file-change previews.
 
 use bcode_tui_components::diff_viewer::{
-    DiffViewerInput, DiffViewerLayout, DiffViewerStyle, diff_viewer_rows_with_style,
+    DiffViewerInput, DiffViewerLayout, DiffViewerStyle, diff_viewer_layout_with_style,
 };
 use bmux_tui::prelude::Line;
 
@@ -25,14 +25,16 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock
     }
 
-    fn anchors(
+    fn layout(
         &self,
         _kind: &str,
-        _payload: &serde_json::Value,
-        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
-        rows: &[Line],
-    ) -> Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor> {
-        file_change_anchors(rows)
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> (
+        Vec<Line>,
+        Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    ) {
+        file_change_layout(payload, context)
     }
 
     fn rows(
@@ -45,25 +47,20 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
     }
 }
 
-/// Identify the start of the bounded diff body independently of volatile chrome.
-/// Line-level correspondence belongs to the diff component; until it is available,
-/// the host retains a clamped offset within this stable region rather than guessing
-/// content identity from formatted text or hashes.
-pub fn file_change_anchors(rows: &[Line]) -> Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor> {
-    rows.iter()
-        .position(|line| line.spans.iter().any(|span| span.content.contains('┌')))
-        .map(|row| bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
-            key: "diff-body".to_owned(),
-            row,
-        })
-        .into_iter()
-        .collect()
-}
-
 pub fn file_change_rows(
     payload: &serde_json::Value,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
+    file_change_layout(payload, context).0
+}
+
+pub fn file_change_layout(
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+) {
     let width = context.width();
     let path = payload
         .get("path")
@@ -124,7 +121,7 @@ pub fn file_change_rows(
         added_emphasis: theme.diff.added_emphasis,
         removed_emphasis: theme.diff.removed_emphasis,
     });
-    diff_viewer_rows_with_style(
+    let projection = diff_viewer_layout_with_style(
         DiffViewerInput {
             syntax_palette,
             label: &context.display_path(path).to_string(),
@@ -149,7 +146,37 @@ pub fn file_change_rows(
         },
         width,
         diff_style,
-    )
+    );
+    source_anchors(projection, old_start_line, new_start_line)
+}
+
+fn source_anchors(
+    projection: bcode_tui_components::diff_viewer::DiffViewerProjection,
+    old_start_line: u32,
+    new_start_line: u32,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+) {
+    let mut anchors = Vec::new();
+    for mapping in projection.source_lines {
+        let side = match mapping.side {
+            bcode_tui_components::diff_viewer::DiffSourceSide::Old => "old",
+            bcode_tui_components::diff_viewer::DiffSourceSide::New => "new",
+        };
+        // Fragment-relative line identity remains stable when execution supplies
+        // absolute file line numbers that were unavailable during the draft.
+        let start = if side == "old" {
+            old_start_line
+        } else {
+            new_start_line
+        };
+        anchors.push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+            key: format!("diff:{side}:{}", mapping.line.saturating_sub(start)),
+            row: mapping.row,
+        });
+    }
+    (projection.rows, anchors)
 }
 
 fn syntax_palette(
@@ -177,6 +204,101 @@ fn syntax_palette(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrapped_source_line_keeps_identity_at_different_widths() {
+        use bcode_plugin_sdk::tui::{PluginTuiDiffLayout, PluginTuiVisualRenderContext};
+        let payload = serde_json::json!({"path":"test.rs", "old_text":"", "new_text":"alpha beta gamma delta epsilon zeta eta theta\nsecond line"});
+        let layout = |width| {
+            super::file_change_layout(
+                &payload,
+                &PluginTuiVisualRenderContext::new(width, PluginTuiDiffLayout::Unified, None),
+            )
+        };
+        let (wide_rows, wide) = layout(90);
+        let (narrow_rows, narrow) = layout(35);
+        let second = |anchors: &[bcode_plugin_sdk::tui_visual::TuiVisualAnchor]| {
+            anchors
+                .iter()
+                .find(|a| a.key == "diff:new:1")
+                .expect("second source line")
+                .row
+        };
+        assert!(second(&narrow) > second(&wide));
+        assert!(line_text(&wide_rows[second(&wide)]).contains("second line"));
+        assert!(line_text(&narrow_rows[second(&narrow)]).contains("second line"));
+    }
+
+    #[test]
+    fn source_correspondence_excludes_omitted_and_clipped_lines() {
+        use bcode_plugin_sdk::tui::{PluginTuiDiffLayout, PluginTuiVisualRenderContext};
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for i in 0..100 {
+            writeln!(&mut text, "line {i}").expect("string write");
+        }
+        let payload = serde_json::json!({"path":"test.rs", "old_text":"", "new_text":text});
+        let (rows, anchors) = super::file_change_layout(
+            &payload,
+            &PluginTuiVisualRenderContext::new(40, PluginTuiDiffLayout::Unified, None),
+        );
+        assert!(anchors.len() < 100);
+        for anchor in anchors {
+            let number = anchor
+                .key
+                .rsplit(':')
+                .next()
+                .expect("line")
+                .parse::<usize>()
+                .expect("source line");
+            assert!(line_text(&rows[anchor.row]).contains(&format!("line {number}")));
+            assert!(!line_text(&rows[anchor.row]).contains("omitted"));
+        }
+    }
+
+    #[test]
+    fn source_lines_survive_layout_changes_and_unknown_absolute_numbers() {
+        let context =
+            |layout| bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(90, layout, None);
+        let payload = serde_json::json!({"path":"test.rs", "old_text":"old alpha\nold beta", "new_text":"new alpha\nnew beta"});
+        let (unified_rows, unified) = super::file_change_layout(
+            &payload,
+            &context(bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified),
+        );
+        let (split_rows, split) = super::file_change_layout(
+            &payload,
+            &context(bcode_plugin_sdk::tui::PluginTuiDiffLayout::SideBySide),
+        );
+        let keys = |anchors: &[bcode_plugin_sdk::tui_visual::TuiVisualAnchor]| {
+            anchors
+                .iter()
+                .map(|a| a.key.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(keys(&unified), keys(&split));
+        assert_eq!(unified.len(), 4);
+        for (rows, anchors) in [(&unified_rows, &unified), (&split_rows, &split)] {
+            bcode_plugin_sdk::tui_visual::validate_visual_anchors(anchors, rows.len())
+                .expect("valid source mapping");
+            for anchor in anchors {
+                let text = line_text(&rows[anchor.row]);
+                let expected = if anchor.key.ends_with(":0") {
+                    "alpha"
+                } else {
+                    "beta"
+                };
+                assert!(text.contains(expected), "{}: {text}", anchor.key);
+            }
+        }
+        let mut completed = payload;
+        completed["old_start_line"] = serde_json::json!(100);
+        completed["new_start_line"] = serde_json::json!(120);
+        let (_, final_anchors) = super::file_change_layout(
+            &completed,
+            &context(bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified),
+        );
+        assert_eq!(keys(&unified), keys(&final_anchors));
+    }
+
     use super::*;
 
     fn line_text(line: &Line) -> String {

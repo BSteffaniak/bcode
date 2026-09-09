@@ -1471,6 +1471,19 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Prepare a coherent row/correspondence pair. Adapters with source-aware
+    /// components override this instead of inferring identity from painted rows.
+    fn layout(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &PluginTuiVisualRenderContext,
+    ) -> (Vec<Line>, Vec<crate::tui_visual::TuiVisualAnchor>) {
+        let rows = self.rows(kind, payload, context);
+        let anchors = self.anchors(kind, payload, context, &rows);
+        (rows, anchors)
+    }
+
     /// Build transcript rows for the artifact/view payload at the given width.
     fn rows(
         &self,
@@ -2323,8 +2336,7 @@ impl PluginTuiRegistry {
         context: &PluginTuiVisualRenderContext,
     ) -> Option<(Vec<Line>, Vec<crate::tui_visual::TuiVisualAnchor>)> {
         let adapter = self.visual_adapter(adapter_id, kind)?;
-        let rows = adapter.rows(kind, payload, context);
-        let anchors = adapter.anchors(kind, payload, context, &rows);
+        let (rows, anchors) = adapter.layout(kind, payload, context);
         crate::tui_visual::validate_visual_anchors(&anchors, rows.len()).ok()?;
         Some((rows, anchors))
     }
