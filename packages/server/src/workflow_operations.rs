@@ -101,6 +101,24 @@ pub fn authorize_local_workflow_application_operation(
 
 /// Apply explicit startup plugin grants in addition to local-client admission.
 /// Execution relationship and durable authority are verified separately before staging.
+/// Authorize publication only for explicitly granted authenticated plugin identities.
+/// Staging grants and local-client staging privileges never grant publication.
+pub fn authorize_configured_run_graph_publication(
+    facts: &bcode_workflow::WorkflowRunGraphPublicationFacts,
+    plugins: &std::collections::BTreeSet<String>,
+) -> WorkflowApplicationAuthorizationDecision {
+    if facts.validate().is_ok()
+        && facts.actor.kind == bcode_workflow::WorkflowApplicationActorKind::Plugin
+        && plugins.contains(&facts.actor.actor_id)
+    {
+        WorkflowApplicationAuthorizationDecision::Allow
+    } else {
+        WorkflowApplicationAuthorizationDecision::Deny {
+            reason: "workflow publication requires an explicit plugin publication grant".to_owned(),
+        }
+    }
+}
+
 pub fn authorize_configured_run_graph_edit(
     facts: &bcode_workflow::WorkflowRunGraphEditFacts,
     plugins: &std::collections::BTreeSet<String>,

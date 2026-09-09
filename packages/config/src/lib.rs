@@ -1605,6 +1605,11 @@ pub struct WorkflowsConfig {
     /// Does not authorize publication or bypass tool permissions. Empty denies all plugins.
     #[serde(default)]
     pub run_edit_plugins: BTreeSet<String>,
+    /// Plugin identities explicitly authorized to publish edits from active workflow executions.
+    /// Separate from staging; does not bypass tool permissions or execution safety checks.
+    /// Empty denies all plugins.
+    #[serde(default)]
+    pub run_publication_plugins: BTreeSet<String>,
     /// Additional filesystem roots scanned for workflow packages.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
@@ -1616,6 +1621,7 @@ impl Default for WorkflowsConfig {
             include_repo_workflows: true,
             include_user_workflows: true,
             run_edit_plugins: BTreeSet::new(),
+            run_publication_plugins: BTreeSet::new(),
             paths: Vec::new(),
         }
     }
@@ -7912,6 +7918,16 @@ fn write_workflows_toml(output: &mut String, workflows: &WorkflowsConfig) {
     if !workflows.run_edit_plugins.is_empty() {
         output.push_str("run_edit_plugins = [");
         for (index, plugin) in workflows.run_edit_plugins.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&toml_string(plugin));
+        }
+        output.push_str("]\n");
+    }
+    if !workflows.run_publication_plugins.is_empty() {
+        output.push_str("run_publication_plugins = [");
+        for (index, plugin) in workflows.run_publication_plugins.iter().enumerate() {
             if index > 0 {
                 output.push_str(", ");
             }

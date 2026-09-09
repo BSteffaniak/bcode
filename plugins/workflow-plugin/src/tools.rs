@@ -141,7 +141,7 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
             payload,
         })) => {
             if operation == PUBLISH_OPERATION {
-                publication_response(payload)
+                publication_response(&payload)
             } else {
                 staging_response(payload)
             }
@@ -156,7 +156,7 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-fn publication_response(payload: serde_json::Value) -> ServiceResponse {
+fn publication_response(payload: &serde_json::Value) -> ServiceResponse {
     let revision = payload
         .as_object()
         .filter(|object| object.len() == 1)

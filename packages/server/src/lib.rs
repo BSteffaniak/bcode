@@ -1596,6 +1596,11 @@ impl ServerState {
         if staged.as_ref() != Some(&facts.request) {
             return Err(denied());
         }
+        if cancellation.is_cancelled() {
+            return Err(ServerError::WorkflowComputationCancelled(
+                facts.request.mutation_id,
+            ));
+        }
         let result = store.publish_retained_leaf_run_graph_edit_from_execution(
             &facts.request.mutation_id,
             &authority,
@@ -1815,6 +1820,11 @@ impl ServerState {
             },
             |store| (store, None),
         );
+        let run_publication_plugins = init
+            .startup_config
+            .workflows
+            .run_publication_plugins
+            .clone();
         let run_edit_plugins = init.startup_config.workflows.run_edit_plugins.clone();
         Self {
             locations: None,
@@ -1865,7 +1875,16 @@ impl ServerState {
             turn_admission_locks: Mutex::default(),
             workflow_store: StdMutex::new(workflow_store),
             workflow_store_unavailable,
-            workflow_run_graph_publication_policy: None,
+            workflow_run_graph_publication_policy: (!run_publication_plugins.is_empty()).then(
+                || WorkflowRunGraphPublicationPolicy {
+                    evaluator: Arc::new(move |facts| {
+                        workflow_operations::authorize_configured_run_graph_publication(
+                            facts,
+                            &run_publication_plugins,
+                        )
+                    }),
+                },
+            ),
             workflow_run_graph_edit_policy: Some(WorkflowRunGraphEditPolicy {
                 evaluator: Arc::new(move |facts| {
                     workflow_operations::authorize_configured_run_graph_edit(
