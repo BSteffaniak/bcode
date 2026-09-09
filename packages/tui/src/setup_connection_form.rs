@@ -55,12 +55,20 @@ impl ConnectionForm {
         if let Some(device) = &mut self.device {
             device.refresh();
             handle_auth_prompt(device, event);
-            if matches!(event, Event::Key(key) if key.key == KeyCode::Escape) {
-                if device.terminal {
+            if device.terminal {
+                if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Enter | KeyCode::Escape | KeyCode::Char('r' | 'b' | 'q')))
+                {
                     self.device = None;
-                } else {
-                    device.cancel();
+                    self.review = false;
+                    self.picker = Some(true);
+                    self.query.clear();
+                    self.selected = 0;
+                    "Choose a method to retry or Esc to choose another provider."
+                        .clone_into(&mut self.status);
                 }
+            } else if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')))
+            {
+                device.cancel();
             }
             return false;
         }
@@ -487,6 +495,17 @@ impl ConnectionForm {
                     theme.text,
                 );
             }
+            write(
+                frame,
+                area,
+                area.height.saturating_sub(2),
+                if device.terminal {
+                    "Enter / r: choose method and retry • Esc / b: back"
+                } else {
+                    "Esc: cancel sign-in"
+                },
+                theme.focused,
+            );
             return;
         }
         if self.presentation == Presentation::Guided {
@@ -648,5 +667,41 @@ fn write(frame: &mut Frame<'_>, area: Rect, row: u16, text: &str, style: Style) 
             &Line::from_spans(vec![Span::styled(text, style)]),
             Style::new(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_login_can_return_to_method_selection_without_closing_tui() {
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Escape,
+            KeyCode::Char('r'),
+            KeyCode::Char('b'),
+        ] {
+            let mut form = ConnectionForm {
+                presentation: Presentation::Guided,
+                providers: Vec::new(),
+                picker: None,
+                selected: 0,
+                query: String::new(),
+                interactive: true,
+                device: Some(super::super::setup_device_login::DeviceLogin::failed_for_test()),
+                importing: false,
+                fields: std::array::from_fn(|_| {
+                    TextInputState::new(TextEditBuffer::from_text(String::new()))
+                }),
+                focus: 4,
+                secret: zeroize::Zeroizing::new(String::new()),
+                review: false,
+                status: String::new(),
+            };
+            assert!(!form.handle_event(&Event::Key(bmux_keyboard::KeyStroke::simple(key))));
+            assert!(form.device.is_none());
+            assert_eq!(form.picker, Some(true));
+        }
     }
 }

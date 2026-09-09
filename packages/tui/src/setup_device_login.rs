@@ -70,7 +70,23 @@ impl DeviceLogin {
     }
 
     pub fn refresh(&mut self) {
-        while let Ok(update) = self.updates.try_recv() {
+        loop {
+            let update = match self.updates.try_recv() {
+                Ok(update) => update,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if !self.terminal {
+                        self.lines = vec![
+                            "Sign-in stopped unexpectedly. Return to method selection and retry."
+                                .to_owned(),
+                        ];
+                        self.terminal = true;
+                        self.prompt = None;
+                        self.answer.clear();
+                    }
+                    break;
+                }
+            };
             if self.terminal {
                 continue;
             }
@@ -88,6 +104,26 @@ impl DeviceLogin {
                     self.answer.clear();
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn failed_for_test() -> Self {
+        let (send, updates) = mpsc::channel();
+        let (answers, _) = mpsc::sync_channel(1);
+        send.send(LoginUpdate::Progress(
+            vec!["Sign-in request failed".to_owned()],
+            true,
+        ))
+        .expect("send");
+        Self {
+            prompt: None,
+            answer: String::new(),
+            answers,
+            lines: Vec::new(),
+            terminal: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            updates,
         }
     }
 
@@ -197,7 +233,7 @@ fn flow(
                 operation,
                 &request,
             )
-            .map_err(|_| "Sign-in request failed. Retry when connected.")?;
+            .map_err(|error| login_request_failure(&error))?;
         response
             .validate()
             .map_err(|_| "Provider returned an invalid authentication response.")?;
@@ -288,6 +324,21 @@ fn answer_prompts(
         }
     }
     Ok(())
+}
+
+const fn login_request_failure(error: &bcode_plugin::PluginServiceCallError) -> &'static str {
+    match error {
+        bcode_plugin::PluginServiceCallError::Invoke(_) => {
+            "Authentication plugin could not be invoked. Return to connection setup and check that the provider is enabled."
+        }
+        bcode_plugin::PluginServiceCallError::Service { .. } => {
+            "The authentication provider rejected or could not complete the request. Return to method selection to retry or choose another sign-in method."
+        }
+        bcode_plugin::PluginServiceCallError::RequestEncode(_)
+        | bcode_plugin::PluginServiceCallError::ResponseDecode(_) => {
+            "Authentication protocol mismatch. Update the provider plugin and retry."
+        }
+    }
 }
 
 fn begin_request(provider_id: &str, method_id: &str, profile: &str) -> AuthFlowRequest {
