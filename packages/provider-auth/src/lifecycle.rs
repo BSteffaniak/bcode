@@ -174,26 +174,49 @@ impl<'a> AuthVaultLifecycle<'a> {
     /// Returns an error when the vault/profile cannot be read or declared ownership is invalid.
     /// Damaged state never causes reset, mutation, or fallback.
     pub fn read(&self) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
-        let vault = self.vault_path();
-        if !vault.exists() {
-            return Err(AuthVaultLifecycleError::VaultUnavailable(format!(
-                "vault at {} does not exist",
-                vault.display()
-            )));
-        }
-        let values = crate::security::read_auth_vault_profile(&vault, self.storage_profile())
-            .map_err(AuthVaultLifecycleError::ProfileUnavailable)?
-            .ok_or_else(|| {
-                AuthVaultLifecycleError::ProfileUnavailable(format!(
-                    "profile '{}' does not exist",
-                    self.storage_profile()
-                ))
-            })?;
-        Ok(self
-            .credential_storage_keys()?
+        self.read_with(|| {
+            let vault = self.vault_path();
+            if !vault.exists() {
+                return Err(AuthVaultLifecycleError::VaultUnavailable(format!(
+                    "vault at {} does not exist",
+                    vault.display()
+                )));
+            }
+            crate::security::read_auth_vault_profile(&vault, self.storage_profile())
+                .map_err(AuthVaultLifecycleError::ProfileUnavailable)?
+                .ok_or_else(|| {
+                    AuthVaultLifecycleError::ProfileUnavailable(format!(
+                        "profile '{}' does not exist",
+                        self.storage_profile()
+                    ))
+                })
+        })
+    }
+
+    /// Read credentials through selected custody using the canonical storage-key mapping.
+    ///
+    /// The caller must read the resolved profile under its ownership and device-seal policy.
+    /// Mapping validation precedes the effect. Unrelated values are discarded and all source
+    /// values are zeroized after mapping, including when the result contains no credentials.
+    /// This method performs no native discovery and never retries through native storage.
+    ///
+    /// # Errors
+    /// Returns mapping validation or selected custody errors without a native fallback.
+    pub fn read_with(
+        &self,
+        read: impl FnOnce() -> Result<BTreeMap<String, String>, AuthVaultLifecycleError>,
+    ) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
+        let keys = self.credential_storage_keys()?;
+        let values: BTreeMap<_, _> = read()?
+            .into_iter()
+            .map(|(key, value)| (key, Zeroizing::new(value)))
+            .collect();
+        Ok(keys
             .into_iter()
             .filter_map(|(credential, key)| {
-                values.get(&key).map(|value| (credential, value.to_owned()))
+                values
+                    .get(&key)
+                    .map(|value| (credential, value.to_string()))
             })
             .collect())
     }
@@ -634,6 +657,33 @@ mod tests {
             supports_verification: false,
             supports_revocation: false,
         }
+    }
+
+    #[test]
+    fn selected_read_custody_maps_only_owned_credentials_without_native_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = directory.path().join("unused.vault");
+        let resolved = resolved(&vault);
+        let method = method();
+        let lifecycle =
+            AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method).unwrap();
+        let credentials = lifecycle
+            .read_with(|| {
+                Ok(BTreeMap::from([
+                    ("TEST_PROVIDER_API_KEY".to_owned(), "controlled".to_owned()),
+                    ("unrelated".to_owned(), "excluded".to_owned()),
+                ]))
+            })
+            .unwrap();
+        assert_eq!(
+            credentials,
+            BTreeMap::from([("api_key".to_owned(), "controlled".to_owned())])
+        );
+        assert!(matches!(
+            lifecycle.read_with(|| Err(AuthVaultLifecycleError::InvalidCredential)),
+            Err(AuthVaultLifecycleError::InvalidCredential)
+        ));
+        assert!(!vault.exists());
     }
 
     #[test]

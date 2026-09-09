@@ -2,7 +2,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +48,9 @@ pub enum AuthStoreError {
 /// must supply a dedicated directory and retain this handle while using its state.
 /// A missing state file is an error; only `create` initializes storage. Dropping
 /// the handle releases ownership. Old subscription files are never imported.
+/// On Unix, snapshot reads and publication remain relative to a retained directory
+/// handle even if its pathname is replaced. Acquisition still requires caller-controlled
+/// ancestors and excludes nonparticipating writers only by that ownership precondition.
 #[derive(Debug)]
 pub struct AuthStore {
     storage: Box<dyn AuthStorage>,
@@ -77,8 +82,35 @@ pub trait AuthStorage: std::fmt::Debug + Send + Sync {
 
 #[derive(Debug)]
 struct NativeAuthStorage {
+    #[cfg(not(unix))]
     directory: PathBuf,
+    #[cfg(unix)]
+    handle: File,
     _lock: File,
+}
+
+#[cfg(unix)]
+fn open_owned_entry(directory: &File, name: &std::ffi::CStr, flags: i32) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    // SAFETY: directory is live, name is NUL-terminated, and mode is supplied for creation.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor owned exclusively by this File.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("auth entry is not a regular file"));
+    }
+    Ok(file)
 }
 
 impl AuthStore {
@@ -136,6 +168,28 @@ impl AuthStore {
         {
             return Err(AuthStoreError::OwnershipUnavailable);
         }
+        #[cfg(unix)]
+        let handle = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&directory)
+                .map_err(AuthStoreError::Io)?
+        };
+        #[cfg(unix)]
+        let lock = open_owned_entry(
+            &handle,
+            c"owner.lock",
+            libc::O_RDWR
+                | if initialize {
+                    libc::O_CREAT | libc::O_EXCL
+                } else {
+                    0
+                },
+        )
+        .map_err(AuthStoreError::Io)?;
+        #[cfg(not(unix))]
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -154,9 +208,27 @@ impl AuthStore {
                 return Err(AuthStoreError::MaintenanceRequired);
             }
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let held = handle.metadata().map_err(AuthStoreError::Io)?;
+            let named = fs::symlink_metadata(&directory).map_err(AuthStoreError::Io)?;
+            // SAFETY: geteuid has no preconditions and does not mutate process state.
+            let owner = unsafe { libc::geteuid() };
+            if held.dev() != named.dev()
+                || held.ino() != named.ino()
+                || held.uid() != owner
+                || held.mode() & 0o077 != 0
+            {
+                return Err(AuthStoreError::OwnershipUnavailable);
+            }
+        }
         Ok(Self {
             storage: Box::new(NativeAuthStorage {
+                #[cfg(not(unix))]
                 directory,
+                #[cfg(unix)]
+                handle,
                 _lock: lock,
             }),
         })
@@ -275,9 +347,12 @@ impl AuthStore {
 impl AuthStorage for NativeAuthStorage {
     fn read_snapshot(&self, limit: usize) -> Result<Vec<u8>, AuthStoreError> {
         let mut bytes = Vec::new();
-        File::open(self.directory.join("state.json"))
-            .map_err(AuthStoreError::Io)?
-            .take(limit as u64)
+        #[cfg(unix)]
+        let file = open_owned_entry(&self.handle, c"state.json", libc::O_RDONLY)
+            .map_err(AuthStoreError::Io)?;
+        #[cfg(not(unix))]
+        let file = File::open(self.directory.join("state.json")).map_err(AuthStoreError::Io)?;
+        file.take(limit as u64)
             .read_to_end(&mut bytes)
             .map_err(AuthStoreError::Io)?;
         Ok(bytes)
@@ -287,16 +362,29 @@ impl AuthStorage for NativeAuthStorage {
         #[cfg(unix)]
         {
             use std::io::Write as _;
-            use switchy_fs::standard::sync::{create_private_file, rename_file, sync_directory};
-            // Acquisition and reads are native. Never let Cargo feature unification
-            // select a different namespace for publication.
-            let pending = self.directory.join("pending.json");
-            let mut file = create_private_file(&pending).map_err(AuthStoreError::Io)?;
+            use std::os::fd::AsRawFd as _;
+            let mut file = open_owned_entry(
+                &self.handle,
+                c"pending.json",
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            )
+            .map_err(AuthStoreError::Io)?;
             file.write_all(bytes).map_err(AuthStoreError::Io)?;
             file.sync_all().map_err(AuthStoreError::Io)?;
             drop(file);
-            rename_file(&pending, self.directory.join("state.json")).map_err(AuthStoreError::Io)?;
-            sync_directory(&self.directory).map_err(AuthStoreError::Io)
+            // SAFETY: both names are static C strings relative to the retained directory.
+            let result = unsafe {
+                libc::renameat(
+                    self.handle.as_raw_fd(),
+                    c"pending.json".as_ptr(),
+                    self.handle.as_raw_fd(),
+                    c"state.json".as_ptr(),
+                )
+            };
+            if result != 0 {
+                return Err(AuthStoreError::Io(std::io::Error::last_os_error()));
+            }
+            self.handle.sync_all().map_err(AuthStoreError::Io)
         }
         #[cfg(not(unix))]
         {
@@ -316,6 +404,58 @@ impl AuthStorage for NativeAuthStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_directory_prevents_path_replacement_redirecting_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth");
+        let moved = temp.path().join("moved");
+        let mut store = AuthStore::create(&path).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        let replacement = AuthStore::create(&path).unwrap();
+        store
+            .update(|state| {
+                state.routing.pools.insert(
+                    "original".into(),
+                    crate::auth_pool_state::AuthPoolRoutingState::default(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .routing
+                .pools
+                .contains_key("original")
+        );
+        assert_eq!(replacement.snapshot().unwrap(), AuthState::default());
+        assert!(AuthStore::open(&moved).is_err());
+        drop(store);
+        assert!(
+            AuthStore::open(&moved)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .routing
+                .pools
+                .contains_key("original")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_symlink_is_not_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth");
+        let store = AuthStore::create(&path).unwrap();
+        let outside = temp.path().join("outside.json");
+        fs::rename(path.join("state.json"), &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, path.join("state.json")).unwrap();
+        assert!(store.snapshot().is_err());
+    }
 
     #[cfg(unix)]
     #[test]
