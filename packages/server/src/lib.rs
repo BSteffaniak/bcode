@@ -48517,6 +48517,133 @@ library = "test"
         drop(state);
     }
 
+    fn publication_leaf_edit(activation_id: String) -> bcode_workflow::WorkflowRunGraphEditBatch {
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_owned(),
+            schema: serde_json::json!({"type":"boolean"}),
+        };
+        bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "edit-run".to_owned(),
+            mutation_id: "publish-new-leaf".to_owned(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node: bcode_workflow::NodeDefinition {
+                    id: "next".to_owned(),
+                    name: "next".to_owned(),
+                    kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    resources: vec![],
+                    configuration: test_workflow_prompt_configuration(
+                        schema,
+                        bcode_workflow::PromptContextTarget::FreshIsolated,
+                    ),
+                },
+                entry: true,
+                exit: true,
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_publication_requires_distinct_policy_and_exact_candidate() {
+        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        let provenance = state
+            .sessions
+            .session_summary(child_id)
+            .await
+            .expect("session")
+            .execution
+            .expect("execution")
+            .provenance;
+        let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
+        let cancel = TurnCancelState::default();
+        state
+            .stage_workflow_run_graph_edit_from_invocation(
+                child_id,
+                "bcode.workflow",
+                edit.clone(),
+                &cancel,
+            )
+            .await
+            .expect("stage");
+        assert!(matches!(
+            state
+                .publish_workflow_run_graph_edit_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    edit.clone(),
+                    &cancel
+                )
+                .await,
+            Err(ServerError::WorkflowApplicationOperationUnauthorized(_))
+        ));
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|facts| {
+                workflow_operations::authorize_configured_run_graph_publication(
+                    facts,
+                    &BTreeSet::from(["bcode.workflow".to_owned()]),
+                )
+            }),
+        });
+        let mut mismatch = edit.clone();
+        mismatch.edits.clear();
+        mismatch
+            .edits
+            .push(bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "next".to_owned(),
+            });
+        assert!(matches!(
+            state
+                .publish_workflow_run_graph_edit_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    mismatch,
+                    &cancel
+                )
+                .await,
+            Err(ServerError::WorkflowApplicationOperationUnauthorized(_))
+        ));
+        assert_eq!(
+            state
+                .publish_workflow_run_graph_edit_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    edit.clone(),
+                    &cancel
+                )
+                .await
+                .expect("publish"),
+            2
+        );
+        assert_eq!(
+            state
+                .publish_workflow_run_graph_edit_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    edit,
+                    &cancel
+                )
+                .await
+                .expect("duplicate"),
+            2
+        );
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .run_graph_revision("edit-run")
+                .expect("revision"),
+            Some(2)
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_fences_waiting_workflow_staging_commit() {
         let (state, child_id, _root) = active_edit_execution_fixture().await;
