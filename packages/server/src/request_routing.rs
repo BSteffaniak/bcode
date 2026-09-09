@@ -495,6 +495,10 @@ pub enum WorkflowDefinitionRequest {
 /// Requests owned by the `RuntimeAndModel` dispatcher (31 variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAndModelRequest {
+    /// Publish an exact staged edit using publication-specific authorization.
+    PublishWorkflowRunGraphEdit {
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    },
     /// Read one bounded run graph page at an expected revision.
     StageWorkflowRunGraphEdit {
         request: bcode_workflow::WorkflowRunGraphEditBatch,
@@ -1143,6 +1147,9 @@ impl RoutedRequest {
                     definition_id,
                     version,
                 },
+            )),
+            Request::PublishWorkflowRunGraphEdit { request } => Self::RuntimeAndModel(Box::new(
+                RuntimeAndModelRequest::PublishWorkflowRunGraphEdit { request },
             )),
             Request::StageWorkflowRunGraphEdit { request } => Self::RuntimeAndModel(Box::new(
                 RuntimeAndModelRequest::StageWorkflowRunGraphEdit { request },

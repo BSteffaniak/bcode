@@ -681,6 +681,10 @@ pub enum Request {
         definition_id: String,
         version: u32,
     },
+    /// Publish an exact staged edit subject to distinct publication authorization.
+    PublishWorkflowRunGraphEdit {
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    },
     /// Persist a candidate edit without publishing or dispatching it.
     StageWorkflowRunGraphEdit {
         request: bcode_workflow::WorkflowRunGraphEditBatch,
@@ -3053,6 +3057,10 @@ pub enum ResponsePayload {
     },
     WorkflowDefinitionDescription {
         definition: Option<bcode_workflow_store::StoredWorkflowDefinition>,
+    },
+    /// Committed graph revision, including for identical duplicate publication.
+    WorkflowRunGraphEditPublished {
+        revision: u64,
     },
     /// Candidate persisted (true) or identical candidate already present (false).
     WorkflowRunGraphEditStaged {

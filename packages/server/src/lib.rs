@@ -5033,6 +5033,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
+        Request::PublishWorkflowRunGraphEdit { .. } => "publish_workflow_run_graph_edit",
         Request::StageWorkflowRunGraphEdit { .. } => "stage_workflow_run_graph_edit",
         Request::InspectWorkflowRunGraph { .. } => "inspect_workflow_run_graph",
         Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
@@ -6497,6 +6498,17 @@ async fn handle_workflow_run_request(
 ) -> Result<(), ServerError> {
     state.require_workflow_store()?;
     match request {
+        RuntimeAndModelRequest::PublishWorkflowRunGraphEdit { request } => {
+            let revision = state
+                .publish_workflow_run_graph_edit(client_id, request)
+                .await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunGraphEditPublished { revision }),
+            )
+            .await
+        }
         RuntimeAndModelRequest::StageWorkflowRunGraphEdit { request } => {
             let created = state
                 .stage_workflow_run_graph_edit(client_id, request)
@@ -64314,6 +64326,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 Response::Ok(ResponsePayload::WorkflowRunGraphEditStaged { created: actual }) if actual == created)
             );
         }
+        let envelope = bcode_ipc::request_envelope(
+            3,
+            &Request::PublishWorkflowRunGraphEdit {
+                request: request.clone(),
+            },
+        )
+        .expect("publication request");
+        bcode_ipc::send_envelope(&mut stream, &envelope)
+            .await
+            .expect("send publication");
+        let response = bcode_ipc::recv_envelope(&mut stream)
+            .await
+            .expect("publication response");
+        assert!(matches!(
+            bcode_ipc::decode_response(&response.payload).expect("decode publication"),
+            Response::Err(_)
+        ));
         drop(stream);
         server.await.expect("server");
         let store = state.workflow_store.lock().expect("store");
