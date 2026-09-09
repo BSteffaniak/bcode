@@ -54,6 +54,7 @@ impl ConnectionForm {
         }
         if let Some(device) = &mut self.device {
             device.refresh();
+            handle_auth_prompt(device, event);
             if matches!(event, Event::Key(key) if key.key == KeyCode::Escape) {
                 if device.terminal {
                     self.device = None;
@@ -474,6 +475,9 @@ impl ConnectionForm {
         if let Some(device) = &mut self.device {
             device.refresh();
             let area = frame.area();
+            if render_auth_prompt(device, frame, area, theme) {
+                return;
+            }
             for (index, text) in device.lines.iter().enumerate() {
                 write(
                     frame,
@@ -540,6 +544,73 @@ impl ConnectionForm {
             &self.status,
             theme.muted,
         );
+    }
+}
+
+fn render_auth_prompt(
+    device: &super::setup_device_login::DeviceLogin,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &PresentedTheme,
+) -> bool {
+    if let Some(bcode_provider_auth_models::AuthFlowEffect::Prompt {
+        message, choices, ..
+    }) = &device.prompt
+    {
+        write(frame, area, 1, message, theme.focused);
+        for (index, choice) in choices
+            .iter()
+            .enumerate()
+            .take(usize::from(area.height.saturating_sub(7)))
+        {
+            write(
+                frame,
+                area,
+                3 + u16::try_from(index).unwrap_or(0),
+                choice,
+                theme.text,
+            );
+        }
+        write(
+            frame,
+            area,
+            area.height.saturating_sub(3),
+            &format!("Answer: {}", device.answer),
+            theme.text,
+        );
+        write(
+            frame,
+            area,
+            area.height.saturating_sub(2),
+            "Enter submits • Esc cancels sign-in",
+            theme.muted,
+        );
+        return true;
+    }
+    false
+}
+
+fn handle_auth_prompt(device: &mut super::setup_device_login::DeviceLogin, event: &Event) {
+    if device.prompt.is_some() {
+        match event {
+            Event::Key(key) => match key.key {
+                KeyCode::Enter => device.submit_answer(),
+                KeyCode::Char(character) if device.answer.len() < 4096 => {
+                    device.answer.push(character);
+                }
+                KeyCode::Backspace => {
+                    device.answer.pop();
+                }
+                _ => {}
+            },
+            Event::Paste(text) => {
+                let remaining = 4096_usize.saturating_sub(device.answer.len());
+                device
+                    .answer
+                    .extend(text.chars().filter(|c| !c.is_control()).take(remaining));
+            }
+            _ => {}
+        }
     }
 }
 

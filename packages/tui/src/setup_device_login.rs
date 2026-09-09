@@ -11,11 +11,24 @@ use std::sync::{
 };
 use std::time::Duration;
 
+pub enum LoginUpdate {
+    Progress(Vec<String>, bool),
+    Prompt(AuthFlowEffect),
+}
+
+struct LoginChannel {
+    updates: mpsc::SyncSender<LoginUpdate>,
+    answers: mpsc::Receiver<String>,
+}
+
 pub struct DeviceLogin {
+    pub prompt: Option<AuthFlowEffect>,
+    pub answer: String,
+    answers: mpsc::SyncSender<String>,
     pub lines: Vec<String>,
     pub terminal: bool,
     cancel: Arc<AtomicBool>,
-    updates: mpsc::Receiver<(Vec<String>, bool)>,
+    updates: mpsc::Receiver<LoginUpdate>,
 }
 
 impl DeviceLogin {
@@ -23,15 +36,32 @@ impl DeviceLogin {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let (send, updates) = mpsc::sync_channel(8);
+        let (answers, receive_answers) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let result = run(&provider, &method, &profile, &vault, &worker_cancel, &send);
+            let channel = LoginChannel {
+                updates: send,
+                answers: receive_answers,
+            };
+            let result = run(
+                &provider,
+                &method,
+                &profile,
+                &vault,
+                &worker_cancel,
+                &channel,
+            );
             let message = match result {
                 Ok(()) => "Sign-in completed and credentials saved.",
                 Err(message) => message,
             };
-            let _ = send.send((vec![message.to_owned()], true));
+            let _ = channel
+                .updates
+                .send(LoginUpdate::Progress(vec![message.to_owned()], true));
         });
         Self {
+            prompt: None,
+            answer: String::new(),
+            answers,
             lines: vec!["Starting sign-in… Esc cancels.".to_owned()],
             terminal: false,
             cancel,
@@ -40,10 +70,34 @@ impl DeviceLogin {
     }
 
     pub fn refresh(&mut self) {
-        while let Ok((lines, terminal)) = self.updates.try_recv() {
-            if !self.terminal {
-                self.lines = lines;
-                self.terminal = terminal;
+        while let Ok(update) = self.updates.try_recv() {
+            if self.terminal {
+                continue;
+            }
+            match update {
+                LoginUpdate::Progress(lines, terminal) => {
+                    self.lines = lines;
+                    self.terminal = terminal;
+                    if terminal {
+                        self.prompt = None;
+                        self.answer.clear();
+                    }
+                }
+                LoginUpdate::Prompt(prompt) => {
+                    self.prompt = Some(prompt);
+                    self.answer.clear();
+                }
+            }
+        }
+    }
+
+    pub fn submit_answer(&mut self) {
+        if let Some(prompt) = &self.prompt {
+            if prompt.validate_answer(&self.answer).is_err() {
+                self.lines = vec!["Choose an offered answer or enter a valid response.".to_owned()];
+            } else if self.answers.try_send(self.answer.clone()).is_ok() {
+                self.prompt = None;
+                self.answer.clear();
             }
         }
     }
@@ -64,7 +118,7 @@ fn run(
     profile: &str,
     vault: &str,
     cancel: &AtomicBool,
-    send: &mpsc::SyncSender<(Vec<String>, bool)>,
+    send: &LoginChannel,
 ) -> Result<(), &'static str> {
     let config = bcode_config::load_config().map_err(|_| "Cannot load configuration.")?;
     let selection =
@@ -88,7 +142,7 @@ fn flow(
     profile: &str,
     vault: &str,
     cancel: &AtomicBool,
-    send: &mpsc::SyncSender<(Vec<String>, bool)>,
+    send: &LoginChannel,
 ) -> Result<(), &'static str> {
     let config = bcode_config::load_config().map_err(|_| "Cannot load configuration.")?;
     let provider = host
@@ -183,11 +237,57 @@ fn flow(
             AuthFlowStatus::Cancelled => return Err("Sign-in cancelled."),
             AuthFlowStatus::Pending => {}
         }
-        let wait = adapt_effects(progress.effects, &mut display, &mut browser)?;
-        let _ = send.try_send((display.clone(), false));
-        wait_or_cancel(wait, cancel);
+        answer_prompts(&progress.effects, &mut domain_flow, send, cancel)?;
+        present_progress(progress.effects, &mut display, &mut browser, send, cancel);
         request = domain_flow.request()?.clone();
     }
+}
+
+fn present_progress(
+    effects: Vec<AuthFlowEffect>,
+    display: &mut Vec<String>,
+    browser: &mut super::auth_browser::AuthBrowser,
+    send: &LoginChannel,
+    cancel: &AtomicBool,
+) {
+    let wait = adapt_effects(effects, display, browser);
+    let _ = send
+        .updates
+        .try_send(LoginUpdate::Progress(display.clone(), false));
+    wait_or_cancel(wait, cancel);
+}
+
+fn answer_prompts(
+    effects: &[AuthFlowEffect],
+    flow: &mut bcode_provider_auth::interactive::InteractiveEnrollment,
+    channel: &LoginChannel,
+    cancel: &AtomicBool,
+) -> Result<(), &'static str> {
+    for effect in effects
+        .iter()
+        .filter(|effect| matches!(effect, AuthFlowEffect::Prompt { .. }))
+    {
+        channel
+            .updates
+            .send(LoginUpdate::Prompt(effect.clone()))
+            .map_err(|_| "Authentication view closed")?;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match channel.answers.recv_timeout(Duration::from_millis(100)) {
+                Ok(answer) => {
+                    flow.answer(effect, answer)?;
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Authentication view closed");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn begin_request(provider_id: &str, method_id: &str, profile: &str) -> AuthFlowRequest {
@@ -223,10 +323,7 @@ fn open_effect_urls(
         .any(|failed| failed)
 }
 
-fn present_effects(
-    effects: Vec<AuthFlowEffect>,
-    display: &mut Vec<String>,
-) -> Result<u64, &'static str> {
+fn present_effects(effects: Vec<AuthFlowEffect>, display: &mut Vec<String>) -> u64 {
     let mut wait = 1000;
     for effect in effects {
         match effect {
@@ -255,14 +352,10 @@ fn present_effects(
                     display.push(message);
                 }
             }
-            AuthFlowEffect::Prompt { .. } => {
-                return Err(
-                    "This method requires an additional prompt. Use the device-code method.",
-                );
-            }
+            AuthFlowEffect::Prompt { .. } => {}
         }
     }
-    Ok(wait)
+    wait
 }
 
 fn wait_or_cancel(wait: u64, cancel: &AtomicBool) {
@@ -278,15 +371,15 @@ fn adapt_effects(
     effects: Vec<AuthFlowEffect>,
     display: &mut Vec<String>,
     browser: &mut super::auth_browser::AuthBrowser,
-) -> Result<u64, &'static str> {
+) -> u64 {
     let browser_failed = open_effect_urls(&effects, browser);
-    let wait = present_effects(effects, display)?;
+    let wait = present_effects(effects, display);
     if browser_failed {
         display.push(
             "Browser could not open. Copy the URL above; sign-in is still waiting.".to_owned(),
         );
     }
-    Ok(wait)
+    wait
 }
 
 #[cfg(test)]
@@ -296,14 +389,20 @@ mod tests {
     #[test]
     fn terminal_progress_cannot_be_reopened_by_late_updates() {
         let (send, updates) = mpsc::channel();
+        let (answers, _) = mpsc::sync_channel(1);
         let mut login = DeviceLogin {
+            prompt: None,
+            answer: String::new(),
+            answers,
             lines: Vec::new(),
             terminal: false,
             cancel: Arc::new(AtomicBool::new(false)),
             updates,
         };
-        send.send((vec!["Completed".to_owned()], true)).unwrap();
-        send.send((vec!["Pending".to_owned()], false)).unwrap();
+        send.send(LoginUpdate::Progress(vec!["Completed".to_owned()], true))
+            .unwrap();
+        send.send(LoginUpdate::Progress(vec!["Pending".to_owned()], false))
+            .unwrap();
         login.refresh();
         assert!(login.terminal);
         assert_eq!(login.lines, vec!["Completed"]);
@@ -317,14 +416,43 @@ mod tests {
                 url: "https://example.com/verify".to_owned(),
             }],
             &mut lines,
-        )
-        .unwrap();
+        );
         assert!(
             lines
                 .iter()
                 .any(|line| line == "https://example.com/verify")
         );
         assert!(wait > 0);
+    }
+
+    #[test]
+    fn prompt_answer_is_validated_and_delivered_without_stdin() {
+        let (send, updates) = mpsc::channel();
+        let (answers, received) = mpsc::sync_channel(1);
+        let mut login = DeviceLogin {
+            prompt: None,
+            answer: String::new(),
+            answers,
+            lines: Vec::new(),
+            terminal: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            updates,
+        };
+        send.send(LoginUpdate::Prompt(AuthFlowEffect::Prompt {
+            prompt_id: "account".to_owned(),
+            message: "Choose account".to_owned(),
+            choices: vec!["work".to_owned(), "personal".to_owned()],
+        }))
+        .unwrap();
+        login.refresh();
+        login.answer = "invalid".to_owned();
+        login.submit_answer();
+        assert!(received.try_recv().is_err());
+        assert!(login.prompt.is_some());
+        login.answer = "work".to_owned();
+        login.submit_answer();
+        assert_eq!(received.try_recv().unwrap(), "work");
+        assert!(login.prompt.is_none());
     }
 
     #[test]
