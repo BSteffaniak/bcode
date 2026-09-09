@@ -1,5 +1,23 @@
 # TUI rendering configuration
 
+## Optional executable allocator
+
+The normal build uses Rust's system allocator. To opt the `bcode` executable into
+mimalloc, build with `cargo build -p bcode --bin bcode --features app,allocator-mimalloc` (combine
+with `distribution` for bundled plugins). Neither defaults nor distribution enable
+this feature. Only `packages/bcode/src/main.rs` declares the global allocator;
+SDK consumers, worker binaries, and plugin libraries do not inherit that declaration.
+Switchy/Turso remain allocator-neutral. Do not enable `turso/mimalloc` transitively.
+
+Validate native-plugin coexistence with
+`BCODE_SMOKE_EXTRA_FEATURES=allocator-mimalloc bash scripts/smoke-native-plugin.sh`
+and `python3 scripts/check-plugin-allocator.py --features bcode/allocator-mimalloc`.
+The guard permits the optional dependency but rejects library-owned global allocation
+and Turso's allocator feature. Multiple independently linked mimalloc instances have
+colliding fixed TLS slots on macOS; external plugins selecting their own allocator
+are not made safe by the executable opt-in. No performance benefit is assumed without
+representative workload benchmarks.
+
 ## Component ownership and direct primitive boundary
 
 Bcode's normal terminal shell composes generic controls from `bmux_tui_components` and coding-agent
@@ -190,15 +208,12 @@ legacy adapters retain the default rows/anchors bridge. Wrapped positions resolv
 source line, not an invented byte-perfect position within the line. Shell terminal correspondence
 remains terminal-region based because terminal screen mutation is not immutable file source.
 
-### Local BMUX integration
+### Published dependencies
 
-The source-line API is implemented in `../bmux/packages/tui-components/src/diff_viewer.rs` and
-backported to the clean pinned-base worktree `../bmux-bcode-source-lines` (base `5e044224`).
-`.cargo/config.toml` temporarily patches BMUX packages to that worktree so ordinary local Cargo
-commands use consistent primitive types. This is a local integration, not a publishable dependency
-update: publish the BMUX change, update the Git lock revision, then remove the local patch block.
-The primary BMUX checkout has unrelated newer API changes and must not be substituted for the
-pinned-base worktree as an incidental upgrade.
+BMUX and MoosicBox are resolved from their published `master` branches, with the
+resolved commits recorded in `Cargo.lock`. No sibling checkout or local Cargo
+patch is required. MoosicBox keeps Turso allocator-neutral unless its explicit
+`turso-mimalloc` feature is selected; Bcode leaves that feature disabled.
 
 ## Accepted Markdown projection scheduling
 

@@ -64,6 +64,7 @@ bcode_tool = { workspace = true }
 bcode_workflow = { workspace = true }
 futures = { workspace = true }
 jsonschema = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 partial-json-fixer = { workspace = true }
 pin-project-lite = { workspace = true }
 schemars = { workspace = true }
@@ -98,6 +99,9 @@ bcode_build_info = { workspace = true }
 sha2             = { workspace = true }
 
 [features]
+# Only src/main.rs installs this allocator. SDK consumers and plugin libraries
+# must never inherit a global allocator declaration from the facade library.
+allocator-mimalloc = ["dep:mimalloc"]
 app = ["cli"]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
 bundled-ocr-tesseract-all = [

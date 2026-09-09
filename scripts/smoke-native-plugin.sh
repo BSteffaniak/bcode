@@ -18,7 +18,7 @@ trap cleanup EXIT
 
 cd "${root}"
 
-cargo build --quiet -p bcode --features distribution
+cargo build --quiet -p bcode --features "distribution${BCODE_SMOKE_EXTRA_FEATURES:+,${BCODE_SMOKE_EXTRA_FEATURES}}"
 
 cargo build --quiet -p bcode_hello_plugin
 
@@ -46,29 +46,7 @@ fi
 plugin_dir="${workdir}/plugins/hello"
 daemon_plugin_dir="${workdir}/config/bcode/plugins/hello"
 mkdir -p "${plugin_dir}" "${daemon_plugin_dir}"
-cat >"${plugin_dir}/bcode-plugin.toml" <<EOF
-id = "example.hello"
-name = "Hello Example Plugin"
-version = "0.0.1"
-
-[[services]]
-description = "Echo service used by smoke tests"
-interface_id = "example-hello/v1"
-name = "Hello Echo"
-
-[[event_subscriptions]]
-topic = "example.event"
-
-[[event_subscriptions]]
-topic = "bcode.session.event"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
+sed "s|^library .*|library = \"${dylib}\"|" examples/hello-plugin/bcode-plugin.toml >"${plugin_dir}/bcode-plugin.toml"
 cp "${plugin_dir}/bcode-plugin.toml" "${daemon_plugin_dir}/bcode-plugin.toml"
 
 export BCODE_CONFIG="${workdir}/bcode.toml"

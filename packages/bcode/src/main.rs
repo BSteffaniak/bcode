@@ -2,6 +2,10 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+#[cfg(feature = "allocator-mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn build_info() -> bcode_build_info::BuildInfo {
     let mode = match env!("BCODE_BUILD_MODE") {
         "developer" => bcode_build_info::BuildMode::Developer,
