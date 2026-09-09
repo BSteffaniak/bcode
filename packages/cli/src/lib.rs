@@ -766,7 +766,12 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             )?;
         }
         WorkflowCommand::Runs { limit } => {
-            print_json(&Box::pin(client.list_workflow_runs(limit)).await?)?;
+            print_json(
+                &Box::pin(bcode_workflow::WorkflowRunApplication::list_workflow_runs(
+                    &client, limit,
+                ))
+                .await?,
+            )?;
         }
         WorkflowCommand::CancelRun { run_id } => {
             print_json(
@@ -847,7 +852,14 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             )?;
         }
         WorkflowCommand::RunOutput { run_id, limit } => {
-            print_json(&Box::pin(client.workflow_run_outputs(run_id, limit)).await?)?;
+            print_json(
+                &Box::pin(
+                    bcode_workflow::WorkflowRunApplication::workflow_run_outputs(
+                        &client, run_id, limit,
+                    ),
+                )
+                .await?,
+            )?;
         }
         WorkflowCommand::ProvideInput {
             run_id,

@@ -465,6 +465,20 @@ pub enum ClientError {
 }
 
 impl bcode_workflow::WorkflowRunApplication for BcodeClient {
+    async fn list_workflow_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowRunSummary>, Self::Error> {
+        Self::list_workflow_runs(self, limit).await
+    }
+
+    async fn workflow_run_outputs(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowOutputInspection>, Self::Error> {
+        Self::workflow_run_outputs(self, run_id, limit).await
+    }
     async fn workflow_run_status(
         &self,
         run_id: String,

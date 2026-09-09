@@ -6900,22 +6900,29 @@ async fn handle_workflow_run_request(
             .await
         }
         RuntimeAndModelRequest::ListWorkflowRuns { limit } => {
-            let runs = workflow_operations::list_runs(state, limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowRunList { runs }),
+            let result = bcode_workflow::WorkflowRunApplication::list_workflow_runs(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(runs) => Response::Ok(ResponsePayload::WorkflowRunList { runs }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::WorkflowRunOutputs { run_id, limit } => {
-            let outputs = workflow_operations::run_outputs(state, &run_id, limit)?;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::WorkflowRunOutputs { outputs }),
+            let result = bcode_workflow::WorkflowRunApplication::workflow_run_outputs(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                limit,
             )
-            .await
+            .await;
+            let response = match result {
+                Ok(outputs) => Response::Ok(ResponsePayload::WorkflowRunOutputs { outputs }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ReconcileOrphanedWorkflowRuns { apply, limit } => {
             let report = workflow_operations::reconcile_orphaned_runs(state, apply, limit).await?;
@@ -65822,9 +65829,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
         store
             .pause_run("direct-resume-pending-run", 2)
             .expect("pause");
-        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+        let mut state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
+        let owner = state.daemon_status.instance_id.clone();
+        Arc::get_mut(&mut state)
+            .expect("unique host")
+            .daemon_status
+            .instance_id = "unverified-other-host".to_string();
+        assert_unverifiable_run_owner_is_not_mutated(
+            &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
+        )
+        .await;
+        Arc::get_mut(&mut state)
+            .expect("no retained host handles")
+            .daemon_status
+            .instance_id = owner;
 
         assert_staging_over_ipc(&state, "direct-resume-pending-run").await;
         assert_run_interface_lifecycle(&workflow_operations::WorkflowAuthoringApplication::new(
@@ -65832,6 +65852,39 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ClientId::new(),
         ))
         .await;
+        drop(state);
+    }
+
+    async fn assert_unverifiable_run_owner_is_not_mutated(
+        application: &impl bcode_workflow::WorkflowRunApplication<
+            Error = bcode_workflow::WorkflowRunOperationFailure,
+        >,
+    ) {
+        let run_id = "direct-resume-pending-run";
+        let before = application
+            .workflow_run_status(run_id.into())
+            .await
+            .expect("status");
+        for result in [
+            application.pause_workflow_run(run_id.into()).await,
+            application.resume_workflow_run(run_id.into()).await,
+            application.cancel_workflow_run(run_id.into()).await,
+        ] {
+            assert_eq!(
+                result
+                    .expect_err("unverifiable ownership must fail closed")
+                    .code,
+                "workflow_unavailable"
+            );
+        }
+        let after = application
+            .workflow_run_status(run_id.into())
+            .await
+            .expect("status after refusals");
+        assert_eq!(
+            before, after,
+            "rejected controls must not change the run projection"
+        );
     }
 
     async fn assert_run_interface_lifecycle(

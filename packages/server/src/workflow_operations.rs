@@ -116,6 +116,26 @@ fn run_operation_failure(error: super::ServerError) -> bcode_workflow::WorkflowR
 }
 
 impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_> {
+    async fn list_workflow_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowRunSummary>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        list_runs(self.state, limit).map_err(|error| run_operation_failure(error.into()))
+    }
+
+    async fn workflow_run_outputs(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow::WorkflowOutputInspection>, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        run_outputs(self.state, &run_id, limit).map_err(|error| run_operation_failure(error.into()))
+    }
     async fn workflow_run_status(
         &self,
         run_id: String,

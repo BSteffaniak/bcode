@@ -10,6 +10,26 @@ pub trait WorkflowRunApplication: Sync {
     /// Adapter-owned transport or normalized domain failure.
     type Error;
 
+    /// List a bounded set of recent runs without repairing durable state.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable state or transport failure.
+    fn list_workflow_runs(
+        &self,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<WorkflowRunSummary>, Self::Error>> + Send;
+
+    /// Inspect bounded, checksum-verified output disclosures for one run.
+    ///
+    /// # Errors
+    /// Returns an error on unavailable or unverifiable state or transport failure.
+    fn workflow_run_outputs(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<crate::WorkflowOutputInspection>, Self::Error>>
+    + Send;
+
     /// Read one run summary without loading aggregate inspection collections.
     ///
     /// An absent run returns `None`; unavailable or damaged state is an error, not absence.
