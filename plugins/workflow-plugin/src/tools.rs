@@ -62,7 +62,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             [definition(), publication_definition()],
             |request, _| {
                 let operation = operation(&request.invocation.tool_name)?;
-                parse_edit(&request.invocation.arguments)?;
+                let edit = parse_edit(&request.invocation.arguments)?;
                 let route = request
                     .host_context
                     .iter()
@@ -86,7 +86,9 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     true,
                     bcode_plugin_sdk::ToolPolicyOperation::Mutating,
                 )
-                .with_descriptor(json!({"route_id":route.route_id})))
+                .with_descriptor(
+                    json!({"route_id":route.route_id, "operation": operation, "edit": edit}),
+                ))
             },
         ),
         bcode_tool::OP_INVOKE_TOOL => invoke_edit(context),
@@ -95,6 +97,23 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             "unsupported workflow tool operation",
         ),
     }
+}
+
+fn prepared_edit_matches(
+    descriptor: &serde_json::Value,
+    operation: &str,
+    edit: &WorkflowRunGraphEditBatch,
+) -> bool {
+    descriptor
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        == Some(operation)
+        && descriptor
+            .get("edit")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<WorkflowRunGraphEditBatch>(value).ok())
+            .as_ref()
+            == Some(edit)
 }
 
 fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
@@ -108,6 +127,12 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
         Ok(edit) => edit,
         Err(message) => return ServiceResponse::error("invalid_request", message),
     };
+    if !prepared_edit_matches(&request.preparation_descriptor, operation, &edit) {
+        return ServiceResponse::error(
+            "invalid_request",
+            "workflow edit differs from prepared authorization",
+        );
+    }
     if context.cancellation.is_cancelled() {
         return ServiceResponse::error("cancelled", "workflow staging cancelled");
     }

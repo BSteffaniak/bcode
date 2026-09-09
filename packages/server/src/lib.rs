@@ -48415,9 +48415,7 @@ library = "test"
         (state, child.id, root)
     }
 
-    #[tokio::test]
-    async fn registered_workflow_tool_stages_active_execution() {
-        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+    fn register_workflow_publication_tool(state: &mut ServerState) {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
             bcode_workflow_plugin::static_plugin(),
@@ -48431,73 +48429,96 @@ library = "test"
             &[plugin],
         )
         .expect("registered workflow plugin");
-        let edit = bcode_workflow::WorkflowRunGraphEditBatch {
-            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
-            run_id: "edit-run".to_owned(),
-            mutation_id: "registered-edit".to_owned(),
-            expected_revision: 1,
-            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
-                node_id: "agent".to_owned(),
-            }],
-            reconciliation: vec![],
-        };
-        let call = bcode_model::ToolCall {
-            id: "registered-call".to_owned(),
-            name: "workflow.stage_run_graph_edit".to_owned(),
-            arguments: serde_json::json!({"edit_json":serde_json::to_string(&edit).expect("edit")}),
-        };
-        let (tool, preparation) = tokio::time::timeout(
-            Duration::from_secs(10),
-            prepare_server_tool(&state, child_id, &call),
-        )
-        .await
-        .expect("registered preparation deadline")
-        .expect("prepare registered tool");
-        let metadata = tool_policy_authorization_metadata(&preparation.authorization, &call.name)
-            .expect("policy facts");
-        assert!(metadata.requires_permission);
-        let approve = async {
-            loop {
-                let permission = state
-                    .pending_permissions
-                    .lock()
-                    .await
-                    .values()
-                    .next()
-                    .cloned();
-                if let Some(permission) = permission {
-                    state
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|facts| {
+                workflow_operations::authorize_configured_run_graph_publication(
+                    facts,
+                    &BTreeSet::from(["bcode.workflow".to_owned()]),
+                )
+            }),
+        });
+    }
+
+    #[tokio::test]
+    async fn registered_workflow_tool_stages_active_execution() {
+        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        register_workflow_publication_tool(&mut state);
+        let provenance = state
+            .sessions
+            .session_summary(child_id)
+            .await
+            .expect("session")
+            .execution
+            .expect("execution")
+            .provenance;
+        let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
+        for name in [
+            "workflow.stage_run_graph_edit",
+            "workflow.publish_run_graph_edit",
+        ] {
+            let call = bcode_model::ToolCall {
+                id: name.to_owned(),
+                name: name.to_owned(),
+                arguments: serde_json::json!({"edit_json":serde_json::to_string(&edit).expect("edit")}),
+            };
+            let (tool, preparation) = tokio::time::timeout(
+                Duration::from_secs(10),
+                prepare_server_tool(&state, child_id, &call),
+            )
+            .await
+            .expect("registered preparation deadline")
+            .expect("prepare registered tool");
+            let metadata =
+                tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+                    .expect("policy facts");
+            assert!(metadata.requires_permission);
+            let approve = async {
+                loop {
+                    let permission = state
                         .pending_permissions
                         .lock()
                         .await
-                        .remove(&permission.summary.permission_id);
-                    *permission.decision.lock().await = Some(true);
-                    permission.notify.notify_waiters();
-                    break;
+                        .values()
+                        .next()
+                        .cloned();
+                    if let Some(permission) = permission {
+                        state
+                            .pending_permissions
+                            .lock()
+                            .await
+                            .remove(&permission.summary.permission_id);
+                        *permission.decision.lock().await = Some(true);
+                        permission.notify.notify_waiters();
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
+            };
+            let cancel = TurnCancelState::default();
+            let (response, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    invoke_prepared_tool_for_test(
+                        &state,
+                        child_id,
+                        &call,
+                        tool,
+                        preparation,
+                        &metadata,
+                        &cancel,
+                    ),
+                    approve
+                )
+            })
+            .await
+            .expect("registered workflow invocation deadline");
+            let response = response.expect("tool transport");
+            assert!(!response.is_error, "{}", response.output);
+            if name == "workflow.stage_run_graph_edit" {
+                assert!(response.output.contains("Topology has not been published"));
+            } else {
+                assert!(response.output.contains("published at revision 2"));
             }
-        };
-        let cancel = TurnCancelState::default();
-        let (response, ()) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(
-                invoke_prepared_tool_for_test(
-                    &state,
-                    child_id,
-                    &call,
-                    tool,
-                    preparation,
-                    &metadata,
-                    &cancel,
-                ),
-                approve
-            )
-        })
-        .await
-        .expect("registered workflow invocation deadline");
-        let response = response.expect("tool transport");
-        assert!(!response.is_error, "{}", response.output);
-        assert!(response.output.contains("Topology has not been published"));
+        }
         let store = state.workflow_store.lock().expect("store");
         let authority = store
             .execution_authority("edit-run")
@@ -48505,13 +48526,13 @@ library = "test"
             .expect("owned");
         assert_eq!(
             store
-                .staged_run_graph_edit("edit-run", "registered-edit", &authority)
+                .staged_run_graph_edit("edit-run", "publish-new-leaf", &authority)
                 .expect("candidate"),
             Some(edit)
         );
         assert_eq!(
             store.run_graph_revision("edit-run").expect("revision"),
-            Some(1)
+            Some(2)
         );
         drop(store);
         drop(state);
