@@ -383,26 +383,9 @@ impl<'a> AuthVaultLifecycle<'a> {
         passphrase: Option<&str>,
         changes: BTreeMap<String, Option<String>>,
         key_source: Option<&dyn crate::operations::AuthCustodyKeySource>,
+        device: Option<&dyn crate::operations::AuthDeviceFactorSource>,
     ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
-        if self
-            .resolved
-            .profile
-            .settings
-            .get("device_seal")
-            .map(String::as_str)
-            != Some("off")
-        {
-            return Err(AuthVaultLifecycleError::WriteFailed(
-                "retained custody policy requires selected device effects".into(),
-            ));
-        }
-        let allowed = self.credential_storage_keys()?;
-        if changes
-            .keys()
-            .any(|key| !allowed.values().any(|value| value == key))
-        {
-            return Err(AuthVaultLifecycleError::InvalidCredential);
-        }
+        self.validate_custody_changes(&changes)?;
         let before = custody.read().map_err(|_| {
             AuthVaultLifecycleError::VaultUnavailable("credential custody unavailable".into())
         })?;
@@ -421,14 +404,32 @@ impl<'a> AuthVaultLifecycle<'a> {
                 ciphertext,
                 key,
                 passphrase,
-                |_| Err(std::io::Error::other("device custody unavailable").into()),
+                |factor| {
+                    let source = device
+                        .ok_or_else(|| std::io::Error::other("device custody unavailable"))?;
+                    source
+                        .retrieve(
+                            &factor.id,
+                            factor.recipient_fingerprint.as_deref(),
+                            &factor.params,
+                        )
+                        .map_err(Into::into)
+                },
             )
             .map_err(|_| {
                 AuthVaultLifecycleError::VaultUnavailable("could not unlock custody".into())
             })?;
         vault
-            .unlock_profile_with_device_factor(self.storage_profile(), &key, passphrase, |_| {
-                Err(std::io::Error::other("device custody unavailable").into())
+            .unlock_profile_with_device_factor(self.storage_profile(), &key, passphrase, |factor| {
+                let source =
+                    device.ok_or_else(|| std::io::Error::other("device custody unavailable"))?;
+                source
+                    .retrieve(
+                        &factor.id,
+                        factor.recipient_fingerprint.as_deref(),
+                        &factor.params,
+                    )
+                    .map_err(Into::into)
             })
             .map_err(|_| {
                 AuthVaultLifecycleError::ProfileUnavailable(
@@ -482,6 +483,33 @@ impl<'a> AuthVaultLifecycle<'a> {
             )
         })?;
         Ok(Vec::new())
+    }
+
+    #[cfg(unix)]
+    fn validate_custody_changes(
+        &self,
+        changes: &BTreeMap<String, Option<String>>,
+    ) -> Result<(), AuthVaultLifecycleError> {
+        if self
+            .resolved
+            .profile
+            .settings
+            .get("device_seal")
+            .map(String::as_str)
+            != Some("off")
+        {
+            return Err(AuthVaultLifecycleError::WriteFailed(
+                "retained custody policy requires selected device effects".into(),
+            ));
+        }
+        let allowed = self.credential_storage_keys()?;
+        if changes
+            .keys()
+            .any(|key| !allowed.values().any(|value| value == key))
+        {
+            return Err(AuthVaultLifecycleError::InvalidCredential);
+        }
+        Ok(())
     }
 
     /// Import static fields only after an explicit review; never replace existing fields.

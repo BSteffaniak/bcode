@@ -102,9 +102,9 @@ pub struct RetainedAuthRequestCustody {
 
 #[cfg(unix)]
 impl RetainedAuthRequestCustody {
-    /// Select trusted retrieval for existing device factors on credential reads.
+    /// Select trusted retrieval for existing device factors on credential reads and writes.
     ///
-    /// This does not enable factor creation, remote custody, or device-protected writes.
+    /// This does not enable factor creation, remote custody, or required/preferred policy upgrades.
     #[must_use]
     pub fn device_source(mut self, source: std::sync::Arc<dyn AuthDeviceFactorSource>) -> Self {
         self.device_source = Some(source);
@@ -227,6 +227,7 @@ impl AuthCredentialCustody for RetainedAuthRequestCustody {
             self.passphrase.as_ref().map(|value| value.as_str()),
             changes,
             self.key_source.as_deref(),
+            self.device_source.as_deref(),
         )
     }
 }
