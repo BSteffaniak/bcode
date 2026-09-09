@@ -4137,6 +4137,21 @@ pub struct WorkflowRunGraphPublicationFacts {
     pub request: WorkflowRunGraphEditBatch,
 }
 
+/// Plugin service compatibility boundary for run publication policy.
+pub const WORKFLOW_PUBLICATION_POLICY_INTERFACE_ID: &str = "bcode.workflow-publication-policy/v1";
+/// Evaluate canonical publication facts; a grant never replaces host authorization.
+pub const OP_AUTHORIZE_WORKFLOW_PUBLICATION: &str = "authorize";
+
+/// Plugin-owned publication policy decision for the v1 policy interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowPublicationPolicyDecision {
+    /// Permit publication subject to host grants and durable execution checks.
+    Allow,
+    /// Reject publication without side effects.
+    Deny,
+}
+
 impl WorkflowRunGraphPublicationFacts {
     /// Validate compatibility, actor, and edit envelope without granting authority.
     ///

@@ -45,6 +45,31 @@ impl RustPlugin for WorkflowPlugin {
             context.request.interface_id.as_str(),
             context.request.operation.as_str(),
         ) {
+            (
+                bcode_workflow::WORKFLOW_PUBLICATION_POLICY_INTERFACE_ID,
+                bcode_workflow::OP_AUTHORIZE_WORKFLOW_PUBLICATION,
+            ) => {
+                let Ok(facts) = context
+                    .request
+                    .payload_json::<bcode_workflow::WorkflowRunGraphPublicationFacts>()
+                else {
+                    return ServiceResponse::error(
+                        "invalid_request",
+                        "invalid publication policy facts",
+                    );
+                };
+                let decision = if facts.validate().is_ok()
+                    && matches!(
+                        facts.actor.kind,
+                        bcode_workflow::WorkflowApplicationActorKind::LocalClient
+                            | bcode_workflow::WorkflowApplicationActorKind::Plugin
+                    ) {
+                    bcode_workflow::WorkflowPublicationPolicyDecision::Allow
+                } else {
+                    bcode_workflow::WorkflowPublicationPolicyDecision::Deny
+                };
+                json_response(&decision)
+            }
             (COMMAND_INTERFACE_ID, OP_INVOKE_COMMAND) => invoke_command(&context.request),
             (SESSION_STATUS_INTERFACE_ID, OP_SESSION_STATUS) => session_status(&context.request),
             _ => ServiceResponse::error(

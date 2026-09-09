@@ -1610,6 +1610,10 @@ pub struct WorkflowsConfig {
     /// Empty denies all plugins.
     #[serde(default)]
     pub run_publication_plugins: BTreeSet<String>,
+    /// Explicitly authorize authenticated local clients to publish staged run edits.
+    /// Disabled by default; does not grant plugin access or bypass execution safety checks.
+    #[serde(default)]
+    pub run_publication_local_clients: bool,
     /// Additional filesystem roots scanned for workflow packages.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
@@ -1622,6 +1626,7 @@ impl Default for WorkflowsConfig {
             include_user_workflows: true,
             run_edit_plugins: BTreeSet::new(),
             run_publication_plugins: BTreeSet::new(),
+            run_publication_local_clients: false,
             paths: Vec::new(),
         }
     }
@@ -7924,6 +7929,9 @@ fn write_workflows_toml(output: &mut String, workflows: &WorkflowsConfig) {
             output.push_str(&toml_string(plugin));
         }
         output.push_str("]\n");
+    }
+    if workflows.run_publication_local_clients {
+        output.push_str("run_publication_local_clients = true\n");
     }
     if !workflows.run_publication_plugins.is_empty() {
         output.push_str("run_publication_plugins = [");

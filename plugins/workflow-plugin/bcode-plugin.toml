@@ -5,6 +5,12 @@ version = "0.0.1"
 categories = ["workflow", "automation"]
 
 [[services]]
+class        = "service"
+description  = "Workflow publication policy evaluated before execution effects"
+interface_id = "bcode.workflow-publication-policy/v1"
+name         = "Workflow Publication Policy"
+
+[[services]]
 class        = "tool_execution"
 description  = "Execution-scoped workflow graph staging"
 interface_id = "bcode.tool/v1"

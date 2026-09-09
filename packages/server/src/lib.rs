@@ -1820,6 +1820,8 @@ impl ServerState {
             },
             |store| (store, None),
         );
+        let run_publication_local_clients =
+            init.startup_config.workflows.run_publication_local_clients;
         let run_publication_plugins = init
             .startup_config
             .workflows
@@ -1875,16 +1877,17 @@ impl ServerState {
             turn_admission_locks: Mutex::default(),
             workflow_store: StdMutex::new(workflow_store),
             workflow_store_unavailable,
-            workflow_run_graph_publication_policy: (!run_publication_plugins.is_empty()).then(
-                || WorkflowRunGraphPublicationPolicy {
-                    evaluator: Arc::new(move |facts| {
-                        workflow_operations::authorize_configured_run_graph_publication(
-                            facts,
-                            &run_publication_plugins,
-                        )
-                    }),
-                },
-            ),
+            workflow_run_graph_publication_policy: (run_publication_local_clients
+                || !run_publication_plugins.is_empty())
+            .then(|| WorkflowRunGraphPublicationPolicy {
+                evaluator: Arc::new(move |facts| {
+                    workflow_operations::authorize_configured_run_graph_publication(
+                        facts,
+                        &run_publication_plugins,
+                        run_publication_local_clients,
+                    )
+                }),
+            }),
             workflow_run_graph_edit_policy: Some(WorkflowRunGraphEditPolicy {
                 evaluator: Arc::new(move |facts| {
                     workflow_operations::authorize_configured_run_graph_edit(
@@ -48434,9 +48437,44 @@ library = "test"
                 workflow_operations::authorize_configured_run_graph_publication(
                     facts,
                     &BTreeSet::from(["bcode.workflow".to_owned()]),
+                    false,
                 )
             }),
         });
+    }
+
+    #[tokio::test]
+    async fn local_publication_requires_separate_configured_grant() {
+        let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
+            version: 1,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
+                actor_id: "local-client".to_owned(),
+            },
+            request: publication_leaf_edit("activation".to_owned()),
+        };
+        facts.validate().expect("valid publication facts");
+        for enabled in [false, true] {
+            let decision = workflow_operations::authorize_configured_run_graph_publication(
+                &facts,
+                &BTreeSet::new(),
+                enabled,
+            );
+            assert_eq!(
+                matches!(decision, WorkflowApplicationAuthorizationDecision::Allow),
+                enabled
+            );
+        }
+        let mut invalid = facts;
+        invalid.version = u32::MAX;
+        assert!(matches!(
+            workflow_operations::authorize_configured_run_graph_publication(
+                &invalid,
+                &BTreeSet::new(),
+                true,
+            ),
+            WorkflowApplicationAuthorizationDecision::Deny { .. }
+        ));
     }
 
     #[tokio::test]
@@ -48572,6 +48610,62 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn local_publication_denies_unavailable_policy_service() {
+        let (state, _, _root) = active_edit_execution_fixture().await;
+        let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
+            version: 1,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
+                actor_id: "local-client".to_owned(),
+            },
+            request: publication_leaf_edit("activation".to_owned()),
+        };
+        assert!(matches!(
+            workflow_operations::authorize_publication_plugin(&state, &facts).await,
+            Err(ServerError::WorkflowApplicationOperationUnauthorized(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_publication_uses_configured_grant_at_application_boundary() {
+        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        register_workflow_publication_tool(&mut state);
+        let provenance = state
+            .sessions
+            .session_summary(child_id)
+            .await
+            .expect("session")
+            .execution
+            .expect("execution")
+            .provenance;
+        let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
+        state
+            .stage_workflow_run_graph_edit_from_invocation(
+                child_id,
+                "bcode.workflow",
+                edit.clone(),
+                &TurnCancelState::default(),
+            )
+            .await
+            .expect("stage");
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|facts| {
+                workflow_operations::authorize_configured_run_graph_publication(
+                    facts,
+                    &BTreeSet::new(),
+                    true,
+                )
+            }),
+        });
+        let state = Arc::new(state);
+        assert!(
+            workflow_operations::publish_run_graph_edit(&state, ClientId::new(), edit)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn execution_publication_requires_distinct_policy_and_exact_candidate() {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
         let provenance = state
@@ -48609,6 +48703,7 @@ library = "test"
                 workflow_operations::authorize_configured_run_graph_publication(
                     facts,
                     &BTreeSet::from(["bcode.workflow".to_owned()]),
+                    false,
                 )
             }),
         });

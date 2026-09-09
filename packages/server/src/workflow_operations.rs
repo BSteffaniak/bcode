@@ -101,20 +101,25 @@ pub fn authorize_local_workflow_application_operation(
 
 /// Apply explicit startup plugin grants in addition to local-client admission.
 /// Execution relationship and durable authority are verified separately before staging.
-/// Authorize publication only for explicitly granted authenticated plugin identities.
+/// Authorize publication for explicitly granted authenticated plugin or local client identities.
 /// Staging grants and local-client staging privileges never grant publication.
 pub fn authorize_configured_run_graph_publication(
     facts: &bcode_workflow::WorkflowRunGraphPublicationFacts,
     plugins: &std::collections::BTreeSet<String>,
+    local_clients: bool,
 ) -> WorkflowApplicationAuthorizationDecision {
-    if facts.validate().is_ok()
-        && facts.actor.kind == bcode_workflow::WorkflowApplicationActorKind::Plugin
-        && plugins.contains(&facts.actor.actor_id)
-    {
+    let granted = match facts.actor.kind {
+        bcode_workflow::WorkflowApplicationActorKind::LocalClient => local_clients,
+        bcode_workflow::WorkflowApplicationActorKind::Plugin => {
+            plugins.contains(&facts.actor.actor_id)
+        }
+        bcode_workflow::WorkflowApplicationActorKind::Service => false,
+    };
+    if facts.validate().is_ok() && granted {
         WorkflowApplicationAuthorizationDecision::Allow
     } else {
         WorkflowApplicationAuthorizationDecision::Deny {
-            reason: "workflow publication requires an explicit plugin publication grant".to_owned(),
+            reason: "workflow publication requires an explicit publication grant".to_owned(),
         }
     }
 }
@@ -206,6 +211,34 @@ pub async fn stage_run_graph_edit(
         .map_err(Into::into)
 }
 
+/// Require plugin-owned policy approval in addition to the host publication grant.
+pub async fn authorize_publication_plugin(
+    state: &ServerState,
+    facts: &bcode_workflow::WorkflowRunGraphPublicationFacts,
+) -> Result<(), super::ServerError> {
+    let decision = state
+        .plugins
+        .invoke_service_by_interface_json::<_, bcode_workflow::WorkflowPublicationPolicyDecision>(
+            bcode_workflow::WORKFLOW_PUBLICATION_POLICY_INTERFACE_ID,
+            bcode_workflow::OP_AUTHORIZE_WORKFLOW_PUBLICATION,
+            facts,
+        )
+        .await
+        .map_err(|_| {
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "workflow publication policy service unavailable or incompatible".to_owned(),
+            )
+        })?;
+    match decision {
+        bcode_workflow::WorkflowPublicationPolicyDecision::Allow => Ok(()),
+        bcode_workflow::WorkflowPublicationPolicyDecision::Deny => Err(
+            super::ServerError::WorkflowApplicationOperationUnauthorized(
+                "workflow publication denied by policy service".to_owned(),
+            ),
+        ),
+    }
+}
+
 /// Authorize executable publication separately from staging.
 ///
 /// # Errors
@@ -237,6 +270,7 @@ pub async fn publish_run_graph_edit(
     if let WorkflowApplicationAuthorizationDecision::Deny { reason } = (policy.evaluator)(&facts) {
         return Err(super::ServerError::WorkflowApplicationOperationUnauthorized(reason));
     }
+    authorize_publication_plugin(state, &facts).await?;
     state.require_workflow_store()?;
     let guard = execution_authority(state, &facts.request.run_id)
         .await?
