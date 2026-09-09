@@ -1509,6 +1509,104 @@ impl ServerState {
         result.map_err(Into::into)
     }
 
+    /// Publish an exact staged candidate for an authenticated plugin invocation.
+    ///
+    /// The dispatcher supplies the plugin identity, session, and turn cancellation state.
+    /// Publication authorization is independent of staging authorization.
+    ///
+    /// # Errors
+    /// Returns an error for denied policy, cancellation, invalid provenance, candidate mismatch,
+    /// inactive execution, stale authority, unsupported topology, or persistence failure.
+    pub async fn publish_workflow_run_graph_edit_from_invocation(
+        &self,
+        session_id: SessionId,
+        plugin_id: &str,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+        cancellation: &TurnCancelState,
+    ) -> Result<u64, ServerError> {
+        let denied = || {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "publication requires an authorized current workflow execution".to_string(),
+            )
+        };
+        let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
+            version: 1,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::Plugin,
+                actor_id: plugin_id.to_string(),
+            },
+            request,
+        };
+        facts.validate().map_err(|_| denied())?;
+        let policy = self
+            .workflow_run_graph_publication_policy
+            .as_ref()
+            .ok_or_else(denied)?;
+        if let WorkflowApplicationAuthorizationDecision::Deny { reason } =
+            (policy.evaluator)(&facts)
+        {
+            return Err(ServerError::WorkflowApplicationOperationUnauthorized(
+                reason,
+            ));
+        }
+        self.require_workflow_store()?;
+        let session = self.sessions.session_summary(session_id).await?;
+        let provenance = session.execution.ok_or_else(denied)?.provenance;
+        if provenance.version != bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION
+            || provenance.owner != "bcode.workflow"
+            || provenance.run_id != facts.request.run_id
+        {
+            return Err(denied());
+        }
+        let activation_id = provenance.activation_id.as_deref().ok_or_else(denied)?;
+        let commit = cancellation.marker_commit.lock().await;
+        if cancellation.is_cancelled() {
+            return Err(ServerError::WorkflowComputationCancelled(
+                facts.request.mutation_id,
+            ));
+        }
+        let mut store = self
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let link = store
+            .execution_session_link(
+                &provenance.run_id,
+                &provenance.node_id,
+                activation_id,
+                provenance.attempt,
+            )?
+            .ok_or_else(denied)?;
+        if link.session_id != session_id.to_string()
+            || Some(link.workspace_snapshot.as_str()) != provenance.workspace_snapshot.as_deref()
+        {
+            return Err(denied());
+        }
+        let authority = store
+            .execution_authority(&provenance.run_id)?
+            .ok_or_else(denied)?;
+        if authority.daemon_instance_id != self.daemon_status.instance_id {
+            return Err(denied());
+        }
+        let staged = store.staged_run_graph_edit(
+            &facts.request.run_id,
+            &facts.request.mutation_id,
+            &authority,
+        )?;
+        if staged.as_ref() != Some(&facts.request) {
+            return Err(denied());
+        }
+        let result = store.publish_retained_leaf_run_graph_edit_from_execution(
+            &facts.request.mutation_id,
+            &authority,
+            &link,
+            current_time_ms(),
+        );
+        drop(store);
+        drop(commit);
+        result.map_err(Into::into)
+    }
+
     /// Configure run-edit staging policy before sharing the server with clients.
     /// Configure executable graph publication policy. Staging policy never grants this permission.
     pub fn set_workflow_run_graph_publication_policy(
@@ -24428,12 +24526,19 @@ async fn invocation_service_routes(
     session_id: SessionId,
 ) -> Vec<ServerInvocationServiceRoute> {
     let mut routes = provider_invocation_service_routes(state, session_id).await;
+    let mut workflow_operations = Vec::new();
     if state.workflow_run_graph_edit_policy.is_some() {
+        workflow_operations.push("stage_run_graph_edit".to_owned());
+    }
+    if state.workflow_run_graph_publication_policy.is_some() {
+        workflow_operations.push("publish_run_graph_edit".to_owned());
+    }
+    if !workflow_operations.is_empty() {
         routes.push(ServerInvocationServiceRoute {
             advertised: bcode_tool::ToolInvocationServiceRoute {
                 route_id: bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
                 interface_id: bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
-                operations: vec!["stage_run_graph_edit".to_owned()],
+                operations: workflow_operations,
             },
             target_plugin_id: None,
             payload_overlay: serde_json::Value::Null,
@@ -26214,6 +26319,13 @@ impl InvocationExchangeBroker for ServerExchangeBroker<'_> {
     }
 }
 
+fn workflow_invocation_failure() -> ToolInvocationServiceResolution {
+    ToolInvocationServiceResolution::Failed {
+        code: "workflow_admission_failed".to_owned(),
+        message: "workflow edit rejected; verify policy, candidate and active execution".to_owned(),
+    }
+}
+
 async fn resolve_server_plugin_bridge_request(
     state: &ServerState,
     session_id: SessionId,
@@ -26254,31 +26366,40 @@ async fn resolve_server_plugin_bridge_request(
                 ToolInvocationServiceResolution::Cancelled
             } else if request.route_id.as_deref()
                 != Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID)
-                || request.operation != "stage_run_graph_edit"
+                || !matches!(
+                    request.operation.as_str(),
+                    "stage_run_graph_edit" | "publish_run_graph_edit"
+                )
             {
                 ToolInvocationServiceResolution::Unsupported
             } else if let Ok(edit) = serde_json::from_value(request.payload) {
-                match state
-                    .stage_workflow_run_graph_edit_from_invocation(
-                        session_id,
-                        plugin_id,
-                        edit,
-                        cancel_state,
-                    )
-                    .await
-                {
-                    Ok(staged) => ToolInvocationServiceResolution::Responded {
-                        payload: serde_json::json!({ "staged": staged }),
-                    },
+                let result = if request.operation == "publish_run_graph_edit" {
+                    state
+                        .publish_workflow_run_graph_edit_from_invocation(
+                            session_id,
+                            plugin_id,
+                            edit,
+                            cancel_state,
+                        )
+                        .await
+                        .map(|revision| serde_json::json!({ "revision": revision }))
+                } else {
+                    state
+                        .stage_workflow_run_graph_edit_from_invocation(
+                            session_id,
+                            plugin_id,
+                            edit,
+                            cancel_state,
+                        )
+                        .await
+                        .map(|staged| serde_json::json!({ "staged": staged }))
+                };
+                match result {
+                    Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
                     Err(ServerError::WorkflowComputationCancelled(_)) => {
                         ToolInvocationServiceResolution::Cancelled
                     }
-                    Err(_) => ToolInvocationServiceResolution::Failed {
-                        code: "workflow_admission_failed".to_owned(),
-                        message:
-                            "workflow edit was not admitted; verify policy and active execution"
-                                .to_owned(),
-                    },
+                    Err(_) => workflow_invocation_failure(),
                 }
             } else {
                 ToolInvocationServiceResolution::Failed {

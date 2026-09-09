@@ -458,7 +458,7 @@ impl WorkflowStore {
         authority: &super::WorkflowExecutionAuthority,
         created_at_ms: u64,
     ) -> Result<u64, WorkflowStoreError> {
-        self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, false)
+        self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, false, None)
     }
 
     /// Publish a leaf-only edit while explicitly retaining unchanged active activations.
@@ -478,7 +478,32 @@ impl WorkflowStore {
         authority: &super::WorkflowExecutionAuthority,
         created_at_ms: u64,
     ) -> Result<u64, WorkflowStoreError> {
-        self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, true)
+        self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, true, None)
+    }
+
+    /// Publish a retained-leaf candidate on behalf of an authenticated active execution.
+    ///
+    /// The application must authorize publication separately from staging. Caller verification
+    /// and publication share one transaction, preventing settlement from racing this check.
+    ///
+    /// # Errors
+    /// Returns an error for mismatched or inactive callers, stale authority, invalid candidates,
+    /// unsupported reconciliation/topology, or persistence failure.
+    pub fn publish_retained_leaf_run_graph_edit_from_execution(
+        &mut self,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        caller: &super::WorkflowExecutionSessionLink,
+        created_at_ms: u64,
+    ) -> Result<u64, WorkflowStoreError> {
+        self.publish_leaf_run_graph_edit(
+            &caller.run_id,
+            mutation_id,
+            authority,
+            created_at_ms,
+            true,
+            Some(caller),
+        )
     }
 
     fn publish_leaf_run_graph_edit(
@@ -488,8 +513,12 @@ impl WorkflowStore {
         authority: &super::WorkflowExecutionAuthority,
         created_at_ms: u64,
         retain_active: bool,
+        caller: Option<&super::WorkflowExecutionSessionLink>,
     ) -> Result<u64, WorkflowStoreError> {
         let transaction = self.connection.unchecked_transaction()?;
+        if let Some(caller) = caller {
+            self.verify_active_graph_edit_caller(run_id, caller)?;
+        }
         let request = self
             .staged_run_graph_edit(run_id, mutation_id, authority)?
             .ok_or_else(|| {
@@ -622,6 +651,42 @@ impl WorkflowStore {
         self.stage_run_graph_edit_for_caller(request, authority, created_at_ms, Some(caller))
     }
 
+    // Both callers hold a transaction on this connection through their eventual commit.
+    fn verify_active_graph_edit_caller(
+        &self,
+        run_id: &str,
+        caller: &super::WorkflowExecutionSessionLink,
+    ) -> Result<(), WorkflowStoreError> {
+        super::validate_execution_session_link(caller)?;
+        let stored = self.execution_session_link(
+            &caller.run_id,
+            &caller.node_id,
+            &caller.activation_id,
+            caller.attempt,
+        )?;
+        if caller.run_id != run_id || stored.as_ref() != Some(caller) {
+            return Err(WorkflowStoreError::InvalidData(
+                "run edit caller link mismatch".to_string(),
+            ));
+        }
+        let active: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt
+             JOIN workflow_activations activation ON activation.run_id = attempt.run_id
+               AND activation.node_id = attempt.node_id AND activation.activation_id = attempt.activation_id
+             WHERE attempt.run_id = ?1 AND attempt.node_id = ?2 AND attempt.activation_id = ?3
+               AND attempt.attempt = ?4 AND activation.status = 'running'
+               AND attempt.status IN ('prepared', 'admitted'))",
+            rusqlite::params![caller.run_id, caller.node_id, caller.activation_id, caller.attempt],
+            |row| row.get(0),
+        )?;
+        if !active {
+            return Err(WorkflowStoreError::InvalidData(
+                "run edit caller is no longer active".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn stage_run_graph_edit_for_caller(
         &self,
         request: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -639,33 +704,7 @@ impl WorkflowStore {
         let transaction = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(&request.run_id, authority)?;
         if let Some(caller) = caller {
-            super::validate_execution_session_link(caller)?;
-            let stored = self.execution_session_link(
-                &caller.run_id,
-                &caller.node_id,
-                &caller.activation_id,
-                caller.attempt,
-            )?;
-            if caller.run_id != request.run_id || stored.as_ref() != Some(caller) {
-                return Err(WorkflowStoreError::InvalidData(
-                    "run edit caller link mismatch".to_string(),
-                ));
-            }
-            let active: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt
-                 JOIN workflow_activations activation ON activation.run_id = attempt.run_id
-                   AND activation.node_id = attempt.node_id AND activation.activation_id = attempt.activation_id
-                 WHERE attempt.run_id = ?1 AND attempt.node_id = ?2 AND attempt.activation_id = ?3
-                   AND attempt.attempt = ?4 AND activation.status = 'running'
-                   AND attempt.status IN ('prepared', 'admitted'))",
-                rusqlite::params![caller.run_id, caller.node_id, caller.activation_id, caller.attempt],
-                |row| row.get(0),
-            )?;
-            if !active {
-                return Err(WorkflowStoreError::InvalidData(
-                    "run edit caller is no longer active".to_string(),
-                ));
-            }
+            self.verify_active_graph_edit_caller(&request.run_id, caller)?;
         }
         if let Some(existing) =
             self.staged_run_graph_edit(&request.run_id, &request.mutation_id, authority)?
