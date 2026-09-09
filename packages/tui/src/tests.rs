@@ -2859,10 +2859,15 @@ fn slash_palette_renders_above_composer() {
     );
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Slash Commands"));
+    assert!(output.contains("Commands & Skills"));
     assert!(output.contains("/plan"));
     assert!(buffer.row_symbols(0).unwrap().trim().is_empty());
-    assert!(buffer.row_symbols(13).unwrap().contains("Slash Commands"));
+    assert!(
+        buffer
+            .row_symbols(13)
+            .unwrap()
+            .contains("Commands & Skills")
+    );
 }
 
 #[test]

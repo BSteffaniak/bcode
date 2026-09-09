@@ -30,8 +30,12 @@ pub fn render_palette(
         return;
     };
 
+    let title = format!(
+        " Commands & Skills ({} skills) · type to search · ↑/↓ browse ",
+        palette.skill_count()
+    );
     let shell = PickerFrame::new()
-        .title(" Slash Commands  tab/enter accept · ↑/↓ select · esc hide ")
+        .title(&title)
         .policy(PickerFramePolicy {
             chrome: true,
             background: true,
@@ -149,7 +153,7 @@ fn slash_item_line(item: &SlashItem, selected: bool, width: u16, theme: TuiTheme
     let available = usize::from(width.saturating_sub(15));
     Line::from_spans(vec![
         Span::styled(if selected { "› " } else { "  " }, base),
-        Span::styled(" cmd ", badge_style),
+        Span::styled(if item.is_skill() { "skill" } else { " cmd " }, badge_style),
         Span::styled("  ", base),
         Span::styled(
             truncate_end(item.command(), available.min(30)),

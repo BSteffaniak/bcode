@@ -16,6 +16,7 @@ pub struct SlashPalette {
 /// One slash completion item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashItem {
+    skill: bool,
     command: String,
     description: String,
 }
@@ -56,6 +57,12 @@ impl SlashPalette {
     #[must_use]
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Number of discovered skill completions in this result.
+    #[must_use]
+    pub fn skill_count(&self) -> usize {
+        self.items.iter().filter(|item| item.is_skill()).count()
     }
 
     /// Return the number of completion items.
@@ -135,6 +142,12 @@ impl SlashPalette {
 }
 
 impl SlashItem {
+    /// Whether this completion invokes a discovered skill.
+    #[must_use]
+    pub const fn is_skill(&self) -> bool {
+        self.skill
+    }
+
     /// Return replacement command text.
     #[must_use]
     pub fn command(&self) -> &str {
@@ -173,8 +186,8 @@ async fn slash_items(
                     .description
                     .unwrap_or_else(|| "invoke skill".to_owned());
                 [
-                    item(format!("/skill {}", skill.id), description),
-                    item(format!("/skill describe {}", skill.id), "describe skill"),
+                    skill_item(format!("/skill {}", skill.id), description),
+                    skill_item(format!("/skill describe {}", skill.id), "describe skill"),
                 ]
             })
             .collect()
@@ -216,7 +229,7 @@ async fn slash_items(
                     let description = skill
                         .description
                         .unwrap_or_else(|| format!("Invoke skill {}", skill.name));
-                    item(format!("/{}", skill.id), description)
+                    skill_item(format!("/{}", skill.id), description)
                 })
             }));
         }
@@ -340,8 +353,15 @@ fn static_items() -> Vec<SlashItem> {
         .collect()
 }
 
+fn skill_item(command: impl Into<String>, description: impl Into<String>) -> SlashItem {
+    let mut result = item(command, description);
+    result.skill = true;
+    result
+}
+
 fn item(command: impl Into<String>, description: impl Into<String>) -> SlashItem {
     SlashItem {
+        skill: false,
         command: command.into(),
         description: description.into(),
     }
@@ -349,6 +369,20 @@ fn item(command: impl Into<String>, description: impl Into<String>) -> SlashItem
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn skills_retain_their_source_and_are_searchable() {
+        let items = super::filter_items(
+            vec![
+                super::item("/model", "Select model"),
+                super::skill_item("/code-review", "Review code"),
+            ],
+            "code-review",
+        );
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_skill());
+        assert_eq!(items[0].command(), "/code-review");
+    }
+
     use super::{filter_items, plugin_slash_items, static_items};
     use bcode_command::{
         CommandAction, CommandContribution, CommandExecution, CommandOwner, CommandSurface,

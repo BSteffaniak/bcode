@@ -2241,7 +2241,9 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             let (endpoint_env_name, endpoint_env_value) =
                 bcode_ipc::endpoint_env_pair(&endpoint)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let mut child = tokio::process::Command::new(exe)
+            let mut command = tokio::process::Command::new(exe);
+            detach_daemon_process(&mut command);
+            let mut child = command
                 .args(["server", "run"])
                 .env(endpoint_env_name, endpoint_env_value)
                 .env(
@@ -2286,6 +2288,47 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         }
     })
     .await
+}
+
+/// Detach the child from the launching terminal, not merely its stdio handles.
+fn detach_daemon_process(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    // SAFETY: setsid is async-signal-safe and touches no Rust state in the
+    // post-fork child. The child starts a new session before exec, so terminal
+    // closure cannot deliver SIGHUP to the daemon's process group.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    #[cfg(windows)]
+    command.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    #[cfg(not(any(unix, windows)))]
+    let _ = command;
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn daemon_child_has_a_new_session_and_process_group() {
+    let mut command = tokio::process::Command::new("sleep");
+    command.arg("10").kill_on_drop(true);
+    detach_daemon_process(&mut command);
+    let mut child = command.spawn().expect("spawn detached child");
+    let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits");
+    // SAFETY: read-only process identity queries for the child we just spawned.
+    let (session, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+    child.kill().await.expect("stop test child");
+    assert_eq!(
+        session, pid,
+        "daemon must not inherit the launching terminal session"
+    );
+    assert_eq!(
+        group, pid,
+        "daemon must not inherit the launching process group"
+    );
 }
 
 /// Ensure the current namespace daemon is running using an in-process start callback.
