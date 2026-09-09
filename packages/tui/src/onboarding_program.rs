@@ -77,6 +77,39 @@ impl OnboardingProgram {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
+        let code = if code == KeyCode::Enter && !self.shell.has_pending_confirmation() {
+            use bcode_settings::SetupSectionId;
+            match self.shell.focused_section() {
+                SetupSectionId::Providers => KeyCode::Char('p'),
+                SetupSectionId::SecureVault => KeyCode::Char('a'),
+                SetupSectionId::Models => KeyCode::Char('m'),
+                SetupSectionId::Launch => KeyCode::Char('l'),
+                SetupSectionId::Welcome => KeyCode::Down,
+                SetupSectionId::Detection
+                | SetupSectionId::Permissions
+                | SetupSectionId::Imports
+                | SetupSectionId::Plugins => {
+                    let message = match self.shell.focused_section() {
+                        SetupSectionId::Detection => {
+                            "Press a to review a credential import, or p to connect a provider."
+                        }
+                        SetupSectionId::Permissions => {
+                            "Permission editing is not implemented in this setup screen yet. Your existing policy is unchanged."
+                        }
+                        SetupSectionId::Imports => {
+                            "Session import is not implemented in this setup screen yet. It is optional; press s to skip."
+                        }
+                        _ => {
+                            "Plugin editing is available in Settings: press g and choose plugins/enabled or plugins/disabled."
+                        }
+                    };
+                    self.shell.set_status_message(message.to_owned());
+                    return Ok(Lifecycle::Continue);
+                }
+            }
+        } else {
+            code
+        };
         match code {
             KeyCode::Char('r' | 'g' | 'x') if !self.shell.has_pending_confirmation() => {
                 self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::new(
@@ -326,6 +359,37 @@ mod tests {
             bmux_tui::geometry::Rect::new(0, 0, 80, 24),
         )
         .expect("program");
+        for (section, importing) in [
+            (bcode_settings::SetupSectionId::Providers, false),
+            (bcode_settings::SetupSectionId::SecureVault, true),
+        ] {
+            let index = program
+                .shell
+                .sections()
+                .iter()
+                .position(|item| item.section_id == section)
+                .expect("section");
+            program.shell.focus_section_index(index);
+            assert_eq!(
+                program.handle_key(KeyCode::Enter).expect("select"),
+                bmux_tui_runtime::Lifecycle::Continue
+            );
+            assert!(
+                program.connection_form.is_some(),
+                "Enter must open connection/import editor ({importing})"
+            );
+            program.connection_form = None;
+        }
+        let index = program
+            .shell
+            .sections()
+            .iter()
+            .position(|item| item.section_id == bcode_settings::SetupSectionId::Models)
+            .expect("models");
+        program.shell.focus_section_index(index);
+        program.handle_key(KeyCode::Enter).expect("select models");
+        assert!(program.settings_form.is_some());
+        program.settings_form = None;
         for key in ['p', 'a', 'm', 'r', 'g', 'x'] {
             assert_eq!(
                 program.handle_key(KeyCode::Char(key)).expect("input"),

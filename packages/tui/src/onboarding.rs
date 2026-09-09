@@ -259,6 +259,11 @@ impl OnboardingShell {
             .map_or(SetupSectionId::Welcome, |section| section.section_id)
     }
 
+    /// Display feedback without recording setup completion.
+    pub fn set_status_message(&mut self, message: String) {
+        self.status_message = Some(message);
+    }
+
     /// Move focus to the next setup section.
     pub fn focus_next(&mut self) {
         if self.sections.is_empty() {
