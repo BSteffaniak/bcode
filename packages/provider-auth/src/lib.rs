@@ -16,6 +16,7 @@ pub mod interactive;
 pub mod lifecycle;
 pub mod operations;
 pub mod security;
+pub mod store;
 
 /// Return portable, secret-free summaries for all configured or runtime auth pools.
 #[must_use]

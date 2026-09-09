@@ -4856,13 +4856,49 @@ fn lock_auth_subscriptions(path: &Path) -> Result<fs::File, ConfigError> {
     Ok(file)
 }
 
+// Defaulted fields may be added, but no supplied field or value may disappear on write.
+fn auth_registry_representation_preserved(
+    original: &serde_json::Value,
+    supported: &serde_json::Value,
+) -> bool {
+    match (original, supported) {
+        (serde_json::Value::Object(original), serde_json::Value::Object(supported)) => {
+            original.iter().all(|(key, value)| {
+                supported
+                    .get(key)
+                    .is_some_and(|known| auth_registry_representation_preserved(value, known))
+            })
+        }
+        (serde_json::Value::Array(original), serde_json::Value::Array(supported)) => {
+            original.len() == supported.len()
+                && original
+                    .iter()
+                    .zip(supported)
+                    .all(|(value, known)| auth_registry_representation_preserved(value, known))
+        }
+        _ => original == supported,
+    }
+}
+
 fn read_auth_subscriptions_for_update(
     path: &Path,
 ) -> Result<RuntimeAuthSubscriptions, ConfigError> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| ConfigError::Composition {
-            message: "auth registry is invalid; existing state preserved".to_owned(),
-        }),
+        Ok(bytes) => {
+            let invalid = || ConfigError::Composition {
+                message: "auth registry is invalid or unsupported; existing state preserved"
+                    .to_owned(),
+            };
+            let original: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            let registry: RuntimeAuthSubscriptions =
+                serde_json::from_value(original.clone()).map_err(|_| invalid())?;
+            let supported = serde_json::to_value(&registry).map_err(|_| invalid())?;
+            if !auth_registry_representation_preserved(&original, &supported) {
+                return Err(invalid());
+            }
+            Ok(registry)
+        }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             Ok(RuntimeAuthSubscriptions::default())
         }
@@ -8502,6 +8538,22 @@ mod tests {
         assert!(!parsed.onboarding.credential_discovery);
         let defaults: super::BcodeConfig = toml::from_str("").expect("empty config parses");
         assert!(defaults.onboarding.credential_discovery);
+    }
+
+    #[test]
+    fn auth_registry_updates_reject_unknown_fields_without_rewriting() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("subscriptions.json");
+        for bytes in [
+            r#"{"version":999,"pools":{}}"#,
+            r#"{"pools":{"pool":{"future_policy":true}}}"#,
+        ] {
+            std::fs::write(&path, bytes).expect("future fixture");
+            assert!(super::read_auth_subscriptions_for_update(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).expect("preserved"), bytes);
+        }
+        std::fs::write(&path, "{}").expect("defaulted current registry");
+        assert!(super::read_auth_subscriptions_for_update(&path).is_ok());
     }
 
     #[test]
