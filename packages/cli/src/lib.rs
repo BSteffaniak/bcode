@@ -55,6 +55,9 @@ const SESSION_CLI_PAGE_LIMIT: usize = 500;
 pub enum CliError {
     #[error("client error: {0}")]
     Client(#[from] ClientError),
+    /// A normalized workflow application failure, independent of its transport.
+    #[error("workflow operation failed ({code}): {message}")]
+    WorkflowApplication { code: String, message: String },
     #[error("daemon lifecycle error: {0}")]
     DaemonLifecycle(#[from] bcode_daemon_lifecycle::DaemonLifecycleError),
     #[error("daemon start error: {0}")]
@@ -227,6 +230,7 @@ impl CliError {
             | Self::SurfaceRepoPath(_)
             | Self::AuthPrimeFailed(_)
             | Self::Sshenv(_)
+            | Self::WorkflowApplication { .. }
             | Self::WorkflowDraftEditNotApplied
             | Self::SessionDerivationNotSucceeded
             | Self::WorkflowApprovalContinuationFailed
@@ -234,6 +238,47 @@ impl CliError {
             #[cfg(feature = "web-renderer")]
             Self::HyperChadRender(_) => 1,
         }
+    }
+}
+
+impl From<bcode_workflow::WorkflowRunOperationFailure> for CliError {
+    fn from(failure: bcode_workflow::WorkflowRunOperationFailure) -> Self {
+        Self::WorkflowApplication {
+            code: failure.code,
+            message: failure.message,
+        }
+    }
+}
+
+impl From<bcode_workflow::WorkflowAuthoringFailure> for CliError {
+    fn from(failure: bcode_workflow::WorkflowAuthoringFailure) -> Self {
+        Self::WorkflowApplication {
+            code: failure.code().to_owned(),
+            message: failure.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod workflow_application_error_tests {
+    #[test]
+    fn normalized_workflow_errors_preserve_codes_and_failure_exit() {
+        let error = super::CliError::from(bcode_workflow::WorkflowAuthoringFailure::Unauthorized);
+        assert_eq!(error.exit_code(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("workflow_operation_unauthorized")
+        );
+        let error = super::CliError::from(bcode_workflow::WorkflowRunOperationFailure {
+            code: "workflow_unavailable".to_owned(),
+            message: "workflow state is unavailable".to_owned(),
+        });
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            error.to_string(),
+            "workflow operation failed (workflow_unavailable): workflow state is unavailable"
+        );
     }
 }
 
@@ -802,13 +847,16 @@ async fn handle_ralph_command(command: RalphCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn handle_associated_run(
-    client: &impl bcode_workflow::WorkflowRunApplication<Error = bcode_client::ClientError>,
+async fn handle_associated_run<A: bcode_workflow::WorkflowRunApplication>(
+    client: &A,
     key: bcode_workflow::WorkflowRunBindingLookup,
     inspect: bool,
     limit: usize,
     action: Option<&str>,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    CliError: From<A::Error>,
+{
     if let Some(action) = action {
         let action = match action {
             "pause" => bcode_workflow::WorkflowRunControlAction::Pause,
@@ -824,10 +872,13 @@ async fn handle_associated_run(
     }
 }
 
-async fn print_package_publication(
-    client: &impl bcode_workflow::WorkflowAuthoringApplication<Error = bcode_client::ClientError>,
+async fn print_package_publication<A: bcode_workflow::WorkflowAuthoringApplication>(
+    client: &A,
     package_id: &str,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    CliError: From<A::Error>,
+{
     print_json(
         &client
             .workflow_package_publication(package_id.to_owned())

@@ -4187,6 +4187,7 @@ async fn run_with_config(
             default_plugin_ids,
             shutdown: bcode_agent_runtime::CancellationToken::new(),
             locations: None,
+            workflow_ready: None,
         },
     )
     .await
@@ -4288,6 +4289,61 @@ pub async fn run_embedded_with_locations_and_shutdown(
             plugin_selection,
             default_plugin_ids,
             shutdown,
+            workflow_ready: None,
+        },
+    ))
+    .await
+}
+
+/// Borrowed workflow application available only while its embedded host is alive.
+/// Use the workflow-owned application traits; construction and daemon state remain private.
+pub use workflow_operations::WorkflowAuthoringApplication as EmbeddedWorkflowApplication;
+
+/// A finite operation invoked after embedded host recovery and before accepting IPC clients.
+///
+/// The returned future must finish before shutdown can complete. It cannot retain the borrowed
+/// application. Dropping the host future is not graceful shutdown.
+pub type EmbeddedWorkflowReady = Box<
+    dyn for<'a> FnOnce(
+            &'a EmbeddedWorkflowApplication<'a>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+        + Send,
+>;
+
+/// Run an embedded host with a finite, lifecycle-scoped workflow application callback.
+///
+/// Recovery, authorization, ownership fencing, and cleanup use the normal host path.
+/// The callback is skipped if shutdown is requested before readiness. Request cancellation
+/// through the supplied shutdown token and continue polling this function to drain cleanup.
+/// No concurrent transport or durable-resume guarantee is provided by this callback.
+///
+/// # Errors
+/// Returns the same initialization, client handling, and shutdown failures as
+/// [`run_embedded_with_services_and_shutdown`]. Operation failures belong to the callback.
+pub async fn run_embedded_with_workflow_application(
+    endpoint: IpcEndpoint,
+    config: bcode_config::BcodeConfig,
+    plugins: bcode_plugin::PluginRuntimeHost,
+    model_catalog: bcode_model_catalog::ModelCatalogResolver,
+    default_plugin_ids: Vec<String>,
+    shutdown: bcode_agent_runtime::CancellationToken,
+    ready: EmbeddedWorkflowReady,
+) -> Result<(), ServerError> {
+    let plugin_selection = plugins.selection().clone();
+    Box::pin(run_with_services(
+        endpoint,
+        false,
+        config,
+        Instant::now(),
+        ServerStartupServices {
+            plugins,
+            model_catalog,
+            plugin_selection,
+            default_plugin_ids,
+            shutdown,
+            locations: None,
+            workflow_ready: Some(ready),
         },
     ))
     .await
@@ -4304,6 +4360,7 @@ struct ServerStartupServices {
     plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
     shutdown: bcode_agent_runtime::CancellationToken,
+    workflow_ready: Option<EmbeddedWorkflowReady>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4321,6 +4378,7 @@ async fn run_with_services(
         default_plugin_ids,
         shutdown: host_shutdown,
         locations,
+        workflow_ready,
     } = services;
     if host_shutdown.is_cancelled() {
         plugins.deactivate_all().await?;
@@ -4540,6 +4598,7 @@ async fn run_with_services(
         config.session_search.enabled,
         &configured_agent_ids,
         host_shutdown,
+        workflow_ready,
     )
     .await
 }
@@ -4552,6 +4611,7 @@ async fn run_constructed_server(
     session_search_enabled: bool,
     configured_agent_ids: &[String],
     host_shutdown: bcode_agent_runtime::CancellationToken,
+    workflow_ready: Option<EmbeddedWorkflowReady>,
 ) -> Result<(), ServerError> {
     if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
@@ -4623,6 +4683,11 @@ async fn run_constructed_server(
     if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
+    }
+    if let Some(ready) = workflow_ready {
+        let application =
+            workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
+        ready(&application).await;
     }
     state.metrics.record_histogram(
         "server.startup.ready_ms",
@@ -66676,35 +66741,42 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 })
                 .expect("run");
         }
-        let application =
-            || workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
         let lookup = bcode_workflow::WorkflowRunBindingLookup {
             owner_plugin_id: key.owner_plugin_id.clone(),
             workflow_kind: key.workflow_kind.clone(),
             scope_key: key.scope_key.clone(),
         };
+        exercise_associated_workflow_application(
+            &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
+            lookup,
+        )
+        .await;
+    }
+
+    // This consumer deliberately accepts no daemon state, IPC request, or persistence handle.
+    async fn exercise_associated_workflow_application<A>(
+        application: &A,
+        lookup: bcode_workflow::WorkflowRunBindingLookup,
+    ) where
+        A: bcode_workflow::WorkflowRunApplication,
+        A::Error: std::fmt::Debug,
+    {
         let status = bcode_workflow::WorkflowRunApplication::associated_workflow_run(
-            &application(),
+            application,
             lookup.clone(),
         )
         .await
         .expect("status")
         .expect("run");
-        assert_eq!(status.status, bcode_workflow_store::RunStatus::Running);
-        assert!(
-            bcode_workflow::WorkflowRunApplication::inspect_associated_workflow_run(
-                &application(),
-                lookup.clone(),
-                10
-            )
+        assert_eq!(status.status, bcode_workflow::RunStatus::Running);
+        let inspection = application
+            .inspect_associated_workflow_run(lookup.clone(), 10)
             .await
             .expect("inspection")
-            .is_some()
-        );
-
-        let (paused, changed) =
-            bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
-                &application(),
+            .expect("associated run");
+        assert_eq!(inspection.run.run_id, status.run_id);
+        let (paused, changed) = application
+            .control_associated_workflow_run(
                 lookup.clone(),
                 bcode_workflow::WorkflowRunControlAction::Pause,
             )
@@ -66713,12 +66785,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(changed);
         assert_eq!(
             paused.expect("paused").status,
-            bcode_workflow_store::RunStatus::Paused
+            bcode_workflow::RunStatus::Paused
         );
-
-        let (resumed, changed) =
-            bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
-                &application(),
+        let (resumed, changed) = application
+            .control_associated_workflow_run(
                 lookup.clone(),
                 bcode_workflow::WorkflowRunControlAction::Resume,
             )
@@ -66727,12 +66797,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(changed);
         assert_eq!(
             resumed.expect("resumed").status,
-            bcode_workflow_store::RunStatus::Running
+            bcode_workflow::RunStatus::Running
         );
-
-        let (stopped, changed) =
-            bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
-                &application(),
+        let (stopped, changed) = application
+            .control_associated_workflow_run(
                 lookup,
                 bcode_workflow::WorkflowRunControlAction::Cancel,
             )
@@ -66741,7 +66809,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(changed);
         let stopped = stopped.expect("stopped");
         assert!(stopped.cancellation_requested_at_ms.is_some());
-        assert_eq!(stopped.status, bcode_workflow_store::RunStatus::Cancelled);
+        assert_eq!(stopped.status, bcode_workflow::RunStatus::Cancelled);
     }
 
     #[tokio::test]
@@ -76817,6 +76885,52 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn embedded_workflow_ready_borrows_application_and_drains() {
+        use bcode_workflow::WorkflowRunApplication as _;
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ready.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let shutdown = bcode_agent_runtime::CancellationToken::new();
+        let signal = shutdown.clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let ready: EmbeddedWorkflowReady = Box::new(move |application| {
+            Box::pin(async move {
+                let result = application
+                    .associated_workflow_run(bcode_workflow::WorkflowRunBindingLookup {
+                        owner_plugin_id: "test".to_owned(),
+                        workflow_kind: "test".to_owned(),
+                        scope_key: "missing".to_owned(),
+                    })
+                    .await;
+                sent.send(result).expect("receiver");
+                signal.cancel();
+            })
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_constructed_server(
+                Arc::new(test_server_state(SessionManager::default())),
+                listener,
+                &bcode_config::DaemonConfig::default(),
+                false,
+                &[],
+                shutdown,
+                Some(ready),
+            ),
+        )
+        .await
+        .expect("callback and cleanup bounded")
+        .expect("shutdown");
+        assert!(
+            received
+                .await
+                .expect("callback ran")
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn constructed_server_shutdown_drains_idle_clients() {
         for cancel_from_host in [false, true] {
             let state = Arc::new(test_server_state(SessionManager::default()));
@@ -76835,6 +76949,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     false,
                     &[],
                     host_shutdown,
+                    None,
                 )
                 .await
             });
@@ -76983,6 +77098,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     false,
                     &[],
                     host_shutdown,
+                    None,
                 ),
             )
             .await
