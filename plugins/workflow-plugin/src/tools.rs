@@ -133,6 +133,27 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
             "workflow edit differs from prepared authorization",
         );
     }
+    if operation == PUBLISH_OPERATION {
+        // Evaluate locally: calling our own service through the bridge would re-enter
+        // the exclusive plugin slot. The host independently derives this plugin's
+        // authenticated identity; no policy decision or actor is sent as authority.
+        let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
+            version: 1,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::Plugin,
+                actor_id: super::PLUGIN_ID.to_owned(),
+            },
+            request: edit.clone(),
+        };
+        if super::publication_policy(&facts)
+            == bcode_workflow::WorkflowPublicationPolicyDecision::Deny
+        {
+            return ServiceResponse::error(
+                "publication_denied",
+                "workflow publication denied by plugin policy",
+            );
+        }
+    }
     if context.cancellation.is_cancelled() {
         return ServiceResponse::error("cancelled", "workflow staging cancelled");
     }

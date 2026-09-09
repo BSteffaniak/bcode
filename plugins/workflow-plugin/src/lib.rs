@@ -58,17 +58,7 @@ impl RustPlugin for WorkflowPlugin {
                         "invalid publication policy facts",
                     );
                 };
-                let decision = if facts.validate().is_ok()
-                    && matches!(
-                        facts.actor.kind,
-                        bcode_workflow::WorkflowApplicationActorKind::LocalClient
-                            | bcode_workflow::WorkflowApplicationActorKind::Plugin
-                    ) {
-                    bcode_workflow::WorkflowPublicationPolicyDecision::Allow
-                } else {
-                    bcode_workflow::WorkflowPublicationPolicyDecision::Deny
-                };
-                json_response(&decision)
+                json_response(&publication_policy(&facts))
             }
             (COMMAND_INTERFACE_ID, OP_INVOKE_COMMAND) => invoke_command(&context.request),
             (SESSION_STATUS_INTERFACE_ID, OP_SESSION_STATUS) => session_status(&context.request),
@@ -77,6 +67,24 @@ impl RustPlugin for WorkflowPlugin {
                 "unsupported workflow plugin operation",
             ),
         }
+    }
+}
+
+// Product policy is shared by the service and the tool's pre-callback path.
+// This decision never grants host authority or replaces authenticated operation facts.
+fn publication_policy(
+    facts: &bcode_workflow::WorkflowRunGraphPublicationFacts,
+) -> bcode_workflow::WorkflowPublicationPolicyDecision {
+    if facts.validate().is_ok()
+        && matches!(
+            facts.actor.kind,
+            bcode_workflow::WorkflowApplicationActorKind::LocalClient
+                | bcode_workflow::WorkflowApplicationActorKind::Plugin
+        )
+    {
+        bcode_workflow::WorkflowPublicationPolicyDecision::Allow
+    } else {
+        bcode_workflow::WorkflowPublicationPolicyDecision::Deny
     }
 }
 
