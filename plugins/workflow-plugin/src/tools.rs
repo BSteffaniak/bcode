@@ -10,6 +10,24 @@ use serde_json::json;
 
 const NAME: &str = "workflow.stage_run_graph_edit";
 const OPERATION: &str = "stage_run_graph_edit";
+const PUBLISH_NAME: &str = "workflow.publish_run_graph_edit";
+const PUBLISH_OPERATION: &str = "publish_run_graph_edit";
+
+fn publication_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: PUBLISH_NAME.to_owned(),
+        description: "Publish an exact previously staged workflow edit for this active execution. Requires separate publication authorization and explicit active-work reconciliation. Preserve the staged edit and mutation_id exactly when retrying; unsupported topology is rejected.".to_owned(),
+        input_schema: definition().input_schema,
+    }
+}
+
+fn operation(name: &str) -> Result<&'static str, String> {
+    match name {
+        NAME => Ok(OPERATION),
+        PUBLISH_NAME => Ok(PUBLISH_OPERATION),
+        _ => Err("unsupported workflow tool".to_owned()),
+    }
+}
 
 fn definition() -> ToolDefinition {
     ToolDefinition {
@@ -37,10 +55,13 @@ fn parse_edit(arguments: &serde_json::Value) -> Result<WorkflowRunGraphEditBatch
 pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         bcode_tool::OP_LIST_TOOLS => super::json_response(&ToolList {
-            tools: vec![definition()],
+            tools: vec![definition(), publication_definition()],
         }),
-        bcode_tool::OP_PREPARE_TOOL => {
-            prepare_tool_service_response(&context.request, [definition()], |request, _| {
+        bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
+            &context.request,
+            [definition(), publication_definition()],
+            |request, _| {
+                let operation = operation(&request.invocation.tool_name)?;
                 parse_edit(&request.invocation.arguments)?;
                 let route = request
                     .host_context
@@ -58,7 +79,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     .flatten()
                     .find(|route| {
                         route.interface_id == WORKFLOW_APPLICATION_INTERFACE_ID
-                            && route.operations.iter().any(|op| op == OPERATION)
+                            && route.operations.iter().any(|op| op == operation)
                     })
                     .ok_or_else(|| "workflow staging route is unavailable".to_owned())?;
                 Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
@@ -66,8 +87,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     bcode_plugin_sdk::ToolPolicyOperation::Mutating,
                 )
                 .with_descriptor(json!({"route_id":route.route_id})))
-            })
-        }
+            },
+        ),
         bcode_tool::OP_INVOKE_TOOL => invoke_edit(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
@@ -80,9 +101,9 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     let Ok(request) = context.request.payload_json::<ToolInvocationRequest>() else {
         return ServiceResponse::error("invalid_request", "invalid workflow tool invocation");
     };
-    if request.name != NAME {
+    let Ok(operation) = operation(&request.name) else {
         return ServiceResponse::error("unsupported_tool", "unsupported workflow tool");
-    }
+    };
     let edit = match parse_edit(&request.arguments) {
         Ok(edit) => edit,
         Err(message) => return ServiceResponse::error("invalid_request", message),
@@ -103,7 +124,7 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
             request_id: edit.mutation_id.clone(),
             route_id: Some(route_id.to_owned()),
             interface_id: WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
-            operation: OPERATION.to_owned(),
+            operation: operation.to_owned(),
             payload: match serde_json::to_value(edit) {
                 Ok(payload) => payload,
                 Err(_) => {
@@ -118,7 +139,13 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     match response {
         Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
             payload,
-        })) => staging_response(payload),
+        })) => {
+            if operation == PUBLISH_OPERATION {
+                publication_response(payload)
+            } else {
+                staging_response(payload)
+            }
+        }
         Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled)) => {
             ServiceResponse::error("cancelled", "workflow staging cancelled")
         }
@@ -127,6 +154,28 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
             "workflow edit was not admitted; verify route, policy, and active execution",
         ),
     }
+}
+
+fn publication_response(payload: serde_json::Value) -> ServiceResponse {
+    let revision = payload
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("revision"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|revision| *revision > 0);
+    let Some(revision) = revision else {
+        return ServiceResponse::error(
+            "invalid_response",
+            "unsupported publication response; outcome is unknown",
+        );
+    };
+    super::json_response(&bcode_tool::ToolInvocationResponse {
+        output: format!("Workflow edit published at revision {revision}."),
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    })
 }
 
 fn staging_response(payload: serde_json::Value) -> ServiceResponse {
