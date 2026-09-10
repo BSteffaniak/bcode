@@ -66,8 +66,8 @@ jobs:
           $checksumCountCheck = 'test "${checksum_count}" -eq "${#expected[@]}"'
           $required = @(
             'commit_sha:',
-            'ref: ${{ inputs.commit_sha }}',
-            'WORKFLOW_SHA: ${{ github.sha }}',
+            ('ref: ' + $expressionOpen + 'inputs.commit_sha }}'),
+            ('WORKFLOW_SHA: ' + $expressionOpen + 'github.sha }}'),
             'target: x86_64-pc-windows-msvc',
             $runtimeSmokeCommand,
             $releaseCommand,
@@ -76,9 +76,9 @@ jobs:
             'uses: actions/download-artifact@v8',
             $artifactGlob,
             $artifactName,
-            'target_commitish: ${{ inputs.commit_sha }}',
-            'commit_sha = ''${{ inputs.commit_sha }}''',
-            'version = ''${{ inputs.version }}''',
+            ('target_commitish: ' + $expressionOpen + 'inputs.commit_sha }}'),
+            ('commit_sha = ''' + $expressionOpen + 'inputs.commit_sha }}'''),
+            ('version = ''' + $expressionOpen + 'inputs.version }}'''),
             'merge-multiple: true',
             $artifactCountCheck,
             $checksumCountCheck
