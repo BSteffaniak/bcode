@@ -874,6 +874,105 @@ pub(crate) fn prepare_auth_vault_security(
     Ok((actions, true))
 }
 
+/// Prepare current-format retained policy without native factor effects or format conversion.
+#[cfg(unix)]
+pub(crate) fn prepare_retained_device_policy(
+    vault: &mut sshenv_vault::Vault,
+    resolved: &crate::ResolvedAuthProfile,
+    profile: &str,
+    source: Option<&dyn crate::operations::AuthDeviceFactorSource>,
+) -> Result<Vec<AuthSecurityDiagnostic>, crate::lifecycle::AuthVaultLifecycleError> {
+    let options = device_seal_options_for_auth_profile(&resolved.profile);
+    if validate_retained_device_policy(vault, profile, options).is_ok() {
+        return Ok(Vec::new());
+    }
+    let mut prepared = vault.clone();
+    let result = (|| {
+        if prepared.header.version != VERSION_V2 {
+            return Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                "explicit vault migration required".into(),
+            ));
+        }
+        let source = source.ok_or_else(|| {
+            crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                "device provisioning unavailable".into(),
+            )
+        })?;
+        prepared.enable_profile_keys().map_err(|_| {
+            crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                "profile encryption unavailable".into(),
+            )
+        })?;
+        let factor = source.provision(resolved)?;
+        // Verify the selected custody source can recover the exact key before binding it.
+        // This is not a durability guarantee; the source still owns durable factor retention.
+        let recovered = source
+            .retrieve(
+                &factor.id,
+                factor.recipient_fingerprint.as_deref(),
+                &factor.parameters,
+            )
+            .map_err(|_| {
+                crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                    "provisioned device factor unavailable".into(),
+                )
+            })?;
+        if *recovered != *factor.key {
+            return Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                "provisioned device factor mismatch".into(),
+            ));
+        }
+        prepared
+            .require_profile_device_seal_with(profile, || {
+                Ok((
+                    sshenv_vault::models::UnlockFactorV2 {
+                        id: factor.id,
+                        kind: sshenv_vault::models::UnlockFactorKindV2::DeviceSeal,
+                        recipient_fingerprint: factor.recipient_fingerprint,
+                        params: factor.parameters,
+                    },
+                    factor.key,
+                ))
+            })
+            .map_err(|_| {
+                crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                    "device binding failed".into(),
+                )
+            })?;
+        validate_retained_device_policy(&prepared, profile, options)
+    })();
+    if result.is_ok() {
+        *vault = prepared;
+        return Ok(Vec::new());
+    }
+    if options.policy == AuthDeviceSealPolicy::Required {
+        result?;
+    }
+    Ok(vec![AuthSecurityDiagnostic::warning(
+        "auth_vault_security_refresh_skipped",
+        "Preferred device provisioning failed; existing policy preserved",
+        "Restore selected device custody to enable the preferred seal",
+    )])
+}
+
+/// Verify that retained custody can preserve an already-satisfied device policy.
+/// No migration, factor creation, or native discovery occurs here.
+pub(crate) fn validate_retained_device_policy(
+    vault: &sshenv_vault::Vault,
+    profile: &str,
+    options: AuthDeviceSealOptions,
+) -> Result<(), crate::lifecycle::AuthVaultLifecycleError> {
+    if options.policy == AuthDeviceSealPolicy::Off
+        || (profile_has_device_seal(vault, profile)
+            && profile_device_seal_matches_options(vault, profile, options.seal))
+    {
+        return Ok(());
+    }
+    Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+        "retained device policy requires explicit factor provisioning before update".into(),
+    ))
+}
+
 fn populate_device_seal_status(
     vault: &sshenv_vault::Vault,
     profile: &str,

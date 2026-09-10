@@ -6,6 +6,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize as _, Zeroizing};
 
+#[cfg(unix)]
+fn zeroize_vault_values(vault: &mut sshenv_vault::Vault) {
+    for values in vault.profiles.profiles.values_mut() {
+        for value in values.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 /// Structured non-secret lifecycle diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthVaultDiagnostic {
@@ -287,6 +296,7 @@ impl<'a> AuthVaultLifecycle<'a> {
                         "could not unlock credential custody".into(),
                     )
                 })?;
+            self.enforce_custody_policy(&mut vault)?;
             vault
                 .unlock_profile_with_device_factor(
                     self.storage_profile(),
@@ -369,8 +379,8 @@ impl<'a> AuthVaultLifecycle<'a> {
 
     /// Update an existing profile under retained custody without relaxing its policy.
     ///
-    /// Only explicitly disabled device-seal configuration is currently supported. Existing
-    /// encrypted profile factors are still enforced. No vault initialization or repair occurs.
+    /// Device-seal policy is prepared using selected provisioning before publication.
+    /// Existing encrypted factors are enforced. Historical formats are never converted here.
     ///
     /// # Errors
     /// Rejects unsupported policy, invalid storage keys, unlock failure, or conflicting writes.
@@ -386,6 +396,11 @@ impl<'a> AuthVaultLifecycle<'a> {
         device: Option<&dyn crate::operations::AuthDeviceFactorSource>,
     ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
         self.validate_custody_changes(&changes)?;
+        custody.ensure_no_provisioning().map_err(|_| {
+            AuthVaultLifecycleError::WriteFailed(
+                "credential provisioning requires maintenance".into(),
+            )
+        })?;
         let before = custody.read().map_err(|_| {
             AuthVaultLifecycleError::VaultUnavailable("credential custody unavailable".into())
         })?;
@@ -436,23 +451,14 @@ impl<'a> AuthVaultLifecycle<'a> {
                     "could not unlock selected profile".into(),
                 )
             })?;
-        let values = vault
-            .profiles
-            .profiles
-            .get_mut(self.storage_profile())
-            .ok_or_else(|| {
-                AuthVaultLifecycleError::ProfileUnavailable("selected profile missing".into())
-            })?;
-        for (name, value) in changes {
-            let previous = if let Some(value) = value {
-                values.insert(name, value)
-            } else {
-                values.remove(&name)
-            };
-            if let Some(mut previous) = previous {
-                previous.zeroize();
-            }
-        }
+        let provisioning = self.begin_custody_provisioning(custody, &vault, device.is_some())?;
+        let diagnostics = crate::security::prepare_retained_device_policy(
+            &mut vault,
+            self.resolved,
+            self.storage_profile(),
+            device,
+        )?;
+        self.apply_custody_changes(&mut vault, changes)?;
         let result = vault.save_with_effects(
             &key,
             || {
@@ -472,17 +478,92 @@ impl<'a> AuthVaultLifecycle<'a> {
                     .map_err(Into::into)
             },
         );
-        for values in vault.profiles.profiles.values_mut() {
-            for value in values.values_mut() {
-                value.zeroize();
-            }
-        }
+        zeroize_vault_values(&mut vault);
         result.map_err(|_| {
             AuthVaultLifecycleError::WriteFailed(
                 "credential publication failed; reload before retrying".into(),
             )
         })?;
-        Ok(Vec::new())
+        if provisioning && diagnostics.is_empty() {
+            custody.finish_provisioning().map_err(|_| {
+                AuthVaultLifecycleError::WriteFailed(
+                    "credential provisioning requires maintenance".into(),
+                )
+            })?;
+        }
+        Ok(diagnostics)
+    }
+
+    #[cfg(unix)]
+    fn begin_custody_provisioning(
+        &self,
+        custody: &crate::custody_storage::CredentialCustodyStorage,
+        vault: &sshenv_vault::Vault,
+        selected: bool,
+    ) -> Result<bool, AuthVaultLifecycleError> {
+        let needed = selected
+            && crate::security::validate_retained_device_policy(
+                vault,
+                self.storage_profile(),
+                crate::security::device_seal_options_for_auth_profile(&self.resolved.profile),
+            )
+            .is_err();
+        if needed {
+            custody.begin_provisioning().map_err(|_| {
+                AuthVaultLifecycleError::WriteFailed(
+                    "credential provisioning requires maintenance".into(),
+                )
+            })?;
+        }
+        Ok(needed)
+    }
+
+    #[cfg(unix)]
+    fn apply_custody_changes(
+        &self,
+        vault: &mut sshenv_vault::Vault,
+        changes: BTreeMap<String, Option<String>>,
+    ) -> Result<(), AuthVaultLifecycleError> {
+        let values = vault
+            .profiles
+            .profiles
+            .get_mut(self.storage_profile())
+            .ok_or_else(|| {
+                AuthVaultLifecycleError::ProfileUnavailable("selected profile missing".into())
+            })?;
+        for (name, value) in changes {
+            let previous = if let Some(value) = value {
+                values.insert(name, value)
+            } else {
+                values.remove(&name)
+            };
+            if let Some(mut previous) = previous {
+                previous.zeroize();
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn enforce_custody_policy(
+        &self,
+        vault: &mut sshenv_vault::Vault,
+    ) -> Result<(), AuthVaultLifecycleError> {
+        let options = crate::security::device_seal_options_for_auth_profile(&self.resolved.profile);
+        // Preferred policy is an upgrade preference, not a requirement for delivery.
+        // Persisted factors are still enforced by the profile unlock that follows this check.
+        if options.policy != crate::security::AuthDeviceSealPolicy::Required {
+            return Ok(());
+        }
+        let result = crate::security::validate_retained_device_policy(
+            vault,
+            self.storage_profile(),
+            options,
+        );
+        if result.is_err() {
+            zeroize_vault_values(vault);
+        }
+        result
     }
 
     #[cfg(unix)]
@@ -490,18 +571,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         &self,
         changes: &BTreeMap<String, Option<String>>,
     ) -> Result<(), AuthVaultLifecycleError> {
-        if self
-            .resolved
-            .profile
-            .settings
-            .get("device_seal")
-            .map(String::as_str)
-            != Some("off")
-        {
-            return Err(AuthVaultLifecycleError::WriteFailed(
-                "retained custody policy requires selected device effects".into(),
-            ));
-        }
         let allowed = self.credential_storage_keys()?;
         if changes
             .keys()
@@ -1035,6 +1104,198 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn retained_policy_rejects_unprovisioned_required_and_preferred() {
+        let root = tempfile::tempdir().unwrap();
+        let public = crate::security::ensure_vault_recipient_key(&root.path().join("key")).unwrap();
+        let (vault, _) = sshenv_vault::Vault::create(&public).unwrap();
+        for options in [
+            crate::security::AuthDeviceSealOptions::preferred_prompt_free(),
+            crate::security::AuthDeviceSealOptions::required_transparent_device_only(),
+        ] {
+            assert!(
+                crate::security::validate_retained_device_policy(&vault, "exa", options).is_err()
+            );
+        }
+        assert!(
+            crate::security::validate_retained_device_policy(
+                &vault,
+                "exa",
+                crate::security::AuthDeviceSealOptions::from_policy(
+                    crate::security::AuthDeviceSealPolicy::Off
+                )
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn protected_custody_update_preserves_factor_and_rejects_failed_retrieval() {
+        use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
+        struct Device(std::sync::atomic::AtomicBool);
+        impl crate::operations::AuthDeviceFactorSource for Device {
+            fn retrieve(
+                &self,
+                id: &str,
+                _: Option<&str>,
+                _: &BTreeMap<String, String>,
+            ) -> Result<Zeroizing<[u8; 32]>, AuthVaultLifecycleError> {
+                assert_eq!(id, "isolated-test-device");
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(Zeroizing::new([17; 32]))
+                } else {
+                    Err(AuthVaultLifecycleError::InvalidCredential)
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("identity");
+        let public = crate::security::ensure_vault_recipient_key(&path).unwrap();
+        let identity = Zeroizing::new(
+            std::fs::read_to_string(crate::security::vault_private_key_path(&path)).unwrap(),
+        );
+        let (mut vault, key) = sshenv_vault::Vault::create(&public).unwrap();
+        vault.migrate_to_v2(&[public]).unwrap();
+        vault.enable_profile_keys().unwrap();
+        vault.profiles.profiles.insert(
+            "exa".into(),
+            BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), "original".into())]),
+        );
+        vault.require_profile_device_seal_with("exa", || Ok((serde_json::from_value(serde_json::json!({
+            "id": "isolated-test-device", "kind": "device-seal", "recipient_fingerprint": null, "params": {}
+        })).unwrap(), Zeroizing::new([17; 32])))).unwrap();
+        let mut bytes = Vec::new();
+        vault
+            .save_with_storage(&key, |value, _| {
+                bytes = value.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        let directory = root.path().join("custody");
+        let storage =
+            crate::custody_storage::CredentialCustodyStorage::create(&directory, &bytes).unwrap();
+        let before = std::fs::read(directory.join("custody")).unwrap();
+        let mut profile = resolved(&root.path().join("unused"));
+        profile
+            .profile
+            .settings
+            .insert("device_seal".into(), "preferred".into());
+        let device = std::sync::Arc::new(Device(std::sync::atomic::AtomicBool::new(false)));
+        let retained = crate::operations::RetainedAuthRequestCustody::new(
+            storage,
+            profile.clone(),
+            "exa",
+            "bcode.web-search",
+            method(),
+            vec![identity],
+            None,
+        )
+        .unwrap()
+        .device_source(device.clone());
+        let context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("exa".into()),
+            ..Default::default()
+        };
+        let changes = BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), Some("updated".into()))]);
+        assert!(retained.persist(&profile, changes.clone()).is_err());
+        assert_eq!(std::fs::read(directory.join("custody")).unwrap(), before);
+        device.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        retained.persist(&profile, changes).unwrap();
+        assert_eq!(
+            retained
+                .materialize("bcode.web-search", &context)
+                .unwrap()
+                .env,
+            BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), "updated".into())])
+        );
+        device.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(retained.materialize("bcode.web-search", &context).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provisioned_factor_must_be_retrievable_before_policy_changes() {
+        struct MismatchedDevice;
+        impl crate::operations::AuthDeviceFactorSource for MismatchedDevice {
+            fn provision(
+                &self,
+                _: &ResolvedAuthProfile,
+            ) -> Result<crate::operations::AuthProvisionedDeviceFactor, AuthVaultLifecycleError>
+            {
+                Ok(crate::operations::AuthProvisionedDeviceFactor {
+                    id: "test-factor".into(),
+                    recipient_fingerprint: None,
+                    parameters: BTreeMap::new(),
+                    key: Zeroizing::new([17; 32]),
+                })
+            }
+            fn retrieve(
+                &self,
+                id: &str,
+                _: Option<&str>,
+                _: &BTreeMap<String, String>,
+            ) -> Result<Zeroizing<[u8; 32]>, AuthVaultLifecycleError> {
+                assert_eq!(id, "test-factor");
+                Ok(Zeroizing::new([18; 32]))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let public =
+            crate::security::ensure_vault_recipient_key(&root.path().join("identity")).unwrap();
+        let (mut vault, _) = sshenv_vault::Vault::create(&public).unwrap();
+        vault.migrate_to_v2(&[public]).unwrap();
+        vault.profiles.profiles.insert(
+            "exa".into(),
+            BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), "original".into())]),
+        );
+        let before = serde_json::to_value(&vault.profiles).unwrap();
+        let mut profile = resolved(&root.path().join("unused"));
+        for policy in ["required", "preferred"] {
+            profile
+                .profile
+                .settings
+                .insert("device_seal".into(), policy.into());
+            let result = crate::security::prepare_retained_device_policy(
+                &mut vault,
+                &profile,
+                "exa",
+                Some(&MismatchedDevice),
+            );
+            if policy == "required" {
+                assert!(
+                    matches!(result, Err(AuthVaultLifecycleError::WriteFailed(message)) if message == "provisioned device factor mismatch")
+                );
+            } else {
+                assert_eq!(result.unwrap().len(), 1);
+            }
+            assert_eq!(serde_json::to_value(&vault.profiles).unwrap(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    struct UnavailableDevice(std::sync::atomic::AtomicUsize);
+    #[cfg(unix)]
+    impl crate::operations::AuthDeviceFactorSource for UnavailableDevice {
+        fn provision(
+            &self,
+            _: &ResolvedAuthProfile,
+        ) -> Result<crate::operations::AuthProvisionedDeviceFactor, AuthVaultLifecycleError>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(AuthVaultLifecycleError::InvalidCredential)
+        }
+        fn retrieve(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &BTreeMap<String, String>,
+        ) -> Result<Zeroizing<[u8; 32]>, AuthVaultLifecycleError> {
+            panic!("unsealed fallback must not retrieve a device factor")
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn selected_key_source_failure_preserves_ciphertext_and_retry_uses_source() {
         use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
         struct Keys(std::sync::atomic::AtomicUsize);
@@ -1075,8 +1336,25 @@ mod tests {
         let storage =
             crate::custody_storage::CredentialCustodyStorage::create(&directory, &bytes).unwrap();
         let before = std::fs::read(directory.join("custody")).unwrap();
-        let profile = resolved(&root.path().join("unused"));
+        let mut profile = resolved(&root.path().join("unused"));
+        profile
+            .profile
+            .settings
+            .insert("device_seal".into(), "preferred".into());
+        let mut required = profile.clone();
+        required
+            .profile
+            .settings
+            .insert("device_seal".into(), "required".into());
+        assert!(
+            AuthVaultLifecycle::new(&required, "exa", "bcode.web-search", &method())
+                .unwrap()
+                .read_from_custody(&storage, &[identity.as_str()], None)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(directory.join("custody")).unwrap(), before);
         let source = std::sync::Arc::new(Keys(std::sync::atomic::AtomicUsize::new(0)));
+        let device = std::sync::Arc::new(UnavailableDevice(std::sync::atomic::AtomicUsize::new(0)));
         let retained = crate::operations::RetainedAuthRequestCustody::new(
             storage,
             profile.clone(),
@@ -1092,7 +1370,12 @@ mod tests {
         assert!(retained.persist(&profile, changes.clone()).is_err());
         assert_eq!(std::fs::read(directory.join("custody")).unwrap(), before);
         assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
-        retained.persist(&profile, changes).unwrap();
+        let retained = retained.device_source(device.clone());
+        let diagnostics = retained.persist(&profile, changes.clone()).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(device.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(retained.persist(&profile, changes).is_err());
+        assert_eq!(device.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         let context = bcode_model::ProviderRequestContext {
             auth_profile: Some("exa".into()),

@@ -141,6 +141,42 @@ impl CredentialCustodyStorage {
         self.publish(ciphertext)
     }
 
+    /// Reject unresolved external provisioning before any further credential mutation.
+    pub(crate) fn ensure_no_provisioning(&self) -> Result<(), CustodyStorageError> {
+        match crate::store::open_owned_entry(&self.directory, c"provisioning-v1", libc::O_RDONLY) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(CustodyStorageError::MaintenanceRequired),
+        }
+    }
+
+    /// Durably fence external provisioning before dispatch. Any failure preserves the fence.
+    pub(crate) fn begin_provisioning(&self) -> Result<(), CustodyStorageError> {
+        self.ensure_no_provisioning()?;
+        let mut intent = crate::store::open_owned_entry(
+            &self.directory,
+            c"provisioning-v1",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        )
+        .map_err(CustodyStorageError::Io)?;
+        intent
+            .write_all(b"BCODE-PROVISIONING\0\x01")
+            .and_then(|()| intent.sync_all())
+            .map_err(CustodyStorageError::Io)?;
+        self.directory.sync_all().map_err(CustodyStorageError::Io)
+    }
+
+    /// Clear the fence only after verified factor binding and durable custody publication.
+    pub(crate) fn finish_provisioning(&self) -> Result<(), CustodyStorageError> {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the static relative name and retained directory descriptor are valid.
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), c"provisioning-v1".as_ptr(), 0) }
+            != 0
+        {
+            return Err(CustodyStorageError::Io(std::io::Error::last_os_error()));
+        }
+        self.directory.sync_all().map_err(CustodyStorageError::Io)
+    }
+
     fn publish(&self, ciphertext: &[u8]) -> Result<(), CustodyStorageError> {
         use std::os::fd::AsRawFd as _;
         let mut pending = crate::store::open_owned_entry(
@@ -208,8 +244,16 @@ mod tests {
         storage
             .compare_and_publish(&ciphertext, &ciphertext)
             .unwrap();
+        storage.begin_provisioning().unwrap();
         drop(storage);
         let reopened = CredentialCustodyStorage::open(&path).unwrap();
+        assert!(matches!(
+            reopened.ensure_no_provisioning(),
+            Err(CustodyStorageError::MaintenanceRequired)
+        ));
+        assert!(reopened.begin_provisioning().is_err());
+        reopened.finish_provisioning().unwrap();
+        reopened.ensure_no_provisioning().unwrap();
         assert_eq!(reopened.read().unwrap(), ciphertext);
         drop(reopened);
         std::fs::write(path.join("custody"), &ciphertext).unwrap();

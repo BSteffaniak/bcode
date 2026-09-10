@@ -53,11 +53,38 @@ pub trait AuthRequestCustody: Send + Sync {
     ) -> Result<crate::ResolvedProviderAuth, crate::lifecycle::AuthVaultLifecycleError>;
 }
 
+/// Selected device-factor provisioning result. Never log its key.
+pub struct AuthProvisionedDeviceFactor {
+    /// Stable factor identity.
+    pub id: String,
+    /// Optional recipient binding.
+    pub recipient_fingerprint: Option<String>,
+    /// Non-secret backend metadata, validated against configured policy by custody.
+    pub parameters: std::collections::BTreeMap<String, String>,
+    /// Fresh factor key. Production sources must use cryptographically secure entropy.
+    pub key: zeroize::Zeroizing<[u8; 32]>,
+}
+
 /// Caller-selected retrieval of an existing device factor.
 ///
 /// Parameters are untrusted persisted metadata, not authorization. Implementations must verify
 /// factor ownership and backend policy before accessing secrets; no native fallback is implied.
 pub trait AuthDeviceFactorSource: Send + Sync {
+    /// Provision a factor for an authorized profile. Implementations must verify ownership and
+    /// honor configured backend/strictness. Custody independently validates returned metadata.
+    /// Failed or interrupted publication may leave an unused factor; implementations must not
+    /// destroy or replace existing factors during provisioning.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported provisioning, policy, or backend failure.
+    fn provision(
+        &self,
+        _profile: &ResolvedAuthProfile,
+    ) -> Result<AuthProvisionedDeviceFactor, crate::lifecycle::AuthVaultLifecycleError> {
+        Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+            "device provisioning unavailable".into(),
+        ))
+    }
     /// Retrieve the key bound to the supplied factor metadata.
     ///
     /// # Errors
@@ -104,7 +131,7 @@ pub struct RetainedAuthRequestCustody {
 impl RetainedAuthRequestCustody {
     /// Select trusted retrieval for existing device factors on credential reads and writes.
     ///
-    /// This does not enable factor creation, remote custody, or required/preferred policy upgrades.
+    /// Provisioning remains explicitly source-owned; remote custody is not selected here.
     #[must_use]
     pub fn device_source(mut self, source: std::sync::Arc<dyn AuthDeviceFactorSource>) -> Self {
         self.device_source = Some(source);
