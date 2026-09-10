@@ -477,7 +477,10 @@ impl WorkflowStore {
         self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, false, None)
     }
 
-    /// Publish a leaf-only edit while explicitly retaining unchanged active activations.
+    /// Publish a leaf-only edit while retaining unchanged work or cancelling unstarted work.
+    ///
+    /// Cancellation is limited to pending activations without attempts or linked work;
+    /// dispatched and waiting work requires operation-owner reconciliation.
     ///
     /// Admission bindings remain historical. Settlement consumes the publication's retained
     /// identities. Connected topology and edits to retained nodes remain unsupported.
@@ -555,16 +558,7 @@ impl WorkflowStore {
             [run_id],
             |row| row.get(0),
         )?;
-        let retentions = if retain_active {
-            validate_leaf_retention(&transaction, &request)?
-        } else if active || !request.reconciliation.is_empty() {
-            return Err(WorkflowStoreError::InvalidData(
-                "publication requires execution reconciliation".to_string(),
-            ));
-        } else {
-            Vec::new()
-        };
-        // Revalidate in this same transaction, never trusting a historical validation marker.
+        // Validate the candidate and its active dispositions before applying cancellation.
         if self.validate_run_graph_edit_in_transaction(
             run_id,
             mutation_id,
@@ -576,6 +570,16 @@ impl WorkflowStore {
                 "publication requires incremental graph validation".to_string(),
             ));
         }
+        let retentions = if retain_active {
+            cancel_unstarted_leaf_activations(&transaction, &request, created_at_ms)?;
+            validate_leaf_retention(&transaction, &request)?
+        } else if active || !request.reconciliation.is_empty() {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication requires execution reconciliation".to_string(),
+            ));
+        } else {
+            Vec::new()
+        };
         let connected: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_run_graph_edges edge
              WHERE edge.run_id = ?1 AND edge.retired_at_revision IS NULL
@@ -983,6 +987,37 @@ fn persist_leaf_retentions(
     Ok(())
 }
 
+fn cancel_unstarted_leaf_activations(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    created_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    for disposition in &request.reconciliation {
+        let bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } = disposition
+        else {
+            continue;
+        };
+        let changed = transaction.execute(
+            "UPDATE workflow_activations SET status = 'cancelled'
+             WHERE run_id = ?1 AND activation_id = ?2 AND status = 'pending' AND output_id IS NULL
+             AND NOT EXISTS (SELECT 1 FROM workflow_attempts WHERE run_id = ?1 AND activation_id = ?2)
+             AND NOT EXISTS (SELECT 1 FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_activation_id = ?2)
+             AND NOT EXISTS (SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1
+                 AND (member_activation_id = ?2 OR controller_node_id = workflow_activations.node_id))",
+            (&request.run_id, activation_id),
+        )?;
+        if changed != 1 {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication cancellation requires one pending activation without attempts or linked work".to_string(),
+            ));
+        }
+        super::append_event(transaction, &request.run_id, "graph_activation_cancelled",
+            &serde_json::json!({"activation_id": activation_id, "mutation_id": request.mutation_id}).to_string(),
+            created_at_ms)?;
+    }
+    Ok(())
+}
+
 fn validate_leaf_retention(
     connection: &Connection,
     request: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -990,6 +1025,12 @@ fn validate_leaf_retention(
     let mut retentions = Vec::new();
     let mut retained = BTreeSet::new();
     for disposition in &request.reconciliation {
+        if matches!(
+            disposition,
+            bcode_workflow::WorkflowRunGraphReconciliation::Cancel { .. }
+        ) {
+            continue;
+        }
         let bcode_workflow::WorkflowRunGraphReconciliation::Retain { activation_id } = disposition
         else {
             return Err(WorkflowStoreError::InvalidData(

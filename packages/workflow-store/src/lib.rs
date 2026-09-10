@@ -22697,6 +22697,79 @@ mod tests {
     }
 
     #[test]
+    fn leaf_publication_cancels_unstarted_activation_and_survives_reopen() {
+        let (temp, mut store) = initialized_store();
+        store.connection.execute_batch("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a';").expect("owner");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let (node_id, activation_id): (String, String) = store.connection.query_row(
+            "SELECT node_id, activation_id FROM workflow_activations WHERE run_id = 'run-1' LIMIT 1", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("activation");
+        let mut node = store
+            .current_run_graph_node("run-1", &node_id)
+            .expect("node")
+            .expect("node")
+            .node;
+        node.id = "replacement-leaf".into();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run-1".into(),
+            mutation_id: "cancel-leaf".into(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node,
+                entry: true,
+                exit: true,
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                activation_id: activation_id.clone(),
+            }],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .expect("stage");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'running' WHERE activation_id = ?1",
+                [&activation_id],
+            )
+            .expect("dispatched fixture");
+        assert!(
+            store
+                .publish_retained_leaf_run_graph_edit("run-1", "cancel-leaf", &authority, 21)
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_activations SET status = 'pending' WHERE activation_id = ?1",
+                [&activation_id],
+            )
+            .expect("unstarted fixture");
+        assert_eq!(
+            store
+                .publish_retained_leaf_run_graph_edit("run-1", "cancel-leaf", &authority, 21)
+                .expect("publish"),
+            2
+        );
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE activation_id = ?1",
+                [activation_id],
+                |row| row.get(0),
+            )
+            .expect("status");
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
     fn retained_leaf_publication_preserves_admission_and_settles() {
         let (temp, mut store) = initialized_store();
         store
