@@ -10084,6 +10084,7 @@ mod tests {
             }],
             opaque: false,
             readable_parts_filtered: false,
+            finished: true,
         };
         let running_tool = bcode_session_view_models::ToolInvocationView {
             tool_call_id: "call-1".to_string(),

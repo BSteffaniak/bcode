@@ -2732,6 +2732,29 @@ impl SessionView {
         event: &bcode_session_models::ReasoningActivityEvent,
     ) {
         let key = (turn_id.to_owned(), event.activity_id().to_owned());
+        if matches!(
+            event,
+            bcode_session_models::ReasoningActivityEvent::Finished { .. }
+        ) {
+            // Already received text must be visible before absence can be classified as final.
+            let pending_ids = self
+                .pending_text_presentations
+                .iter()
+                .filter_map(|(id, pending)| match &pending.destination {
+                    PendingTextDestination::ReasoningPart {
+                        turn_id,
+                        activity_id,
+                        ..
+                    } if turn_id == &key.0 && activity_id == &key.1 => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for id in pending_ids {
+                if let Some(pending) = self.pending_text_presentations.remove(&id) {
+                    let _ = self.replace_presented_text(&id, &pending.target, &pending.destination);
+                }
+            }
+        }
         self.live_reasoning
             .entry(key.clone())
             .or_default()
@@ -4508,6 +4531,7 @@ fn live_reasoning_activity_view(
         parts,
         opaque: activity.opaque,
         readable_parts_filtered,
+        finished: activity.finished,
     }
 }
 
@@ -4552,6 +4576,7 @@ fn reasoning_activity_view(
         parts,
         opaque: activity.opaque,
         readable_parts_filtered,
+        finished: true,
     }
 }
 
@@ -9014,6 +9039,137 @@ mod tests {
             activity.content_availability(),
             bcode_session_view_models::ReasoningContentAvailability::Filtered
         );
+    }
+
+    #[test]
+    fn opaque_reasoning_waits_for_completion_and_flushes_queued_readable_text() {
+        use bcode_session_models::{
+            ReasoningActivityEvent, ReasoningActivityStatus, ReasoningContentKind,
+            ReasoningContentRole,
+        };
+        use bcode_session_view_models::ReasoningContentAvailability;
+
+        for status in [
+            ReasoningActivityStatus::Completed,
+            ReasoningActivityStatus::Interrupted,
+            ReasoningActivityStatus::Failed,
+        ] {
+            for readable in [false, true] {
+                let mut view = SessionView::new();
+                for event in [
+                    ReasoningActivityEvent::Started {
+                        activity_id: "activity".to_owned(),
+                        order: 0,
+                    },
+                    ReasoningActivityEvent::OpaqueObserved {
+                        activity_id: "activity".to_owned(),
+                        activity_order: 0,
+                    },
+                ] {
+                    view.apply_live_reasoning_activity("turn", &event);
+                    let TranscriptViewItemKind::ReasoningActivity { activity } =
+                        &view.snapshot().transcript.items[0].kind
+                    else {
+                        panic!("reasoning")
+                    };
+                    assert_eq!(
+                        activity.content_availability(),
+                        ReasoningContentAvailability::Pending
+                    );
+                }
+                if readable {
+                    // Model the interval before the first paced character is displayed.
+                    view.pending_text_presentations.insert(
+                        TranscriptViewItemId::new("queued-reasoning"),
+                        PendingTextPresentation::new(
+                            "readable reasoning".to_owned(),
+                            0,
+                            Instant::now(),
+                            1,
+                            Duration::from_secs(1),
+                            PendingTextDestination::ReasoningPart {
+                                turn_id: "turn".to_owned(),
+                                activity_id: "activity".to_owned(),
+                                activity_order: 0,
+                                part_id: "part".to_owned(),
+                                kind: ReasoningContentKind::Summary,
+                                role: ReasoningContentRole::Milestone,
+                                part_order: 0,
+                            },
+                        ),
+                    );
+                }
+                view.apply_live_reasoning_activity(
+                    "turn",
+                    &ReasoningActivityEvent::Finished {
+                        activity_id: "activity".to_owned(),
+                        activity_order: 0,
+                        status,
+                    },
+                );
+                let TranscriptViewItemKind::ReasoningActivity { activity } =
+                    &view.snapshot().transcript.items[0].kind
+                else {
+                    panic!("reasoning")
+                };
+                assert!(activity.finished);
+                assert_eq!(
+                    activity.content_availability(),
+                    if readable {
+                        ReasoningContentAvailability::Readable
+                    } else {
+                        ReasoningContentAvailability::Withheld
+                    }
+                );
+                assert!(view.pending_text_presentations.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_reasoning_becomes_readable_before_completion() {
+        use bcode_session_models::ReasoningActivityEvent;
+        use bcode_session_view_models::ReasoningContentAvailability;
+        let mut view = SessionView::new();
+        view.apply_live_reasoning_activity(
+            "turn",
+            &ReasoningActivityEvent::OpaqueObserved {
+                activity_id: "activity".to_owned(),
+                activity_order: 0,
+            },
+        );
+        for event in [
+            ReasoningActivityEvent::PartDelta {
+                activity_id: "activity".to_owned(),
+                activity_order: 0,
+                part_id: "part".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "thinking".to_owned(),
+            },
+            ReasoningActivityEvent::PartCompleted {
+                activity_id: "activity".to_owned(),
+                activity_order: 0,
+                part_id: "part".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "thought".to_owned(),
+            },
+        ] {
+            view.apply_live_reasoning_activity("turn", &event);
+            let TranscriptViewItemKind::ReasoningActivity { activity } =
+                &view.snapshot().transcript.items[0].kind
+            else {
+                panic!("reasoning")
+            };
+            assert!(!activity.finished);
+            assert_eq!(
+                activity.content_availability(),
+                ReasoningContentAvailability::Readable
+            );
+        }
     }
 
     #[test]

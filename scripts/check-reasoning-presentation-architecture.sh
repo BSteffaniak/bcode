@@ -27,6 +27,7 @@ for required in (
     "Withheld",
     "Pending",
     "fn content_availability",
+    "self.opaque && self.finished",
     "readable_parts_filtered",
 ):
     if required not in shared_models:

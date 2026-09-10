@@ -784,6 +784,7 @@ fn structured_reasoning_activity_renders_terminal_status_chrome() {
                 parts: Vec::new(),
                 opaque: true,
                 readable_parts_filtered: false,
+                finished: true,
             },
         };
         let rendered = format!("{:?}", transcript_item_body(&kind));
@@ -795,6 +796,13 @@ fn structured_reasoning_activity_renders_terminal_status_chrome() {
             rendered.contains("did not return readable reasoning content"),
             "withheld reasoning must be explained: {rendered}"
         );
+        let mut kind = kind;
+        let TranscriptViewItemKind::ReasoningActivity { activity } = &mut kind else {
+            unreachable!();
+        };
+        activity.finished = false;
+        let pending = format!("{:?}", transcript_item_body(&kind));
+        assert!(!pending.contains("did not return readable reasoning content"));
     }
 }
 

@@ -1099,6 +1099,11 @@ pub struct ReasoningActivityView {
     /// readable reasoning", which renderers must not conflate.
     #[serde(default)]
     pub readable_parts_filtered: bool,
+    /// Whether authoritative activity completion has been observed.
+    ///
+    /// Missing evidence in older snapshots defaults to pending, never to confirmed absence.
+    #[serde(default)]
+    pub finished: bool,
 }
 
 /// Why a reasoning activity currently has no selected readable content.
@@ -1113,9 +1118,9 @@ pub enum ReasoningContentAvailability {
     Readable,
     /// Readable reasoning exists but local presentation policy excluded it.
     Filtered,
-    /// The provider withheld readable reasoning and recorded opaque evidence only.
+    /// Authoritative completion recorded opaque evidence but no readable content.
     Withheld,
-    /// Neither readable content nor opaque evidence has arrived yet.
+    /// Readable content is absent, but its unavailability has not been established.
     Pending,
 }
 
@@ -1146,7 +1151,7 @@ impl ReasoningActivityView {
         if self.readable_parts_filtered {
             return ReasoningContentAvailability::Filtered;
         }
-        if self.opaque {
+        if self.opaque && self.finished {
             return ReasoningContentAvailability::Withheld;
         }
         ReasoningContentAvailability::Pending

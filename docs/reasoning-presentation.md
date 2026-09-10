@@ -24,8 +24,10 @@ Every mode retains neutral activity chrome when reasoning activity evidence exis
 An activity that carries no selected readable content is explained rather than shown empty. Bcode distinguishes three cases so frontends never present a bare heading:
 
 * readable content was hidden by the local display mode or `show = false`;
-* the provider withheld readable reasoning and recorded only opaque continuation evidence;
-* nothing has arrived yet, which carries no claim either way.
+* the provider withheld readable reasoning and recorded only opaque continuation evidence, confirmed after authoritative activity completion;
+* nothing readable has arrived yet and completion is unconfirmed, which carries no claim either way—even when opaque evidence already exists.
+
+Opaque evidence is not evidence that readable content will never arrive. Live activities remain pending until readable content arrives or completion confirms its absence. Already-received text queued for presentation is flushed before completion is classified. Older snapshots without completion evidence conservatively remain pending; finalized historical activities carry completion evidence.
 
 The distinction is renderer-neutral: each frontend chooses its own wording and affordances from the shared classification, and no frontend re-derives it from raw parts or provider flags.
 

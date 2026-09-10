@@ -1608,6 +1608,7 @@ mod tests {
                         parts: Vec::new(),
                         opaque: true,
                         readable_parts_filtered: false,
+                        finished: true,
                     },
                 },
             };
@@ -1646,6 +1647,7 @@ mod tests {
                 parts,
                 opaque,
                 readable_parts_filtered,
+                finished: true,
             }
         };
 
@@ -1666,6 +1668,10 @@ mod tests {
             reasoning_activity_body(&activity(Vec::new(), true, true)).contains("`/thinking`"),
             "locally filtered reasoning must point at the display setting"
         );
+        let mut pending = activity(Vec::new(), true, false);
+        pending.finished = false;
+        assert!(reasoning_activity_body(&pending).is_empty());
+
         // Nothing has arrived yet: no chrome to explain, and no misleading claim.
         assert!(
             reasoning_activity_body(&activity(Vec::new(), false, false)).is_empty(),

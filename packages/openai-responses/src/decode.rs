@@ -986,6 +986,34 @@ mod tests {
         assert_eq!(item.content.get(&0).map(String::as_str), Some("raw"));
         assert!(!item.content.contains_key(&1), "non-text parts are skipped");
         assert!(item.finished);
+        // A single output item may expose opaque evidence before its readable parts.
+        // Consumers must wait for Finished before interpreting absence as definitive.
+        let events = recorder.events.borrow();
+        let position = |predicate: fn(&bcode_session_models::ReasoningActivityEvent) -> bool| {
+            events.iter().position(|event| matches!(event,
+                bcode_model::ProviderTurnEvent::ReasoningActivity { event } if predicate(event)
+            )).expect("reasoning event")
+        };
+        let opaque = position(|event| {
+            matches!(
+                event,
+                bcode_session_models::ReasoningActivityEvent::OpaqueObserved { .. }
+            )
+        });
+        let readable = position(|event| {
+            matches!(
+                event,
+                bcode_session_models::ReasoningActivityEvent::PartCompleted { .. }
+            )
+        });
+        let terminal = position(|event| {
+            matches!(
+                event,
+                bcode_session_models::ReasoningActivityEvent::Finished { .. }
+            )
+        });
+        assert!(opaque < readable && readable < terminal);
+        drop(events);
 
         // Completion is reported only once.
         let before = recorder.events.borrow().len();

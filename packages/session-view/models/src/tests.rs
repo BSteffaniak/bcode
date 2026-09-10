@@ -540,6 +540,7 @@ fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
                 }],
                 opaque: true,
                 readable_parts_filtered: false,
+                finished: true,
             },
         },
     };
@@ -572,12 +573,33 @@ fn reasoning_content_availability_distinguishes_withheld_from_filtered() {
         parts,
         opaque,
         readable_parts_filtered,
+        finished: true,
     };
 
     assert_eq!(
         activity(vec![readable_part("thought")], false, false).content_availability(),
         ReasoningContentAvailability::Readable
     );
+    // Opaque evidence alone says nothing about content that may still arrive.
+    let mut pending = activity(Vec::new(), true, false);
+    pending.finished = false;
+    assert_eq!(
+        pending.content_availability(),
+        ReasoningContentAvailability::Pending
+    );
+    let mut old_snapshot = serde_json::to_value(&pending).expect("serialize activity");
+    old_snapshot
+        .as_object_mut()
+        .expect("object")
+        .remove("finished");
+    let decoded: ReasoningActivityView =
+        serde_json::from_value(old_snapshot).expect("old snapshot");
+    assert!(!decoded.finished);
+    assert_eq!(
+        decoded.content_availability(),
+        ReasoningContentAvailability::Pending
+    );
+
     // The provider recorded opaque evidence and no readable content: genuinely withheld.
     assert_eq!(
         activity(Vec::new(), true, false).content_availability(),
