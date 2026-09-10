@@ -71,10 +71,12 @@ pub fn diff_from_text_at_lines_with_palette(
     new_start_line: u32,
     #[cfg(feature = "syntax")] syntax_palette: Option<SyntaxPalette>,
 ) -> DiffDocument {
+    let old_text = super::source_text::visible_source(old_text);
+    let new_text = super::source_text::visible_source(new_text);
     let document = bmux_tui_components::diff_viewer::diff_from_text_at_lines(
         label,
-        old_text,
-        new_text,
+        &old_text,
+        &new_text,
         old_start_line,
         new_start_line,
     );
@@ -222,6 +224,24 @@ mod tests {
                 .iter()
                 .flat_map(|line| &line.syntax_spans)
                 .any(|span| { span.style.fg == Some(Color::Rgb(11, 12, 13)) })
+        );
+    }
+
+    #[test]
+    fn ansi_diff_content_and_ranges_use_visible_source() {
+        let document = diff_from_text("sample.txt", "\x1b[31mold\x1b[0m", "\x1b[32mnew\x1b[0m");
+        assert_eq!((document.added, document.removed), (1, 1));
+        for line in &document.lines {
+            assert!(!line.content.chars().any(char::is_control));
+            for range in &line.changed_ranges {
+                assert!(line.content.get(range.start..range.end).is_some());
+            }
+        }
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.content.contains("\\u{1b}[32mnew"))
         );
     }
 

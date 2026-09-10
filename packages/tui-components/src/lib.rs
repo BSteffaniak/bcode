@@ -4,6 +4,9 @@
 
 //! Reusable Bcode TUI components and compatibility adapters.
 
+#[cfg(any(feature = "source-viewer", feature = "diff-viewer"))]
+mod source_text;
+
 #[cfg(feature = "activity")]
 pub mod activity;
 #[cfg(feature = "chrome")]

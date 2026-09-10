@@ -47,6 +47,11 @@ pub fn source_viewer_rows_with_style(
     width: u16,
     style: SourceViewerStyle,
 ) -> Vec<Line> {
+    let contents = super::source_text::visible_source(input.contents);
+    let input = SourceViewerInput {
+        contents: &contents,
+        ..input
+    };
     let styled_lines = highlighted_lines(input);
     bmux_tui_components::source_viewer::source_viewer_rows_with_style(
         bmux_tui_components::source_viewer::SourceViewerInput {
@@ -120,6 +125,40 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ansi_source_is_escaped_before_wrapping() {
+        use super::{SourceViewerInput, source_viewer_rows};
+        for width in [20, 40, 80] {
+            let rows = source_viewer_rows(
+                SourceViewerInput {
+                    label: "sample.txt",
+                    #[cfg(feature = "syntax")]
+                    syntax_palette: None,
+                    contents: "\x1b[31mRed text\x1b[0m\n\t\r\u{9b}2J",
+                    start_line: 1,
+                    max_lines: 30,
+                    truncated_message: "truncated",
+                    line_numbers: true,
+                },
+                width,
+            );
+            let text = rows
+                .iter()
+                .map(bmux_tui::prelude::Line::plain_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!text.chars().any(|ch| ch.is_control() && ch != '\n'));
+            if width == 80 {
+                assert!(text.contains("\\u{1b}[31mRed text\\u{1b}[0m"));
+            }
+            for row in rows {
+                assert!(
+                    bmux_tui::text_width::display_width(&row.plain_text()) <= usize::from(width)
+                );
+            }
+        }
+    }
+
     use super::*;
 
     #[cfg(feature = "syntax")]
