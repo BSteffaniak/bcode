@@ -141,6 +141,75 @@ fn workflow_repair_cli_requires_confirmation_and_rejects_unknown_resolution() {
     assert!(unavailable.stdout.is_empty());
 }
 
+fn verify_incremental_catalog(root: &std::path::Path, sources: &std::path::Path) {
+    // Nonmatching entries force multiple bounded advances without exhausting candidate capacity.
+    for index in 0..40 {
+        std::fs::write(sources.join(format!("ignored-{index}.txt")), "ignored").unwrap();
+    }
+    let mut request = serde_json::json!({
+        "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        "workspace": root, "limit": 10, "incremental": true,
+        "search": "Catalog acceptance", "source_kind": "standalone_source"
+    });
+    let mut tokens = std::collections::BTreeSet::new();
+    let mut consumed_request = None;
+    let mut complete = false;
+    for _ in 0..32 {
+        std::fs::write(
+            root.join("incremental.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let page = graph_cli_json(
+            root,
+            &[
+                "workflow",
+                "launch-catalog",
+                "--request",
+                "incremental.json",
+            ],
+        );
+        if let Some(token) = page
+            .get("discovery_token")
+            .and_then(serde_json::Value::as_str)
+        {
+            assert!(page["items"].as_array().unwrap().is_empty());
+            assert!(page.get("next_cursor").is_none());
+            assert!(tokens.insert(token.to_string()), "token did not rotate");
+            if request.get("discovery_token").is_some() {
+                consumed_request = Some(request.clone());
+            }
+            request["discovery_token"] = token.into();
+        } else {
+            assert_eq!(page["items"].as_array().unwrap().len(), 3);
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete, "incremental discovery never completed");
+    assert!(tokens.len() > 1);
+    std::fs::write(
+        root.join("incremental.json"),
+        serde_json::to_vec(&consumed_request.unwrap()).unwrap(),
+    )
+    .unwrap();
+    let replay = run_cli_at_root(
+        root,
+        &[
+            "workflow",
+            "launch-catalog",
+            "--request",
+            "incremental.json",
+        ],
+        Stdio::piped(),
+        Stdio::piped(),
+    );
+    assert!(
+        !replay.status.success(),
+        "consumed discovery token was accepted"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
@@ -217,6 +286,7 @@ fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
         )
         .unwrap();
     }
+    verify_incremental_catalog(root.path(), &sources);
     let mut request = serde_json::json!({"version":bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
         "workspace":root.path(), "limit":1, "search":"Catalog acceptance", "source_kind":"standalone_source"});
     let mut titles = std::collections::BTreeSet::new();
