@@ -478,6 +478,8 @@ impl WorkflowStore {
     }
 
     /// Publish a leaf-only edit while retaining unchanged work or cancelling unstarted work.
+    /// Newly added entry nodes are admitted atomically using the run input and current limits.
+    /// Existing nodes and their historical activations are never implicitly restarted.
     ///
     /// Cancellation is limited to pending activations without attempts or linked work;
     /// dispatched and waiting work requires operation-owner reconciliation.
@@ -623,6 +625,7 @@ impl WorkflowStore {
             rusqlite::params![run_id, mutation_id, revision],
         )?;
         persist_retained_edge_bindings(&transaction, &request, revision)?;
+        admit_added_leaf_entries(&transaction, &request, revision, created_at_ms)?;
         super::append_event(
             &transaction,
             run_id,
@@ -982,6 +985,56 @@ fn persist_leaf_retentions(
             "INSERT INTO workflow_leaf_retentions (run_id, node_id, activation_id, revision)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![run_id, node_id, activation_id, revision],
+        )?;
+    }
+    Ok(())
+}
+
+fn admit_added_leaf_entries(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    revision: u64,
+    created_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    for edit in &request.edits {
+        let bcode_workflow::WorkflowRunGraphEdit::AddNode {
+            node, entry: true, ..
+        } = edit
+        else {
+            continue;
+        };
+        let input = super::transform_run_json(
+            transaction,
+            &request.run_id,
+            super::TransformRunField::Input,
+        )?
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or(serde_json::Value::Null);
+        let activation = super::NewActivation {
+            run_id: request.run_id.clone(),
+            node_id: node.id.clone(),
+            activation_id: super::activation_identity(&request.run_id, &node.id, 0),
+            dependency_generation: 0,
+            input: Some(input),
+            created_at_ms,
+        };
+        super::validate_activation(&activation)?;
+        super::enforce_activation_limits(transaction, &activation)?;
+        super::insert_activation_bound_to_node(
+            transaction,
+            &activation,
+            super::activation_status_for_node(node),
+            node,
+            revision,
+        )?;
+        super::record_activation_graph_binding(
+            transaction,
+            &request.run_id,
+            &node.id,
+            &activation.activation_id,
+            revision,
         )?;
     }
     Ok(())

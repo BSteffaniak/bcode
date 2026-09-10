@@ -22750,6 +22750,36 @@ mod tests {
                 [&activation_id],
             )
             .expect("unstarted fixture");
+        store.connection.execute_batch(
+            "CREATE TEMP TRIGGER reject_cancel_publication BEFORE INSERT ON workflow_graph_edit_publications
+             BEGIN SELECT RAISE(ABORT, 'publication fault'); END;"
+        ).expect("publication fault");
+        assert!(
+            store
+                .publish_retained_leaf_run_graph_edit("run-1", "cancel-leaf", &authority, 21)
+                .is_err()
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE activation_id = ?1",
+                [&activation_id],
+                |row| row.get(0),
+            )
+            .expect("rolled back activation");
+        assert_eq!(status, "pending");
+        assert_eq!(
+            run_graph::graph_revision(&store.connection, "run-1").expect("revision"),
+            Some(1)
+        );
+        let replacement = store
+            .current_run_graph_node("run-1", "replacement-leaf")
+            .expect("rolled back node");
+        assert!(replacement.is_none());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_cancel_publication;")
+            .expect("remove fault");
         assert_eq!(
             store
                 .publish_retained_leaf_run_graph_edit("run-1", "cancel-leaf", &authority, 21)
@@ -22767,6 +22797,22 @@ mod tests {
             )
             .expect("status");
         assert_eq!(status, "cancelled");
+        assert_published_leaf_admission(&store);
+    }
+
+    fn assert_published_leaf_admission(store: &WorkflowStore) {
+        let activation_id = activation_identity("run-1", "replacement-leaf", 0);
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision("run-1", "replacement-leaf", &activation_id)
+                .expect("admission"),
+            Some(2)
+        );
+        let status: String = store.connection.query_row(
+            "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND activation_id = ?1",
+            [activation_id], |row| row.get(0),
+        ).expect("published entry");
+        assert_eq!(status, "pending");
     }
 
     #[test]
