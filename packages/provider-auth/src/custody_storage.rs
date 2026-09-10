@@ -150,8 +150,20 @@ impl CredentialCustodyStorage {
     }
 
     /// Durably fence external provisioning before dispatch. Any failure preserves the fence.
-    pub(crate) fn begin_provisioning(&self) -> Result<(), CustodyStorageError> {
+    pub(crate) fn begin_provisioning(
+        &self,
+        intent: &crate::operations::AuthProvisioningIntent,
+    ) -> Result<(), CustodyStorageError> {
         self.ensure_no_provisioning()?;
+        let bytes =
+            serde_json::to_vec(intent).map_err(|_| CustodyStorageError::MaintenanceRequired)?;
+        if intent.version != 2
+            || intent.source.is_empty()
+            || intent.operation.is_empty()
+            || bytes.len() > 65536
+        {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
         let mut intent = crate::store::open_owned_entry(
             &self.directory,
             c"provisioning-v1",
@@ -159,10 +171,32 @@ impl CredentialCustodyStorage {
         )
         .map_err(CustodyStorageError::Io)?;
         intent
-            .write_all(b"BCODE-PROVISIONING\0\x01")
+            .write_all(&bytes)
             .and_then(|()| intent.sync_all())
             .map_err(CustodyStorageError::Io)?;
         self.directory.sync_all().map_err(CustodyStorageError::Io)
+    }
+
+    /// Read a bounded current-format intent; legacy markers are never guessed.
+    pub(crate) fn provisioning_intent(
+        &self,
+    ) -> Result<crate::operations::AuthProvisioningIntent, CustodyStorageError> {
+        let file =
+            crate::store::open_owned_entry(&self.directory, c"provisioning-v1", libc::O_RDONLY)
+                .map_err(CustodyStorageError::Io)?;
+        let mut bytes = Vec::new();
+        file.take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(CustodyStorageError::Io)?;
+        if bytes.len() > 65536 {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        let intent: crate::operations::AuthProvisioningIntent =
+            serde_json::from_slice(&bytes).map_err(|_| CustodyStorageError::MaintenanceRequired)?;
+        if intent.version != 2 || intent.source.is_empty() || intent.operation.is_empty() {
+            return Err(CustodyStorageError::MaintenanceRequired);
+        }
+        Ok(intent)
     }
 
     /// Clear the fence only after verified factor binding and durable custody publication.
@@ -244,14 +278,21 @@ mod tests {
         storage
             .compare_and_publish(&ciphertext, &ciphertext)
             .unwrap();
-        storage.begin_provisioning().unwrap();
+        let intent = crate::operations::AuthProvisioningIntent {
+            version: 2,
+            source: "test".into(),
+            operation: "attempt-1".into(),
+            profile_binding: "test-binding".into(),
+        };
+        storage.begin_provisioning(&intent).unwrap();
         drop(storage);
         let reopened = CredentialCustodyStorage::open(&path).unwrap();
         assert!(matches!(
             reopened.ensure_no_provisioning(),
             Err(CustodyStorageError::MaintenanceRequired)
         ));
-        assert!(reopened.begin_provisioning().is_err());
+        assert!(reopened.provisioning_intent().unwrap() == intent);
+        assert!(reopened.begin_provisioning(&intent).is_err());
         reopened.finish_provisioning().unwrap();
         reopened.ensure_no_provisioning().unwrap();
         assert_eq!(reopened.read().unwrap(), ciphertext);

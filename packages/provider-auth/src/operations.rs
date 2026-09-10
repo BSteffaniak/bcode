@@ -65,6 +65,37 @@ pub struct AuthProvisionedDeviceFactor {
     pub key: zeroize::Zeroizing<[u8; 32]>,
 }
 
+/// Durable identity of a selected-source provisioning attempt (format version 2).
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthProvisioningIntent {
+    /// Compatibility boundary; unsupported versions require maintenance.
+    pub version: u32,
+    /// Stable source identity, verified on reconciliation.
+    pub source: String,
+    /// Source-owned unique operation identity; never reused for a different attempt.
+    pub operation: String,
+    /// SHA-256 binding of the resolved profile and policy; no credential settings are stored.
+    pub profile_binding: String,
+}
+
+pub(crate) fn provisioning_binding(
+    profile: &ResolvedAuthProfile,
+) -> Result<String, crate::lifecycle::AuthVaultLifecycleError> {
+    use sha2::Digest as _;
+    let bytes = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(
+            &profile.profile_name,
+            &profile.provider_id,
+            &profile.owner_plugin_id,
+            &profile.profile,
+            matches!(profile.source, crate::AuthProfileSource::Runtime),
+        ))
+        .map_err(|_| crate::lifecycle::AuthVaultLifecycleError::InvalidCredential)?,
+    );
+    Ok(format!("{:x}", sha2::Sha256::digest(bytes.as_slice())))
+}
+
 /// Caller-selected retrieval of an existing device factor.
 ///
 /// Parameters are untrusted persisted metadata, not authorization. Implementations must verify
@@ -85,6 +116,47 @@ pub trait AuthDeviceFactorSource: Send + Sync {
             "device provisioning unavailable".into(),
         ))
     }
+    /// Allocate an identity without performing provisioning effects.
+    ///
+    /// # Errors
+    /// Rejects unsupported recovery. The source must durably prevent operation-ID reuse.
+    fn provisioning_identity(
+        &self,
+        _profile: &ResolvedAuthProfile,
+    ) -> Result<(String, String), crate::lifecycle::AuthVaultLifecycleError> {
+        Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+            "recoverable provisioning unavailable".into(),
+        ))
+    }
+
+    /// Provision under a durably recorded identity, idempotently for this exact binding.
+    ///
+    /// # Errors
+    /// Rejects unsupported or conflicting identities without fallback to legacy provisioning.
+    fn provision_attempt(
+        &self,
+        _intent: &AuthProvisioningIntent,
+    ) -> Result<AuthProvisionedDeviceFactor, crate::lifecycle::AuthVaultLifecycleError> {
+        Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+            "recoverable provisioning unavailable".into(),
+        ))
+    }
+
+    /// Explicitly reconcile an attempt without deleting or replacing any factor. Success certifies
+    /// source/profile ownership, a quiescent operation, and durable retrievability of every factor
+    /// that could have been published. An absent operation must be durably fenced against late work.
+    ///
+    /// # Errors
+    /// Ambiguous, foreign, or unsupported attempts remain unresolved.
+    fn reconcile_provisioning(
+        &self,
+        _intent: &AuthProvisioningIntent,
+    ) -> Result<(), crate::lifecycle::AuthVaultLifecycleError> {
+        Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+            "provisioning reconciliation unavailable".into(),
+        ))
+    }
+
     /// Retrieve the key bound to the supplied factor metadata.
     ///
     /// # Errors
@@ -129,6 +201,30 @@ pub struct RetainedAuthRequestCustody {
 
 #[cfg(unix)]
 impl RetainedAuthRequestCustody {
+    /// Resolve a fenced provisioning attempt after caller authorization for maintenance.
+    /// Does not replay credential changes or delete external factors.
+    ///
+    /// # Errors
+    /// Preserves the fence for unsupported intents, mismatched profiles, or failed reconciliation.
+    pub fn reconcile_provisioning(&self) -> Result<(), crate::lifecycle::AuthVaultLifecycleError> {
+        let failure = || {
+            crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                "provisioning requires maintenance".into(),
+            )
+        };
+        let storage = self.storage.lock().map_err(|_| failure())?;
+        let intent = storage.provisioning_intent().map_err(|_| failure())?;
+        if intent.profile_binding != provisioning_binding(&self.resolved)? {
+            return Err(failure());
+        }
+        self.device_source
+            .as_ref()
+            .ok_or_else(failure)?
+            .reconcile_provisioning(&intent)
+            .map_err(|_| failure())?;
+        storage.finish_provisioning().map_err(|_| failure())
+    }
+
     /// Select trusted retrieval for existing device factors on credential reads and writes.
     ///
     /// Provisioning remains explicitly source-owned; remote custody is not selected here.

@@ -881,6 +881,7 @@ pub(crate) fn prepare_retained_device_policy(
     resolved: &crate::ResolvedAuthProfile,
     profile: &str,
     source: Option<&dyn crate::operations::AuthDeviceFactorSource>,
+    intent: Option<&crate::operations::AuthProvisioningIntent>,
 ) -> Result<Vec<AuthSecurityDiagnostic>, crate::lifecycle::AuthVaultLifecycleError> {
     let options = device_seal_options_for_auth_profile(&resolved.profile);
     if validate_retained_device_policy(vault, profile, options).is_ok() {
@@ -903,7 +904,12 @@ pub(crate) fn prepare_retained_device_policy(
                 "profile encryption unavailable".into(),
             )
         })?;
-        let factor = source.provision(resolved)?;
+        let intent = intent.ok_or_else(|| {
+            crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
+                "recoverable provisioning unavailable".into(),
+            )
+        })?;
+        let factor = source.provision_attempt(intent)?;
         // Verify the selected custody source can recover the exact key before binding it.
         // This is not a durability guarantee; the source still owns durable factor retention.
         let recovered = source

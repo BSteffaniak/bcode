@@ -451,12 +451,13 @@ impl<'a> AuthVaultLifecycle<'a> {
                     "could not unlock selected profile".into(),
                 )
             })?;
-        let provisioning = self.begin_custody_provisioning(custody, &vault, device.is_some())?;
+        let provisioning = self.begin_custody_provisioning(custody, &vault, device)?;
         let diagnostics = crate::security::prepare_retained_device_policy(
             &mut vault,
             self.resolved,
             self.storage_profile(),
             device,
+            provisioning.as_ref(),
         )?;
         self.apply_custody_changes(&mut vault, changes)?;
         let result = vault.save_with_effects(
@@ -484,7 +485,7 @@ impl<'a> AuthVaultLifecycle<'a> {
                 "credential publication failed; reload before retrying".into(),
             )
         })?;
-        if provisioning && diagnostics.is_empty() {
+        if provisioning.is_some() && diagnostics.is_empty() {
             custody.finish_provisioning().map_err(|_| {
                 AuthVaultLifecycleError::WriteFailed(
                     "credential provisioning requires maintenance".into(),
@@ -499,9 +500,9 @@ impl<'a> AuthVaultLifecycle<'a> {
         &self,
         custody: &crate::custody_storage::CredentialCustodyStorage,
         vault: &sshenv_vault::Vault,
-        selected: bool,
-    ) -> Result<bool, AuthVaultLifecycleError> {
-        let needed = selected
+        selected: Option<&dyn crate::operations::AuthDeviceFactorSource>,
+    ) -> Result<Option<crate::operations::AuthProvisioningIntent>, AuthVaultLifecycleError> {
+        let needed = selected.is_some()
             && crate::security::validate_retained_device_policy(
                 vault,
                 self.storage_profile(),
@@ -509,13 +510,40 @@ impl<'a> AuthVaultLifecycle<'a> {
             )
             .is_err();
         if needed {
-            custody.begin_provisioning().map_err(|_| {
+            let identity = selected
+                .ok_or(AuthVaultLifecycleError::InvalidCredential)?
+                .provisioning_identity(self.resolved);
+            let (source, operation) = match identity {
+                Ok(identity) => identity,
+                Err(_)
+                    if crate::security::device_seal_options_for_auth_profile(
+                        &self.resolved.profile,
+                    )
+                    .policy
+                        == crate::security::AuthDeviceSealPolicy::Preferred =>
+                {
+                    return Ok(None);
+                }
+                Err(_) => {
+                    return Err(AuthVaultLifecycleError::WriteFailed(
+                        "recoverable provisioning unavailable".into(),
+                    ));
+                }
+            };
+            let intent = crate::operations::AuthProvisioningIntent {
+                version: 2,
+                source,
+                operation,
+                profile_binding: crate::operations::provisioning_binding(self.resolved)?,
+            };
+            custody.begin_provisioning(&intent).map_err(|_| {
                 AuthVaultLifecycleError::WriteFailed(
                     "credential provisioning requires maintenance".into(),
                 )
             })?;
+            return Ok(Some(intent));
         }
-        Ok(needed)
+        Ok(None)
     }
 
     #[cfg(unix)]
@@ -1217,9 +1245,9 @@ mod tests {
     fn provisioned_factor_must_be_retrievable_before_policy_changes() {
         struct MismatchedDevice;
         impl crate::operations::AuthDeviceFactorSource for MismatchedDevice {
-            fn provision(
+            fn provision_attempt(
                 &self,
-                _: &ResolvedAuthProfile,
+                _: &crate::operations::AuthProvisioningIntent,
             ) -> Result<crate::operations::AuthProvisionedDeviceFactor, AuthVaultLifecycleError>
             {
                 Ok(crate::operations::AuthProvisionedDeviceFactor {
@@ -1260,6 +1288,12 @@ mod tests {
                 &profile,
                 "exa",
                 Some(&MismatchedDevice),
+                Some(&crate::operations::AuthProvisioningIntent {
+                    version: 2,
+                    source: "test".into(),
+                    operation: "mismatch".into(),
+                    profile_binding: crate::operations::provisioning_binding(&profile).unwrap(),
+                }),
             );
             if policy == "required" {
                 assert!(
@@ -1276,6 +1310,35 @@ mod tests {
     struct UnavailableDevice(std::sync::atomic::AtomicUsize);
     #[cfg(unix)]
     impl crate::operations::AuthDeviceFactorSource for UnavailableDevice {
+        fn provisioning_identity(
+            &self,
+            _: &ResolvedAuthProfile,
+        ) -> Result<(String, String), AuthVaultLifecycleError> {
+            Ok((
+                "isolated-test".into(),
+                format!(
+                    "attempt-{}",
+                    self.0.load(std::sync::atomic::Ordering::SeqCst)
+                ),
+            ))
+        }
+        fn provision_attempt(
+            &self,
+            intent: &crate::operations::AuthProvisioningIntent,
+        ) -> Result<crate::operations::AuthProvisionedDeviceFactor, AuthVaultLifecycleError>
+        {
+            assert_eq!(intent.source, "isolated-test");
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(AuthVaultLifecycleError::InvalidCredential)
+        }
+        fn reconcile_provisioning(
+            &self,
+            intent: &crate::operations::AuthProvisioningIntent,
+        ) -> Result<(), AuthVaultLifecycleError> {
+            assert_eq!(intent.source, "isolated-test");
+            assert_eq!(intent.operation, "attempt-0");
+            Ok(()) // This test source never starts external work.
+        }
         fn provision(
             &self,
             _: &ResolvedAuthProfile,
@@ -1376,6 +1439,8 @@ mod tests {
         assert_eq!(device.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(retained.persist(&profile, changes).is_err());
         assert_eq!(device.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        retained.reconcile_provisioning().unwrap();
+        assert!(!directory.join("provisioning-v1").exists());
         assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         let context = bcode_model::ProviderRequestContext {
             auth_profile: Some("exa".into()),
