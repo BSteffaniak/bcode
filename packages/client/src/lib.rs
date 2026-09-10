@@ -1300,7 +1300,13 @@ impl BcodeClient {
         {
             return Ok(());
         }
+        let coordination_started = std::time::Instant::now();
         let _startup_guard = self.startup_gate.lock().await;
+        tracing::debug!(
+            target: "bcode_client::startup",
+            elapsed_us = coordination_started.elapsed().as_micros(),
+            "client startup gate acquired"
+        );
         if self
             .connect_with_deadline("bcode-daemon-availability")
             .await
@@ -5258,29 +5264,58 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached, rejects the handshake, or reports a
     /// different build fingerprint.
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
-        match self.connect_with_deadline(client_name).await {
-            Ok(connection) => Ok(connection),
-            Err(error)
-                if self.daemon_availability == DaemonAvailability::AutoStart
-                    && self.expected_state_location.is_none()
-                    && error.is_daemon_unavailable() =>
-            {
-                self.ensure_daemon_available().await?;
-                self.connect_with_deadline(client_name).await
+        use tracing::Instrument as _;
+
+        let span = tracing::debug_span!(target: "bcode_client::startup", "daemon_connection");
+        Box::pin(async {
+            let started = std::time::Instant::now();
+            let mut acquisition_required = false;
+            let result = async {
+                match self.connect_with_deadline(client_name).await {
+                    Ok(connection) => Ok(connection),
+                    Err(error)
+                        if self.daemon_availability == DaemonAvailability::AutoStart
+                            && self.expected_state_location.is_none()
+                            && error.is_daemon_unavailable() =>
+                    {
+                        acquisition_required = true;
+                        self.ensure_daemon_available().await?;
+                        self.connect_with_deadline(client_name).await
+                    }
+                    Err(error) => Err(error),
+                }
             }
-            Err(error) => Err(error),
-        }
+            .await;
+            tracing::debug!(
+                target: "bcode_client::startup",
+                elapsed_us = started.elapsed().as_micros(),
+                acquisition_required,
+                success = result.is_ok(),
+                "daemon connection completed"
+            );
+            result
+        })
+        .instrument(span)
+        .await
     }
 
     async fn connect_with_deadline(
         &self,
         client_name: &str,
     ) -> Result<ClientConnection, ClientError> {
-        tokio::time::timeout(self.connect_timeout, self.connect_once(client_name))
-            .await
-            .map_err(|_| ClientError::ConnectTimeout {
-                timeout: self.connect_timeout,
-            })?
+        let started = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(self.connect_timeout, self.connect_once(client_name)).await;
+        tracing::debug!(
+            target: "bcode_client::startup",
+            elapsed_us = started.elapsed().as_micros(),
+            timed_out = result.is_err(),
+            success = matches!(&result, Ok(Ok(_))),
+            "verified connection attempt completed"
+        );
+        result.map_err(|_| ClientError::ConnectTimeout {
+            timeout: self.connect_timeout,
+        })?
     }
 
     /// Observe detached session-open preparation until terminal state or receiver drop.
@@ -5310,7 +5345,16 @@ impl BcodeClient {
     }
 
     async fn connect_once(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
-        let stream = LocalIpcStream::connect(&self.endpoint).await?;
+        let transport_started = std::time::Instant::now();
+        let stream = LocalIpcStream::connect(&self.endpoint).await;
+        tracing::debug!(
+            target: "bcode_client::startup",
+            elapsed_us = transport_started.elapsed().as_micros(),
+            success = stream.is_ok(),
+            "local transport connection completed"
+        );
+        let stream = stream?;
+        let handshake_started = std::time::Instant::now();
         let mut connection = ClientConnection {
             stream,
             next_request_id: 1,
@@ -5343,6 +5387,11 @@ impl BcodeClient {
                 client_id, daemon, ..
             } => {
                 self.verify_server_identity(&daemon)?;
+                tracing::debug!(
+                    target: "bcode_client::startup",
+                    elapsed_us = handshake_started.elapsed().as_micros(),
+                    "daemon identity handshake verified"
+                );
                 connection.client_id = Some(client_id);
                 Ok(connection)
             }

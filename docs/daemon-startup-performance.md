@@ -2,6 +2,28 @@
 
 Measured on 2026-07-31 from the `bcode/daemon-client-compatibility` worktree with the isolated daemon-startup harness.
 
+## Connection tracing
+
+Set `BCODE_STARTUP_TRACE=1` to enable client connection and daemon startup debug
+traces (unless `BCODE_LOG` or `RUST_LOG` supplies an explicit filter). Client
+`daemon_connection` spans record total microseconds, whether daemon acquisition
+was required, and success. Events distinguish local transport connection,
+verified connection attempts (including timeout), successful identity handshake,
+and the in-process startup gate. Lifecycle events record cross-process lock
+acquisition and waiting for another launcher to supply a ready daemon.
+
+These events deliberately omit runtime context, client-supplied names, and raw
+errors. They are diagnostic traces, not persisted session content or new metrics.
+Acquisition-required does not mean this client spawned a daemon: another client
+may win coordination. A timed-out verified attempt without a completed transport
+event identifies transport delay; a completed transport without a verified
+handshake identifies handshake delay or rejection. Cancellation may leave a span
+without a completion event.
+
+This instrumentation does not change readiness semantics: startup still polls,
+and the server still waits for application initialization before accepting clients.
+It does not yet provide cross-process trace correlation or capability readiness.
+
 ## Environment
 
 * Host: macOS Darwin 25.5.0, Apple arm64.

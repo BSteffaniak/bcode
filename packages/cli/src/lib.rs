@@ -2960,7 +2960,7 @@ fn init_tracing() {
         .ok()
         .unwrap_or_else(|| {
             if std::env::var_os("BCODE_STARTUP_TRACE").is_some() {
-                "bcode_server::startup=debug,bcode_plugin::startup=debug,bcode_daemon_lifecycle::startup=debug".to_string()
+                "bcode_client::startup=debug,bcode_server::startup=debug,bcode_plugin::startup=debug,bcode_daemon_lifecycle::startup=debug".to_string()
             } else if foreground_server {
                 "info".to_string()
             } else {

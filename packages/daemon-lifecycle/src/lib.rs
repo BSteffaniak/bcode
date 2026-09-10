@@ -2498,10 +2498,20 @@ impl StartupLock {
                     file.set_len(0)?;
                     writeln!(&file, "pid={}", std::process::id())?;
                     file.sync_data()?;
+                    tracing::debug!(
+                        target: "bcode_daemon_lifecycle::startup",
+                        elapsed_us = started.elapsed().as_micros(),
+                        "startup coordination acquired"
+                    );
                     return Ok(Some(Self { file }));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if ping_ready(endpoint).await {
+                        tracing::debug!(
+                            target: "bcode_daemon_lifecycle::startup",
+                            elapsed_us = started.elapsed().as_micros(),
+                            "concurrent launcher supplied ready daemon"
+                        );
                         return Ok(None);
                     }
                     if started.elapsed() >= Self::ACQUIRE_TIMEOUT {
@@ -2858,6 +2868,33 @@ mod startup_lock_tests {
         drop(listener);
         fs::remove_file(socket_path).expect("socket cleanup");
         fs::remove_dir_all(root).expect("directory cleanup");
+    }
+
+    #[tokio::test]
+    async fn concurrent_startup_lock_holders_are_exclusive() {
+        let directory = tempfile::tempdir().expect("lock directory");
+        let path = directory.path().join("startup.lock");
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let path = path.clone();
+            let active = active.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                let lock = StartupLock::acquire_at(path, Duration::from_secs(5))
+                    .await
+                    .expect("acquire startup lock");
+                assert_eq!(active.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                tokio::task::yield_now().await;
+                assert_eq!(active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst), 1);
+                drop(lock);
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.expect("exclusive holder task");
+        }
     }
 
     #[tokio::test]
