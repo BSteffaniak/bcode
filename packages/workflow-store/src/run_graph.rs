@@ -1608,7 +1608,7 @@ pub fn revised_leaf_exit(
     Ok(exit)
 }
 
-fn reconciled_activation_exit(
+pub fn reconciled_activation_exit(
     connection: &Connection,
     run_id: &str,
     node_id: &str,
@@ -1656,6 +1656,7 @@ fn reconciled_activation_exit(
     Ok(node.exit)
 }
 
+#[cfg(test)]
 pub fn initial_exit(
     connection: &Connection,
     run_id: &str,
@@ -1703,6 +1704,7 @@ pub fn initial_edge_between(
     }
 }
 
+#[cfg(test)]
 pub fn initial_incoming_edges(
     connection: &Connection,
     run_id: &str,

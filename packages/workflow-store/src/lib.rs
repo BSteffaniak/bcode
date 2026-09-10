@@ -11265,7 +11265,11 @@ where
         run_graph::graph_revision(transaction, &output.run_id)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData("settlement graph is missing".to_string())
         })?;
-    if graph_revision != 1 {
+    let admitted: u64 = transaction.query_row(
+        "SELECT graph_revision FROM workflow_activation_graph_bindings WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+        (&output.run_id, &output.node_id, &output.activation_id), |row| row.get(0),
+    )?;
+    if graph_revision != 1 && admitted != graph_revision {
         let exit = run_graph::revised_leaf_exit(
             transaction,
             &output.run_id,
@@ -11274,7 +11278,7 @@ where
         )?;
         return Ok((Vec::new(), exit));
     }
-    let completed_node = run_graph::initial_activation_node(
+    let completed_node = run_graph::bound_activation_node(
         transaction,
         &output.run_id,
         &output.node_id,
@@ -11283,8 +11287,12 @@ where
     .ok_or_else(|| {
         WorkflowStoreError::InvalidData("completed activation executable is missing".to_string())
     })?;
-    let mut completed_is_exit =
-        run_graph::initial_exit(transaction, &output.run_id, &output.node_id)?;
+    let mut completed_is_exit = run_graph::reconciled_activation_exit(
+        transaction,
+        &output.run_id,
+        &output.node_id,
+        &output.activation_id,
+    )?;
     let mut targets = Vec::new();
     let mut selected_edges = std::collections::BTreeMap::new();
     let mut cursor = None;
@@ -11335,13 +11343,14 @@ where
     }
     for target in &targets {
         let node =
-            run_graph::initial_node(transaction, &output.run_id, target)?.ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "workflow successor node is missing from the run graph: {target}"
-                ))
-            })?;
-        if node.kind == bcode_workflow::NodeKind::Parallel {
-            validate_parallel_run_topology(transaction, &output.run_id, &node)?;
+            WorkflowStore::current_run_graph_node_in_snapshot(transaction, &output.run_id, target)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "workflow successor node is missing from the run graph: {target}"
+                    ))
+                })?;
+        if node.node.kind == bcode_workflow::NodeKind::Parallel {
+            validate_parallel_run_topology(transaction, &output.run_id, &node.node)?;
         }
     }
     if completed_node.kind == bcode_workflow::NodeKind::Branch {
@@ -11777,9 +11786,19 @@ fn validate_parallel_run_topology(
     let members = bcode_workflow::parallel_join_member_ids(node)
         .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     let mut missing = members.into_iter().collect::<BTreeSet<_>>();
+    let revision = run_graph::graph_revision(transaction, run_id)?.ok_or_else(|| {
+        WorkflowStoreError::InvalidData("parallel topology graph is missing".to_string())
+    })?;
     let mut cursor = None;
     loop {
-        let edges = run_graph::initial_incoming_edges(transaction, run_id, &node.id, cursor)?;
+        let edges = WorkflowStore::current_run_graph_edges_in_snapshot(
+            transaction,
+            run_id,
+            revision,
+            cursor,
+            100,
+            Some(run_graph::EdgeEndpoint::Target(&node.id)),
+        )?;
         if edges.is_empty() {
             break;
         }
@@ -11787,7 +11806,12 @@ fn validate_parallel_run_topology(
         for record in edges {
             if matches!(record.edge.kind, bcode_workflow::EdgeKind::Direct)
                 && missing.contains(record.edge.from.as_str())
-                && run_graph::initial_node(transaction, run_id, &record.edge.from)?.is_some()
+                && WorkflowStore::current_run_graph_node_in_snapshot(
+                    transaction,
+                    run_id,
+                    &record.edge.from,
+                )?
+                .is_some()
             {
                 missing.remove(record.edge.from.as_str());
             }
@@ -11808,8 +11832,18 @@ fn parallel_join_for_member(
 ) -> Result<Option<bcode_workflow::NodeDefinition>, WorkflowStoreError> {
     let mut cursor = None;
     let mut selected: Option<bcode_workflow::NodeDefinition> = None;
+    let revision = run_graph::graph_revision(transaction, run_id)?.ok_or_else(|| {
+        WorkflowStoreError::InvalidData("parallel settlement graph is missing".to_string())
+    })?;
     loop {
-        let edges = run_graph::initial_outgoing_edges(transaction, run_id, member_node_id, cursor)?;
+        let edges = WorkflowStore::current_run_graph_edges_in_snapshot(
+            transaction,
+            run_id,
+            revision,
+            cursor,
+            100,
+            Some(run_graph::EdgeEndpoint::Source(member_node_id)),
+        )?;
         if edges.is_empty() {
             return Ok(selected);
         }
@@ -11818,14 +11852,18 @@ fn parallel_join_for_member(
             if !matches!(record.edge.kind, bcode_workflow::EdgeKind::Direct) {
                 continue;
             }
-            let node = run_graph::initial_node(transaction, run_id, &record.edge.to)?.ok_or_else(
-                || {
-                    WorkflowStoreError::InvalidData(format!(
-                        "parallel settlement references missing run-graph node: {}",
-                        record.edge.to
-                    ))
-                },
-            )?;
+            let node = WorkflowStore::current_run_graph_node_in_snapshot(
+                transaction,
+                run_id,
+                &record.edge.to,
+            )?
+            .map(|record| record.node)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "parallel settlement references missing run-graph node: {}",
+                    record.edge.to
+                ))
+            })?;
             if node.kind == bcode_workflow::NodeKind::Parallel
                 && parallel_member_ids(&node, member_node_id)?
                     .iter()
@@ -11904,7 +11942,10 @@ fn settle_parallel_failure(
     settled_at_ms: u64,
 ) -> Result<Option<ParallelFailureSettlement>, WorkflowStoreError> {
     if run_graph::graph_revision(transaction, run_id)? != Some(1) {
-        run_graph::revised_leaf_exit(transaction, run_id, member_node_id, activation_id)?;
+        run_graph::reconciled_activation_exit(transaction, run_id, member_node_id, activation_id)?;
+        if parallel_join_for_member(transaction, run_id, member_node_id)?.is_some() {
+            run_graph::revised_leaf_exit(transaction, run_id, member_node_id, activation_id)?;
+        }
         return Ok(None);
     }
     let generation: u64 = transaction.query_row(
@@ -34564,6 +34605,53 @@ mod tests {
             )
             .expect("durable terminal status");
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn current_revision_direct_settlement_admits_successor_at_same_revision() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        store.create_run(&run).expect("run");
+        // Exercise current-revision settlement independently of still-guarded publication.
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_run_graphs SET revision = 2;
+             UPDATE workflow_activation_graph_bindings SET graph_revision = 2;",
+            )
+            .expect("revision fixture");
+        let outcome = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "revised-first".into(),
+                run_id: "run-1".into(),
+                node_id: "first".into(),
+                activation_id: activation_identity("run-1", "first", 0),
+                schema_id: "u32".into(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("revised settlement");
+        assert_eq!(outcome.activated.len(), 1);
+        assert_eq!(outcome.activated[0].input, Some(serde_json::json!(2)));
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(
+                    "run-1",
+                    "second",
+                    &outcome.activated[0].activation_id
+                )
+                .expect("binding"),
+            Some(2)
+        );
     }
 
     #[test]
