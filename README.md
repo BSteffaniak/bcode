@@ -23,7 +23,7 @@ Bcode currently requires the [stable Rust toolchain](https://www.rust-lang.org/t
 ```sh
 git clone https://github.com/BSteffaniak/bcode.git
 cd bcode
-cargo build --release -p bcode \
+cargo build --locked --release -p bcode \
   --no-default-features \
   --features app,static-bundled-plugins \
   --bin bcode
@@ -42,7 +42,7 @@ Until the crate is published, depend on the repository directly. Pin a commit fo
 
 ```toml
 [dependencies]
-bcode = { git = "https://github.com/BSteffaniak/bcode", default-features = false }
+bcode = { git = "https://github.com/BSteffaniak/bcode", rev = "ff33ba113c7dd5e95ed7e65d0c59d0898b31168c", default-features = false }
 ```
 
 Bcode's lean SDK accepts application-owned model providers and does not require the TUI, daemon, bundled plugins, or network access:
@@ -72,6 +72,14 @@ Bcode plugins are native Rust libraries with manifest-declared, versioned interf
 
 Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](examples/hello-plugin).
 
+## Architecture
+
+* **SDK:** the `bcode` facade runs providers, tools, and stateful agents in-process without a daemon or renderer.
+* **Application:** the terminal client uses a local daemon for durable multi-client sessions and cross-process ownership.
+* **Presentation:** neutral events and session views feed frontend-specific renderers.
+* **Plugins:** domain services supply providers, tools, workflows, and UI contributions through explicit contracts.
+* **Model router:** this workspace also contains [brouter](packages/router/README.md), a separately run OpenAI-compatible service for capability- and policy-based model selection. Normal Bcode use does not automatically enable that service.
+
 ## Documentation
 
 ### Start here
@@ -99,7 +107,7 @@ Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](
 
 Bcode is under active development at `0.0.1-alpha.0`. There are no published binaries or crates yet. Release automation currently targets ARM64 and x86-64 macOS, ARM64 and x86-64 Linux, and x86-64 Windows.
 
-This repository does not yet include a contributor guide or security policy. Use [GitHub Issues](https://github.com/BSteffaniak/bcode/issues) for bug reports and focused proposals; do not include credentials or other sensitive data.
+See [Contributing](CONTRIBUTING.md) for development and validation guidance and [Security](SECURITY.md) for private vulnerability reporting. Use [GitHub Issues](https://github.com/BSteffaniak/bcode/issues) for non-sensitive bugs and focused proposals.
 
 ## License
 

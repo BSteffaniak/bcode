@@ -1,139 +1,31 @@
 # Type-enforced IPC request routing
 
-## Problem
+Bcode's wire `Request` enum spans multiple product domains. The server partitions it once into domain-owned request enums, then dispatches directly to the owning handler.
 
-`Request` is a flat 163-variant enum. `packages/server` dispatches it through nine `async fn`
-dispatchers chained by fall-through: each handles some variants and forwards the rest to the next.
+This is **IPC dispatch**, not provider/model selection. The separately runnable [brouter](../packages/router/README.md) handles capability- and policy-based model routing.
 
-That chaining caused a measured stack overflow. Dispatchers are `async fn`s, so each one's generated
-future stays live for the whole call, and a request that fell through five dispatchers kept all five
-frames — including a 751 KB one — on the stack simultaneously. Measured cost of one fall-through hop:
-**1.24 MiB** of a 2 MiB budget.
+## Current implementation
 
-Direct routing fixed the overflow (debug 4096 → 2048 KiB) by classifying a request first and jumping
-straight to its owning dispatcher. But that fix is **not enforced**, and the gap is structural:
+[`packages/server/src/request_routing.rs`](../packages/server/src/request_routing.rs) defines `RoutedRequest::from_request`. Its exhaustive match has no wildcard arm: a new wire request must be assigned to a domain before the server compiles.
 
-* `request_domain` and the dispatchers are two independent lists of the same 163 variants.
-* `request_domain` ends in `_ => RequestDomain::Remaining`, so a new variant silently falls through
-  and reintroduces the regression with no compile error and no failing test.
-* Seven fall-through arms (`request => Box::pin(next_dispatcher(..))`) still exist.
-* Two `unreachable!()` panics stand in for a guarantee the type system should provide, turning a
-  routing mistake into a production panic rather than a build failure.
+Each dispatcher consumes its domain-specific enum rather than the original flat request. It therefore cannot forward an unrelated request to another dispatcher. Large domain payloads are boxed where needed to bound the routing enum and async frame sizes.
 
-The gap is already load-bearing: `AuthPoolList` and `SetAuthPoolPreference` reach their handler only
-through the wildcard.
+The wire format remains defined by `bcode_ipc::Request`; this internal partition does not change the client protocol.
 
-## Target design
+## Why this boundary exists
 
-One consuming partition replaces the classifier and every fall-through arm:
+Earlier dispatchers were chained by fall-through. Their async futures remained live together, accumulating unrelated stack frames and causing a measured stack overflow. Direct, typed routing removes that chain structurally rather than relying on handler order or runtime `unreachable!()` assertions.
 
-```rust
-enum RoutedRequest {
-    SessionLifecycle(SessionLifecycleRequest),
-    SessionSearchAttach(SessionSearchAttachRequest),
-    SessionTurn(SessionTurnRequest),
-    WorkflowMutation(Box<WorkflowMutationRequest>),
-    WorkflowAuthoring(WorkflowAuthoringRequest),
-    WorkflowDefinition(Box<WorkflowDefinitionRequest>),
-    RuntimeAndModel(Box<RuntimeAndModelRequest>),
-    PermissionInteraction(PermissionInteractionRequest),
-    AgentSkillPlugin(AgentSkillPluginRequest),
-}
+The original migration plan is not the current architecture: exhaustive partitioning is implemented. Avoid copying historical variant counts or dispatcher lists into guidance; the source is authoritative.
 
-impl Request {
-    /// Bind a request to the domain that owns it.
-    ///
-    /// Deliberately has no wildcard arm: adding a `Request` variant fails to compile until it is
-    /// placed in a domain.
-    fn into_routed(self) -> RoutedRequest { /* all 163 variants */ }
-}
-```
+## Maintaining the partition
 
-Each dispatcher takes its own domain type rather than `Request`.
+The module carries a historical generator comment, but that generator is not present in this checkout. Treat the checked-in partition and affected dispatchers as authoritative; update them together and run the server's relevant tests and repository architecture checks. Do not add a catch-all fallback to make a new request compile.
 
-| Property | Enforced by |
-| --- | --- |
-| A new variant cannot be forgotten | exhaustive `match` with no wildcard: build error |
-| A dispatcher cannot fall through | it holds a domain type, so it has no `Request` to forward |
-| Mis-routing cannot panic at runtime | unrepresentable, so both `unreachable!()` arms are deleted |
-| Partition and dispatch cannot drift | they are the same `match` |
+Preserve these properties:
 
-Wire format is unchanged. `Request` stays flat, so this is internal routing only: no protocol change
-and no call sites outside `packages/server`.
-
-## Derived partition
-
-`scripts/derive-request-domains.py` reads the dispatchers -- the authoritative source, since a
-dispatcher's arms are what really handle a variant -- and emits the partition. All 163 variants are
-classified with no duplicates and no residual wildcard:
-
-| Domain | Variants |
-| --- | --- |
-| SessionLifecycle | 36 |
-| RuntimeAndModel | 31 |
-| WorkflowMutation | 21 |
-| WorkflowDefinition | 19 |
-| SessionSearchAttach | 18 |
-| AgentSkillPlugin | 14 |
-| WorkflowAuthoring | 10 |
-| SessionTurn | 9 |
-| PermissionInteraction | 5 |
-
-Domain names describe what each dispatcher handles rather than reusing the incidental names from how
-the dispatchers were originally split; `RuntimeAndModel` in particular had accumulated runtime-work,
-model-selection, and auth-pool variants.
-
-The five permission variants that appear in two dispatchers are correctly owned by the child
-dispatcher; the parent's forwarding arm disappears with the fall-through chain.
-
-## Phases
-
-1. Declare the nine domain enums, moving variant blocks verbatim so field attributes and doc
-   comments survive.
-2. Write the classifier with no wildcard. This is the enforcement point.
-3. Convert each dispatcher to take its domain type; delete the seven fall-through arms and both
-   `unreachable!()` arms.
-4. Rewire dispatch through `RoutedRequest`; delete `request_domain` and `RequestDomain`.
-5. Measure with `scripts/measure-dispatch-stack.sh` in both profiles.
-6. Validate.
-
-All six phases are complete.
-
-## Outcome
-
-`packages/server/src/request_routing.rs` is generated by `scripts/generate-request-routing.py` from
-the partition that `scripts/derive-request-domains.py` derives. Regenerating after a `Request` change
-is one command per script.
-
-Measured stack requirement for `permission_resolution_crosses_real_ipc`:
-
-| Profile | Before direct routing | After direct routing | After type-enforced routing |
-| --- | --- | --- | --- |
-| debug | overflowed at 2048 KiB | 2048 KiB | 1024 KiB |
-| release | 256 KiB | 256 KiB | 128 KiB |
-
-Removing the chain entirely halved the requirement again in both profiles, because a request no
-longer instantiates the entry dispatcher's frame on its way to another domain.
-
-Enforcement was verified by deleting one classification arm, which produced:
-
-```
-error[E0004]: non-exhaustive patterns: `bcode_ipc::Request::Ping` not covered
-```
-
-`scripts/check-loop-runtime-architecture.sh` additionally rejects a wildcard domain arm, a dispatcher
-fall-through arm, and a missing classifier. Each guard was verified to fail when its condition is
-violated.
-
-## Risks
-
-The main risk is mis-partitioning while moving variants. The compiler checks both directions: the
-classifier will not compile if a variant is unplaced, and a dispatcher's `match` will not compile if
-it receives a variant it does not handle.
-
-Boxing the three large workflow/runtime domains keeps `RoutedRequest` small; matching through a box
-is slightly awkward but confined to those dispatchers.
-
-Domain enums deliberately carry no serde attributes. They are internal routing types, and `Request`
-remains the sole wire format, so the IPC protocol is unchanged.
-
+- Every wire variant has exactly one owning domain.
+- Dispatchers cannot fall through to unrelated domains.
+- Boxing decisions preserve bounded stack use.
+- Serialization remains owned by the wire types.
+- New request handling is tested at the owning dispatcher.

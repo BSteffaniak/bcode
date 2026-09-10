@@ -18,7 +18,7 @@ Clone Bcode and build the TUI with its statically bundled providers, tools, comm
 ```sh
 git clone https://github.com/BSteffaniak/bcode.git
 cd bcode
-cargo build --release -p bcode \
+cargo build --locked --release -p bcode \
   --no-default-features \
   --features app,static-bundled-plugins \
   --bin bcode
@@ -84,7 +84,7 @@ Bcode asks before sensitive operations according to the active agent's policy. P
 The complete release feature composition adds bundled OCR runtimes, Mermaid rendering, and the optional web renderer:
 
 ```sh
-cargo build --release -p bcode --features distribution --bin bcode
+cargo build --locked --release -p bcode --features distribution --bin bcode
 ```
 
 Release automation and supported artifact targets are documented in [Release builds](release-builds.md). Public artifacts have not been published yet.
