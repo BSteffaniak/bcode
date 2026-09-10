@@ -3181,6 +3181,16 @@ pub struct PendingDiscovery {
     request: bcode_workflow::WorkflowLaunchCatalogRequest,
     scan: bcode_workflow_discovery::WorkflowDiscoveryScan,
     expires: std::time::Instant,
+    expiration: DiscoveryExpiration,
+}
+
+#[derive(Debug)]
+struct DiscoveryExpiration(tokio::task::JoinHandle<()>);
+
+impl Drop for DiscoveryExpiration {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn discovery_error(message: &str) -> super::ServerError {
@@ -3211,7 +3221,10 @@ pub async fn launch_catalog(
                 "expired or mismatched discovery token; restart discovery",
             ));
         }
-        scans.remove(token).map(|pending| pending.scan)
+        scans.remove(token).map(|pending| {
+            drop(pending.expiration);
+            pending.scan
+        })
     } else {
         None
     };
@@ -3246,6 +3259,17 @@ pub async fn launch_catalog(
         if request.incremental {
             let token = uuid::Uuid::new_v4().to_string();
             let lifetime = std::time::Duration::from_mins(1);
+            let scans = std::sync::Arc::downgrade(&state.workflow_discovery_scans);
+            let expired_token = token.clone();
+            let expiration = DiscoveryExpiration(tokio::spawn(async move {
+                tokio::time::sleep(lifetime).await;
+                if let Some(scans) = scans.upgrade() {
+                    scans
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&expired_token);
+                }
+            }));
             {
                 let mut scans = state
                     .workflow_discovery_scans
@@ -3262,20 +3286,10 @@ pub async fn launch_catalog(
                         request: binding,
                         scan,
                         expires: std::time::Instant::now() + lifetime,
+                        expiration,
                     },
                 );
             }
-            let scans = std::sync::Arc::downgrade(&state.workflow_discovery_scans);
-            let expired_token = token.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(lifetime).await;
-                if let Some(scans) = scans.upgrade() {
-                    scans
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&expired_token);
-                }
-            });
             return Ok(bcode_workflow::WorkflowLaunchCatalogPage {
                 version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
                 discovery_token: Some(token),
