@@ -225,6 +225,20 @@ impl RetainedAuthRequestCustody {
         storage.finish_provisioning().map_err(|_| failure())
     }
 
+    /// Select native operation-scoped macOS custody using this service's validated profile.
+    /// No Keychain access occurs until an authorized read, write, or reconciliation request.
+    /// Replaces any previously selected device source; no implicit fallback is installed.
+    ///
+    /// # Errors
+    /// Rejects a profile that cannot be encoded for native ownership binding.
+    #[cfg(target_os = "macos")]
+    pub fn macos_operation_factors(
+        self,
+    ) -> Result<Self, crate::lifecycle::AuthVaultLifecycleError> {
+        let source = crate::native_device::MacosOperationFactorSource::new(self.resolved.clone())?;
+        Ok(self.device_source(std::sync::Arc::new(source)))
+    }
+
     /// Select trusted retrieval for existing device factors on credential reads and writes.
     ///
     /// Provisioning remains explicitly source-owned; remote custody is not selected here.

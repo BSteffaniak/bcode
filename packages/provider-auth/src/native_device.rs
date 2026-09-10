@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 /// Native macOS device-only Keychain source bound to one authorized resolved profile.
+///
 /// Construction performs no native access. Callers authorize provisioning and reconciliation
 /// before invoking custody. Operation identifiers are fresh 256-bit random values; Keychain
 /// records are addressed by their profile-bound digest, never by untrusted paths.
@@ -55,11 +56,11 @@ impl AuthDeviceFactorSource for MacosOperationFactorSource {
         &self,
         profile: &ResolvedAuthProfile,
     ) -> Result<(String, String), AuthVaultLifecycleError> {
+        use sha2::Digest as _;
         if profile != &self.profile {
             return Err(AuthVaultLifecycleError::InvalidCredential);
         }
         let random = sshenv_vault::crypto::generate_data_key();
-        use sha2::Digest as _;
         Ok((
             "macos-operation-v1".into(),
             format!("{:x}", sha2::Sha256::digest(&random[..])),

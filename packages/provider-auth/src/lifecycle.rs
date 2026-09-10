@@ -1070,6 +1070,46 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn native_operation_source_rejects_foreign_intents_before_effects() {
+        use crate::operations::{AuthDeviceFactorSource as _, AuthProvisioningIntent};
+        let profile = resolved(Path::new("/unused-native-source-test"));
+        let source =
+            crate::native_device::MacosOperationFactorSource::new(profile.clone()).unwrap();
+        let intent = AuthProvisioningIntent {
+            version: 2,
+            source: "macos-operation-v1".into(),
+            operation: "a".repeat(64),
+            profile_binding: crate::operations::provisioning_binding(&profile).unwrap(),
+        };
+        let mut foreign = profile;
+        foreign.owner_plugin_id = "foreign-plugin".into();
+        assert!(source.provisioning_identity(&foreign).is_err());
+        let mut cases = Vec::new();
+        let mut changed = intent.clone();
+        changed.source = "foreign-source".into();
+        cases.push(changed);
+        let mut changed = intent.clone();
+        changed.profile_binding = crate::operations::provisioning_binding(&foreign).unwrap();
+        cases.push(changed);
+        let mut changed = intent.clone();
+        changed.version = 3;
+        cases.push(changed);
+        let mut changed = intent;
+        changed.operation = "../invalid".into();
+        cases.push(changed);
+        for invalid in cases {
+            assert!(source.provision_attempt(&invalid).is_err());
+            assert!(source.reconcile_provisioning(&invalid).is_err());
+        }
+        assert!(
+            source
+                .retrieve("foreign-factor", None, &BTreeMap::new())
+                .is_err()
+        );
+    }
+
     fn method() -> AuthMethodContribution {
         AuthMethodContribution::SecretFields {
             method_id: "api_key".to_owned(),
