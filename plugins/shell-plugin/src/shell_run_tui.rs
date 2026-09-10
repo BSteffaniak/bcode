@@ -258,13 +258,18 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             replays.remove(&chunk.tool_call_id);
         }
         let replay = replays.entry(chunk.tool_call_id.clone()).or_default();
+        // Rendering a request is not terminal initialization. The recording header owns
+        // execution dimensions; a request can be painted before even its header arrives.
         if let Some((columns, rows)) = dimensions
-            && (replay.initial_columns == 0 || replay.initial_rows == 0)
+            && replay.frames.is_empty()
+            && replay.output.is_empty()
         {
             replay.initial_columns = columns;
             replay.initial_rows = rows;
             replay.columns = columns;
             replay.rows = rows;
+            replay.stream = None;
+            replay.projection = ShellContentProjection::default();
         }
         let decoded_emulate_bytes = frames.iter().fold(0_u64, |total, frame| match frame {
             crate::recording::ShellRecordingFrame::ReplayOutput { bytes, .. } => {
@@ -706,10 +711,15 @@ impl ShellRunTuiVisualAdapter {
                     .and_then(serde_json::Value::as_str)
             })
             .unwrap_or("shell-live-terminal");
+        if output.is_empty() && self.live_replay_data(key).is_none() {
+            return shell_terminal_prompt_rows(payload, width, context);
+        }
         let initial_columns = payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
         let initial_rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
         let live_bytes = output.as_bytes().to_vec();
-        self.update_live_replay(key, &live_bytes, None, initial_columns, initial_rows);
+        if !live_bytes.is_empty() {
+            self.update_live_replay(key, &live_bytes, None, initial_columns, initial_rows);
+        }
         let streaming = runtime
             .get("streaming")
             .and_then(serde_json::Value::as_bool)
@@ -2525,6 +2535,67 @@ mod tests {
             render_hydrated_recording(&uninterrupted, "call"),
             render_hydrated_recording(&fresh_finalized, "call")
         );
+    }
+
+    #[test]
+    fn request_before_split_recording_header_preserves_execution_dimensions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("progress.bcsr");
+        let mut writer =
+            crate::recording::ShellRecordingWriter::create(&path, 140, 25).expect("writer");
+        let output = format!("{}\r{}\r\x1b[Kdone\r\n", "x".repeat(139), "y".repeat(139));
+        writer
+            .write_replay_output(1, output.as_bytes())
+            .expect("output");
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+        let bytes = std::fs::read(path).expect("bytes");
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let request = serde_json::json!({
+            "columns": 140, "rows": 25, "command": "cargo check",
+            "_bcode_runtime": { "live_state_key": "call" }
+        });
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            224,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let render_request = || {
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+                &adapter,
+                "bcode.tool.request.shell.run",
+                &request,
+                &context,
+            )
+        };
+        let _ = render_request();
+        assert!(adapter.live_replay_data("call").is_none());
+        for (start, end) in [(0, 7), (7, 14), (14, bytes.len())] {
+            deliver_recording_range(&adapter, "call", &bytes, start, end, end == bytes.len());
+            let _ = render_request();
+        }
+        let replay = adapter.live_replay_data("call").expect("replay");
+        assert_eq!((replay.initial_columns, replay.initial_rows), (140, 25));
+        let result = serde_json::json!({
+            "mode": "terminal", "_bcode_runtime": { "live_state_key": "call" }
+        });
+        for width in [224, 40, 160, 80, 224] {
+            let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                width,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            );
+            let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+                &adapter,
+                "bcode.shell.run",
+                &result,
+                &context,
+            );
+            let text = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("done"), "{text}");
+            assert!(!text.contains("xxx") && !text.contains("yyy"), "{text}");
+        }
     }
 
     #[test]
