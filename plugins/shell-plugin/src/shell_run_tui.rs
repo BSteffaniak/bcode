@@ -181,6 +181,36 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 .is_some_and(|content_type| content_type.starts_with(SHELL_RECORDING_MEDIA_TYPE))
     }
 
+    fn viewport_input(
+        &self,
+        invocation_id: &str,
+        kind: &str,
+        columns: u16,
+        rows: u16,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        if !self.supports(kind) || columns <= 4 || rows == 0 {
+            return None;
+        }
+        if self.live_replay_data(invocation_id).is_some_and(|replay| {
+            replay.exit_code.is_some()
+                || replay.cancelled
+                || replay.timed_out
+                || (replay.columns == columns - 4 && replay.rows == rows)
+        }) {
+            return None;
+        }
+        Some(bcode_tool::ToolInvocationInput {
+            invocation_id: invocation_id.to_owned(),
+            input_id: format!("{invocation_id}-viewport-{columns}-{rows}"),
+            producer_id: "bcode.shell".to_owned(),
+            schema: crate::contracts::SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
+            schema_version: crate::contracts::SHELL_SCHEMA_VERSION,
+            payload: serde_json::json!({
+                "type": "resize", "columns": columns - 4, "rows": rows,
+            }),
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn artifact_chunk(
         &self,
@@ -2534,6 +2564,34 @@ mod tests {
         assert_eq!(
             render_hydrated_recording(&uninterrupted, "call"),
             render_hydrated_recording(&fresh_finalized, "call")
+        );
+    }
+
+    #[test]
+    fn allocated_viewport_proposes_pty_resize_without_mutating_replay() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter as _;
+        let adapter = ShellRunTuiVisualAdapter::default();
+        for (columns, rows) in [(144, 25), (84, 12), (144, 25)] {
+            let input = adapter
+                .viewport_input("call", SHELL_RUN_SCHEMA, columns, rows)
+                .expect("resize proposal");
+            assert_eq!(
+                input.payload,
+                serde_json::json!({
+                    "type": "resize", "columns": columns - 4, "rows": rows,
+                })
+            );
+            assert!(adapter.live_replay_data("call").is_none());
+        }
+        assert!(
+            adapter
+                .viewport_input("call", SHELL_RUN_SCHEMA, 4, 25)
+                .is_none()
+        );
+        assert!(
+            adapter
+                .viewport_input("call", SHELL_RUN_SCHEMA, 80, 0)
+                .is_none()
         );
     }
 

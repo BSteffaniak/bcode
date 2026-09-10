@@ -372,6 +372,7 @@ pub struct ServerState {
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
+    invocation_input_controllers: StdMutex<BTreeMap<(SessionId, String), ClientId>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     active_contributions: Arc<StdMutex<ActiveContributionRegistry>>,
     presentation_update_scopes:
@@ -1943,6 +1944,7 @@ impl ServerState {
             pending_permission_batches: Arc::new(StdMutex::default()),
             pending_tool_exchanges: Mutex::default(),
             active_plugin_invocations: Arc::default(),
+            invocation_input_controllers: StdMutex::default(),
             active_artifacts: Arc::default(),
             active_contributions: Arc::default(),
             presentation_update_scopes: Arc::default(),
@@ -2016,6 +2018,9 @@ impl ServerState {
             .lock()
             .await
             .remove(&client_id);
+        if let Ok(mut controllers) = self.invocation_input_controllers.lock() {
+            controllers.retain(|_, owner| *owner != client_id);
+        }
         if let Some(session_id) = session_id {
             let _detached = self.sessions.detach_session(session_id, client_id).await?;
             self.deactivate_session_namespace_if_inactive(session_id)
@@ -5640,7 +5645,7 @@ async fn handle_request_inner(
             .await
         }
         SessionLifecycleRequest::InvocationInput { session_id, input } => {
-            handle_invocation_input(request_id, state, writer, session_id, input).await
+            handle_invocation_input(request_id, client_id, state, writer, session_id, input).await
         }
         SessionLifecycleRequest::SessionDerivationSnapshot { session_id } => {
             handle_session_derivation_snapshot(request_id, state, writer, session_id).await
@@ -10410,12 +10415,14 @@ impl Drop for ActivePluginInvocationRegistration {
 
 async fn handle_invocation_input(
     request_id: u64,
+    client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
     input: ToolInvocationInput,
 ) -> Result<(), ServerError> {
-    let result = plugin_operations::route_invocation_input(state, session_id, input);
+    let result =
+        plugin_operations::route_controlled_invocation_input(state, session_id, client_id, input);
     match result {
         Ok(()) => {
             send_response(
@@ -39649,6 +39656,56 @@ library = "test"
         );
     }
     #[tokio::test]
+    async fn invocation_control_releases_on_detach_and_rejects_foreign_clients() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        let first = ClientId::new();
+        let second = ClientId::new();
+        let (inputs, mut received) = mpsc::channel(4);
+        let _registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session_id,
+            "call",
+            ActivePluginInvocation {
+                producer_plugin_id: "plugin".to_owned(),
+                inputs,
+            },
+            None,
+        )
+        .expect("register");
+        let input = ToolInvocationInput {
+            invocation_id: "call".to_owned(),
+            input_id: "resize".to_owned(),
+            producer_id: "plugin".to_owned(),
+            schema: "plugin.input".to_owned(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+        };
+        let route = |client| {
+            plugin_operations::route_controlled_invocation_input(
+                &state,
+                session_id,
+                client,
+                input.clone(),
+            )
+        };
+        route(first).expect("first claims");
+        assert_eq!(
+            route(second),
+            Err(plugin_operations::RouteInvocationInputError::NotController)
+        );
+        assert_eq!(received.try_recv().expect("input"), input);
+        assert!(received.try_recv().is_err());
+        // No canonical session is needed to release renderer control.
+        state.detach_client_session(first).await.expect("detach");
+        route(second).expect("second claims after release");
+        drop(state);
+        assert_eq!(received.try_recv().expect("input"), input);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises input validation and controller handoff over real IPC.
     async fn invocation_input_delivery_and_rejection_match_real_ipc() {
         let state = Arc::new(test_server_state(SessionManager::default()));
         let session_id = SessionId::new();
@@ -39683,8 +39740,43 @@ library = "test"
             stopped,
         ));
         let client = bcode_client::BcodeClient::new(endpoint);
+        client.ping().await.expect("connect input client");
+        let client_id = *state.clients.lock().await.iter().next().expect("client");
+        state.attach_client_session(client_id, session_id).await;
         plugin_operations::route_invocation_input(&state, session_id, input.clone()).unwrap();
         assert_eq!(received.try_recv().unwrap(), input);
+        let mut controlling_connection = client.connect("viewport-test").await.expect("connect");
+        controlling_connection
+            .send_invocation_input(session_id, input.clone())
+            .await
+            .expect("claim");
+        assert_eq!(received.try_recv().expect("controlled input"), input);
+        let rejected = client
+            .send_invocation_input(session_id, input.clone())
+            .await;
+        assert!(
+            matches!(rejected, Err(bcode_client::ClientError::Server { code, .. })
+            if code == "invocation_input_not_controller")
+        );
+        controlling_connection
+            .send_invocation_input(session_id, input.clone())
+            .await
+            .expect("same controller");
+        assert_eq!(received.try_recv().expect("controlled input"), input);
+        let controller_id = controlling_connection
+            .client_id()
+            .expect("controller identity");
+        drop(controlling_connection);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !state.clients.lock().await.contains(&controller_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controller disconnect");
         client
             .send_invocation_input(session_id, input.clone())
             .await
@@ -39748,11 +39840,13 @@ library = "test"
         input: &ToolInvocationInput,
     ) {
         use plugin_operations::RouteInvocationInputError as Error;
+        let mut other_session = input.clone();
+        other_session.invocation_id = "not-active".to_owned();
         assert_invocation_input_rejection(
             state,
             client,
-            SessionId::new(),
-            input.clone(),
+            session_id,
+            other_session,
             Error::NotActive,
         )
         .await;

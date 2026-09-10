@@ -1445,6 +1445,10 @@ impl ShellInvocationActionReader {
                     if columns == 0 || rows == 0 {
                         return Err("terminal resize dimensions must be positive".to_owned());
                     }
+                    let current = master.get_size().map_err(|error| error.to_string())?;
+                    if current.cols == columns && current.rows == rows {
+                        continue;
+                    }
                     let size = portable_pty::PtySize {
                         rows,
                         cols: columns,
@@ -1469,10 +1473,12 @@ impl ShellInvocationActionReader {
                     } else {
                         master.resize(size).map_err(|error| error.to_string())?;
                     }
-                    self.applied_resizes
+                    let mut applied = self
+                        .applied_resizes
                         .lock()
-                        .map_err(|_| "shell applied resize state poisoned".to_owned())?
-                        .push(ShellAppliedResize { columns, rows });
+                        .map_err(|_| "shell applied resize state poisoned".to_owned())?;
+                    applied.clear();
+                    applied.push(ShellAppliedResize { columns, rows });
                 }
             }
         }
@@ -3812,8 +3818,8 @@ mod tests {
         if index == 0 {
             std::thread::sleep(Duration::from_millis(40));
         }
-        let response = if index < 2 {
-            let (columns, rows) = if index == 0 { (100, 30) } else { (132, 40) };
+        let response = if index < 4 {
+            let (columns, rows) = if index < 2 { (100, 30) } else { (132, 40) };
             ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Received {
                 input: bcode_tool::ToolInvocationInput {
                     invocation_id,

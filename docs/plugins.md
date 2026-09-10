@@ -27,6 +27,28 @@ bcode plugin services
 bcode plugin check
 ```
 
+## Live terminal viewport control
+
+Native TUI visual adapters may propose invocation input through `viewport_input`.
+The TUI calls this outside painting for active artifact-backed invocations, using
+transcript geometry rather than output length. The shell adapter subtracts its
+four-column inset and proposes a typed PTY resize. Recorded dimensions acknowledge
+the change; unchanged dimensions and terminal invocations produce no proposal.
+The host bounds batches to 64 inputs and retries at most every 250 ms during runtime
+updates. Adapters without this optional native capability retain presentation-only reflow.
+
+Viewport control uses a persistent application client connection. The first
+successfully queued input claims an invocation for that connection; competing
+connections receive `invocation_input_not_controller`. Disconnect or detach releases
+control. Queue acceptance does not mean execution completed, and input IDs do not
+provide generic deduplication. Shell resize is convergent: repeated current dimensions
+produce neither PTY mutation nor recording frames. Other input protocols must define
+their own retry safety.
+
+The shell plugin owns PTY resizing and ordered recording frames. Terminal replay is
+initialized from recording dimensions, never viewport defaults. Completed output
+continues to reflow through BMUX content projections without execution input.
+
 ## Selection
 
 Plugin loading and model-callable tool exposure are separate choices:

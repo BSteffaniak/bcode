@@ -1419,6 +1419,18 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         PluginTuiTranscriptHeader::default()
     }
 
+    /// Propose producer-owned execution input for an allocated terminal viewport.
+    /// Called outside painting; the host must authorize and dispatch the proposal.
+    fn viewport_input(
+        &self,
+        _invocation_id: &str,
+        _kind: &str,
+        _columns: u16,
+        _rows: u16,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        None
+    }
+
     /// Convert a renderer event into neutral input for an active invocation.
     fn invocation_event_input(
         &self,
@@ -2282,6 +2294,23 @@ impl PluginTuiRegistry {
     ) -> Option<PluginTuiTranscriptHeader> {
         self.visual_adapter(adapter_id, kind)
             .map(|adapter| adapter.transcript_header(kind, payload))
+    }
+
+    /// Propose input for an allocated viewport without executing it.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "Option already carries must-use semantics"
+    )]
+    pub fn visual_viewport_input(
+        &self,
+        adapter_id: &str,
+        invocation_id: &str,
+        kind: &str,
+        columns: u16,
+        rows: u16,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        self.visual_adapter(adapter_id, kind)
+            .and_then(|adapter| adapter.viewport_input(invocation_id, kind, columns, rows))
     }
 
     /// Convert a renderer event through a matching visual adapter.

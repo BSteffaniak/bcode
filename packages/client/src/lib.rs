@@ -5448,6 +5448,24 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
+    /// Deliver input on this connection, retaining its invocation-control identity.
+    ///
+    /// # Errors
+    /// Returns a transport, ownership, or input-routing error. Input is not replayed automatically.
+    pub async fn send_invocation_input(
+        &mut self,
+        session_id: SessionId,
+        input: bcode_tool::ToolInvocationInput,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::InvocationInput { session_id, input })
+            .await?
+        {
+            ResponsePayload::InvocationInputAccepted => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return the server-assigned client identifier.
     #[must_use]
     pub const fn client_id(&self) -> Option<ClientId> {

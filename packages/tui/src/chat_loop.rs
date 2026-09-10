@@ -233,6 +233,10 @@ pub struct ChatLoopState {
     slash_palette: Option<slash_palette::SlashPalette>,
     foreground_client: BcodeClient,
     passive_client: BcodeClient,
+    viewport_input_task: Option<tokio::task::JoinHandle<()>>,
+    viewport_input_connection:
+        std::sync::Arc<tokio::sync::Mutex<Option<bcode_client::ClientConnection>>>,
+    viewport_input_retry_at: Instant,
     daemon_connection: DaemonConnectionMonitor,
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
@@ -274,6 +278,14 @@ pub struct ChatLoopState {
     frame_index: u64,
 }
 
+impl Drop for ChatLoopState {
+    fn drop(&mut self) {
+        if let Some(task) = self.viewport_input_task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl ChatLoopState {
     pub fn new(
         foreground_client: &BcodeClient,
@@ -285,6 +297,9 @@ impl ChatLoopState {
             slash_palette: None,
             foreground_client: foreground_client.clone(),
             passive_client: passive_client.clone(),
+            viewport_input_task: None,
+            viewport_input_connection: std::sync::Arc::default(),
+            viewport_input_retry_at: Instant::now(),
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             thinking_dialog: None,
@@ -1417,9 +1432,65 @@ impl ChatLoopState {
     }
 
     pub fn session_changed(&mut self, session_id: Option<bcode_session_models::SessionId>) {
+        if let Some(task) = self.viewport_input_task.take() {
+            task.abort();
+        }
+        self.viewport_input_connection = std::sync::Arc::default();
+        self.viewport_input_retry_at = Instant::now();
         self.request_draft_handoff.clear();
         self.markdown_projection.invalidate();
         self.artifact_stream.retain_session(session_id);
+    }
+
+    fn prepare_viewport_inputs(&mut self, chat: &ActiveChat, frame_area: Rect) {
+        if Instant::now() < self.viewport_input_retry_at
+            || self
+                .viewport_input_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let Some(session_id) = chat.attached_session_id() else {
+            return;
+        };
+        let Some(presentation) = chat.app.plugin_presentation() else {
+            return;
+        };
+        let area = super::render::transcript_area_for_frame(&chat.app, frame_area);
+        let inputs = self.artifact_stream.viewport_inputs(
+            session_id,
+            presentation,
+            bmux_tui::geometry::Size::new(area.width, area.height.saturating_sub(3).max(1)),
+            |id| chat.app.tool_invocation_is_terminal(id),
+        );
+        self.viewport_input_retry_at = Instant::now() + std::time::Duration::from_millis(250);
+        if inputs.is_empty() {
+            return;
+        }
+        let client = self.foreground_client.clone();
+        let connection = std::sync::Arc::clone(&self.viewport_input_connection);
+        self.viewport_input_task = Some(tokio::spawn(async move {
+            let mut connection = connection.lock().await;
+            if connection.is_none() {
+                match client.connect("bcode-viewport-control").await {
+                    Ok(client) => *connection = Some(client),
+                    Err(error) => {
+                        tracing::debug!(%error, "viewport connection deferred");
+                        return;
+                    }
+                }
+            }
+            let Some(client) = connection.as_mut() else {
+                return;
+            };
+            for input in inputs {
+                if let Err(error) = client.send_invocation_input(session_id, input).await {
+                    tracing::debug!(%error, "viewport input deferred");
+                }
+            }
+            drop(connection);
+        }));
     }
 
     pub fn prepare_runtime_work(
@@ -1427,6 +1498,7 @@ impl ChatLoopState {
         chat: &mut ActiveChat,
         frame_area: Rect,
     ) -> super::invalidation::UiInvalidation {
+        self.prepare_viewport_inputs(chat, frame_area);
         self.artifact_stream.start_due_fetches(Instant::now());
         self.request_latest_markdown_projection(chat, frame_area.width);
         record_artifact_stream_stats(self);

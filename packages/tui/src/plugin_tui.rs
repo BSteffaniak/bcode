@@ -818,6 +818,25 @@ impl PluginTuiPresentation {
         }
     }
 
+    /// Prepare execution input outside rendering for a routed native visual.
+    pub fn viewport_input(
+        &self,
+        invocation_id: &str,
+        producer: &str,
+        schema: &str,
+        schema_version: u32,
+        viewport: bmux_tui::geometry::Size,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        let route = self.visual_route(schema, schema_version, Some(producer))?;
+        self.registry(&route.plugin_id)?.visual_viewport_input(
+            &route.adapter_id,
+            invocation_id,
+            schema,
+            viewport.width,
+            viewport.height,
+        )
+    }
+
     /// Deliver opaque artifact bytes to the retained adapter selected by generic routing metadata.
     ///
     /// # Errors

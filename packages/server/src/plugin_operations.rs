@@ -6,6 +6,8 @@ use tokio::sync::mpsc;
 /// Failure while routing input to an active plugin invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteInvocationInputError {
+    /// Another connected client controls this invocation.
+    NotController,
     /// No matching active invocation exists.
     NotActive,
     /// The producer does not own the selected invocation.
@@ -29,6 +31,7 @@ impl RouteInvocationInputError {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
+            Self::NotController => "invocation_input_not_controller",
             Self::NotActive => "plugin_invocation_not_active",
             Self::ProducerMismatch => "plugin_invocation_producer_mismatch",
             Self::InvalidProducer => "invalid_invocation_input_producer",
@@ -44,6 +47,7 @@ impl RouteInvocationInputError {
     #[must_use]
     pub const fn message(self) -> &'static str {
         match self {
+            Self::NotController => "invocation input requires the controlling client",
             Self::NotActive => "plugin invocation is not active",
             Self::ProducerMismatch => "invocation input producer does not own the invocation",
             Self::InvalidProducer => "invocation input producer id must not be empty",
@@ -107,6 +111,40 @@ pub const fn normalize_error(_error: &bcode_plugin::PluginLoadError) -> PublicPl
         code: "plugin_error",
         message: "plugin operation failed; inspect local daemon diagnostics",
     }
+}
+
+/// Route input from a connected client. The first successfully enqueued input claims
+/// control until that client disconnects or detaches. Rejected input never claims control.
+///
+/// # Errors
+/// Returns an ownership, validation, or bounded queue error without changing control.
+pub fn route_controlled_invocation_input(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    client_id: bcode_session_models::ClientId,
+    input: bcode_tool::ToolInvocationInput,
+) -> Result<(), RouteInvocationInputError> {
+    let mut controllers = state
+        .invocation_input_controllers
+        .lock()
+        .map_err(|_| RouteInvocationInputError::NotController)?;
+    let active = state
+        .active_plugin_invocations
+        .lock()
+        .map_err(|_| RouteInvocationInputError::NotActive)?;
+    controllers.retain(|key, _| active.contains_key(key));
+    drop(active);
+    let key = (session_id, input.invocation_id.clone());
+    if controllers
+        .get(&key)
+        .is_some_and(|owner| *owner != client_id)
+    {
+        return Err(RouteInvocationInputError::NotController);
+    }
+    route_invocation_input(state, session_id, input)?;
+    controllers.insert(key, client_id);
+    drop(controllers);
+    Ok(())
 }
 
 /// Route one bounded producer-owned input to an active plugin invocation.

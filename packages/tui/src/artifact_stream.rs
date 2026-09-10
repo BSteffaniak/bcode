@@ -131,6 +131,38 @@ impl ArtifactStreamCoordinator {
         }
     }
 
+    /// Propose bounded viewport input for nonterminal artifact-backed invocations.
+    pub(crate) fn viewport_inputs(
+        &self,
+        session_id: SessionId,
+        presentation: &crate::plugin_tui::PluginTuiPresentation,
+        viewport: bmux_tui::geometry::Size,
+        terminal: impl Fn(&str) -> bool,
+    ) -> Vec<bcode_tool::ToolInvocationInput> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.artifact_fetches
+            .iter()
+            .filter_map(|(key, state)| {
+                let target = state.target.as_ref()?;
+                if key.0 != session_id
+                    || target.finalized
+                    || terminal(&key.1)
+                    || !seen.insert(&key.1)
+                {
+                    return None;
+                }
+                presentation.viewport_input(
+                    &key.1,
+                    &target.producer_plugin_id,
+                    &target.schema,
+                    target.schema_version,
+                    viewport,
+                )
+            })
+            .take(64)
+            .collect()
+    }
+
     pub(crate) fn drain_stats(&mut self) -> ArtifactStreamStats {
         self.stats.backlog = u64::try_from(
             self.artifact_fetches
