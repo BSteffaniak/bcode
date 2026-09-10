@@ -3969,8 +3969,13 @@ impl BmuxApp {
     }
 
     pub(crate) fn capture_stable_transcript_anchor(&mut self) {
-        if self.viewport.follows_bottom()
-            || self.pending_stable_transcript_anchor.is_some()
+        if self.viewport.follows_bottom() {
+            if let Some(presentation) = &self.plugin_presentation {
+                presentation.clear_content_positions();
+            }
+            return;
+        }
+        if self.pending_stable_transcript_anchor.is_some()
             || self.transcript_scroll_animation.is_some()
         {
             return;
@@ -3979,6 +3984,11 @@ impl BmuxApp {
             && self.transcript.presentation_index(anchor.item_id).is_some()
         {
             self.pending_stable_transcript_anchor = Some(anchor.clone());
+            if let Some((identity, offset)) = &anchor.content
+                && let Some(presentation) = &self.plugin_presentation
+            {
+                presentation.retain_content_position(identity, *offset);
+            }
             return;
         }
         let top_row = self

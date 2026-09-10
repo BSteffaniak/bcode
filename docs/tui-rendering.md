@@ -205,8 +205,20 @@ line numbers are unknown; completion's absolute file line numbers do not change 
 Chrome, omission rows, and clipped lines do not receive source identity. Two sides may map to the
 same rendered row. Native adapters return rows and correspondence together through `layout`;
 legacy adapters retain the default rows/anchors bridge. Wrapped positions resolve to their owning
-source line, not an invented byte-perfect position within the line. Shell terminal correspondence
-remains terminal-region based because terminal screen mutation is not immutable file source.
+source line, not an invented byte-perfect position within the line.
+
+Serialized visual contract version 4 adds optional adapter-owned half-open source ranges.
+Versions 1–3 remain accepted, but cannot claim version-4 correspondence. The TUI scopes source
+identities to their producer and resolves retained positions by range containment, not physical
+row offsets. Shell captures additionally scope identity by invocation and capture epoch; live
+content changes, capture scope changes, and replay resets invalidate old correspondence.
+Width-only changes reuse BMUX logical coordinates and may request an anchor-centered bounded
+window. Bottom-follow clears that local request. Unavailable positions use item fallback.
+
+Positioned shell output supports local horizontal wheel scrolling and right-click focus, then
+Left/Right or Home; Escape releases focus. These events never become invocation input and do
+not resize the PTY. Expanded viewing and source-aware selection/copy are not yet implemented;
+the existing transcript selection behavior has not been promoted to a source-aware contract.
 
 ### Published dependencies
 

@@ -313,11 +313,25 @@ impl IndexedTranscriptLayout {
             .iter()
             .filter(|anchor| anchor.row <= row)
             .max_by_key(|anchor| anchor.row)
-            .map(|anchor| (anchor.key.as_str(), row.saturating_sub(anchor.row)))
+            .map(|anchor| {
+                anchor.source.as_ref().map_or_else(
+                    || (anchor.key.as_str(), row.saturating_sub(anchor.row)),
+                    |source| (source.identity.as_str(), source.start),
+                )
+            })
     }
 
     pub fn resolve_content_anchor(&self, index: usize, key: &str, offset: usize) -> Option<usize> {
         let entry = self.transcript.entries.get(index)?;
+        if let Some(anchor) = entry.anchors.iter().find(|anchor| {
+            anchor.source.as_ref().is_some_and(|source| {
+                source.identity == key
+                    && ((source.start..source.end).contains(&offset)
+                        || source.start == source.end && source.start == offset)
+            })
+        }) {
+            return Some(anchor.row);
+        }
         let start = entry.anchors.iter().find(|anchor| anchor.key == key)?.row;
         let end = entry
             .anchors
@@ -571,10 +585,12 @@ mod tests {
                 anchors: vec![
                     TuiVisualAnchor {
                         key: "body".to_owned(),
+                        source: None,
                         row: 1,
                     },
                     TuiVisualAnchor {
                         key: "status".to_owned(),
+                        source: None,
                         row: 4,
                     },
                 ],
@@ -630,6 +646,43 @@ mod tests {
     }
 
     #[test]
+    fn source_position_resolves_inside_a_reflowed_row() {
+        use bcode_plugin_sdk::tui_visual::{TuiVisualAnchor, TuiVisualSourceRange};
+        let mut layout = IndexedTranscriptLayout::default();
+        let make = |row, start, end| TuiVisualAnchor {
+            key: format!("row-{row}"),
+            row,
+            source: Some(TuiVisualSourceRange {
+                identity: "capture:line".to_owned(),
+                start,
+                end,
+            }),
+        };
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("narrow".to_owned()),
+            |_| TranscriptLayoutRows::Anchored {
+                rows: vec![Line::default(); 3],
+                anchors: vec![make(0, 0, 3), make(1, 3, 6), make(2, 6, 9)],
+            },
+            |_| None,
+        );
+        assert_eq!(layout.content_anchor(0, 2), Some(("capture:line", 6)));
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("wide".to_owned()),
+            |_| TranscriptLayoutRows::Anchored {
+                rows: vec![Line::default()],
+                anchors: vec![make(0, 0, 9)],
+            },
+            |_| None,
+        );
+        assert_eq!(layout.resolve_content_anchor(0, "capture:line", 6), Some(0));
+        assert_eq!(layout.resolve_content_anchor(0, "stale:line", 6), None);
+        assert_eq!(layout.resolve_content_anchor(0, "capture:line", 9), None);
+    }
+
+    #[test]
     fn accepted_content_key_resolves_after_header_growth() {
         use bcode_plugin_sdk::tui_visual::TuiVisualAnchor;
         let mut layout = IndexedTranscriptLayout::default();
@@ -641,6 +694,7 @@ mod tests {
                 anchors: vec![TuiVisualAnchor {
                     key: "body".to_owned(),
                     row: 1,
+                    source: None,
                 }],
             },
             |_| None,
@@ -654,6 +708,7 @@ mod tests {
                 anchors: vec![TuiVisualAnchor {
                     key: "body".to_owned(),
                     row: 3,
+                    source: None,
                 }],
             },
             |_| None,

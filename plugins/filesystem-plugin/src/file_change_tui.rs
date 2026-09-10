@@ -174,6 +174,7 @@ fn source_anchors(
         anchors.push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
             key: format!("diff:{side}:{}", mapping.line.saturating_sub(start)),
             row: mapping.row,
+            source: None,
         });
     }
     (projection.rows, anchors)

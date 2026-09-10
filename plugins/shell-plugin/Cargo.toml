@@ -26,6 +26,7 @@ bcode_tui_components = { workspace = true, features = [
     "terminal-viewer",
 ], optional = true }
 bcode_workflow = { workspace = true }
+bmux_keyboard = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
 bmux_tui = { workspace = true, optional = true }
 portable-pty = { workspace = true }
@@ -45,6 +46,7 @@ default = []
 fail-on-warnings = []
 static-bundled = [
     "bcode_tui_components",
+    "bmux_keyboard",
     "bmux_terminal_grid",
     "bmux_tui",
     "shuck-formatter",

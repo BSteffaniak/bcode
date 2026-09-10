@@ -2720,6 +2720,7 @@ fn push_transcript_item_rows(
             bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
                 key: format!("markdown:{}", anchor.fragment),
                 row: body_start.saturating_add(usize::from(anchor.row)),
+                source: None,
             }
         }));
     }
@@ -4564,6 +4565,9 @@ fn push_routed_tool_surface(
     let body_start = rows.len();
     anchors.extend(routed.anchors.into_iter().map(|mut anchor| {
         anchor.key = format!("{}:{}", routed.route.plugin_id, anchor.key);
+        if let Some(source) = &mut anchor.source {
+            source.identity = format!("{}:{}", routed.route.plugin_id, source.identity);
+        }
         anchor.row = anchor.row.saturating_add(body_start);
         anchor
     }));

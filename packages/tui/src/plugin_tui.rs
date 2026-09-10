@@ -451,6 +451,39 @@ impl PluginTuiPresentation {
         }
     }
 
+    /// Restore an opaque, producer-scoped position in this view's native adapters.
+    pub fn retain_content_position(&self, identity: &str, offset: usize) {
+        let Some((plugin, identity)) = identity.split_once(':') else {
+            return;
+        };
+        if let Some(registry) = self.registry(plugin) {
+            registry.retain_visual_content_position(identity, offset);
+        }
+    }
+
+    /// Clear native restoration requests when resuming bottom-follow.
+    pub fn clear_content_positions(&self) {
+        if let Ok(registries) = self.registries.lock() {
+            for registry in registries.values() {
+                registry.clear_visual_content_positions();
+            }
+        }
+    }
+
+    /// Send local input to a targeted visual; never to its running invocation.
+    pub fn content_event(&self, identity: &str, event: &bmux_tui::event::Event) -> bool {
+        let Some((plugin, identity)) = identity.split_once(':') else {
+            return false;
+        };
+        let changed = self
+            .registry(plugin)
+            .is_some_and(|registry| registry.visual_content_event(identity, event));
+        if changed {
+            self.full_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
+    }
+
     /// Return presentation metadata for an exact model-callable tool.
     #[must_use]
     pub fn tool_presentation(

@@ -1463,6 +1463,19 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Restore a renderer-local content position before the next layout.
+    /// This never dispatches invocation input or changes canonical state.
+    fn retain_content_position(&self, _identity: &str, _offset: usize) {}
+
+    /// Clear local anchor requests when the view follows its newest content.
+    fn clear_content_positions(&self) {}
+
+    /// Handle focused presentation navigation only. Returning true requests
+    /// layout invalidation; execution input must use its separate contract.
+    fn content_event(&self, _identity: &str, _event: &Event) -> bool {
+        false
+    }
+
     /// Return correspondence for exactly the rows just prepared by this adapter.
     /// The default keeps older adapters usable with host item-level fallback.
     fn anchors(
@@ -2283,6 +2296,29 @@ impl PluginTuiRegistry {
     ) -> Option<bcode_tool::ToolInvocationInput> {
         self.visual_adapter(adapter_id, kind)
             .and_then(|adapter| adapter.invocation_event_input(invocation_id, kind, payload, event))
+    }
+
+    /// Offer an opaque position to native presentation adapters. Identities are
+    /// adapter-owned; unmatched requests have no effect.
+    pub fn retain_visual_content_position(&self, identity: &str, offset: usize) {
+        for adapter in self.visual_adapters.values() {
+            adapter.retain_content_position(identity, offset);
+        }
+    }
+
+    /// Clear view-local content restoration requests.
+    pub fn clear_visual_content_positions(&self) {
+        for adapter in self.visual_adapters.values() {
+            adapter.clear_content_positions();
+        }
+    }
+
+    /// Route local visual navigation without invoking tools or services.
+    #[must_use]
+    pub fn visual_content_event(&self, identity: &str, event: &Event) -> bool {
+        self.visual_adapters
+            .values()
+            .any(|adapter| adapter.content_event(identity, event))
     }
 
     /// Return whether the owning visual adapter consumes one artifact reference.

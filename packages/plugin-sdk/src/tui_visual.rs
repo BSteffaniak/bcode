@@ -16,7 +16,7 @@ pub const OP_DELIVER_TUI_VISUAL_ARTIFACT: &str = "artifact_chunk";
 /// Earliest serialized TUI visual extension contract version accepted by this SDK.
 pub const MIN_TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 1;
 /// Current serialized TUI visual extension contract version.
-pub const TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 3;
+pub const TUI_VISUAL_ADAPTER_CONTRACT_VERSION: u32 = 4;
 /// Maximum rows accepted from one serialized visual response.
 pub const MAX_SERIALIZED_TUI_VISUAL_ROWS: usize = 256;
 /// Maximum spans accepted across one serialized visual response.
@@ -126,6 +126,20 @@ pub struct RenderTuiVisualRequest {
 pub struct TuiVisualAnchor {
     pub key: String,
     pub row: usize,
+    /// Version 4 source interval; coordinates belong to the adapter, not the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TuiVisualSourceRange>,
+}
+
+/// Half-open source interval represented by a display row.
+///
+/// Empty source lines use equal endpoints. Identity is scoped by the host to producer and invocation
+/// and must change when content correspondence is no longer trustworthy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiVisualSourceRange {
+    pub identity: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 /// Validate bounded correspondence before accepting a plugin layout.
@@ -141,10 +155,26 @@ pub fn validate_visual_anchors(anchors: &[TuiVisualAnchor], rows: usize) -> Resu
         return Err("too many visual anchors".to_owned());
     }
     let mut keys = std::collections::BTreeSet::new();
+    let mut ranges: std::collections::BTreeMap<&str, Vec<(usize, usize)>> =
+        std::collections::BTreeMap::new();
     for anchor in anchors {
+        if let Some(source) = &anchor.source {
+            let previous = ranges.entry(&source.identity).or_default();
+            if previous.iter().any(|&(start, end)| {
+                source.start < end && start < source.end || start == source.start
+            }) {
+                return Err("overlapping visual source ranges".to_owned());
+            }
+            previous.push((source.start, source.end));
+        }
         if anchor.key.is_empty()
             || anchor.key.len() > 256
             || anchor.row >= rows
+            || anchor.source.as_ref().is_some_and(|source| {
+                source.identity.is_empty()
+                    || source.identity.len() > 256
+                    || source.start > source.end
+            })
             || !keys.insert(&anchor.key)
         {
             return Err("invalid visual anchor".to_owned());
@@ -188,6 +218,9 @@ impl RenderTuiVisualResponse {
         if self.version < 3 && !self.anchors.is_empty() {
             return Err("visual anchors require response version 3".to_owned());
         }
+        if self.version < 4 && self.anchors.iter().any(|anchor| anchor.source.is_some()) {
+            return Err("visual source ranges require response version 4".to_owned());
+        }
         validate_visual_anchors(&self.anchors, self.rows.len())?;
         if self.version < 2
             && self
@@ -226,14 +259,44 @@ impl RenderTuiVisualResponse {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn source_ranges_require_v4_and_reject_ambiguous_overlap() {
+        let anchor = TuiVisualAnchor {
+            key: "row".to_owned(),
+            row: 0,
+            source: Some(TuiVisualSourceRange {
+                identity: "capture:line".to_owned(),
+                start: 0,
+                end: 2,
+            }),
+        };
+        let mut response = RenderTuiVisualResponse {
+            version: 3,
+            render_mode: String::new(),
+            title: None,
+            timeout_ms: None,
+            rows: vec![SerializedTuiRow::default()],
+            anchors: vec![anchor.clone()],
+        };
+        assert!(response.validate().is_err());
+        response.version = 4;
+        assert!(response.validate().is_ok());
+        let mut duplicate = anchor;
+        duplicate.key = "other".to_owned();
+        response.anchors.push(duplicate);
+        assert!(response.validate().is_err());
+    }
+
+    #[test]
     fn same_row_old_and_new_source_keys_are_valid() {
         let anchors = vec![
             TuiVisualAnchor {
                 key: "old:0".to_owned(),
+                source: None,
                 row: 0,
             },
             TuiVisualAnchor {
                 key: "new:0".to_owned(),
+                source: None,
                 row: 0,
             },
         ];
@@ -246,6 +309,7 @@ mod tests {
         use super::*;
         let anchor = TuiVisualAnchor {
             key: "body".to_owned(),
+            source: None,
             row: 0,
         };
         assert!(validate_visual_anchors(std::slice::from_ref(&anchor), 1).is_ok());

@@ -81,6 +81,14 @@ impl LiveTerminalReplay {
     }
 
     fn apply_frame(&mut self, frame: &TerminalReplayFrame) -> bool {
+        if self
+            .projection
+            .capture
+            .as_ref()
+            .is_some_and(|(_, live, _)| *live)
+        {
+            self.projection.capture = None;
+        }
         let Some(stream) = self.ensure_stream() else {
             return false;
         };
@@ -97,7 +105,10 @@ impl LiveTerminalReplay {
 
     fn reset_stream(&mut self) {
         self.stream = None;
-        self.projection = ShellContentProjection::default();
+        self.projection = ShellContentProjection {
+            epoch: self.projection.epoch.saturating_add(1),
+            ..ShellContentProjection::default()
+        };
     }
 }
 
@@ -345,6 +356,68 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         .collect()
     }
 
+    fn retain_content_position(&self, identity: &str, offset: usize) {
+        let Some((key, capture, line)) = shell_content_identity(identity) else {
+            return;
+        };
+        if let Ok(mut replays) = self.live_replays.lock()
+            && let Some(replay) = replays.get_mut(key)
+        {
+            replay.projection.retained = Some(bmux_terminal_grid::ContentAnchor {
+                capture,
+                line,
+                column: offset,
+            });
+        }
+    }
+
+    fn clear_content_positions(&self) {
+        if let Ok(mut replays) = self.live_replays.lock() {
+            for replay in replays.values_mut() {
+                replay.projection.retained = None;
+            }
+        }
+    }
+
+    fn content_event(&self, identity: &str, event: &bmux_tui::event::Event) -> bool {
+        let Some((key, _, _)) = shell_content_identity(identity) else {
+            return false;
+        };
+        let Ok(mut replays) = self.live_replays.lock() else {
+            return false;
+        };
+        let Some(replay) = replays.get_mut(key) else {
+            return false;
+        };
+        if !replay
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.grid().mode() == GridMode::Alternate)
+        {
+            return false;
+        }
+        let delta = match event {
+            bmux_tui::event::Event::Mouse(mouse) => match mouse.kind {
+                bmux_tui::event::MouseEventKind::ScrollLeft => -8,
+                bmux_tui::event::MouseEventKind::ScrollRight => 8,
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Right) => 0,
+                _ => return false,
+            },
+            bmux_tui::event::Event::Key(key) if key.modifiers.is_empty() => match key.key {
+                bmux_keyboard::KeyCode::Left => -8,
+                bmux_keyboard::KeyCode::Right => 8,
+                bmux_keyboard::KeyCode::Home => {
+                    replay.projection.horizontal = 0;
+                    return true;
+                }
+                _ => return false,
+            },
+            _ => return false,
+        };
+        replay.projection.horizontal = replay.projection.horizontal.saturating_add_signed(delta);
+        true
+    }
+
     fn anchors(
         &self,
         _kind: &str,
@@ -356,9 +429,62 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             return Vec::new();
         }
         let row = shell_terminal_prompt_rows(payload, context.width(), context).len();
+        if let Some(key) = payload
+            .get("_bcode_runtime")
+            .and_then(|runtime| runtime.get("live_state_key"))
+            .and_then(serde_json::Value::as_str)
+            && let Ok(replays) = self.live_replays.lock()
+            && let Some(replay) = replays.get(key)
+        {
+            if replay
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.grid().mode() == GridMode::Alternate)
+            {
+                return (row..rows.len())
+                    .map(|row| bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                        key: format!("terminal:{}:{}:0:{}", key.len(), key, row),
+                        row,
+                        source: None,
+                    })
+                    .collect();
+            }
+            let status = usize::from(
+                replay.cancelled
+                    || replay.timed_out
+                    || replay.signal.is_some()
+                    || replay.exit_code.is_some(),
+            );
+            let body_start = row + status;
+            return replay
+                .projection
+                .sources
+                .iter()
+                .enumerate()
+                .filter_map(|(index, source)| {
+                    let row = body_start + index;
+                    (row < rows.len()).then(|| bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                        key: format!("terminal-row:{index}"),
+                        row,
+                        source: Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
+                            identity: format!(
+                                "terminal:{}:{}:{}:{}",
+                                key.len(),
+                                key,
+                                source.start.capture,
+                                source.start.line
+                            ),
+                            start: source.start.column,
+                            end: source.end.column,
+                        }),
+                    })
+                })
+                .collect();
+        }
         (row < rows.len())
             .then(|| bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
                 key: "terminal-body".to_owned(),
+                source: None,
                 row,
             })
             .into_iter()
@@ -1148,6 +1274,16 @@ fn shell_terminal_stream(
     Some(stream)
 }
 
+fn shell_content_identity(identity: &str) -> Option<(&str, u128, usize)> {
+    let rest = identity.strip_prefix("terminal:")?;
+    let (length, rest) = rest.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    let key = rest.get(..length)?;
+    let suffix = rest.get(length..)?.strip_prefix(':')?;
+    let (capture, line) = suffix.split_once(':')?;
+    Some((key, capture.parse().ok()?, line.parse().ok()?))
+}
+
 const SHELL_PROJECTION_BUDGET: ContentBudget = ContentBudget {
     cells: 1_000_000,
     bytes: 16 * 1024 * 1024,
@@ -1155,7 +1291,11 @@ const SHELL_PROJECTION_BUDGET: ContentBudget = ContentBudget {
 
 #[derive(Default)]
 struct ShellContentProjection {
+    epoch: u128,
     capture: Option<(u64, bool, Result<ContentProjection, HistorySliceError>)>,
+    sources: Vec<bmux_terminal_grid::ContentRowSource>,
+    retained: Option<bmux_terminal_grid::ContentAnchor>,
+    horizontal: usize,
 }
 
 impl ShellContentProjection {
@@ -1166,9 +1306,15 @@ impl ShellContentProjection {
         width: u16,
         max_rows: usize,
     ) -> Result<Vec<PhysicalRow>, HistorySliceError> {
+        self.sources.clear();
         let width = usize::from(width.saturating_sub(4).max(1));
         if grid.mode() == GridMode::Alternate {
-            return grid.screen_window(0..width, 0..max_rows, SHELL_PROJECTION_BUDGET);
+            self.horizontal = self.horizontal.min(grid.width().saturating_sub(width));
+            return grid.screen_window(
+                self.horizontal..self.horizontal.saturating_add(width),
+                0..max_rows,
+                SHELL_PROJECTION_BUDGET,
+            );
         }
         let revision = grid.content_revision();
         if !self
@@ -1176,15 +1322,17 @@ impl ShellContentProjection {
             .as_ref()
             .is_some_and(|(cached, scope, _)| *cached == revision && *scope == live)
         {
+            self.epoch = self.epoch.saturating_add(1);
             let capture = if live {
-                grid.capture_viewport(u128::from(revision), SHELL_PROJECTION_BUDGET)
+                grid.capture_viewport(self.epoch, SHELL_PROJECTION_BUDGET)
             } else {
                 grid.capture_content(
-                    u128::from(revision),
+                    self.epoch,
                     MAX_INLINE_TERMINAL_ROWS,
                     SHELL_PROJECTION_BUDGET,
                 )
             };
+            self.retained = None;
             self.capture = Some((revision, live, capture));
         }
         let (_, _, capture) = self
@@ -1193,9 +1341,17 @@ impl ShellContentProjection {
             .ok_or(HistorySliceError::Unavailable)?;
         let projection = capture.as_mut().map_err(|error| *error)?;
         projection.prepare(width, SHELL_PROJECTION_BUDGET)?;
-        projection
-            .tail(max_rows, SHELL_PROJECTION_BUDGET.bytes)
-            .map(|window| window.rows)
+        let window = if let Some(row) = self.retained.and_then(|anchor| projection.resolve(anchor))
+        {
+            projection.window(
+                row..row.saturating_add(max_rows),
+                SHELL_PROJECTION_BUDGET.bytes,
+            )?
+        } else {
+            projection.tail(max_rows, SHELL_PROJECTION_BUDGET.bytes)?
+        };
+        self.sources = window.sources;
+        Ok(window.rows)
     }
 }
 
@@ -1240,9 +1396,15 @@ fn shell_terminal_grid_rows(
         }
     }
     if grid.mode() == GridMode::Alternate && grid.width() > usize::from(width.saturating_sub(4)) {
-        output.push(Line::from(
-            "    positioned screen clipped to available width",
-        ));
+        output.push(Line::from(format!(
+            "    columns {}–{} / {} · right-click: focus · ←/→: pan · Esc: leave",
+            projection.horizontal.saturating_add(1),
+            projection
+                .horizontal
+                .saturating_add(usize::from(width.saturating_sub(4)))
+                .min(grid.width()),
+            grid.width(),
+        )));
     }
     output
 }
@@ -2630,6 +2792,62 @@ mod tests {
             Some(&u64::try_from(first.len() + second.len()).expect("emulated bytes"))
         );
         assert_eq!(values.get("emulate_frames"), Some(&3));
+    }
+
+    #[test]
+    fn positioned_keyboard_pan_changes_only_local_columns() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let key = "positioned";
+        let bytes = b"\x1b[?1049habcdefghijklmnop";
+        adapter.update_live_replay(key, bytes, None, 20, 3);
+        let before = retained_snapshot(&adapter, key);
+        let identity = format!("terminal:{}:{}:0:0", key.len(), key);
+        let event = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Right,
+            modifiers: bmux_keyboard::Modifiers::default(),
+        });
+        assert!(adapter.content_event(&identity, &event));
+        let mut replays = adapter.live_replays.lock().unwrap();
+        let replay = replays.get_mut(key).unwrap();
+        let grid = replay.stream.as_ref().unwrap().grid();
+        let rows = replay.projection.rows(grid, true, 8, 3).unwrap();
+        assert_eq!(bmux_terminal_grid::row_text(&rows[0], 4), "ijkl");
+        drop(replays);
+        assert_eq!(retained_snapshot(&adapter, key), before);
+        assert!(!adapter.content_event("unrelated", &event));
+    }
+
+    #[test]
+    fn retained_position_selects_a_window_instead_of_losing_content_to_tail() {
+        let stream = shell_terminal_stream(
+            80,
+            5,
+            &[TerminalReplayFrame::Output(
+                b"abcdefghijklmnopqrstuvwxyz".to_vec(),
+            )],
+        )
+        .unwrap();
+        let mut projection = ShellContentProjection::default();
+        projection.rows(stream.grid(), true, 30, 28).unwrap();
+        let source = projection.sources[0];
+        projection.retained = Some(bmux_terminal_grid::ContentAnchor {
+            column: 3,
+            ..source.start
+        });
+        let rows = projection.rows(stream.grid(), true, 5, 3).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| bmux_terminal_grid::row_text(row, 1))
+                .collect::<Vec<_>>(),
+            ["d", "e", "f"]
+        );
+        assert_eq!(projection.sources[0].start.column, 3);
+        projection.rows(stream.grid(), false, 30, 28).unwrap();
+        assert!(
+            projection.retained.is_none(),
+            "scope changes invalidate capture positions"
+        );
     }
 
     #[test]

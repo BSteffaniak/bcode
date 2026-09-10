@@ -224,6 +224,7 @@ pub struct BcodeRuntimeModel {
     pub selected_plain_text: Option<String>,
     /// Last successfully committed terminal frame area.
     pub committed_area: bmux_tui::geometry::Rect,
+    focused_visual: Option<String>,
     /// Last successfully committed frame layout used for regional damage projection.
     committed_layout: Option<super::render::FrameLayout>,
     /// Last successfully committed presentation timestamp.
@@ -293,6 +294,7 @@ impl BcodeRuntimeModel {
             transcript_selection: bmux_tui::selection::SelectionController::new(),
             selected_plain_text: None,
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
+            focused_visual: None,
             committed_layout: None,
             last_presented_at: None,
             exit_after_plugin_surface: false,
@@ -930,6 +932,25 @@ impl BcodeRuntimeModel {
                 super::invalidation::UiInvalidation::Structural
             }
             Event::Key(stroke) => {
+                if !self.loop_state.modal_foreground()
+                    && let Some(identity) = &self.focused_visual
+                {
+                    if stroke.key == bmux_keyboard::KeyCode::Escape {
+                        self.focused_visual = None;
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                    if self
+                        .chat
+                        .app
+                        .plugin_presentation()
+                        .is_some_and(|presentation| {
+                            presentation.content_event(identity, &Event::Key(stroke))
+                        })
+                    {
+                        return super::invalidation::UiInvalidation::Structural;
+                    }
+                    self.focused_visual = None;
+                }
                 if self.loop_state.permission_dialog.is_some() {
                     return self.handle_permission_key(stroke);
                 }
@@ -1075,6 +1096,42 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if !self.loop_state.modal_foreground()
+                    && matches!(
+                        mouse.kind,
+                        bmux_tui::event::MouseEventKind::ScrollLeft
+                            | bmux_tui::event::MouseEventKind::ScrollRight
+                            | bmux_tui::event::MouseEventKind::Down(
+                                bmux_tui::event::MouseButton::Right
+                            )
+                    )
+                {
+                    let area = super::render::transcript_area_for_frame(
+                        &self.chat.app,
+                        self.committed_area,
+                    );
+                    if area.contains(mouse.position) {
+                        let layout = self.chat.app.transcript_layout();
+                        let visible = layout.visible_lines_from_top(
+                            self.chat.app.transcript_top_row(area.height),
+                            area.height,
+                        );
+                        if let Some(line) =
+                            visible.get(usize::from(mouse.position.y.saturating_sub(area.y)))
+                            && line.source
+                                == super::transcript_layout::VisibleTranscriptSource::Transcript
+                            && let Some((identity, _)) =
+                                layout.content_anchor(line.entry_index, line.row_in_entry)
+                            && let Some(presentation) = self.chat.app.plugin_presentation()
+                            && presentation.content_event(identity, &Event::Mouse(mouse))
+                        {
+                            if matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_)) {
+                                self.focused_visual = Some(identity.to_owned());
+                            }
+                            return super::invalidation::UiInvalidation::Structural;
+                        }
+                    }
+                }
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Permission) {
                     let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
                     let changed = super::mouse_flow::handle_permission_action_mouse(
