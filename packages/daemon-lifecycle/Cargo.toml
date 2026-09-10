@@ -21,7 +21,7 @@ serde_json           = { workspace = true }
 sha2                 = { workspace = true }
 sysinfo              = { workspace = true }
 thiserror            = { workspace = true }
-tokio                = { workspace = true, features = ["process", "time"] }
+tokio                = { workspace = true, features = ["io-util", "process", "time"] }
 tracing              = { workspace = true }
 
 [dev-dependencies]

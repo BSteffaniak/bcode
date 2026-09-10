@@ -2201,7 +2201,8 @@ fn config_home_for_daemon(config_dir: &Path) -> PathBuf {
 /// Returns an error when stale-record cleanup fails, spawning the daemon fails,
 /// or the daemon does not pass bounded readiness checks.
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
-    ensure_daemon_running_with_start(options, |options| {
+    ensure_daemon_running_with_start(options, |options, startup_lock| {
+        let inherited_startup_lock = startup_lock.file.try_clone();
         let endpoint = options.endpoint.clone();
         let log_path = options.log_path.clone();
         async move {
@@ -2270,12 +2271,14 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 )
                 .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
                 .env("BCODE_DAEMON_LOG", &log_path)
-                // Readiness owns the child only until startup succeeds. The daemon must remain
-                // detached after this future returns; cancellation uses endpoint occupancy to
-                // prevent a competing bind rather than killing a potentially ready daemon.
+                .env("BCODE_DAEMON_READY_STDOUT", "v1")
+                // The daemon remains detached on cancellation. On Unix its inherited
+                // startup lock fences later launchers even before endpoint publication.
                 .kill_on_drop(false)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::from(log_file))
+                // On Unix the inherited open file description retains startup ownership
+                // even if the launcher exits before the child binds its endpoint.
+                .stdin(startup_lock_stdio(inherited_startup_lock?))
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::from(stderr_log))
                 .spawn()?;
             tracing::debug!(
@@ -2284,7 +2287,7 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 "daemon child spawned"
             );
 
-            wait_for_server_ready(&endpoint, &mut child, &log_path).await
+            wait_for_child_notification(&endpoint, &mut child, &log_path).await
         }
     })
     .await
@@ -2342,7 +2345,7 @@ pub async fn ensure_daemon_running_in_process(
     mut start: impl FnMut() -> Result<(), DaemonStartError>,
 ) -> Result<(), DaemonStartError> {
     let log_path = options.log_path.clone();
-    ensure_daemon_running_with_start(options, move |options| {
+    ensure_daemon_running_with_start(options, move |options, _startup_lock| {
         let result = start();
         let endpoint = options.endpoint.clone();
         let log_path = log_path.clone();
@@ -2359,7 +2362,7 @@ async fn ensure_daemon_running_with_start<F, Fut>(
     mut start: F,
 ) -> Result<(), DaemonStartError>
 where
-    F: FnMut(&EnsureDaemonOptions) -> Fut,
+    F: FnMut(&EnsureDaemonOptions, &StartupLock) -> Fut,
     Fut: std::future::Future<Output = Result<(), DaemonStartError>>,
 {
     if ping_ready(&options.endpoint).await {
@@ -2390,7 +2393,7 @@ where
         return Ok(());
     }
 
-    start(options).await?;
+    start(options, &lock).await?;
     drop(image_use_guard);
     let _cleanup_task = tokio::spawn(async {
         let _ = cleanup_stale_daemon_records().await;
@@ -2560,6 +2563,23 @@ impl StartupLock {
     }
 }
 
+// Unix file locks are attached to the open file description. Passing a duplicate
+// through stdin transfers ownership atomically with spawn, before child Rust code
+// runs. Do not explicitly unlock the parent's description: that would also unlock
+// the child's duplicate. The daemon retains stdin for its lifetime.
+fn startup_lock_stdio(file: fs::File) -> std::process::Stdio {
+    #[cfg(unix)]
+    {
+        std::process::Stdio::from(file)
+    }
+    #[cfg(not(unix))]
+    {
+        drop(file);
+        std::process::Stdio::null()
+    }
+}
+
+#[cfg(not(unix))]
 impl Drop for StartupLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
@@ -2569,48 +2589,65 @@ impl Drop for StartupLock {
 const READINESS_TIMEOUT: Duration = Duration::from_secs(20);
 const READINESS_RETRY_DELAY: Duration = Duration::from_millis(25);
 
-async fn wait_for_server_ready(
+/// Notify the launching client that the daemon is ready to accept connections.
+///
+/// This private, versioned launch-channel signal is only a wakeup: callers must
+/// still verify the normal IPC identity handshake. Foreground servers do nothing.
+/// A departed launcher must not prevent the daemon from serving other clients.
+pub fn notify_launcher_ready() {
+    if std::env::var("BCODE_DAEMON_READY_STDOUT").as_deref() == Ok("v1") {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(b"BCODE_READY_V1\n");
+        let _ = stdout.flush();
+    }
+}
+
+async fn wait_for_child_notification(
     endpoint: &IpcEndpoint,
     child: &mut tokio::process::Child,
     log_path: &Path,
 ) -> Result<(), DaemonStartError> {
-    let readiness_started_at = std::time::Instant::now();
-    let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
-    loop {
-        let readiness = ping_ready(endpoint);
-        tokio::pin!(readiness);
-        tokio::select! {
-            biased;
-            status = child.wait() => {
-                let status = status?;
-                let error = DaemonStartError::Exited {
-                    status: status.to_string(),
-                    log_path: display_from_current_dir(log_path).to_string(),
-                    recent_log: recent_log_excerpt(log_path),
-                };
-                if error.is_existing_daemon_race() && wait_for_existing_daemon(endpoint).await {
-                    return Ok(());
-                }
-                return Err(error);
-            }
-            ready = &mut readiness => {
-                if ready {
-                    tracing::debug!(
-                        target: "bcode_daemon_lifecycle::startup",
-                        elapsed_ms = readiness_started_at.elapsed().as_millis(),
-                        "daemon readiness verified"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(DaemonStartError::StartTimeout {
+    use tokio::io::AsyncReadExt as _;
+
+    let started = std::time::Instant::now();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("daemon startup notification channel missing"))?;
+    let mut token = [0_u8; 15];
+    let notification = tokio::time::timeout(READINESS_TIMEOUT, stdout.read_exact(&mut token));
+    tokio::pin!(notification);
+    tokio::select! {
+        status = child.wait() => {
+            return Err(DaemonStartError::Exited {
+                status: status?.to_string(),
                 log_path: display_from_current_dir(log_path).to_string(),
                 recent_log: recent_log_excerpt(log_path),
             });
         }
-        tokio::time::sleep(READINESS_RETRY_DELAY).await;
+        result = &mut notification => {
+            match result {
+                Ok(Ok(_)) if &token == b"BCODE_READY_V1\n" => {}
+                Ok(_) => return Err(std::io::Error::other("invalid or closed daemon startup notification channel").into()),
+                Err(_) => return Err(DaemonStartError::StartTimeout {
+                    log_path: display_from_current_dir(log_path).to_string(),
+                    recent_log: recent_log_excerpt(log_path),
+                }),
+            }
+        }
+    }
+    tracing::debug!(
+        target: "bcode_daemon_lifecycle::startup",
+        elapsed_us = started.elapsed().as_micros(),
+        "daemon readiness notification received"
+    );
+    if ping_ready(endpoint).await {
+        Ok(())
+    } else {
+        Err(DaemonStartError::HealthCheckFailed {
+            log_path: display_from_current_dir(log_path).to_string(),
+            recent_log: recent_log_excerpt(log_path),
+        })
     }
 }
 
@@ -2856,7 +2893,7 @@ mod startup_lock_tests {
         };
         let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_starts = std::sync::Arc::clone(&starts);
-        let error = ensure_daemon_running_with_start(&options, move |_| {
+        let error = ensure_daemon_running_with_start(&options, move |_, _| {
             observed_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Ok(()) }
         })
@@ -2868,6 +2905,79 @@ mod startup_lock_tests {
         drop(listener);
         fs::remove_file(socket_path).expect("socket cleanup");
         fs::remove_dir_all(root).expect("directory cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_notification_does_not_substitute_for_identity_verification() {
+        let directory = tempfile::tempdir().expect("notification directory");
+        let endpoint = IpcEndpoint::unix_socket(directory.path().join("absent.sock"));
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf 'BCODE_READY_V1\\n'; exec sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("notification child");
+        let result = super::wait_for_child_notification(
+            &endpoint,
+            &mut child,
+            &directory.path().join("daemon.log"),
+        )
+        .await;
+        child.kill().await.expect("stop child");
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::HealthCheckFailed { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_readiness_notification_fails_closed() {
+        let directory = tempfile::tempdir().expect("notification directory");
+        let endpoint = IpcEndpoint::unix_socket(directory.path().join("absent.sock"));
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf 'BCODE_READY_V2\\n'; exec sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("notification child");
+        let result = super::wait_for_child_notification(
+            &endpoint,
+            &mut child,
+            &directory.path().join("daemon.log"),
+        )
+        .await;
+        child.kill().await.expect("stop child");
+        assert!(matches!(result, Err(DaemonStartError::Io(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_startup_lock_fences_launchers_until_child_exit() {
+        let directory = tempfile::tempdir().expect("lock directory");
+        let path = directory.path().join("startup.lock");
+        let owner = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .expect("launcher lock");
+        let inherited = owner.file.try_clone().expect("inherited lock");
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(super::startup_lock_stdio(inherited))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn child before endpoint publication");
+        drop(owner);
+        let result = StartupLock::acquire_at(path.clone(), Duration::from_millis(75)).await;
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::StartupCoordinationTimeout { .. })
+        ));
+        child.kill().await.expect("stop child");
+        let replacement = StartupLock::acquire_at(path, Duration::from_secs(1))
+            .await
+            .expect("ownership released only after child exit");
+        drop(replacement);
     }
 
     #[tokio::test]

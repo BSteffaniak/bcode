@@ -20,9 +20,11 @@ event identifies transport delay; a completed transport without a verified
 handshake identifies handshake delay or rejection. Cancellation may leave a span
 without a completion event.
 
-This instrumentation does not change readiness semantics: startup still polls,
-and the server still waits for application initialization before accepting clients.
-It does not yet provide cross-process trace correlation or capability readiness.
+This instrumentation does not change application readiness semantics. Detached
+launch now waits for a versioned child notification followed by a verified
+handshake; concurrent waiters and explicit in-process startup still probe. The
+server still waits for application initialization before accepting clients. These
+traces do not yet provide cross-process trace correlation or capability readiness.
 
 ## Environment
 

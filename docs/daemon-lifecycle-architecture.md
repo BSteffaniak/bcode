@@ -94,6 +94,22 @@ Digest and metadata are retained for diagnostics and conservative process verifi
 
 The startup lock is artifact-scoped through the namespace. A lock holder rechecks readiness before spawn, owns stale endpoint recovery, materializes the image, spawns the child, and waits for readiness. Other processes wait for the lock and recheck rather than intentionally launching another child.
 
+On Unix, spawn inherits a duplicate of the locked open file description as stdin.
+The parent closes rather than explicitly unlocks its copy; the child retains the
+lock for its lifetime. Thus launcher cancellation or death before endpoint bind
+cannot release coordination while the child is alive. This relies on the daemon
+retaining stdin; it must not close, replace, or expose it to plugins. Non-Unix
+platforms retain the previous lock behavior and do not yet have this handoff.
+
+Normal detached launch reserves stdout for the private `BCODE_READY_V1\n`
+notification, opted into by `BCODE_DAEMON_READY_STDOUT=v1`. Logs remain on stderr.
+The launcher reads exactly one bounded token, races child exit and a startup
+deadline, then performs the existing verified handshake. Unknown tokens, EOF,
+and failed verification fail closed. Notification is not identity evidence.
+A departed launcher does not stop the daemon. Concurrent waiters and explicit
+in-process startup still use bounded probing; this is not yet a fully event-driven
+multi-client readiness protocol.
+
 A successful verified `Hello` is full application readiness. Lifecycle readiness performs that exact handshake and validates artifact identity, protocol, build fingerprint, storage writer epoch, and session event schema without hashing executable bytes. The server initializes configuration, plugins, session services, application state, workflow recovery, and ownership behavior before accepting that handshake. No partial-ready protocol is currently justified by measurements.
 
 Lifecycle must preserve a responsive foreign endpoint and report incompatibility rather than deleting it. Endpoint and record cleanup is permitted only with positive stale evidence.

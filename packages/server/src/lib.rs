@@ -4594,6 +4594,7 @@ async fn run_constructed_server(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server ready; accepting clients"
     );
+    bcode_daemon_lifecycle::notify_launcher_ready();
     let mut clients = JoinSet::new();
     let accept_result = loop {
         tokio::select! {
