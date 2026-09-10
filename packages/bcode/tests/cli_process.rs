@@ -141,6 +141,51 @@ fn workflow_repair_cli_requires_confirmation_and_rejects_unknown_resolution() {
     assert!(unavailable.stdout.is_empty());
 }
 
+fn verify_catalog_admission(root: &std::path::Path, base: &serde_json::Value) {
+    let command = ["workflow", "launch-catalog", "--request", "admission.json"];
+    let write = |request: &serde_json::Value| {
+        std::fs::write(
+            root.join("admission.json"),
+            serde_json::to_vec(request).unwrap(),
+        )
+        .unwrap();
+    };
+    let mut pending = Vec::new();
+    for _ in 0..8 {
+        write(base);
+        let page = graph_cli_json(root, &command);
+        let mut request = base.clone();
+        request["discovery_token"] = page["discovery_token"].clone();
+        assert!(request["discovery_token"].is_string());
+        pending.push(request);
+    }
+    write(base);
+    let rejected = run_cli_at_root(root, &command, Stdio::piped(), Stdio::piped());
+    assert!(!rejected.status.success(), "ninth scan bypassed admission");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("request_failed"));
+    for mut request in pending {
+        let mut completed = false;
+        for _ in 0..32 {
+            write(&request);
+            let page = graph_cli_json(root, &command);
+            if let Some(token) = page.get("discovery_token") {
+                request["discovery_token"] = token.clone();
+            } else {
+                assert_eq!(page["items"].as_array().unwrap().len(), 3);
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "admitted scan could not finish at capacity");
+    }
+    // Legacy requests use the same admission pool; completion must have returned the permits.
+    let mut fresh = base.clone();
+    fresh["incremental"] = false.into();
+    write(&fresh);
+    let page = graph_cli_json(root, &command);
+    assert_eq!(page["items"].as_array().unwrap().len(), 3);
+}
+
 fn verify_incremental_catalog(root: &std::path::Path, sources: &std::path::Path) {
     // Nonmatching entries force multiple bounded advances without exhausting candidate capacity.
     for index in 0..40 {
@@ -151,6 +196,7 @@ fn verify_incremental_catalog(root: &std::path::Path, sources: &std::path::Path)
         "workspace": root, "limit": 10, "incremental": true,
         "search": "Catalog acceptance", "source_kind": "standalone_source"
     });
+    verify_catalog_admission(root, &request);
     let mut tokens = std::collections::BTreeSet::new();
     let mut consumed_request = None;
     let mut complete = false;
