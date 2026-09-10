@@ -1,5 +1,14 @@
 # Workflow Persistence Architecture
 
+## Retained edge publication storage
+
+Schema 29 adds revision-scoped retained-edge bindings through the existing exclusive upgrade
+coordinator, including upgrades from schema 28. Publication records the exact source activation
+and committed edge revision atomically with its publication receipt. Foreign keys preserve those
+historical identities; one edge has at most one retained source per graph revision. Connected
+publication remains rejected until readiness, input resolution, and settlement consume these
+bindings. This storage addition does not itself enable connected revised execution.
+
 ## Retained leaf publication
 
 Schema 28 adds revision-scoped leaf retention records through the existing exclusive upgrade
