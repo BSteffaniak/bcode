@@ -10918,7 +10918,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#510b782ed5a0446ab1264d0bd9a2d2dbafa1e1e8"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#e6cf285014f05f4c85fb8e207aab2a385d7d8e38"
 dependencies = [
  "aes-siv",
  "age",
@@ -10950,7 +10950,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault_models"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#510b782ed5a0446ab1264d0bd9a2d2dbafa1e1e8"
+source = "git+https://github.com/BSteffaniak/sshenv.git?branch=master#e6cf285014f05f4c85fb8e207aab2a385d7d8e38"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
