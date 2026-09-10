@@ -919,6 +919,9 @@ impl BcodeRuntimeModel {
             Event::Resize(_) => super::invalidation::UiInvalidation::Full,
             Event::Focus(_) | Event::Tick => super::invalidation::UiInvalidation::Paint,
             Event::Paste(text) => {
+                if self.loop_state.modal_foreground() {
+                    return super::invalidation::UiInvalidation::None;
+                }
                 self.chat.app.reset_input_history_navigation();
                 self.chat.app.paste_composer_text(&text);
                 self.chat.app.wake_cursor();
@@ -930,11 +933,15 @@ impl BcodeRuntimeModel {
                 if self.loop_state.permission_dialog.is_some() {
                     return self.handle_permission_key(stroke);
                 }
-                if self
-                    .loop_state
-                    .handle_streaming_configurator_key(&mut self.chat, stroke)
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Streaming)
+                    && self
+                        .loop_state
+                        .handle_streaming_configurator_key(&mut self.chat, stroke)
                 {
                     return super::invalidation::UiInvalidation::Structural;
+                }
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Streaming) {
+                    return super::invalidation::UiInvalidation::None;
                 }
                 match self
                     .loop_state
@@ -948,6 +955,9 @@ impl BcodeRuntimeModel {
                         return super::invalidation::UiInvalidation::Structural;
                     }
                     super::chat_loop::TimelineDialogRootOutcome::Unhandled => {}
+                }
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Timeline) {
+                    return super::invalidation::UiInvalidation::None;
                 }
                 match self
                     .loop_state
@@ -967,11 +977,17 @@ impl BcodeRuntimeModel {
                     }
                     super::chat_loop::ThinkingDialogRootOutcome::Unhandled => {}
                 }
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Thinking) {
+                    return super::invalidation::UiInvalidation::None;
+                }
                 if self
                     .loop_state
                     .handle_theme_picker_key(&mut self.chat, stroke)
                 {
                     return super::invalidation::UiInvalidation::Structural;
+                }
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Theme) {
+                    return super::invalidation::UiInvalidation::None;
                 }
                 if self.loop_state.has_command_palette() {
                     if let Some(action) = self.loop_state.handle_command_palette_key(stroke) {
@@ -993,6 +1009,9 @@ impl BcodeRuntimeModel {
                         }
                         super::chat_loop::SlashPaletteRootOutcome::Unhandled => {}
                     }
+                }
+                if self.loop_state.modal_foreground() {
+                    return super::invalidation::UiInvalidation::None;
                 }
                 if self
                     .settings
@@ -1056,24 +1075,42 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Permission) {
+                    let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
+                    let changed = super::mouse_flow::handle_permission_action_mouse(
+                        hit_id.as_deref(),
+                        &mut self.chat,
+                        &mut self.loop_state.permission_dialog,
+                        mouse,
+                    );
+                    return if changed {
+                        super::invalidation::UiInvalidation::Structural
+                    } else {
+                        super::invalidation::UiInvalidation::None
+                    };
+                }
                 if let Some(selection_damage) = self.handle_transcript_selection_mouse(mouse) {
                     return selection_damage;
                 }
-                if self.loop_state.handle_streaming_configurator_mouse(
-                    &mut self.chat,
-                    mouse,
-                    self.committed_area,
-                ) {
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Streaming)
+                    && self.loop_state.handle_streaming_configurator_mouse(
+                        &mut self.chat,
+                        mouse,
+                        self.committed_area,
+                    )
+                {
                     return super::invalidation::UiInvalidation::Structural;
                 }
-                if self.loop_state.handle_theme_picker_mouse(
-                    &mut self.chat,
-                    mouse,
-                    self.committed_area,
-                ) {
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Theme)
+                    && self.loop_state.handle_theme_picker_mouse(
+                        &mut self.chat,
+                        mouse,
+                        self.committed_area,
+                    )
+                {
                     return super::invalidation::UiInvalidation::Structural;
                 }
-                if self.loop_state.has_command_palette() {
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Commands) {
                     if let Some(action) = self
                         .loop_state
                         .handle_command_palette_mouse(mouse, self.committed_area)
@@ -1082,13 +1119,16 @@ impl BcodeRuntimeModel {
                     }
                     return super::invalidation::UiInvalidation::Structural;
                 }
-                if self.loop_state.has_slash_palette() {
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Slash) {
                     let _handled = self.loop_state.handle_slash_palette_mouse(
                         &mut self.chat,
                         mouse,
                         self.committed_area,
                     );
                     return super::invalidation::UiInvalidation::Structural;
+                }
+                if self.loop_state.modal_foreground() {
+                    return super::invalidation::UiInvalidation::None;
                 }
                 let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
                 let changed = if self.loop_state.permission_dialog.is_some() {
@@ -1125,7 +1165,7 @@ impl BcodeRuntimeModel {
         &mut self,
         mouse: bmux_tui::event::MouseEvent,
     ) -> Option<super::invalidation::UiInvalidation> {
-        if self.loop_state.permission_dialog.is_some()
+        if self.loop_state.modal_foreground()
             || self.loop_state.has_command_palette()
             || self.loop_state.has_slash_palette()
             || self
@@ -2250,7 +2290,8 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             )) => return Err(error.into()),
             bmux_tui_runtime::RuntimeEvent::Terminal(event)
             | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(event)) => {
-                if self.loop_state.has_interactive_surface() {
+                if self.loop_state.has_interactive_surface() && !self.loop_state.modal_foreground()
+                {
                     if let Event::Key(stroke) = event
                         && let Some(action) = self.root_interactive_surface_host_key(stroke)
                     {
@@ -2312,17 +2353,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         return Ok(bmux_tui_runtime::Update::redraw());
                     }
                 }
-                let route_to_surface = match event {
-                    Event::Mouse(mouse) if self.loop_state.has_interactive_surface() => self
-                        .loop_state
-                        .active_interactive_surface_geometry()
-                        .is_some_and(|geometry| geometry.destination.contains(mouse.position)),
-                    _ => self
-                        .loop_state
-                        .routes_non_mouse_event_to_interactive_surface(
-                            self.chat.app.tui_config().interactions,
-                        ),
-                };
+                let route_to_surface = !self.loop_state.modal_foreground()
+                    && match event {
+                        Event::Mouse(mouse) if self.loop_state.has_interactive_surface() => self
+                            .loop_state
+                            .active_interactive_surface_geometry()
+                            .is_some_and(|geometry| geometry.destination.contains(mouse.position)),
+                        _ => self
+                            .loop_state
+                            .routes_non_mouse_event_to_interactive_surface(
+                                self.chat.app.tui_config().interactions,
+                            ),
+                    };
                 if route_to_surface {
                     match self.loop_state.handle_interactive_surface_event(&event) {
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Ignored => {}
@@ -2814,6 +2856,12 @@ pub enum BcodeRuntimeScreen {
     Thinking,
     /// Timeline navigation overlay.
     Timeline,
+    /// Theme selection overlay.
+    Theme,
+    /// Streaming presentation configurator.
+    Streaming,
+    /// Provider authentication pool picker.
+    AuthPool,
     /// Session-owned plugin interaction surface.
     InteractiveSurface,
 }
@@ -4277,6 +4325,141 @@ mod tests {
         );
         assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
         assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
+    }
+
+    #[tokio::test]
+    async fn modal_foreground_owns_input_and_metadata_across_frames() {
+        use bmux_tui_runtime::{Presenter, Program};
+        let mut model = root_test_model();
+        let surface = question_surface_for_root_test(model.settings.keymap()).await;
+        model
+            .loop_state
+            .install_interactive_surface_for_test(surface);
+        model.chat.app.replace_composer_with("preserved draft");
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("chat");
+        model.loop_state.open_command_palette(&mut model.chat);
+        model.synchronize_screen();
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("modal");
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .all(|hit| hit.id.as_str() != "composer")
+        );
+        assert!(terminal.selection().fragments().is_empty());
+        assert!(terminal.image_scene().placements().len() == 0);
+        let snapshot = terminal.retained_buffer().cloned();
+        let cursor = terminal.cursor();
+        model
+            .update(bmux_tui_runtime::RuntimeEvent::Terminal(
+                bmux_tui::event::Event::Paste("must not reach draft".into()),
+            ))
+            .expect("modal paste");
+        assert_eq!(model.chat.app.composer().text(), "preserved draft");
+        let frozen_work = model
+            .loop_state
+            .active_interactive_surface_work_shape_for_test();
+        for _ in 0..3 {
+            model.presentation_damage = model.select_presentation_damage(
+                super::super::invalidation::UiInvalidation::Paint,
+                &[super::super::app::TemporalDamage::Composer],
+            );
+            model.fast_temporal_presentation = true;
+            super::BcodeRuntimePresenter::new(&mut terminal)
+                .present(&mut model)
+                .expect("modal timer");
+            assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
+            assert_eq!(terminal.cursor(), cursor);
+            assert!(terminal.selection().fragments().is_empty());
+        }
+        assert_eq!(
+            model
+                .loop_state
+                .active_interactive_surface_work_shape_for_test(),
+            frozen_work
+        );
+        terminal.reset();
+        model.fast_temporal_presentation = true;
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("reset modal");
+        assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
+        assert_eq!(terminal.cursor(), cursor);
+        let escape = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Escape,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        });
+        model
+            .update(bmux_tui_runtime::RuntimeEvent::Terminal(escape))
+            .expect("close modal");
+        assert!(!model.loop_state.has_command_palette());
+        assert!(model.loop_state.has_interactive_surface());
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("restored chat");
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .any(|hit| hit.id.as_str() == "composer")
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn modal_resize_and_replacement_reconcile_foreground_scene() {
+        use bmux_tui_runtime::Presenter;
+        let mut model = root_test_model();
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut bytes,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        );
+        model.loop_state.open_command_palette(&mut model.chat);
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("palette");
+        model.loop_state.open_session_picker(&mut model.chat);
+        assert_eq!(
+            model.loop_state.foreground(),
+            Some(crate::foreground::Foreground::Sessions)
+        );
+        model.synchronize_screen();
+        terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        model.fast_temporal_presentation = true;
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("resized sessions");
+        let partial = terminal.retained_buffer().cloned();
+        let hits = terminal.hits().clone();
+        let semantics = terminal.semantics().clone();
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        model.fast_temporal_presentation = false;
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("reference sessions");
+        assert_eq!(terminal.retained_buffer(), partial.as_ref());
+        assert_eq!(terminal.hits(), &hits);
+        assert_eq!(terminal.semantics(), &semantics);
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .all(|hit| hit.id.as_str() != "composer")
+        );
+        drop(model);
     }
 
     #[tokio::test]

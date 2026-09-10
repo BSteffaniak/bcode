@@ -22,6 +22,7 @@ pub(crate) mod effects;
 pub mod eval_launcher;
 pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
+pub(crate) mod foreground;
 #[cfg(test)]
 mod frame_sequence_harness;
 pub(crate) mod history_flow;

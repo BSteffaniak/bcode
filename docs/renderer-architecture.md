@@ -2,15 +2,32 @@
 
 ## TUI foreground composition
 
-Full and temporal frames share `chat_loop::paint_foreground`. Temporal preparation may
-reuse committed chat and interactive-surface geometry, but must not bypass foreground
-composition. Full-screen foregrounds suppress covered chat painting and its cursor,
-hit, selection, image, and semantic contributions. Partial-screen surfaces continue to
-compose over chat. Structural changes use the normal preparation path.
+`ChatLoopState::foreground` resolves the active foreground in input-priority order.
+Root screen transitions and painting consume that identity; modal interception prevents
+covered interaction surfaces, composer input, transcript selection, and background mouse
+actions from receiving foreground input. Slash completion deliberately remains non-modal
+and shares the composer. Inactive foreground states remain retained, but do not paint.
 
-The retained-terminal regression in `root_program` compares repeated sessions-picker
-cursor updates with full presentation, including cursor, semantic regions, and images.
-This boundary does not yet centralize modal input routing or partial-surface occlusion.
+Full and temporal frames share `paint_foreground`. Full-screen foregrounds omit chat;
+partial-screen modals retain a cells-only backdrop prepared through BMUX `PaintCx`.
+Backdrop controls do not contribute cursor, focus, hits, selection, semantic regions, or
+protocol images. The modal owns those contributions even outside its panel. This is a
+conservative modal policy, not geometric hit-through or alpha-layer composition.
+
+Modal frames replace the complete metadata scene while ANSI output remains diffed. Their
+temporal path reuses a terminal-sized backdrop rather than remeasuring/repainting the
+transcript or invoking background plugin components. Structural/background content updates
+refresh preparation; normal rendering restores live background controls on close. Missing
+retained terminal state or incompatible backdrop dimensions forces normal preparation.
+Backdrop storage is bounded by terminal dimensions and is disposable presentation state.
+
+Both draw paths emit protocol image updates through `draw_damage_with_overlay`, before the
+terminal's synchronized-output end and flush. Foreground coverage removes background image
+placements rather than allowing a later image write to cover the modal.
+
+Retained-frame tests cover sessions blinking, modal metadata exclusion, paste interception,
+Escape with a covered tool interaction, repeated temporal frames without background plugin
+work, terminal reset, and restoration of chat controls after close.
 
 Bcode's target renderer architecture uses a shared semantic session-view layer rather than session event logs or another renderer's UI state.
 
