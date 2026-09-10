@@ -1400,6 +1400,26 @@ pub struct PluginTuiDiagnostic {
     pub value: u64,
 }
 
+/// One native visual selection cell.
+///
+/// Byte ranges must come from the producer's source model, never inferred by the host.
+#[derive(Debug, Clone)]
+pub struct PluginTuiSelectionCell {
+    pub column: u16,
+    pub width: u16,
+    pub bytes: std::ops::Range<usize>,
+}
+
+/// Bounded source text and geometry for a visual row.
+#[derive(Debug, Clone)]
+pub struct PluginTuiSelectionRow {
+    pub identity: String,
+    pub byte_start: usize,
+    pub text: String,
+    pub cells: Vec<PluginTuiSelectionCell>,
+    pub revision: u64,
+}
+
 /// Native Rust plugin artifact/view renderer for inline transcript content.
 pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Return whether this adapter can render the artifact/view kind.
@@ -1473,6 +1493,11 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
     /// adapters must report only low-cardinality numeric work observations.
     fn drain_diagnostics(&self) -> Vec<PluginTuiDiagnostic> {
         Vec::new()
+    }
+
+    /// Return source-aware selection for one currently projected anchor.
+    fn selection_row(&self, _identity: &str, _offset: usize) -> Option<PluginTuiSelectionRow> {
+        None
     }
 
     /// Restore a renderer-local content position before the next layout.
@@ -2325,6 +2350,18 @@ impl PluginTuiRegistry {
     ) -> Option<bcode_tool::ToolInvocationInput> {
         self.visual_adapter(adapter_id, kind)
             .and_then(|adapter| adapter.invocation_event_input(invocation_id, kind, payload, event))
+    }
+
+    /// Resolve native source-aware selection through the owning adapter.
+    #[must_use]
+    pub fn visual_selection_row(
+        &self,
+        identity: &str,
+        offset: usize,
+    ) -> Option<PluginTuiSelectionRow> {
+        self.visual_adapters
+            .values()
+            .find_map(|adapter| adapter.selection_row(identity, offset))
     }
 
     /// Offer an opaque position to native presentation adapters. Identities are

@@ -218,6 +218,7 @@ pub struct BcodeRuntimeModel {
     pub committed_hits: bmux_tui::hit::HitMap,
     /// Last successfully committed logical content-selection scene.
     pub committed_selection: bmux_tui::selection::SelectionScene,
+    committed_visual_text: Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
     /// Bcode-owned transcript selection gesture state.
     pub transcript_selection: bmux_tui::selection::SelectionController,
     /// Canonical plain-text export for the current logical selection.
@@ -291,6 +292,7 @@ impl BcodeRuntimeModel {
             fast_temporal_presentation: false,
             committed_hits: bmux_tui::hit::HitMap::default(),
             committed_selection: bmux_tui::selection::SelectionScene::new(),
+            committed_visual_text: Vec::new(),
             transcript_selection: bmux_tui::selection::SelectionController::new(),
             selected_plain_text: None,
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
@@ -1282,7 +1284,33 @@ impl BcodeRuntimeModel {
             .transcript_selection
             .snapshot(&self.committed_selection)
             .and_then(|snapshot| {
-                export_plain_transcript_selection(self.chat.app.transcript(), &snapshot)
+                let mut parts = Vec::new();
+                let mut start = 0;
+                while start < snapshot.slices.len() {
+                    let visual = snapshot.slices[start]
+                        .content_id
+                        .as_str()
+                        .starts_with("bcode.visual:");
+                    let mut end = start + 1;
+                    while end < snapshot.slices.len()
+                        && snapshot.slices[end]
+                            .content_id
+                            .as_str()
+                            .starts_with("bcode.visual:")
+                            == visual
+                    {
+                        end += 1;
+                    }
+                    let mut group = snapshot.clone();
+                    group.slices = snapshot.slices[start..end].to_vec();
+                    parts.push(if visual {
+                        export_visual_selection(&group, &self.committed_visual_text)?
+                    } else {
+                        export_plain_transcript_selection(self.chat.app.transcript(), &group)?
+                    });
+                    start = end;
+                }
+                (!parts.is_empty()).then(|| parts.join("\n\n"))
             });
         self.chat
             .app
@@ -1851,6 +1879,28 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
         )?;
         program.committed_hits = self.terminal.hits().clone();
         program.committed_selection = self.terminal.selection().clone();
+        program.committed_visual_text.clear();
+        if let Some(layout) = program.committed_layout {
+            let body = layout.body();
+            for line in program.chat.app.transcript_layout().visible_lines_from_top(
+                program.chat.app.transcript_top_row(body.height),
+                body.height,
+            ) {
+                if let Some((identity, offset)) = program
+                    .chat
+                    .app
+                    .transcript_layout()
+                    .content_anchor(line.entry_index, line.row_in_entry)
+                    && let Some(row) = program
+                        .chat
+                        .app
+                        .plugin_presentation()
+                        .and_then(|host| host.selection_row(identity, offset))
+                {
+                    program.committed_visual_text.push(row);
+                }
+            }
+        }
         let reconciliation = program
             .transcript_selection
             .reconcile(&program.committed_selection);
@@ -2009,6 +2059,32 @@ fn register_transcript_selection_scene(
                 .revision(item.revision()),
             );
         }
+        if let Some((identity, offset)) = app
+            .transcript_layout()
+            .content_anchor(visible.entry_index, visible.row_in_entry)
+            && let Some(selection) = app
+                .plugin_presentation()
+                .and_then(|host| host.selection_row(identity, offset))
+        {
+            for cell in selection.cells {
+                let x = body.x.saturating_add(cell.column);
+                if x.saturating_add(cell.width) > body.right() {
+                    continue;
+                }
+                scene.push_fragment(
+                    bmux_tui::selection::SelectionFragment::new(
+                        scope_id.clone(),
+                        format!("bcode.visual:{}", selection.identity),
+                        bmux_tui::geometry::Rect::new(x, y, cell.width, 1),
+                        u64::try_from(visible.row_in_entry).unwrap_or(u64::MAX),
+                        cell.bytes,
+                    )
+                    .revision(selection.revision),
+                );
+            }
+            y = y.saturating_add(1);
+            continue;
+        }
         let text = row.plain_text();
         if item.text_format() == bcode_session_view_models::TextFormat::Markdown {
             let entry_start = app
@@ -2106,6 +2182,76 @@ fn register_transcript_selection_scene(
         }
         y = y.saturating_add(1);
     }
+}
+
+fn export_visual_selection(
+    snapshot: &bmux_tui::selection::SelectionSnapshot,
+    rows: &[bcode_plugin_sdk::tui::PluginTuiSelectionRow],
+) -> Option<String> {
+    export_visual_slices(&snapshot.slices, rows)
+}
+
+fn export_visual_slices(
+    slices: &[bmux_tui::selection::SelectionSlice],
+    rows: &[bcode_plugin_sdk::tui::PluginTuiSelectionRow],
+) -> Option<String> {
+    let mut output = String::new();
+    let mut previous = None;
+    for slice in slices {
+        let identity = slice.content_id.as_str().strip_prefix("bcode.visual:")?;
+        if previous.is_some_and(|previous| previous != identity) {
+            output.push('\n');
+        }
+        let mut start = slice.source_range.start;
+        for row in rows
+            .iter()
+            .filter(|row| row.identity == identity && row.revision == slice.revision)
+        {
+            let end = row
+                .byte_start
+                .checked_add(row.text.len())?
+                .min(slice.source_range.end);
+            if start >= row.byte_start && start < end {
+                output.push_str(row.text.get(start - row.byte_start..end - row.byte_start)?);
+                start = end;
+            }
+        }
+        if start != slice.source_range.end {
+            return None;
+        }
+        previous = Some(identity);
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+#[test]
+fn visual_copy_joins_soft_rows_and_rejects_stale_source() {
+    use bcode_plugin_sdk::tui::PluginTuiSelectionRow;
+    use bmux_tui::selection::{SelectionContentId, SelectionSlice};
+    let row = |identity: &str, start, text: &str| PluginTuiSelectionRow {
+        identity: identity.to_owned(),
+        byte_start: start,
+        text: text.to_owned(),
+        cells: Vec::new(),
+        revision: 7,
+    };
+    let rows = vec![
+        row("line", 0, "界"),
+        row("line", 3, "e\u{301}"),
+        row("next", 0, "next"),
+    ];
+    let slice = |identity: &str, range| SelectionSlice {
+        content_id: SelectionContentId::new(format!("bcode.visual:{identity}")),
+        source_range: range,
+        revision: 7,
+    };
+    let mut slices = vec![slice("line", 0..6), slice("next", 0..4)];
+    assert_eq!(
+        export_visual_slices(&slices, &rows).as_deref(),
+        Some("界e\u{301}\nnext")
+    );
+    slices[0].revision = 8;
+    assert_eq!(export_visual_slices(&slices, &rows), None);
 }
 
 #[must_use]

@@ -217,8 +217,17 @@ window. Bottom-follow clears that local request. Unavailable positions use item 
 
 Positioned shell output supports local horizontal wheel scrolling and right-click focus, then
 Left/Right or Home; Escape releases focus. These events never become invocation input and do
-not resize the PTY. Expanded viewing and source-aware selection/copy are not yet implemented;
-the existing transcript selection behavior has not been promoted to a source-aware contract.
+not resize the PTY. Focused `e` toggles an expanded inline screen window (up to 128 rows);
+Up/Down and PageUp/PageDown navigate source screen rows. This is an inline expansion, not a
+separate full-screen modal. Normal transcript scrolling exposes the expanded rows.
+
+Native shell selection uses BMUX cell geometry and UTF-8 source bytes, not painted-row offsets.
+Soft wraps share one logical-line identity; hard-line transitions insert newlines. Clipped wide
+screen fragments are not selectable. The host retains bounded source text with successful
+presentation and rejects revision mismatches or unavailable ranges on copy. Cross-window
+selection beyond retained visible source text is unavailable rather than guessed. Serialized
+third-party visual adapters retain their existing selection fallback; this native extension
+introduces no terminal types into public frontend/session contracts.
 
 ### Published dependencies
 

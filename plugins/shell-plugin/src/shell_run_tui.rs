@@ -414,6 +414,29 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         }
     }
 
+    fn selection_row(
+        &self,
+        identity: &str,
+        offset: usize,
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiSelectionRow> {
+        let (key, capture, line) = shell_content_identity(identity)?;
+        let replays = self.live_replays.lock().ok()?;
+        let replay = replays.get(key)?;
+        let index = if capture == 0 {
+            line
+        } else {
+            replay.projection.sources.iter().position(|source| {
+                source.start.capture == capture
+                    && source.start.line == line
+                    && source.start.column == offset
+            })?
+        };
+        let mut row = replay.projection.selection.get(index)?.clone();
+        drop(replays);
+        row.identity = format!("{}:{}:{}", key.len(), key, row.identity);
+        Some(row)
+    }
+
     fn content_event(&self, identity: &str, event: &bmux_tui::event::Event) -> bool {
         let Some((key, _, _)) = shell_content_identity(identity) else {
             return false;
@@ -439,6 +462,26 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 _ => return false,
             },
             bmux_tui::event::Event::Key(key) if key.modifiers.is_empty() => match key.key {
+                bmux_keyboard::KeyCode::Char('e') => {
+                    replay.projection.expanded = !replay.projection.expanded;
+                    return true;
+                }
+                bmux_keyboard::KeyCode::Up => {
+                    replay.projection.vertical = replay.projection.vertical.saturating_sub(1);
+                    return true;
+                }
+                bmux_keyboard::KeyCode::Down => {
+                    replay.projection.vertical = replay.projection.vertical.saturating_add(1);
+                    return true;
+                }
+                bmux_keyboard::KeyCode::PageUp => {
+                    replay.projection.vertical = replay.projection.vertical.saturating_sub(28);
+                    return true;
+                }
+                bmux_keyboard::KeyCode::PageDown => {
+                    replay.projection.vertical = replay.projection.vertical.saturating_add(28);
+                    return true;
+                }
                 bmux_keyboard::KeyCode::Left => -8,
                 bmux_keyboard::KeyCode::Right => 8,
                 bmux_keyboard::KeyCode::Home => {
@@ -478,7 +521,20 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             {
                 return (row..rows.len())
                     .map(|row| bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
-                        key: format!("terminal:{}:{}:0:{}", key.len(), key, row),
+                        key: format!(
+                            "terminal:{}:{}:0:{}",
+                            key.len(),
+                            key,
+                            row.saturating_sub(
+                                shell_terminal_prompt_rows(payload, context.width(), context).len()
+                            )
+                            .saturating_sub(usize::from(
+                                replay.cancelled
+                                    || replay.timed_out
+                                    || replay.signal.is_some()
+                                    || replay.exit_code.is_some()
+                            ))
+                        ),
                         row,
                         source: None,
                     })
@@ -1314,6 +1370,31 @@ fn shell_terminal_stream(
     Some(stream)
 }
 
+fn selection_row(
+    identity: String,
+    byte_start: usize,
+    text: String,
+    cells: Vec<bmux_terminal_grid::SelectionCell>,
+    revision: u64,
+) -> bcode_plugin_sdk::tui::PluginTuiSelectionRow {
+    bcode_plugin_sdk::tui::PluginTuiSelectionRow {
+        identity,
+        byte_start,
+        text,
+        revision,
+        cells: cells
+            .into_iter()
+            .filter_map(|cell| {
+                Some(bcode_plugin_sdk::tui::PluginTuiSelectionCell {
+                    column: u16::try_from(cell.columns.start).ok()?.saturating_add(4),
+                    width: u16::try_from(cell.columns.end - cell.columns.start).ok()?,
+                    bytes: cell.bytes,
+                })
+            })
+            .collect(),
+    }
+}
+
 fn shell_content_identity(identity: &str) -> Option<(&str, u128, usize)> {
     let rest = identity.strip_prefix("terminal:")?;
     let (length, rest) = rest.split_once(':')?;
@@ -1335,6 +1416,9 @@ struct ShellContentProjection {
     capture: Option<(u64, bool, Result<ContentProjection, HistorySliceError>)>,
     sources: Vec<bmux_terminal_grid::ContentRowSource>,
     retained: Option<bmux_terminal_grid::ContentAnchor>,
+    expanded: bool,
+    vertical: usize,
+    selection: Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
     horizontal: usize,
 }
 
@@ -1347,14 +1431,33 @@ impl ShellContentProjection {
         max_rows: usize,
     ) -> Result<Vec<PhysicalRow>, HistorySliceError> {
         self.sources.clear();
+        self.selection.clear();
+        let max_rows = if self.expanded { 128 } else { max_rows };
         let width = usize::from(width.saturating_sub(4).max(1));
         if grid.mode() == GridMode::Alternate {
             self.horizontal = self.horizontal.min(grid.width().saturating_sub(width));
-            return grid.screen_window(
-                self.horizontal..self.horizontal.saturating_add(width),
-                0..max_rows,
-                SHELL_PROJECTION_BUDGET,
-            );
+            self.vertical = self.vertical.min(grid.height().saturating_sub(max_rows));
+            let columns = self.horizontal..self.horizontal.saturating_add(width);
+            let rows = self.vertical..self.vertical.saturating_add(max_rows);
+            self.selection = grid
+                .screen_selection(
+                    grid.content_revision(),
+                    columns.clone(),
+                    rows.clone(),
+                    SHELL_PROJECTION_BUDGET,
+                )?
+                .into_iter()
+                .map(|row| {
+                    selection_row(
+                        format!("screen:{}:{}", grid.content_revision(), row.source.row),
+                        row.byte_start,
+                        row.text,
+                        row.cells,
+                        grid.content_revision(),
+                    )
+                })
+                .collect();
+            return grid.screen_window(columns, rows, SHELL_PROJECTION_BUDGET);
         }
         let revision = grid.content_revision();
         if !self
@@ -1390,6 +1493,32 @@ impl ShellContentProjection {
         } else {
             projection.tail(max_rows, SHELL_PROJECTION_BUDGET.bytes)?
         };
+        if let Some(first) = window
+            .anchors
+            .first()
+            .and_then(|anchor| projection.resolve(*anchor))
+        {
+            for row in projection
+                .selection_window(first..first + window.rows.len(), SHELL_PROJECTION_BUDGET)?
+            {
+                let text = projection.export_text(
+                    row.source.start.capture,
+                    row.source.start.line,
+                    row.bytes.clone(),
+                    SHELL_PROJECTION_BUDGET,
+                )?;
+                self.selection.push(selection_row(
+                    format!(
+                        "capture:{}:{}",
+                        row.source.start.capture, row.source.start.line
+                    ),
+                    row.bytes.start,
+                    text,
+                    row.cells,
+                    revision,
+                ));
+            }
+        }
         self.sources = window.sources;
         Ok(window.rows)
     }
@@ -1427,7 +1556,11 @@ fn shell_terminal_grid_rows(
         max_rows,
     } = input.sizing
     {
-        let target_rows = visible_rows.max(1).min(max_rows);
+        let target_rows = if projection.expanded {
+            output.len()
+        } else {
+            visible_rows.max(1).min(max_rows)
+        };
         if output.len() > target_rows {
             output = output[output.len().saturating_sub(target_rows)..].to_vec();
         }
@@ -1435,9 +1568,9 @@ fn shell_terminal_grid_rows(
             output.push(Line::default());
         }
     }
-    if grid.mode() == GridMode::Alternate && grid.width() > usize::from(width.saturating_sub(4)) {
+    if grid.mode() == GridMode::Alternate {
         output.push(Line::from(format!(
-            "    columns {}–{} / {} · right-click: focus · ←/→: pan · Esc: leave",
+            "    columns {}–{} / {} · right-click: focus · e: expand/collapse · arrows/PgUp/PgDn: pan · Esc: leave",
             projection.horizontal.saturating_add(1),
             projection
                 .horizontal
@@ -2921,6 +3054,39 @@ mod tests {
             Some(&u64::try_from(first.len() + second.len()).expect("emulated bytes"))
         );
         assert_eq!(values.get("emulate_frames"), Some(&3));
+    }
+
+    #[test]
+    fn selection_uses_source_bytes_and_expansion_preserves_screen_state() {
+        let stream = shell_terminal_stream(
+            8,
+            40,
+            &[TerminalReplayFrame::Output(
+                "界e\u{301}z".as_bytes().to_vec(),
+            )],
+        )
+        .unwrap();
+        let mut projection = ShellContentProjection::default();
+        projection.rows(stream.grid(), true, 5, 28).unwrap();
+        assert_eq!(projection.selection[0].text, "界");
+        assert_eq!(projection.selection[0].cells[0].bytes, 0..3);
+        assert_eq!(projection.selection[0].cells[0].width, 1);
+        assert_eq!(projection.selection[1].text, "e\u{301}");
+        let screen = shell_terminal_stream(
+            8,
+            40,
+            &[TerminalReplayFrame::Output(b"\x1b[?1049hhello".to_vec())],
+        )
+        .unwrap();
+        let before = screen.snapshot(0, 40);
+        projection.rows(screen.grid(), true, 12, 28).unwrap();
+        assert_eq!(projection.selection.len(), 28);
+        projection.expanded = true;
+        assert_eq!(
+            projection.rows(screen.grid(), true, 12, 28).unwrap().len(),
+            40
+        );
+        assert_eq!(screen.snapshot(0, 40), before);
     }
 
     #[test]

@@ -453,6 +453,34 @@ impl PluginTuiPresentation {
         }
     }
 
+    /// Resolve bounded source-aware selection without calling a tool/service.
+    pub fn selection_row(
+        &self,
+        identity: &str,
+        offset: usize,
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiSelectionRow> {
+        let (plugin, identity) = identity.split_once(':')?;
+        let mut row = self
+            .registry(plugin)?
+            .visual_selection_row(identity, offset)?;
+        if row.identity.len() > 256 || row.text.len() > 256 * 1024 || row.cells.len() > 4096 {
+            return None;
+        }
+        let end = row.byte_start.checked_add(row.text.len())?;
+        if row.cells.iter().any(|cell| {
+            cell.width == 0
+                || cell.bytes.start < row.byte_start
+                || cell.bytes.end > end
+                || cell.bytes.start > cell.bytes.end
+                || !row.text.is_char_boundary(cell.bytes.start - row.byte_start)
+                || !row.text.is_char_boundary(cell.bytes.end - row.byte_start)
+        }) {
+            return None;
+        }
+        row.identity = format!("{plugin}:{}", row.identity);
+        Some(row)
+    }
+
     /// Restore an opaque, producer-scoped position in this view's native adapters.
     pub fn retain_content_position(&self, identity: &str, offset: usize) {
         let Some((plugin, identity)) = identity.split_once(':') else {
