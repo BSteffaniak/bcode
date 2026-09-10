@@ -3179,9 +3179,16 @@ async fn launch_detail_for_catalog_item(
 #[derive(Debug)]
 pub struct PendingDiscovery {
     request: bcode_workflow::WorkflowLaunchCatalogRequest,
-    scan: bcode_workflow_discovery::WorkflowDiscoveryScan,
+    scan: AdmittedDiscovery,
     expires: std::time::Instant,
     expiration: DiscoveryExpiration,
+}
+
+/// Keeps capacity occupied until both retained state and any active blocking work are dropped.
+#[derive(Debug)]
+struct AdmittedDiscovery {
+    scan: bcode_workflow_discovery::WorkflowDiscoveryScan,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Debug)]
@@ -3208,7 +3215,7 @@ pub async fn launch_catalog(
     request.validate()?;
     let mut binding = request.clone();
     binding.discovery_token = None;
-    let resumed = if let Some(token) = &request.discovery_token {
+    let mut resumed = if let Some(token) = &request.discovery_token {
         let mut scans = state
             .workflow_discovery_scans
             .lock()
@@ -3230,30 +3237,41 @@ pub async fn launch_catalog(
     };
     let workspace = request.workspace.clone();
     let config = state.startup_config.workflows.clone();
-    let mut scan = if let Some(scan) = resumed {
+    let mut scan = if let Some(scan) = resumed.take() {
         scan
     } else {
+        let permit = std::sync::Arc::clone(&state.workflow_discovery_capacity)
+            .try_acquire_owned()
+            .map_err(|_| discovery_error("discovery scan capacity reached; retry later"))?;
         tokio::task::spawn_blocking(move || {
             bcode_workflow_discovery::WorkflowDiscoveryScan::open(
                 &workspace,
                 &config,
                 bcode_workflow_discovery::MAX_DISCOVERY_RESULTS,
             )
+            .map(|scan| AdmittedDiscovery {
+                scan,
+                _permit: permit,
+            })
         })
         .await
         .map_err(super::ServerError::BlockingTask)??
     };
+    drop(resumed);
     let discovery = loop {
         // Transfer ownership into just one bounded batch. Dropping this request can leave that
         // batch running, but cannot schedule another; its output then releases the scan handles.
         let (next_scan, result) = tokio::task::spawn_blocking(move || {
-            let result = scan.advance(16.min(bcode_workflow_discovery::MAX_DISCOVERY_RESULTS));
+            let result = scan
+                .scan
+                .advance(16.min(bcode_workflow_discovery::MAX_DISCOVERY_RESULTS));
             (scan, result)
         })
         .await
         .map_err(super::ServerError::BlockingTask)?;
         scan = next_scan;
         if let Some(discovery) = result? {
+            drop(scan);
             break discovery;
         }
         if request.incremental {
@@ -3275,11 +3293,6 @@ pub async fn launch_catalog(
                     .workflow_discovery_scans
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if scans.len() >= 8 {
-                    return Err(discovery_error(
-                        "discovery scan capacity reached; retry later",
-                    ));
-                }
                 scans.insert(
                     token.clone(),
                     PendingDiscovery {

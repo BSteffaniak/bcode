@@ -159,7 +159,10 @@ const MAX_DEFINITION_BOUNDARIES: usize = 10_000;
 pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 2;
 
 /// Current portable workflow launch-catalog contract version.
-pub const WORKFLOW_LAUNCH_CATALOG_VERSION: u32 = 1;
+///
+/// Version 2 adds opt-in pending discovery responses. Version 1 and unknown versions are rejected
+/// before discovery; no persisted workflow representation is changed by this contract revision.
+pub const WORKFLOW_LAUNCH_CATALOG_VERSION: u32 = 2;
 /// Maximum entries returned by one launch-catalog request.
 pub const MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE: usize = 1_000;
 /// Maximum bytes accepted in launch-catalog search text.
@@ -272,6 +275,9 @@ pub struct WorkflowLaunchCatalogRequest {
     #[serde(default)]
     pub incremental: bool,
     /// Continue a process-local scan using its latest token and the unchanged request.
+    /// Tokens are single-use: successful admission consumes one even if the response is lost.
+    /// Unknown, consumed, expired, or request-mismatched tokens fail; restart without a token
+    /// after response loss or daemon replacement. No durable resume or retry idempotency is promised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_token: Option<String>,
     pub limit: usize,
@@ -443,6 +449,20 @@ mod launch_catalog_contract_tests {
             source_kind: None,
             readiness: None,
         }
+    }
+
+    #[test]
+    fn launch_catalog_rejects_previous_version_and_invalid_continuation() {
+        assert!(request(1).validate().is_err());
+        let mut next = request(WORKFLOW_LAUNCH_CATALOG_VERSION);
+        next.discovery_token = Some("scan-token".into());
+        assert!(next.validate().is_err());
+        next.incremental = true;
+        assert!(next.validate().is_ok());
+        next.discovery_token = Some(String::new());
+        assert!(next.validate().is_err());
+        next.discovery_token = Some("x".repeat(129));
+        assert!(next.validate().is_err());
     }
 
     #[test]

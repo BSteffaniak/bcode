@@ -368,6 +368,7 @@ pub struct ServerState {
     workflow_run_graph_publication_policy:
         Option<workflow_operations::WorkflowRunGraphPublicationPolicy>,
     workflow_application_authorization: workflow_operations::WorkflowApplicationAuthorizationPolicy,
+    workflow_discovery_capacity: Arc<tokio::sync::Semaphore>,
     workflow_discovery_scans:
         Arc<StdMutex<BTreeMap<String, workflow_operations::PendingDiscovery>>>,
     workflow_computations:
@@ -1951,6 +1952,7 @@ impl ServerState {
                     ),
                 },
             ),
+            workflow_discovery_capacity: Arc::new(tokio::sync::Semaphore::new(8)),
             workflow_discovery_scans: Arc::new(StdMutex::new(BTreeMap::new())),
             workflow_computations: StdMutex::new(BTreeMap::new()),
             runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
