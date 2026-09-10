@@ -11,6 +11,11 @@
 //! * Version 3 requires a start frame and supports replay-output frames used after shell-owned
 //!   presentation filtering. Active incremental decoding accepts version 3 only.
 //!
+//! Live asynchronous producers share one recording-owned clock under the same lock that
+//! serializes output, resize side effects, and completion admission. Caller offsets on these
+//! APIs are retained for source compatibility but are not authoritative. The synchronous writer
+//! accepts explicit timing for authored recordings and rejects regressions before writing.
+//!
 //! Complete readers must continue accepting versions 1 through 3, rejecting malformed,
 //! incomplete, checksum-mismatched, non-monotonic, or post-finish frame streams. Unknown frame
 //! kinds remain skippable by declared length so newer optional frames do not invalidate otherwise
@@ -326,7 +331,7 @@ enum AsyncRecordingCommand {
 #[derive(Clone)]
 pub struct AsyncShellRecordingResizeSender {
     sender: mpsc::SyncSender<AsyncRecordingCommand>,
-    sequence: Arc<Mutex<()>>,
+    sequence: Arc<Mutex<Instant>>,
     failed: Arc<AtomicBool>,
 }
 
@@ -340,12 +345,12 @@ impl AsyncShellRecordingResizeSender {
     /// publication of the authoritative recording.
     pub fn write_resize_with(
         &self,
-        offset_micros: u64,
+        _offset_micros: u64,
         columns: u16,
         rows: u16,
         resize: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        let _sequence = self.sequence.lock().map_err(|_| {
+        let sequence = self.sequence.lock().map_err(|_| {
             self.failed.store(true, Ordering::SeqCst);
             io::Error::other("shell recording sequence lock poisoned")
         })?;
@@ -353,7 +358,9 @@ impl AsyncShellRecordingResizeSender {
             self.failed.store(true, Ordering::SeqCst);
             return Err(error);
         }
-        self.sender
+        let offset_micros = u64::try_from(sequence.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let result = self
+            .sender
             .try_send(AsyncRecordingCommand::Resize {
                 offset_micros,
                 columns,
@@ -362,7 +369,9 @@ impl AsyncShellRecordingResizeSender {
             .map_err(|_| {
                 self.failed.store(true, Ordering::SeqCst);
                 io::Error::other("shell recording queue overflowed or disconnected")
-            })
+            });
+        drop(sequence);
+        result
     }
 }
 
@@ -370,7 +379,7 @@ impl AsyncShellRecordingResizeSender {
 pub struct AsyncShellRecordingWriter {
     sender: mpsc::SyncSender<AsyncRecordingCommand>,
     worker: Option<thread::JoinHandle<()>>,
-    sequence: Arc<Mutex<()>>,
+    sequence: Arc<Mutex<Instant>>,
     failed: Arc<AtomicBool>,
 }
 
@@ -404,7 +413,7 @@ impl AsyncShellRecordingWriter {
         Ok(Self {
             sender,
             worker: Some(worker),
-            sequence: Arc::new(Mutex::new(())),
+            sequence: Arc::new(Mutex::new(Instant::now())),
             failed: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -429,7 +438,7 @@ impl AsyncShellRecordingWriter {
     /// Returns an error when ordering state is poisoned or the writer queue is disconnected.
     pub fn write_output_with(
         &mut self,
-        offset_micros: u64,
+        _offset_micros: u64,
         bytes: &[u8],
         replay_bytes: Option<&[u8]>,
         queued: impl FnOnce(),
@@ -437,10 +446,11 @@ impl AsyncShellRecordingWriter {
         if self.failed.load(Ordering::SeqCst) {
             return Err(io::Error::other("shell recording writer previously failed"));
         }
-        let _sequence = self.sequence.lock().map_err(|_| {
+        let sequence = self.sequence.lock().map_err(|_| {
             self.failed.store(true, Ordering::SeqCst);
             io::Error::other("shell recording sequence lock poisoned")
         })?;
+        let offset_micros = u64::try_from(sequence.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.sender
             .send(AsyncRecordingCommand::Output {
                 offset_micros,
@@ -452,6 +462,7 @@ impl AsyncShellRecordingWriter {
                 io::Error::other("shell recording queue disconnected")
             })?;
         queued();
+        drop(sequence);
         Ok(())
     }
 
@@ -462,7 +473,7 @@ impl AsyncShellRecordingWriter {
     /// returned, finalization fails explicitly and no authoritative recording is published.
     pub fn try_write_output_with(
         &mut self,
-        offset_micros: u64,
+        _offset_micros: u64,
         bytes: &[u8],
         replay_bytes: Option<&[u8]>,
         queued: impl FnOnce(),
@@ -472,10 +483,11 @@ impl AsyncShellRecordingWriter {
         }
         let bytes = bytes.to_vec();
         let replay_bytes = replay_bytes.map(<[u8]>::to_vec);
-        let Ok(_sequence) = self.sequence.try_lock() else {
+        let Ok(sequence) = self.sequence.try_lock() else {
             self.failed.store(true, Ordering::SeqCst);
             return false;
         };
+        let offset_micros = u64::try_from(sequence.elapsed().as_micros()).unwrap_or(u64::MAX);
         if self
             .sender
             .try_send(AsyncRecordingCommand::Output {
@@ -489,6 +501,7 @@ impl AsyncShellRecordingWriter {
             return false;
         }
         queued();
+        drop(sequence);
         true
     }
 
@@ -511,7 +524,7 @@ impl AsyncShellRecordingWriter {
     /// Returns an error after queue overflow/disconnection, writer I/O failure, or worker panic.
     pub fn finish(
         mut self,
-        offset_micros: u64,
+        _offset_micros: u64,
         exit_code: Option<i32>,
         signal: Option<String>,
         timed_out: bool,
@@ -522,7 +535,7 @@ impl AsyncShellRecordingWriter {
                 "shell recording queue overflowed, disconnected, or lost an ordered frame",
             ));
         }
-        let _sequence = self
+        let sequence = self
             .sequence
             .lock()
             .map_err(|_| io::Error::other("shell recording sequence lock poisoned"))?;
@@ -531,6 +544,7 @@ impl AsyncShellRecordingWriter {
                 "shell recording queue overflowed, disconnected, or lost an ordered frame",
             ));
         }
+        let offset_micros = u64::try_from(sequence.elapsed().as_micros()).unwrap_or(u64::MAX);
         let (response, result) = mpsc::channel();
         self.sender
             .send(AsyncRecordingCommand::Finish {
@@ -542,6 +556,7 @@ impl AsyncShellRecordingWriter {
                 response,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "recording writer stopped"))?;
+        drop(sequence);
         let result = result
             .recv()
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "recording writer stopped"))?;
@@ -786,6 +801,7 @@ pub struct ShellRecordingWriter {
     encoded_bytes: u64,
     output_bytes: u64,
     checksum: Sha256,
+    last_offset_micros: u64,
     finished: bool,
 }
 
@@ -820,6 +836,7 @@ impl ShellRecordingWriter {
             encoded_bytes: RECORDING_HEADER_BYTES as u64,
             output_bytes: 0,
             checksum: Sha256::new(),
+            last_offset_micros: 0,
             finished: false,
         };
         recording.write_frame(FRAME_START, 0, &[])?;
@@ -937,6 +954,13 @@ impl ShellRecordingWriter {
     }
 
     fn write_frame(&mut self, kind: u8, offset_micros: u64, payload: &[u8]) -> io::Result<()> {
+        if offset_micros < self.last_offset_micros || payload.len() > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recording frame violates timing or size contract",
+            ));
+        }
+        self.last_offset_micros = offset_micros;
         let length = u32::try_from(payload.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "recording frame too large")
         })?;
@@ -1495,7 +1519,7 @@ mod tests {
         let mut writer = AsyncShellRecordingWriter {
             sender,
             worker: None,
-            sequence: Arc::new(Mutex::new(())),
+            sequence: Arc::new(Mutex::new(Instant::now())),
             failed: Arc::clone(&failed),
         };
         assert!(writer.try_write_output(1, b"first"));
@@ -1555,6 +1579,61 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_writer_rejects_regressing_time_before_encoding() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("timing.bcsr");
+        let mut writer = ShellRecordingWriter::create(&path, 80, 24).expect("writer");
+        writer.write_output(100, b"kept").expect("output");
+        assert!(writer.write_resize(99, 100, 30).is_err());
+        writer
+            .finish(100, Some(0), None, false, false)
+            .expect("finish");
+        let (_, frames) = read_recording(&path).expect("valid recording");
+        assert_eq!(frames.len(), 3);
+    }
+
+    #[test]
+    fn concurrent_resize_and_output_ignore_foreign_clock_origins() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ordered.bcsr");
+        let mut writer = AsyncShellRecordingWriter::create(&path, 120, 40).expect("writer");
+        let resize = writer.resize_sender();
+        let thread = std::thread::spawn(move || {
+            for i in 0..32 {
+                resize
+                    .write_resize_with(u64::MAX, 80 + i, 24, || Ok(()))
+                    .expect("resize");
+                std::thread::yield_now();
+            }
+        });
+        for _ in 0..32 {
+            writer
+                .write_output_with(0, b"output\r\n", Some(b"output\r\n"), || {})
+                .expect("output");
+            std::thread::yield_now();
+        }
+        thread.join().expect("join");
+        writer
+            .finish(0, Some(0), None, false, false)
+            .expect("finish");
+        let (_, frames) = read_recording(&path).expect("complete validation");
+        assert_eq!(frames.len(), 98);
+        let bytes = std::fs::read(path).expect("bytes");
+        for size in [1, 7, 27, bytes.len()] {
+            let mut decoder = IncrementalShellRecordingDecoder::default();
+            let mut received = Vec::new();
+            for (index, chunk) in bytes.chunks(size).enumerate() {
+                received.extend(
+                    decoder
+                        .push(u64::try_from(index * size).expect("offset"), chunk)
+                        .expect("decode"),
+                );
+            }
+            assert_eq!(received, frames);
+        }
+    }
+
+    #[test]
     fn async_writer_preserves_frames_and_finalizes() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("recording.bcsr");
@@ -1565,7 +1644,18 @@ mod tests {
         writer
             .finish(4, Some(0), None, false, false)
             .expect("finish");
-        let (_, frames) = read_recording(&path).expect("recording");
+        let (_, mut frames) = read_recording(&path).expect("recording");
+        for (index, frame) in frames.iter_mut().enumerate() {
+            let offset = match frame {
+                ShellRecordingFrame::Start { offset_micros }
+                | ShellRecordingFrame::Output { offset_micros, .. }
+                | ShellRecordingFrame::ReplayOutput { offset_micros, .. }
+                | ShellRecordingFrame::Resize { offset_micros, .. }
+                | ShellRecordingFrame::Finish { offset_micros, .. }
+                | ShellRecordingFrame::Unknown { offset_micros, .. } => offset_micros,
+            };
+            *offset = u64::try_from(index).expect("index");
+        }
         assert_eq!(
             frames,
             vec![

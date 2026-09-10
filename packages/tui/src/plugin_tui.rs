@@ -361,6 +361,7 @@ pub struct PluginTuiPresentation {
     registry_factories: BTreeMap<String, bcode_plugin_sdk::tui::PluginTuiRegistryFactory>,
     registries: Mutex<BTreeMap<String, Arc<PluginTuiRegistry>>>,
     visual_revisions: Mutex<BTreeMap<String, u64>>,
+    artifact_delivery_failures: Mutex<BTreeSet<String>>,
     dirty_visuals: Mutex<BTreeSet<String>>,
     visual_generation: AtomicU64,
     full_generation: AtomicU64,
@@ -443,6 +444,7 @@ impl PluginTuiPresentation {
             registry_factories,
             registries: Mutex::new(BTreeMap::new()),
             visual_revisions: Mutex::new(BTreeMap::new()),
+            artifact_delivery_failures: Mutex::new(BTreeSet::new()),
             dirty_visuals: Mutex::new(BTreeSet::new()),
             visual_generation: AtomicU64::new(0),
             full_generation: AtomicU64::new(0),
@@ -650,9 +652,18 @@ impl PluginTuiPresentation {
     ) -> Option<RoutedTuiVisual> {
         for route in self.visual_routes(schema, schema_version, producer_plugin_id) {
             if let Some(registry) = self.registry(&route.plugin_id)
-                && let Some((rows, anchors)) =
+                && let Some((mut rows, anchors)) =
                     registry.visual_layout(&route.adapter_id, &route.schema, payload, context)
             {
+                if self
+                    .artifact_delivery_failures
+                    .lock()
+                    .is_ok_and(|failures| failures.contains(invocation_id))
+                {
+                    rows.push(bmux_tui::prelude::Line::from(
+                        "Artifact replay failed; showing last valid output. Recording requires inspection.",
+                    ));
+                }
                 let render_mode = registry
                     .visual_render_mode(&route.adapter_id, &route.schema, payload)
                     .unwrap_or_else(|| manifest_render_mode(route.render_mode));
@@ -851,7 +862,22 @@ impl PluginTuiPresentation {
             && registry.supports_visual_adapter(&route.adapter_id, &route.schema)
         {
             let started = Instant::now();
-            let delivered = registry.visual_artifact_chunk(&route.adapter_id, chunk)?;
+            let delivered = match registry.visual_artifact_chunk(&route.adapter_id, chunk) {
+                Ok(delivered) => delivered,
+                Err(error) => {
+                    if let Ok(mut failures) = self.artifact_delivery_failures.lock()
+                        && failures.len() < 256
+                    {
+                        failures.insert(chunk.tool_call_id.clone());
+                    }
+                    if let Ok(mut revisions) = self.visual_revisions.lock() {
+                        let revision = revisions.entry(chunk.tool_call_id.clone()).or_default();
+                        *revision = revision.wrapping_add(1);
+                    }
+                    self.mark_visual_dirty(&chunk.tool_call_id);
+                    return Err(error);
+                }
+            };
             self.record_timing(PluginVisualTiming {
                 operation: "artifact_delivery",
                 plugin_id: route.plugin_id.clone(),
@@ -1903,6 +1929,45 @@ library = "libdynamic_visual_test.dylib"
                 .unwrap_or_default();
             vec![Line::from(text)]
         }
+    }
+
+    #[test]
+    fn rejected_native_recording_is_visible_and_invalidates_layout() {
+        let presentation = test_presentation();
+        let result = presentation.deliver_artifact_chunk(&PluginTuiArtifactChunk {
+            tool_call_id: "broken".to_owned(),
+            artifact_id: "artifact".to_owned(),
+            reference_key: "shell_recording".to_owned(),
+            producer_plugin_id: "bcode.shell".to_owned(),
+            schema: "bcode.shell.run".to_owned(),
+            schema_version: 1,
+            content_type: Some("application/x-bcode-shell-recording; version=3".to_owned()),
+            offset: 0,
+            total_bytes: 32,
+            revision: 1,
+            finalized: true,
+            bytes: vec![0; 32],
+        });
+        assert!(result.is_err());
+        assert!(presentation.drain_dirty_visuals().contains("broken"));
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            100,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let visual = presentation
+            .routed_visual(
+                "broken",
+                1,
+                "bcode.shell.run",
+                1,
+                Some("bcode.shell"),
+                &serde_json::json!({"mode":"terminal"}),
+                &context,
+            )
+            .expect("visual");
+        drop(presentation);
+        assert!(routed_text(&visual).contains("Artifact replay failed"));
     }
 
     fn test_presentation() -> PluginTuiPresentation {
