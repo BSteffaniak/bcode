@@ -1151,6 +1151,7 @@ fn authoring_failure(error: super::ServerError) -> bcode_workflow::WorkflowAutho
     use super::ServerError;
     use bcode_workflow::WorkflowAuthoringFailure as Failure;
     match error {
+        ServerError::WorkflowAuthoring(failure) => failure,
         ServerError::WorkflowComputationTimedOut(_) => Failure::TimedOut,
         ServerError::WorkflowComputationCancelled(_) => Failure::Cancelled,
         ServerError::WorkflowComputationControlInvalid(_) => Failure::InvalidControl,
@@ -3200,10 +3201,6 @@ impl Drop for DiscoveryExpiration {
     }
 }
 
-fn discovery_error(message: &str) -> super::ServerError {
-    bcode_workflow_discovery::WorkflowDiscoveryError::Invalid(message.to_string()).into()
-}
-
 /// Discover and semantically preview one bounded workflow launch-catalog page.
 ///
 /// Discovery is read-only. It never applies, publishes, repairs, or starts a workflow.
@@ -3220,13 +3217,18 @@ pub async fn launch_catalog(
             .workflow_discovery_scans
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending = scans.get(token).ok_or_else(|| {
-            discovery_error("unknown or expired discovery token; restart discovery")
-        })?;
-        if pending.expires <= std::time::Instant::now() || pending.request != binding {
-            return Err(discovery_error(
-                "expired or mismatched discovery token; restart discovery",
-            ));
+        let invalid = || {
+            super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+            )
+        };
+        let pending = scans.get(token).ok_or_else(invalid)?;
+        if pending.expires <= std::time::Instant::now() {
+            scans.remove(token);
+            return Err(invalid());
+        }
+        if pending.request != binding {
+            return Err(invalid());
         }
         scans.remove(token).map(|pending| {
             drop(pending.expiration);
@@ -3242,7 +3244,11 @@ pub async fn launch_catalog(
     } else {
         let permit = std::sync::Arc::clone(&state.workflow_discovery_capacity)
             .try_acquire_owned()
-            .map_err(|_| discovery_error("discovery scan capacity reached; retry later"))?;
+            .map_err(|_| {
+                super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::DiscoveryCapacity,
+                )
+            })?;
         tokio::task::spawn_blocking(move || {
             bcode_workflow_discovery::WorkflowDiscoveryScan::open(
                 &workspace,

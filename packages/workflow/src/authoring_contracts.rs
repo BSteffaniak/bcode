@@ -716,6 +716,12 @@ pub enum WorkflowAuthoringFailure {
     /// Computation identity or deadline is invalid.
     #[error("workflow computation control request is invalid")]
     InvalidControl,
+    /// Continuation is unknown, consumed, expired, or does not match its original request.
+    #[error("workflow discovery continuation is invalid; restart discovery without a token")]
+    DiscoveryContinuationInvalid,
+    /// Discovery admission is full; retry after another scan completes or expires.
+    #[error("workflow discovery capacity reached; retry after a scan completes or expires")]
+    DiscoveryCapacity,
     /// Unclassified failures disclose no host details.
     #[error("request failed")]
     Failed,
@@ -737,6 +743,8 @@ impl WorkflowAuthoringFailure {
             Self::TimedOut => "workflow_computation_timed_out",
             Self::Cancelled => "workflow_computation_cancelled",
             Self::InvalidControl => "workflow_computation_control_invalid",
+            Self::DiscoveryContinuationInvalid => "workflow_discovery_continuation_invalid",
+            Self::DiscoveryCapacity => "workflow_discovery_capacity",
             Self::Failed => "request_failed",
         }
     }

@@ -162,7 +162,7 @@ fn verify_catalog_admission(root: &std::path::Path, base: &serde_json::Value) {
     write(base);
     let rejected = run_cli_at_root(root, &command, Stdio::piped(), Stdio::piped());
     assert!(!rejected.status.success(), "ninth scan bypassed admission");
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("request_failed"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("workflow_discovery_capacity"));
     for mut request in pending {
         let mut completed = false;
         for _ in 0..32 {
@@ -253,6 +253,9 @@ fn verify_incremental_catalog(root: &std::path::Path, sources: &std::path::Path)
     assert!(
         !replay.status.success(),
         "consumed discovery token was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&replay.stderr).contains("workflow_discovery_continuation_invalid")
     );
 }
 
