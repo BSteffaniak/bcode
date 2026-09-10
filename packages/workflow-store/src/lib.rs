@@ -10896,6 +10896,11 @@ fn parallel_join_members(
                 })?;
             let (revision, edge) =
                 dependency_input_edge(transaction, run_id, &node_id, &target.id)?;
+            if revision != 1 && edge.is_none() {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "parallel join member has no dependency edge: {node_id}"
+                )));
+            }
             let retained = edge
                 .as_ref()
                 .map(|edge| {
@@ -10912,7 +10917,7 @@ fn parallel_join_members(
                     &identity,
                 )?)
             } else {
-                activation_output_value(transaction, run_id, &node_id, generation)
+                current_dependency_output_value(transaction, run_id, &node_id, generation, revision)
             };
             match value {
                 Ok(value) => {
@@ -11003,8 +11008,47 @@ fn dependency_input_value(
     if source_node_id == output.node_id {
         Ok(output.value.clone())
     } else {
-        activation_output_value(transaction, &output.run_id, source_node_id, generation)
+        current_dependency_output_value(
+            transaction,
+            &output.run_id,
+            source_node_id,
+            generation,
+            revision,
+        )
     }
+}
+
+fn current_dependency_output_value(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node_id: &str,
+    generation: u64,
+    revision: u64,
+) -> Result<serde_json::Value, WorkflowStoreError> {
+    if revision == 1 {
+        return activation_output_value(transaction, run_id, node_id, generation);
+    }
+    let (activation_id, status) =
+        activation_at_generation(transaction, run_id, node_id, generation)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    if status != "completed" {
+        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+    }
+    let admitted: Option<u64> = transaction
+        .query_row(
+            "SELECT graph_revision FROM workflow_activation_graph_bindings
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            (run_id, node_id, &activation_id),
+            |row| row.get(0),
+        )
+        .optional()?;
+    if admitted != Some(revision) {
+        return Err(WorkflowStoreError::InvalidData(
+            "dependency input requires graph reconciliation".to_string(),
+        ));
+    }
+    run_graph::reconciled_activation_exit(transaction, run_id, node_id, &activation_id)?;
+    activation_output_value_by_identity(transaction, run_id, node_id, &activation_id)
 }
 
 fn dependency_input_edge(
@@ -11222,14 +11266,35 @@ fn successor_dependencies_ready(
             let completed = if let Some(activation_id) = retained {
                 retained_activation_ready(transaction, &output.run_id, &edge.from, &activation_id)?
             } else {
-                activation_status_at_generation(
-                    transaction,
-                    &output.run_id,
-                    &edge.from,
-                    generation,
-                )?
-                .as_deref()
-                .is_some_and(|status| matches!(status, "completed" | "skipped"))
+                let activation =
+                    activation_at_generation(transaction, &output.run_id, &edge.from, generation)?;
+                if let Some((activation_id, status)) = activation {
+                    let ready = matches!(status.as_str(), "completed" | "skipped");
+                    if ready && revision != 1 {
+                        let admitted: Option<u64> = transaction
+                            .query_row(
+                                "SELECT graph_revision FROM workflow_activation_graph_bindings
+                             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+                                (&output.run_id, &edge.from, &activation_id),
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        if admitted != Some(revision) {
+                            return Err(WorkflowStoreError::InvalidData(
+                                "successor dependency requires graph reconciliation".to_string(),
+                            ));
+                        }
+                        run_graph::reconciled_activation_exit(
+                            transaction,
+                            &output.run_id,
+                            &edge.from,
+                            &activation_id,
+                        )?;
+                    }
+                    ready
+                } else {
+                    false
+                }
             };
             if conditional {
                 reached_by_conditional = true;
@@ -11941,12 +12006,23 @@ fn settle_parallel_failure(
     member_failed: bool,
     settled_at_ms: u64,
 ) -> Result<Option<ParallelFailureSettlement>, WorkflowStoreError> {
-    if run_graph::graph_revision(transaction, run_id)? != Some(1) {
+    let graph_revision = run_graph::graph_revision(transaction, run_id)?.ok_or_else(|| {
+        WorkflowStoreError::InvalidData("parallel settlement graph is missing".to_string())
+    })?;
+    if graph_revision != 1 {
         run_graph::reconciled_activation_exit(transaction, run_id, member_node_id, activation_id)?;
-        if parallel_join_for_member(transaction, run_id, member_node_id)?.is_some() {
+        let admitted: Option<u64> = transaction
+            .query_row(
+                "SELECT graph_revision FROM workflow_activation_graph_bindings
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+                (run_id, member_node_id, activation_id),
+                |row| row.get(0),
+            )
+            .optional()?;
+        if admitted != Some(graph_revision) {
             run_graph::revised_leaf_exit(transaction, run_id, member_node_id, activation_id)?;
+            return Ok(None);
         }
-        return Ok(None);
     }
     let generation: u64 = transaction.query_row(
         "SELECT dependency_generation FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2 \
@@ -11957,10 +12033,41 @@ fn settle_parallel_failure(
     if let Some(join) = parallel_join_for_member(transaction, run_id, member_node_id)? {
         let members = parallel_member_ids(&join, member_node_id)?;
         for member in &members {
-            if run_graph::initial_node(transaction, run_id, member)?.is_none() {
+            if WorkflowStore::current_run_graph_node_in_snapshot(transaction, run_id, member)?
+                .is_none()
+            {
                 return Err(WorkflowStoreError::InvalidData(format!(
                     "parallel settlement references missing member: {member}"
                 )));
+            }
+            if graph_revision != 1 {
+                let (member_activation, _) =
+                    activation_at_generation(transaction, run_id, member, generation)?.ok_or_else(
+                        || {
+                            WorkflowStoreError::InvalidData(format!(
+                                "parallel member activation is missing: {member}"
+                            ))
+                        },
+                    )?;
+                let admitted: Option<u64> = transaction
+                    .query_row(
+                        "SELECT graph_revision FROM workflow_activation_graph_bindings
+                     WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+                        (run_id, member, &member_activation),
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if admitted != Some(graph_revision) {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "parallel member requires graph reconciliation".to_string(),
+                    ));
+                }
+                run_graph::reconciled_activation_exit(
+                    transaction,
+                    run_id,
+                    member,
+                    &member_activation,
+                )?;
             }
         }
         validate_parallel_run_topology(transaction, run_id, &join)?;
@@ -34608,6 +34715,58 @@ mod tests {
     }
 
     #[test]
+    fn revised_readiness_rejects_unreconciled_completed_dependency() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        store.create_run(&run).expect("run");
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_run_graphs SET revision = 2;
+             UPDATE workflow_activations SET status = 'completed';",
+            )
+            .expect("revision fixture");
+        let output = ValidatedOutput {
+            output_id: "dependency".into(),
+            run_id: run.run_id.clone(),
+            node_id: "first".into(),
+            activation_id: activation_identity(&run.run_id, "first", 0),
+            schema_id: "u32".into(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        let transaction = store.connection.transaction().expect("transaction");
+        let error = successor_dependencies_ready(&transaction, &output, "second", 0)
+            .expect_err("stale admission");
+        assert!(
+            error
+                .to_string()
+                .contains("successor dependency requires graph reconciliation")
+        );
+        let input_error = current_dependency_output_value(&transaction, &run.run_id, "first", 0, 2)
+            .expect_err("stale input admission");
+        assert!(
+            input_error
+                .to_string()
+                .contains("dependency input requires graph reconciliation")
+        );
+        transaction
+            .execute(
+                "UPDATE workflow_activation_graph_bindings SET graph_revision = 2",
+                [],
+            )
+            .expect("current admission");
+        assert!(successor_dependencies_ready(&transaction, &output, "second", 0).expect("ready"));
+    }
+
+    #[test]
     fn current_revision_direct_settlement_admits_successor_at_same_revision() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -35313,6 +35472,53 @@ mod tests {
         assert!(
             result.run_failed,
             "must not read successful generation zero"
+        );
+    }
+
+    #[test]
+    fn revised_parallel_failure_requires_current_sibling_admission() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("revised-parallel", 1, &parallel_join_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "revised-parallel".to_string();
+        store.create_run(&run).expect("run");
+        store.connection.execute_batch(
+            "UPDATE workflow_run_graphs SET revision = 2;
+             UPDATE workflow_activation_graph_bindings SET graph_revision = 2 WHERE node_id = 'left';
+             UPDATE workflow_activations SET status = CASE node_id WHEN 'left' THEN 'failed' ELSE 'completed' END;"
+        ).expect("revision fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let activation = activation_identity(&run.run_id, "left", 0);
+        let error =
+            settle_parallel_failure(&transaction, &run.run_id, "left", &activation, true, 20)
+                .expect_err("stale sibling");
+        assert!(
+            error
+                .to_string()
+                .contains("parallel member requires graph reconciliation")
+        );
+        transaction
+            .execute(
+                "UPDATE workflow_activation_graph_bindings SET graph_revision = 2",
+                [],
+            )
+            .expect("bind siblings");
+        let result =
+            settle_parallel_failure(&transaction, &run.run_id, "left", &activation, true, 20)
+                .expect("settle")
+                .expect("join");
+        assert!(result.run_failed);
+        transaction.commit().expect("commit");
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            reopened
+                .decision(&format!("{}:join:0:parallel-wait-all", run.run_id))
+                .expect("decision")
+                .is_some()
         );
     }
 
