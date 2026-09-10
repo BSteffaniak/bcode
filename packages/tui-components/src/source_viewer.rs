@@ -47,17 +47,20 @@ pub fn source_viewer_rows_with_style(
     width: u16,
     style: SourceViewerStyle,
 ) -> Vec<Line> {
-    let contents = super::source_text::visible_source(input.contents);
-    let input = SourceViewerInput {
-        contents: &contents,
-        ..input
-    };
-    let styled_lines = highlighted_lines(input);
+    let ansi_lines = super::source_text::ansi_source(input.contents);
+    let plain = ansi_lines.as_ref().map(|lines| {
+        lines
+            .iter()
+            .map(Line::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    let styled_lines = ansi_lines.unwrap_or_else(|| highlighted_lines(input));
     bmux_tui_components::source_viewer::source_viewer_rows_with_style(
         bmux_tui_components::source_viewer::SourceViewerInput {
             label: input.label,
             styled_lines: Some(&styled_lines),
-            contents: input.contents,
+            contents: plain.as_deref().unwrap_or(input.contents),
             start_line: input.start_line,
             max_lines: input.max_lines,
             truncated_message: input.truncated_message,
@@ -126,7 +129,61 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn ansi_source_is_escaped_before_wrapping() {
+    fn ansi_card_geometry_matches_plain_text_and_redraw_is_safe() {
+        use super::{SourceViewerInput, source_viewer_rows};
+        use bmux_tui::{buffer::Buffer, geometry::Rect, prelude::Color};
+        for width in [16, 24, 80] {
+            let input = SourceViewerInput {
+                label: "sample.txt",
+                #[cfg(feature = "syntax")]
+                syntax_palette: None,
+                contents: "\x1b[31mRed text with a long wrapped line\x1b[0m\nplain",
+                start_line: 1,
+                max_lines: 30,
+                truncated_message: "truncated",
+                line_numbers: true,
+            };
+            let rows = source_viewer_rows(input, width);
+            let plain = source_viewer_rows(
+                SourceViewerInput {
+                    contents: "Red text with a long wrapped line\nplain",
+                    ..input
+                },
+                width,
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(bmux_tui::prelude::Line::plain_text)
+                    .collect::<Vec<_>>(),
+                plain
+                    .iter()
+                    .map(bmux_tui::prelude::Line::plain_text)
+                    .collect::<Vec<_>>()
+            );
+            let area = Rect::new(0, 0, width, u16::try_from(rows.len()).unwrap());
+            let mut frame = Buffer::empty(area);
+            for (y, row) in rows.iter().enumerate() {
+                frame.write_line(Rect::new(0, u16::try_from(y).unwrap(), width, 1), row);
+                for span in &row.spans {
+                    if span.content.contains('│') || span.content.contains('┐') {
+                        assert_ne!(span.style.fg, Some(Color::Red));
+                    }
+                }
+            }
+            let blank = Buffer::empty(area);
+            let mut full = Vec::new();
+            bmux_tui::ansi::write_ansi_frame(&mut full, &frame, None).unwrap();
+            let mut redraw = Vec::new();
+            bmux_tui::ansi::write_ansi_frame_diff(&mut redraw, &frame, &blank, None).unwrap();
+            assert!(!redraw.is_empty());
+            let mut restored = Vec::new();
+            bmux_tui::ansi::write_ansi_frame(&mut restored, &frame, None).unwrap();
+            assert_eq!(full, restored);
+        }
+    }
+
+    #[test]
+    fn ansi_source_is_styled_before_wrapping() {
         use super::{SourceViewerInput, source_viewer_rows};
         for width in [20, 40, 80] {
             let rows = source_viewer_rows(
@@ -134,7 +191,7 @@ mod tests {
                     label: "sample.txt",
                     #[cfg(feature = "syntax")]
                     syntax_palette: None,
-                    contents: "\x1b[31mRed text\x1b[0m\n\t\r\u{9b}2J",
+                    contents: "\x1b[31mRed text\x1b[0m\nplain",
                     start_line: 1,
                     max_lines: 30,
                     truncated_message: "truncated",
@@ -149,7 +206,13 @@ mod tests {
                 .join("\n");
             assert!(!text.chars().any(|ch| ch.is_control() && ch != '\n'));
             if width == 80 {
-                assert!(text.contains("\\u{1b}[31mRed text\\u{1b}[0m"));
+                assert!(text.contains("Red text"));
+                assert!(!text.contains("[31m"));
+                assert!(
+                    rows.iter()
+                        .flat_map(|row| &row.spans)
+                        .any(|span| span.style.fg == Some(bmux_tui::prelude::Color::Red))
+                );
             }
             for row in rows {
                 assert!(

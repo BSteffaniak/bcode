@@ -71,17 +71,44 @@ pub fn diff_from_text_at_lines_with_palette(
     new_start_line: u32,
     #[cfg(feature = "syntax")] syntax_palette: Option<SyntaxPalette>,
 ) -> DiffDocument {
-    let old_text = super::source_text::visible_source(old_text);
-    let new_text = super::source_text::visible_source(new_text);
-    let document = bmux_tui_components::diff_viewer::diff_from_text_at_lines(
+    let old_ansi = super::source_text::ansi_source(old_text);
+    let new_ansi = super::source_text::ansi_source(new_text);
+    let mut document = bmux_tui_components::diff_viewer::diff_from_text_at_lines(
         label,
-        &old_text,
-        &new_text,
+        old_text,
+        new_text,
         old_start_line,
         new_start_line,
     );
-    #[cfg(feature = "syntax")]
-    let mut document = document;
+    // Diff original source first: ANSI-only edits must remain real changes. Then
+    // project each logical line into visible text and styles for terminal layout.
+    for line in &mut document.lines {
+        let source = if line.kind == DiffLineKind::Removed {
+            line.old_line
+                .and_then(|number| number.checked_sub(old_start_line))
+                .and_then(|index| old_ansi.as_ref()?.get(index as usize))
+        } else {
+            line.new_line
+                .and_then(|number| number.checked_sub(new_start_line))
+                .and_then(|index| new_ansi.as_ref()?.get(index as usize))
+        };
+        if let Some(source) = source {
+            line.content = source.plain_text();
+            // Raw-byte intraline offsets cannot index the parsed display string.
+            // Highlight the changed visible line rather than guessing those offsets.
+            if !line.changed_ranges.is_empty() {
+                line.changed_ranges = vec![ChangedRange::new(0, line.content.len())];
+            }
+            line.syntax_spans = source
+                .spans
+                .iter()
+                .map(|span| DiffSyntaxSpan {
+                    content: span.content.clone(),
+                    style: span.style,
+                })
+                .collect();
+        }
+    }
     #[cfg(feature = "syntax")]
     apply_syntax(label, &mut document, syntax_palette);
     document
@@ -152,10 +179,11 @@ fn apply_syntax(label: &str, document: &mut DiffDocument, palette: Option<Syntax
         return;
     }
     for line in document.lines.iter_mut().filter(|line| {
-        matches!(
-            line.kind,
-            DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
-        )
+        line.syntax_spans.is_empty()
+            && matches!(
+                line.kind,
+                DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
+            )
     }) {
         line.syntax_spans = highlighter
             .highlight_line_tokens(label, &line.content)
@@ -237,12 +265,31 @@ mod tests {
                 assert!(line.content.get(range.start..range.end).is_some());
             }
         }
-        assert!(
-            document
+        assert!(document.lines.iter().any(|line| {
+            line.content == "new"
+                && line
+                    .syntax_spans
+                    .iter()
+                    .any(|span| span.style.fg == Some(bmux_tui::prelude::Color::Green))
+        }));
+    }
+
+    #[test]
+    fn ansi_only_diff_changes_keep_their_identity_and_styles() {
+        let document = diff_from_text("sample.txt", "\x1b[31msame", "\x1b[32msame");
+        assert_eq!((document.added, document.removed), (1, 1));
+        for (kind, color) in [
+            (DiffLineKind::Removed, bmux_tui::prelude::Color::Red),
+            (DiffLineKind::Added, bmux_tui::prelude::Color::Green),
+        ] {
+            let line = document
                 .lines
                 .iter()
-                .any(|line| line.content.contains("\\u{1b}[32mnew"))
-        );
+                .find(|line| line.kind == kind)
+                .unwrap();
+            assert_eq!(line.content, "same");
+            assert_eq!(line.syntax_spans[0].style.fg, Some(color));
+        }
     }
 
     #[test]
