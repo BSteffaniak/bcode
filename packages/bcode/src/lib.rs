@@ -6019,10 +6019,7 @@ impl BcodeBuilder {
                 }
             },
         );
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(builder),
-        }
+        failure.map_or_else(|| Ok(builder), Err)
     }
 
     /// Configure model and auth defaults from an exclusively owned auth store.

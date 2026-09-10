@@ -179,8 +179,8 @@ impl Pager {
         usize::from(self.content_height().max(1))
     }
 
-    fn max_offset(&self) -> usize {
-        self.lines.len().saturating_sub(self.page_size())
+    fn max_offset(&self) -> u64 {
+        u64::try_from(self.lines.len().saturating_sub(self.page_size())).unwrap_or(u64::MAX)
     }
 
     fn position_label(&self) -> String {
@@ -192,7 +192,7 @@ impl Pager {
                 .get()
                 .vertical_offset()
                 .saturating_add(1)
-                .min(total)
+                .min(u64::try_from(total).unwrap_or(u64::MAX))
         };
         format!(" {position}/{total} ")
     }
