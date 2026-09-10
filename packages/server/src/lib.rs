@@ -392,6 +392,8 @@ pub struct ServerState {
     workflow_event_forwarder_started: std::sync::atomic::AtomicBool,
     workflow_event_forwarder: Mutex<Option<JoinHandle<()>>>,
     workflow_event_forwarder_failed: std::sync::atomic::AtomicBool,
+    workflow_driver_sender: std::sync::OnceLock<mpsc::Sender<String>>,
+    workflow_driver_task: Mutex<Option<JoinHandle<()>>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
     catalog_workers: Mutex<Vec<JoinHandle<()>>>,
     catalog_workers_failed: std::sync::atomic::AtomicBool,
@@ -1601,6 +1603,12 @@ impl ServerState {
                 facts.request.mutation_id,
             ));
         }
+        let permit = self
+            .workflow_driver_sender
+            .get()
+            .ok_or_else(denied)?
+            .try_reserve()
+            .map_err(|_| denied())?;
         let result = store.publish_retained_leaf_run_graph_edit_from_execution(
             &facts.request.mutation_id,
             &authority,
@@ -1609,7 +1617,9 @@ impl ServerState {
         );
         drop(store);
         drop(commit);
-        result.map_err(Into::into)
+        let revision = result?;
+        permit.send(facts.request.run_id);
+        Ok(revision)
     }
 
     /// Configure run-edit staging policy before sharing the server with clients.
@@ -1623,6 +1633,9 @@ impl ServerState {
 
     /// Authorize and publish a retained-leaf edit for an accepted local client.
     ///
+    /// Success reports a committed revision queued for scheduling, not execution completion.
+    /// Driver failures do not retroactively turn a committed publication into an error.
+    ///
     /// # Errors
     /// Returns an error for denied policy, invalid facts, unavailable storage, stale authority,
     /// candidate conflicts, or unsupported execution reconciliation/topology.
@@ -1631,7 +1644,22 @@ impl ServerState {
         client_id: ClientId,
         request: bcode_workflow::WorkflowRunGraphEditBatch,
     ) -> Result<u64, ServerError> {
-        workflow_operations::publish_run_graph_edit(self, client_id, request).await
+        self.start_workflow_driver().await;
+        let sender = self.workflow_driver_sender.get().ok_or_else(|| {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "workflow scheduler is unavailable".to_string(),
+            )
+        })?;
+        let permit = sender.try_reserve().map_err(|_| {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "workflow scheduler is unavailable or full".to_string(),
+            )
+        })?;
+        let run_id = request.run_id.clone();
+        let revision =
+            workflow_operations::publish_run_graph_edit(self, client_id, request).await?;
+        permit.send(run_id);
+        Ok(revision)
     }
 
     pub fn set_workflow_run_graph_edit_policy(&mut self, policy: WorkflowRunGraphEditPolicy) {
@@ -1934,6 +1962,8 @@ impl ServerState {
             workflow_event_forwarder_started: std::sync::atomic::AtomicBool::new(false),
             workflow_event_forwarder: Mutex::new(None),
             workflow_event_forwarder_failed: std::sync::atomic::AtomicBool::new(false),
+            workflow_driver_sender: std::sync::OnceLock::new(),
+            workflow_driver_task: Mutex::new(None),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             catalog_workers: Mutex::new(Vec::new()),
             catalog_workers_failed: std::sync::atomic::AtomicBool::new(false),
@@ -2478,6 +2508,69 @@ impl ServerState {
         } else {
             Ok(())
         }
+    }
+
+    async fn start_workflow_driver(self: &Arc<Self>) {
+        let mut task = self.workflow_driver_task.lock().await;
+        if task.is_some() || self.shutdown_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.workflow_driver_sender.get().is_some() {
+            return;
+        }
+        let (sender, mut receiver) = mpsc::channel::<String>(256);
+        if self.workflow_driver_sender.set(sender).is_err() {
+            return;
+        }
+        let state = Arc::clone(self);
+        let mut shutdown = self.subscribe_shutdown();
+        *task = Some(tokio::spawn(async move {
+            let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
+            recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut after_run_id = String::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    _ = recovery_tick.tick() => {
+                        let page = state.workflow_store.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .continuation_run_ids_after(&after_run_id, 16);
+                        // A slow page must not leave the biased timer perpetually ready,
+                        // starving queued publications between discovery passes.
+                        recovery_tick.reset();
+                        let Ok(run_ids) = page else {
+                            tracing::warn!("workflow continuation discovery failed");
+                            continue;
+                        };
+                        if run_ids.is_empty() {
+                            after_run_id.clear();
+                        }
+                        for run_id in run_ids {
+                            if state.shutdown_requested.load(Ordering::SeqCst) { return; }
+                            after_run_id.clone_from(&run_id);
+                            let runnable = state.workflow_store.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .run_summary(&run_id)
+                                .is_ok_and(|run| run.is_some_and(|run| run.status == bcode_workflow_store::RunStatus::Running));
+                            if !runnable { continue; }
+                            // Discovery is only a hint; driving qualifies durable ownership.
+                            if drive_workflow_run(&state, &run_id).await.is_err() {
+                                tracing::warn!("durable workflow continuation failed");
+                            }
+                        }
+                        recovery_tick.reset();
+                    }
+                    run_id = receiver.recv() => {
+                        let Some(run_id) = run_id else { break };
+                        if state.shutdown_requested.load(Ordering::SeqCst) { break; }
+                        if drive_workflow_run(&state, &run_id).await.is_err() {
+                            tracing::warn!("published workflow continuation failed; durable work remains available for recovery");
+                        }
+                    }
+                }
+            }
+        }));
     }
 
     async fn start_workflow_event_forwarder(self: &Arc<Self>) {
@@ -4427,6 +4520,7 @@ async fn run_constructed_server(
     let startup_started_at = state.startup_started_at;
     let stage_started_at = Instant::now();
     state.start_catalog_event_forwarder().await;
+    state.start_workflow_driver().await;
     state.start_workflow_event_forwarder().await;
     state.start_session_search_ingestion().await;
     start_catalog_refresh(&state).await;
@@ -4578,6 +4672,11 @@ async fn shutdown_constructed_server(
 ) -> Result<(), ServerError> {
     state.request_shutdown();
     let ingestion = state.stop_session_search_ingestion().await;
+    let driver_task = state.workflow_driver_task.lock().await.take();
+    if let Some(task) = driver_task {
+        task.abort();
+        let _ = task.await;
+    }
     let workflow_forwarder = state.stop_workflow_event_forwarder().await;
     let catalog_workers = state.stop_catalog_workers().await;
     let idle_watcher = state.stop_idle_shutdown_watcher().await;
@@ -15240,7 +15339,9 @@ async fn broadcast_workflow_event(
 }
 
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
-    let authority = workflow_operations::execution_authority(state, run_id).await?;
+    let Some(authority) = workflow_operations::execution_authority(state, run_id).await? else {
+        return Ok(());
+    };
     let started_at = std::time::Instant::now();
     let store_path = state
         .workflow_store
@@ -15249,10 +15350,11 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         .path()
         .to_path_buf();
     loop {
-        if let Some(authority) = authority.as_ref() {
-            bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-                .verify_execution_authority(run_id, &authority.authority)?;
+        if state.shutdown_requested.load(Ordering::SeqCst) {
+            return Ok(());
         }
+        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .verify_execution_authority(run_id, &authority.authority)?;
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
         if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
@@ -15270,19 +15372,15 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
                 now_ms,
             )
             .await?;
-        let reconciled = if let Some(authority) = authority.as_ref() {
-            bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-                .reconcile_owned_receipts_for_run_async(
-                    &WorkflowTurnReceiptObserver { state },
-                    run_id,
-                    &authority.authority,
-                    1_000,
-                    now_ms,
-                )
-                .await?
-        } else {
-            bcode_workflow_store::ReceiptReconciliationSummary::default()
-        };
+        let reconciled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .reconcile_owned_receipts_for_run_async(
+                &WorkflowTurnReceiptObserver { state },
+                run_id,
+                &authority.authority,
+                1_000,
+                now_ms,
+            )
+            .await?;
         if !reconciled.sibling_cancellations.is_empty() {
             propagate_fail_fast_sibling_cancellation(
                 state,
@@ -48439,10 +48537,19 @@ library = "test"
         state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.workflow".to_owned()]),
+                enabled: BTreeSet::from([
+                    "bcode.workflow".to_owned(),
+                    "bcode.fake-provider".to_owned(),
+                ]),
                 disabled: BTreeSet::new(),
             },
-            &[plugin],
+            &[
+                plugin,
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+                    bcode_fake_provider_plugin::static_plugin(),
+                ),
+            ],
         )
         .expect("registered workflow plugin");
         state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
@@ -48493,6 +48600,8 @@ library = "test"
     #[tokio::test]
     async fn registered_workflow_tool_stages_active_execution() {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        let (sender, mut scheduled) = mpsc::channel(1);
+        state.workflow_driver_sender.set(sender).expect("scheduler");
         register_workflow_publication_tool(&mut state);
         let provenance = state
             .sessions
@@ -48568,6 +48677,7 @@ library = "test"
                 assert!(response.output.contains("Topology has not been published"));
             } else {
                 assert!(response.output.contains("published at revision 2"));
+                assert_eq!(scheduled.try_recv().expect("publication wake"), "edit-run");
             }
         }
         let store = state.workflow_store.lock().expect("store");
@@ -48642,6 +48752,8 @@ library = "test"
     #[tokio::test]
     async fn local_publication_uses_configured_grant_at_application_boundary() {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        let (sender, mut queued) = mpsc::channel(1);
+        state.workflow_driver_sender.set(sender).expect("queue");
         register_workflow_publication_tool(&mut state);
         let provenance = state
             .sessions
@@ -48670,17 +48782,64 @@ library = "test"
                 )
             }),
         });
-        let state = Arc::new(state);
+        let mut state = Arc::new(state);
+        state
+            .publish_workflow_run_graph_edit(ClientId::new(), edit)
+            .await
+            .expect("publication queued");
+        assert_eq!(queued.try_recv().expect("discard wake"), "edit-run");
+        Arc::get_mut(&mut state)
+            .expect("exclusive state")
+            .workflow_driver_sender
+            .take();
+        state.start_workflow_driver().await;
+        let dispatched = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attempts = state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .attempt_history("edit-run", None, 100)
+                    .expect("attempts");
+                if let Some(attempt) = attempts
+                    .iter()
+                    .find(|attempt| attempt.node_id == "next" && attempt.terminal_at_ms.is_some())
+                {
+                    break attempt.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let task = state
+            .workflow_driver_task
+            .lock()
+            .await
+            .take()
+            .expect("driver");
+        task.abort();
+        let _ = task.await;
+        let outputs = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .validated_outputs("edit-run", 10)
+            .expect("validated outputs");
+        drop(state);
+        let attempt = dispatched.expect("published entry settled by worker");
+        assert_eq!(attempt.status, "succeeded", "{attempt:?}");
         assert!(
-            workflow_operations::publish_run_graph_edit(&state, ClientId::new(), edit)
-                .await
-                .is_ok()
+            outputs
+                .iter()
+                .any(|output| output.node_id == "next" && output.value == serde_json::json!(true))
         );
     }
 
     #[tokio::test]
     async fn execution_publication_requires_distinct_policy_and_exact_candidate() {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        let (sender, mut scheduled) = mpsc::channel(2);
+        state.workflow_driver_sender.set(sender).expect("scheduler");
         let provenance = state
             .sessions
             .session_summary(child_id)
@@ -48755,13 +48914,19 @@ library = "test"
                 .publish_workflow_run_graph_edit_from_invocation(
                     child_id,
                     "bcode.workflow",
-                    edit,
+                    edit.clone(),
                     &cancel
                 )
                 .await
                 .expect("duplicate"),
             2
         );
+        assert_publication_queue_full(&state, child_id, edit, &cancel).await;
+        assert_eq!(
+            scheduled.try_recv().expect("publication scheduled"),
+            "edit-run"
+        );
+        assert_eq!(scheduled.try_recv().expect("duplicate wake"), "edit-run");
         assert_eq!(
             state
                 .workflow_store
@@ -48770,6 +48935,25 @@ library = "test"
                 .run_graph_revision("edit-run")
                 .expect("revision"),
             Some(2)
+        );
+    }
+
+    async fn assert_publication_queue_full(
+        state: &ServerState,
+        session_id: SessionId,
+        edit: bcode_workflow::WorkflowRunGraphEditBatch,
+        cancel: &TurnCancelState,
+    ) {
+        assert!(
+            state
+                .publish_workflow_run_graph_edit_from_invocation(
+                    session_id,
+                    "bcode.workflow",
+                    edit,
+                    cancel
+                )
+                .await
+                .is_err()
         );
     }
 
@@ -64334,7 +64518,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -64611,7 +64795,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,

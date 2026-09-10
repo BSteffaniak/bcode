@@ -7438,6 +7438,31 @@ impl WorkflowStore {
             .map_err(WorkflowStoreError::from)
     }
 
+    /// Return a keyset page of run identities for notification-independent discovery.
+    ///
+    /// All statuses are included so each query examines at most one page rather than scanning
+    /// an unbounded number of inactive runs. Callers must check current run status and qualify
+    /// execution ownership before driving, and restart after reaching an empty page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the limit is invalid or the query fails.
+    pub fn continuation_run_ids_after(
+        &self,
+        after_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id FROM workflow_runs WHERE run_id > ?1 \
+             ORDER BY run_id LIMIT ?2",
+        )?;
+        statement
+            .query_map(rusqlite::params![after_run_id, limit], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowStoreError::from)
+    }
+
     /// Return bounded artifact identities that still own resumable workflow runs.
     ///
     /// Deleting a daemon image whose artifact still owns `running`/`paused` runs would strand
@@ -9622,13 +9647,19 @@ impl WorkflowStore {
                     input_json,
                     created_at_ms,
                 ) = row?;
-                // Revised topology is not dispatchable until readiness and settlement
-                // also consume revision-aware graph semantics.
-                self.run_graph_node(&run_id, &node_id)?.ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(format!(
-                        "workflow activation references missing run-graph node: {node_id}"
-                    ))
-                })?;
+                if run_graph::graph_revision(&self.connection, &run_id)? == Some(1) {
+                    self.run_graph_node(&run_id, &node_id)?.ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(format!(
+                            "workflow activation references missing run-graph node: {node_id}"
+                        ))
+                    })?;
+                }
+                run_graph::reconciled_activation_exit(
+                    &self.connection,
+                    &run_id,
+                    &node_id,
+                    &activation_id,
+                )?;
                 let node = self
                     .activation_graph_node(&run_id, &node_id, &activation_id)?
                     .ok_or_else(|| {
@@ -10948,12 +10979,21 @@ fn retained_source_output(
     trigger: &ValidatedOutput,
     activation_id: &str,
 ) -> Result<ValidatedOutput, WorkflowStoreError> {
-    let value = activation_output_value_by_identity(
+    stored_activation_output(
         transaction,
         &trigger.run_id,
         &trigger.node_id,
         activation_id,
-    )?;
+    )
+}
+
+fn stored_activation_output(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<ValidatedOutput, WorkflowStoreError> {
+    let value = activation_output_value_by_identity(transaction, run_id, node_id, activation_id)?;
     let (output_id, schema_id, schema_version, artifact_reference, created_at_ms) = transaction.query_row(
         "SELECT output.output_id, output.schema_id, output.schema_version,
                 output.artifact_reference, output.created_at_ms
@@ -10963,13 +11003,13 @@ fn retained_source_output(
            AND length(CAST(output.output_id AS BLOB)) <= ?4
            AND length(CAST(output.schema_id AS BLOB)) <= ?4
            AND (output.artifact_reference IS NULL OR length(CAST(output.artifact_reference AS BLOB)) <= ?4)",
-        rusqlite::params![trigger.run_id, trigger.node_id, activation_id, MAX_INLINE_JSON_BYTES],
+        rusqlite::params![run_id, node_id, activation_id, MAX_INLINE_JSON_BYTES],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     )?;
     let output = ValidatedOutput {
         output_id,
-        run_id: trigger.run_id.clone(),
-        node_id: trigger.node_id.clone(),
+        run_id: run_id.to_string(),
+        node_id: node_id.to_string(),
         activation_id: activation_id.to_string(),
         schema_id,
         schema_version,
@@ -11334,15 +11374,7 @@ where
         "SELECT graph_revision FROM workflow_activation_graph_bindings WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
         (&output.run_id, &output.node_id, &output.activation_id), |row| row.get(0),
     )?;
-    if graph_revision != 1 && admitted != graph_revision {
-        let exit = run_graph::revised_leaf_exit(
-            transaction,
-            &output.run_id,
-            &output.node_id,
-            &output.activation_id,
-        )?;
-        return Ok((Vec::new(), exit));
-    }
+    let retained_from_prior_revision = graph_revision != 1 && admitted != graph_revision;
     let completed_node = run_graph::bound_activation_node(
         transaction,
         &output.run_id,
@@ -11377,6 +11409,21 @@ where
         }
         cursor = edges.last().map(|edge| edge.edge_id);
         for record in edges {
+            if retained_from_prior_revision
+                && run_graph::retained_edge_activation(
+                    transaction,
+                    &output.run_id,
+                    graph_revision,
+                    &record,
+                )?
+                .as_deref()
+                    != Some(output.activation_id.as_str())
+            {
+                return Err(WorkflowStoreError::InvalidData(
+                    "retained successor settlement requires an exact activation binding"
+                        .to_string(),
+                ));
+            }
             let edge = record.edge;
             has_outgoing = true;
             all_conditional &= matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. });
@@ -11473,6 +11520,139 @@ where
         )?;
         fault.after_boundary(WorkflowOutputBoundary::BranchDecisionPersisted, output)?;
     }
+    let activated = materialize_selected_successors(
+        transaction,
+        output,
+        generation,
+        graph_revision,
+        targets,
+        &selected_edges,
+    )?;
+    Ok((activated, completed_is_exit))
+}
+
+fn successor_input_source_identity(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    revision: u64,
+    generation: u64,
+    edge: &run_graph::RunGraphEdge,
+) -> Result<Option<String>, WorkflowStoreError> {
+    if matches!(
+        edge.edge.kind,
+        bcode_workflow::EdgeKind::Back { .. } | bcode_workflow::EdgeKind::Retry { .. }
+    ) {
+        return Ok(None);
+    }
+    if let Some(identity) =
+        run_graph::retained_edge_activation(transaction, run_id, revision, edge)?
+    {
+        return Ok(Some(identity));
+    }
+    let Some((identity, status)) =
+        activation_at_generation(transaction, run_id, &edge.edge.from, generation)?
+    else {
+        return Ok(None);
+    };
+    if status != "completed" {
+        return Ok(None);
+    }
+    let admitted: Option<u64> = transaction.query_row(
+        "SELECT graph_revision FROM workflow_activation_graph_bindings WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+        (run_id, &edge.edge.from, &identity), |row| row.get(0),
+    ).optional()?;
+    if admitted != Some(revision) {
+        return Err(WorkflowStoreError::InvalidData(
+            "successor input source requires graph reconciliation".to_string(),
+        ));
+    }
+    run_graph::reconciled_activation_exit(transaction, run_id, &edge.edge.from, &identity)?;
+    Ok(Some(identity))
+}
+
+fn validate_retained_successor_inputs(
+    transaction: &Transaction<'_>,
+    trigger: &ValidatedOutput,
+    target: &bcode_workflow::NodeDefinition,
+    generation: u64,
+    input: &serde_json::Value,
+) -> Result<(), WorkflowStoreError> {
+    let revision = run_graph::graph_revision(transaction, &trigger.run_id)?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("successor graph is missing".to_string()))?;
+    if revision == 1 {
+        return Ok(());
+    }
+    let mut cursor = None;
+    loop {
+        let edges = WorkflowStore::current_run_graph_edges_in_snapshot(
+            transaction,
+            &trigger.run_id,
+            revision,
+            cursor,
+            100,
+            Some(run_graph::EdgeEndpoint::Target(&target.id)),
+        )?;
+        if edges.is_empty() {
+            break;
+        }
+        cursor = edges.last().map(|edge| edge.edge_id);
+        for record in edges {
+            let Some(identity) = successor_input_source_identity(
+                transaction,
+                &trigger.run_id,
+                revision,
+                generation,
+                &record,
+            )?
+            else {
+                continue;
+            };
+            if !retained_activation_ready(
+                transaction,
+                &trigger.run_id,
+                &record.edge.from,
+                &identity,
+            )? {
+                continue;
+            }
+            let source = stored_activation_output(
+                transaction,
+                &trigger.run_id,
+                &record.edge.from,
+                &identity,
+            )?;
+            let selected = match &record.edge.kind {
+                bcode_workflow::EdgeKind::Direct => true,
+                bcode_workflow::EdgeKind::Conditional {
+                    predicate,
+                    expected,
+                } => evaluate_predicate(predicate, &source.value)? == *expected,
+                bcode_workflow::EdgeKind::Back { .. } | bcode_workflow::EdgeKind::Retry { .. } => {
+                    false
+                }
+            };
+            if selected
+                && activation_input(transaction, &source, target, generation, &record.edge)?
+                    != *input
+            {
+                return Err(WorkflowStoreError::InvalidData(
+                    "retained successor requires consistent inputs across selected sources"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_selected_successors(
+    transaction: &Transaction<'_>,
+    output: &ValidatedOutput,
+    generation: u64,
+    graph_revision: u64,
+    mut targets: Vec<String>,
+    selected_edges: &std::collections::BTreeMap<String, (u64, u64, bcode_workflow::EdgeDefinition)>,
+) -> Result<Vec<NewActivation>, WorkflowStoreError> {
     targets.sort();
     targets.dedup();
     let mut activated = Vec::new();
@@ -11515,6 +11695,7 @@ where
             .transpose()?;
         let input_source = retained_output.as_ref().unwrap_or(output);
         let input = activation_input(transaction, input_source, target, generation, edge)?;
+        validate_retained_successor_inputs(transaction, output, target, generation, &input)?;
         let activation = NewActivation {
             run_id: output.run_id.clone(),
             node_id: node_id.clone(),
@@ -11523,6 +11704,7 @@ where
             input: Some(input),
             created_at_ms: output.created_at_ms,
         };
+        enforce_activation_limits(transaction, &activation)?;
         let status = activation_status_for_node(target);
         let changed = transaction.execute(
             "INSERT INTO workflow_activations \
@@ -11555,32 +11737,47 @@ where
             &activation.activation_id,
             graph_revision,
         )?;
-        append_event(
+        append_successor_event(
             transaction,
-            &activation.run_id,
-            if status == "pending" {
-                "activation_created"
-            } else {
-                "activation_waiting"
-            },
-            &serde_json::json!({
-                "activation": activation,
-                "status": status,
-                "input_binding": {
-                    "version": 1,
-                    "graph_revision": graph_revision,
-                    "edge_id": edge_id,
-                    "edge_revision": edge_revision,
-                    "source_activation_id": input_source.activation_id,
-                    "source_output_id": input_source.output_id,
-                },
-            })
-            .to_string(),
-            activation.created_at_ms,
+            &activation,
+            status,
+            graph_revision,
+            (*edge_id, *edge_revision),
+            input_source,
         )?;
         activated.push(activation);
     }
-    Ok((activated, completed_is_exit))
+    Ok(activated)
+}
+
+fn append_successor_event(
+    transaction: &Transaction<'_>,
+    activation: &NewActivation,
+    status: &str,
+    graph_revision: u64,
+    edge: (u64, u64),
+    input_source: &ValidatedOutput,
+) -> Result<(), WorkflowStoreError> {
+    append_event(
+        transaction,
+        &activation.run_id,
+        if status == "pending" {
+            "activation_created"
+        } else {
+            "activation_waiting"
+        },
+        &serde_json::json!({
+            "activation": activation, "status": status,
+            "input_binding": {
+                "version": 1, "graph_revision": graph_revision,
+                "edge_id": edge.0, "edge_revision": edge.1,
+                "source_activation_id": input_source.activation_id,
+                "source_output_id": input_source.output_id,
+            },
+        })
+        .to_string(),
+        activation.created_at_ms,
+    )
 }
 
 fn prepared_read_only_dispatches(
@@ -11666,12 +11863,14 @@ fn prepared_read_only_dispatches_scoped(
                     "prepared workflow activation input is oversized or not text".to_string(),
                 ));
             }
+            run_graph::reconciled_activation_exit(connection, &run_id, &node_id, &activation_id)?;
             let node =
-                run_graph::initial_node(connection, &run_id, &node_id)?.ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(format!(
-                        "prepared workflow attempt references missing run-graph node: {node_id}"
-                    ))
-                })?;
+                run_graph::bound_activation_node(connection, &run_id, &node_id, &activation_id)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(format!(
+                            "prepared workflow attempt references missing run-graph node: {node_id}"
+                        ))
+                    })?;
             Ok(PreparedActivationDispatch {
                 activation: PendingActivation {
                     run_id,
@@ -12011,18 +12210,6 @@ fn settle_parallel_failure(
     })?;
     if graph_revision != 1 {
         run_graph::reconciled_activation_exit(transaction, run_id, member_node_id, activation_id)?;
-        let admitted: Option<u64> = transaction
-            .query_row(
-                "SELECT graph_revision FROM workflow_activation_graph_bindings
-             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
-                (run_id, member_node_id, activation_id),
-                |row| row.get(0),
-            )
-            .optional()?;
-        if admitted != Some(graph_revision) {
-            run_graph::revised_leaf_exit(transaction, run_id, member_node_id, activation_id)?;
-            return Ok(None);
-        }
     }
     let generation: u64 = transaction.query_row(
         "SELECT dependency_generation FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2 \
@@ -12058,9 +12245,35 @@ fn settle_parallel_failure(
                     )
                     .optional()?;
                 if admitted != Some(graph_revision) {
-                    return Err(WorkflowStoreError::InvalidData(
-                        "parallel member requires graph reconciliation".to_string(),
-                    ));
+                    let (_, edge) = dependency_input_edge(transaction, run_id, member, &join.id)?;
+                    let edge = edge.ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "retained parallel member edge is missing".to_string(),
+                        )
+                    })?;
+                    let join_record = WorkflowStore::current_run_graph_node_in_snapshot(
+                        transaction,
+                        run_id,
+                        &join.id,
+                    )?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData("parallel join is missing".to_string())
+                    })?;
+                    if admitted.is_none_or(|revision| join_record.revision > revision)
+                        || run_graph::retained_edge_activation(
+                            transaction,
+                            run_id,
+                            graph_revision,
+                            &edge,
+                        )?
+                        .as_deref()
+                            != Some(member_activation.as_str())
+                    {
+                        return Err(WorkflowStoreError::InvalidData(
+                            "parallel member requires exact retention and an unchanged join"
+                                .to_string(),
+                        ));
+                    }
                 }
                 run_graph::reconciled_activation_exit(
                     transaction,
@@ -12222,7 +12435,13 @@ fn schedule_retry_for_observation_transaction(
         [&request.run_id],
         |row| row.get(0),
     )?;
-    let node = run_graph::initial_activation_node(
+    run_graph::reconciled_activation_exit(
+        transaction,
+        &request.run_id,
+        &request.node_id,
+        &request.activation_id,
+    )?;
+    let node = run_graph::bound_activation_node(
         transaction,
         &request.run_id,
         &request.node_id,
@@ -13069,12 +13288,17 @@ fn pending_activation_by_identity(
         )
         .optional()?;
     row.map(|(dependency_generation, input_json, created_at_ms)| {
-        let node = run_graph::initial_activation_node(connection, run_id, node_id, activation_id)?
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "workflow activation references missing run-graph node: {node_id}"
-                ))
-            })?;
+        let initial = if run_graph::graph_revision(connection, run_id)? == Some(1) {
+            run_graph::initial_activation_node(connection, run_id, node_id, activation_id)?
+        } else {
+            run_graph::reconciled_activation_exit(connection, run_id, node_id, activation_id)?;
+            run_graph::bound_activation_node(connection, run_id, node_id, activation_id)?
+        };
+        let node = initial.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow activation references missing run-graph node: {node_id}"
+            ))
+        })?;
         Ok(PendingActivation {
             run_id: run_id.to_string(),
             node_id: node_id.to_string(),
@@ -34932,6 +35156,591 @@ mod tests {
         );
     }
 
+    fn assert_retained_successor_deadline(store: &mut WorkflowStore, output: &ValidatedOutput) {
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET deadline_at_ms = 20 WHERE run_id = 'sequential-run'",
+                [],
+            )
+            .expect("deadline");
+        let error = store
+            .persist_validated_output(output)
+            .expect_err("expired successor admission");
+        assert!(error.to_string().contains("deadline"));
+        assert!(
+            store
+                .validated_outputs("sequential-run", 10)
+                .expect("no expired output")
+                .is_empty()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET deadline_at_ms = NULL WHERE run_id = 'sequential-run'",
+                [],
+            )
+            .expect("clear deadline");
+    }
+
+    struct FailRetainedSuccessors;
+    impl WorkflowOutputFault for FailRetainedSuccessors {
+        fn after_boundary(
+            &self,
+            boundary: WorkflowOutputBoundary,
+            _output: &ValidatedOutput,
+        ) -> Result<(), WorkflowStoreError> {
+            if boundary == WorkflowOutputBoundary::SuccessorsMaterialized {
+                return Err(WorkflowStoreError::InvalidData(
+                    "injected successor failure".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn current_revision_input_source_requires_admission_proof() {
+        let (_temp, mut store) = initialized_store();
+        let output = ValidatedOutput {
+            output_id: "current-output".into(),
+            run_id: "run-1".into(),
+            node_id: "review".into(),
+            activation_id: activation_id(),
+            schema_id: definition("example").nodes["review"]
+                .output
+                .type_name
+                .clone(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 12,
+        };
+        store.persist_validated_output(&output).expect("output");
+        let mut edge = sequential_definition().edges[0].clone();
+        edge.from = "review".into();
+        let edge = run_graph::RunGraphEdge {
+            edge_id: 99,
+            revision: 2,
+            edge,
+        };
+        let transaction = store.connection.transaction().expect("transaction");
+        let mut retry_edge = edge.clone();
+        retry_edge.edge.kind = bcode_workflow::EdgeKind::Retry { max_attempts: 2 };
+        assert!(
+            successor_input_source_identity(&transaction, "run-1", 2, 0, &retry_edge)
+                .expect("retry is not an input")
+                .is_none()
+        );
+        let error = successor_input_source_identity(&transaction, "run-1", 2, 0, &edge)
+            .expect_err("historical source");
+        assert!(error.to_string().contains("graph reconciliation"));
+        transaction.rollback().expect("rollback");
+    }
+
+    #[test]
+    fn deferred_retained_source_checks_inputs_during_settlement() {
+        for value in [2, 3] {
+            assert_deferred_retained_source(value, false);
+            assert_deferred_retained_source(value, true);
+        }
+    }
+
+    fn readmit_fixture_source_at_current_revision(store: &mut WorkflowStore, identity: &str) {
+        // Replace only the unstarted fixture activation, not a completed result.
+        store
+            .connection
+            .execute_batch(
+                "DELETE FROM workflow_retained_edge_bindings WHERE source_node_id = 'other';
+             DELETE FROM workflow_leaf_retentions WHERE node_id = 'other';
+             DELETE FROM workflow_activation_graph_bindings WHERE node_id = 'other';
+             DELETE FROM workflow_activations WHERE node_id = 'other';
+             UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("current-source fixture");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        store
+            .create_activation_at_graph_revision(
+                &NewActivation {
+                    run_id: "run-1".into(),
+                    node_id: "other".into(),
+                    activation_id: identity.into(),
+                    dependency_generation: 0,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 26,
+                },
+                2,
+                &authority,
+            )
+            .expect("ownership-checked admission");
+    }
+
+    fn assert_deferred_retained_source(value: u32, current_source: bool) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut graph = sequential_definition();
+        let mut other = graph.nodes["first"].clone();
+        other.id = "other".into();
+        graph.nodes.insert(other.id.clone(), other);
+        graph.entries.push("other".into());
+        let mut edge = graph.edges[0].clone();
+        edge.from = "other".into();
+        graph.edges.push(edge);
+        store
+            .persist_definition("deferred", 1, &graph)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "deferred".into();
+        store.create_run(&run).expect("run");
+        let first_id = activation_identity(&run.run_id, "first", 0);
+        let other_id = activation_identity(&run.run_id, "other", 0);
+        let first = ValidatedOutput {
+            output_id: "first-output".into(),
+            run_id: run.run_id.clone(),
+            node_id: "first".into(),
+            activation_id: first_id.clone(),
+            schema_id: "u32".into(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        store
+            .persist_validated_output(&first)
+            .expect("first source");
+        store.connection.execute("INSERT INTO workflow_graph_edit_candidates VALUES ('run-1', 'deferred', 1, '{}', '{}', 1)", []).expect("candidate fixture");
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "deferred".into(),
+            expected_revision: 1,
+            edits: vec![],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: first_id,
+                    edge_ids: vec![0],
+                },
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: other_id.clone(),
+                    edge_ids: vec![1],
+                },
+            ],
+        };
+        let transaction = store.connection.transaction().expect("transaction");
+        run_graph::persist_graph_publication(
+            &transaction,
+            &request,
+            &[("other".into(), other_id.clone())],
+            25,
+        )
+        .expect("publication");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            store
+                .activations_for_run(&run.run_id, 10)
+                .expect("deferred")
+                .len(),
+            2
+        );
+        if current_source {
+            readmit_fixture_source_at_current_revision(&mut store, &other_id);
+        }
+        let late = ValidatedOutput {
+            output_id: "other-output".into(),
+            node_id: "other".into(),
+            activation_id: other_id,
+            value: serde_json::json!(value),
+            created_at_ms: 30,
+            ..first.clone()
+        };
+        let result = store.persist_validated_output(&late);
+        if value == 2 {
+            assert_eq!(result.expect("matching input").activated.len(), 1);
+        } else {
+            assert!(
+                result
+                    .expect_err("conflicting input")
+                    .to_string()
+                    .contains("consistent inputs")
+            );
+            assert_eq!(
+                store.validated_outputs(&run.run_id, 10).expect("outputs"),
+                vec![first]
+            );
+            assert_eq!(
+                store
+                    .activations_for_run(&run.run_id, 10)
+                    .expect("rollback")
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn completed_sources_converge_independently_of_reconciliation_order() {
+        for reverse in [false, true] {
+            for other_value in [2, 3] {
+                assert_completed_source_convergence(reverse, other_value);
+            }
+        }
+    }
+
+    fn assert_completed_source_convergence(reverse: bool, other_value: u32) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut graph = sequential_definition();
+        let mut other = graph.nodes["first"].clone();
+        other.id = "other".into();
+        graph.nodes.insert(other.id.clone(), other);
+        graph.entries.push("other".into());
+        let mut edge = graph.edges[0].clone();
+        edge.from = "other".into();
+        graph.edges.push(edge);
+        store
+            .persist_definition("converge", 1, &graph)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "converge".into();
+        store.create_run(&run).expect("run");
+        let mut reconciliation = Vec::new();
+        for (node, value, edge_id) in [("first", 2, 0), ("other", other_value, 1)] {
+            let identity = activation_identity(&run.run_id, node, 0);
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: format!("output-{node}"),
+                    run_id: run.run_id.clone(),
+                    node_id: node.into(),
+                    activation_id: identity.clone(),
+                    schema_id: "u32".into(),
+                    schema_version: 1,
+                    value: serde_json::json!(value),
+                    artifact_reference: None,
+                    created_at_ms: 20,
+                })
+                .expect("source output");
+            reconciliation.push(
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: identity,
+                    edge_ids: vec![edge_id],
+                },
+            );
+        }
+        store.connection.execute_batch(
+            "DELETE FROM workflow_activation_graph_bindings WHERE node_id = 'second';
+             DELETE FROM workflow_activations WHERE node_id = 'second';
+             INSERT INTO workflow_graph_edit_candidates VALUES ('run-1', 'converge', 1, '{}', '{}', 1);"
+        ).expect("unpublished fixture");
+        if reverse {
+            reconciliation.reverse();
+        }
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "converge".into(),
+            expected_revision: 1,
+            edits: vec![],
+            reconciliation,
+        };
+        {
+            let transaction = store.connection.transaction().expect("transaction");
+            let result = run_graph::persist_graph_publication(&transaction, &request, &[], 25);
+            if other_value == 2 {
+                assert_eq!(result.expect("agreeing sources"), 2);
+                transaction.commit().expect("commit");
+            } else {
+                assert!(
+                    result
+                        .expect_err("conflicting sources")
+                        .to_string()
+                        .contains("consistent inputs")
+                );
+            }
+        }
+        let count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_activations WHERE node_id = 'second'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, u64::from(other_value == 2));
+        assert_eq!(
+            run_graph::graph_revision(&store.connection, &run.run_id).expect("revision"),
+            Some(if other_value == 2 { 2 } else { 1 })
+        );
+    }
+
+    fn assert_ambiguous_completed_admission(
+        store: &mut WorkflowStore,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    ) {
+        let mut ambiguous = request.clone();
+        ambiguous
+            .reconciliation
+            .extend(request.reconciliation.clone());
+        let transaction = store.connection.transaction().expect("transaction");
+        let error = run_graph::admit_completed_result_successors(&transaction, &ambiguous, 2, 25)
+            .expect_err("ambiguous input source");
+        assert!(error.to_string().contains("unambiguous input source"));
+        let successors: u64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_activations WHERE node_id = 'second'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("successors");
+        assert_eq!(successors, 0);
+        transaction.rollback().expect("rollback");
+    }
+
+    fn assert_completed_admission_late_failure(
+        store: &mut WorkflowStore,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    ) {
+        store.connection.execute_batch(
+            "CREATE TEMP TRIGGER fail_successor_binding BEFORE INSERT ON workflow_activation_graph_bindings
+             WHEN NEW.node_id = 'second'
+             BEGIN SELECT RAISE(ABORT, 'injected binding failure'); END;"
+        ).expect("fault trigger");
+        {
+            let transaction = store.connection.transaction().expect("transaction");
+            let error = run_graph::persist_graph_publication(&transaction, request, &[], 25)
+                .expect_err("failure after activation insertion");
+            assert!(error.to_string().contains("injected binding failure"));
+            let inserted: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE node_id = 'second')",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("partial transaction");
+            assert!(inserted, "fault must occur after successor insertion");
+            // Match publisher error propagation: dropping the transaction rolls back all writes.
+        }
+        assert_eq!(
+            store
+                .activations_for_run(&request.run_id, 10)
+                .expect("rollback")
+                .len(),
+            1
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_successor_binding;")
+            .expect("remove fault");
+    }
+
+    #[test]
+    fn completed_result_admission_preserves_output_and_checks_publication_deadline() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        run.run_id = "sequential-run".into();
+        store.create_run(&run).expect("run");
+        let first_id = activation_identity("sequential-run", "first", 0);
+        let output = ValidatedOutput {
+            output_id: "completed-first".into(),
+            run_id: run.run_id.clone(),
+            node_id: "first".into(),
+            activation_id: first_id.clone(),
+            schema_id: "u32".into(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        store
+            .persist_validated_output(&output)
+            .expect("complete source");
+        // Model a committed connected graph before successor admission; public publication stays guarded.
+        store.connection.execute_batch(
+            "DELETE FROM workflow_activation_graph_bindings WHERE node_id = 'second';
+             DELETE FROM workflow_activations WHERE node_id = 'second';
+             UPDATE workflow_run_graphs SET revision = 2;
+             UPDATE workflow_runs SET deadline_at_ms = 30;
+             INSERT INTO workflow_graph_edit_candidates VALUES ('sequential-run', 'completed', 1, '{}', '{}', 1);
+             INSERT INTO workflow_graph_edit_publications VALUES ('sequential-run', 'completed', 2);"
+        ).expect("connected fixture");
+        store.connection.execute(
+            "INSERT INTO workflow_retained_edge_bindings VALUES ('sequential-run', 'completed', 2, 0, 1, 'first', ?1)", [&first_id]
+        ).expect("binding");
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "completed".into(),
+            expected_revision: 1,
+            edits: vec![],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: first_id,
+                    edge_ids: vec![0],
+                },
+            ],
+        };
+        assert_ambiguous_completed_admission(&mut store, &request);
+        let transaction = store.connection.transaction().expect("transaction");
+        let error = run_graph::admit_completed_result_successors(&transaction, &request, 2, 30)
+            .expect_err("publication deadline");
+        assert!(error.to_string().contains("deadline"));
+        transaction.rollback().expect("rollback");
+        assert_eq!(
+            store
+                .activations_for_run(&run.run_id, 10)
+                .expect("activations")
+                .len(),
+            1
+        );
+        store.connection.execute_batch("DELETE FROM workflow_retained_edge_bindings; DELETE FROM workflow_graph_edit_publications; UPDATE workflow_run_graphs SET revision = 1;").expect("unpublished candidate");
+        assert_completed_admission_late_failure(&mut store, &request);
+        let transaction = store.connection.transaction().expect("transaction");
+        run_graph::persist_graph_publication(&transaction, &request, &[], 25).expect("publication");
+        transaction.commit().expect("commit");
+        let activations = store
+            .activations_for_run(&run.run_id, 10)
+            .expect("activations");
+        assert_eq!(activations.len(), 2);
+        let successor = activations
+            .iter()
+            .find(|item| item.node_id == "second")
+            .expect("successor");
+        let input: String = store
+            .connection
+            .query_row(
+                "SELECT input_json FROM workflow_activations WHERE node_id = 'second'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("input");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&input).expect("json"),
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(&run.run_id, "second", &successor.activation_id)
+                .expect("revision"),
+            Some(2)
+        );
+        assert_eq!(
+            store.validated_outputs(&run.run_id, 10).expect("outputs"),
+            vec![output]
+        );
+    }
+
+    #[test]
+    fn retained_connected_successor_requires_binding_and_commits_current_revision() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        run.run_id = "sequential-run".into();
+        store.create_run(&run).expect("run");
+        let first_id = activation_identity("sequential-run", "first", 0);
+        // Model a committed connected revision below the still-guarded public publisher.
+        store.connection.execute_batch(
+            "UPDATE workflow_run_graphs SET revision = 2;
+             INSERT INTO workflow_graph_edit_candidates VALUES ('sequential-run', 'retained', 1, '{}', '{}', 1);
+             INSERT INTO workflow_graph_edit_publications VALUES ('sequential-run', 'retained', 2);"
+        ).expect("revision fixture");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_leaf_retentions VALUES ('sequential-run', 'first', ?1, 2)",
+                [&first_id],
+            )
+            .expect("retain");
+        let output = ValidatedOutput {
+            output_id: "retained-first".into(),
+            run_id: "sequential-run".into(),
+            node_id: "first".into(),
+            activation_id: first_id.clone(),
+            schema_id: "u32".into(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        assert!(store.persist_validated_output(&output).is_err());
+        assert!(
+            store
+                .validated_outputs("sequential-run", 10)
+                .expect("outputs")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .activations_for_run("sequential-run", 10)
+                .expect("activations")
+                .len(),
+            1
+        );
+        store.connection.execute(
+            "INSERT INTO workflow_retained_edge_bindings VALUES ('sequential-run', 'retained', 2, 0, 1, 'first', ?1)",
+            [&first_id],
+        ).expect("bind edge");
+        assert!(
+            store
+                .persist_validated_output_with_fault(&output, &FailRetainedSuccessors)
+                .is_err()
+        );
+        assert!(
+            store
+                .validated_outputs("sequential-run", 10)
+                .expect("rolled back outputs")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .activations_for_run("sequential-run", 10)
+                .expect("rolled back successors")
+                .len(),
+            1
+        );
+        assert_retained_successor_deadline(&mut store, &output);
+        let result = store
+            .persist_validated_output(&output)
+            .expect("retained settlement");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(result.activated[0].input, Some(serde_json::json!(2)));
+        let successor_id = &result.activated[0].activation_id;
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision("sequential-run", "second", successor_id)
+                .expect("revision"),
+            Some(2)
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let terminal = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "retained-second".into(),
+                run_id: "sequential-run".into(),
+                node_id: "second".into(),
+                activation_id: result.activated[0].activation_id.clone(),
+                schema_id: "u32".into(),
+                schema_version: 1,
+                value: serde_json::json!(3),
+                artifact_reference: None,
+                created_at_ms: 21,
+            })
+            .expect("complete after reopen");
+        assert_eq!(terminal.run_status, RunStatus::Completed);
+    }
+
     #[test]
     fn validated_output_atomically_activates_direct_successor_and_completes_run() {
         let temp = tempfile::tempdir().expect("temp");
@@ -35617,7 +36426,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("parallel member requires graph reconciliation")
+                .contains("parallel member requires exact retention and an unchanged join")
         );
         transaction
             .execute(
@@ -35639,6 +36448,64 @@ mod tests {
                 .expect("decision")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn retained_parallel_failure_settles_without_rebinding_admissions() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("retained-parallel", 1, &parallel_join_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "retained-parallel".into();
+        store.create_run(&run).expect("run");
+        store.connection.execute_batch(
+            "UPDATE workflow_run_graphs SET revision = 2;
+             UPDATE workflow_activations SET status = CASE node_id WHEN 'left' THEN 'failed' ELSE 'completed' END;
+             INSERT INTO workflow_graph_edit_candidates VALUES ('run-1', 'retained-parallel', 1, '{}', '{}', 1);
+             INSERT INTO workflow_graph_edit_publications VALUES ('run-1', 'retained-parallel', 2);
+             INSERT INTO workflow_leaf_retentions SELECT run_id, node_id, activation_id, 2 FROM workflow_activations;
+             INSERT INTO workflow_retained_edge_bindings
+             SELECT edge.run_id, 'retained-parallel', 2, edge.edge_id, edge.revision,
+                    activation.node_id, activation.activation_id
+             FROM workflow_run_graph_edges edge JOIN workflow_activations activation
+               ON activation.run_id = edge.run_id AND activation.node_id = edge.source_node_id
+             WHERE edge.target_node_id = 'join';"
+        ).expect("retained revision fixture");
+        let transaction = store.connection.transaction().expect("transaction");
+        let result = settle_parallel_failure(
+            &transaction,
+            &run.run_id,
+            "left",
+            &activation_identity(&run.run_id, "left", 0),
+            true,
+            20,
+        )
+        .expect("retained settlement")
+        .expect("join");
+        assert!(result.run_failed);
+        transaction.commit().expect("commit");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            store
+                .decision("run-1:join:0:parallel-wait-all")
+                .expect("decision")
+                .is_some()
+        );
+        for member in ["left", "right"] {
+            assert_eq!(
+                store
+                    .activation_admitted_graph_revision(
+                        &run.run_id,
+                        member,
+                        &activation_identity(&run.run_id, member, 0)
+                    )
+                    .expect("historical admission"),
+                Some(1)
+            );
+        }
     }
 
     #[test]
@@ -36484,6 +37351,48 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "run_created");
         assert_eq!(events[1].event_type, "activation_created");
+    }
+
+    #[test]
+    fn running_discovery_pages_past_unchanged_runs() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        for id in ["a", "b", "c"] {
+            let mut run = new_run();
+            run.run_id = id.to_owned();
+            store.create_run(&run).expect("run");
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'paused' WHERE run_id = 'b'",
+                [],
+            )
+            .expect("pause");
+        assert_eq!(
+            store.continuation_run_ids_after("", 1).expect("first"),
+            ["a"]
+        );
+        assert_eq!(
+            store
+                .continuation_run_ids_after("a", 1)
+                .expect("paused page"),
+            ["b"]
+        );
+        assert_eq!(
+            store.continuation_run_ids_after("b", 1).expect("last"),
+            ["c"]
+        );
+        assert!(
+            store
+                .continuation_run_ids_after("c", 1)
+                .expect("end")
+                .is_empty()
+        );
+        assert!(store.continuation_run_ids_after("", 0).is_err());
     }
 
     #[test]

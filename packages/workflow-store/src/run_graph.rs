@@ -596,43 +596,8 @@ impl WorkflowStore {
                 "publication requires binding-aware successor settlement".to_string(),
             ));
         }
-        let revision = request.expected_revision + 1;
-        persist_leaf_retentions(&transaction, run_id, revision, &retentions)?;
-        publish_candidate_edges(&transaction, run_id, mutation_id, revision)?;
-        transaction.execute(
-            "UPDATE workflow_run_graph_nodes SET retired_at_revision = ?3
-             WHERE run_id = ?1 AND retired_at_revision IS NULL AND node_id IN
-             (SELECT node_id FROM workflow_graph_edit_nodes WHERE run_id = ?1 AND mutation_id = ?2)",
-            rusqlite::params![run_id, mutation_id, revision],
-        )?;
-        transaction.execute(
-            "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
-             SELECT run_id, node_id, ?3, node_json, is_entry, is_exit FROM workflow_graph_edit_nodes
-             WHERE run_id = ?1 AND mutation_id = ?2 AND node_json IS NOT NULL",
-            rusqlite::params![run_id, mutation_id, revision],
-        )?;
-        if transaction.execute(
-            "UPDATE workflow_run_graphs SET revision = ?2 WHERE run_id = ?1 AND revision = ?3",
-            rusqlite::params![run_id, revision, request.expected_revision],
-        )? != 1
-        {
-            return Err(WorkflowStoreError::InvalidData(
-                "workflow graph revision conflict".to_string(),
-            ));
-        }
-        transaction.execute(
-            "INSERT INTO workflow_graph_edit_publications (run_id, mutation_id, revision) VALUES (?1, ?2, ?3)",
-            rusqlite::params![run_id, mutation_id, revision],
-        )?;
-        persist_retained_edge_bindings(&transaction, &request, revision)?;
-        admit_added_leaf_entries(&transaction, &request, revision, created_at_ms)?;
-        super::append_event(
-            &transaction,
-            run_id,
-            "graph_edit_published",
-            &serde_json::json!({"mutation_id": mutation_id, "revision": revision}).to_string(),
-            created_at_ms,
-        )?;
+        let revision =
+            persist_graph_publication(&transaction, &request, &retentions, created_at_ms)?;
         transaction.commit()?;
         Ok(revision)
     }
@@ -974,6 +939,109 @@ pub fn persist_retained_edge_bindings(
     Ok(())
 }
 
+pub fn admit_completed_result_successors(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    revision: u64,
+    created_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    let mut admissions = Vec::new();
+    let mut claimed_targets = std::collections::BTreeMap::new();
+    let mut sources = BTreeSet::new();
+    for disposition in &request.reconciliation {
+        let bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+            activation_id,
+            edge_ids,
+        } = disposition
+        else {
+            continue;
+        };
+        let source: Option<(String, u64)> = transaction.query_row(
+            "SELECT node_id, dependency_generation FROM workflow_activations WHERE run_id = ?1 AND activation_id = ?2 AND status = 'completed'",
+            (&request.run_id, activation_id), |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((node_id, generation)) = source else {
+            continue;
+        };
+        if !sources.insert(activation_id) {
+            return Err(WorkflowStoreError::InvalidData(
+                "completed-result admission requires an unambiguous input source disposition"
+                    .to_string(),
+            ));
+        }
+        let mut output =
+            super::stored_activation_output(transaction, &request.run_id, &node_id, activation_id)?;
+        // Admission is new work; the stored source output and its timestamp remain untouched.
+        output.created_at_ms = created_at_ms;
+        let mut selected = std::collections::BTreeMap::new();
+        for edge_id in edge_ids {
+            let (edge_revision, edge_json): (u64, String) = transaction.query_row(
+                "SELECT edge.revision, edge.edge_json FROM workflow_retained_edge_bindings binding
+                 JOIN workflow_run_graph_edges edge ON edge.run_id = binding.run_id AND edge.edge_id = binding.edge_id AND edge.revision = binding.edge_revision
+                 WHERE binding.run_id = ?1 AND binding.graph_revision = ?2 AND binding.edge_id = ?3 AND binding.source_activation_id = ?4 AND edge.retired_at_revision IS NULL",
+                rusqlite::params![request.run_id, revision, edge_id, activation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let edge: EdgeDefinition = serde_json::from_str(&edge_json)?;
+            let enabled = match &edge.kind {
+                bcode_workflow::EdgeKind::Direct => true,
+                bcode_workflow::EdgeKind::Conditional {
+                    predicate,
+                    expected,
+                } => super::evaluate_predicate(predicate, &output.value)? == *expected,
+                bcode_workflow::EdgeKind::Back { .. } | bcode_workflow::EdgeKind::Retry { .. } => {
+                    false
+                }
+            };
+            if enabled
+                && selected
+                    .insert(edge.to.clone(), (*edge_id, edge_revision, edge))
+                    .is_some()
+            {
+                return Err(WorkflowStoreError::InvalidData(
+                    "completed result requires one selected edge per target".to_string(),
+                ));
+            }
+        }
+        for (target, (_, _, edge)) in &selected {
+            if !super::successor_dependencies_ready(transaction, &output, target, generation)? {
+                continue;
+            }
+            let node = WorkflowStore::current_run_graph_node_in_snapshot(
+                transaction,
+                &request.run_id,
+                target,
+            )?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("completed-result target is missing".to_string())
+            })?;
+            let input =
+                super::activation_input(transaction, &output, &node.node, generation, edge)?;
+            if claimed_targets
+                .insert((target.clone(), generation), input.clone())
+                .is_some_and(|previous| previous != input)
+            {
+                return Err(WorkflowStoreError::InvalidData(
+                    "completed-result admission requires consistent inputs for each target and generation".to_string(),
+                ));
+            }
+        }
+        admissions.push((output, generation, selected));
+    }
+    // Resolve the whole bounded reconciliation batch before inserting any successor.
+    // Otherwise request ordering silently selects the first completed source's input.
+    for (output, generation, selected) in admissions {
+        super::materialize_selected_successors(
+            transaction,
+            &output,
+            generation,
+            revision,
+            selected.keys().cloned().collect(),
+            &selected,
+        )?;
+    }
+    Ok(())
+}
+
 fn persist_leaf_retentions(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -1078,18 +1146,30 @@ fn validate_leaf_retention(
     let mut retentions = Vec::new();
     let mut retained = BTreeSet::new();
     for disposition in &request.reconciliation {
+        let activation_id = match disposition {
+            bcode_workflow::WorkflowRunGraphReconciliation::Cancel { .. } => continue,
+            bcode_workflow::WorkflowRunGraphReconciliation::Retain { activation_id }
+            | bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                activation_id,
+                ..
+            } => activation_id,
+        };
         if matches!(
             disposition,
-            bcode_workflow::WorkflowRunGraphReconciliation::Cancel { .. }
+            bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings { .. }
         ) {
-            continue;
+            let completed: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1
+                 AND activation_id = ?2 AND status = 'completed' AND output_id IS NOT NULL)",
+                (&request.run_id, activation_id),
+                |row| row.get(0),
+            )?;
+            // Candidate validation verifies completed results before this active-work pass.
+            // They are bound to edges at publication, not given a new admission or retention row.
+            if completed {
+                continue;
+            }
         }
-        let bcode_workflow::WorkflowRunGraphReconciliation::Retain { activation_id } = disposition
-        else {
-            return Err(WorkflowStoreError::InvalidData(
-                "leaf publication supports only explicit retention".to_string(),
-            ));
-        };
         retained.insert(activation_id.as_str());
     }
     let mut statement = connection.prepare(
@@ -1177,6 +1257,58 @@ pub fn validate_reconciliation_targets(
     Ok(())
 }
 
+// Caller owns authorization, candidate validation, and the transaction commit.
+pub fn persist_graph_publication(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    retentions: &[(String, String)],
+    created_at_ms: u64,
+) -> Result<u64, WorkflowStoreError> {
+    let run_id = &request.run_id;
+    let mutation_id = &request.mutation_id;
+    let revision = request.expected_revision.checked_add(1).ok_or_else(|| {
+        WorkflowStoreError::InvalidData("workflow graph revision overflow".to_string())
+    })?;
+    persist_leaf_retentions(transaction, run_id, revision, retentions)?;
+    publish_candidate_edges(transaction, run_id, mutation_id, revision)?;
+    transaction.execute(
+        "UPDATE workflow_run_graph_nodes SET retired_at_revision = ?3
+         WHERE run_id = ?1 AND retired_at_revision IS NULL AND node_id IN
+         (SELECT node_id FROM workflow_graph_edit_nodes WHERE run_id = ?1 AND mutation_id = ?2)",
+        rusqlite::params![run_id, mutation_id, revision],
+    )?;
+    transaction.execute(
+        "INSERT INTO workflow_run_graph_nodes (run_id, node_id, revision, node_json, is_entry, is_exit)
+         SELECT run_id, node_id, ?3, node_json, is_entry, is_exit FROM workflow_graph_edit_nodes
+         WHERE run_id = ?1 AND mutation_id = ?2 AND node_json IS NOT NULL",
+        rusqlite::params![run_id, mutation_id, revision],
+    )?;
+    if transaction.execute(
+        "UPDATE workflow_run_graphs SET revision = ?2 WHERE run_id = ?1 AND revision = ?3",
+        rusqlite::params![run_id, revision, request.expected_revision],
+    )? != 1
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow graph revision conflict".to_string(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO workflow_graph_edit_publications (run_id, mutation_id, revision) VALUES (?1, ?2, ?3)",
+        rusqlite::params![run_id, mutation_id, revision],
+    )?;
+    persist_retained_edge_bindings(transaction, request, revision)?;
+    admit_added_leaf_entries(transaction, request, revision, created_at_ms)?;
+    admit_completed_result_successors(transaction, request, revision, created_at_ms)?;
+    super::append_event(
+        transaction,
+        run_id,
+        "graph_edit_published",
+        &serde_json::json!({"mutation_id": mutation_id, "revision": revision}).to_string(),
+        created_at_ms,
+    )?;
+    Ok(revision)
+}
+
 fn publish_candidate_edges(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -1207,6 +1339,7 @@ fn validate_retained_bindings(
     graph: &WorkflowDefinition,
     edges: &std::collections::BTreeMap<u64, EdgeDefinition>,
 ) -> Result<(), WorkflowStoreError> {
+    let mut claimed_edges = BTreeSet::new();
     for disposition in &request.reconciliation {
         let bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
             activation_id,
@@ -1215,6 +1348,13 @@ fn validate_retained_bindings(
         else {
             continue;
         };
+        for edge_id in edge_ids {
+            if !claimed_edges.insert(*edge_id) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "retained edge requires one unambiguous source activation".to_string(),
+                ));
+            }
+        }
         let (source_id, completed): (String, bool) = connection.query_row(
             "SELECT node_id, status = 'completed' FROM workflow_activations WHERE run_id = ?1 AND activation_id = ?2",
             (&request.run_id, activation_id),
@@ -1681,6 +1821,7 @@ fn activation_node_record_in_snapshot(
         })
 }
 
+#[cfg(test)]
 pub fn revised_leaf_exit(
     connection: &Connection,
     run_id: &str,
