@@ -1361,8 +1361,12 @@ async fn stream_compaction_summary(
     )
     .await;
     if result.is_err()
-        && let Some(usage) =
-            receive_final_billing_usage(&mut invocation, &mut attempt.original_usage).await
+        && let Some(usage) = receive_final_billing_usage(
+            &mut invocation,
+            &attempt.identity.provider_plugin_id,
+            &mut attempt.original_usage,
+        )
+        .await
         && let Err(error) = append_model_usage_event(
             state,
             session_id,
@@ -1715,10 +1719,15 @@ pub async fn handle_compaction_events(
             },
             ProviderTurnEvent::TextDelta { text } => summary.push_str(&text),
             ProviderTurnEvent::OriginalUsage { original } => {
-                bcode_model_provider_runtime::append_usage_capture(
+                if bcode_model_provider_runtime::receive_original_usage(
+                    &attempt.identity.provider_plugin_id,
                     &mut attempt.original_usage,
                     *original,
-                );
+                )
+                .is_err()
+                {
+                    return CompactionPollStatus::Failed("invalid provider original usage".into());
+                }
             }
             ProviderTurnEvent::Usage { usage } => {
                 if let Err(error) = append_model_usage_event(

@@ -8,6 +8,9 @@
 //! (`POST /responses`) so multiple provider integrations can share one implementation of the wire
 //! format instead of duplicating it.
 //!
+//! Pure usage decoding is also shared here: adapters select [`ResponsesUsageDialect`] while the
+//! provider runtime owns capture budgets, event publication, and transport lifetime.
+//!
 //! # Scope
 //!
 //! These are portable data types plus lightweight helpers on owned values. Provider behavior
@@ -21,6 +24,12 @@
 //!
 //! Callers describe the request variations they need through [`ResponsesRequestCapabilities`]
 //! rather than exposing their own configuration types here.
+
+mod usage_decoder;
+pub use usage_decoder::ResponsesUsageDialect;
+
+/// Pure usage decoding reusable by Responses-compatible providers.
+pub mod usage;
 
 use serde::{Deserialize, Serialize};
 

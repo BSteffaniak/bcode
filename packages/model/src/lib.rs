@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod usage;
+pub use usage::{UsageCaptureSpec, UsageDecoder};
+
 mod status;
 pub use status::SessionModelStatus;
 

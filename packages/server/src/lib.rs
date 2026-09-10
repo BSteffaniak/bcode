@@ -19322,8 +19322,16 @@ async fn drain_interrupted_request_usage(
     invocation: &mut bcode_plugin::StreamingServiceInvocation,
     outcome: &mut ModelPollOutcome,
 ) {
+    let provider = state
+        .session_current_turn(session_id)
+        .await
+        .and_then(|turn| turn.model)
+        .map(|attempt| attempt.identity.provider_plugin_id);
+    let Some(provider) = provider else {
+        return;
+    };
     let mut original = None;
-    let received_usage = receive_final_billing_usage(invocation, &mut original).await;
+    let received_usage = receive_final_billing_usage(invocation, &provider, &mut original).await;
     if let Some(original) = original {
         retain_original_usage(state, session_id, provider_turn_id, original).await;
     }
@@ -19341,6 +19349,7 @@ async fn drain_interrupted_request_usage(
 
 async fn receive_final_billing_usage(
     invocation: &mut bcode_plugin::StreamingServiceInvocation,
+    provider: &str,
     original: &mut Option<bcode_session_models::OriginalUsage>,
 ) -> Option<TokenUsage> {
     invocation.cancel.cancel();
@@ -19353,7 +19362,10 @@ async fn receive_final_billing_usage(
             match serde_json::from_slice(&payload) {
                 Ok(ProviderTurnEvent::Usage { usage }) => return Some(usage),
                 Ok(ProviderTurnEvent::OriginalUsage { original: report }) => {
-                    bcode_model_provider_runtime::append_usage_capture(original, *report);
+                    bcode_model_provider_runtime::receive_original_usage(
+                        provider, original, *report,
+                    )
+                    .ok()?;
                 }
                 _ => {}
             }
@@ -20422,13 +20434,14 @@ async fn retain_original_usage(
         let mut current = runtime.current_turn.lock().await;
         if let Some(attempt) = current.as_mut().and_then(|turn| turn.model.as_mut())
             && attempt.provider_turn_id == provider_turn_id
-            && attempt.identity.provider_plugin_id == original.provider_id
-            && original.validate().is_ok()
-        {
-            bcode_model_provider_runtime::append_usage_capture(
+            && bcode_model_provider_runtime::receive_original_usage(
+                &attempt.identity.provider_plugin_id,
                 &mut attempt.original_usage,
                 original,
-            );
+            )
+            .is_err()
+        {
+            tracing::warn!("provider original usage failed attribution or capture validation");
         }
     }
 }

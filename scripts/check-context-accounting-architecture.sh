@@ -31,4 +31,13 @@ if rg -n 'input_tokens\s*\+\s*(cached_input_tokens|cache_(read|write)_input_toke
   fail "hosts and renderers must not independently reconstruct complete provider-visible input"
 fi
 
+if rg -n 'capture_usage_json|finalize_usage_capture|fn normalize_original_usage_service' \
+  plugins/openai-compatible-provider-plugin/src plugins/bedrock-provider-plugin/src --glob '*.rs'; then
+  fail "providers must use the shared usage recorder and normalization service"
+fi
+if rg -n 'OpenAi|Bedrock|Anthropic|ChatCompletions|prompt_tokens|inputTokens' \
+  packages/model-provider-runtime/src/usage_recorder.rs packages/model-provider-runtime/src/usage_service.rs; then
+  fail "usage capture lifecycle must not own provider protocol interpretation"
+fi
+
 echo "context accounting architecture guard passed"

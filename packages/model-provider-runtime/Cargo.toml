@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_model          = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
 bcode_session_models = { workspace = true }
 httpdate             = { workspace = true }
 serde                = { workspace = true }
@@ -20,7 +21,6 @@ tokio                = { workspace = true, features = ["net", "rt", "sync", "tim
 
 [dev-dependencies]
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_plugin_sdk           = { workspace = true }
 
 [features]
 default          = []

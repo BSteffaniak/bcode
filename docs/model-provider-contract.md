@@ -263,6 +263,26 @@ it with their live usage parsing helpers. Unknown API shapes and unsafe/incomple
 rejected rather than guessed. Older providers without this operation remain usable, but cannot
 renormalize private evidence they do not understand.
 
+### Capture implementation boundary
+
+`bcode_model::UsageDecoder` describes protocol extraction paths, billing labels, and pure usage
+interpretation. The provider runtime's request-scoped `UsageRecorder` owns bounded ordered capture,
+capture opt-in, requested/confirmed separation, incomplete status, and original-before-normalized
+publication. Transport scopes finalize on completion, errors, and cancellation; `ScopedUsageRecorder`
+also flushes on future drop. Repeated finalization cannot publish duplicate usage.
+
+Providers register decoders with `normalize_usage_service`; live observation and offline normalization
+use those same decoders without initializing transport or auth. OpenAI Responses, Codex, Chat
+Completions, and Bedrock Mantle share the Responses protocol module with explicit serving dialects.
+Bedrock Messages folds partial reports in a pure usage accumulator, not its text/tool accumulator.
+Converse contributes an SDK report and uses the same recorder lifecycle.
+
+Capture policy and normalization are independent: accepted raw reports survive a later rejected
+fragment, the capture remains explicitly incomplete, and independently valid normalized observations
+can still be emitted. Offline replay rejects incomplete capture rather than claiming parity from
+missing facts. Normal turn, interrupted-drain, and compaction receipt use the same provider attribution
+validation boundary. No durable schema or provider service version changes are required.
+
 ## Usage and stop reasons
 
 Every successfully completed generation or tool-call round emits one final cumulative `Usage`

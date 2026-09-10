@@ -4,8 +4,19 @@
 
 //! Shared turn lifecycle support for native model provider plugins.
 
+mod usage_receiver;
+pub use usage_receiver::receive_original_usage;
+
+mod usage_service;
+pub use usage_service::normalize_usage_service;
+
+mod usage_recorder;
+pub use usage_recorder::{
+    ScopedUsageRecorder, UsageObservation, UsageRecorder, normalize_registered_usage,
+};
+
 mod usage_capture;
-pub use usage_capture::{append_usage_capture, capture_usage_json, finalize_usage_capture};
+use usage_capture::append_usage_capture;
 
 mod conformance;
 pub use conformance::{
@@ -567,6 +578,12 @@ impl TurnState {
             event
         };
         events.push_back(event);
+    }
+
+    /// Whether this provider transport accepts private original evidence for its current host.
+    #[must_use]
+    pub fn original_usage_enabled(&self) -> bool {
+        self.original_usage_enabled.load(Ordering::Acquire)
     }
 
     /// Opt in to private billing evidence on this provider turn.

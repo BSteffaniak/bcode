@@ -36,6 +36,7 @@ use bcode_model_provider_runtime::{
     ProviderOutputPositionAllocator, ProviderRuntime, retry_hint_from_json_value,
     retry_hint_from_response_parts, sanitize_provider_diagnostic,
 };
+use bcode_openai_responses::usage::{OpenAiUsage, OpenAiUsageContext};
 use bcode_openai_responses::{
     ReasoningItemAccumulator, ResponsesContextManagement, ResponsesEventSink, ResponsesInputItem,
     ResponsesNativeSearchBody, ResponsesReasoningOptions, ResponsesReasoningSummary,
@@ -210,8 +211,7 @@ struct TurnState {
     routing: turn_routing::TurnRouting,
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
-    billing_settings: Arc<Mutex<BTreeMap<String, String>>>,
-    original_usage_enabled: Arc<AtomicBool>,
+    usage_recorder: Arc<Mutex<Option<bcode_model_provider_runtime::UsageRecorder<'static>>>>,
     positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
@@ -262,19 +262,15 @@ struct OpenAiAuthTokenResponse {
 }
 
 impl TurnState {
-    fn push(&self, mut event: ProviderTurnEvent) {
-        if let ProviderTurnEvent::OriginalUsage { original } = &mut event {
-            if let Ok(settings) = self.billing_settings.lock() {
-                for (key, value) in settings.iter() {
-                    original.requested.insert(key.clone(), value.clone());
-                }
+    fn push(&self, event: ProviderTurnEvent) {
+        if matches!(
+            event,
+            ProviderTurnEvent::TurnFinished { .. } | ProviderTurnEvent::Cancelled
+        ) {
+            let mut recorder = self.usage_recorder.lock().expect("usage recorder lock");
+            if let Some(recorder) = recorder.as_mut() {
+                recorder.finish(false, |event| self.push(event));
             }
-            bcode_model_provider_runtime::finalize_usage_capture(original);
-        }
-        if matches!(event, ProviderTurnEvent::OriginalUsage { .. })
-            && !self.original_usage_enabled.load(Ordering::Acquire)
-        {
-            return;
         }
         let event = if self.positioned_output.load(Ordering::Acquire) {
             match self.output_positions.lock() {
@@ -289,21 +285,26 @@ impl TurnState {
         }
     }
 
-    fn configure_original_usage(&self, request: &ModelTurnRequest) {
+    fn configure_original_usage(
+        &self,
+        request: &ModelTurnRequest,
+        dialect: OpenAiCompatibleDialect,
+        model_id: &str,
+    ) {
+        let decoder: &'static dyn bcode_model::UsageDecoder = match dialect {
+            OpenAiCompatibleDialect::ChatCompletions => {
+                &bcode_openai_responses::ResponsesUsageDialect::ChatCompletions
+            }
+            _ => &bcode_openai_responses::ResponsesUsageDialect::OpenAi,
+        };
         let context = openai_usage_context(request);
-        if let Ok(mut billing) = self.billing_settings.lock() {
-            billing.insert("model".into(), request.model_id.clone());
-            if let Some(tier) = context.service_tier {
-                billing.insert("service_tier".into(), tier);
-            }
-            if let Some(retention) = context.prompt_cache_retention {
-                billing.insert("prompt_cache_retention".into(), retention);
-            }
+        let mut billing = BTreeMap::from([("model".into(), model_id.to_owned())]);
+        if let Some(retention) = context.prompt_cache_retention {
+            billing.insert("prompt_cache_retention".into(), retention);
         }
-        if let Ok(mut billing) = self.billing_settings.lock()
-            && let Ok(Some(options)) = request
-                .provider_context
-                .extension::<OpenAiResponsesRequestOptions>()
+        if let Ok(Some(options)) = request
+            .provider_context
+            .extension::<OpenAiResponsesRequestOptions>()
             && let Some(tier) = options.service_tier
         {
             billing.insert(
@@ -317,13 +318,28 @@ impl TurnState {
                 .into(),
             );
         }
-        if request
-            .metadata
-            .get(bcode_model::CAPTURE_ORIGINAL_USAGE_METADATA_KEY)
-            .is_some_and(|value| value == "true")
-        {
-            self.original_usage_enabled.store(true, Ordering::Release);
+        *self.usage_recorder.lock().expect("usage recorder lock") =
+            Some(bcode_model_provider_runtime::UsageRecorder::for_request(
+                PROVIDER_ID,
+                decoder,
+                request,
+                billing,
+            ));
+    }
+
+    fn observe_usage(&self, json: &str) {
+        let mut recorder = self.usage_recorder.lock().expect("usage recorder lock");
+        if let Some(recorder) = recorder.as_mut() {
+            recorder.observe_json(json);
         }
+    }
+
+    fn finish_usage(&self, complete: bool) -> Option<TokenUsage> {
+        let mut recorder = self.usage_recorder.lock().expect("usage recorder lock");
+        recorder
+            .as_mut()
+            .filter(|recorder| complete || recorder.is_complete())
+            .and_then(|recorder| recorder.finish(complete, |event| self.push(event)))
     }
 
     fn enable_positioned_output(&self) {
@@ -1345,7 +1361,13 @@ impl OpenAiCompatibleProviderPlugin {
                 Self::context_management_capabilities(&context.request)
             }
             OP_COMPACT_CONTEXT => self.compact_context(&context.request),
-            bcode_model::OP_NORMALIZE_USAGE => normalize_original_usage_service(&context.request),
+            bcode_model::OP_NORMALIZE_USAGE => {
+                bcode_model_provider_runtime::normalize_usage_service(
+                    PROVIDER_ID,
+                    usage_decoders(),
+                    &context.request,
+                )
+            }
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => self.validate_config(&context.request),
             OP_VERIFY_MODEL => self.verify_model(&context.request),
@@ -1575,7 +1597,6 @@ impl OpenAiCompatibleProviderPlugin {
             routing: state.routing.clone(),
             ..TurnState::default()
         };
-        turn.configure_original_usage(&request);
         if positioned_output {
             turn.enable_positioned_output();
         }
@@ -2053,10 +2074,6 @@ struct ChatMessageToolCallFunction {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
     choices: Vec<ChatChunkChoice>,
-    #[serde(default)]
-    service_tier: Option<String>,
-    #[serde(default)]
-    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2101,61 +2118,6 @@ struct ModelResponseItem {
     created: Option<i64>,
     #[serde(flatten)]
     metadata: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiUsage {
-    #[serde(default)]
-    service_tier: Option<String>,
-    #[serde(default)]
-    prompt_tokens: Option<u32>,
-    #[serde(default)]
-    completion_tokens: Option<u32>,
-    #[serde(default)]
-    total_tokens: Option<u32>,
-    #[serde(default)]
-    prompt_tokens_details: Option<OpenAiInputTokenDetails>,
-    #[serde(default)]
-    completion_tokens_details: Option<OpenAiCompletionTokenDetails>,
-    #[serde(default)]
-    input_tokens: Option<u32>,
-    #[serde(default)]
-    output_tokens: Option<u32>,
-    #[serde(default)]
-    input_tokens_details: Option<OpenAiInputTokenDetails>,
-    #[serde(default)]
-    output_tokens_details: Option<OpenAiOutputTokenDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompletionTokenDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u32>,
-    #[serde(default)]
-    audio_tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiInputTokenDetails {
-    #[serde(default)]
-    cached_tokens: Option<u32>,
-    /// Separately billed input written to the prompt cache, not additional input.
-    #[serde(
-        default,
-        rename = "cache_write_tokens",
-        alias = "cache_creation_tokens"
-    )]
-    cache_write: Option<u32>,
-    #[serde(default)]
-    audio_tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiOutputTokenDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u32>,
-    #[serde(default)]
-    audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2220,6 +2182,14 @@ fn stream_turn_events(turn: &TurnState, context: &NativeServiceContext) -> Servi
     loop {
         if context.cancellation.is_cancelled() {
             turn.cancel();
+            if let Some(recorder) = turn
+                .usage_recorder
+                .lock()
+                .expect("usage recorder lock")
+                .as_mut()
+            {
+                recorder.finish(false, |event| turn.push(event));
+            }
             for event in turn.drain() {
                 emit_provider_turn_event(context, &event);
             }
@@ -4372,6 +4342,7 @@ async fn stream_chat_completion_attempt(
         )
     })?;
     let model_id = resolve_model_id_for_turn(&settings, request, turn).await;
+    turn.configure_original_usage(request, settings.dialect, &model_id);
     match (&settings.auth, settings.dialect) {
         (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ChatCompletions) => {
             let response =
@@ -4884,7 +4855,6 @@ async fn read_responses_stream_events(
         dialect,
         context_format,
         name_map: &name_map,
-        pricing_context: openai_usage_context(request),
         suppress_provider_reuse_state,
         uses_previous_response: request
             .conversation_reuse
@@ -4924,7 +4894,6 @@ struct ResponsesStreamProcessor<'a> {
     dialect: OpenAiCompatibleDialect,
     context_format: ProviderContextFormat,
     name_map: &'a BTreeMap<String, String>,
-    pricing_context: OpenAiUsageContext,
     suppress_provider_reuse_state: bool,
     uses_previous_response: bool,
     saw_assistant_text: std::cell::Cell<bool>,
@@ -4981,37 +4950,9 @@ fn process_responses_stream_line(
     saw_tool_call: &mut bool,
 ) -> Result<StreamOutcome, ProviderError> {
     if let Some(data) = line.strip_prefix("data:")
-        && let Some(mut original) = bcode_model_provider_runtime::capture_usage_json(
-            PROVIDER_ID,
-            "responses",
-            data.trim(),
-            "usage",
-        )
+        && data.trim() != "[DONE]"
     {
-        original.complete = matches!(
-            original
-                .reports
-                .last()
-                .map_or("usage", |report| report.source.as_str()),
-            "response.completed" | "response.done" | "response.incomplete" | "response.failed"
-        );
-        if let Some(model) = &processor.pricing_context.model {
-            original.requested.insert("model".into(), model.clone());
-        }
-        if let Some(tier) = &processor.pricing_context.service_tier {
-            original
-                .requested
-                .insert("service_tier".into(), tier.clone());
-        }
-        if let Some(ttl) = &processor.pricing_context.prompt_cache_retention {
-            original
-                .requested
-                .insert("prompt_cache_retention".into(), ttl.clone());
-        }
-        bcode_model_provider_runtime::finalize_usage_capture(&mut original);
-        processor.sink.push(ProviderTurnEvent::OriginalUsage {
-            original: Box::new(original),
-        });
+        processor.sink.0.observe_usage(data.trim());
     }
     let event = match classify_responses_stream_line(line)? {
         ResponsesStreamLine::Ignored => return Ok(StreamOutcome::Cancelled),
@@ -5027,6 +4968,12 @@ fn process_responses_stream_line(
         ResponsesStreamLine::Event(event) => event,
     };
     let event_type = responses_event_type(&event);
+    if matches!(
+        event_type,
+        "response.completed" | "response.done" | "response.incomplete" | "response.failed"
+    ) {
+        processor.sink.0.finish_usage(true);
+    }
     match event_type {
         "response.output_text.delta" | "response.refusal.delta" => {
             if let Some(delta) = responses_text_delta(&event) {
@@ -5146,13 +5093,6 @@ fn process_responses_stream_line(
                 let exact_input = (!processor.uses_previous_response)
                     .then(|| usage.prompt_tokens.or(usage.input_tokens))
                     .flatten();
-                processor.sink.push(ProviderTurnEvent::Usage {
-                    usage: token_usage_from_openai_usage_with_context(
-                        usage,
-                        processor.dialect,
-                        processor.pricing_context.clone(),
-                    ),
-                });
                 if let Some(tokens) = exact_input {
                     processor
                         .sink
@@ -5197,13 +5137,6 @@ fn process_responses_stream_line(
                     let exact_input = (!processor.uses_previous_response)
                         .then(|| usage.prompt_tokens.or(usage.input_tokens))
                         .flatten();
-                    processor.sink.push(ProviderTurnEvent::Usage {
-                        usage: token_usage_from_openai_usage_with_context(
-                            usage,
-                            processor.dialect,
-                            processor.pricing_context.clone(),
-                        ),
-                    });
                     if let Some(tokens) = exact_input {
                         processor
                             .sink
@@ -5231,27 +5164,9 @@ fn process_responses_stream_line(
                 }
                 return Ok(StreamOutcome::MaxTokens);
             }
-            if let Some(usage) = openai_usage_from_responses_event(&event) {
-                processor.sink.push(ProviderTurnEvent::Usage {
-                    usage: token_usage_from_openai_usage_with_context(
-                        usage,
-                        processor.dialect,
-                        processor.pricing_context.clone(),
-                    ),
-                });
-            }
             return Err(responses_incomplete_error(&event));
         }
         "response.failed" | "error" => {
-            if let Some(usage) = openai_usage_from_responses_event(&event) {
-                processor.sink.push(ProviderTurnEvent::Usage {
-                    usage: token_usage_from_openai_usage_with_context(
-                        usage,
-                        processor.dialect,
-                        processor.pricing_context.clone(),
-                    ),
-                });
-            }
             return Err(responses_failed_error(&event));
         }
         _ => {}
@@ -5425,19 +5340,7 @@ fn process_stream_line(
         return Err(provider_error(code, category, err.message));
     }
 
-    // Reuse the same source adapter for live decoding and historical normalization.
-    // Capture still precedes typed deserialization so unsupported fields survive.
-    if let Some(mut original) = bcode_model_provider_runtime::capture_usage_json(
-        PROVIDER_ID,
-        "chat_completions",
-        data,
-        "usage",
-    ) {
-        original.complete = true;
-        turn.push(ProviderTurnEvent::OriginalUsage {
-            original: Box::new(original),
-        });
-    }
+    turn.observe_usage(data);
     let chunk = serde_json::from_str::<ChatCompletionChunk>(data).map_err(|error| {
         provider_error(
             "stream_decode_failed",
@@ -5445,17 +5348,12 @@ fn process_stream_line(
             error.to_string(),
         )
     })?;
-    if let Some(mut usage) = chunk.usage {
-        usage.service_tier = chunk.service_tier.or(usage.service_tier);
-        let exact_input = usage.prompt_tokens.or(usage.input_tokens);
-        turn.push(ProviderTurnEvent::Usage {
-            usage: token_usage_from_openai_usage(usage, OpenAiCompatibleDialect::ChatCompletions),
+    if let Some(usage) = turn.finish_usage(false)
+        && let Some(tokens) = usage.input_tokens
+    {
+        turn.push(ProviderTurnEvent::ExactRequestInputTokens {
+            tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
         });
-        if let Some(tokens) = exact_input {
-            turn.push(ProviderTurnEvent::ExactRequestInputTokens {
-                tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
-            });
-        }
     }
     for choice in chunk.choices {
         if let Some(content) = choice.delta.content
@@ -5477,16 +5375,6 @@ fn process_stream_line(
         }
     }
     Ok(StreamOutcome::Cancelled)
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct OpenAiUsageContext {
-    #[serde(default)]
-    service_tier: Option<String>,
-    #[serde(default)]
-    prompt_cache_retention: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
 }
 
 fn openai_usage_context(request: &ModelTurnRequest) -> OpenAiUsageContext {
@@ -5517,280 +5405,39 @@ fn openai_usage_context(request: &ModelTurnRequest) -> OpenAiUsageContext {
     }
 }
 
-fn normalize_original_usage_service(request: &ServiceRequest) -> ServiceResponse {
-    let result = request
-        .payload_json::<bcode_session_models::OriginalUsage>()
-        .map_err(|_| "invalid original usage".to_owned())
-        .and_then(|original| normalize_original_usage(&original));
-    result.map_or_else(
-        |_| {
-            ServiceResponse::error(
-                "usage_normalization_failed",
-                "original usage is incomplete, unsupported, or invalid",
-            )
-        },
-        |usage| {
-            ServiceResponse::json(&usage).unwrap_or_else(|_| {
-                ServiceResponse::error("usage_encode_failed", "normalized usage encoding failed")
-            })
-        },
-    )
-}
-
+#[cfg(test)]
 fn normalize_original_usage(
     original: &bcode_session_models::OriginalUsage,
 ) -> Result<TokenUsage, String> {
-    original.validate()?;
-    if original.provider_id != PROVIDER_ID || original.capture_issue.is_some() {
-        return Err("unsupported usage evidence".into());
-    }
-    let dialect = match original.api_shape.as_str() {
-        "responses" => OpenAiCompatibleDialect::ResponsesApi,
-        "chat_completions" => OpenAiCompatibleDialect::ChatCompletions,
-        _ => return Err("unsupported usage shape".into()),
-    };
-    for report in &original.reports {
-        if !matches!(
-            report.source.as_str(),
-            "response.completed"
-                | "response.done"
-                | "response.incomplete"
-                | "response.failed"
-                | "usage"
-        ) {
-            return Err("unsupported usage report source".into());
-        }
-    }
-    let report = original.reports.last().ok_or("no usage reports")?;
-    let mut usage: OpenAiUsage =
-        serde_json::from_str(&report.usage_json).map_err(|_| "invalid upstream usage")?;
-    if let Some(tier) = report.confirmed.get("service_tier") {
-        usage.service_tier = Some(tier.clone());
-    }
-    let context = OpenAiUsageContext {
-        model: report
-            .confirmed
-            .get("model")
-            .or_else(|| original.requested.get("model"))
-            .cloned(),
-        service_tier: report
-            .confirmed
-            .get("service_tier")
-            .or_else(|| {
-                original
-                    .requested
-                    .get("service_tier")
-                    .filter(|tier| matches!(tier.as_str(), "default" | "standard"))
-            })
-            .cloned(),
-        prompt_cache_retention: report
-            .confirmed
-            .get("prompt_cache_retention")
-            .or_else(|| original.requested.get("prompt_cache_retention"))
-            .cloned(),
-    };
-    let mut normalized = token_usage_from_openai_usage_with_context(usage, dialect, context);
-    if !original.complete {
-        normalized.output_tokens = None;
-        normalized.total_tokens = None;
-    }
-    Ok(normalized)
+    bcode_model_provider_runtime::normalize_registered_usage(
+        PROVIDER_ID,
+        usage_decoders(),
+        original,
+    )
 }
 
-fn token_usage_from_openai_usage(
-    usage: OpenAiUsage,
-    dialect: OpenAiCompatibleDialect,
-) -> TokenUsage {
-    token_usage_from_openai_usage_with_context(usage, dialect, OpenAiUsageContext::default())
+fn usage_decoders() -> &'static [&'static dyn bcode_model::UsageDecoder] {
+    &[
+        &bcode_openai_responses::ResponsesUsageDialect::OpenAi,
+        &bcode_openai_responses::ResponsesUsageDialect::ChatCompletions,
+    ]
 }
 
-fn token_usage_from_openai_usage_with_context(
+#[cfg(test)]
+fn normalize_usage_with_context(
     usage: OpenAiUsage,
     _dialect: OpenAiCompatibleDialect,
     context: OpenAiUsageContext,
 ) -> TokenUsage {
-    let service_tier = usage.service_tier.or(context.service_tier);
-    let cached_input_tokens = usage
-        .prompt_tokens_details
-        .as_ref()
-        .and_then(|details| details.cached_tokens)
-        .or_else(|| {
-            usage
-                .input_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens)
-        });
-    let cache_write_input_tokens = usage
-        .prompt_tokens_details
-        .as_ref()
-        .and_then(|details| details.cache_write)
-        .or_else(|| {
-            usage
-                .input_tokens_details
-                .as_ref()
-                .and_then(|details| details.cache_write)
-        });
-    let reasoning_tokens = usage
-        .completion_tokens_details
-        .as_ref()
-        .and_then(|details| details.reasoning_tokens)
-        .or_else(|| {
-            usage
-                .output_tokens_details
-                .as_ref()
-                .and_then(|details| details.reasoning_tokens)
-        });
-    let input_audio_tokens = usage
-        .prompt_tokens_details
-        .as_ref()
-        .and_then(|details| details.audio_tokens)
-        .or_else(|| {
-            usage
-                .input_tokens_details
-                .as_ref()
-                .and_then(|details| details.audio_tokens)
-        });
-    let output_audio_tokens = usage
-        .completion_tokens_details
-        .as_ref()
-        .and_then(|details| details.audio_tokens)
-        .or_else(|| {
-            usage
-                .output_tokens_details
-                .as_ref()
-                .and_then(|details| details.audio_tokens)
-        });
-    let input_tokens = usage.prompt_tokens.or(usage.input_tokens);
-    // OpenAI Chat Completions `prompt_tokens` and Responses `input_tokens` are totals that already
-    // include cached tokens. Cached details are a billed subset, not additional model-visible
-    // input, across both native OpenAI and compatible surfaces using this contract.
-    let output_tokens = usage.completion_tokens.or(usage.output_tokens);
-    let details = openai_modality_usage_details(
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        cache_write_input_tokens,
-        input_audio_tokens,
-        output_audio_tokens,
-    );
-    TokenUsage {
-        input_tokens,
-        output_tokens,
-        total_tokens: usage.total_tokens,
-        cached_input_tokens,
-        cache_write_input_tokens,
-        details,
-        pricing_context: Box::new(bcode_model::ModelPricingContext {
-            service_tier: service_tier.map(|tier| bcode_model::normalize_model_service_tier(&tier)),
-            invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
-            billing_scope: context
-                .model
-                .as_deref()
-                .map(bcode_model::model_billing_scope_from_effective_id),
-            request_input_tokens: input_tokens.map(u64::from),
-            cache_ttl_seconds: context
-                .prompt_cache_retention
-                .as_deref()
-                .and_then(|retention| match retention {
-                    "24h" => Some(24 * 60 * 60),
-                    _ => None,
-                }),
-        }),
-        reasoning_tokens,
-    }
+    bcode_openai_responses::usage::normalize_usage(usage, context)
 }
 
-fn openai_modality_usage_details(
-    input_tokens: Option<u32>,
-    output_tokens: Option<u32>,
-    cached_input_tokens: Option<u32>,
-    cache_write_input_tokens: Option<u32>,
-    input_audio_tokens: Option<u32>,
-    output_audio_tokens: Option<u32>,
-) -> Box<[bcode_model::ModelTokenUsageDetail]> {
-    let ambiguous_modality = input_audio_tokens.is_some_and(|audio| {
-        audio > input_tokens.unwrap_or_default()
-            || (audio > 0
-                && (cached_input_tokens.is_none_or(|cached| cached > 0)
-                    || cache_write_input_tokens.is_some_and(|written| written > 0)))
-    }) || output_audio_tokens
-        .is_some_and(|audio| audio > output_tokens.unwrap_or_default());
-    if ambiguous_modality {
-        // Preserve evidence without inventing cached/written audio allocations.
-        return [
-            (bcode_model::ModelPricingBucket::Input, input_audio_tokens),
-            (bcode_model::ModelPricingBucket::Output, output_audio_tokens),
-        ]
-        .into_iter()
-        .filter_map(|(bucket, tokens)| {
-            tokens
-                .filter(|tokens| *tokens > 0)
-                .map(|tokens| bcode_model::ModelTokenUsageDetail {
-                    bucket,
-                    modality: bcode_model::ModelTokenModality::Audio,
-                    tokens,
-                    cache_ttl_seconds: None,
-                })
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    }
-    if input_audio_tokens.is_none() && output_audio_tokens.is_none() {
-        return Box::default();
-    }
-    let cached = cached_input_tokens.unwrap_or_default();
-    let written = cache_write_input_tokens.unwrap_or_default();
-    let input_audio = input_audio_tokens.unwrap_or_default();
-    let output_audio = output_audio_tokens.unwrap_or_default();
-    let mut details = Vec::new();
-    for (bucket, modality, tokens) in [
-        (
-            bcode_model::ModelPricingBucket::Input,
-            bcode_model::ModelTokenModality::Text,
-            input_tokens
-                .unwrap_or_default()
-                .saturating_sub(cached)
-                .saturating_sub(written)
-                .saturating_sub(input_audio),
-        ),
-        (
-            bcode_model::ModelPricingBucket::Input,
-            bcode_model::ModelTokenModality::Audio,
-            input_audio,
-        ),
-        (
-            bcode_model::ModelPricingBucket::CacheReadInput,
-            bcode_model::ModelTokenModality::Text,
-            cached,
-        ),
-        (
-            bcode_model::ModelPricingBucket::CacheWriteInput,
-            bcode_model::ModelTokenModality::Text,
-            written,
-        ),
-        (
-            bcode_model::ModelPricingBucket::Output,
-            bcode_model::ModelTokenModality::Text,
-            output_tokens
-                .unwrap_or_default()
-                .saturating_sub(output_audio),
-        ),
-        (
-            bcode_model::ModelPricingBucket::Output,
-            bcode_model::ModelTokenModality::Audio,
-            output_audio,
-        ),
-    ] {
-        if tokens > 0 {
-            details.push(bcode_model::ModelTokenUsageDetail {
-                bucket,
-                modality,
-                tokens,
-                cache_ttl_seconds: None,
-            });
-        }
-    }
-    details.into_boxed_slice()
+#[cfg(test)]
+fn token_usage_from_openai_usage(
+    usage: OpenAiUsage,
+    dialect: OpenAiCompatibleDialect,
+) -> TokenUsage {
+    normalize_usage_with_context(usage, dialect, OpenAiUsageContext::default())
 }
 
 fn openai_usage_from_responses_event(event: &serde_json::Value) -> Option<OpenAiUsage> {
@@ -11906,26 +11553,6 @@ mod tests {
     /// Credential-free original-usage normalization is an optional provider operation.
     /// The encoding of normalized usage is deliberately separate from private capture.
     #[test]
-    fn old_hosts_do_not_receive_unrequested_original_usage_events() {
-        let turn = TurnState::default();
-        let original = bcode_session_models::OriginalUsage {
-            provider_id: PROVIDER_ID.into(),
-            api_shape: "responses".into(),
-            capture_issue: Some(bcode_session_models::UsageCaptureIssue::UnsafeOrMalformed),
-            ..Default::default()
-        };
-        turn.push(ProviderTurnEvent::OriginalUsage {
-            original: Box::new(original.clone()),
-        });
-        assert!(turn.drain().is_empty());
-        turn.original_usage_enabled.store(true, Ordering::Release);
-        turn.push(ProviderTurnEvent::OriginalUsage {
-            original: Box::new(original),
-        });
-        assert_eq!(turn.drain().len(), 1);
-    }
-
-    #[test]
     fn normalizer_service_needs_no_provider_configuration() {
         let original = bcode_session_models::OriginalUsage { provider_id:PROVIDER_ID.into(),api_shape:"responses".into(),complete:true,
             reports:vec![bcode_session_models::OriginalUsageReport {source:"response.completed".into(),usage_json:r#"{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":100}}"#.into(),confirmed:BTreeMap::new()}],..Default::default() };
@@ -11934,7 +11561,11 @@ mod tests {
             operation: bcode_model::OP_NORMALIZE_USAGE.into(),
             payload: serde_json::to_vec(&original).unwrap(),
         };
-        let response = normalize_original_usage_service(&request);
+        let response = bcode_model_provider_runtime::normalize_usage_service(
+            PROVIDER_ID,
+            usage_decoders(),
+            &request,
+        );
         assert!(response.error.is_none());
         let normalized: TokenUsage = serde_json::from_slice(&response.payload).unwrap();
         assert_eq!(normalized.cache_write_input_tokens, Some(100));
@@ -11943,7 +11574,6 @@ mod tests {
     #[test]
     fn source_report_survives_typed_decode_failure() {
         let turn = TurnState::default();
-        turn.original_usage_enabled.store(true, Ordering::Release);
         let name_map = BTreeMap::new();
         let processor = test_responses_stream_processor(&turn, &name_map);
         let _ = process_responses_stream_line(
@@ -11958,8 +11588,20 @@ mod tests {
 
     #[test]
     fn original_usage_is_offline_normalizable_and_debug_safe() {
-        let mut original = bcode_model_provider_runtime::capture_usage_json(PROVIDER_ID,"responses",r#"{"response":{"service_tier":"flex","usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":80},"future_counter":123456789012345678901234567890},"output":[{"text":"not billing"}]}}"#,"response.completed").unwrap();
-        original.complete = true;
+        let mut recorder = bcode_model_provider_runtime::UsageRecorder::new(
+            PROVIDER_ID,
+            &bcode_openai_responses::ResponsesUsageDialect::OpenAi,
+            BTreeMap::new(),
+            true,
+        );
+        recorder.observe_json(r#"{"type":"response.completed","response":{"service_tier":"flex","usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":80},"future_counter":123456789012345678901234567890},"output":[{"text":"not billing"}]}}"#);
+        let mut captured = None;
+        recorder.finish(true, |event| {
+            if let ProviderTurnEvent::OriginalUsage { original } = event {
+                captured = Some(*original);
+            }
+        });
+        let mut original = captured.unwrap();
         let usage = normalize_original_usage(&original).unwrap();
         assert_eq!(usage.cache_write_input_tokens, Some(80));
         assert_eq!(usage.uncached_input_tokens(), Some(10));
@@ -12894,6 +12536,13 @@ mod tests {
         turn: &'a TurnState,
         name_map: &'a BTreeMap<String, String>,
     ) -> ResponsesStreamProcessor<'a> {
+        *turn.usage_recorder.lock().unwrap() =
+            Some(bcode_model_provider_runtime::UsageRecorder::new(
+                PROVIDER_ID,
+                &bcode_openai_responses::ResponsesUsageDialect::OpenAi,
+                BTreeMap::new(),
+                true,
+            ));
         ResponsesStreamProcessor {
             sink: TurnEventSink(turn),
             dialect: OpenAiCompatibleDialect::ResponsesApi,
@@ -12902,7 +12551,6 @@ mod tests {
                 compatibility_key: "test".to_string(),
             },
             name_map,
-            pricing_context: OpenAiUsageContext::default(),
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
             saw_assistant_text: std::cell::Cell::new(false),
@@ -13031,6 +12679,13 @@ mod tests {
     #[test]
     fn chat_completion_stream_reads_usage_after_finish_reason() {
         let turn = TurnState::default();
+        *turn.usage_recorder.lock().unwrap() =
+            Some(bcode_model_provider_runtime::UsageRecorder::new(
+                PROVIDER_ID,
+                &bcode_openai_responses::ResponsesUsageDialect::ChatCompletions,
+                BTreeMap::new(),
+                true,
+            ));
         let mut buffer = concat!(
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49,\"prompt_tokens_details\":{\"cached_tokens\":10,\"cache_write_tokens\":20}}}\n\n",
@@ -13066,6 +12721,13 @@ mod tests {
     #[test]
     fn chat_completion_stream_preserves_tool_call_outcome_until_done() {
         let turn = TurnState::default();
+        *turn.usage_recorder.lock().unwrap() =
+            Some(bcode_model_provider_runtime::UsageRecorder::new(
+                PROVIDER_ID,
+                &bcode_openai_responses::ResponsesUsageDialect::ChatCompletions,
+                BTreeMap::new(),
+                true,
+            ));
         let mut buffer = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"filesystem_write\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1,\"total_tokens\":10}}\n\n",
@@ -13171,7 +12833,6 @@ mod tests {
                 compatibility_key: "test".to_string(),
             },
             name_map: &name_map,
-            pricing_context: OpenAiUsageContext::default(),
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
             saw_assistant_text: std::cell::Cell::new(false),
@@ -13249,7 +12910,6 @@ mod tests {
                 compatibility_key: "test".to_string(),
             },
             name_map: &name_map,
-            pricing_context: OpenAiUsageContext::default(),
             suppress_provider_reuse_state: false,
             uses_previous_response: false,
             saw_assistant_text: std::cell::Cell::new(false),
