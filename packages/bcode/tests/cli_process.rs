@@ -186,6 +186,8 @@ fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
         root.path().join("catalog.json"),
         serde_json::to_vec(&bcode_workflow::WorkflowLaunchCatalogRequest {
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            incremental: false,
+            discovery_token: None,
             workspace: root.path().to_path_buf(),
             limit: 1,
             cursor: None,

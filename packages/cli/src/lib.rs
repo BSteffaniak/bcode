@@ -2173,6 +2173,8 @@ async fn handle_workflow_package_command(
             client,
             bcode_workflow::WorkflowLaunchCatalogRequest {
                 version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                incremental: false,
+                discovery_token: None,
                 workspace,
                 limit,
                 cursor: None,

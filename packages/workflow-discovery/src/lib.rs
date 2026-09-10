@@ -534,6 +534,8 @@ pub struct WorkflowDirectoryBatch {
 #[derive(Debug)]
 pub struct WorkflowDirectoryScan {
     entries: Option<fs::ReadDir>,
+    root: PathBuf,
+    modified: Option<std::time::SystemTime>,
     kind: WorkflowCandidateKind,
     failed: bool,
 }
@@ -549,8 +551,15 @@ impl WorkflowDirectoryScan {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
+        let modified = if entries.is_some() {
+            Some(fs::metadata(root)?.modified()?)
+        } else {
+            None
+        };
         Ok(Self {
             entries,
+            root: root.to_path_buf(),
+            modified,
             kind,
             failed: false,
         })
@@ -586,8 +595,10 @@ impl WorkflowDirectoryScan {
             return Ok(batch);
         };
         self.failed = true;
+        self.check_directory_stamp()?;
         for _ in 0..budget {
             let Some(entry) = entries.next() else {
+                self.check_directory_stamp()?;
                 self.failed = false;
                 batch.complete = true;
                 return Ok(batch);
@@ -607,9 +618,19 @@ impl WorkflowDirectoryScan {
                 batch.paths.push(path);
             }
         }
+        self.check_directory_stamp()?;
         self.failed = false;
         self.entries = Some(entries);
         Ok(batch)
+    }
+
+    fn check_directory_stamp(&self) -> Result<(), std::io::Error> {
+        if Some(fs::metadata(&self.root)?.modified()?) != self.modified {
+            return Err(std::io::Error::other(
+                "workflow discovery directory changed during enumeration; restart discovery",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -866,6 +887,28 @@ fn read_bounded_source(path: &Path) -> Result<String, WorkflowDiscoveryError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_directory_stamp_invalidates_scan_permanently() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one.workflow.json"), "{}").unwrap();
+        let mut scan = super::WorkflowDirectoryScan::open(
+            root.path(),
+            super::WorkflowCandidateKind::Standalone,
+        )
+        .unwrap();
+        assert!(!scan.advance(1).unwrap().complete);
+        // Inject an old stamp deterministically, independent of filesystem timestamp resolution.
+        scan.modified = Some(std::time::UNIX_EPOCH);
+        assert!(scan.advance(1).unwrap_err().to_string().contains("changed"));
+        assert!(scan.entries.is_none());
+        assert!(
+            scan.advance(1)
+                .unwrap_err()
+                .to_string()
+                .contains("previously failed")
+        );
+    }
+
     #[test]
     fn discovery_scan_yields_and_delivers_result_once() {
         let root = tempfile::tempdir().unwrap();

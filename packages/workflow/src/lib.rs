@@ -268,6 +268,12 @@ pub struct WorkflowLaunchCatalogCursor {
 pub struct WorkflowLaunchCatalogRequest {
     pub version: u32,
     pub workspace: PathBuf,
+    /// Opt into bounded discovery advances. Pending responses contain no catalog items.
+    #[serde(default)]
+    pub incremental: bool,
+    /// Continue a process-local scan using its latest token and the unchanged request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_token: Option<String>,
     pub limit: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<WorkflowLaunchCatalogCursor>,
@@ -300,6 +306,16 @@ impl WorkflowLaunchCatalogRequest {
             return Err(authoring_error(
                 "launch_catalog.workspace",
                 "launch catalog requires a workspace path",
+            ));
+        }
+        if self
+            .discovery_token
+            .as_ref()
+            .is_some_and(|token| !self.incremental || token.is_empty() || token.len() > 128)
+        {
+            return Err(authoring_error(
+                "launch_catalog.discovery_token",
+                "invalid discovery continuation",
             ));
         }
         if self.limit == 0 || self.limit > MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE {
@@ -355,6 +371,10 @@ pub struct WorkflowLaunchCatalogItem {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowLaunchCatalogPage {
     pub version: u32,
+    /// Pending scan token, not an item cursor or durable resume capability. Retry with the
+    /// unchanged request within 60 seconds; expiration or daemon loss requires a fresh scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_token: Option<String>,
     pub items: Vec<WorkflowLaunchCatalogItem>,
     pub diagnostics: Vec<WorkflowLaunchDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -413,6 +433,8 @@ mod launch_catalog_contract_tests {
 
     fn request(version: u32) -> WorkflowLaunchCatalogRequest {
         WorkflowLaunchCatalogRequest {
+            incremental: false,
+            discovery_token: None,
             version,
             workspace: PathBuf::from("/workspace"),
             limit: 100,

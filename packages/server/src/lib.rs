@@ -368,6 +368,8 @@ pub struct ServerState {
     workflow_run_graph_publication_policy:
         Option<workflow_operations::WorkflowRunGraphPublicationPolicy>,
     workflow_application_authorization: workflow_operations::WorkflowApplicationAuthorizationPolicy,
+    workflow_discovery_scans:
+        Arc<StdMutex<BTreeMap<String, workflow_operations::PendingDiscovery>>>,
     workflow_computations:
         StdMutex<BTreeMap<String, Arc<workflow_operations::ComputationCancellation>>>,
     runtime_work: RuntimeWorkManager,
@@ -1949,6 +1951,7 @@ impl ServerState {
                     ),
                 },
             ),
+            workflow_discovery_scans: Arc::new(StdMutex::new(BTreeMap::new())),
             workflow_computations: StdMutex::new(BTreeMap::new()),
             runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
             ralph_store: init.ralph_store,
@@ -36972,6 +36975,8 @@ mod tests {
         let state = test_server_state_with_shell_plugin(SessionManager::default());
         let cli_request = bcode_workflow::WorkflowLaunchCatalogRequest {
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            incremental: false,
+            discovery_token: None,
             workspace: workspace.path().to_path_buf(),
             limit: 100,
             cursor: None,
@@ -36981,6 +36986,8 @@ mod tests {
         };
         let tui_request = bcode_workflow::WorkflowLaunchCatalogRequest {
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            incremental: false,
+            discovery_token: None,
             workspace: workspace.path().to_path_buf(),
             limit: 100,
             cursor: None,
@@ -67509,6 +67516,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state
     }
 
+    fn unavailable_launch_catalog_request(workspace: &std::path::Path) -> Request {
+        Request::WorkflowLaunchCatalog(bcode_workflow::WorkflowLaunchCatalogRequest {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            incremental: false,
+            discovery_token: None,
+            workspace: workspace.to_path_buf(),
+            limit: 5,
+            cursor: None,
+            search: None,
+            source_kind: None,
+            readiness: None,
+        })
+    }
+
     #[tokio::test]
     async fn unavailable_definition_queries_return_correlated_domain_errors() {
         let state = unavailable_workflow_state();
@@ -67561,15 +67582,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Request::GetWorkflowPackagePublication {
                 package_id: "missing".to_string(),
             },
-            Request::WorkflowLaunchCatalog(bcode_workflow::WorkflowLaunchCatalogRequest {
-                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
-                workspace: socket_dir.path().to_path_buf(),
-                limit: 5,
-                cursor: None,
-                search: None,
-                source_kind: None,
-                readiness: None,
-            }),
+            unavailable_launch_catalog_request(socket_dir.path()),
             Request::WorkflowLaunchDetail(bcode_workflow::WorkflowLaunchDetailRequest {
                 version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
                 workspace: socket_dir.path().to_path_buf(),

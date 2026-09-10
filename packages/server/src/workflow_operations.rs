@@ -3028,6 +3028,8 @@ pub async fn launch_detail(
                 state,
                 &bcode_workflow::WorkflowLaunchCatalogRequest {
                     version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                    incremental: false,
+                    discovery_token: None,
                     workspace: request.workspace.clone(),
                     limit: bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE,
                     cursor: None,
@@ -3174,6 +3176,17 @@ async fn launch_detail_for_catalog_item(
     })
 }
 
+#[derive(Debug)]
+pub struct PendingDiscovery {
+    request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    scan: bcode_workflow_discovery::WorkflowDiscoveryScan,
+    expires: std::time::Instant,
+}
+
+fn discovery_error(message: &str) -> super::ServerError {
+    bcode_workflow_discovery::WorkflowDiscoveryError::Invalid(message.to_string()).into()
+}
+
 /// Discover and semantically preview one bounded workflow launch-catalog page.
 ///
 /// Discovery is read-only. It never applies, publishes, repairs, or starts a workflow.
@@ -3183,17 +3196,40 @@ pub async fn launch_catalog(
     request: &bcode_workflow::WorkflowLaunchCatalogRequest,
 ) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
     request.validate()?;
+    let mut binding = request.clone();
+    binding.discovery_token = None;
+    let resumed = if let Some(token) = &request.discovery_token {
+        let mut scans = state
+            .workflow_discovery_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = scans.get(token).ok_or_else(|| {
+            discovery_error("unknown or expired discovery token; restart discovery")
+        })?;
+        if pending.expires <= std::time::Instant::now() || pending.request != binding {
+            return Err(discovery_error(
+                "expired or mismatched discovery token; restart discovery",
+            ));
+        }
+        scans.remove(token).map(|pending| pending.scan)
+    } else {
+        None
+    };
     let workspace = request.workspace.clone();
     let config = state.startup_config.workflows.clone();
-    let mut scan = tokio::task::spawn_blocking(move || {
-        bcode_workflow_discovery::WorkflowDiscoveryScan::open(
-            &workspace,
-            &config,
-            bcode_workflow_discovery::MAX_DISCOVERY_RESULTS,
-        )
-    })
-    .await
-    .map_err(super::ServerError::BlockingTask)??;
+    let mut scan = if let Some(scan) = resumed {
+        scan
+    } else {
+        tokio::task::spawn_blocking(move || {
+            bcode_workflow_discovery::WorkflowDiscoveryScan::open(
+                &workspace,
+                &config,
+                bcode_workflow_discovery::MAX_DISCOVERY_RESULTS,
+            )
+        })
+        .await
+        .map_err(super::ServerError::BlockingTask)??
+    };
     let discovery = loop {
         // Transfer ownership into just one bounded batch. Dropping this request can leave that
         // batch running, but cannot schedule another; its output then releases the scan handles.
@@ -3206,6 +3242,47 @@ pub async fn launch_catalog(
         scan = next_scan;
         if let Some(discovery) = result? {
             break discovery;
+        }
+        if request.incremental {
+            let token = uuid::Uuid::new_v4().to_string();
+            let lifetime = std::time::Duration::from_mins(1);
+            {
+                let mut scans = state
+                    .workflow_discovery_scans
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if scans.len() >= 8 {
+                    return Err(discovery_error(
+                        "discovery scan capacity reached; retry later",
+                    ));
+                }
+                scans.insert(
+                    token.clone(),
+                    PendingDiscovery {
+                        request: binding,
+                        scan,
+                        expires: std::time::Instant::now() + lifetime,
+                    },
+                );
+            }
+            let scans = std::sync::Arc::downgrade(&state.workflow_discovery_scans);
+            let expired_token = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(lifetime).await;
+                if let Some(scans) = scans.upgrade() {
+                    scans
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&expired_token);
+                }
+            });
+            return Ok(bcode_workflow::WorkflowLaunchCatalogPage {
+                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                discovery_token: Some(token),
+                items: Vec::new(),
+                diagnostics: Vec::new(),
+                next_cursor: None,
+            });
         }
         tokio::task::yield_now().await;
     };
@@ -3488,6 +3565,7 @@ fn project_launch_catalog_page(
     });
     bcode_workflow::WorkflowLaunchCatalogPage {
         version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        discovery_token: None,
         items,
         diagnostics,
         next_cursor,

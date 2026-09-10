@@ -2859,6 +2859,8 @@ impl WorkflowStatusSurface {
             self.launch_detail = None;
         }
         let request = bcode_workflow::WorkflowLaunchCatalogRequest {
+            incremental: false,
+            discovery_token: None,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             workspace,
             limit: WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE,
@@ -9424,6 +9426,7 @@ mod tests {
         surface.live_status = "live updates unavailable: offline".to_string();
         assert!(render_workspace_text(&mut surface, 100, 24).contains("Disconnected"));
         surface.launch_catalog = Some(bcode_workflow::WorkflowLaunchCatalogPage {
+            discovery_token: None,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             items: Vec::new(),
             diagnostics: Vec::new(),
@@ -9734,6 +9737,7 @@ mod tests {
         };
         surface.selected_launch_source = Some(item.source.clone());
         surface.launch_catalog = Some(bcode_workflow::WorkflowLaunchCatalogPage {
+            discovery_token: None,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             items: vec![item.clone()],
             diagnostics: Vec::new(),
