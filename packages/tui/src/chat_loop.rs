@@ -2659,10 +2659,10 @@ pub fn apply_effect_result(
             apply_agent_catalog_result(chat, agents);
         }
         TuiEffectResult::OlderHistoryLoaded { session_id, result } => {
-            apply_older_history_result(chat, session_id, result);
+            apply_older_history_result(chat, loop_state, session_id, result);
         }
         TuiEffectResult::NewerHistoryLoaded { session_id, result } => {
-            apply_newer_history_result(chat, session_id, result);
+            apply_newer_history_result(chat, loop_state, session_id, result);
         }
         TuiEffectResult::PermissionList { result } => {
             apply_permission_list_result(chat, loop_state, result);
@@ -3271,13 +3271,41 @@ fn apply_agent_catalog_result(
     }
 }
 
+fn hydrate_history_artifacts(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    events: &[bcode_session_models::SessionEvent],
+) {
+    let presentation = chat.app.plugin_presentation();
+    for event in events {
+        loop_state.artifact_stream.observe_finalized_artifact(
+            event.session_id,
+            event.sequence,
+            &event.kind,
+            |producer, schema, version, key, content_type| {
+                presentation.is_some_and(|presentation| {
+                    presentation.accepts_artifact_reference(
+                        producer,
+                        schema,
+                        version,
+                        key,
+                        content_type,
+                    )
+                })
+            },
+        );
+    }
+}
+
 fn apply_older_history_result(
     chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
     result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
 ) {
     match result {
         Ok(page) if Some(session_id) == chat.viewing_session_id() => {
+            hydrate_history_artifacts(chat, loop_state, &page.events);
             chat.app.prepend_older_history(&page.events, page.has_more);
         }
         Ok(_stale) => {}
@@ -3292,11 +3320,13 @@ fn apply_older_history_result(
 
 fn apply_newer_history_result(
     chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
     result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
 ) {
     match result {
         Ok(page) if Some(session_id) == chat.viewing_session_id() => {
+            hydrate_history_artifacts(chat, loop_state, &page.events);
             chat.app.append_newer_history(&page.events, page.has_more);
         }
         Ok(_stale) => {}
@@ -5152,14 +5182,23 @@ fn handle_artifact_completion(
     completion: ActiveArtifactFetchCompletion,
 ) -> bool {
     let presentation = chat.app.plugin_presentation();
-    loop_state
-        .artifact_stream
-        .handle_completion(chat.viewing_session_id(), completion, |chunk| {
+    let changed = loop_state.artifact_stream.handle_completion(
+        chat.viewing_session_id(),
+        completion,
+        |chunk| {
             presentation.map_or_else(
                 || Err("plugin presentation unavailable".to_owned()),
                 |presentation| presentation.deliver_artifact_chunk(chunk),
             )
-        })
+        },
+    );
+    let failures = loop_state.artifact_stream.failed_invocations();
+    if let Some(presentation) = presentation.as_ref() {
+        for invocation_id in &failures {
+            presentation.mark_artifact_unavailable(invocation_id);
+        }
+    }
+    changed || !failures.is_empty()
 }
 
 fn absorb_session_stream_update(

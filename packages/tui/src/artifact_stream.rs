@@ -182,7 +182,23 @@ impl ArtifactStreamCoordinator {
     }
 
     pub(crate) fn reset_session(&mut self, session_id: SessionId) {
-        self.artifact_fetches.retain(|key, _| key.0 != session_id);
+        // The retained adapters still own decoded prefixes. Restarting at zero would
+        // deliver conflicting duplicate ranges to those same decoders.
+        for (key, state) in &mut self.artifact_fetches {
+            if key.0 == session_id {
+                state.terminal_error = None;
+                state.retry_at = Some(Instant::now());
+            }
+        }
+    }
+
+    pub(crate) fn failed_invocations(&self) -> Vec<String> {
+        self.artifact_fetches
+            .iter()
+            .filter(|(_, state)| state.terminal_error.is_some())
+            .map(|(key, _)| key.1.clone())
+            .take(256)
+            .collect()
     }
 
     pub(crate) fn retain_session(&mut self, session_id: Option<SessionId>) {
@@ -900,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn resetting_a_resident_session_discards_all_artifact_fetch_state() {
+    fn resetting_a_resident_session_preserves_decoder_progress() {
         let session_id = SessionId::new();
         let other_session_id = SessionId::new();
         let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
@@ -917,12 +933,12 @@ mod tests {
         }
 
         coordinator.reset_session(session_id);
-        assert_eq!(coordinator.artifact_fetches.len(), 1);
+        assert_eq!(coordinator.artifact_fetches.len(), 2);
         assert!(
             coordinator
                 .artifact_fetches
-                .keys()
-                .all(|key| key.0 == other_session_id)
+                .iter()
+                .any(|(key, state)| key.0 == session_id && state.retry_at.is_some())
         );
     }
 

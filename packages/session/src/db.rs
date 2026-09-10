@@ -10743,6 +10743,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_reference_updates_preserve_other_artifacts_and_keys() {
+        let temp = tempfile::tempdir().expect("temp");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .expect("open");
+        let mut artifact = bcode_session_models::ToolArtifact {
+            artifact_id: "first".to_owned(),
+            producer_plugin_id: "fixture".to_owned(),
+            schema: "fixture".to_owned(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: None,
+            metadata: serde_json::Value::Null,
+            refs: vec![bcode_session_models::ToolArtifactRef {
+                key: "recording".to_owned(),
+                storage_uri: Some("file:///first".to_owned()),
+                content_type: None,
+                byte_len: Some(10),
+                metadata: None,
+            }],
+        };
+        project_artifact_references(db.database(), 1, &artifact)
+            .await
+            .expect("first");
+        artifact.refs[0].key = "clean".to_owned();
+        project_artifact_references(db.database(), 2, &artifact)
+            .await
+            .expect("second key");
+        artifact.artifact_id = "second".to_owned();
+        project_artifact_references(db.database(), 3, &artifact)
+            .await
+            .expect("second artifact");
+        artifact.refs[0].byte_len = Some(20);
+        project_artifact_references(db.database(), 4, &artifact)
+            .await
+            .expect("update");
+        let rows = db
+            .database()
+            .select("artifact_references")
+            .execute(db.database())
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 3);
+        drop(db);
+        let reopened = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .expect("reopen");
+        let rows = reopened
+            .database()
+            .select("artifact_references")
+            .execute(reopened.database())
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
     async fn finalized_artifact_references_are_projected_for_bounded_lookup() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();

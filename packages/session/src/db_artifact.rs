@@ -4,6 +4,7 @@ use crate::db::{FinalizedArtifactReference, SessionDbError, SessionDbResult};
 use crate::db_event_store::seq_to_value;
 use crate::db_row::{i64_to_u64, optional_i64, optional_string, required_i64, required_string};
 use bcode_session_models::{ToolArtifact, ToolArtifactRef};
+use switchy::database::query::FilterableQuery as _;
 use switchy::database::{Database, DatabaseValue};
 
 pub async fn project_artifact_references(
@@ -15,6 +16,8 @@ pub async fn project_artifact_references(
         let (availability, complete, checksum_sha256) =
             generic_artifact_reference_metadata(reference);
         db.upsert("artifact_references")
+            .where_eq("artifact_id", artifact.artifact_id.clone())
+            .where_eq("reference_key", reference.key.clone())
             .value("artifact_id", artifact.artifact_id.clone())
             .value("reference_key", reference.key.clone())
             .value("producer_plugin_id", artifact.producer_plugin_id.clone())

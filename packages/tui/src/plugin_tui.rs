@@ -876,6 +876,23 @@ impl PluginTuiPresentation {
         )
     }
 
+    /// Surface an artifact lookup failure even when no bytes reached an adapter.
+    pub fn mark_artifact_unavailable(&self, invocation_id: &str) {
+        let changed = self
+            .artifact_delivery_failures
+            .lock()
+            .is_ok_and(|mut failures| {
+                failures.len() < 256 && failures.insert(invocation_id.to_owned())
+            });
+        if changed {
+            if let Ok(mut revisions) = self.visual_revisions.lock() {
+                let revision = revisions.entry(invocation_id.to_owned()).or_default();
+                *revision = revision.wrapping_add(1);
+            }
+            self.mark_visual_dirty(invocation_id);
+        }
+    }
+
     /// Deliver opaque artifact bytes to the retained adapter selected by generic routing metadata.
     ///
     /// # Errors
