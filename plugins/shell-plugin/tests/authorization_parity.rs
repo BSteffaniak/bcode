@@ -78,6 +78,7 @@ fn static_bundled_entrypoint_produces_same_fact_as_concurrent_plugin() {
     let context = context(source);
     let encoded = serde_json::to_vec(&context).unwrap();
     let vtable = bcode_shell_plugin::static_plugin();
+    assert_eq!((vtable.activate)(vtable.instance), 0);
     let mut output = vec![0_u8; 1024 * 1024];
     let mut output_len = 0_usize;
     let status = (vtable.invoke_service_streaming)(
@@ -101,4 +102,5 @@ fn static_bundled_entrypoint_produces_same_fact_as_concurrent_plugin() {
         .payload_json::<ToolPreparationResponse>()
         .expect("static preparation should decode");
     assert_eq!(actual.authorization, expected.authorization);
+    assert_eq!((vtable.deactivate)(vtable.instance), 0);
 }

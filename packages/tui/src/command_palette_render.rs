@@ -32,11 +32,16 @@ pub fn render_palette(
     );
     component.paint(&layout, frame);
     let panel = &layout.children[0];
-    let list = panel.node.children.last().expect("picker list");
+    let list = panel
+        .node
+        .children
+        .iter()
+        .find(|child| child.node.id.as_str() == "commands.chrome.list")
+        .expect("picker list");
     let area = Rect::new(
-        panel.x + list.x,
+        u16::try_from(panel.x.saturating_add(list.x)).unwrap_or(u16::MAX),
         u16::try_from(panel.y + list.y).unwrap_or(u16::MAX),
-        list.node.size.width,
+        u16::try_from(list.node.size.width).unwrap_or(u16::MAX),
         u16::try_from(list.node.size.height).unwrap_or(u16::MAX),
     );
     let items = palette.visible_items(theme.muted);
@@ -49,9 +54,9 @@ pub fn render_palette(
     );
     let input = &panel.node.children[0];
     let input_area = Rect::new(
-        panel.x + input.x,
+        u16::try_from(panel.x.saturating_add(input.x)).unwrap_or(u16::MAX),
         u16::try_from(panel.y + input.y).unwrap_or(u16::MAX),
-        input.node.size.width,
+        u16::try_from(input.node.size.width).unwrap_or(u16::MAX),
         u16::try_from(input.node.size.height).unwrap_or(u16::MAX),
     );
     drop(component);
@@ -66,11 +71,17 @@ pub fn palette_list_area(area: Rect) -> Rect {
         PickerFrameComponent::new("commands", command_palette_frame(), TextBlock::new(""));
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     let panel = &layout.children[0];
-    let list = panel.node.children.last().expect("picker list");
+    let list = panel
+        .node
+        .children
+        .iter()
+        .find(|child| child.node.id.as_str() == "commands.chrome.list")
+        .expect("picker list");
     Rect::new(
-        area.x + panel.x + list.x,
+        area.x
+            .saturating_add(u16::try_from(panel.x.saturating_add(list.x)).unwrap_or(u16::MAX)),
         area.y + u16::try_from(panel.y + list.y).unwrap_or(u16::MAX),
-        list.node.size.width,
+        u16::try_from(list.node.size.width).unwrap_or(u16::MAX),
         u16::try_from(list.node.size.height).unwrap_or(u16::MAX),
     )
 }

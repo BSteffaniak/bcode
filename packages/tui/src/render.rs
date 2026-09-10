@@ -1491,10 +1491,11 @@ fn composer_content_area(area: Rect, theme: TuiTheme) -> Rect {
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     let child = &layout.children[0];
     Rect::new(
-        area.x.saturating_add(child.x),
+        area.x
+            .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
         area.y
             .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
-        child.node.size.width,
+        u16::try_from(child.node.size.width).unwrap_or(u16::MAX),
         u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
     )
 }

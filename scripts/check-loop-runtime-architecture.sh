@@ -796,7 +796,7 @@ fi
 
 if ! grep -F 'invocation_input_request_round_trips_with_opaque_payload' packages/ipc/src/lib.rs >/dev/null ||
    ! grep -F 'generic_invocation_inputs_enqueue_opaque_bounded_payloads' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'shell_visual_adapter_owns_resize_input_payload_and_identity' plugins/shell-plugin/src/shell_run_tui.rs >/dev/null; then
+   ! grep -F 'display_resize_reflows_without_emulation_or_execution_input' plugins/shell-plugin/src/shell_run_tui.rs >/dev/null; then
   echo "Runtime architecture violation: neutral invocation input transport coverage was removed." >&2
   violations=1
 fi
@@ -1491,7 +1491,7 @@ if [[ -z "${bmux_source_root}" ]]; then
 fi
 
 if ! grep -F 'fn select_presentation_damage(' packages/tui/src/root_program.rs >/dev/null \
-  || ! grep -F 'draw_damage(damage' packages/tui/src/chat_loop.rs >/dev/null \
+  || ! grep -F 'draw_damage_with_overlay(' packages/tui/src/chat_loop.rs >/dev/null \
   || ! grep -F 'draw_damage(Damage::Full' packages/tui/src/onboarding_program.rs >/dev/null \
   || ! grep -F 'cursor_partial_presentation_matches_full_production_presenter' packages/tui/src/root_program.rs >/dev/null \
   || ! grep -F 'scripts/capture-tui-product-latency.sh' docs/tui-rendering.md >/dev/null \

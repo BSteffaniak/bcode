@@ -30,14 +30,22 @@ impl FilteredListState {
     pub fn render_state(&mut self, viewport_height: u16) -> &mut SelectableListState {
         let viewport = ScrollViewComponent::viewport_layout(
             LayoutId::new("picker.viewport"),
-            LogicalSize::new(1, usize::from(viewport_height)),
+            LogicalSize::new(1, u64::from(viewport_height)),
             LayoutNode::leaf(
                 LayoutId::new("picker.rows"),
-                LogicalSize::new(1, self.filtered_indices.len()),
+                LogicalSize::new(
+                    1,
+                    u64::try_from(self.filtered_indices.len()).unwrap_or(u64::MAX),
+                ),
             ),
         );
         if let Some(selected) = self.list_state.selected() {
-            ScrollView::new().ensure_visible(&viewport, &mut self.list_state.scroll, selected, 1);
+            ScrollView::new().ensure_visible(
+                &viewport,
+                &mut self.list_state.scroll,
+                u64::try_from(selected).unwrap_or(u64::MAX),
+                1,
+            );
             self.list_state.set_focused(Some(selected));
         }
         &mut self.list_state
@@ -45,8 +53,8 @@ impl FilteredListState {
 
     /// Return the current scroll offset.
     #[must_use]
-    pub const fn offset(&self) -> usize {
-        self.list_state.vertical_scroll()
+    pub fn offset(&self) -> usize {
+        usize::try_from(self.list_state.vertical_scroll()).unwrap_or(usize::MAX)
     }
 
     /// Return filtered source indices.

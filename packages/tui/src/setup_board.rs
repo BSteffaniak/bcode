@@ -126,7 +126,7 @@ pub struct SetupBoardState {
     pub hovered: Option<SetupSectionId>,
     /// Pressed spot, if any.
     pub pressed: Option<SetupSectionId>,
-    drag_origin: Option<(Point, usize, usize)>,
+    drag_origin: Option<(Point, u64, u64)>,
 }
 
 impl SetupBoardState {
@@ -385,19 +385,19 @@ impl<'a> SetupBoard<'a> {
             MouseEventKind::Drag(MouseButton::Left) if state.drag_origin.is_some() => {
                 let (origin, horizontal, vertical) = state.drag_origin.expect("drag origin");
                 state.pressed = None;
-                let shift = |offset: usize, from: u16, to: u16| {
+                let shift = |offset: u64, from: u16, to: u16| {
                     offset
-                        .saturating_add(usize::from(from.saturating_sub(to)))
-                        .saturating_sub(usize::from(to.saturating_sub(from)))
+                        .saturating_add(u64::from(from.saturating_sub(to)))
+                        .saturating_sub(u64::from(to.saturating_sub(from)))
                 };
                 let layout = self.layout();
                 state.scroll.set_horizontal_offset(
                     shift(horizontal, origin.x, mouse.position.x)
-                        .min(usize::from(layout.width.saturating_sub(area.width))),
+                        .min(u64::from(layout.width.saturating_sub(area.width))),
                 );
                 state.scroll.set_vertical_offset(
                     shift(vertical, origin.y, mouse.position.y)
-                        .min(usize::from(layout.height.saturating_sub(area.height))),
+                        .min(u64::from(layout.height.saturating_sub(area.height))),
                 );
                 Some(SetupBoardOutcome::Panned)
             }

@@ -215,9 +215,10 @@ fn render_preview(
     let layout = shell.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     let child = &layout.children[0];
     let inner = Rect::new(
-        area.x + child.x,
+        area.x
+            .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
         area.y + u16::try_from(child.y).unwrap_or(u16::MAX),
-        child.node.size.width,
+        u16::try_from(child.node.size.width).unwrap_or(u16::MAX),
         u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
     );
     paint_component(&shell, area, frame);

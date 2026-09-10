@@ -5,10 +5,9 @@
 //! transcript code routes opaque plugin visuals without understanding those values.
 
 #[cfg(test)]
-use crate::contracts::SHELL_RECORDING_CONTENT_TYPE;
+use crate::contracts::{SHELL_RECORDING_CONTENT_TYPE, SHELL_SCHEMA_VERSION};
 use crate::contracts::{
-    SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_MEDIA_TYPE, SHELL_RECORDING_REF_KEY,
-    SHELL_RUN_SCHEMA, SHELL_SCHEMA_VERSION, ShellInvocationAction,
+    SHELL_RECORDING_MEDIA_TYPE, SHELL_RECORDING_REF_KEY, SHELL_RUN_SCHEMA,
     TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
 };
 use bcode_tui_components::terminal_viewer::{
@@ -16,8 +15,8 @@ use bcode_tui_components::terminal_viewer::{
     terminal_viewer_rows,
 };
 use bmux_terminal_grid::{
-    Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
-    TerminalGridStream,
+    Color as GridColor, ContentBudget, ContentProjection, GridLimits, GridMode, HistorySliceError,
+    PhysicalRow, Style as GridStyle, TerminalGrid, TerminalGridStream,
 };
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use bmux_tui::style::Modifier;
@@ -54,8 +53,7 @@ struct LiveTerminalReplay {
     output: Vec<u8>,
     frames: Vec<TerminalReplayFrame>,
     stream: Option<TerminalGridStream>,
-    pending_resizes: Vec<TerminalReplayFrame>,
-    next_input_sequence: u64,
+    projection: ShellContentProjection,
     last_frame_sequence: u64,
     initial_columns: u16,
     initial_rows: u16,
@@ -99,6 +97,7 @@ impl LiveTerminalReplay {
 
     fn reset_stream(&mut self) {
         self.stream = None;
+        self.projection = ShellContentProjection::default();
     }
 }
 
@@ -157,58 +156,6 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             title: Some("Shell run".to_owned()),
             timeout_ms,
         }
-    }
-
-    fn invocation_event_input(
-        &self,
-        invocation_id: &str,
-        kind: &str,
-        payload: &serde_json::Value,
-        event: &bmux_tui::event::Event,
-    ) -> Option<bcode_tool::ToolInvocationInput> {
-        if !self.supports(kind) {
-            return None;
-        }
-        let bmux_tui::event::Event::Resize(size) = event else {
-            return None;
-        };
-        let input_sequence = if let Ok(mut replays) = self.live_replays.lock() {
-            let replay = replays.entry(invocation_id.to_owned()).or_default();
-            if replay.initial_columns == 0 || replay.initial_rows == 0 {
-                let runtime = payload.get("_bcode_runtime").unwrap_or(payload);
-                replay.initial_columns =
-                    payload_u16(runtime, "columns").unwrap_or(DEFAULT_TERMINAL_COLUMNS);
-                replay.initial_rows = payload_u16(runtime, "rows").unwrap_or(DEFAULT_TERMINAL_ROWS);
-            }
-            replay.columns = size.width;
-            replay.rows = size.height;
-            let resize = TerminalReplayFrame::Resize {
-                columns: size.width,
-                rows: size.height,
-            };
-            let _ = replay.apply_frame(&resize);
-            if let Ok(mut diagnostics) = self.diagnostics.lock() {
-                diagnostics.emulate_frames = diagnostics.emulate_frames.saturating_add(1);
-            }
-            replay.pending_resizes.push(resize);
-            let sequence = replay.next_input_sequence;
-            replay.next_input_sequence = replay.next_input_sequence.saturating_add(1);
-            sequence
-        } else {
-            return None;
-        };
-        Some(bcode_tool::ToolInvocationInput {
-            input_id: format!("{invocation_id}-input-{input_sequence}"),
-            invocation_id: invocation_id.to_owned(),
-            producer_id: "bcode.shell".to_owned(),
-            schema: SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
-            schema_version: SHELL_SCHEMA_VERSION,
-            payload: serde_json::to_value(ShellInvocationAction::Resize {
-                columns: size.width,
-                rows: size.height,
-            })
-            .unwrap_or(serde_json::Value::Null),
-        })
     }
 
     fn accepts_artifact_reference(
@@ -493,11 +440,16 @@ impl ShellRunTuiVisualAdapter {
 }
 
 impl ShellRunTuiVisualAdapter {
-    fn live_grid_rows(&self, key: &str, input: TerminalViewerInput<'_>) -> Option<Vec<Line>> {
-        let replays = self.live_replays.lock().ok()?;
-        let replay = replays.get(key)?;
+    fn live_grid_rows(
+        &self,
+        key: &str,
+        input: TerminalViewerInput<'_>,
+        width: u16,
+    ) -> Option<Vec<Line>> {
+        let mut replays = self.live_replays.lock().ok()?;
+        let replay = replays.get_mut(key)?;
         let stream = replay.stream.as_ref()?;
-        let rows = shell_terminal_grid_rows(input, stream.grid());
+        let rows = shell_terminal_grid_rows(input, stream.grid(), width, &mut replay.projection);
         drop(replays);
         Some(rows)
     }
@@ -548,7 +500,7 @@ impl ShellRunTuiVisualAdapter {
             show_status: false,
             sizing: TerminalViewerSizing::Compact,
         };
-        if let Some(rows) = self.live_grid_rows(key, input) {
+        if let Some(rows) = self.live_grid_rows(key, input, width) {
             if let Ok(mut diagnostics) = self.diagnostics.lock() {
                 diagnostics.emitted_rows = diagnostics
                     .emitted_rows
@@ -652,7 +604,7 @@ impl ShellRunTuiVisualAdapter {
             sizing: TerminalViewerSizing::Compact,
         };
         if streaming {
-            let visible_rows = self.live_visible_rows(key, input);
+            let visible_rows = self.live_visible_rows(key, input, width);
             input.sizing = TerminalViewerSizing::Live {
                 visible_rows,
                 max_rows: MAX_INLINE_TERMINAL_ROWS,
@@ -660,7 +612,7 @@ impl ShellRunTuiVisualAdapter {
         }
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(self.live_replay_status_rows(key, runtime));
-        let retained_rows = self.live_grid_rows(key, input);
+        let retained_rows = self.live_grid_rows(key, input, width);
         let used_retained_grid = retained_rows.is_some();
         let terminal_rows = retained_rows.unwrap_or_else(|| terminal_viewer_rows(input, width));
         if !used_retained_grid {
@@ -710,29 +662,18 @@ impl ShellRunTuiVisualAdapter {
                 if *sequence <= replay.last_frame_sequence {
                     continue;
                 }
-                let mut already_applied = false;
                 if let TerminalReplayFrame::Resize { columns, rows } = frame {
                     replay.columns = *columns;
                     replay.rows = *rows;
-                    if let Some(index) = replay
-                        .pending_resizes
-                        .iter()
-                        .position(|pending| pending == frame)
-                    {
-                        replay.pending_resizes.remove(index);
-                        already_applied = true;
+                }
+                let _ = replay.apply_frame(frame);
+                emulated_bytes = emulated_bytes.saturating_add(match frame {
+                    TerminalReplayFrame::Output(bytes) => {
+                        u64::try_from(bytes.len()).unwrap_or(u64::MAX)
                     }
-                }
-                if !already_applied {
-                    let _ = replay.apply_frame(frame);
-                    emulated_bytes = emulated_bytes.saturating_add(match frame {
-                        TerminalReplayFrame::Output(bytes) => {
-                            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
-                        }
-                        TerminalReplayFrame::Resize { .. } => 0,
-                    });
-                    emulated_frames = emulated_frames.saturating_add(1);
-                }
+                    TerminalReplayFrame::Resize { .. } => 0,
+                });
+                emulated_frames = emulated_frames.saturating_add(1);
                 replay.frames.push(frame.clone());
                 replay.last_frame_sequence = *sequence;
             }
@@ -755,7 +696,6 @@ impl ShellRunTuiVisualAdapter {
                 && output != replay.output;
             if dimensions_changed || discontinuous_output {
                 replay.frames.clear();
-                replay.pending_resizes.clear();
                 replay.initial_columns = initial_columns;
                 replay.initial_rows = initial_rows;
                 replay.columns = initial_columns;
@@ -825,7 +765,7 @@ impl ShellRunTuiVisualAdapter {
             .unwrap_or_else(|| shell_status_rows(fallback))
     }
 
-    fn live_visible_rows(&self, key: &str, input: TerminalViewerInput<'_>) -> usize {
+    fn live_visible_rows(&self, key: &str, input: TerminalViewerInput<'_>, width: u16) -> usize {
         let Ok(mut states) = self.live_states.lock() else {
             return 1;
         };
@@ -834,14 +774,17 @@ impl ShellRunTuiVisualAdapter {
             .live_replays
             .lock()
             .ok()
-            .and_then(|replays| {
-                replays.get(key).and_then(|replay| {
+            .and_then(|mut replays| {
+                replays.get_mut(key).and_then(|replay| {
                     replay.stream.as_ref().map(|stream| {
-                        live_viewport_content_rows(stream.grid(), MAX_INLINE_TERMINAL_ROWS).len()
+                        replay
+                            .projection
+                            .rows(stream.grid(), true, width, MAX_INLINE_TERMINAL_ROWS)
+                            .map_or(1, |rows| rows.len())
                     })
                 })
             })
-            .unwrap_or_else(|| terminal_viewer_rows(input, u16::MAX).len());
+            .unwrap_or_else(|| terminal_viewer_rows(input, width).len());
         state.update_rows(content_rows.max(1), MAX_INLINE_TERMINAL_ROWS);
         state.visible_rows()
     }
@@ -1205,31 +1148,74 @@ fn shell_terminal_stream(
     Some(stream)
 }
 
-fn live_viewport_content_rows(grid: &TerminalGrid, max_rows: usize) -> Vec<PhysicalRow> {
-    let content_end = (0..grid.height())
-        .rev()
-        .find(|&row| {
-            grid.viewport_row_ref(row)
-                .is_some_and(|row| !row.cells().is_empty())
-        })
-        .map_or(0, |row| row.saturating_add(1));
-    let end = content_end
-        .max(grid.cursor().row.saturating_add(1))
-        .min(grid.height());
-    let start = end.saturating_sub(max_rows);
-    (start..end)
-        .filter_map(|row| grid.viewport_row_ref(row).cloned())
-        .collect()
+const SHELL_PROJECTION_BUDGET: ContentBudget = ContentBudget {
+    cells: 1_000_000,
+    bytes: 16 * 1024 * 1024,
+};
+
+#[derive(Default)]
+struct ShellContentProjection {
+    capture: Option<(u64, bool, Result<ContentProjection, HistorySliceError>)>,
 }
 
-fn shell_terminal_grid_rows(input: TerminalViewerInput<'_>, grid: &TerminalGrid) -> Vec<Line> {
+impl ShellContentProjection {
+    fn rows(
+        &mut self,
+        grid: &TerminalGrid,
+        live: bool,
+        width: u16,
+        max_rows: usize,
+    ) -> Result<Vec<PhysicalRow>, HistorySliceError> {
+        let width = usize::from(width.saturating_sub(4).max(1));
+        if grid.mode() == GridMode::Alternate {
+            return grid.screen_window(0..width, 0..max_rows, SHELL_PROJECTION_BUDGET);
+        }
+        let revision = grid.content_revision();
+        if !self
+            .capture
+            .as_ref()
+            .is_some_and(|(cached, scope, _)| *cached == revision && *scope == live)
+        {
+            let capture = if live {
+                grid.capture_viewport(u128::from(revision), SHELL_PROJECTION_BUDGET)
+            } else {
+                grid.capture_content(
+                    u128::from(revision),
+                    MAX_INLINE_TERMINAL_ROWS,
+                    SHELL_PROJECTION_BUDGET,
+                )
+            };
+            self.capture = Some((revision, live, capture));
+        }
+        let (_, _, capture) = self
+            .capture
+            .as_mut()
+            .ok_or(HistorySliceError::Unavailable)?;
+        let projection = capture.as_mut().map_err(|error| *error)?;
+        projection.prepare(width, SHELL_PROJECTION_BUDGET)?;
+        projection
+            .tail(max_rows, SHELL_PROJECTION_BUDGET.bytes)
+            .map(|window| window.rows)
+    }
+}
+
+fn shell_terminal_grid_rows(
+    input: TerminalViewerInput<'_>,
+    grid: &TerminalGrid,
+    width: u16,
+    projection: &mut ShellContentProjection,
+) -> Vec<Line> {
     let max_rows = match input.sizing {
         TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
         TerminalViewerSizing::Live { max_rows, .. } => max_rows,
     };
-    let rows = match input.sizing {
-        TerminalViewerSizing::Compact => grid.main_content_tail_rows(max_rows),
-        TerminalViewerSizing::Live { .. } => live_viewport_content_rows(grid, max_rows),
+    let Ok(rows) = projection.rows(
+        grid,
+        matches!(input.sizing, TerminalViewerSizing::Live { .. }),
+        width,
+        max_rows,
+    ) else {
+        return vec![Line::from("    terminal preview exceeds projection budget")];
     };
     let mut output = rows
         .iter()
@@ -1253,6 +1239,11 @@ fn shell_terminal_grid_rows(input: TerminalViewerInput<'_>, grid: &TerminalGrid)
             output.push(Line::default());
         }
     }
+    if grid.mode() == GridMode::Alternate && grid.width() > usize::from(width.saturating_sub(4)) {
+        output.push(Line::from(
+            "    positioned screen clipped to available width",
+        ));
+    }
     output
 }
 
@@ -1264,7 +1255,12 @@ fn shell_terminal_frame_rows(
     let Some(stream) = shell_terminal_stream(input.columns, input.rows, frames) else {
         return terminal_viewer_rows(input, width);
     };
-    shell_terminal_grid_rows(input, stream.grid())
+    shell_terminal_grid_rows(
+        input,
+        stream.grid(),
+        width,
+        &mut ShellContentProjection::default(),
+    )
 }
 
 fn shell_terminal_grid_row_to_line(grid: &TerminalGrid, row: &PhysicalRow) -> Line {
@@ -2558,8 +2554,8 @@ mod tests {
             "bcode.tool.request.shell.run",
             &payload,
             &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(9, 4)),
-        )
-        .expect("resize input");
+        );
+        assert!(input.is_none());
         cumulative.extend_from_slice(second);
         let incoming_frames = vec![
             (1, TerminalReplayFrame::Output(first.clone())),
@@ -2597,7 +2593,6 @@ mod tests {
             .frames
             .clone();
 
-        assert_eq!(input.producer_id, "bcode.shell");
         assert_eq!(live_frames, reopened_frames);
         let retained_snapshot = retained_snapshot(&adapter, key);
         let reopened =
@@ -2606,7 +2601,12 @@ mod tests {
             .grid()
             .scrollback_rows_hint()
             .saturating_add(reopened.grid().height());
-        assert_eq!(retained_snapshot, reopened.snapshot(0, reopened_rows));
+        let mut reopened_snapshot = reopened.snapshot(0, reopened_rows);
+        assert_eq!(retained_snapshot.history_truncated, Some(true));
+        assert_eq!(reopened_snapshot.history_truncated, Some(false));
+        // The live grid intentionally retains less history than full artifact replay.
+        reopened_snapshot.history_truncated = retained_snapshot.history_truncated;
+        assert_eq!(retained_snapshot, reopened_snapshot);
         let replays = adapter.live_replays.lock().expect("live replays");
         let retained = replays
             .get(key)
@@ -2633,85 +2633,53 @@ mod tests {
     }
 
     #[test]
-    fn live_shell_visual_uses_plugin_owned_resize_dimensions() {
+    fn display_resize_reflows_without_emulation_or_execution_input() {
         let adapter = ShellRunTuiVisualAdapter::default();
         let payload = serde_json::json!({
             "arguments": {"command": "printf test"},
-            "_bcode_runtime": {
-                "output": "12345678ABCD",
-                "columns": 8,
-                "rows": 24,
-                "live_state_key": "call-resize",
-                "streaming": true
-            }
+            "_bcode_runtime": {"output": "12345678ABCD", "columns": 8,
+                "rows": 24, "live_state_key": "call-resize", "streaming": true}
         });
-        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-            100,
-            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
-            None,
-        );
-        let before = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &adapter,
-            "bcode.tool.request.shell.run",
-            &payload,
-            &context,
-        );
+        let render = |width| {
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+                &adapter,
+                "bcode.tool.request.shell.run",
+                &payload,
+                &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                    width,
+                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                    None,
+                ),
+            )
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+        assert!(render(100).contains("12345678ABCD"));
+        let snapshot = retained_snapshot(&adapter, "call-resize");
+        let _ = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter);
         let input = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_input(
             &adapter,
             "call-resize",
             "bcode.tool.request.shell.run",
             &payload,
-            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(4, 24)),
+            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(8, 24)),
         );
-        let after = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &adapter,
-            "bcode.tool.request.shell.run",
-            &payload,
-            &context,
-        );
-
-        assert!(input.is_some());
-        assert_ne!(before, after);
-        let rendered = after.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("5678\n    ABCD"), "{rendered}");
-    }
-
-    #[test]
-    fn shell_visual_adapter_owns_resize_input_payload_and_identity() {
-        let adapter = ShellRunTuiVisualAdapter::default();
-        let payload = serde_json::json!({"live_state_key": "stale-renderer-key"});
-        let input = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_input(
-            &adapter,
-            "shell-call",
-            "bcode.tool.request.shell.run",
-            &payload,
-            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(132, 40)),
-        );
-        assert_eq!(
-            input,
-            Some(bcode_tool::ToolInvocationInput {
-                invocation_id: "shell-call".to_owned(),
-                input_id: "shell-call-input-0".to_owned(),
-                producer_id: "bcode.shell".to_owned(),
-                schema: SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
-                schema_version: SHELL_SCHEMA_VERSION,
-                payload: serde_json::json!({
-                    "type": "resize",
-                    "columns": 132,
-                    "rows": 40,
-                }),
-            })
-        );
-        let repeated = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::invocation_event_input(
-            &adapter,
-            "shell-call",
-            "bcode.tool.request.shell.run",
-            &payload,
-            &bmux_tui::event::Event::Resize(bmux_tui::geometry::Size::new(132, 40)),
-        )
-        .expect("repeated resize input");
-        assert_eq!(repeated.invocation_id, "shell-call");
-        assert_eq!(repeated.input_id, "shell-call-input-1");
+        assert!(input.is_none());
+        assert!(render(8).contains("1234\n    5678\n    ABCD"));
+        assert!(render(100).contains("12345678ABCD"));
+        assert_eq!(retained_snapshot(&adapter, "call-resize"), snapshot);
+        let diagnostics =
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter);
+        for diagnostic in diagnostics {
+            if matches!(
+                diagnostic.name.as_str(),
+                "emulate_bytes" | "emulate_frames" | "decode_bytes" | "decode_frames"
+            ) {
+                assert_eq!(diagnostic.value, 0, "{}", diagnostic.name);
+            }
+        }
     }
 
     #[test]

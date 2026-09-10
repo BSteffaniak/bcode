@@ -42,9 +42,15 @@ pub fn render_timeline_dialog(
     else {
         return;
     };
-    let visible_entries = body_layout.size.height.saturating_sub(3);
+    let visible_entries =
+        usize::try_from(body_layout.size.height.saturating_sub(3)).unwrap_or(usize::MAX);
     state.sync_scroll(visible_entries);
-    let body = rows(state, body_layout.size.width, visible_entries, theme);
+    let body = rows(
+        state,
+        u16::try_from(body_layout.size.width).unwrap_or(u16::MAX),
+        visible_entries,
+        theme,
+    );
     let dialog = DialogComponent::new(
         "timeline",
         Dialog::new(&body, &[], theme.modal_theme())

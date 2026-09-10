@@ -1001,9 +1001,11 @@ impl EvalWizard {
             .find_logical_rect(&LayoutId::new("eval.wizard.actions"))
             .expect("wizard actions");
         let action_area = Rect::new(
-            area.x + rect.x,
-            area.y + u16::try_from(rect.y).unwrap_or(u16::MAX),
-            rect.width,
+            area.x
+                .saturating_add(u16::try_from(rect.x).unwrap_or(u16::MAX)),
+            area.y
+                .saturating_add(u16::try_from(rect.y).unwrap_or(u16::MAX)),
+            u16::try_from(rect.width).unwrap_or(u16::MAX),
             u16::try_from(rect.height).unwrap_or(u16::MAX),
         );
         match ActionRow::new(&actions).handle_event(action_area, self.dialog_state_mut(), event) {
@@ -1683,9 +1685,11 @@ fn wizard_layout(area: Rect) -> WizardLayout {
         .find_logical_rect(&LayoutId::new("eval.wizard.body"))
         .expect("wizard body");
     let body = Rect::new(
-        area.x + rect.x,
-        area.y + u16::try_from(rect.y).unwrap_or(u16::MAX),
-        rect.width,
+        area.x
+            .saturating_add(u16::try_from(rect.x).unwrap_or(u16::MAX)),
+        area.y
+            .saturating_add(u16::try_from(rect.y).unwrap_or(u16::MAX)),
+        u16::try_from(rect.width).unwrap_or(u16::MAX),
         u16::try_from(rect.height).unwrap_or(u16::MAX),
     );
     WizardLayout {

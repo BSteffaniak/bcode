@@ -146,10 +146,11 @@ pub fn render_picker_panel(
     let panel = &layout.children[0];
     let child = &panel.node.children[0];
     Rect::new(
-        area.x.saturating_add(panel.x).saturating_add(child.x),
+        area.x
+            .saturating_add(u16::try_from(panel.x.saturating_add(child.x)).unwrap_or(u16::MAX)),
         area.y
             .saturating_add(u16::try_from(panel.y + child.y).unwrap_or(u16::MAX)),
-        child.node.size.width,
+        u16::try_from(child.node.size.width).unwrap_or(u16::MAX),
         u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
     )
 }

@@ -1670,13 +1670,14 @@ impl BmuxApp {
 
     /// Return the composer scroll offset that should be used for the latest content area.
     pub fn composer_scroll_offset_for_render(&self) -> usize {
-        if self.composer.vertical_scroll() == usize::MAX {
+        let offset = if self.composer.vertical_scroll() == u64::MAX {
             self.composer
                 .cursor_scroll_offset(&composer_policy())
                 .unwrap_or(0)
         } else {
             self.composer.vertical_scroll()
-        }
+        };
+        usize::try_from(offset).unwrap_or(usize::MAX)
     }
 
     /// Return the composer text input state.
@@ -1697,7 +1698,7 @@ impl BmuxApp {
     }
 
     /// Return the composer buffer mutably.
-    pub const fn composer_mut(&mut self) -> &mut TextEditBuffer {
+    pub fn composer_mut(&mut self) -> &mut TextEditBuffer {
         self.composer.buffer_mut()
     }
 

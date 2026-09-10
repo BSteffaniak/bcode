@@ -65,11 +65,17 @@ pub fn render_palette(
         |cx| component.paint(&layout, cx),
     );
     let panel = &layout.children[0];
-    let list = panel.node.children.last().expect("list child");
+    let list = panel
+        .node
+        .children
+        .iter()
+        .find(|child| child.node.id.as_str() == "slash.chrome.list")
+        .expect("list child");
     let inner = Rect::new(
-        area.x + panel.x + list.x,
+        area.x
+            .saturating_add(u16::try_from(panel.x.saturating_add(list.x)).unwrap_or(u16::MAX)),
         area.y + u16::try_from(panel.y + list.y).unwrap_or(u16::MAX),
-        list.node.size.width,
+        u16::try_from(list.node.size.width).unwrap_or(u16::MAX),
         u16::try_from(list.node.size.height).unwrap_or(u16::MAX),
     );
     if inner.is_empty() {

@@ -75,7 +75,7 @@ impl ThemePickerState {
 
     /// Return the current list offset for hit testing.
     #[must_use]
-    pub const fn list_offset(&self) -> usize {
+    pub fn list_offset(&self) -> usize {
         self.list.offset()
     }
 

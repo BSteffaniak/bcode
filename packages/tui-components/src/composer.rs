@@ -55,7 +55,8 @@ impl Component for ComposerPanel<'_> {
             LocalRect::new(
                 1,
                 0,
-                title_width.min(layout.size.width.saturating_sub(2)),
+                title_width
+                    .min(u16::try_from(layout.size.width.saturating_sub(2)).unwrap_or(u16::MAX)),
                 1,
             ),
             &title,
