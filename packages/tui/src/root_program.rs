@@ -4280,6 +4280,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_cursor_frames_preserve_foreground_composition() {
+        use bmux_tui_runtime::Presenter;
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut partial = root_test_model();
+        let mut full = root_test_model();
+        for model in [&mut partial, &mut full] {
+            model.loop_state.open_session_picker(&mut model.chat);
+        }
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+        super::BcodeRuntimePresenter::new(&mut partial_terminal)
+            .present(&mut partial)
+            .expect("initial picker");
+        super::BcodeRuntimePresenter::new(&mut full_terminal)
+            .present(&mut full)
+            .expect("initial reference picker");
+        let picker_cursor = partial_terminal.cursor();
+        for tick in 1..=4 {
+            let now = std::time::Instant::now() + std::time::Duration::from_secs(tick);
+            for model in [&mut partial, &mut full] {
+                let key = model
+                    .chat
+                    .app
+                    .invalidation_requests(now, std::time::SystemTime::now())
+                    .into_iter()
+                    .next()
+                    .expect("cursor timer")
+                    .key;
+                model.chat.app.handle_invalidations(&[key], now);
+            }
+            partial.presentation_damage = partial.select_presentation_damage(
+                super::super::invalidation::UiInvalidation::Paint,
+                &[super::super::app::TemporalDamage::Composer],
+            );
+            partial.fast_temporal_presentation = true;
+            full.presentation_damage = bmux_tui::damage::Damage::Full;
+            super::BcodeRuntimePresenter::new(&mut partial_terminal)
+                .present(&mut partial)
+                .expect("partial picker");
+            super::BcodeRuntimePresenter::new(&mut full_terminal)
+                .present(&mut full)
+                .expect("full picker");
+            assert_eq!(
+                partial_terminal.retained_buffer(),
+                full_terminal.retained_buffer()
+            );
+            assert_eq!(partial_terminal.cursor(), picker_cursor);
+            assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+            assert_eq!(partial_terminal.semantics(), full_terminal.semantics());
+            assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
+        }
+        drop((partial, full));
+    }
+
+    #[tokio::test]
     async fn cursor_partial_presentation_matches_full_production_presenter() {
         use bmux_tui_runtime::Presenter;
 

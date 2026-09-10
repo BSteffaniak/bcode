@@ -1498,6 +1498,16 @@ impl ChatLoopState {
         })
     }
 
+    /// Whether a full-screen foreground owns the canvas instead of chat.
+    const fn foreground_owns_canvas(&self) -> bool {
+        self.session_picker.is_some()
+            || self.plugin_surface.is_some()
+            || self.provider_picker.is_some()
+            || self.model_picker.is_some()
+            || self.auth_pool_picker.is_some()
+            || self.skill_picker.is_some()
+    }
+
     pub const fn has_session_picker(&self) -> bool {
         self.session_picker.is_some()
     }
@@ -4467,8 +4477,33 @@ pub fn draw_chat_frame<W: Write>(
                 .iter()
                 .any(|region| !area.intersection(*region).is_empty())
     };
+    let geometry = loop_state.interactive_surface.as_ref().map(|_| {
+        if pinned {
+            InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Pinned,
+                logical_height: interaction_rows.unwrap_or(surface_area.height),
+                visible_logical_offset: pinned_offset,
+                destination: surface_area,
+            }
+        } else if let Some(placement) = inline_placement {
+            InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Transcript,
+                logical_height: placement.full_area.height,
+                visible_logical_offset: placement.visible_content_offset,
+                destination: placement.destination,
+            }
+        } else {
+            InteractiveSurfaceGeometry {
+                placement: InteractiveSurfacePlacement::Transcript,
+                logical_height: interaction_rows.unwrap_or(0),
+                visible_logical_offset: 0,
+                destination: surface_area,
+            }
+        }
+    });
+    let foreground_owns_canvas = loop_state.foreground_owns_canvas();
     let draw_stats = terminal.draw_damage(damage, |frame| {
-        if let Some(layout) = layout {
+        if let Some(layout) = layout.filter(|_| !foreground_owns_canvas) {
             render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
             let selection_scene =
                 super::root_program::transcript_selection_scene(&chat.app, layout.body());
@@ -4491,7 +4526,7 @@ pub fn draw_chat_frame<W: Write>(
                 frame,
             );
         }
-        if layout.is_some_and(|layout| intersects(layout.body)) {
+        if !foreground_owns_canvas && layout.is_some_and(|layout| intersects(layout.body)) {
             for region in &rich_presentation.rich {
                 let Some(visible_rect) = region.visible_rect else {
                     continue;
@@ -4533,125 +4568,12 @@ pub fn draw_chat_frame<W: Write>(
                 }
             }
         }
-        if let Some(slash_palette) = &loop_state.slash_palette {
-            slash_palette_render::render_palette(
-                slash_palette,
-                chat.app.composer_content_area(),
-                frame,
-                theme,
-            );
-        }
-        if let Some(palette) = &mut loop_state.palette {
-            command_palette_render::render_palette(palette, frame, theme);
-        }
-        if let Some(configurator) = &mut loop_state.streaming_configurator {
-            let geometry = super::streaming_configurator_render::streaming_configurator_geometry(
-                configurator,
-                Rect::new(0, 0, frame.area().width, frame.area().height),
-                theme,
-            );
-            configurator.commit_geometry(geometry);
-            super::streaming_configurator_render::render_streaming_configurator(
-                configurator,
-                frame,
-                theme,
-            );
-        }
-        if let Some(picker) = &mut loop_state.theme_picker {
-            super::theme_picker_render::render_theme_picker(picker, frame, theme);
-        }
-        if let Some(dialog) = &loop_state.permission_dialog {
-            permission_dialog_render::render_permission_dialog(dialog, frame, theme);
-        }
-        if let Some(dialog) = &loop_state.thinking_dialog {
-            thinking_dialog_render::render_thinking_dialog(dialog, frame, theme);
-        }
-        if let Some(dialog) = &mut loop_state.timeline_dialog {
-            timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
-        }
-        if let Some(surface) = &mut loop_state.interactive_surface
-            && !surface_area.is_empty()
-        {
-            if pinned {
-                frame.fill(
-                    bmux_tui::paint::LocalRect::terminal(surface_area),
-                    " ",
-                    bmux_tui::prelude::Style::new(),
-                );
-                surface.render_slice(
-                    interaction_rows.unwrap_or(surface_area.height),
-                    pinned_offset,
-                    surface_area,
-                    frame,
-                );
-            } else if let Some(placement) = inline_placement {
-                surface.render_slice(
-                    placement.full_area.height,
-                    placement.visible_content_offset,
-                    placement.destination,
-                    frame,
-                );
-            }
-        }
-        if let Some(picker) = &mut loop_state.session_picker {
-            super::session_picker_render::render_picker(picker, frame, theme);
-        }
-        if let Some(surface) = &mut loop_state.plugin_surface {
-            let area = Rect::new(0, 0, frame.area().width, frame.area().height);
-            let plugin_theme = render::plugin_theme_for_app(&chat.app);
-            surface
-                .surface
-                .render_with_theme(area, frame, Some(&plugin_theme));
-        }
-        if let Some(picker) = &mut loop_state.provider_picker {
-            super::provider_picker_render::render_provider_picker(picker, frame, theme);
-        }
-        if let Some(model) = &mut loop_state.model_picker {
-            super::model_picker_render::render_model_picker(&mut model.picker, frame, theme);
-        }
-        if let Some(picker) = &mut loop_state.auth_pool_picker {
-            super::auth_pool_picker_render::render_auth_pool_picker(picker, frame, theme);
-        }
-        if let Some(picker) = &mut loop_state.skill_picker {
-            super::skill_picker_render::render_skill_picker(picker, frame, theme);
-        }
-        if let Some(dialog) = &mut loop_state.ralph_start_dialog {
-            super::ralph_start_dialog_render::render_dialog(dialog, frame, theme);
-        }
-        if let Some(dialog) = &mut loop_state.working_directory_dialog {
-            super::working_directory_dialog_render::render_dialog(dialog, frame, theme);
-        }
-        if let Some(dialog) = &mut loop_state.worktree_create_dialog {
-            super::wt_create_dialog_render::render_dialog(dialog, frame, theme);
-        }
+        paint_foreground(chat, loop_state, geometry, frame);
         if let Some(snapshot) = transcript_selection.snapshot(frame.selection()) {
             frame.paint_selection(&snapshot, theme.selection);
         }
     })?;
-    loop_state.interactive_surface_geometry = loop_state.interactive_surface.as_ref().map(|_| {
-        if pinned {
-            InteractiveSurfaceGeometry {
-                placement: InteractiveSurfacePlacement::Pinned,
-                logical_height: interaction_rows.unwrap_or(surface_area.height),
-                visible_logical_offset: pinned_offset,
-                destination: surface_area,
-            }
-        } else if let Some(placement) = inline_placement {
-            InteractiveSurfaceGeometry {
-                placement: InteractiveSurfacePlacement::Transcript,
-                logical_height: placement.full_area.height,
-                visible_logical_offset: placement.visible_content_offset,
-                destination: placement.destination,
-            }
-        } else {
-            InteractiveSurfaceGeometry {
-                placement: InteractiveSurfacePlacement::Transcript,
-                logical_height: interaction_rows.unwrap_or(0),
-                visible_logical_offset: 0,
-                destination: surface_area,
-            }
-        }
-    });
+    loop_state.interactive_surface_geometry = geometry;
     loop_state.telemetry.record_histogram(
         "tui.frame.changed_cells",
         u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),
@@ -4709,6 +4631,122 @@ pub fn draw_chat_frame<W: Write>(
     Ok((draw_stats, layout))
 }
 
+/// Compose every foreground surface in the same order for full and temporal frames.
+/// Preparation may be skipped; composition must never be skipped.
+fn paint_chat_overlays(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    geometry: Option<InteractiveSurfaceGeometry>,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+) {
+    let theme = render::TuiTheme::for_app(&chat.app);
+    if let Some(slash_palette) = &loop_state.slash_palette {
+        slash_palette_render::render_palette(
+            slash_palette,
+            chat.app.composer_content_area(),
+            frame,
+            theme,
+        );
+    }
+    if let Some(palette) = &mut loop_state.palette {
+        command_palette_render::render_palette(palette, frame, theme);
+    }
+    if let Some(configurator) = &mut loop_state.streaming_configurator {
+        let geometry = super::streaming_configurator_render::streaming_configurator_geometry(
+            configurator,
+            Rect::new(0, 0, frame.area().width, frame.area().height),
+            theme,
+        );
+        configurator.commit_geometry(geometry);
+        super::streaming_configurator_render::render_streaming_configurator(
+            configurator,
+            frame,
+            theme,
+        );
+    }
+    if let Some(picker) = &mut loop_state.theme_picker {
+        super::theme_picker_render::render_theme_picker(picker, frame, theme);
+    }
+    if let Some(dialog) = &loop_state.permission_dialog {
+        permission_dialog_render::render_permission_dialog(dialog, frame, theme);
+    }
+    if let Some(dialog) = &loop_state.thinking_dialog {
+        thinking_dialog_render::render_thinking_dialog(dialog, frame, theme);
+    }
+    if let Some(dialog) = &mut loop_state.timeline_dialog {
+        timeline_dialog_render::render_timeline_dialog(dialog, frame, theme);
+    }
+    paint_interactive_surface(loop_state, geometry, frame);
+}
+
+fn paint_foreground(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    geometry: Option<InteractiveSurfaceGeometry>,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+) {
+    if !loop_state.foreground_owns_canvas() {
+        paint_chat_overlays(chat, loop_state, geometry, frame);
+    }
+    let theme = render::TuiTheme::for_app(&chat.app);
+    if let Some(picker) = &mut loop_state.session_picker {
+        super::session_picker_render::render_picker(picker, frame, theme);
+    }
+    if let Some(surface) = &mut loop_state.plugin_surface {
+        let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+        let plugin_theme = render::plugin_theme_for_app(&chat.app);
+        surface
+            .surface
+            .render_with_theme(area, frame, Some(&plugin_theme));
+    }
+    if let Some(picker) = &mut loop_state.provider_picker {
+        super::provider_picker_render::render_provider_picker(picker, frame, theme);
+    }
+    if let Some(model) = &mut loop_state.model_picker {
+        super::model_picker_render::render_model_picker(&mut model.picker, frame, theme);
+    }
+    if let Some(picker) = &mut loop_state.auth_pool_picker {
+        super::auth_pool_picker_render::render_auth_pool_picker(picker, frame, theme);
+    }
+    if let Some(picker) = &mut loop_state.skill_picker {
+        super::skill_picker_render::render_skill_picker(picker, frame, theme);
+    }
+    if let Some(dialog) = &mut loop_state.ralph_start_dialog {
+        super::ralph_start_dialog_render::render_dialog(dialog, frame, theme);
+    }
+    if let Some(dialog) = &mut loop_state.working_directory_dialog {
+        super::working_directory_dialog_render::render_dialog(dialog, frame, theme);
+    }
+    if let Some(dialog) = &mut loop_state.worktree_create_dialog {
+        super::wt_create_dialog_render::render_dialog(dialog, frame, theme);
+    }
+}
+
+fn paint_interactive_surface(
+    loop_state: &mut ChatLoopState,
+    geometry: Option<InteractiveSurfaceGeometry>,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+) {
+    if let Some(surface) = &mut loop_state.interactive_surface
+        && let Some(geometry) = geometry
+        && !geometry.destination.is_empty()
+    {
+        if geometry.placement == InteractiveSurfacePlacement::Pinned {
+            frame.fill(
+                bmux_tui::paint::LocalRect::terminal(geometry.destination),
+                " ",
+                bmux_tui::prelude::Style::new(),
+            );
+        }
+        surface.render_slice(
+            geometry.logical_height,
+            geometry.visible_logical_offset,
+            geometry.destination,
+            frame,
+        );
+    }
+}
+
 fn draw_temporal_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
     chat: &mut ActiveChat,
@@ -4726,26 +4764,15 @@ fn draw_temporal_frame<W: Write>(
     };
     let draw_started = Instant::now();
     let draw_stats = terminal.draw_damage(damage, |frame| {
-        render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
-        if let Some(surface) = &mut loop_state.interactive_surface
-            && let Some(geometry) = loop_state.interactive_surface_geometry
-            && !geometry.destination.is_empty()
-            && intersects(geometry.destination)
-        {
-            if geometry.placement == InteractiveSurfacePlacement::Pinned {
-                frame.fill(
-                    bmux_tui::paint::LocalRect::terminal(geometry.destination),
-                    " ",
-                    bmux_tui::prelude::Style::new(),
-                );
-            }
-            surface.render_slice(
-                geometry.logical_height,
-                geometry.visible_logical_offset,
-                geometry.destination,
-                frame,
-            );
+        if !loop_state.foreground_owns_canvas() {
+            render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
         }
+        paint_foreground(
+            chat,
+            loop_state,
+            loop_state.interactive_surface_geometry,
+            frame,
+        );
     })?;
     record_frame_telemetry(
         loop_state,

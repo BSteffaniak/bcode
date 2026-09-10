@@ -1,5 +1,17 @@
 # Renderer Architecture
 
+## TUI foreground composition
+
+Full and temporal frames share `chat_loop::paint_foreground`. Temporal preparation may
+reuse committed chat and interactive-surface geometry, but must not bypass foreground
+composition. Full-screen foregrounds suppress covered chat painting and its cursor,
+hit, selection, image, and semantic contributions. Partial-screen surfaces continue to
+compose over chat. Structural changes use the normal preparation path.
+
+The retained-terminal regression in `root_program` compares repeated sessions-picker
+cursor updates with full presentation, including cursor, semantic regions, and images.
+This boundary does not yet centralize modal input routing or partial-surface occlusion.
+
 Bcode's target renderer architecture uses a shared semantic session-view layer rather than session event logs or another renderer's UI state.
 
 Reasoning content remains shared semantic state, while visibility, readable-representation selection (`all`, `summary`, or `raw`), disclosure, labels, and styling are frontend presentation policy. `SessionView` accepts a renderer/client-selected policy so each attached frontend can derive its own bounded projection; the policy never changes provider requests or durable history.
