@@ -59,12 +59,7 @@ workdirs=()
 cleanup() {
   for workdir in "${workdirs[@]}"; do
     if [[ -x "${bcode}" ]]; then
-      BCODE_CONFIG="${workdir}/config.toml" \
-        BCODE_STATE_DIR="${workdir}/state" \
-        TMPDIR="${workdir}/tmp" \
-        BCODE_SOCKET="${workdir}/bcode.sock" \
-        BCODE_DAEMON_LOG="${workdir}/daemon.log" \
-        "${bcode}" server stop --force >/dev/null 2>&1 || true
+      run_bcode "${workdir}" "${bcode}" server stop --force --yes >/dev/null 2>&1 || true
     fi
   done
   rm -rf "${suite_work_root}"
@@ -131,8 +126,12 @@ EOF
 run_bcode() {
   local workdir="$1"
   shift
-  BCODE_CONFIG="${workdir}/config.toml" \
+  env -u BCODE_IPC_ENDPOINT -u BCODE_IPC_ENDPOINT_NAMESPACE \
+    -u BCODE_CONFIG_TOML -u BCODE_DAEMON_READY_STDOUT \
+    BCODE_CONFIG="${workdir}/config.toml" \
     BCODE_STATE_DIR="${workdir}/state" \
+    BCODE_SESSION_STORE_DIR="${workdir}/state/sessions" \
+    XDG_CONFIG_HOME="${workdir}/config" \
     TMPDIR="${workdir}/tmp" \
     BCODE_SOCKET="${workdir}/bcode.sock" \
     BCODE_DAEMON_LOG="${workdir}/daemon.log" \
@@ -187,17 +186,17 @@ for ((iteration = 0; iteration < samples; iteration++)); do
   printf '%s\n' "$(((finished_ns - started_ns) / 1000))" >>"${output_dir}/process-baseline.samples"
 done
 summarize process-baseline "bcode --version"
-run_bcode "${warm_workdir}" "${bcode}" server stop --force >/dev/null
+run_bcode "${warm_workdir}" "${bcode}" server stop --force --yes >/dev/null
 
 cache_workdir="$(new_environment)"
 workdirs+=("${cache_workdir}")
 run_bcode "${cache_workdir}" "${probe}" server startup-probe >/dev/null
 cp "${cache_workdir}/daemon.log" "${output_dir}/first-startup-trace.log"
-run_bcode "${cache_workdir}" "${bcode}" server stop --force >/dev/null
+run_bcode "${cache_workdir}" "${bcode}" server stop --force --yes >/dev/null
 : >"${output_dir}/cached-cold.samples"
 for ((iteration = 0; iteration < samples; iteration++)); do
   run_bcode "${cache_workdir}" "${probe}" server startup-probe >>"${output_dir}/cached-cold.samples"
-  run_bcode "${cache_workdir}" "${bcode}" server stop --force >/dev/null
+  run_bcode "${cache_workdir}" "${bcode}" server stop --force --yes >/dev/null
 done
 summarize cached-cold "bcode server startup-probe" 500000
 
@@ -206,7 +205,7 @@ for ((iteration = 0; iteration < samples; iteration++)); do
   first_workdir="$(new_environment)"
   workdirs+=("${first_workdir}")
   run_bcode "${first_workdir}" "${probe}" server startup-probe >>"${output_dir}/first-cold.samples"
-  run_bcode "${first_workdir}" "${bcode}" server stop --force >/dev/null
+  run_bcode "${first_workdir}" "${bcode}" server stop --force --yes >/dev/null
   rm -rf "${first_workdir}"
 done
 summarize first-cold "bcode server startup-probe"
@@ -225,7 +224,7 @@ for mode in "${startup_modes[@]}"; do
     workdirs+=("${mode_workdir}")
     run_bcode "${mode_workdir}" "${probe}" server startup-probe >>"${output_dir}/${mode}-cold.samples"
     run_bcode "${mode_workdir}" "${bcode}" server metrics --json >"${output_dir}/${mode}-${iteration}-metrics.json"
-    run_bcode "${mode_workdir}" "${bcode}" server stop --force >/dev/null
+    run_bcode "${mode_workdir}" "${bcode}" server stop --force --yes >/dev/null
     rm -rf "${mode_workdir}"
   done
   summarize "${mode}-cold" "bcode server startup-probe"
@@ -248,6 +247,6 @@ printf '%s\n' "$(((concurrent_finished_ns - concurrent_started_ns) / 1000))" >"$
 summarize concurrent-cold "${concurrent_clients} concurrent bcode server startup-probe"
 run_bcode "${concurrent_workdir}" "${bcode}" server status --verbose >"${output_dir}/concurrent-status.txt"
 cp "${concurrent_workdir}/daemon.log" "${output_dir}/concurrent-startup-trace.log"
-run_bcode "${concurrent_workdir}" "${bcode}" server stop --force >/dev/null
+run_bcode "${concurrent_workdir}" "${bcode}" server stop --force --yes >/dev/null
 
 printf 'daemon startup performance reports: %s\n' "${output_dir}"

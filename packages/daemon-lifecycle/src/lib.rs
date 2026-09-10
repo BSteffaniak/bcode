@@ -2201,6 +2201,18 @@ fn config_home_for_daemon(config_dir: &Path) -> PathBuf {
 /// Returns an error when stale-record cleanup fails, spawning the daemon fails,
 /// or the daemon does not pass bounded readiness checks.
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
+    use tracing::Instrument as _;
+
+    let startup_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let launcher_pid = std::process::id();
+    let span = tracing::debug_span!(
+        target: "bcode_daemon_lifecycle::startup",
+        "daemon_acquisition",
+        startup_id,
+        launcher_pid
+    );
     ensure_daemon_running_with_start(options, |options, startup_lock| {
         let inherited_startup_lock = startup_lock.file.try_clone();
         let endpoint = options.endpoint.clone();
@@ -2209,10 +2221,12 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             if let Some(parent) = log_path.parent() {
                 fs::create_dir_all(parent)?;
             }
+            // Truncate before opening append-only handles: parent tracing and child
+            // stderr share this path, so positional writes would overwrite trace records.
+            fs::File::create(&log_path)?;
             let mut log_file = fs::OpenOptions::new()
                 .create(true)
-                .write(true)
-                .truncate(true)
+                .append(true)
                 .open(&log_path)?;
             writeln!(log_file, "--- bcode daemon start ---")?;
             let stderr_log = log_file.try_clone()?;
@@ -2272,6 +2286,10 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
                 .env("BCODE_DAEMON_LOG", &log_path)
                 .env("BCODE_DAEMON_READY_STDOUT", "v1")
+                .env(
+                    "BCODE_STARTUP_CORRELATION",
+                    format!("{launcher_pid}-{startup_id}"),
+                )
                 // The daemon remains detached on cancellation. On Unix its inherited
                 // startup lock fences later launchers even before endpoint publication.
                 .kill_on_drop(false)
@@ -2290,6 +2308,7 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             wait_for_child_notification(&endpoint, &mut child, &log_path).await
         }
     })
+    .instrument(span)
     .await
 }
 

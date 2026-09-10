@@ -4036,7 +4036,27 @@ pub async fn run_with_static_bundled(
     endpoint: IpcEndpoint,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> Result<(), ServerError> {
-    run_with_static_bundled_inner(endpoint, static_plugins, true).await
+    use tracing::Instrument as _;
+
+    // The launch identifier is diagnostic only, never routing or ownership evidence.
+    let correlation = std::env::var("BCODE_STARTUP_CORRELATION")
+        .ok()
+        .filter(|value| {
+            value.len() <= 64
+                && !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        });
+    let span = tracing::debug_span!(
+        target: "bcode_server::startup",
+        "daemon_process",
+        startup_correlation = correlation.as_deref().unwrap_or("standalone"),
+        daemon_pid = std::process::id()
+    );
+    run_with_static_bundled_inner(endpoint, static_plugins, true)
+        .instrument(span)
+        .await
 }
 
 /// Run an embedded server without publishing a daemon lifecycle record.

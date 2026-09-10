@@ -26,6 +26,26 @@ handshake; concurrent waiters and explicit in-process startup still probe. The
 server still waits for application initialization before accepting clients. These
 traces do not yet provide cross-process trace correlation or capability readiness.
 
+## September 10 diagnostic sample
+
+A three-sample release run with 16 concurrent clients, after correcting the
+harness's forced-stop confirmation and inherited session/config environment,
+measured warm handshake p95 **0.920 ms**, cached cold p95 **354.753 ms**, first cold
+p95 **1,246.456 ms**, and concurrent cold wall time **1,308.538 ms**. This is a small
+diagnostic sample, not a statistically established regression baseline or evidence
+that the reported five-second interactive delay is resolved. It predates the
+append-only log and launch-correlation changes in this update.
+
+The first-start trace attributes about 71 ms to server initialization, compared
+with about 980 ms from spawn to readiness notification. Most of that sample's
+post-spawn delay therefore precedes the server initialization timer; moving
+capability initialization alone would not explain or remove it. Process-entry,
+loader, and CLI initialization timing remain to be separated.
+
+The harness now explicitly isolates the session root and config directory and
+removes inherited endpoint and inline-config overrides. Earlier runs with those
+overrides inherited must not be used as isolated measurements.
+
 ## Environment
 
 * Host: macOS Darwin 25.5.0, Apple arm64.
