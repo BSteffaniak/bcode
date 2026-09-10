@@ -886,7 +886,117 @@ where
     )
 }
 
+async fn repair_cli_workflow_attempt<A: bcode_workflow::WorkflowRunApplication>(
+    application: &A,
+    dispatch_identity: &str,
+    path: &Path,
+) -> Result<(), CliError>
+where
+    CliError: From<A::Error>,
+{
+    let resolution: bcode_workflow::RepairResolution =
+        serde_json::from_value(read_bounded_json(path)?).map_err(|_| {
+            CliError::InvalidArguments("invalid workflow repair resolution".to_owned())
+        })?;
+    print_json(
+        &application
+            .repair_workflow_attempt(dispatch_identity.to_owned(), resolution)
+            .await?,
+    )
+}
+
+async fn watch_cli_workflows() -> Result<(), CliError> {
+    use bcode_workflow::{
+        WorkflowRunObservationApplication, WorkflowRunSubscription, WorkflowRunWatchEvent,
+    };
+    let mut watcher =
+        WorkflowRunObservationApplication::watch_workflow_runs(&BcodeClient::default_endpoint())
+            .await?;
+    // Install the handler before readiness is visible to a supervising process.
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    print_json_line(&serde_json::json!({"type":"subscribed"}))?;
+    loop {
+        #[cfg(unix)]
+        let interrupted = async {
+            interrupt.recv().await;
+            Ok::<(), std::io::Error>(())
+        };
+        #[cfg(not(unix))]
+        let interrupted = tokio::signal::ctrl_c();
+        let event = tokio::select! {
+            result = WorkflowRunSubscription::next_event(&mut watcher) => result?,
+            signal = interrupted => { signal?; return Ok(()); }
+        };
+        match event {
+            WorkflowRunWatchEvent::Changed(event) => {
+                print_json_line(&serde_json::json!({"type":"workflow_changed", "event":event}))?;
+            }
+            WorkflowRunWatchEvent::ResyncRequired => {
+                print_json_line(&serde_json::json!({"type":"resync_required"}))?;
+                return Ok(());
+            }
+            WorkflowRunWatchEvent::UnsupportedVersion { version } => {
+                print_json_line(
+                    &serde_json::json!({"type":"unsupported_version", "version":version}),
+                )?;
+                return Err(CliError::InvalidArguments("unsupported workflow notification version; replace the view with a fresh snapshot".to_string()));
+            }
+        }
+    }
+}
+
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
+    if let WorkflowCommand::LaunchCatalog { request } = command.as_ref() {
+        let request: bcode_workflow::WorkflowLaunchCatalogRequest =
+            serde_json::from_value(read_bounded_json(request)?).map_err(|_| {
+                CliError::InvalidArguments("invalid workflow launch catalog request".to_string())
+            })?;
+        request
+            .validate()
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+        return print_json(
+            &Box::pin(
+                bcode_workflow::WorkflowAuthoringApplication::workflow_launch_catalog(
+                    &BcodeClient::default_endpoint(),
+                    request,
+                ),
+            )
+            .await?,
+        );
+    }
+    if matches!(command.as_ref(), WorkflowCommand::Watch) {
+        return Box::pin(watch_cli_workflows()).await;
+    }
+    if let WorkflowCommand::CatchUp {
+        after_sequence,
+        limit,
+    } = command.as_ref()
+    {
+        return print_json(
+            &Box::pin(
+                bcode_workflow::WorkflowRunApplication::workflow_live_event_catch_up(
+                    &BcodeClient::default_endpoint(),
+                    *after_sequence,
+                    usize::from(*limit),
+                ),
+            )
+            .await?,
+        );
+    }
+    if let WorkflowCommand::RepairAttempt {
+        dispatch_identity,
+        resolution,
+        yes: _,
+    } = command.as_ref()
+    {
+        return Box::pin(repair_cli_workflow_attempt(
+            &BcodeClient::default_endpoint(),
+            dispatch_identity,
+            resolution,
+        ))
+        .await;
+    }
     if let WorkflowCommand::AssociatedRun {
         owner_plugin_id,
         workflow_kind,
@@ -978,7 +1088,15 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
             limit,
         } => {
             print_json(
-                &Box::pin(client.workflow_event_history(run_id, after_sequence, limit)).await?,
+                &Box::pin(
+                    bcode_workflow::WorkflowRunApplication::workflow_event_history(
+                        &client,
+                        run_id,
+                        after_sequence,
+                        limit,
+                    ),
+                )
+                .await?,
             )?;
         }
         WorkflowCommand::Attempts {
@@ -989,7 +1107,7 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         } => {
             let cursor = match (after_prepared_at_ms, after_dispatch_identity) {
                 (Some(prepared_at_ms), Some(dispatch_identity)) => {
-                    Some(bcode_workflow_store::AttemptCursor {
+                    Some(bcode_workflow::AttemptCursor {
                         prepared_at_ms,
                         dispatch_identity,
                     })
@@ -1002,9 +1120,10 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 }
             };
             print_json(
-                &client
-                    .workflow_attempt_history(run_id, cursor, limit)
-                    .await?,
+                &bcode_workflow::WorkflowRunApplication::workflow_attempt_history(
+                    &client, run_id, cursor, limit,
+                )
+                .await?,
             )?;
         }
         WorkflowCommand::Definitions { limit } => {
@@ -1031,7 +1150,11 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 .await?,
             )?;
         }
-        WorkflowCommand::AssociatedRun { .. }
+        WorkflowCommand::LaunchCatalog { .. }
+        | WorkflowCommand::Watch
+        | WorkflowCommand::CatchUp { .. }
+        | WorkflowCommand::RepairAttempt { .. }
+        | WorkflowCommand::AssociatedRun { .. }
         | WorkflowCommand::PackagePublication { .. }
         | WorkflowCommand::LaunchDetail { .. } => {
             unreachable!("handled before dispatch")
@@ -3887,6 +4010,33 @@ enum WorkflowCommand {
         /// Bounded JSON `WorkflowRunGraphEditBatch`, including run, revision, and mutation identity.
         #[arg(long)]
         file: PathBuf,
+    },
+    /// Query a bounded launch catalog page with domain-owned cursors and filters as JSON.
+    LaunchCatalog {
+        /// `WorkflowLaunchCatalogRequest` JSON file, or - for stdin.
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Stream workflow change notifications as JSON Lines (no initial snapshot or durable resume).
+    /// Ctrl-C ends observation without cancelling runs; resync ends the stream for snapshot replacement.
+    Watch,
+    /// Read bounded live-notification gap catch-up as JSON, not durable resume.
+    /// If `resync_required` is true, replace the view from a fresh snapshot.
+    CatchUp {
+        #[arg(long)]
+        after_sequence: u64,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    /// Explicitly resolve an ambiguous attempt without dispatching a retry.
+    RepairAttempt {
+        dispatch_identity: String,
+        /// Tagged `RepairResolution` JSON file, or - for stdin.
+        #[arg(long)]
+        resolution: PathBuf,
+        /// Confirm this explicit maintenance mutation.
+        #[arg(long, required = true)]
+        yes: bool,
     },
     /// Look up, inspect, or control the newest run for an exact binding key as JSON.
     AssociatedRun {

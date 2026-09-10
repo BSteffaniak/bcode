@@ -61994,12 +61994,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
     /// stayed `running` with no failure, retry, or repair signal. A mutating attempt must now be
     /// surfaced as `repair_required` instead.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn undecodable_receipt_contract_marks_a_mutating_attempt_repair_required() {
-        // This test drives real workflow reconciliation, so it serializes against the other
-        // workflow-runtime tests.
         let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
-        let sessions = SessionManager::default();
+        for current_owner in [None, Some(true), Some(false)] {
+            assert_ambiguous_attempt_repair_authority(current_owner).await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_ambiguous_attempt_repair_authority(current_owner: Option<bool>) {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions =
+            SessionManager::persistent(session_root.path()).expect("persistent sessions");
         let parent = sessions
             .create_session(Some("parent".to_string()), PathBuf::from("."))
             .await
@@ -62024,7 +62030,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("terminal");
-        let state = test_server_state(sessions);
+        let state = std::sync::Arc::new(test_server_state(sessions));
         let store_path = {
             let mut store = state
                 .workflow_store
@@ -62045,6 +62051,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
             store
                 .persist_definition("undecodable", 1, &definition)
                 .expect("definition");
+            let execution_authority =
+                current_owner.map(
+                    |is_current| bcode_workflow_store::WorkflowExecutionAuthority {
+                        target_artifact_id: state.daemon_status.build_fingerprint.clone(),
+                        daemon_instance_id: if is_current {
+                            state.daemon_status.instance_id.clone()
+                        } else {
+                            "unverifiable-foreign-owner".to_string()
+                        },
+                        generation: 1,
+                        fencing_token: uuid::Uuid::new_v4().to_string(),
+                    },
+                );
             store
                 .create_run(&bcode_workflow_store::NewWorkflowRun {
                     run_id: "undecodable-run".to_string(),
@@ -62056,7 +62075,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
-                    execution_authority: None,
+                    execution_authority,
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -62126,6 +62145,80 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .status,
             bcode_workflow_store::RunStatus::RepairRequired,
             "the run must not remain active"
+        );
+        let identity = &summary.repair_required[0];
+        let authority_before = store.execution_authority("undecodable-run").unwrap();
+        state
+            .sessions
+            .release_session_ownership(parent.id)
+            .await
+            .expect("release local lease");
+        let foreign_lease = (current_owner == Some(false)).then(|| {
+            bcode_session::lease::acquire_session_lease(
+                session_root.path(),
+                parent.id,
+                &SessionLeaseOwnerContext {
+                    daemon_instance_id: Some("unverifiable-foreign-owner".to_string()),
+                    ..SessionLeaseOwnerContext::default()
+                },
+            )
+            .expect("foreign live lease")
+        });
+        if foreign_lease.is_some() {
+            let observations =
+                bcode_session::lease::session_owner_observations(session_root.path(), parent.id)
+                    .unwrap();
+            assert!(observations.iter().any(|observation| {
+                observation.owner.daemon_instance_id.as_deref()
+                    == Some("unverifiable-foreign-owner")
+                    && observation.liveness == bcode_session::lease::SessionOwnerLiveness::Live
+            }));
+        }
+        let outcome = workflow_operations::repair_attempt(
+            &state,
+            identity,
+            &bcode_workflow::RepairResolution::ConfirmFailed {
+                message: "operator confirmed failure".to_string(),
+            },
+        )
+        .await;
+        drop(foreign_lease);
+        drop(state);
+        assert_eq!(
+            store.execution_authority("undecodable-run").unwrap(),
+            authority_before
+        );
+        let (attempt_status, run_status) = if current_owner == Some(true) {
+            let repaired = outcome.expect("current owner can repair");
+            assert_eq!(repaired.dispatch_identity, *identity);
+            assert_eq!(repaired.attempt_status, "failed");
+            assert_eq!(repaired.run_status, bcode_workflow_store::RunStatus::Paused);
+            ("failed", bcode_workflow_store::RunStatus::Paused)
+        } else {
+            let error = outcome.expect_err("missing or unverifiable authority must reject repair");
+            if current_owner.is_none() {
+                assert!(error.to_string().contains("durable execution authority"));
+            } else {
+                assert!(matches!(
+                    error,
+                    ServerError::WorkflowOwnedByLiveDaemon { .. }
+                ));
+            }
+            (
+                "repair_required",
+                bcode_workflow_store::RunStatus::RepairRequired,
+            )
+        };
+        let attempts = store.attempt_history("undecodable-run", None, 10).unwrap();
+        assert_eq!(attempts.len(), 1, "repair must not admit a retry");
+        assert_eq!(attempts[0].status, attempt_status);
+        assert_eq!(
+            store
+                .run_summary("undecodable-run")
+                .unwrap()
+                .unwrap()
+                .status,
+            run_status
         );
     }
 

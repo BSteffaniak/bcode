@@ -1398,6 +1398,7 @@ dependencies = [
  "bcode_shell_plugin",
  "bcode_tool",
  "bcode_workflow",
+ "bcode_workflow_store",
  "futures 0.3.34",
  "jsonschema",
  "mimalloc",

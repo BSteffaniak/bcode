@@ -146,138 +146,271 @@ struct SourcePackageMember {
 
 /// Discover bounded package and standalone workflow sources using the configured root policy.
 ///
+/// Returns an error when a candidate window would be truncated; callers must not interpret a
+/// partial discovery window as a complete catalog.
+///
 /// Equal-precedence package identities are removed and surfaced as ambiguity diagnostics. Package
 /// member files are suppressed from standalone results.
 ///
 /// # Errors
 ///
 /// Returns an error when the workspace cannot be canonicalized or request bounds are invalid.
-#[allow(clippy::too_many_lines)]
 pub fn discover_workflows(
     workspace: &Path,
     config: &bcode_config::WorkflowsConfig,
     limit: usize,
 ) -> Result<WorkflowDiscoveryResult, WorkflowDiscoveryError> {
-    if limit == 0 || limit > MAX_DISCOVERY_RESULTS {
-        return Err(WorkflowDiscoveryError::Invalid(format!(
-            "workflow discovery limit must be within 1..={MAX_DISCOVERY_RESULTS}"
-        )));
-    }
-    let workspace = fs::canonicalize(workspace)?;
-    let roots = discovery_roots(&workspace, config);
-    let mut result = WorkflowDiscoveryResult::default();
-    let mut packages = BTreeMap::<String, DiscoveredWorkflowSource>::new();
-    let mut ambiguous_packages = BTreeSet::new();
-    let mut package_members = BTreeSet::new();
-
-    for root in &roots {
-        for manifest_path in matching_files(&root.path, is_package_manifest, limit)? {
-            match read_package_closure(&manifest_path, &root.path) {
-                Ok((closure, members)) => {
-                    package_members.extend(members);
-                    let package_id = closure.entry_package_id.clone();
-                    let candidate = DiscoveredWorkflowSource::Package {
-                        package_id: package_id.clone(),
-                        source_label: root.label.clone(),
-                        precedence: root.precedence,
-                        manifest_path: manifest_path.clone(),
-                        closure,
-                    };
-                    match packages.get(&package_id) {
-                        Some(existing) if existing.precedence() == root.precedence => {
-                            ambiguous_packages.insert(package_id.clone());
-                            result.diagnostics.push(WorkflowDiscoveryDiagnostic {
-                                source_label: root.label.clone(),
-                                path: manifest_path,
-                                code: "ambiguous_package_identity".to_string(),
-                                message: format!(
-                                    "package '{package_id}' appears more than once at precedence {}",
-                                    root.precedence
-                                ),
-                            });
-                        }
-                        Some(existing) if existing.precedence() < root.precedence => {}
-                        _ => {
-                            packages.insert(package_id, candidate);
-                        }
-                    }
-                }
-                Err(error) => result.diagnostics.push(WorkflowDiscoveryDiagnostic {
-                    source_label: root.label.clone(),
-                    path: manifest_path,
-                    code: "invalid_package".to_string(),
-                    message: error.to_string(),
-                }),
-            }
+    let mut scan = WorkflowDiscoveryScan::open(workspace, config, limit)?;
+    loop {
+        if let Some(result) = scan.advance(MAX_DISCOVERY_RESULTS)? {
+            return Ok(result);
         }
     }
-    for package_id in ambiguous_packages {
-        packages.remove(&package_id);
-    }
-    result.sources.extend(packages.into_values());
+}
 
-    for root in &roots {
-        for source_path in matching_files(&root.path, is_standalone_source, limit)? {
-            let canonical = match fs::canonicalize(&source_path) {
-                Ok(path) => path,
-                Err(error) => {
-                    result.diagnostics.push(WorkflowDiscoveryDiagnostic {
-                        source_label: root.label.clone(),
-                        path: source_path,
-                        code: "unreadable_source".to_string(),
-                        message: error.to_string(),
-                    });
-                    continue;
+/// Process-local discovery and reconciliation across bounded enumeration advances.
+///
+/// No partial sources are exposed: all package roots are processed before standalone member
+/// suppression. The retained candidate allowance is explicit and overflow fails closed. This
+/// bounded collector is not yet a large-catalog index, snapshot, or durable transport cursor.
+#[derive(Debug)]
+pub struct WorkflowDiscoveryScan {
+    roots: Vec<DiscoveryRoot>,
+    root_index: usize,
+    kind: WorkflowCandidateKind,
+    directory: Option<WorkflowDirectoryScan>,
+    limit: usize,
+    candidates: usize,
+    result: WorkflowDiscoveryResult,
+    packages: BTreeMap<String, DiscoveredWorkflowSource>,
+    ambiguous_packages: BTreeSet<String>,
+    package_members: BTreeSet<PathBuf>,
+    terminal: bool,
+}
+
+impl WorkflowDiscoveryScan {
+    /// Resolve discovery roots without enumerating their contents.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bounds or an inaccessible workspace.
+    pub fn open(
+        workspace: &Path,
+        config: &bcode_config::WorkflowsConfig,
+        limit: usize,
+    ) -> Result<Self, WorkflowDiscoveryError> {
+        if limit == 0 || limit > MAX_DISCOVERY_RESULTS {
+            return Err(WorkflowDiscoveryError::Invalid(format!(
+                "workflow discovery limit must be within 1..={MAX_DISCOVERY_RESULTS}"
+            )));
+        }
+        let workspace = fs::canonicalize(workspace)?;
+        Ok(Self {
+            roots: discovery_roots(&workspace, config),
+            root_index: 0,
+            kind: WorkflowCandidateKind::Package,
+            directory: None,
+            limit,
+            candidates: 0,
+            result: WorkflowDiscoveryResult::default(),
+            packages: BTreeMap::new(),
+            ambiguous_packages: BTreeSet::new(),
+            package_members: BTreeSet::new(),
+            terminal: false,
+        })
+    }
+
+    /// Advance at most `budget` entries or root transitions and return a result only at completion.
+    ///
+    /// Each candidate uses existing bounded source and package-closure reads. Dropping the scan
+    /// releases its handles and accumulated state. Completion consumes the result once; failures
+    /// terminate the scan. Callers must restart rather than reuse a completed or failed scan.
+    ///
+    /// # Errors
+    /// Returns an error for invalid budgets, terminal reuse, I/O failures, or candidate overflow.
+    pub fn advance(
+        &mut self,
+        budget: usize,
+    ) -> Result<Option<WorkflowDiscoveryResult>, WorkflowDiscoveryError> {
+        if budget == 0 || budget > MAX_DISCOVERY_RESULTS || self.terminal {
+            return Err(WorkflowDiscoveryError::Invalid(
+                "invalid discovery advance or terminal scan".into(),
+            ));
+        }
+        self.terminal = true;
+        let outcome = self.advance_inner(budget);
+        if matches!(&outcome, Ok(None)) {
+            self.terminal = false;
+        } else {
+            self.directory = None;
+            self.packages.clear();
+            self.package_members.clear();
+            self.ambiguous_packages.clear();
+            self.result = WorkflowDiscoveryResult::default();
+        }
+        outcome
+    }
+
+    fn advance_inner(
+        &mut self,
+        budget: usize,
+    ) -> Result<Option<WorkflowDiscoveryResult>, WorkflowDiscoveryError> {
+        for _ in 0..budget {
+            let Some(root) = self.roots.get(self.root_index).cloned() else {
+                match self.kind {
+                    WorkflowCandidateKind::Package => {
+                        for id in &self.ambiguous_packages {
+                            self.packages.remove(id);
+                        }
+                        self.result
+                            .sources
+                            .extend(std::mem::take(&mut self.packages).into_values());
+                        self.kind = WorkflowCandidateKind::Standalone;
+                        self.root_index = 0;
+                        continue;
+                    }
+                    WorkflowCandidateKind::Standalone => {
+                        self.finish()?;
+                        return Ok(Some(std::mem::take(&mut self.result)));
+                    }
                 }
             };
-            if package_members.contains(&canonical) {
-                continue;
+            if self.directory.is_none() {
+                self.directory = Some(WorkflowDirectoryScan::open(&root.path, self.kind)?);
             }
-            match read_bounded_source(&canonical) {
-                Ok(source) => {
-                    let Some(name) = canonical.file_name().and_then(std::ffi::OsStr::to_str) else {
-                        continue;
-                    };
-                    match bcode_workflow::WorkflowSourceFormat::from_file_name(name) {
-                        Ok(source_format) => {
-                            result.sources.push(DiscoveredWorkflowSource::Standalone {
+            let batch = self
+                .directory
+                .as_mut()
+                .expect("opened directory")
+                .advance(1)?;
+            for path in batch.paths {
+                self.candidates += 1;
+                if self.candidates > self.limit {
+                    return Err(WorkflowDiscoveryError::Invalid(
+                        "workflow discovery exceeds the aggregate candidate allowance; narrow configured discovery roots".into()
+                    ));
+                }
+                match self.kind {
+                    WorkflowCandidateKind::Package => self.package(&root, path),
+                    WorkflowCandidateKind::Standalone => self.standalone(&root, path),
+                }
+            }
+            if batch.complete {
+                self.directory = None;
+                self.root_index += 1;
+            }
+        }
+        Ok(None)
+    }
+
+    fn package(&mut self, root: &DiscoveryRoot, manifest_path: PathBuf) {
+        match read_package_closure(&manifest_path, &root.path) {
+            Ok((closure, members)) => {
+                self.package_members.extend(members);
+                let package_id = closure.entry_package_id.clone();
+                let candidate = DiscoveredWorkflowSource::Package {
+                    package_id: package_id.clone(),
+                    source_label: root.label.clone(),
+                    precedence: root.precedence,
+                    manifest_path: manifest_path.clone(),
+                    closure,
+                };
+                match self.packages.get(&package_id) {
+                    Some(existing) if existing.precedence() == root.precedence => {
+                        self.ambiguous_packages.insert(package_id.clone());
+                        self.result.diagnostics.push(WorkflowDiscoveryDiagnostic {
+                            source_label: root.label.clone(),
+                            path: manifest_path,
+                            code: "ambiguous_package_identity".to_string(),
+                            message: format!(
+                                "package '{package_id}' appears more than once at precedence {}",
+                                root.precedence
+                            ),
+                        });
+                    }
+                    Some(existing) if existing.precedence() < root.precedence => {}
+                    _ => {
+                        self.packages.insert(package_id, candidate);
+                    }
+                }
+            }
+            Err(error) => self.result.diagnostics.push(WorkflowDiscoveryDiagnostic {
+                source_label: root.label.clone(),
+                path: manifest_path,
+                code: "invalid_package".to_string(),
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    fn standalone(&mut self, root: &DiscoveryRoot, source_path: PathBuf) {
+        let canonical = match fs::canonicalize(&source_path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.result.diagnostics.push(WorkflowDiscoveryDiagnostic {
+                    source_label: root.label.clone(),
+                    path: source_path,
+                    code: "unreadable_source".to_string(),
+                    message: error.to_string(),
+                });
+                return;
+            }
+        };
+        if self.package_members.contains(&canonical) {
+            return;
+        }
+        match read_bounded_source(&canonical) {
+            Ok(source) => {
+                let Some(name) = canonical.file_name().and_then(std::ffi::OsStr::to_str) else {
+                    return;
+                };
+                match bcode_workflow::WorkflowSourceFormat::from_file_name(name) {
+                    Ok(source_format) => {
+                        self.result
+                            .sources
+                            .push(DiscoveredWorkflowSource::Standalone {
                                 source_label: root.label.clone(),
                                 precedence: root.precedence,
                                 source_path: canonical,
                                 source_format,
                                 source,
                             });
-                        }
-                        Err(error) => result.diagnostics.push(WorkflowDiscoveryDiagnostic {
-                            source_label: root.label.clone(),
-                            path: canonical,
-                            code: "unsupported_source_format".to_string(),
-                            message: error.to_string(),
-                        }),
                     }
+                    Err(error) => self.result.diagnostics.push(WorkflowDiscoveryDiagnostic {
+                        source_label: root.label.clone(),
+                        path: canonical,
+                        code: "unsupported_source_format".to_string(),
+                        message: error.to_string(),
+                    }),
                 }
-                Err(error) => result.diagnostics.push(WorkflowDiscoveryDiagnostic {
-                    source_label: root.label.clone(),
-                    path: canonical,
-                    code: "invalid_source".to_string(),
-                    message: error.to_string(),
-                }),
             }
+            Err(error) => self.result.diagnostics.push(WorkflowDiscoveryDiagnostic {
+                source_label: root.label.clone(),
+                path: canonical,
+                code: "invalid_source".to_string(),
+                message: error.to_string(),
+            }),
         }
     }
-    result.sources.sort_by(|left, right| {
-        (left.precedence(), left.source_key()).cmp(&(right.precedence(), right.source_key()))
-    });
-    result.sources.truncate(limit);
-    result.diagnostics.sort_by(|left, right| {
-        (&left.source_label, &left.path, &left.code).cmp(&(
-            &right.source_label,
-            &right.path,
-            &right.code,
-        ))
-    });
-    result.diagnostics.truncate(limit);
-    Ok(result)
+
+    fn finish(&mut self) -> Result<(), WorkflowDiscoveryError> {
+        self.result.sources.sort_by(|left, right| {
+            (left.precedence(), left.source_key()).cmp(&(right.precedence(), right.source_key()))
+        });
+        if self.result.sources.len() > self.limit {
+            return Err(WorkflowDiscoveryError::Invalid(
+            "workflow discovery exceeds the bounded candidate window; narrow configured discovery roots".to_string(),
+        ));
+        }
+        self.result.diagnostics.sort_by(|left, right| {
+            (&left.source_label, &left.path, &left.code).cmp(&(
+                &right.source_label,
+                &right.path,
+                &right.code,
+            ))
+        });
+        self.result.diagnostics.truncate(self.limit);
+        Ok(())
+    }
 }
 
 /// Read one explicit package manifest or standalone workflow source outside automatic roots.
@@ -373,27 +506,136 @@ fn discovery_roots(workspace: &Path, config: &bcode_config::WorkflowsConfig) -> 
     roots
 }
 
+/// Candidate classification for an incremental workflow directory scan.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkflowCandidateKind {
+    /// Package manifests, reconciled before standalone sources.
+    Package,
+    /// Standalone source candidates, before package-member suppression.
+    Standalone,
+}
+
+/// One bounded scan advance. Candidates are not yet a reconciled launch catalog.
+#[derive(Debug)]
+pub struct WorkflowDirectoryBatch {
+    /// Matching regular files, in filesystem enumeration order.
+    pub paths: Vec<PathBuf>,
+    /// All directory entries consumed, including nonmatching entries.
+    pub inspected: usize,
+    /// Whether enumeration has reached its end.
+    pub complete: bool,
+}
+
+/// Incremental, process-local enumeration of one workflow discovery directory.
+///
+/// Dropping the scan releases its directory handle. Advances do not rescan earlier entries.
+/// This is not a filesystem snapshot: callers must reconcile candidates and establish catalog
+/// validity before exposing ordered pages. The handle is not a durable or public transport cursor.
+#[derive(Debug)]
+pub struct WorkflowDirectoryScan {
+    entries: Option<fs::ReadDir>,
+    kind: WorkflowCandidateKind,
+    failed: bool,
+}
+
+impl WorkflowDirectoryScan {
+    /// Open a directory scan. A missing optional discovery root produces an empty scan.
+    ///
+    /// # Errors
+    /// Returns I/O errors for inaccessible roots or roots that are not directories.
+    pub fn open(root: &Path, kind: WorkflowCandidateKind) -> Result<Self, std::io::Error> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            entries,
+            kind,
+            failed: false,
+        })
+    }
+
+    /// Consume at most `budget` directory entries, retaining position for the next advance.
+    ///
+    /// An exact-budget final batch can require another advance to observe completion. Errors
+    /// terminate this scan; callers must discard earlier batches rather than infer completeness.
+    ///
+    /// # Errors
+    /// Returns an error for a zero or excessive budget, enumeration failures, or unreadable
+    /// matching candidate metadata. Symlink targets are followed, not authorized by this scan.
+    pub fn advance(&mut self, budget: usize) -> Result<WorkflowDirectoryBatch, std::io::Error> {
+        if budget == 0 || budget > MAX_DISCOVERY_RESULTS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workflow directory scan budget is outside supported bounds",
+            ));
+        }
+        if self.failed {
+            return Err(std::io::Error::other(
+                "workflow directory scan previously failed; restart discovery",
+            ));
+        }
+        let mut batch = WorkflowDirectoryBatch {
+            paths: Vec::new(),
+            inspected: 0,
+            complete: self.entries.is_none(),
+        };
+        // Taking the handle makes any I/O failure terminal instead of allowing skipped entries.
+        let Some(mut entries) = self.entries.take() else {
+            return Ok(batch);
+        };
+        self.failed = true;
+        for _ in 0..budget {
+            let Some(entry) = entries.next() else {
+                self.failed = false;
+                batch.complete = true;
+                return Ok(batch);
+            };
+            let path = entry?.path();
+            batch.inspected += 1;
+            let predicate = match self.kind {
+                WorkflowCandidateKind::Package => is_package_manifest,
+                WorkflowCandidateKind::Standalone => is_standalone_source,
+            };
+            if path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(predicate)
+                && fs::metadata(&path)?.is_file()
+            {
+                batch.paths.push(path);
+            }
+        }
+        self.failed = false;
+        self.entries = Some(entries);
+        Ok(batch)
+    }
+}
+
+#[cfg(test)]
 fn matching_files(
     root: &Path,
-    predicate: fn(&str) -> bool,
+    kind: WorkflowCandidateKind,
     limit: usize,
 ) -> Result<Vec<PathBuf>, std::io::Error> {
-    if !root.is_dir() {
-        return Ok(Vec::new());
+    let mut scan = WorkflowDirectoryScan::open(root, kind)?;
+    let mut paths = Vec::new();
+    loop {
+        let batch = scan.advance(MAX_DISCOVERY_RESULTS)?;
+        for path in batch.paths {
+            paths.push(path);
+            if paths.len() > limit {
+                return Err(std::io::Error::other(
+                    "workflow discovery exceeds the bounded candidate window; narrow configured discovery roots",
+                ));
+            }
+        }
+        if batch.complete {
+            break;
+        }
     }
-    let mut paths = fs::read_dir(root)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(predicate)
-        })
-        .collect::<Vec<_>>();
     paths.sort();
-    paths.truncate(limit);
     Ok(paths)
 }
 
@@ -593,8 +835,17 @@ fn confined_relative_path(value: &str) -> Result<&Path, WorkflowDiscoveryError> 
     Ok(path)
 }
 
+fn read_source_window(path: &Path, limit: usize) -> Result<String, std::io::Error> {
+    use std::io::Read as _;
+    let mut source = String::new();
+    fs::File::open(path)?
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_string(&mut source)?;
+    Ok(source)
+}
+
 fn read_bounded_package_source(path: &Path) -> Result<String, WorkflowDiscoveryError> {
-    let source = fs::read_to_string(path)?;
+    let source = read_source_window(path, bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES)?;
     if source.len() > bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES {
         return Err(WorkflowDiscoveryError::Invalid(
             "workflow package manifest exceeds the package byte bound".to_string(),
@@ -604,7 +855,7 @@ fn read_bounded_package_source(path: &Path) -> Result<String, WorkflowDiscoveryE
 }
 
 fn read_bounded_source(path: &Path) -> Result<String, WorkflowDiscoveryError> {
-    let source = fs::read_to_string(path)?;
+    let source = read_source_window(path, bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES)?;
     if source.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
         return Err(WorkflowDiscoveryError::Invalid(
             "workflow source exceeds the authoring byte bound".to_string(),
@@ -615,6 +866,108 @@ fn read_bounded_source(path: &Path) -> Result<String, WorkflowDiscoveryError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_scan_yields_and_delivers_result_once() {
+        let root = tempfile::tempdir().unwrap();
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            paths: Vec::new(),
+            ..Default::default()
+        };
+        let mut scan = super::WorkflowDiscoveryScan::open(root.path(), &config, 10).unwrap();
+        assert!(scan.advance(1).unwrap().is_none());
+        let mut completed = false;
+        for _ in 0..100 {
+            if let Some(result) = scan.advance(1).unwrap() {
+                assert!(result.sources.is_empty());
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert!(scan.advance(1).is_err());
+    }
+
+    #[test]
+    fn source_window_reads_only_limit_plus_one_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.json");
+        std::fs::write(&path, "abcdefghijklmnop").unwrap();
+        assert_eq!(super::read_source_window(&path, 4).unwrap(), "abcde");
+        assert_eq!(
+            super::read_source_window(&path, 16).unwrap(),
+            "abcdefghijklmnop"
+        );
+    }
+
+    #[test]
+    fn incremental_scan_bounds_all_entries_and_continues_beyond_candidate_window() {
+        let root = tempfile::tempdir().unwrap();
+        let count = super::MAX_DISCOVERY_RESULTS + 3;
+        for index in 0..count {
+            std::fs::write(root.path().join(format!("{index}.workflow.json")), "{}").unwrap();
+            std::fs::write(root.path().join(format!("{index}.txt")), "ignored").unwrap();
+        }
+        let mut scan = super::WorkflowDirectoryScan::open(
+            root.path(),
+            super::WorkflowCandidateKind::Standalone,
+        )
+        .unwrap();
+        assert!(scan.advance(0).is_err());
+        let mut paths = std::collections::BTreeSet::new();
+        let mut inspected = 0;
+        loop {
+            let batch = scan.advance(7).unwrap();
+            assert!(batch.inspected <= 7);
+            assert!(batch.paths.len() <= batch.inspected);
+            inspected += batch.inspected;
+            for path in batch.paths {
+                assert!(paths.insert(path));
+            }
+            if batch.complete {
+                break;
+            }
+        }
+        assert_eq!(paths.len(), count);
+        assert_eq!(inspected, count * 2);
+        let done = scan.advance(7).unwrap();
+        assert!(done.complete);
+        assert_eq!(done.inspected, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_candidate_is_not_silently_omitted() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join("missing"),
+            root.path().join("broken.workflow.json"),
+        )
+        .unwrap();
+        let error =
+            super::matching_files(root.path(), super::WorkflowCandidateKind::Standalone, 10)
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn discovery_rejects_truncated_candidate_windows() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.workflow.json", "b.workflow.json", "c.workflow.json"] {
+            std::fs::write(root.path().join(name), "{}").unwrap();
+        }
+        let error = super::matching_files(root.path(), super::WorkflowCandidateKind::Standalone, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("bounded candidate window"));
+        assert_eq!(
+            super::matching_files(root.path(), super::WorkflowCandidateKind::Standalone, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
     use super::*;
 
     fn source(workflow_id: &str, title: &str) -> String {

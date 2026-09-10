@@ -13,7 +13,7 @@ fn embedded_workflow_public_entry_external_consumer() {
     const CHILD: &str = "BCODE_TEST_EMBEDDED_WORKFLOW_CHILD";
     if std::env::var_os(CHILD).is_some() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            use bcode_workflow::WorkflowRunApplication as _;
+            use bcode_workflow::{WorkflowAuthoringApplication as _, WorkflowRunApplication as _};
             let (plugins,) = (
                 bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
                     &bcode_plugin::PluginSelection {
@@ -30,6 +30,26 @@ fn embedded_workflow_public_entry_external_consumer() {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let ready: bcode_server::EmbeddedWorkflowReady = Box::new(move |application| {
                 Box::pin(async move {
+                    let document: bcode_workflow::WorkflowAuthoringDocument =
+                        serde_json::from_str(include_str!(
+                            "../../../fixtures/workflows/source-defined-input.workflow.json"
+                        ))
+                        .unwrap();
+                    let workflow_id = document.workflow_id.clone();
+                    let (workflow, draft) = application
+                        .create_authored_workflow(bcode_workflow::CreateAuthoredWorkflowRequest {
+                            document,
+                            draft_id: "external-draft".to_owned(),
+                        })
+                        .await
+                        .expect("public application creates authored state");
+                    assert_eq!(workflow.workflow_id, workflow_id);
+                    let restored = application
+                        .workflow_draft(workflow_id, "external-draft".to_owned())
+                        .await
+                        .expect("bounded public draft lookup")
+                        .expect("populated draft");
+                    assert_eq!(restored, draft);
                     let result = application
                         .associated_workflow_run(bcode_workflow::WorkflowRunBindingLookup {
                             owner_plugin_id: "external-test".to_owned(),
@@ -87,6 +107,419 @@ fn embedded_workflow_public_entry_external_consumer() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn workflow_repair_cli_requires_confirmation_and_rejects_unknown_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("resolution.json");
+    std::fs::write(&path, r#"{"resolution":"future_resolution"}"#).unwrap();
+    let base = [
+        "workflow",
+        "repair-attempt",
+        "dispatch",
+        "--resolution",
+        path.to_str().unwrap(),
+    ];
+    let unconfirmed = run_cli_with_state(&base, true);
+    assert_eq!(unconfirmed.status.code(), Some(2));
+    let mut confirmed = base.to_vec();
+    confirmed.push("--yes");
+    let invalid = run_cli_with_state(&confirmed, true);
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("invalid workflow repair resolution")
+    );
+    std::fs::write(
+        &path,
+        r#"{"resolution":"confirm_failed","message":"operator resolution"}"#,
+    )
+    .unwrap();
+    let unavailable = run_cli_with_state(&confirmed, true);
+    assert_eq!(unavailable.status.code(), Some(1));
+    assert!(unavailable.stdout.is_empty());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("bcode.toml"),
+        "[plugins]\ndefault = \"none\"\n",
+    )
+    .unwrap();
+    let mut daemon = ForegroundDaemon(
+        isolated_cli(root.path())
+            .args(["server", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
+        let status = run_cli_at_root(
+            root.path(),
+            &["server", "status", "--verbose"],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        if status.status.success() {
+            break String::from_utf8(status.stdout).unwrap();
+        }
+        assert!(Instant::now() < deadline, "daemon startup timed out");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let field = |prefix: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap()
+            .to_string()
+    };
+    let session = graph_cli_json(root.path(), &["session", "create", "repair-cli", "--json"]);
+    std::fs::write(
+        root.path().join("catalog.json"),
+        serde_json::to_vec(&bcode_workflow::WorkflowLaunchCatalogRequest {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            workspace: root.path().to_path_buf(),
+            limit: 1,
+            cursor: None,
+            search: Some("nonexistent-test-launch".to_string()),
+            source_kind: None,
+            readiness: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let catalog = graph_cli_json(
+        root.path(),
+        &["workflow", "launch-catalog", "--request", "catalog.json"],
+    );
+    assert!(catalog["items"].as_array().unwrap().is_empty());
+    let sources = root.path().join("workflows");
+    std::fs::create_dir_all(&sources).unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        std::fs::write(
+            sources.join(format!("{name}.workflow.json")),
+            include_str!("../../../fixtures/workflows/source-defined-input.workflow.json")
+                .replace("example/source-defined-input", &format!("example/{name}"))
+                .replace(
+                    "Source-defined input",
+                    &format!("Catalog acceptance {name}"),
+                ),
+        )
+        .unwrap();
+    }
+    let mut request = serde_json::json!({"version":bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        "workspace":root.path(), "limit":1, "search":"Catalog acceptance", "source_kind":"standalone_source"});
+    let mut titles = std::collections::BTreeSet::new();
+    for page_number in 0..3 {
+        std::fs::write(
+            root.path().join("catalog.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let page = graph_cli_json(
+            root.path(),
+            &["workflow", "launch-catalog", "--request", "catalog.json"],
+        );
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{page}");
+        assert!(titles.insert(items[0]["title"].as_str().unwrap().to_string()));
+        if page_number < 2 {
+            assert!(page.get("next_cursor").is_some());
+            request["cursor"] = page["next_cursor"].clone();
+        } else {
+            assert!(page.get("next_cursor").is_none());
+        }
+    }
+    assert_eq!(
+        titles,
+        std::collections::BTreeSet::from([
+            "Catalog acceptance alpha".to_string(),
+            "Catalog acceptance beta".to_string(),
+            "Catalog acceptance gamma".to_string()
+        ])
+    );
+    let mut watch = ForegroundDaemon(
+        isolated_cli(root.path())
+            .args(["workflow", "watch"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pipe = watch.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(pipe).lines().take(32) {
+            if sender.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let ready: serde_json::Value =
+        serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+    assert_eq!(ready["type"], "subscribed");
+    let mut store =
+        bcode_workflow_store::WorkflowStore::open_in_state_dir(&root.path().join("bcode-state"))
+            .unwrap();
+    let workflow = bcode_workflow::WorkflowBuilder::new(
+        "repair-cli",
+        bcode_workflow::Step::<u32, u32>::task("task", |value, _| async move { Ok(value) }),
+    )
+    .build()
+    .unwrap();
+    store
+        .persist_definition("repair-cli", 1, workflow.definition())
+        .unwrap();
+    store
+        .create_run(&bcode_workflow_store::NewWorkflowRun {
+            run_id: "repair-cli-run".to_string(),
+            definition_id: "repair-cli".to_string(),
+            definition_version: 1,
+            workspace_snapshot: "test".to_string(),
+            parent_session_id: Some(session["id"].as_str().unwrap().to_string()),
+            parent_session_generation: None,
+            binding: None,
+            authored_provenance: None,
+            input: Some(serde_json::json!(1)),
+            execution_authority: Some(bcode_workflow_store::WorkflowExecutionAuthority {
+                target_artifact_id: field("build fingerprint: "),
+                daemon_instance_id: field("instance: "),
+                generation: 1,
+                fencing_token: "repair-cli-fence".to_string(),
+            }),
+            created_at_ms: 1,
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                version: 1,
+                provider_id: "test".to_string(),
+                profile_id: "build".to_string(),
+                policy_digest_sha256: "a".repeat(64),
+            },
+            authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+            limits: bcode_workflow_store::WorkflowRunLimits::default(),
+        })
+        .unwrap();
+    let activation = store
+        .pending_activations_for_run("repair-cli-run", 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let identity = store
+        .prepare_attempt(&bcode_workflow_store::PreparedAttempt {
+            run_id: "repair-cli-run".to_string(),
+            node_id: activation.node_id,
+            activation_id: activation.activation_id,
+            attempt: 1,
+            side_effect: bcode_workflow_store::DispatchSideEffect::Mutating,
+            intent: serde_json::json!({"operation":"test"}),
+            prepared_at_ms: 2,
+        })
+        .unwrap();
+    store
+        .reconcile_prepared_attempts_for_run("repair-cli-run", 10, 3)
+        .unwrap();
+    std::fs::write(
+        root.path().join("resolution.json"),
+        r#"{"resolution":"confirm_failed","message":"operator confirmed failure"}"#,
+    )
+    .unwrap();
+    let result = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "repair-attempt",
+            &identity,
+            "--resolution",
+            "resolution.json",
+            "--yes",
+        ],
+    );
+    assert_eq!(result["dispatch_identity"], identity);
+    assert_eq!(result["attempt_status"], "failed");
+    assert_eq!(result["run_status"], "paused");
+    let changed: serde_json::Value =
+        serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+    assert_eq!(changed["type"], "workflow_changed");
+    assert_eq!(changed["event"]["run_id"], "repair-cli-run");
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &watch.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = watch.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "watch failed to stop on Ctrl-C");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(receiver);
+    reader.join().unwrap();
+    let history = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "attempts",
+            "--run-id",
+            "repair-cli-run",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["dispatch_identity"], identity);
+    assert_eq!(history[0]["status"], "failed");
+    let tail = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "attempts",
+            "--run-id",
+            "repair-cli-run",
+            "--after-prepared-at-ms",
+            "2",
+            "--after-dispatch-identity",
+            &identity,
+            "--limit",
+            "1",
+        ],
+    );
+    assert!(tail.as_array().unwrap().is_empty());
+    let events = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "events",
+            "--run-id",
+            "repair-cli-run",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(events.as_array().unwrap().len(), 1);
+    let catch_up = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "catch-up",
+            "--after-sequence",
+            "0",
+            "--limit",
+            "1",
+        ],
+    );
+    let first = catch_up["events"].as_array().unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(catch_up["resync_required"], true);
+    assert_eq!(first[0]["run_id"], "repair-cli-run");
+    let complete = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "catch-up",
+            "--after-sequence",
+            "0",
+            "--limit",
+            "1000",
+        ],
+    );
+    let events = complete["events"].as_array().unwrap();
+    assert!(events.len() > 1, "fixture must exercise truncated catch-up");
+    assert_eq!(complete["resync_required"], false);
+    assert_eq!(events[0], first[0]);
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0]["event_sequence"].as_u64().unwrap()
+                < pair[1]["event_sequence"].as_u64().unwrap())
+    );
+    let last = events.last().unwrap()["event_sequence"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let tail = graph_cli_json(
+        root.path(),
+        &[
+            "workflow",
+            "catch-up",
+            "--after-sequence",
+            &last,
+            "--limit",
+            "1",
+        ],
+    );
+    assert!(tail["events"].as_array().unwrap().is_empty());
+    assert_eq!(tail["resync_required"], false);
+    let attempts = store.attempt_history("repair-cli-run", None, 10).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        store.run_summary("repair-cli-run").unwrap().unwrap().status,
+        bcode_workflow_store::RunStatus::Paused
+    );
+    drop(store);
+}
+
+#[test]
+fn workflow_catch_up_rejects_invalid_bounds_before_dispatch() {
+    for limit in ["0", "1001"] {
+        let output = run_cli_with_state(
+            &[
+                "workflow",
+                "catch-up",
+                "--after-sequence",
+                "0",
+                "--limit",
+                limit,
+            ],
+            true,
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn workflow_watch_reports_connection_failure_without_success_output() {
+    let output = run_cli_with_state(&["workflow", "watch"], true);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    let help = run_cli_with_state(&["workflow", "watch", "--help"], true);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("without cancelling runs"));
+}
+
+#[test]
+fn launch_catalog_rejects_future_version_before_dispatch() {
+    let output = run_cli_with_fixture(
+        &["workflow", "launch-catalog", "--request", "catalog.json"],
+        true,
+        Stdio::piped(),
+        |root| {
+            std::fs::write(
+                root.join("catalog.json"),
+                r#"{"version":4294967295,"workspace":".","limit":1}"#,
+            )
+            .unwrap();
+        },
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported launch catalog version"));
 }
 
 fn capture_output(mut pipe: impl std::io::Read) -> std::io::Result<(Vec<u8>, bool)> {

@@ -184,7 +184,8 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
             .require_workflow_store()
             .map_err(run_operation_failure)?;
         repair_attempt(self.state, &dispatch_identity, &resolution)
-            .map_err(|error| run_operation_failure(error.into()))
+            .await
+            .map_err(run_operation_failure)
     }
     async fn doctor_workflow_run(
         &self,
@@ -3182,12 +3183,32 @@ pub async fn launch_catalog(
     request: &bcode_workflow::WorkflowLaunchCatalogRequest,
 ) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
     request.validate()?;
-    let config = &state.startup_config.workflows;
-    let discovery = bcode_workflow_discovery::discover_workflows(
-        &request.workspace,
-        config,
-        request.limit.saturating_add(1),
-    )?;
+    let workspace = request.workspace.clone();
+    let config = state.startup_config.workflows.clone();
+    let mut scan = tokio::task::spawn_blocking(move || {
+        bcode_workflow_discovery::WorkflowDiscoveryScan::open(
+            &workspace,
+            &config,
+            bcode_workflow_discovery::MAX_DISCOVERY_RESULTS,
+        )
+    })
+    .await
+    .map_err(super::ServerError::BlockingTask)??;
+    let discovery = loop {
+        // Transfer ownership into just one bounded batch. Dropping this request can leave that
+        // batch running, but cannot schedule another; its output then releases the scan handles.
+        let (next_scan, result) = tokio::task::spawn_blocking(move || {
+            let result = scan.advance(16.min(bcode_workflow_discovery::MAX_DISCOVERY_RESULTS));
+            (scan, result)
+        })
+        .await
+        .map_err(super::ServerError::BlockingTask)?;
+        scan = next_scan;
+        if let Some(discovery) = result? {
+            break discovery;
+        }
+        tokio::task::yield_now().await;
+    };
     let catalog = authoring_catalog(state).await?;
     let mut items = Vec::new();
     for source in discovery.sources {
@@ -6568,11 +6589,28 @@ pub async fn control_associated_run(
 }
 
 /// Apply one explicit repair resolution to an exact workflow attempt.
-pub fn repair_attempt(
-    state: &ServerState,
+pub async fn repair_attempt(
+    state: &std::sync::Arc<ServerState>,
     dispatch_identity: &str,
     resolution: &bcode_workflow_store::RepairResolution,
-) -> Result<bcode_workflow_store::RepairResult, bcode_workflow_store::WorkflowStoreError> {
+) -> Result<bcode_workflow_store::RepairResult, super::ServerError> {
+    let attempt = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .attempt_by_dispatch_identity(dispatch_identity)?
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "workflow repair attempt does not exist".to_string(),
+            )
+        })?;
+    let _authority = execution_authority(state, &attempt.run_id)
+        .await?
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "workflow repair requires durable execution authority".to_string(),
+            )
+        })?;
     let started_at = std::time::Instant::now();
     let result = state
         .workflow_store

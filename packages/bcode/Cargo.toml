@@ -92,6 +92,7 @@ bcode_plugin          = { workspace = true }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_server          = { workspace = true }
 bcode_shell_plugin    = { workspace = true, features = ["static-bundled"] }
+bcode_workflow_store  = { workspace = true }
 sshenv_vault          = { workspace = true }
 tempfile              = { workspace = true }
 tokio                 = { workspace = true, features = ["macros", "rt"] }
