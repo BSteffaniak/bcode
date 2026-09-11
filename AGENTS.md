@@ -31,6 +31,24 @@ Bcode is a Rust-native, TUI-first, plugin-driven coding agent with a local clien
 - Bundled plugins should be enabled by default, but fully disableable.
 - Keep Bcode independently usable even as BMUX integration grows.
 
+## BMUX TUI Layout
+
+Applies to terminal rendering in packages and plugins. Read
+[`docs/tui-rendering.md`](docs/tui-rendering.md) before changing these areas.
+
+- Compose BMUX layout, text, container, and interaction primitives. Do not implement parallel wrapping, clipping, or text-measurement engines.
+- Inspect the public APIs of the locked BMUX revision before adding helpers. If a generic capability is missing, implement it in BMUX rather than duplicating it in Bcode; coordinate dependency updates before relying on new APIs.
+- Bcode owns semantic content, styling, and presentation policy. BMUX owns generic terminal text-layout mechanics. Fixed padding, preview limits, and responsive presentation choices are permitted; duplicated layout mechanics and independently guessed geometry are not.
+- Never use byte length, character count, or formatting field width as terminal-cell measurement for arbitrary text.
+- Derive prefix widths, content constraints, painting, and hit regions from the same layout definitions. Do not maintain duplicate constants or independent measurements for the same geometry.
+- Constrain prefix and content together. Minimum sizes must not silently exceed the available area; define explicit narrow-layout degradation.
+- Choose overflow behavior explicitly. Wrapping alone does not guarantee containment of an indivisible wide grapheme. Use bounded presentation APIs where appropriate, preserving truthful source geometry.
+- Retain measured rows and source mappings together. Do not rewrap after measurement or recompute an entire text block separately for each row. Keep layout caches and interactive work bounded.
+- Resize anchoring uses stable content identity and source positions where available. Generated or unmapped content uses an explicit fallback.
+- Register interactions only for visible, correctly positioned content. Clipping, resizing, and empty areas must not leave stale or invisible hit regions.
+- Test zero/tiny widths, oversized prefixes, CJK, emoji, combining marks, styled spans, resize, and clipping/selection/hit-region agreement. Test behavior—not source text or helper names.
+- Keep terminal adaptation at the TUI boundary; portable contracts must not acquire BMUX types or terminal-specific layout policy.
+
 ## Workspace Organization
 
 - Root workspace configuration lives in `Cargo.toml`.
