@@ -251,20 +251,19 @@ pub fn resolve_provider_request_context_with_resolver(
                 );
                 continue;
             }
-            if let Some(profile) = registry
-                .pools
-                .get(auth_pool_name)
-                .into_iter()
-                .flat_map(|pool| pool.profiles.iter())
-                .find(|profile| profile.auth_profile == *profile_name)
-            {
-                if !seen.insert(profile.auth_profile.clone()) {
+            if let Some(auth_profile) = runtime_pool_candidate_profile(
+                request.config,
+                registry,
+                auth_pool_name,
+                profile_name,
+                request.selection.provider_plugin_id.as_deref(),
+            ) {
+                if !seen.insert(profile_name.clone()) {
                     continue;
                 }
-                let auth_profile = runtime_subscription_auth_profile_config(profile);
-                let resolved = resolve(&profile.auth_profile, &auth_profile);
+                let resolved = resolve(profile_name, &auth_profile);
                 candidates.push(bcode_model::ProviderAuthCandidate {
-                    profile: Some(profile.auth_profile.clone()),
+                    profile: Some(profile_name.clone()),
                     auth: resolved.auth,
                     env: resolved.env,
                 });
@@ -298,6 +297,28 @@ pub fn resolve_provider_request_context_with_resolver(
     }
 
     context
+}
+
+fn runtime_pool_candidate_profile(
+    config: &bcode_config::BcodeConfig,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+    pool: &str,
+    name: &str,
+    owner: Option<&str>,
+) -> Option<bcode_config::AuthProfileConfig> {
+    if registry.profiles.contains_key(name) {
+        // An invalid current registration must not fall back to a historical pool
+        // member that happens to have the same name or a different destination.
+        return selected_runtime_auth_profile(config, registry, name, owner)
+            .map(|resolved| resolved.profile);
+    }
+    registry
+        .pools
+        .get(pool)?
+        .profiles
+        .iter()
+        .find(|profile| profile.auth_profile == name)
+        .map(runtime_subscription_auth_profile_config)
 }
 
 fn selected_runtime_auth_profile(
@@ -1406,6 +1427,17 @@ mod tests {
             ..Default::default()
         };
         for owner in [None, Some("foreign.plugin"), Some("example.plugin")] {
+            let profile = runtime_pool_candidate_profile(
+                &config,
+                &registry,
+                "arbitrary-pool",
+                "custom-account",
+                owner,
+            );
+            assert_eq!(profile.is_some(), owner == Some("example.plugin"));
+            if let Some(profile) = profile {
+                assert_eq!(profile.settings["profile"], "stored-account");
+            }
             let mut calls = 0;
             let context = resolve_provider_request_context_with_resolver(
                 ProviderRequestContextResolution {
