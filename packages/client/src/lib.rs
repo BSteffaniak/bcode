@@ -639,8 +639,7 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    let mut resolved = config.resolved_model_selection();
-    resolved.auth_profile = selected_auth_profile(&resolved);
+    let resolved = config.resolved_model_selection();
     let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
@@ -793,13 +792,6 @@ mod runtime_context_auth_tests {
             Some("account")
         );
     }
-}
-
-fn selected_auth_profile(resolved: &bcode_config::ResolvedModelSelection) -> Option<String> {
-    std::env::var(bcode_config::BCODE_AUTH_PROFILE_ENV)
-        .ok()
-        .filter(|profile| !profile.trim().is_empty())
-        .or_else(|| resolved.auth_profile.clone())
 }
 
 impl From<ErrorResponse> for ClientError {

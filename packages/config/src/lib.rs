@@ -597,6 +597,11 @@ impl BcodeConfig {
             selection.model_id = Some(model_id);
             selection.model_source = Some(model_source);
         }
+        if let Some(profile) = environment.var(BCODE_AUTH_PROFILE_ENV)
+            && !profile.trim().is_empty()
+        {
+            selection.auth_profile = Some(profile);
+        }
         self.apply_model_metadata_override(&mut selection);
         selection
     }
@@ -12402,6 +12407,24 @@ model_id = "second"
         )
         .expect("valid TOML");
         assert!(super::resolve_composed_config_value(&raw).is_err());
+    }
+
+    #[test]
+    fn auth_environment_override_is_shared_and_empty_values_do_not_clear_selection() {
+        let mut config = BcodeConfig::default();
+        config.model.auth_profile = Some("configured-account".to_owned());
+        for (value, expected) in [
+            ("override-account", "override-account"),
+            ("", "configured-account"),
+            ("  ", "configured-account"),
+        ] {
+            let environment = super::ConfigEnvironmentSnapshot::new(
+                BTreeMap::from([(super::BCODE_AUTH_PROFILE_ENV.to_owned(), value.into())]),
+                PathBuf::from("."),
+            );
+            let selection = config.resolved_model_selection_with_environment(&environment);
+            assert_eq!(selection.auth_profile.as_deref(), Some(expected));
+        }
     }
 
     #[test]
