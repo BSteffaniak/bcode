@@ -32,25 +32,9 @@ bcode_workflow_store       = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 serde                      = { workspace = true, features = ["derive"] }
 serde_json                 = { workspace = true }
-sshenv_vault               = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, features = ["sync", "time"] }
 tracing                    = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-sshenv_vault = { workspace = true, features = [
-    "linux-secret-service",
-    "tpm-device-seal",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-sshenv_vault = { workspace = true, features = ["macos-keychain"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-sshenv_vault = { workspace = true, features = ["windows-dpapi"] }
-
-[target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
-sshenv_vault = { workspace = true }
 
 [features]
 default          = []

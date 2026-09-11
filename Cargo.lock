@@ -1668,7 +1668,6 @@ dependencies = [
  "bcode_workflow_view_models",
  "serde",
  "serde_json",
- "sshenv_vault",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

@@ -625,9 +625,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
             ..ClientRuntimeContext::default()
         };
     };
-    let effective_config_toml = bcode_config::encode_effective_config(&config)
-        .ok()
-        .map(Box::new);
+    let effective_config_toml = bcode_config::encode_effective_config(&config).ok();
     let env = CLIENT_RUNTIME_ENV_VARS
         .iter()
         .filter_map(|name| match std::env::var(name) {
@@ -635,21 +633,34 @@ fn current_runtime_context() -> ClientRuntimeContext {
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    // Snapshot before auth profile/pool materialization adds profile-scoped values, so the daemon
-    // can distinguish provider-neutral shell environment from credentials tied to one provider.
-    let process_env = env.clone();
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
     resolved.auth_pool = selected_auth_pool(&config, &resolved);
-    let mut provider_context = bcode_provider_auth::resolve_provider_request_context(
+    let provider_context = bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
             selection: resolved.clone(),
         },
     );
+    runtime_context_from_selection(
+        working_directory,
+        effective_config_toml,
+        resolved,
+        provider_context,
+        env,
+    )
+}
+
+fn runtime_context_from_selection(
+    working_directory: std::path::PathBuf,
+    effective_config_toml: Option<String>,
+    resolved: bcode_config::ResolvedModelSelection,
+    mut provider_context: bcode_model::ProviderRequestContext,
+    process_env: BTreeMap<String, String>,
+) -> ClientRuntimeContext {
     // Process environment retains its existing precedence, but do not mix credentials
     // from unselected pool candidates into the selected account's environment.
-    provider_context.env.extend(env);
+    provider_context.env.extend(process_env.clone());
     let env_keys = provider_context
         .env
         .keys()
@@ -658,7 +669,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
         .collect();
     ClientRuntimeContext {
         working_directory: Some(working_directory),
-        effective_config_toml,
+        effective_config_toml: effective_config_toml.map(Box::new),
         selected_provider_plugin_id: resolved.provider_plugin_id,
         selected_model_id: resolved.model_id,
         requested_model_id: resolved.selected_model_id,
@@ -666,6 +677,77 @@ fn current_runtime_context() -> ClientRuntimeContext {
         process_env,
         interaction_adapters: Vec::new(),
         env_keys,
+    }
+}
+
+#[cfg(test)]
+mod runtime_context_auth_tests {
+    use super::*;
+
+    #[test]
+    fn selected_account_and_credentials_survive_client_adaptation_together() {
+        let auth = bcode_model::ProviderAuthContext {
+            profile: Some("preferred-account".to_owned()),
+            credentials: BTreeMap::from([(
+                "token".to_owned(),
+                bcode_model::ProviderAuthCredential {
+                    value: "preferred-token".to_owned(),
+                    source: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let provider_context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("preferred-account".to_owned()),
+            auth: Some(auth.clone()),
+            env: BTreeMap::from([("SELECTED".to_owned(), "selected-value".to_owned())]),
+            auth_candidates: vec![bcode_model::ProviderAuthCandidate {
+                profile: Some("other-account".to_owned()),
+                auth: bcode_model::ProviderAuthContext::default(),
+                env: BTreeMap::from([("OTHER_TOKEN".to_owned(), "other-value".to_owned())]),
+            }],
+            ..Default::default()
+        };
+        let process_env = BTreeMap::from([("SHELL_SETTING".to_owned(), "shell-value".to_owned())]);
+        let context = runtime_context_from_selection(
+            ".".into(),
+            None,
+            bcode_config::ResolvedModelSelection {
+                auth_profile: Some("original-primary".to_owned()),
+                ..Default::default()
+            },
+            provider_context,
+            process_env.clone(),
+        );
+        assert_eq!(
+            context.provider_context.auth_profile.as_deref(),
+            Some("preferred-account")
+        );
+        assert_eq!(context.provider_context.auth, Some(auth));
+        assert!(!context.provider_context.env.contains_key("OTHER_TOKEN"));
+        assert!(!context.env_keys.contains_key("OTHER_TOKEN"));
+        assert_eq!(context.process_env, process_env);
+        assert!(!context.process_env.contains_key("SELECTED"));
+    }
+
+    #[test]
+    fn explicit_shell_values_keep_precedence_without_changing_account_identity() {
+        let context = runtime_context_from_selection(
+            ".".into(),
+            None,
+            bcode_config::ResolvedModelSelection::default(),
+            bcode_model::ProviderRequestContext {
+                auth_profile: Some("account".to_owned()),
+                env: BTreeMap::from([("SETTING".to_owned(), "profile-value".to_owned())]),
+                ..Default::default()
+            },
+            BTreeMap::from([("SETTING".to_owned(), "shell-value".to_owned())]),
+        );
+        assert_eq!(context.provider_context.env["SETTING"], "shell-value");
+        assert_eq!(
+            context.provider_context.auth_profile.as_deref(),
+            Some("account")
+        );
     }
 }
 
