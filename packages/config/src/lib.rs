@@ -5067,8 +5067,7 @@ pub fn register_runtime_auth_subscription(
     let _lock = lock_auth_subscriptions(&path)?;
     let mut registry = read_auth_subscriptions_for_update(&path)?;
     if let Some(existing) = registry.profiles.get(&profile.auth_profile)
-        && (existing.provider_id != runtime_profile.provider_id
-            || existing.owner_plugin_id != runtime_profile.owner_plugin_id)
+        && existing != &runtime_profile
     {
         return Err(ConfigError::Composition {
             message: format!(
@@ -5091,6 +5090,22 @@ pub fn register_runtime_auth_subscription(
                 preferred_profile: None,
                 profiles: Vec::new(),
             });
+    if [
+        pool_entry.provider_plugin_id.as_ref(),
+        pool_entry.owner_plugin_id.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|owner| Some(owner) != profile.owner_plugin_id.as_ref())
+        || pool_entry
+            .provider_id
+            .as_ref()
+            .is_some_and(|provider| provider != &profile.provider)
+    {
+        return Err(ConfigError::Composition {
+            message: "runtime authentication pool ownership conflicts with enrollment; existing metadata preserved".to_owned(),
+        });
+    }
     pool_entry
         .provider_plugin_id
         .clone_from(&profile.owner_plugin_id);
@@ -5103,7 +5118,11 @@ pub fn register_runtime_auth_subscription(
         .iter_mut()
         .find(|existing| existing.auth_profile == profile.auth_profile)
     {
-        *existing = profile;
+        if existing != &profile {
+            return Err(ConfigError::Composition {
+                message: "runtime authentication pool member conflicts with enrollment; existing metadata preserved".to_owned(),
+            });
+        }
     } else {
         pool_entry.profiles.push(profile);
     }
@@ -5139,8 +5158,7 @@ pub fn register_runtime_auth_profile(
     let _lock = lock_auth_subscriptions(&path)?;
     let mut registry = read_auth_subscriptions_for_update(&path)?;
     if let Some(existing) = registry.profiles.get(profile_name)
-        && (existing.provider_id != profile.provider_id
-            || existing.owner_plugin_id != profile.owner_plugin_id)
+        && existing != &profile
     {
         return Err(ConfigError::Composition {
             message: format!(
@@ -9239,6 +9257,10 @@ scheme = "api_key"
         register_runtime_auth_profile("example-2", second.clone()).expect("idempotent publication");
         let loaded = load_runtime_auth_subscriptions();
         let before_conflict = std::fs::read(&runtime_path).expect("registered metadata");
+        let mut redirected = second.clone();
+        redirected.storage_profile = "redirected-account".to_owned();
+        assert!(register_runtime_auth_profile("example-2", redirected).is_err());
+        assert_eq!(std::fs::read(&runtime_path).unwrap(), before_conflict);
         let mut foreign = second.clone();
         foreign.owner_plugin_id = "bcode.foreign".to_owned();
         let conflict = register_runtime_auth_profile("example-3", foreign);
