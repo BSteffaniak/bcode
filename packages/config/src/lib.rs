@@ -1078,7 +1078,11 @@ fn resolve_composed_config_value(
                 message: "composition profile id must not be empty".to_string(),
             });
         }
-        profiles.insert(canonical_id, profile);
+        if profiles.insert(canonical_id, profile).is_some() {
+            return Err(ConfigError::Composition {
+                message: "composition profile IDs must be distinct after normalization".to_owned(),
+            });
+        }
     }
 
     let active_profile = composition
@@ -12238,6 +12242,20 @@ max_tool_rounds = 3
 
         let config = load_config_from_paths(&[config_path]).expect("config should load");
         assert_eq!(config.model.max_tool_rounds, Some(9));
+    }
+
+    #[test]
+    fn composition_rejects_colliding_normalized_profile_names() {
+        let raw = toml::from_str(
+            r#"
+[composition.profiles.alpha.patch.model]
+model_id = "first"
+[composition.profiles." alpha ".patch.model]
+model_id = "second"
+"#,
+        )
+        .expect("valid TOML");
+        assert!(super::resolve_composed_config_value(&raw).is_err());
     }
 
     #[test]

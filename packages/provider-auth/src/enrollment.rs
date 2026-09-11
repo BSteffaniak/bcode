@@ -74,6 +74,13 @@ pub fn prepare(
         runtime,
     ) {
         Ok(mut resolved) => {
+            crate::lifecycle::AuthVaultLifecycle::new(
+                &resolved,
+                &provider.provider_id,
+                owner_plugin_id,
+                method,
+            )
+            .map_err(|_| EnrollmentError::InvalidMethod)?;
             if let Some(vault) = vault {
                 resolved
                     .profile
@@ -192,4 +199,63 @@ pub fn publish(resolved: &ResolvedAuthProfile) -> Result<(), bcode_config::Confi
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_account_method_is_checked_before_interactive_effects() {
+        let provider = AuthProviderContribution {
+            schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "example".to_owned(),
+            display_name: "Example".to_owned(),
+            methods: vec![AuthMethodContribution::Interactive {
+                method_id: "browser".to_owned(),
+                display_name: "Browser".to_owned(),
+                operation: "auth.browser".to_owned(),
+                credentials: Vec::new(),
+                supports_revocation: false,
+            }],
+        };
+        let mut config = BcodeConfig::default();
+        config.auth.profiles.insert(
+            "account".to_owned(),
+            AuthProfileConfig {
+                backend: "sshenv".to_owned(),
+                provider_id: Some("example".to_owned()),
+                owner_plugin_id: Some("bcode.example".to_owned()),
+                scheme: Some("different-method".to_owned()),
+                map: BTreeMap::new(),
+                settings: BTreeMap::new(),
+            },
+        );
+        let destination = EnrollmentDestination {
+            profile: Some("account".to_owned()),
+            ..EnrollmentDestination::default()
+        };
+        assert!(matches!(
+            prepare(
+                &config,
+                &RuntimeAuthSubscriptions::default(),
+                &provider,
+                "bcode.example",
+                "browser",
+                destination.clone(),
+            ),
+            Err(EnrollmentError::InvalidMethod)
+        ));
+        config.auth.profiles.get_mut("account").unwrap().scheme = Some("browser".to_owned());
+        let prepared = prepare(
+            &config,
+            &RuntimeAuthSubscriptions::default(),
+            &provider,
+            "bcode.example",
+            "browser",
+            destination,
+        )
+        .expect("matching owned method");
+        assert!(!prepared.publish_runtime);
+    }
 }
