@@ -110,6 +110,11 @@ auth_pool = "openai"
 
 Config declares the desired subscription candidates. Runtime quota/cooldown observations are stored under Bcode's state directory and do not mutate declarative config.
 
+Pool selection is explicit: set `auth_pool` on the active model selection to opt into
+multi-account routing. Selecting only `auth_profile` uses that account and does not infer
+an `openai` pool from the authentication scheme. Pool and profile names are user-defined;
+`openai` is an example, not a reserved pool name.
+
 ## Preferred profile and effective order
 
 Auth pools support any number of profiles. The first profile in effective order is the preferred

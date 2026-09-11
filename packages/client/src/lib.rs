@@ -641,7 +641,6 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
         .collect::<BTreeMap<_, _>>();
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
-    resolved.auth_pool = selected_auth_pool(&config, &resolved);
     let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
@@ -691,6 +690,32 @@ fn runtime_context_from_selection(
 #[cfg(test)]
 mod runtime_context_auth_tests {
     use super::*;
+
+    #[test]
+    fn single_account_selection_does_not_infer_a_pool_from_chatgpt_scheme() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.model.auth_profile = Some("custom-account".to_owned());
+        config.auth.profiles.insert(
+            "custom-account".to_owned(),
+            bcode_config::AuthProfileConfig {
+                backend: "env".to_owned(),
+                scheme: Some("chatgpt".to_owned()),
+                settings: BTreeMap::from([("provider".to_owned(), "openai".to_owned())]),
+                ..Default::default()
+            },
+        );
+        let context = bcode_provider_auth::resolve_provider_request_context_with_resolver(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config: &config,
+                selection: config.resolved_model_selection(),
+            },
+            &bcode_config::RuntimeAuthSubscriptions::default(),
+            |_, _| bcode_provider_auth::ResolvedProviderAuth::default(),
+        );
+        assert_eq!(context.auth_profile.as_deref(), Some("custom-account"));
+        assert!(context.auth_pool.is_none());
+        assert!(context.auth_candidates.is_empty());
+    }
 
     #[tokio::test]
     async fn invalid_runtime_context_blocks_connection_before_transport() {
@@ -775,28 +800,6 @@ fn selected_auth_profile(resolved: &bcode_config::ResolvedModelSelection) -> Opt
         .ok()
         .filter(|profile| !profile.trim().is_empty())
         .or_else(|| resolved.auth_profile.clone())
-}
-
-fn selected_auth_pool(
-    config: &bcode_config::BcodeConfig,
-    resolved: &bcode_config::ResolvedModelSelection,
-) -> Option<String> {
-    resolved.auth_pool.clone().or_else(|| {
-        resolved
-            .auth_profile
-            .as_deref()
-            .filter(|auth_profile| is_openai_chatgpt_auth_profile(config, auth_profile))
-            .map(|_| "openai".to_string())
-    })
-}
-
-fn is_openai_chatgpt_auth_profile(config: &bcode_config::BcodeConfig, auth_profile: &str) -> bool {
-    let Some(profile) = config.auth.profiles.get(auth_profile) else {
-        return false;
-    };
-    profile.settings.get("provider").map(String::as_str) == Some("openai")
-        && (profile.scheme.as_deref() == Some("chatgpt")
-            || profile.settings.get("mode").map(String::as_str) == Some("chatgpt"))
 }
 
 impl From<ErrorResponse> for ClientError {
