@@ -292,25 +292,21 @@ impl ReviewViewDocument {
                     }
                 }
                 if let Some(agent_state) = agent_states.get(&thread_key) {
-                    let body_line_count = agent_thread_visible_line_count(
-                        agent_state,
-                        expanded_agent_answers.contains(&thread_key),
-                    );
-                    for body_line_index in 0..body_line_count {
-                        rows.push(ReviewViewRow {
-                            visual_row: 0,
-                            source_row: None,
-                            target: ReviewViewTarget::AgentThread {
-                                thread_key: thread_key.clone(),
-                            },
-                            block: ReviewViewBlock::InlineAgentThread {
-                                thread_key: thread_key.clone(),
-                                state: agent_state.clone(),
-                                body_line_index,
-                                body_line_count,
-                            },
-                        });
-                    }
+                    rows.push(ReviewViewRow {
+                        visual_row: 0,
+                        source_row: None,
+                        target: ReviewViewTarget::AgentThread {
+                            thread_key: thread_key.clone(),
+                        },
+                        block: ReviewViewBlock::InlineAgentThread {
+                            thread_key: thread_key.clone(),
+                            state: agent_state.clone(),
+                            expanded: expanded_agent_answers.contains(&thread_key),
+                            rendered: None,
+                            body_line_index: 0,
+                            body_line_count: 1,
+                        },
+                    });
                 }
                 let has_agent_answer = agent_states
                     .get(&thread_key)
@@ -353,10 +349,10 @@ impl ReviewViewDocument {
         Self { rows }
     }
 
-    /// Resolve comment Markdown once per body at the pane's content width.
+    /// Resolve inline text once per body at the pane's content width.
     /// All navigation and painting consume the resulting visual rows.
     #[must_use]
-    pub fn layout_comments(mut self, width: u16) -> Self {
+    pub fn layout_inline_threads(mut self, width: u16) -> Self {
         let prefix_width = usize::from(width.saturating_sub(1)).min(12);
         let content_width = width
             .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
@@ -431,6 +427,18 @@ impl ReviewViewDocument {
                     }
                     rows.push(projected);
                 }
+            } else if let ReviewViewBlock::InlineAgentThread {
+                body_line_index,
+                state,
+                expanded,
+                ..
+            } = &row.block
+            {
+                if *body_line_index != 0 {
+                    continue;
+                }
+                let lines = agent_thread_rows(state, *expanded, width);
+                append_agent_rows(&mut rows, &row, lines);
             } else {
                 rows.push(row);
             }
@@ -632,6 +640,10 @@ pub enum ReviewViewBlock {
         thread_key: String,
         /// Agent state for this thread.
         state: ReviewAgentThreadState,
+        /// Explicit presentation policy, independent of visual row count.
+        expanded: bool,
+        /// Retained text projection for painting.
+        rendered: Option<AgentThreadRow>,
         /// Body/status line index inside this agent block.
         body_line_index: usize,
         /// Total visible body/status lines for this agent block.
@@ -646,29 +658,134 @@ pub enum ReviewViewBlock {
     },
 }
 
-fn agent_thread_visible_line_count(state: &ReviewAgentThreadState, expanded: bool) -> usize {
-    let warning_count = usize::from(state.stream_warning.is_some());
-    let activity_count = usize::from(state.activity.is_some());
-    let context_count = usize::from(!state.context_summary.is_empty());
-    let session_item_count = if expanded {
-        state.session_items.len().min(24)
-    } else {
-        state.session_items.len().min(6)
-    };
-    if state.answer.trim().is_empty() {
-        1 + context_count + warning_count + activity_count + session_item_count
-    } else {
-        let answer_lines = state.answer.lines().count();
-        1 + context_count
-            + warning_count
-            + activity_count
-            + session_item_count
-            + if expanded {
-                answer_lines.max(1)
-            } else {
-                answer_lines.clamp(1, 4)
-            }
+fn append_agent_rows(
+    rows: &mut Vec<ReviewViewRow>,
+    row: &ReviewViewRow,
+    lines: Vec<AgentThreadRow>,
+) {
+    let count = lines.len();
+    for (index, line) in lines.into_iter().enumerate() {
+        let mut projected = row.clone();
+        if let ReviewViewBlock::InlineAgentThread {
+            body_line_index,
+            body_line_count,
+            rendered,
+            ..
+        } = &mut projected.block
+        {
+            *body_line_index = index;
+            *body_line_count = count;
+            *rendered = Some(line);
+        }
+        rows.push(projected);
     }
+}
+
+/// Width-resolved agent text; colors remain a paint-time theme choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentThreadRow {
+    /// Measured decorative prefix.
+    pub prefix: String,
+    /// Retained content row.
+    pub content: bmux_tui::text::Line,
+    /// Optional session-item semantic role.
+    pub kind: Option<crate::code_review_tui::ReviewAgentSessionItemKind>,
+}
+
+fn agent_text_rows(prefix: &str, text: &str, markdown: bool, width: u16) -> Vec<AgentThreadRow> {
+    use bmux_tui::text::Line;
+    let prefix = Line::raw(prefix)
+        .viewport(0, usize::from(width.saturating_sub(1)))
+        .plain_text();
+    let available = width
+        .saturating_sub(
+            u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
+        )
+        .max(1);
+    let mut content = if markdown {
+        bcode_markdown_render::render_markdown_lines(
+            text,
+            bcode_markdown_render::MarkdownRenderOptions::new(available),
+        )
+    } else {
+        text.lines()
+            .flat_map(|line| Line::raw(line).wrap_word(usize::from(available)))
+            .collect()
+    };
+    if content.is_empty() {
+        content.push(Line::default());
+    }
+    content
+        .into_iter()
+        .map(|content| AgentThreadRow {
+            prefix: prefix.clone(),
+            content,
+            kind: None,
+        })
+        .collect()
+}
+
+pub(crate) fn agent_thread_rows(
+    state: &ReviewAgentThreadState,
+    expanded: bool,
+    width: u16,
+) -> Vec<AgentThreadRow> {
+    let mut rows = agent_text_rows(
+        &format!("   │ 🤖 Bcode · {} ", state.live_state_label()),
+        state.error.as_deref().unwrap_or(&state.status),
+        false,
+        width,
+    );
+    for (prefix, text) in [
+        ("   │  context ", Some(state.context_summary.as_str())),
+        ("   │  ⚠ stream ", state.stream_warning.as_deref()),
+        ("   │  activity ", state.activity.as_deref()),
+    ] {
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            rows.extend(agent_text_rows(prefix, text, false, width));
+        }
+    }
+    let limit = if expanded { 24 } else { 6 };
+    for item in state
+        .session_items
+        .iter()
+        .skip(state.session_items.len().saturating_sub(limit))
+    {
+        let marker = if item.degraded {
+            "⚠"
+        } else if item.streaming {
+            "…"
+        } else {
+            "·"
+        };
+        // Session items are deliberately single-row previews, not full messages.
+        if let Some(mut row) = agent_text_rows(
+            &format!("   │  {marker} {} ", item.label),
+            &item.text,
+            item.format == bcode_session_view_models::TextFormat::Markdown,
+            width,
+        )
+        .into_iter()
+        .next()
+        {
+            row.kind = Some(item.kind);
+            rows.push(row);
+        }
+    }
+    if !state.answer.trim().is_empty() {
+        let mut answer = agent_text_rows("   │  answer ", &state.answer, true, width);
+        if !expanded && answer.len() > 4 {
+            answer.truncate(4);
+            if let Some(last) = answer.last_mut() {
+                last.content.push_span(bmux_tui::text::Span::raw(" …"));
+                let available = usize::from(width)
+                    .saturating_sub(bmux_tui::text_width::display_width(&last.prefix));
+                last.content = last.content.truncate(available);
+            }
+        }
+        rows.extend(answer);
+    }
+    rows
 }
 
 /// Inline action exposed for a review thread.
@@ -1467,6 +1584,75 @@ mod tests {
     }
 
     #[test]
+    fn agent_session_preview_limits_do_not_depend_on_metadata_height() {
+        use crate::code_review_tui::{ReviewAgentSessionItem, ReviewAgentSessionItemKind};
+        let mut state = super::ReviewAgentThreadState::pending(String::new());
+        state.status = "long metadata that wraps into many visual rows ".repeat(8);
+        state.session_items = (0..10)
+            .map(|index| ReviewAgentSessionItem {
+                id: format!("item-{index}"),
+                revision: 1,
+                kind: ReviewAgentSessionItemKind::Assistant,
+                label: "message".to_owned(),
+                text: format!("item-{index}"),
+                format: bcode_session_view_models::TextFormat::PlainText,
+                streaming: false,
+                degraded: false,
+            })
+            .collect();
+        for (expanded, count, first) in [(false, 6, "item-4"), (true, 10, "item-0")] {
+            let rows = super::agent_thread_rows(&state, expanded, 32);
+            let previews = rows
+                .iter()
+                .filter(|row| row.kind.is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(previews.len(), count);
+            assert_eq!(previews[0].content.plain_text(), first);
+            assert_eq!(
+                previews.last().expect("last preview").content.plain_text(),
+                "item-9"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_answers_use_visual_limits_and_explicit_expansion() {
+        let mut state = super::ReviewAgentThreadState::pending(String::new());
+        state.status = "ready".to_owned();
+        state.answer = "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_owned();
+        for width in 2..=30 {
+            let expanded = super::agent_thread_rows(&state, true, width);
+            let collapsed = super::agent_thread_rows(&state, false, width);
+            assert!(expanded.len() >= collapsed.len());
+            for row in expanded.iter().chain(&collapsed) {
+                assert!(
+                    bmux_tui::text_width::display_width(&row.prefix) + row.content.width()
+                        <= usize::from(width)
+                );
+            }
+        }
+        let expanded = super::agent_thread_rows(&state, true, 18);
+        let collapsed = super::agent_thread_rows(&state, false, 18);
+        assert!(expanded.len() > collapsed.len());
+        assert!(
+            expanded
+                .last()
+                .expect("answer")
+                .content
+                .plain_text()
+                .contains("kappa")
+        );
+        assert!(
+            collapsed
+                .last()
+                .expect("preview")
+                .content
+                .plain_text()
+                .contains('…')
+        );
+    }
+
+    #[test]
     fn multiline_draft_comments_render_multiple_semantic_rows() {
         let file = test_file();
         let anchor = ReviewThreadAnchor {
@@ -1499,7 +1685,7 @@ mod tests {
                     true,
                 );
 
-        let narrow = document.clone().layout_comments(15);
+        let narrow = document.clone().layout_inline_threads(15);
         let projected = narrow
             .rows
             .iter()
@@ -1519,7 +1705,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("first"));
         assert!(text.contains("second"));
-        let wide = document.clone().layout_comments(80);
+        let wide = document.clone().layout_inline_threads(80);
         assert!(wide.rows.len() < narrow.rows.len());
         assert!(
             narrow

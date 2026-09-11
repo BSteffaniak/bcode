@@ -12408,7 +12408,7 @@ impl ReviewApp {
             &self.resolved_review_threads,
             self.show_resolved_threads,
         );
-        document = document.layout_comments(cache_key.content_width);
+        document = document.layout_inline_threads(cache_key.content_width);
         if let Ok(mut cache) = self.view_document_cache.write() {
             *cache = Some(ReviewViewDocumentCache {
                 key: cache_key,

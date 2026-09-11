@@ -2033,22 +2033,12 @@ fn render_view_row(
                 style,
             }
         }
-        ReviewViewBlock::InlineAgentThread {
-            state,
-            body_line_index,
-            body_line_count,
-            ..
-        } => {
+        ReviewViewBlock::InlineAgentThread { rendered, .. } => {
             let style = theme.focused.patch(theme.overlay);
             RenderedRow {
-                line: render_inline_agent_thread_line(
-                    state,
-                    *body_line_index,
-                    *body_line_count,
-                    width,
-                    style,
-                    theme,
-                ),
+                line: rendered
+                    .as_ref()
+                    .map_or_else(Line::default, |row| render_agent_row(row, style, theme)),
                 style,
             }
         }
@@ -2109,146 +2099,21 @@ fn render_inline_suggestion_line(
     Line::from_spans(spans)
 }
 
-fn render_inline_agent_thread_line(
-    state: &crate::code_review_tui::ReviewAgentThreadState,
-    body_line_index: usize,
-    body_line_count: usize,
-    width: u16,
+fn render_agent_row(
+    row: &crate::code_review_tui_view::AgentThreadRow,
     style: Style,
     theme: ReviewTheme,
 ) -> Line {
-    let prefix_style = theme.focused.patch(theme.overlay);
-    let has_warning = state
-        .stream_warning
-        .as_ref()
-        .is_some_and(|text| !text.is_empty());
-    let has_activity = state.activity.as_ref().is_some_and(|text| !text.is_empty());
-    let has_context = !state.context_summary.is_empty();
-    let metadata_count =
-        1 + usize::from(has_context) + usize::from(has_warning) + usize::from(has_activity);
-    let visible_session_items =
-        state
-            .session_items
-            .len()
-            .min(if body_line_count > 12 { 24 } else { 6 });
-    if body_line_index >= metadata_count
-        && body_line_index < metadata_count.saturating_add(visible_session_items)
-    {
-        let item = &state.session_items[state
-            .session_items
-            .len()
-            .saturating_sub(visible_session_items)
-            .saturating_add(body_line_index.saturating_sub(metadata_count))];
-        return render_inline_session_item(item, width, style, theme);
-    }
-    let answer_line_index = body_line_index
-        .saturating_sub(metadata_count)
-        .saturating_sub(visible_session_items);
-    let prefix = if body_line_index == 0 {
-        format!("   │ 🤖 Bcode · {} ", state.live_state_label())
-    } else if has_context && body_line_index == 1 {
-        "   │  context ".to_string()
-    } else if has_warning && body_line_index == 1 + usize::from(has_context) {
-        "   │  ⚠ stream ".to_string()
-    } else if has_activity
-        && body_line_index == 1 + usize::from(has_context) + usize::from(has_warning)
-    {
-        "   │  activity ".to_string()
-    } else if body_line_index.saturating_add(1) == body_line_count {
-        "   ╰─ answer ".to_string()
-    } else {
-        "   │  answer ".to_string()
+    use crate::code_review_tui::ReviewAgentSessionItemKind;
+    let prefix_style = match row.kind {
+        Some(ReviewAgentSessionItemKind::Assistant) => theme.overlay,
+        Some(ReviewAgentSessionItemKind::Reasoning) => theme.muted.patch(theme.overlay),
+        Some(ReviewAgentSessionItemKind::ActionNeeded) => theme.diff.hunk.patch(theme.overlay),
+        Some(ReviewAgentSessionItemKind::Status) => theme.diff.removed.patch(theme.overlay),
+        Some(ReviewAgentSessionItemKind::Tool) | None => theme.focused.patch(theme.overlay),
     };
-    let detail = if body_line_index == 0 {
-        state
-            .error
-            .as_ref()
-            .map_or(state.status.as_str(), String::as_str)
-    } else if has_context && body_line_index == 1 {
-        state.context_summary.as_str()
-    } else if has_warning && body_line_index == 1 + usize::from(has_context) {
-        state.stream_warning.as_deref().unwrap_or_default()
-    } else if has_activity
-        && body_line_index == 1 + usize::from(has_context) + usize::from(has_warning)
-    {
-        state.activity.as_deref().unwrap_or_default()
-    } else {
-        state
-            .answer
-            .lines()
-            .nth(answer_line_index)
-            .unwrap_or_default()
-    };
-    let is_answer = body_line_index >= metadata_count.saturating_add(visible_session_items);
-    let available = usize::from(width.saturating_sub(
-        u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
-    ));
-    let mut spans = vec![Span::styled(prefix, prefix_style)];
-    if is_answer {
-        let markdown_width = u16::try_from(available).unwrap_or(u16::MAX).max(1);
-        let markdown_line =
-            render_markdown_lines(&state.answer, MarkdownRenderOptions::new(markdown_width))
-                .get(answer_line_index)
-                .cloned()
-                .unwrap_or_default();
-        spans.extend(markdown_line.spans);
-    } else {
-        spans.push(Span::styled(
-            truncate_to_display_width(detail, available),
-            style,
-        ));
-    }
-    if body_line_index.saturating_add(1) == body_line_count && state.answer.lines().count() > 4 {
-        spans.push(Span::styled(" …", prefix_style));
-    }
-    Line::from_spans(spans)
-}
-
-fn render_inline_session_item(
-    item: &crate::code_review_tui::ReviewAgentSessionItem,
-    width: u16,
-    style: Style,
-    theme: ReviewTheme,
-) -> Line {
-    let marker = if item.degraded {
-        "⚠"
-    } else if item.streaming {
-        "…"
-    } else {
-        "·"
-    };
-    let prefix = format!("   │  {marker} {} ", item.label);
-    let available = width.saturating_sub(
-        u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
-    );
-    let prefix_style = match item.kind {
-        crate::code_review_tui::ReviewAgentSessionItemKind::Assistant => theme.overlay,
-        crate::code_review_tui::ReviewAgentSessionItemKind::Reasoning => {
-            theme.muted.patch(theme.overlay)
-        }
-        crate::code_review_tui::ReviewAgentSessionItemKind::Tool => {
-            theme.focused.patch(theme.overlay)
-        }
-        crate::code_review_tui::ReviewAgentSessionItemKind::ActionNeeded => {
-            theme.diff.hunk.patch(theme.overlay)
-        }
-        crate::code_review_tui::ReviewAgentSessionItemKind::Status => {
-            theme.diff.removed.patch(theme.overlay)
-        }
-    };
-    let content = if item.format == bcode_session_view_models::TextFormat::Markdown {
-        render_markdown_lines(&item.text, MarkdownRenderOptions::new(available.max(1)))
-            .into_iter()
-            .next()
-            .unwrap_or_default()
-    } else {
-        Line::from_spans(vec![Span::styled(
-            truncate_to_display_width(&item.text, usize::from(available)),
-            style,
-        )])
-    };
-    let mut spans = vec![Span::styled(prefix, prefix_style)];
-    spans.extend(content.spans);
+    let mut spans = vec![Span::styled(row.prefix.clone(), prefix_style)];
+    spans.extend(row.content.with_fallback_style(style).spans);
     Line::from_spans(spans)
 }
 
@@ -4262,6 +4127,24 @@ mod tests {
             assert!(comment_editor_title(&editor).contains(label));
             assert!(comment_editor_footer(&editor).contains(&format!("[{label}]")));
         }
+    }
+
+    fn render_inline_session_item(
+        item: &crate::code_review_tui::ReviewAgentSessionItem,
+        width: u16,
+        style: Style,
+        theme: ReviewTheme,
+    ) -> Line {
+        let mut state = crate::code_review_tui::ReviewAgentThreadState::pending(String::new());
+        state.session_items.push(item.clone());
+        let rows = crate::code_review_tui_view::agent_thread_rows(&state, false, width);
+        render_agent_row(
+            rows.iter()
+                .find(|row| row.kind.is_some())
+                .expect("session preview"),
+            style,
+            theme,
+        )
     }
 
     #[test]
