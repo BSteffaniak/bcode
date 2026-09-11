@@ -8,7 +8,7 @@ use bcode_config::{
     AuthCredentialMapping, AuthProfileConfig, BcodeConfig, RuntimeAuthSubscriptions,
 };
 use bcode_provider_auth_models::{AuthMethodContribution, AuthProviderContribution};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Explicit enrollment destination, resolved after frontend review.
@@ -181,16 +181,44 @@ pub fn new_profile_name(
     runtime: &RuntimeAuthSubscriptions,
     provider_id: &str,
 ) -> String {
-    if !config.auth.profiles.contains_key(provider_id)
-        && !runtime.profiles.contains_key(provider_id)
-    {
+    let mut occupied: BTreeSet<&str> = config
+        .auth
+        .profiles
+        .keys()
+        .map(String::as_str)
+        .chain(runtime.profiles.keys().map(String::as_str))
+        .collect();
+    occupied.extend(
+        config
+            .auth
+            .bindings
+            .values()
+            .filter_map(|binding| binding.profile.as_deref()),
+    );
+    occupied.extend(
+        runtime
+            .bindings
+            .values()
+            .map(|binding| binding.profile.as_str()),
+    );
+    occupied.extend(
+        config
+            .auth
+            .pools
+            .values()
+            .flat_map(|pool| pool.profiles.iter().map(String::as_str)),
+    );
+    occupied.extend(runtime.pools.values().flat_map(|pool| {
+        pool.profiles
+            .iter()
+            .map(|profile| profile.auth_profile.as_str())
+    }));
+    if !occupied.contains(provider_id) {
         return provider_id.to_owned();
     }
     for index in 2_u64.. {
         let candidate = format!("{provider_id}-{index}");
-        if !config.auth.profiles.contains_key(&candidate)
-            && !runtime.profiles.contains_key(&candidate)
-        {
+        if !occupied.contains(candidate.as_str()) {
             return candidate;
         }
     }
@@ -237,6 +265,46 @@ pub fn publish(resolved: &ResolvedAuthProfile) -> Result<(), bcode_config::Confi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_account_names_do_not_reuse_pool_members_or_dangling_bindings() {
+        let mut config = BcodeConfig::default();
+        let mut runtime = RuntimeAuthSubscriptions::default();
+        assert_eq!(new_profile_name(&config, &runtime, "custom"), "custom");
+        config.auth.bindings.insert(
+            "provider".to_owned(),
+            bcode_config::AuthBindingConfig {
+                profile: Some("custom".to_owned()),
+            },
+        );
+        runtime.bindings.insert(
+            "provider".to_owned(),
+            bcode_config::RuntimeAuthBinding {
+                profile: "custom-2".to_owned(),
+                owner_plugin_id: "example.plugin".to_owned(),
+            },
+        );
+        config.auth.pools.insert(
+            "declared".to_owned(),
+            bcode_config::AuthPoolConfig {
+                profiles: vec!["custom-3".to_owned()],
+                ..Default::default()
+            },
+        );
+        runtime.pools.insert(
+            "runtime".to_owned(),
+            bcode_config::RuntimeAuthSubscriptionPool {
+                profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
+                    auth_profile: "custom-4".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(new_profile_name(&config, &runtime, "custom"), "custom-5");
+        assert_eq!(runtime.profiles.len(), 0);
+        assert!(config.auth.profiles.is_empty());
+    }
 
     #[test]
     fn existing_account_method_is_checked_before_interactive_effects() {
