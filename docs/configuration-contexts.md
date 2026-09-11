@@ -34,6 +34,6 @@ Resolved context identity crosses effective-config transport. Model profile name
 * Interactive context creation/selection, scoped runtime account registration, adoption review, and durable session context selection are not implemented.
 * Full launch handoff is not atomic with validation. Context switching is not yet a supported live-session operation.
 * Compatibility work must address existing global names that resemble qualified names; the qualification format is not a general credential authorization boundary.
-* Context-local model profiles currently use the existing setup editor, which does not yet target context-local configuration edits.
+* Context-local model-profile selection now uses a reviewed context-targeted edit. The destination file remains explicit; higher-priority overrides may still win.
 
 Do not describe this as complete account isolation or a completed onboarding redesign.

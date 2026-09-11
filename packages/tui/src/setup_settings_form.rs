@@ -47,13 +47,11 @@ impl SetupSettingsForm {
 
     /// Select a configured profile while retaining an explicit, reviewed edit destination.
     pub fn models(path: &std::path::Path, config: &bcode_config::BcodeConfig) -> Self {
-        if config.active_context.is_some() {
-            let mut form = Self::new(path, "model/profile");
-            form.model_profiles = Some(Vec::new());
-            "Context-local model editing requires editing that context's configuration. Esc returns without changing global defaults.".clone_into(&mut form.status);
-            return form;
-        }
-        let mut form = Self::new(path, "model/profile");
+        let key = config.active_context.as_ref().map_or_else(
+            || "model/profile".to_owned(),
+            |context| format!("contexts/entries/{context}/model/profile"),
+        );
+        let mut form = Self::new(path, &key);
         form.focused = 0;
         form.model_profiles = Some(
             config
@@ -283,6 +281,34 @@ auth_profile = "local-account"
         let saved: bcode_config::BcodeConfig =
             toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(saved.model.profile.as_deref(), Some("custom account"));
+    }
+
+    #[test]
+    fn context_picker_edits_only_the_selected_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let mut config = bcode_config::BcodeConfig {
+            active_context: Some("custom-context".to_owned()),
+            ..Default::default()
+        };
+        config.model.profiles.insert(
+            "fast".to_owned(),
+            bcode_config::ModelProfileConfig {
+                provider_plugin_id: "example.provider".to_owned(),
+                model_id: Some("example-model".to_owned()),
+                ..Default::default()
+            },
+        );
+        let mut form = SetupSettingsForm::models(&path, &config);
+        form.submit();
+        assert!(form.pending.is_some());
+        form.submit();
+        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(saved.get("model").is_none());
+        assert_eq!(
+            saved["contexts"]["entries"]["custom-context"]["model"]["profile"].as_str(),
+            Some("fast")
+        );
     }
 
     #[test]

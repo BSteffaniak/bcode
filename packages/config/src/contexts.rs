@@ -218,6 +218,55 @@ scheme = "oauth"
     }
 
     #[test]
+    fn switching_contexts_replaces_selection_without_requalifying_transport() {
+        let mut alpha = fixture("alpha");
+        alpha.contexts.as_mut().unwrap().active = Some("beta".to_owned());
+        let raw = toml::Value::try_from(&alpha).unwrap();
+        let (resolved, _) = crate::resolve_composed_config_value(&raw).unwrap();
+        let beta = crate::validate_config_value(resolved, "switch").unwrap();
+        assert_eq!(beta.active_context.as_deref(), Some("beta"));
+        assert_eq!(beta.model.model_id.as_deref(), Some("model-b"));
+        assert!(
+            !beta
+                .auth
+                .profiles
+                .contains_key(&qualify("alpha", "account").unwrap())
+        );
+        assert_eq!(
+            crate::decode_effective_config(&crate::encode_effective_config(&beta).unwrap())
+                .unwrap()
+                .auth,
+            beta.auth
+        );
+    }
+
+    #[test]
+    fn explicit_storage_sharing_survives_context_resolution() {
+        let mut config = fixture("alpha");
+        let contexts = config.contexts.as_mut().unwrap();
+        for definition in contexts.entries.values_mut() {
+            definition
+                .auth
+                .profiles
+                .get_mut("account")
+                .unwrap()
+                .settings
+                .insert("profile".to_owned(), "shared-storage".to_owned());
+        }
+        for context in ["alpha", "beta"] {
+            config.contexts.as_mut().unwrap().active = Some(context.to_owned());
+            let (resolved, _) =
+                crate::resolve_composed_config_value(&toml::Value::try_from(&config).unwrap())
+                    .unwrap();
+            let selected = crate::validate_config_value(resolved, "shared").unwrap();
+            assert_eq!(
+                selected.auth.profiles[&qualify(context, "account").unwrap()].settings["profile"],
+                "shared-storage"
+            );
+        }
+    }
+
+    #[test]
     fn missing_context_and_invalid_ids_do_not_fallback() {
         for raw in [
             "[contexts]\nactive = 'missing'",

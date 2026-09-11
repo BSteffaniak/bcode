@@ -73,6 +73,20 @@ pub fn plan_field_edit(
     keys: &[String],
     value: Option<toml::Value>,
 ) -> Result<ConfigEdit, ConfigError> {
+    if keys.first().is_some_and(|key| key == "contexts") {
+        let valid =
+            keys.len() == 5 && keys[1] == "entries" && keys[3] == "model" && keys[4] == "profile";
+        if !valid {
+            return Err(invalid(
+                "Only context-local model profile selection is supported by this editor",
+            ));
+        }
+        crate::contexts::qualify(&keys[2], "validation")?;
+        if !matches!(&value, Some(toml::Value::String(name)) if !name.trim().is_empty()) {
+            return Err(invalid("Select a non-empty context-local model profile"));
+        }
+        return plan_validated_field_edit(path, keys, value);
+    }
     if keys.is_empty()
         || keys.iter().any(String::is_empty)
         || matches!(
@@ -108,6 +122,14 @@ pub fn plan_field_edit(
     if !allowed {
         return Err(invalid("This field requires a dedicated domain editor"));
     }
+    plan_validated_field_edit(path, keys, value)
+}
+
+fn plan_validated_field_edit(
+    path: PathBuf,
+    keys: &[String],
+    value: Option<toml::Value>,
+) -> Result<ConfigEdit, ConfigError> {
     let original = read_optional(&path)?;
     let mut document = original
         .as_deref()
@@ -204,6 +226,35 @@ fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_model_edit_preserves_global_and_sibling_selections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let original = "# preserved\n[model]\nprofile = 'global'\n[contexts.entries.alpha.model]\nprofile = 'before'\n[contexts.entries.beta.model]\nprofile = 'sibling'\n";
+        std::fs::write(&path, original).unwrap();
+        let keys = ["contexts", "entries", "alpha", "model", "profile"].map(str::to_owned);
+        let edit = plan_field_edit(
+            path.clone(),
+            &keys,
+            Some(toml::Value::String("after".to_owned())),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        edit.apply().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["model"]["profile"].as_str(), Some("global"));
+        assert_eq!(
+            parsed["contexts"]["entries"]["alpha"]["model"]["profile"].as_str(),
+            Some("after")
+        );
+        assert_eq!(
+            parsed["contexts"]["entries"]["beta"]["model"]["profile"].as_str(),
+            Some("sibling")
+        );
+        assert!(text.starts_with("# preserved"));
+    }
+
     #[test]
     fn preserves_comments_and_rejects_stale_review() {
         let temp = tempfile::tempdir().unwrap();
