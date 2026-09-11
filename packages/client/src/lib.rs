@@ -642,12 +642,14 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
     resolved.auth_pool = selected_auth_pool(&config, &resolved);
-    let provider_context = bcode_provider_auth::resolve_provider_request_context(
+    let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
             selection: resolved.clone(),
         },
-    );
+    ).map_err(|_| ClientError::Protocol(
+        "Required authentication metadata is unreadable or unsupported; inspect authentication state before connecting. No substitute account was selected.".to_owned(),
+    ))?;
     Ok(runtime_context_from_selection(
         working_directory,
         effective_config_toml,

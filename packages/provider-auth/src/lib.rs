@@ -167,17 +167,47 @@ pub fn resolve_provider_request_context(
     )
 }
 
-fn resolve_provider_request_context_with_registry_loader(
+/// Resolve request authentication without treating damaged runtime metadata as empty state.
+///
+/// Registry access is required only for a pool or a profile absent from declarative config.
+///
+/// # Errors
+/// Returns a configuration error before credential materialization if required runtime
+/// metadata is unreadable, oversized, malformed, or unsupported.
+pub fn try_resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
-    load: impl FnOnce() -> bcode_config::RuntimeAuthSubscriptions,
-) -> bcode_model::ProviderRequestContext {
-    let registry = if request.selection.auth_pool.is_some()
+) -> Result<bcode_model::ProviderRequestContext, bcode_config::ConfigError> {
+    try_resolve_with_registry_loader(request, bcode_config::try_load_runtime_auth_subscriptions)
+}
+
+fn request_needs_runtime_registry(request: &ProviderRequestContextResolution<'_>) -> bool {
+    request.selection.auth_pool.is_some()
         || request
             .selection
             .auth_profile
             .as_ref()
             .is_some_and(|name| !request.config.auth.profiles.contains_key(name))
-    {
+}
+
+fn try_resolve_with_registry_loader(
+    request: ProviderRequestContextResolution<'_>,
+    load: impl FnOnce() -> Result<bcode_config::RuntimeAuthSubscriptions, bcode_config::ConfigError>,
+) -> Result<bcode_model::ProviderRequestContext, bcode_config::ConfigError> {
+    let registry = if request_needs_runtime_registry(&request) {
+        load()?
+    } else {
+        bcode_config::RuntimeAuthSubscriptions::default()
+    };
+    Ok(resolve_provider_request_context_with_subscriptions(
+        request, &registry,
+    ))
+}
+
+fn resolve_provider_request_context_with_registry_loader(
+    request: ProviderRequestContextResolution<'_>,
+    load: impl FnOnce() -> bcode_config::RuntimeAuthSubscriptions,
+) -> bcode_model::ProviderRequestContext {
+    let registry = if request_needs_runtime_registry(&request) {
         load()
     } else {
         bcode_config::RuntimeAuthSubscriptions::default()
@@ -1503,6 +1533,43 @@ mod tests {
             assert_eq!(calls, usize::from(owner == Some("example.plugin")));
             assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
         }
+    }
+
+    #[test]
+    fn strict_resolution_propagates_required_registry_failure() {
+        let config = bcode_config::BcodeConfig::default();
+        for selection in [
+            bcode_config::ResolvedModelSelection {
+                auth_profile: Some("runtime-account".to_owned()),
+                ..Default::default()
+            },
+            bcode_config::ResolvedModelSelection {
+                auth_pool: Some("runtime-pool".to_owned()),
+                ..Default::default()
+            },
+        ] {
+            let result = try_resolve_with_registry_loader(
+                ProviderRequestContextResolution {
+                    config: &config,
+                    selection,
+                },
+                || {
+                    Err(bcode_config::ConfigError::Composition {
+                        message: "registry requires maintenance".to_owned(),
+                    })
+                },
+            );
+            assert!(result.is_err());
+        }
+        let context = try_resolve_with_registry_loader(
+            ProviderRequestContextResolution {
+                config: &config,
+                selection: bcode_config::ResolvedModelSelection::default(),
+            },
+            || panic!("unrelated requests must not read auth metadata"),
+        )
+        .unwrap();
+        assert!(context.auth.is_none());
     }
 
     #[test]
