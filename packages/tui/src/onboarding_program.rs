@@ -84,6 +84,17 @@ impl OnboardingProgram {
         })
     }
 
+    fn open_settings(&mut self, context: bool) {
+        self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::new(
+            &bcode_config::default_config_dir().join("bcode.toml"),
+            if context {
+                "contexts/active"
+            } else {
+                "model/profile"
+            },
+        ));
+    }
+
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
         if self.launch_pending {
             self.launch_pending = false;
@@ -123,11 +134,8 @@ impl OnboardingProgram {
             code
         };
         match code {
-            KeyCode::Char('r' | 'g' | 'x') if !self.shell.has_pending_confirmation() => {
-                self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::new(
-                    &bcode_config::default_config_dir().join("bcode.toml"),
-                    "model/profile",
-                ));
+            KeyCode::Char('o' | 'r' | 'g' | 'x') if !self.shell.has_pending_confirmation() => {
+                self.open_settings(code == KeyCode::Char('o'));
                 Ok(Lifecycle::Continue)
             }
             KeyCode::Char('p' | 'a' | 'm') if !self.shell.has_pending_confirmation() => {

@@ -357,9 +357,10 @@ fn resolve_surface_repo_path(
 fn config_override_from_matches(
     matches: &clap::ArgMatches,
 ) -> Option<bcode_config::ConfigOverrideGuard> {
+    let context = matches.get_one::<String>("context");
     let profile = matches.get_one::<String>("profile");
     let request_timeout_secs = matches.get_one::<u64>("request_timeout_secs");
-    if profile.is_none() && request_timeout_secs.is_none() {
+    if profile.is_none() && request_timeout_secs.is_none() && context.is_none() {
         return None;
     }
     let mut override_toml = String::new();
@@ -370,6 +371,15 @@ fn config_override_from_matches(
         use std::fmt::Write as _;
         writeln!(override_toml, "[client]\nrequest_timeout_secs = {timeout}")
             .expect("writing to string should not fail");
+    }
+    if let Some(context) = context {
+        use std::fmt::Write as _;
+        writeln!(
+            override_toml,
+            "\n[contexts]\nactive = {}",
+            toml::Value::String(context.clone())
+        )
+        .expect("writing to string should not fail");
     }
     Some(bcode_config::push_process_config_overrides(
         bcode_config::ConfigLoadOverrides::from_env_with_cli(None, Some(override_toml)),
@@ -3075,6 +3085,9 @@ struct Cli {
     /// Create a new session in a new worktree and open it in the terminal UI.
     #[arg(long, value_name = "NAME", requires = "new")]
     worktree: Option<String>,
+    /// Select a user-defined configuration context for this invocation.
+    #[arg(long, global = true, value_name = "CONTEXT")]
+    context: Option<String>,
     /// Select a model profile from configuration for this client connection.
     #[arg(long, value_name = "MODEL_PROFILE")]
     profile: Option<String>,
@@ -24790,6 +24803,17 @@ mod client_timeout_cli_tests {
     use std::sync::Mutex;
 
     static CONFIG_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn context_selection_is_global_and_accepts_user_defined_names() {
+        for args in [
+            vec!["bcode", "--context", "custom-team"],
+            vec!["bcode", "session", "list", "--context", "custom-team"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.context.as_deref(), Some("custom-team"));
+        }
+    }
 
     #[test]
     fn request_timeout_override_is_visible_to_default_client() {

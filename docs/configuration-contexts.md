@@ -1,6 +1,6 @@
 # Named configuration contexts (initial declarative implementation)
 
-Contexts are user-defined; no names are built in. Keys are stable identities and `label` is optional presentation. Select through a config overlay, for example `BCODE_CONFIG_TOML='[contexts]\nactive = "alpha"'` (supply a real newline in the environment value).
+Contexts are user-defined; no names are built in. Keys are stable identities and `label` is optional presentation. Select for one invocation with `bcode --context alpha` (also accepted after subcommands). This does not write configuration. In onboarding, `o` opens an explicit reviewed `contexts/active` configuration edit; higher-priority command-line selection still wins.
 
 ```toml
 [contexts]

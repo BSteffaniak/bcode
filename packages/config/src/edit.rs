@@ -74,14 +74,25 @@ pub fn plan_field_edit(
     value: Option<toml::Value>,
 ) -> Result<ConfigEdit, ConfigError> {
     if keys.first().is_some_and(|key| key == "contexts") {
-        let valid =
-            keys.len() == 5 && keys[1] == "entries" && keys[3] == "model" && keys[4] == "profile";
+        let selection = keys.len() == 2 && keys[1] == "active";
+        let valid = selection
+            || (keys.len() == 5
+                && keys[1] == "entries"
+                && keys[3] == "model"
+                && keys[4] == "profile");
         if !valid {
             return Err(invalid(
                 "Only context-local model profile selection is supported by this editor",
             ));
         }
-        crate::contexts::qualify(&keys[2], "validation")?;
+        if selection {
+            let Some(toml::Value::String(context)) = &value else {
+                return Err(invalid("Select a context ID explicitly"));
+            };
+            crate::contexts::qualify(context, "validation")?;
+        } else {
+            crate::contexts::qualify(&keys[2], "validation")?;
+        }
         if !matches!(&value, Some(toml::Value::String(name)) if !name.trim().is_empty()) {
             return Err(invalid("Select a non-empty context-local model profile"));
         }
@@ -226,6 +237,23 @@ fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_context_selection_edit_preserves_definitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        std::fs::write(&path, "[contexts]\nactive = 'alpha'\n[contexts.entries.alpha]\nlabel = 'First'\n[contexts.entries.beta]\nlabel = 'Second'\n").unwrap();
+        let edit = plan_field_edit(
+            path.clone(),
+            &["contexts".to_owned(), "active".to_owned()],
+            Some(toml::Value::String("beta".to_owned())),
+        )
+        .unwrap();
+        edit.apply().unwrap();
+        let config = crate::load_config_from_paths(&[path]).unwrap();
+        assert_eq!(config.active_context.as_deref(), Some("beta"));
+        assert_eq!(config.contexts.unwrap().entries.len(), 2);
+    }
+
     #[test]
     fn context_model_edit_preserves_global_and_sibling_selections() {
         let temp = tempfile::tempdir().unwrap();
