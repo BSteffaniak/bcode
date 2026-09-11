@@ -121,7 +121,7 @@ fn entry_line(entry: &TimelineEntry, selected: bool, width: u16, theme: TuiTheme
         theme.muted
     };
     let reserved = TIMESTAMP_WIDTH.saturating_add(4);
-    let preview_width = usize::from(width).saturating_sub(reserved).max(8);
+    let preview_width = usize::from(width).saturating_sub(reserved);
     Line::from_spans(vec![
         Span::styled(marker, accent),
         Span::styled(" ", base),
@@ -129,6 +129,7 @@ fn entry_line(entry: &TimelineEntry, selected: bool, width: u16, theme: TuiTheme
         Span::styled("  ", base),
         Span::styled(markdown_preview(entry.text(), preview_width), base),
     ])
+    .truncate(usize::from(width))
 }
 
 fn format_timestamp(timestamp_ms: u64) -> String {

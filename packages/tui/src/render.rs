@@ -5133,6 +5133,12 @@ fn push_wrapped_styled_text(
 ) {
     let max_width = usize::from(width.max(1));
     let prefix_width = spans_width(&prefix);
+    if prefix_width >= max_width || max_width <= 2 {
+        let mut spans = prefix;
+        spans.push(Span::styled(text, body_style));
+        rows.extend(Line::from_spans(spans).wrap_word(max_width));
+        return;
+    }
     let available_first = max_width.saturating_sub(prefix_width).max(1);
     let available_next = max_width.saturating_sub(2).max(1);
     let continuation_prefix = Span::styled("  ", continuation_style);

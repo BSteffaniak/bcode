@@ -207,6 +207,12 @@ fn push_metadata_row(rows: &mut Vec<Line>, label: &str, value: &str, width: u16,
 fn push_wrapped_rows(rows: &mut Vec<Line>, prefix: &[Span], text: &str, width: u16, style: Style) {
     let max_width = usize::from(width.max(1));
     let prefix_width: usize = prefix.iter().map(|span| display_width(&span.content)).sum();
+    if prefix_width >= max_width || max_width <= 2 {
+        let mut spans = prefix.to_owned();
+        spans.push(Span::styled(text, style));
+        rows.extend(Line::from_spans(spans).wrap_word(max_width));
+        return;
+    }
     let first_width = max_width.saturating_sub(prefix_width).max(1);
     let next_width = max_width.saturating_sub(2).max(1);
     for (index, chunk) in wrap_text_with_continuation(text, first_width, next_width)

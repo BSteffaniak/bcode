@@ -408,7 +408,7 @@ fn model_item(
         Span::raw(CELL_GAP),
         Span::styled(
             pad_right(
-                &truncate_ascii(&row.model_id, widths.model_id),
+                &truncate_column(&row.model_id, widths.model_id),
                 widths.model_id,
             ),
             theme.text.add_modifier(Modifier::BOLD),
@@ -494,7 +494,7 @@ fn format_cells(
 ) -> String {
     [
         marker.to_string(),
-        pad_right(&truncate_ascii(model_id, widths.model_id), widths.model_id),
+        pad_right(&truncate_column(model_id, widths.model_id), widths.model_id),
         pad_left(context, widths.context),
         pad_left(max_output, widths.max_output),
         pad_right(input_price, widths.input_price),
@@ -547,18 +547,12 @@ fn pad_left(text: &str, width: usize) -> String {
     format!("{}{text}", " ".repeat(padding))
 }
 
-fn truncate_ascii(text: &str, width: usize) -> String {
-    if display_width(text) <= width {
-        return text.to_string();
-    }
-    if width <= 1 {
-        return "…".to_string();
-    }
-    format!("{}…", text.chars().take(width - 1).collect::<String>())
+fn truncate_column(text: &str, width: usize) -> String {
+    bmux_tui::text_width::truncate_to_display_width(text, width)
 }
 
 fn display_width(text: &str) -> usize {
-    text.chars().count()
+    bmux_tui::text_width::display_width(text)
 }
 
 fn model_price_cell(
@@ -765,6 +759,15 @@ fn empty_item(message: &str, theme: super::render::TuiTheme) -> ListItem {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unicode_columns_use_terminal_cells() {
+        assert_eq!(super::display_width("界e\u{301}"), 3);
+        for width in 0..10 {
+            let text = super::truncate_column("界👩‍💻abcdef", width);
+            assert!(bmux_tui::text_width::display_width(&text) <= width);
+        }
+    }
+
     use super::*;
 
     fn price(micros: u64) -> ModelTokenPrice {

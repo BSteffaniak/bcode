@@ -171,21 +171,11 @@ fn slash_item_line(item: &SlashItem, selected: bool, width: u16, theme: TuiTheme
             if selected { base } else { theme.muted },
         ),
     ])
+    .truncate(usize::from(width))
 }
 
-fn truncate_end(value: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    output.push('…');
-    output
+fn truncate_end(value: &str, width: usize) -> String {
+    bmux_tui::text_width::truncate_to_display_width(value, width)
 }
 
 fn usize_to_u16_saturating(value: usize) -> u16 {

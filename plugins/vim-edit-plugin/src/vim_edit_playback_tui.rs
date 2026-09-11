@@ -438,12 +438,16 @@ fn truncate(value: &str, width: usize) -> String {
 }
 
 fn pad_rule(prefix: &str, width: u16, fill: char, end: char) -> String {
-    let width = usize::from(width.max(8));
-    let mut value = prefix.to_string();
-    let len = value.chars().count();
-    if len < width.saturating_sub(1) {
-        value.extend(std::iter::repeat_n(fill, width - len - 1));
+    let width = usize::from(width);
+    if width == 0 {
+        return String::new();
     }
+    let mut value = truncate(prefix, width.saturating_sub(1));
+    let used = bmux_tui::text_width::display_width(&value);
+    value.extend(std::iter::repeat_n(
+        fill,
+        width.saturating_sub(used).saturating_sub(1),
+    ));
     value.push(end);
     value
 }
@@ -482,6 +486,17 @@ fn diff_removed() -> Style {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn border_titles_fit_tiny_and_unicode_widths() {
+        for width in 0..30 {
+            let line = super::pad_rule("╭─ 界👩‍💻/long/path", width, '─', '╮');
+            assert_eq!(
+                bmux_tui::text_width::display_width(&line),
+                usize::from(width)
+            );
+        }
+    }
+
     use super::*;
     use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
     use serde_json::json;

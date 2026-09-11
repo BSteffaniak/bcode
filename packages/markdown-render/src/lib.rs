@@ -59,7 +59,6 @@ use pulldown_cmark::{
 };
 use smallvec::{SmallVec, smallvec};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 #[cfg(test)]
@@ -4151,9 +4150,13 @@ impl TerminalMarkdownRenderer {
         let alert_kind = self.alert_kinds.get(blockquote_index).copied().flatten();
         self.next_blockquote_index
             .set(blockquote_index.saturating_add(1));
+        let prefix = Line::raw("│ ")
+            .viewport(0, self.width.saturating_sub(1))
+            .plain_text();
+        let prefix_width = text_display_width(&prefix);
         let mut nested = self.nested(
-            self.width.saturating_sub(2),
-            self.origin_x.saturating_add(2),
+            self.width.saturating_sub(prefix_width),
+            self.origin_x.saturating_add(prefix_width),
             self.origin_y.saturating_add(self.rows.len()),
         );
         nested.render_container_children(container, style);
@@ -4167,14 +4170,15 @@ impl TerminalMarkdownRenderer {
                 Line::from_spans(vec![Span::styled(
                     alert_label(kind),
                     alert_style.patch(self.theme.strong),
-                )]),
+                )])
+                .truncate(self.width.saturating_sub(prefix_width)),
             );
         }
         let border_style = alert_kind.map_or(self.theme.blockquote_bar, |kind| {
             self.theme.alert_style(kind)
         });
         for line in rows {
-            let mut spans = vec![Span::styled("│ ", border_style)];
+            let mut spans = vec![Span::styled(prefix.clone(), border_style)];
             spans.extend(line.spans);
             self.rows.push(Line::from_spans(spans));
         }
@@ -4190,12 +4194,16 @@ impl TerminalMarkdownRenderer {
             .then(|| (self.rows.len(), 0, self.geometry.borrow().len()));
         let header = language.map_or_else(|| "┌─".to_owned(), |language| format!("┌─ {language}"));
         self.rows
-            .push(Line::from_spans(vec![Span::styled(header, border_style)]));
+            .push(Line::from_spans(vec![Span::styled(header, border_style)]).truncate(self.width));
 
-        let nested_width = self.width.saturating_sub(2);
+        let prefix = Line::raw("│ ")
+            .viewport(0, self.width.saturating_sub(1))
+            .plain_text();
+        let prefix_width = text_display_width(&prefix);
+        let nested_width = self.width.saturating_sub(prefix_width);
         let mut nested = self.nested(
             nested_width,
-            self.origin_x.saturating_add(2),
+            self.origin_x.saturating_add(prefix_width),
             self.origin_y.saturating_add(self.rows.len()),
         );
         nested.render_container_children(
@@ -4214,12 +4222,12 @@ impl TerminalMarkdownRenderer {
             code_rows.push(Line::default());
         }
         for line in code_rows {
-            let mut spans = vec![Span::styled("│ ", border_style)];
+            let mut spans = vec![Span::styled(prefix.clone(), border_style)];
             spans.extend(line.spans);
             self.rows.push(Line::from_spans(spans));
         }
         self.rows
-            .push(Line::from_spans(vec![Span::styled("└─", border_style)]));
+            .push(Line::from_spans(vec![Span::styled("└─", border_style)]).truncate(self.width));
         self.ensure_blank_line();
         if language == Some("mermaid") {
             while self
@@ -4276,7 +4284,10 @@ impl TerminalMarkdownRenderer {
     }
 
     fn render_prefixed_list_item(&mut self, item: &Container, style: TextStyle, marker: &str) {
-        let marker_width = text_display_width(marker);
+        let marker = Line::raw(marker)
+            .viewport(0, self.width.saturating_sub(1))
+            .plain_text();
+        let marker_width = text_display_width(&marker);
         let nested_width = self.width.saturating_sub(marker_width);
         let mut nested = self.nested(
             nested_width,
@@ -4294,7 +4305,7 @@ impl TerminalMarkdownRenderer {
         let continuation = " ".repeat(marker_width);
         for (row_index, row) in item_rows.into_iter().enumerate() {
             let prefix = if row_index == 0 {
-                marker
+                &marker
             } else {
                 &continuation
             };
@@ -4490,7 +4501,7 @@ impl TerminalMarkdownRenderer {
                 };
             }
             let content = if style.preserve_whitespace {
-                without_newline.to_owned()
+                without_newline.replace('\t', "    ")
             } else {
                 normalize_inline_whitespace(without_newline)
             };
@@ -4820,27 +4831,9 @@ fn spans_width(spans: &[Span]) -> usize {
         .sum()
 }
 
-/// Return the terminal display width of `text`, expanding tabs to four cells.
-///
-/// This runs once per grapheme during layout, so it uses a single-byte ASCII
-/// fast path and avoids a second scan when no tab is present.
+/// Measure already-normalized display text using BMUX terminal semantics.
 fn text_display_width(text: &str) -> usize {
-    if let [byte] = text.as_bytes() {
-        // Printable single-byte ASCII is one cell; tabs expand to four.
-        if byte.is_ascii_graphic() || *byte == b' ' {
-            return 1;
-        }
-        if *byte == b'\t' {
-            return 4;
-        }
-    }
-    if !text.contains('\t') {
-        return UnicodeWidthStr::width(text);
-    }
-    text.split('\t')
-        .map(UnicodeWidthStr::width)
-        .sum::<usize>()
-        .saturating_add(text.matches('\t').count().saturating_mul(4))
+    bmux_tui::text_width::display_width(text)
 }
 
 #[cfg(test)]
@@ -4857,6 +4850,35 @@ mod tests {
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn tiny_widths_constrain_prefixes_headers_and_link_rectangles() {
+        for width in 1..=12 {
+            for source in [
+                "> [abc](https://example.com)",
+                "1. [abc](https://example.com)",
+                "```verylonglanguage\nabc\n```",
+                "> [!IMPORTANT]\n> abc",
+            ] {
+                let result = render_markdown(source, &MarkdownRenderOptions::new(width));
+                assert!(
+                    result
+                        .lines
+                        .iter()
+                        .all(|row| row.width() <= usize::from(width)),
+                    "{source} at {width}: {:?}",
+                    result.lines
+                );
+                assert!(
+                    result
+                        .geometry
+                        .iter()
+                        .flat_map(|item| &item.rects)
+                        .all(|rect| rect.x.saturating_add(rect.width) <= width)
+                );
+            }
+        }
+    }
 
     fn rendered_text(markdown: &str) -> String {
         render_markdown_lines(markdown, MarkdownRenderOptions::new(80))

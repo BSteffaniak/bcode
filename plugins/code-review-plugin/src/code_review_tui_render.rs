@@ -338,7 +338,8 @@ fn render_header_button(
     style: Style,
 ) -> u16 {
     let text = format!("[{label}]");
-    let width = u16::try_from(text.chars().count().saturating_add(1)).unwrap_or(u16::MAX);
+    let width = u16::try_from(bmux_tui::text_width::display_width(&text).saturating_add(1))
+        .unwrap_or(u16::MAX);
     let rect = Rect::new(x, y, width.saturating_sub(1), 1);
     frame.write_line_with_fallback_style(
         LocalRect::terminal(rect),
@@ -2066,7 +2067,9 @@ fn render_inline_comment_line(
     let prefix_style = theme.diff.hunk.patch(theme.overlay);
     let prefix = format!("   {branch} {label:<6} ");
     let markdown_width = width
-        .saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX))
+        .saturating_sub(
+            u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
+        )
         .max(1);
     let markdown_line =
         render_markdown_lines(&comment.body, MarkdownRenderOptions::new(markdown_width))
@@ -2099,7 +2102,9 @@ fn render_inline_suggestion_line(
     };
     let label = if body_line_index == 0 { status } else { "" };
     let prefix = format!("   {branch} {label:<8} ");
-    let available = width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX));
+    let available = width.saturating_sub(
+        u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
+    );
     let line = suggestion
         .body
         .lines()
@@ -2185,9 +2190,9 @@ fn render_inline_agent_thread_line(
             .unwrap_or_default()
     };
     let is_answer = body_line_index >= metadata_count.saturating_add(visible_session_items);
-    let available = usize::from(
-        width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX)),
-    );
+    let available = usize::from(width.saturating_sub(
+        u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
+    ));
     let mut spans = vec![Span::styled(prefix, prefix_style)];
     if is_answer {
         let markdown_width = u16::try_from(available).unwrap_or(u16::MAX).max(1);
@@ -2223,7 +2228,9 @@ fn render_inline_session_item(
         "·"
     };
     let prefix = format!("   │  {marker} {} ", item.label);
-    let available = width.saturating_sub(u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX));
+    let available = width.saturating_sub(
+        u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
+    );
     let prefix_style = match item.kind {
         crate::code_review_tui::ReviewAgentSessionItemKind::Assistant => theme.overlay,
         crate::code_review_tui::ReviewAgentSessionItemKind::Reasoning => {
@@ -3500,7 +3507,8 @@ fn register_comment_action_region(
     label: &'static str,
     action: crate::code_review_tui::ReviewMouseAction,
 ) -> u16 {
-    let width = u16::try_from(label.len().saturating_add(2)).unwrap_or(u16::MAX);
+    let width = u16::try_from(bmux_tui::text_width::display_width(label).saturating_add(2))
+        .unwrap_or(u16::MAX);
     app.register_mouse_region(Rect::new(x, y, width, 1), action, label);
     x.saturating_add(width).saturating_add(1)
 }
