@@ -230,7 +230,11 @@ fn validate_runtime_pool_selection(
         return Err(invalid());
     }
     for name in &order.profiles {
-        if request.config.auth.profiles.contains_key(name) {
+        if let Some(profile) = request.config.auth.profiles.get(name) {
+            validate_declared_request_owner(
+                profile,
+                request.selection.provider_plugin_id.as_deref(),
+            )?;
             continue;
         }
         if runtime_pool_candidate_profile(
@@ -248,6 +252,22 @@ fn validate_runtime_pool_selection(
     Ok(())
 }
 
+fn validate_declared_request_owner(
+    profile: &bcode_config::AuthProfileConfig,
+    selected_owner: Option<&str>,
+) -> Result<(), bcode_config::ConfigError> {
+    // Legacy declarative profiles may omit ownership. A supplied owner, however,
+    // must never be ignored when routing credentials to a provider plugin.
+    if let Some(owner) = profile.owner_plugin_id.as_deref()
+        && (owner.trim().is_empty() || Some(owner) != selected_owner)
+    {
+        return Err(bcode_config::ConfigError::Composition {
+            message: "Selected authentication profile belongs to a different or unselected provider plugin; review the model's account selection.".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_runtime_account_selection(
     request: &ProviderRequestContextResolution<'_>,
     registry: &bcode_config::RuntimeAuthSubscriptions,
@@ -255,8 +275,11 @@ fn validate_runtime_account_selection(
     let Some(name) = request.selection.auth_profile.as_deref() else {
         return Ok(());
     };
-    if request.config.auth.profiles.contains_key(name) {
-        return Ok(());
+    if let Some(profile) = request.config.auth.profiles.get(name) {
+        return validate_declared_request_owner(
+            profile,
+            request.selection.provider_plugin_id.as_deref(),
+        );
     }
     if selected_runtime_auth_profile(
         request.config,
@@ -1612,6 +1635,47 @@ mod tests {
             );
             assert_eq!(calls, usize::from(owner == Some("example.plugin")));
             assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
+        }
+    }
+
+    #[test]
+    fn strict_selection_checks_declared_ownership_for_primary_and_pool_members() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.profiles.insert(
+            "account".to_owned(),
+            bcode_config::AuthProfileConfig {
+                backend: "env".to_owned(),
+                owner_plugin_id: Some("example.plugin".to_owned()),
+                ..Default::default()
+            },
+        );
+        config.auth.pools.insert(
+            "pool".to_owned(),
+            bcode_config::AuthPoolConfig {
+                profiles: vec!["account".to_owned()],
+                ..Default::default()
+            },
+        );
+        let registry = bcode_config::RuntimeAuthSubscriptions::default();
+        for owner in [None, Some("foreign.plugin"), Some("example.plugin")] {
+            let request = ProviderRequestContextResolution {
+                config: &config,
+                selection: bcode_config::ResolvedModelSelection {
+                    provider_plugin_id: owner.map(str::to_owned),
+                    auth_profile: Some("account".to_owned()),
+                    auth_pool: Some("pool".to_owned()),
+                    ..Default::default()
+                },
+            };
+            let expected = owner == Some("example.plugin");
+            assert_eq!(
+                validate_runtime_account_selection(&request, &registry).is_ok(),
+                expected
+            );
+            assert_eq!(
+                validate_runtime_pool_selection(&request, &registry).is_ok(),
+                expected
+            );
         }
     }
 
