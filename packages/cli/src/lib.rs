@@ -2966,7 +2966,7 @@ fn init_tracing() {
             } else {
                 // Background daemons are otherwise silent; lifecycle transitions that explain why
                 // a daemon is still alive are low-volume and always worth a log line.
-                "off,bcode_server::idle_shutdown=info".to_string()
+                "off,bcode_server::idle_shutdown=info,bcode_server::session_stream=info,bcode_tui::session_stream=info".to_string()
             }
         });
     let (env_filter, invalid_filter) = match tracing_subscriber::EnvFilter::try_new(filter) {

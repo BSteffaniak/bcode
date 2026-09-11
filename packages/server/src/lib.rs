@@ -179,6 +179,7 @@ const CATALOG_EVENT_BROADCAST_BATCH_SIZE: usize = 16;
 struct ResponseWriter {
     writer: Mutex<WriteHalf<LocalIpcStream>>,
     metrics: MetricsRegistry,
+    disconnect: Notify,
 }
 
 pub(crate) type SharedWriter = Arc<ResponseWriter>;
@@ -485,6 +486,12 @@ impl ClientEventSink {
             labels.clone(),
         );
         if result.is_err() {
+            // A timed-out write may have emitted a partial frame. Never keep that
+            // connection alive or let the client wait on a dead subscription.
+            self.writer.disconnect.notify_one();
+            tracing::warn!(target: "bcode_server::session_stream", client_id = %self.client_id,
+                event_kind, elapsed_ms = elapsed.as_millis(),
+                "event delivery failed; disconnecting client for resynchronization");
             self.metrics
                 .add_counter_with_labels("ipc.event_send.errors_total", 1, labels);
         }
@@ -4997,6 +5004,7 @@ async fn handle_registered_client(
     let writer = Arc::new(ResponseWriter {
         writer: Mutex::new(writer),
         metrics: state.metrics.clone(),
+        disconnect: Notify::new(),
     });
     let mut attached_session: Option<SessionId> = None;
 
@@ -5004,6 +5012,7 @@ async fn handle_registered_client(
         let received = tokio::select! {
             biased;
             _ = shutdown.recv() => break,
+            () = writer.disconnect.notified() => break,
             envelope = recv_envelope(&mut reader) => envelope,
         };
         let envelope = match received {
@@ -33266,6 +33275,19 @@ async fn send_active_runtime_snapshots(
     Ok(())
 }
 
+struct SessionForwarderLifetime {
+    writer: SharedWriter,
+    session_id: SessionId,
+}
+
+impl Drop for SessionForwarderLifetime {
+    fn drop(&mut self) {
+        self.writer.disconnect.notify_one();
+        tracing::info!(target: "bcode_server::session_stream", session_id = %self.session_id,
+            "session event forwarder ended; connection invalidated");
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Durable/live selection, coalescing, bounds, and resync remain one ordered client loop.
 fn forward_session_events(
     sink: ClientEventSink,
@@ -33274,6 +33296,10 @@ fn forward_session_events(
     mut live_events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionLiveEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let _lifetime = SessionForwarderLifetime {
+            writer: Arc::clone(&sink.writer),
+            session_id,
+        };
         let mut pending_live = PendingLiveEventBuffer::default();
         let flush_timer = tokio::time::sleep(SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL);
         tokio::pin!(flush_timer);
@@ -56150,6 +56176,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         // Keep one attachment alive while replacing the observed connection. A final detach is a
         // session-unload boundary and correctly clears transient state rather than replaying it.
+        state.abort_client_forwarders(client_id).await;
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // Already buffered events may precede EOF, but no new producer remains.
+            while connection.recv_event_without_reconnect().await.is_ok() {}
+        })
+        .await
+        .expect("forwarder termination closes transport");
         drop(connection);
         let mut reconnected = client
             .connect("session-view-reconnect-test")

@@ -408,6 +408,27 @@ async fn flush_superseded_progress(
     true
 }
 
+// The receive future owns partial IPC framing state. Presentation timers must
+// never cancel it; only closing the entire stream may abandon an in-flight read.
+async fn receive_with_progress_flush<T>(
+    receive: impl std::future::Future<Output = T>,
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    pending: &mut BTreeMap<SupersedableEventKey, BcodeEvent>,
+    mut timer: std::pin::Pin<&mut tokio::time::Sleep>,
+) -> Option<T> {
+    tokio::pin!(receive);
+    loop {
+        tokio::select! {
+            event = &mut receive => return Some(event),
+            () = sender.closed() => return None,
+            () = &mut timer, if !pending.is_empty() => {
+                if !flush_superseded_progress(sender, pending).await { return None; }
+                timer.as_mut().reset(tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
+            }
+        }
+    }
+}
+
 async fn reconnecting_event_stream<F>(
     client: BcodeClient,
     session_id: SessionId,
@@ -436,18 +457,15 @@ async fn reconnecting_event_stream<F>(
     let progress_flush = tokio::time::sleep(SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
     tokio::pin!(progress_flush);
     loop {
-        let received = tokio::select! {
-            event = connection.recv_event() => Some(event),
-            () = &mut progress_flush, if !pending_progress.is_empty() => None,
-        };
-        let Some(received) = received else {
-            if !flush_superseded_progress(&event_sender, &mut pending_progress).await {
-                return;
-            }
-            progress_flush
-                .as_mut()
-                .reset(tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
-            continue;
+        let Some(received) = receive_with_progress_flush(
+            connection.recv_event_without_reconnect(),
+            &event_sender,
+            &mut pending_progress,
+            progress_flush.as_mut(),
+        )
+        .await
+        else {
+            return;
         };
         let needs_resync = match received {
             Ok(BcodeEvent::SessionViewResyncRequired {
@@ -482,7 +500,12 @@ async fn reconnecting_event_stream<F>(
                 }
                 false
             }
-            Err(_error) => true,
+            Err(error) => {
+                tracing::warn!(target: "bcode_tui::session_stream", %session_id,
+                    transport_unavailable = error.is_daemon_unavailable(),
+                    "session receive failed; starting bounded resynchronization");
+                true
+            }
         };
         if !needs_resync {
             continue;
@@ -516,6 +539,8 @@ async fn reconnecting_event_stream<F>(
                         {
                             return;
                         }
+                        tracing::info!(target: "bcode_tui::session_stream", %session_id,
+                            "session event stream resynchronized");
                         connection = next_connection;
                         reconnect_delay = std::time::Duration::from_millis(100);
                         break;
@@ -523,6 +548,9 @@ async fn reconnecting_event_stream<F>(
                 }
                 Err(_error) => {}
             }
+            tracing::warn!(target: "bcode_tui::session_stream", %session_id,
+                retry_delay_ms = reconnect_delay.as_millis(),
+                "session reconnect or attachment failed; retrying");
             tokio::time::sleep(reconnect_delay).await;
             reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
         }
@@ -532,6 +560,56 @@ async fn reconnecting_event_stream<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn progress_flush_preserves_partial_ipc_frame() {
+        use tokio::io::AsyncWriteExt as _;
+        let session_id = SessionId::new();
+        let event = lifecycle_event(
+            session_id,
+            1,
+            bcode_session_models::ToolInvocationLifecycleStage::Progress,
+        );
+        let mut pending = BTreeMap::new();
+        pending.insert(supersedable_event_key(&event).expect("progress key"), event);
+        let envelope = bcode_ipc::request_envelope(1, &bcode_ipc::Request::Ping).expect("envelope");
+        let bytes = bcode_ipc::encode_envelope_frames(&envelope)
+            .expect("frames")
+            .concat();
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        writer.write_all(&bytes[..4]).await.expect("header");
+        let (sender, mut receiver) = session_stream_channel();
+        let timer = tokio::time::sleep(std::time::Duration::from_millis(5));
+        tokio::pin!(timer);
+        let deliver = async {
+            receiver
+                .recv()
+                .await
+                .expect("progress flushed during partial read");
+            writer
+                .write_all(&bytes[4..])
+                .await
+                .expect("remaining frame");
+        };
+        let read = receive_with_progress_flush(
+            bcode_ipc::recv_envelope(&mut reader),
+            &sender,
+            &mut pending,
+            timer.as_mut(),
+        );
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(read, deliver)
+        })
+        .await
+        .expect("read completed");
+        assert_eq!(
+            result
+                .expect("stream open")
+                .expect("valid envelope")
+                .payload,
+            envelope.payload
+        );
+    }
 
     fn lifecycle_event(
         session_id: SessionId,

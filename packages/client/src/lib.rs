@@ -6092,6 +6092,23 @@ impl ClientConnection {
         )
     }
 
+    /// Receive without implicit reconnection, allowing the caller to expose continuity loss.
+    ///
+    /// # Errors
+    /// Returns transport or decoding errors. Keep the future alive until completion;
+    /// cancelling a partial envelope read requires discarding this connection.
+    pub async fn recv_event_without_reconnect(&mut self) -> Result<Event, ClientError> {
+        loop {
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(event);
+            }
+            let envelope = recv_envelope(&mut self.stream).await?;
+            if envelope.kind == EnvelopeKind::Event {
+                return decode_event(&envelope.payload).map_err(ClientError::from);
+            }
+        }
+    }
+
     /// Receive the next server event.
     ///
     /// # Errors

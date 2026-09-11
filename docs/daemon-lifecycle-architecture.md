@@ -13,6 +13,25 @@ Bcode daemon availability is split across explicit owners:
 
 The embedded plugin-surface server is a separate explicit integration mode. It does not publish a normal daemon record and is not an availability fallback.
 
+## Session stream continuity and diagnostics
+
+The TUI retains an in-flight IPC receive across progress-flush timers. Framed reads
+are not cancellation-safe: abandoning one requires discarding the connection, not
+starting a fresh read on the remaining payload bytes. The TUI uses explicit receive
+errors to display resynchronization before reconnecting and loading bounded state.
+
+Failed event writes invalidate the connection, including writes interrupted by the
+send deadline. Session forwarder exit or cancellation also invalidates its connection;
+a live socket must not conceal a dead session subscription. Normal session execution
+is independent of this client transport teardown.
+
+Default background/client tracing enables `bcode_server::session_stream` and
+`bcode_tui::session_stream` at info level in the namespace-specific daemon log.
+Diagnostics include session/client identifiers, event category, retry delay, and
+recovery transitions, but not event payloads or raw provider/tool errors. Explicit
+`BCODE_LOG` or `RUST_LOG` filters override these defaults. These logs complement
+`ipc.event_send.errors_total`; they do not constitute durable stream acknowledgments.
+
 ## Request-scoped provider execution
 
 * **`bcode_model::ProviderRequestContext`** owns the complete per-turn provider profile. When that
