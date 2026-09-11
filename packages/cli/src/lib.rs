@@ -4920,6 +4920,9 @@ struct VerifyImagesArgs {
     /// Exact expected answer, kept out of model requests and reports.
     #[arg(long)]
     expected_answer: Option<String>,
+    /// Probe an image in a correlated tool result instead of a user message.
+    #[arg(long)]
+    tool_result: bool,
     /// Authorize provider-side conversation storage for the continuation probe.
     #[arg(long)]
     allow_conversation_storage: bool,
@@ -10994,6 +10997,11 @@ async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
                     provider_context,
                     model,
                     image: image.clone(),
+                    source: if args.tool_result {
+                        bcode_model_provider_runtime::image_verification::ImageVerificationSource::ToolResult
+                    } else {
+                        bcode_model_provider_runtime::image_verification::ImageVerificationSource::User
+                    },
                     question: args.question.clone().unwrap_or_default(),
                     expected_answer: args.expected_answer.clone().unwrap_or_default(),
                     allow_conversation_storage: args.allow_conversation_storage,

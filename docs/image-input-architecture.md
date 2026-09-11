@@ -9,7 +9,9 @@ themselves, and prompt-cache savings are distinct from transport savings.
 Implemented first slice:
 
 * `bcode model verify-images`: bounded provider-operation probes for image acknowledgement,
-  inline follow-up, repeated inline follow-up, and explicitly authorized continuation.
+  inline follow-up, repeated inline follow-up, and explicitly authorized continuation. Add
+  `--tool-result` to test correlated tool-result image history rather than user images; this
+  requires independent provider and model `ToolResultImage` claims. No host tool is executed.
 * OpenAI-compatible JSON request-body byte observations at the send boundary. Each attempt
   constructs and serializes its body once; the measured byte buffer is passed directly to HTTP.
   Local HTTP capture tests compare observations with received image-bearing bodies for both
@@ -20,7 +22,7 @@ Implemented first slice:
 
 Not implemented or verified by this slice: provider uploads/file IDs, authorized hosted URLs,
 request compression, lazy image hydration, durable reference lifecycle, automatic generated visual
-fixtures, tool-result/multiple-image probes, daemon restart/fault evals, and live provider results.
+fixtures, multiple-image probes, daemon restart/fault evals, and live provider results.
 No provider capability claims have been upgraded based on offline tests.
 
 ## Ownership and target request pipeline
@@ -113,7 +115,8 @@ This prevents an earlier assistant description from trivially answering the late
 Exact trimmed, ASCII-case-insensitive matching is intentionally simple: use an unambiguous fixture
 and short answer. A model's verbal answer alone is not proof of identical image processing.
 
-Reports use schema version 1. Readers must reject unknown report versions. Cases distinguish
+Reports use schema version 1, with an additive `source` field identifying user or tool-result
+images (absent in older reports means user). Readers must reject unknown report versions. Cases distinguish
 passed, failed, inconclusive, blocked, and unsupported. Zero process exit means no executed
 assertion failed; it does not turn unsupported/inconclusive cases into passes. No selected models
 or an invocation/cleanup failure produces a command error.
