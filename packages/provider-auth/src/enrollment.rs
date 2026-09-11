@@ -36,6 +36,11 @@ pub enum EnrollmentError {
     /// Registration or requested method is inconsistent.
     #[error("Authentication registration or method is invalid")]
     InvalidMethod,
+    /// Reusing a profile cannot silently change its credential destination.
+    #[error(
+        "Existing account uses a different vault; choose a new profile or explicitly migrate the account"
+    )]
+    DestinationConflict,
     /// Existing profile ownership cannot be established.
     #[error(transparent)]
     Profile(#[from] AuthProfileResolutionError),
@@ -82,6 +87,14 @@ pub fn prepare(
             )
             .map_err(|_| EnrollmentError::InvalidMethod)?;
             if let Some(vault) = vault {
+                let existing_vault = resolved
+                    .profile
+                    .settings
+                    .get("vault")
+                    .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
+                if vault != existing_vault {
+                    return Err(EnrollmentError::DestinationConflict);
+                }
                 resolved
                     .profile
                     .settings
@@ -100,6 +113,7 @@ pub fn prepare(
         }
         Err(AuthProfileResolutionError::MissingProfile { .. }) => {
             let name = profile.unwrap_or_else(|| provider.provider_id.clone());
+            validate_enrollment_binding(runtime, &provider.provider_id, owner_plugin_id, &name)?;
             let vault = vault.unwrap_or_else(bcode_config::default_auth_vault_path);
             let mut settings = BTreeMap::from([
                 ("profile".to_owned(), name.clone()),
@@ -138,6 +152,25 @@ pub fn prepare(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn validate_enrollment_binding(
+    runtime: &RuntimeAuthSubscriptions,
+    provider_id: &str,
+    owner: &str,
+    name: &str,
+) -> Result<(), EnrollmentError> {
+    if let Some(binding) = runtime.bindings.get(provider_id)
+        && binding.owner_plugin_id != owner
+    {
+        return Err(AuthProfileResolutionError::OwnerMismatch {
+            profile: name.to_owned(),
+            expected: owner.to_owned(),
+            actual: binding.owner_plugin_id.clone(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Allocate a default name for a new account without reusing existing metadata.
@@ -257,5 +290,45 @@ mod tests {
         )
         .expect("matching owned method");
         assert!(!prepared.publish_runtime);
+        let conflict = prepare(
+            &config,
+            &RuntimeAuthSubscriptions::default(),
+            &provider,
+            "bcode.example",
+            "browser",
+            EnrollmentDestination {
+                profile: Some("account".to_owned()),
+                vault: Some(PathBuf::from("different-vault")),
+                recipient_key: None,
+            },
+        );
+        assert!(matches!(
+            conflict,
+            Err(EnrollmentError::DestinationConflict)
+        ));
+        let runtime = RuntimeAuthSubscriptions {
+            bindings: BTreeMap::from([(
+                "example".to_owned(),
+                bcode_config::RuntimeAuthBinding {
+                    profile: "foreign-account".to_owned(),
+                    owner_plugin_id: "foreign.plugin".to_owned(),
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            prepare(
+                &config,
+                &runtime,
+                &provider,
+                "bcode.example",
+                "browser",
+                EnrollmentDestination {
+                    profile: Some("new-account".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
     }
 }
