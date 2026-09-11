@@ -433,16 +433,8 @@ fn header(title: &str) -> Line {
     )
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    output.push('…');
-    output
+fn truncate(value: &str, width: usize) -> String {
+    bcode_tui_components::compact::truncate_width(value, width)
 }
 
 fn pad_rule(prefix: &str, width: u16, fill: char, end: char) -> String {

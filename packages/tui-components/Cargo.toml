@@ -16,12 +16,11 @@ path              = "src/bin/bcode_terminal_grid_probe.rs"
 required-features = ["terminal-viewer"]
 
 [dependencies]
-bcode_syntax_render  = { workspace = true, optional = true }
-bmux_terminal_grid   = { workspace = true, optional = true }
-bmux_tui             = { workspace = true }
-bmux_tui_components  = { workspace = true }
-unicode-segmentation = { workspace = true, optional = true }
-unicode-width        = { workspace = true, optional = true }
+bcode_syntax_render = { workspace = true, optional = true }
+bmux_terminal_grid  = { workspace = true, optional = true }
+bmux_tui            = { workspace = true }
+bmux_tui_components = { workspace = true }
+unicode-width       = { workspace = true, optional = true }
 
 [features]
 activity = []
@@ -39,7 +38,7 @@ all = [
     "tool-card",
     "transcript",
 ]
-chrome = ["dep:unicode-segmentation"]
+chrome = []
 compact = ["bmux_tui_components/compact"]
 composer = []
 default = []
@@ -47,11 +46,7 @@ diff-viewer = ["bmux_tui_components/diff-viewer"]
 fail-on-warnings = []
 permission = ["bmux_tui_components/modal-frame"]
 setup = []
-source-preview = [
-    "source-viewer",
-    "dep:unicode-segmentation",
-    "dep:unicode-width",
-]
+source-preview = ["source-viewer", "dep:unicode-width"]
 source-viewer = ["bmux_tui_components/source-viewer"]
 syntax = [
     "dep:bcode_syntax_render",

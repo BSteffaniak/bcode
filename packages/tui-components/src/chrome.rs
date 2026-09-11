@@ -2,7 +2,6 @@
 
 use bmux_tui::prelude::{Span, Style};
 use bmux_tui::text_width::display_width;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// One semantic Bcode chrome segment.
 #[derive(Debug, Clone)]
@@ -146,16 +145,10 @@ fn truncate_chrome_part(part: &str, max_width: usize) -> String {
     if max_width == 1 {
         return "…".to_owned();
     }
-    let mut suffix = String::new();
-    let mut width = 1_usize;
-    for grapheme in part.graphemes(true).rev() {
-        let grapheme_width = display_width(grapheme);
-        if width.saturating_add(grapheme_width) > max_width {
-            break;
-        }
-        suffix.insert_str(0, grapheme);
-        width = width.saturating_add(grapheme_width);
-    }
+    let available = max_width.saturating_sub(1);
+    let suffix = bmux_tui::text::Line::raw(part)
+        .viewport(display_width(part).saturating_sub(available), available)
+        .plain_text();
     format!("…{suffix}")
 }
 

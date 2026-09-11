@@ -40,6 +40,21 @@ including `scroll-view`, `selectable-list`, and `text-input`.
 BMUX dependencies continue to follow `branch = "master"`. Cargo.lock records the resolved published
 commit; no local path override or fixed `rev` dependency is required.
 
+## Markdown text layout
+
+The terminal Markdown adapter collects styled logical lines and contribution byte ranges.
+BMUX `TextBlock::projection` supplies both wrapped visual rows and their source ranges;
+inline contribution rectangles are derived from that same projection after the whole
+logical line is known. Bcode retains Markdown interpretation and source provenance, not
+word-breaking or character-wrapping mechanics. Reserved image/diagram rows remain
+explicit presentation reservations.
+
+Transcript producers resolve their content width before layout. Container decoration
+preserves content row count and clips residual overflow rather than reflowing measured
+rows and invalidating selection, link, or anchor geometry. Source previews and compact
+chrome likewise delegate cell-aware clipping to BMUX, retaining Bcode's preview limits
+and prefix/suffix presentation choices.
+
 ## Theme ownership
 
 Terminal presentation is derived from the active versioned theme definition described in

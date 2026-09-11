@@ -3794,31 +3794,15 @@ impl TextStyle {
     }
 }
 
-/// Position of an in-progress word inside the row being emitted.
-///
-/// A word can begin partway through a span because same-style graphemes are
-/// coalesced, so the anchor records a byte offset as well as a span index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WordAnchor {
-    /// Index of the span containing the word start.
-    span_index: usize,
-    /// Byte offset of the word start within that span.
-    byte_offset: usize,
-    /// Display column where the word starts.
-    column: usize,
-}
-
 #[derive(Debug)]
 struct TerminalMarkdownRenderer {
     width: usize,
     rows: Vec<Line>,
     current_spans: Vec<Span>,
-    current_width: usize,
-    /// Start of the in-progress word on the current row, as
-    /// `(index into current_spans, starting display column)`.
-    ///
-    /// `None` means no word is open, so the next break may happen freely.
-    word_start: Option<WordAnchor>,
+    current_bytes: usize,
+    wrap: bmux_tui::text::TextWrap,
+    active_geometry: Vec<usize>,
+    pending_geometry: Vec<(Range<usize>, Vec<usize>)>,
     geometry: Rc<RefCell<Vec<MarkdownContributionGeometry>>>,
     heading_rows: Rc<RefCell<Vec<u16>>>,
     origin_x: usize,
@@ -3848,8 +3832,10 @@ impl TerminalMarkdownRenderer {
             width: usize::from(width.max(1)),
             rows: Vec::new(),
             current_spans: Vec::new(),
-            current_width: 0,
-            word_start: None,
+            current_bytes: 0,
+            wrap: bmux_tui::text::TextWrap::Word,
+            active_geometry: Vec::new(),
+            pending_geometry: Vec::new(),
             geometry: Rc::new(RefCell::new(Vec::new())),
             heading_rows: Rc::new(RefCell::new(Vec::new())),
             origin_x: 0,
@@ -3871,8 +3857,10 @@ impl TerminalMarkdownRenderer {
             width: width.max(1),
             rows: Vec::new(),
             current_spans: Vec::new(),
-            current_width: 0,
-            word_start: None,
+            current_bytes: 0,
+            wrap: bmux_tui::text::TextWrap::Word,
+            active_geometry: Vec::new(),
+            pending_geometry: Vec::new(),
             geometry: Rc::clone(&self.geometry),
             heading_rows: Rc::clone(&self.heading_rows),
             origin_x,
@@ -4020,11 +4008,22 @@ impl TerminalMarkdownRenderer {
         }
     }
 
+    fn begin_geometry(&mut self, kind: &str) -> usize {
+        let index = self.geometry.borrow().len();
+        self.geometry
+            .borrow_mut()
+            .push(MarkdownContributionGeometry {
+                contribution_id: kind.to_owned(),
+                rects: Vec::new(),
+            });
+        self.active_geometry.push(index);
+        index
+    }
+
     fn render_marked_children(&mut self, container: &Container, style: TextStyle, kind: &str) {
-        let start_row = self.rows.len();
-        let start_column = self.current_width;
+        self.begin_geometry(kind);
         self.render_container_children(container, style);
-        self.record_geometry(kind, start_row, start_column);
+        self.active_geometry.pop();
     }
 
     fn render_marked_reserved_text(
@@ -4035,63 +4034,48 @@ impl TerminalMarkdownRenderer {
         reserved_rows: usize,
     ) {
         let start_row = self.rows.len();
-        let start_column = self.current_width;
+        let index = self.begin_geometry(kind);
         self.push_text(text, style);
-        if reserved_rows <= 1 {
-            self.record_geometry(kind, start_row, start_column);
-            return;
+        self.active_geometry.pop();
+        if reserved_rows > 1 {
+            self.flush_line();
+            while self.rows.len().saturating_sub(start_row) < reserved_rows {
+                self.geometry.borrow_mut()[index]
+                    .rects
+                    .push(markdown_cell_rect(
+                        self.origin_x,
+                        self.origin_y.saturating_add(self.rows.len()),
+                        1,
+                    ));
+                self.rows.push(Line::from_spans(vec![Span::raw(" ")]));
+            }
         }
-        self.flush_line();
-        while self.rows.len().saturating_sub(start_row) < reserved_rows {
-            self.rows.push(Line::from_spans(vec![Span::raw(" ")]));
-        }
-        self.record_geometry(kind, start_row, start_column);
     }
 
     fn record_geometry(&self, kind: &str, start_row: usize, start_column: usize) {
-        let end_row = self.rows.len();
-        let mut rects = Vec::new();
-        if start_row == end_row {
-            let width = self.current_width.saturating_sub(start_column);
-            if width > 0 {
-                rects.push(markdown_cell_rect(start_column, start_row, width));
-            }
-        } else {
-            if let Some(first) = self.rows.get(start_row) {
-                let width = spans_width(&first.spans).saturating_sub(start_column);
-                if width > 0 {
-                    rects.push(markdown_cell_rect(start_column, start_row, width));
-                }
-            }
-            for row in start_row.saturating_add(1)..end_row {
-                if let Some(line) = self.rows.get(row) {
-                    let width = spans_width(&line.spans);
-                    if width > 0 {
-                        rects.push(markdown_cell_rect(0, row, width));
-                    }
-                }
-            }
-            if self.current_width > 0 {
-                rects.push(markdown_cell_rect(0, end_row, self.current_width));
-            }
-        }
-        if !rects.is_empty() {
-            for rect in &mut rects {
-                rect.x = rect
-                    .x
-                    .saturating_add(u16::try_from(self.origin_x).unwrap_or(u16::MAX));
-                rect.y = rect
-                    .y
-                    .saturating_add(u16::try_from(self.origin_y).unwrap_or(u16::MAX));
-            }
-            debug_assert!(rects.iter().all(|rect| rect.width > 0 && rect.height == 1));
-            self.geometry
-                .borrow_mut()
-                .push(MarkdownContributionGeometry {
-                    contribution_id: kind.to_owned(),
-                    rects,
-                });
-        }
+        let rects = self
+            .rows
+            .iter()
+            .enumerate()
+            .skip(start_row)
+            .filter_map(|(row, line)| {
+                let column = if row == start_row { start_column } else { 0 };
+                let width = line.width().saturating_sub(column);
+                (width > 0).then(|| {
+                    markdown_cell_rect(
+                        self.origin_x.saturating_add(column),
+                        self.origin_y.saturating_add(row),
+                        width,
+                    )
+                })
+            })
+            .collect();
+        self.geometry
+            .borrow_mut()
+            .push(MarkdownContributionGeometry {
+                contribution_id: kind.to_owned(),
+                rects,
+            });
     }
 
     fn render_input(&mut self, input: &Input, style: TextStyle) {
@@ -4202,13 +4186,8 @@ impl TerminalMarkdownRenderer {
         self.ensure_blank_line();
         let border_style = self.theme.code_block_border;
         let language = container.data.get("language").map(String::as_str);
-        let geometry_start = (language == Some("mermaid")).then(|| {
-            (
-                self.rows.len(),
-                self.current_width,
-                self.geometry.borrow().len(),
-            )
-        });
+        let geometry_start = (language == Some("mermaid"))
+            .then(|| (self.rows.len(), 0, self.geometry.borrow().len()));
         let header = language.map_or_else(|| "┌─".to_owned(), |language| format!("┌─ {language}"));
         self.rows
             .push(Line::from_spans(vec![Span::styled(header, border_style)]));
@@ -4445,164 +4424,93 @@ impl TerminalMarkdownRenderer {
     }
 
     fn flush_line(&mut self) {
-        // Any row break ends the in-progress word.
-        self.word_start = None;
+        use bmux_tui::component::{Component, Constraints, LayoutCx};
+        use bmux_tui::composition::TextBlock;
+
         if self.current_spans.is_empty() {
             return;
         }
-        self.rows
-            .push(Line::from_spans(std::mem::take(&mut self.current_spans)));
-        self.current_width = 0;
+        let line = Line::from_spans(std::mem::take(&mut self.current_spans));
+        let source = line.plain_text();
+        let block = TextBlock::new(bmux_tui::text::Text::from_lines(vec![line])).wrap(self.wrap);
+        let layout = block.layout(
+            Constraints::for_width(self.width as u64),
+            &mut LayoutCx::new(),
+        );
+        for row in block.projection(&layout) {
+            let first = self
+                .pending_geometry
+                .partition_point(|(range, _)| range.end <= row.source_range.start);
+            for (range, owners) in self.pending_geometry[first..]
+                .iter()
+                .take_while(|(range, _)| range.start < row.source_range.end)
+            {
+                let start = range.start.max(row.source_range.start);
+                let end = range.end.min(row.source_range.end);
+                if start >= end {
+                    continue;
+                }
+                let column = text_display_width(&source[row.source_range.start..start]);
+                let width = text_display_width(&source[start..end]);
+                if width == 0 {
+                    continue;
+                }
+                let rect = markdown_cell_rect(
+                    self.origin_x.saturating_add(column),
+                    self.origin_y.saturating_add(self.rows.len()),
+                    width,
+                );
+                for owner in owners {
+                    let mut geometry = self.geometry.borrow_mut();
+                    let rects = &mut geometry[*owner].rects;
+                    if let Some(last) = rects.last_mut()
+                        && last.y == rect.y
+                        && last.x.saturating_add(last.width) == rect.x
+                    {
+                        last.width = last.width.saturating_add(rect.width);
+                    } else {
+                        rects.push(rect);
+                    }
+                }
+            }
+            self.rows.push(row.line);
+        }
+        self.pending_geometry.clear();
+        self.current_bytes = 0;
     }
 
     fn push_text(&mut self, text: &str, style: TextStyle) {
         for segment in text.split_inclusive('\n') {
             let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
-            if style.preserve_whitespace {
-                self.push_character_wrapped_text(without_newline, style.style);
+            if self.current_spans.is_empty() {
+                self.wrap = if style.preserve_whitespace {
+                    bmux_tui::text::TextWrap::Character
+                } else {
+                    bmux_tui::text::TextWrap::Word
+                };
+            }
+            let content = if style.preserve_whitespace {
+                without_newline.to_owned()
             } else {
-                self.push_word_wrapped_text(
-                    &normalize_inline_whitespace(without_newline),
-                    style.style,
-                );
+                normalize_inline_whitespace(without_newline)
+            };
+            let start = self.current_bytes;
+            self.current_bytes = self.current_bytes.saturating_add(content.len());
+            if !self.active_geometry.is_empty() {
+                self.pending_geometry
+                    .push((start..self.current_bytes, self.active_geometry.clone()));
+            }
+            if let Some(last) = self.current_spans.last_mut()
+                && last.style == style.style
+            {
+                last.content.push_str(&content);
+            } else if !content.is_empty() {
+                self.current_spans.push(Span::styled(content, style.style));
             }
             if segment.ends_with('\n') {
                 self.flush_line();
             }
         }
-    }
-
-    /// Append `content` to the current row, merging into the previous span when
-    /// its style matches.
-    ///
-    /// Coalescing keeps one span per styled run instead of one span per
-    /// grapheme, which bounds the cost of every later span walk.
-    fn push_merged_span(&mut self, content: &str, style: Style) {
-        if let Some(last) = self.current_spans.last_mut()
-            && last.style == style
-        {
-            last.content.push_str(content);
-        } else {
-            self.current_spans
-                .push(Span::styled(content.to_owned(), style));
-        }
-        self.current_width = self
-            .current_width
-            .saturating_add(text_display_width(content));
-    }
-
-    /// Wrap at grapheme boundaries, for column-significant content such as
-    /// fenced code blocks where word boundaries must be ignored.
-    fn push_character_wrapped_text(&mut self, text: &str, style: Style) {
-        for grapheme in text.graphemes(true) {
-            let grapheme_width = text_display_width(grapheme);
-            if self.current_width > 0
-                && self.current_width.saturating_add(grapheme_width) > self.width
-            {
-                self.flush_line();
-            }
-            self.push_merged_span(grapheme, style);
-        }
-    }
-
-    /// Wrap at word boundaries, keeping words intact across style changes.
-    ///
-    /// The in-progress word is tracked by its exact position in the current row
-    /// rather than buffered aside, so `self.rows` and `self.current_width` stay
-    /// accurate for the geometry and selection-provenance readers that observe
-    /// them immediately after emission.
-    fn push_word_wrapped_text(&mut self, text: &str, style: Style) {
-        for grapheme in text.graphemes(true) {
-            let grapheme_width = text_display_width(grapheme);
-            let whitespace = !grapheme.is_empty() && grapheme.chars().all(char::is_whitespace);
-
-            if whitespace {
-                // Whitespace terminates the current word.
-                self.word_start = None;
-                // Prefer keeping the separator at the END of this row: every
-                // source grapheme must retain a display cell for selection
-                // provenance, and a continuation row must never begin with
-                // wrapped whitespace. When it cannot fit, break instead so the
-                // row never exceeds the requested width.
-                if self.current_width > 0
-                    && self.current_width.saturating_add(grapheme_width) > self.width
-                {
-                    self.flush_line();
-                    continue;
-                }
-                self.push_merged_span(grapheme, style);
-                continue;
-            }
-
-            if self.word_start.is_none() {
-                // Anchor the word at the exact current position. When the last
-                // span shares this style the grapheme will merge into it, so
-                // record the byte offset where the word begins inside it.
-                self.word_start = Some(match self.current_spans.last() {
-                    Some(last) if last.style == style => WordAnchor {
-                        span_index: self.current_spans.len().saturating_sub(1),
-                        byte_offset: last.content.len(),
-                        column: self.current_width,
-                    },
-                    _ => WordAnchor {
-                        span_index: self.current_spans.len(),
-                        byte_offset: 0,
-                        column: self.current_width,
-                    },
-                });
-            }
-
-            if self.current_width > 0
-                && self.current_width.saturating_add(grapheme_width) > self.width
-            {
-                // Move the whole word down when it began partway into this row;
-                // otherwise it spans the full width and must break mid-word.
-                let moved = match self.word_start {
-                    Some(anchor) if anchor.column > 0 => self.take_word_from(anchor),
-                    _ => Vec::new(),
-                };
-                self.flush_line();
-                for span in moved {
-                    self.push_merged_span(&span.content, span.style);
-                }
-                self.word_start = Some(WordAnchor {
-                    span_index: 0,
-                    byte_offset: 0,
-                    column: 0,
-                });
-            }
-            self.push_merged_span(grapheme, style);
-        }
-    }
-
-    /// Remove and return the in-progress word from the current row.
-    ///
-    /// Splitting is byte-precise because [`Self::push_merged_span`] coalesces
-    /// same-style graphemes, so a word can begin partway through a span.
-    fn take_word_from(&mut self, anchor: WordAnchor) -> Vec<Span> {
-        if anchor.span_index >= self.current_spans.len() {
-            return Vec::new();
-        }
-        let mut moved = self.current_spans.split_off(anchor.span_index);
-        if anchor.byte_offset > 0 {
-            let first = &mut moved[0];
-            if anchor.byte_offset < first.content.len() {
-                let tail = first.content.split_off(anchor.byte_offset);
-                let style = first.style;
-                let head = std::mem::replace(&mut first.content, tail);
-                self.current_spans.push(Span::styled(head, style));
-            } else {
-                // The anchor covers this whole span; it stays in place.
-                let retained = moved.remove(0);
-                self.current_spans.push(retained);
-            }
-        }
-        let moved_width: usize = moved
-            .iter()
-            .map(|span| text_display_width(&span.content))
-            .sum();
-        self.current_width = self.current_width.saturating_sub(moved_width);
-        moved
     }
 }
 
@@ -6322,6 +6230,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, 0, 3, 1), (0, 1, 1, 1)]
         );
+    }
+
+    #[test]
+    fn link_geometry_follows_words_moved_by_later_styled_text() {
+        let result = render_markdown(
+            "xx [ab](https://example.com)**cdef**",
+            &MarkdownRenderOptions::new(8),
+        );
+        assert_eq!(result.lines[1].plain_text(), "abcdef");
+        assert_eq!(geometry_text(&result, 0), "ab");
+        assert_eq!(result.geometry[0].rects[0].y, 1);
+        assert_eq!(result.geometry[0].rects[0].x, 0);
     }
 
     #[test]

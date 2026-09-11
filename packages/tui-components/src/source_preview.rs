@@ -1,7 +1,6 @@
 //! Source-code preview rendering helpers for Bcode TUI surfaces.
 
 use bmux_tui::prelude::{Color, Line, Span, Style};
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[cfg(feature = "syntax")]
@@ -130,19 +129,20 @@ pub fn source_preview_lines(contents: &str, options: &SourcePreviewOptions<'_>) 
         .collect::<Vec<_>>();
 
     if truncated {
-        rows.push(Line::from_spans(vec![Span::styled(
-            options.truncated_message.to_owned(),
-            options.truncated_style,
-        )]));
+        rows.push(
+            Line::from_spans(vec![Span::styled(
+                options.truncated_message.to_owned(),
+                options.truncated_style,
+            )])
+            .truncate(usize::from(options.width)),
+        );
     }
 
     rows
 }
 
 fn preview_width(width: u16, prefix: &str) -> usize {
-    usize::from(width)
-        .saturating_sub(UnicodeWidthStr::width(prefix))
-        .max(20)
+    usize::from(width).saturating_sub(UnicodeWidthStr::width(prefix))
 }
 
 fn preview_line(
@@ -164,7 +164,7 @@ fn preview_line(
                 .patch(span.style.unwrap_or_else(Style::new)),
         )
     }));
-    Line::from_spans(output)
+    Line::from_spans(output).truncate(usize::from(options.width))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,44 +233,23 @@ fn truncate_spans(spans: Vec<SourceSpan>, max_width: usize) -> Vec<SourceSpan> {
         return spans;
     }
 
-    let content_width = max_width.saturating_sub(UnicodeWidthStr::width("…"));
-    let mut output = Vec::new();
-    let mut used_width = 0usize;
-
-    for span in spans {
-        let mut content = String::new();
-        for grapheme in span.content.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-            if used_width.saturating_add(grapheme_width) > content_width {
-                if !content.is_empty() {
-                    output.push(SourceSpan {
-                        content,
-                        style: span.style,
-                    });
-                }
-                push_truncation_marker(&mut output, span.style);
-                return output;
-            }
-            content.push_str(grapheme);
-            used_width = used_width.saturating_add(grapheme_width);
-        }
-        if !content.is_empty() {
-            output.push(SourceSpan {
-                content,
-                style: span.style,
-            });
-        }
+    if max_width == 0 {
+        return Vec::new();
     }
-
-    push_truncation_marker(&mut output, None);
-    output
-}
-
-fn push_truncation_marker(output: &mut Vec<SourceSpan>, style: Option<Style>) {
-    output.push(SourceSpan {
-        content: "…".to_owned(),
-        style,
-    });
+    let line = Line::from_spans(
+        spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, span.style.unwrap_or_default()))
+            .collect::<Vec<_>>(),
+    );
+    line.truncate(max_width)
+        .spans
+        .into_iter()
+        .map(|span| SourceSpan {
+            content: span.content,
+            style: Some(span.style),
+        })
+        .collect()
 }
 
 #[cfg(feature = "syntax")]
@@ -291,6 +270,17 @@ const fn syntax_style_to_tui(style: SyntaxStyle) -> Style {
 #[cfg(test)]
 mod tests {
     use super::{SourcePreviewOptions, source_preview_lines};
+
+    #[test]
+    fn narrow_previews_and_omission_markers_fit_available_cells() {
+        for width in 0..30 {
+            let rows = source_preview_lines(
+                "界界界👩‍💻abcdef\nsecond line",
+                &SourcePreviewOptions::new("text", width).max_lines(1),
+            );
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+        }
+    }
 
     fn line_text(line: &Line) -> String {
         line.spans
@@ -361,7 +351,7 @@ mod tests {
     fn truncates_after_preserving_grapheme_boundaries() {
         let rows = source_preview_lines(
             "abcdefghijklmnopqr🙂b",
-            &SourcePreviewOptions::new("txt", 6),
+            &SourcePreviewOptions::new("txt", 24),
         );
 
         assert_eq!(line_text(&rows[0]), "  │ abcdefghijklmnopqr…");
