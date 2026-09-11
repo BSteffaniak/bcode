@@ -6790,6 +6790,18 @@ impl ReviewApp {
         });
     }
 
+    /// Discard portions of hit regions outside the painted frame.
+    pub fn confine_mouse_regions(&mut self, area: Rect) {
+        self.mouse_regions.retain_mut(|region| {
+            let x = region.rect.x.max(area.x);
+            let y = region.rect.y.max(area.y);
+            let right = region.rect.right().min(area.right());
+            let bottom = region.rect.bottom().min(area.bottom());
+            region.rect = Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y));
+            !region.rect.is_empty()
+        });
+    }
+
     /// Return registered mouse action at terminal coordinates.
     #[must_use]
     pub fn mouse_action_at(&self, x: u16, y: u16) -> Option<ReviewMouseAction> {

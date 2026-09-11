@@ -128,17 +128,18 @@ pub fn render(
     theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
 ) {
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+    app.clear_mouse_regions();
     if area.is_empty() {
         return;
     }
 
     let review_theme = theme.map_or_else(ReviewTheme::default, |theme| ReviewTheme::from(*theme));
     frame.fill(LocalRect::terminal(area), " ", review_theme.canvas);
-    app.clear_mouse_regions();
     render_chrome(app, area, frame, review_theme);
     let diff_area = render_body(app, area, frame, review_theme);
     render_main_content(app, diff_area, frame, theme, review_theme);
     render_overlays(app, area, frame, review_theme);
+    app.confine_mouse_regions(area);
 }
 
 fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
@@ -3442,43 +3443,46 @@ fn render_comment_editor_footer(
             theme.diff.hunk.patch(theme.overlay),
         )]),
     );
-    let mut footer_x = popup.x.saturating_add(1);
-    if matches!(
+    let visible_footer =
+        truncate_to_display_width(&footer, usize::from(popup.width.saturating_sub(2)));
+    let footer_area = Rect::new(
+        popup.x.saturating_add(1),
+        popup.bottom().saturating_sub(1),
+        popup.width.saturating_sub(2),
+        1,
+    );
+    let creating = matches!(
         editor.mode,
         crate::code_review_tui::ReviewCommentEditorMode::Create
-    ) {
-        footer_x = register_comment_action_region(
-            app,
-            footer_x,
-            popup.bottom().saturating_sub(1),
-            "save draft",
-            crate::code_review_tui::ReviewMouseAction::CommentAction(
+    );
+    if creating {
+        for (label, action) in [
+            (
+                "save draft",
                 crate::code_review_tui::ReviewCommentAction::SaveDraft,
             ),
-        );
-        footer_x = register_comment_action_region(
-            app,
-            footer_x,
-            popup.bottom().saturating_sub(1),
-            "ask Bcode",
-            crate::code_review_tui::ReviewMouseAction::CommentAction(
+            (
+                "ask Bcode",
                 crate::code_review_tui::ReviewCommentAction::AskBcode,
             ),
-        );
-        footer_x = register_comment_action_region(
-            app,
-            footer_x,
-            popup.bottom().saturating_sub(1),
-            "publish",
-            crate::code_review_tui::ReviewMouseAction::CommentAction(
+            (
+                "publish",
                 crate::code_review_tui::ReviewCommentAction::Publish,
             ),
-        );
+        ] {
+            register_footer_action(
+                app,
+                &visible_footer,
+                footer_area,
+                label,
+                crate::code_review_tui::ReviewMouseAction::CommentAction(action),
+            );
+        }
     }
-    let _ = register_comment_action_region(
+    register_footer_action(
         app,
-        footer_x,
-        popup.bottom().saturating_sub(1),
+        &visible_footer,
+        footer_area,
         "cancel",
         crate::code_review_tui::ReviewMouseAction::CancelComment,
     );
@@ -3500,17 +3504,28 @@ fn comment_editor_y(app: &ReviewApp, area: Rect, height: u16) -> u16 {
     anchor_y.min(max_y).max(area.y)
 }
 
-fn register_comment_action_region(
+fn register_footer_action(
     app: &mut ReviewApp,
-    x: u16,
-    y: u16,
+    visible: &str,
+    area: Rect,
     label: &'static str,
     action: crate::code_review_tui::ReviewMouseAction,
-) -> u16 {
-    let width = u16::try_from(bmux_tui::text_width::display_width(label).saturating_add(2))
-        .unwrap_or(u16::MAX);
-    app.register_mouse_region(Rect::new(x, y, width, 1), action, label);
-    x.saturating_add(width).saturating_add(1)
+) {
+    let Some(offset) = visible.find(label) else {
+        return;
+    };
+    let x = bmux_tui::text_width::display_width(&visible[..offset]);
+    let width = bmux_tui::text_width::display_width(label);
+    app.register_mouse_region(
+        Rect::new(
+            area.x.saturating_add(u16::try_from(x).unwrap_or(u16::MAX)),
+            area.y,
+            u16::try_from(width).unwrap_or(u16::MAX),
+            1,
+        ),
+        action,
+        label,
+    );
 }
 
 fn comment_editor_footer(editor: &crate::code_review_tui::ReviewCommentEditor) -> String {
@@ -3987,6 +4002,26 @@ mod tests {
 
     fn render_app_text(app: &mut ReviewApp, width: u16, height: u16) -> String {
         render_app_text_with_theme(app, width, height, None)
+    }
+
+    #[test]
+    fn footer_hits_follow_visible_labels_and_exclude_truncated_actions() {
+        let mut app = crate::code_review_tui::tests::sample_app();
+        let action = crate::code_review_tui::ReviewMouseAction::CancelComment;
+        let area = Rect::new(3, 4, 40, 1);
+        register_footer_action(&mut app, "界 help  cancel", area, "cancel", action);
+        assert_eq!(app.mouse_action_at(12, 4), Some(action));
+        assert_eq!(app.mouse_action_at(3, 4), None);
+        app.clear_mouse_regions();
+        register_footer_action(&mut app, "help  can…", area, "cancel", action);
+        assert_eq!(app.mouse_action_at(9, 4), None);
+        app.register_mouse_region(Rect::new(0, 0, 20, 20), action, "cancel");
+        app.confine_mouse_regions(Rect::new(3, 4, 2, 1));
+        assert_eq!(app.mouse_action_at(3, 4), Some(action));
+        assert_eq!(app.mouse_action_at(5, 4), None);
+        assert_eq!(app.mouse_action_at(3, 5), None);
+        render_app_text(&mut app, 0, 0);
+        assert_eq!(app.mouse_action_at(3, 4), None);
     }
 
     #[test]
