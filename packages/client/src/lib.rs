@@ -648,7 +648,7 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
             selection: resolved.clone(),
         },
     ).map_err(|_| ClientError::Protocol(
-        "Required authentication metadata is unreadable or unsupported; inspect authentication state before connecting. No substitute account was selected.".to_owned(),
+        "Authentication selection could not be verified. Inspect the selected account, pool membership, and authentication metadata before connecting. No substitute account was selected.".to_owned(),
     ))?;
     Ok(runtime_context_from_selection(
         working_directory,

@@ -199,9 +199,53 @@ fn try_resolve_with_registry_loader(
         bcode_config::RuntimeAuthSubscriptions::default()
     };
     validate_runtime_account_selection(&request, &registry)?;
+    validate_runtime_pool_selection(&request, &registry)?;
     Ok(resolve_provider_request_context_with_subscriptions(
         request, &registry,
     ))
+}
+
+fn validate_runtime_pool_selection(
+    request: &ProviderRequestContextResolution<'_>,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+) -> Result<(), bcode_config::ConfigError> {
+    let Some(pool) = request.selection.auth_pool.as_deref() else {
+        return Ok(());
+    };
+    let invalid = || {
+        bcode_config::ConfigError::Composition {
+        message: "Selected authentication pool is missing, empty, or contains an unresolved account; inspect pool membership before continuing.".to_owned(),
+    }
+    };
+    if !request.config.auth.pools.contains_key(pool) && !registry.pools.contains_key(pool) {
+        return Err(invalid());
+    }
+    let order = bcode_config::effective_auth_pool_order(
+        request.config,
+        registry,
+        pool,
+        request.selection.auth_profile.as_deref(),
+    );
+    if order.profiles.is_empty() {
+        return Err(invalid());
+    }
+    for name in &order.profiles {
+        if request.config.auth.profiles.contains_key(name) {
+            continue;
+        }
+        if runtime_pool_candidate_profile(
+            request.config,
+            registry,
+            pool,
+            name,
+            request.selection.provider_plugin_id.as_deref(),
+        )
+        .is_none()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 fn validate_runtime_account_selection(
@@ -1569,6 +1613,58 @@ mod tests {
             assert_eq!(calls, usize::from(owner == Some("example.plugin")));
             assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
         }
+    }
+
+    #[test]
+    fn strict_pool_selection_rejects_missing_empty_and_dangling_members() {
+        let mut config = bcode_config::BcodeConfig::default();
+        let selection = bcode_config::ResolvedModelSelection {
+            auth_pool: Some("custom-pool".to_owned()),
+            provider_plugin_id: Some("example.plugin".to_owned()),
+            ..Default::default()
+        };
+        let registry = bcode_config::RuntimeAuthSubscriptions::default();
+        assert!(
+            validate_runtime_pool_selection(
+                &ProviderRequestContextResolution {
+                    config: &config,
+                    selection: selection.clone()
+                },
+                &registry
+            )
+            .is_err()
+        );
+        config.auth.pools.insert(
+            "custom-pool".to_owned(),
+            bcode_config::AuthPoolConfig::default(),
+        );
+        assert!(
+            validate_runtime_pool_selection(
+                &ProviderRequestContextResolution {
+                    config: &config,
+                    selection: selection.clone()
+                },
+                &registry
+            )
+            .is_err()
+        );
+        config
+            .auth
+            .pools
+            .get_mut("custom-pool")
+            .unwrap()
+            .profiles
+            .push("missing-member".to_owned());
+        assert!(
+            validate_runtime_pool_selection(
+                &ProviderRequestContextResolution {
+                    config: &config,
+                    selection
+                },
+                &registry
+            )
+            .is_err()
+        );
     }
 
     #[test]
