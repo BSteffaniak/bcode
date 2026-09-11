@@ -161,8 +161,24 @@ pub struct ProviderRequestContextResolution<'a> {
 pub fn resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> bcode_model::ProviderRequestContext {
-    let registry = if request.selection.auth_pool.is_some() {
-        bcode_config::load_runtime_auth_subscriptions()
+    resolve_provider_request_context_with_registry_loader(
+        request,
+        bcode_config::load_runtime_auth_subscriptions,
+    )
+}
+
+fn resolve_provider_request_context_with_registry_loader(
+    request: ProviderRequestContextResolution<'_>,
+    load: impl FnOnce() -> bcode_config::RuntimeAuthSubscriptions,
+) -> bcode_model::ProviderRequestContext {
+    let registry = if request.selection.auth_pool.is_some()
+        || request
+            .selection
+            .auth_profile
+            .as_ref()
+            .is_some_and(|name| !request.config.auth.profiles.contains_key(name))
+    {
+        load()
     } else {
         bcode_config::RuntimeAuthSubscriptions::default()
     };
@@ -1487,6 +1503,44 @@ mod tests {
             assert_eq!(calls, usize::from(owner == Some("example.plugin")));
             assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
         }
+    }
+
+    #[test]
+    fn standalone_runtime_selection_loads_registry_without_a_pool() {
+        let config = bcode_config::BcodeConfig::default();
+        let mut loaded = false;
+        let context = resolve_provider_request_context_with_registry_loader(
+            ProviderRequestContextResolution {
+                config: &config,
+                selection: bcode_config::ResolvedModelSelection {
+                    provider_plugin_id: Some("example.plugin".to_owned()),
+                    auth_profile: Some("enrolled-account".to_owned()),
+                    ..Default::default()
+                },
+            },
+            || {
+                loaded = true;
+                bcode_config::RuntimeAuthSubscriptions {
+                    profiles: BTreeMap::from([(
+                        "enrolled-account".to_owned(),
+                        bcode_config::RuntimeAuthProfile {
+                            provider_id: "example".to_owned(),
+                            owner_plugin_id: "example.plugin".to_owned(),
+                            backend: "env".to_owned(),
+                            scheme: "test-scheme".to_owned(),
+                            storage_profile: "stored-account".to_owned(),
+                            vault: PathBuf::from("unused"),
+                            map: BTreeMap::new(),
+                            device_seal: None,
+                        },
+                    )]),
+                    ..Default::default()
+                }
+            },
+        );
+        assert!(loaded);
+        assert_eq!(context.auth.unwrap().scheme.as_deref(), Some("test-scheme"));
+        assert!(context.auth_pool.is_none());
     }
 
     #[test]
