@@ -2858,6 +2858,25 @@ impl BcodeClient {
         }
     }
 
+    /// Check whether an exact resolved model is visible in the application's provider catalog.
+    ///
+    /// This is a read-only discovery check, not proof that a remote inference request will succeed.
+    /// A model absent from a partial catalog is unverified and returns false, not unsupported.
+    ///
+    /// # Errors
+    /// Returns an error when catalog discovery cannot complete.
+    pub async fn model_available_for_setup(
+        &self,
+        provider_plugin_id: String,
+        model_id: &str,
+    ) -> Result<bool, ClientError> {
+        let models = self.session_model_list(Some(provider_plugin_id)).await?;
+        Ok(models.models.iter().any(|model| {
+            model.model_id == model_id
+                && matches!(model.visibility, bcode_model::ModelVisibility::Visible)
+        }))
+    }
+
     /// Request cancellation of the active model turn for a session.
     ///
     /// # Errors

@@ -265,6 +265,25 @@ async fn validate_launch_provider() -> Result<(), String> {
                 .to_owned(),
         );
     }
+    let available = client
+        .model_available_for_setup(
+            selection
+                .provider_plugin_id
+                .clone()
+                .ok_or_else(|| "Select a provider.".to_owned())?,
+            selection
+                .model_id
+                .as_deref()
+                .ok_or_else(|| "Select a model.".to_owned())?,
+        )
+        .await
+        .map_err(|_| {
+            "Could not load the model catalog. Check the connection and retry from setup."
+                .to_owned()
+        })?;
+    if !available {
+        return Err("The selected model could not be verified in the available catalog. Review Models before launching.".to_owned());
+    }
     let current = tokio::task::spawn_blocking(inspect_launch_selection)
         .await
         .map_err(|_| "Could not recheck launch selection. Retry from setup.".to_owned())??;
