@@ -296,6 +296,7 @@ impl ReviewViewDocument {
                                 body_line_count,
                                 suggestion: suggestion.clone(),
                                 rendered: None,
+                                source_ranges: Vec::new(),
                             },
                         });
                     }
@@ -415,7 +416,7 @@ impl ReviewViewDocument {
                         "│", "", true, width,
                     )))
                     .max(1);
-                let lines = suggestion_rows(&suggestion.body, content_width);
+                let (lines, ranges) = plain_rows_with_sources(&suggestion.body, content_width);
                 let count = lines.len();
                 for (index, line) in lines.into_iter().enumerate() {
                     let mut projected = row.clone();
@@ -423,12 +424,14 @@ impl ReviewViewDocument {
                         body_line_index,
                         body_line_count,
                         rendered,
+                        source_ranges,
                         ..
                     } = &mut projected.block
                     {
                         *body_line_index = index;
                         *body_line_count = count;
                         *rendered = Some(line);
+                        *source_ranges = ranges.get(index).cloned().unwrap_or_default();
                     }
                     rows.push(projected);
                 }
@@ -455,30 +458,30 @@ impl ReviewViewDocument {
         self
     }
 
-    /// Capture a canonical comment byte position at the top visible row.
-    pub(crate) fn text_anchor(&self, row: usize) -> Option<(ReviewViewTarget, usize)> {
+    /// Capture the owning text section and a canonical byte position.
+    pub(crate) fn text_anchor(&self, row: usize) -> Option<(ReviewViewTarget, String, usize)> {
         let row = self.rows.get(row)?;
-        let ReviewViewBlock::InlineComment { source_ranges, .. } = &row.block else {
-            return None;
-        };
+        let (id, ranges) = row.block.text_source()?;
         Some((
             row.target.clone(),
-            source_ranges.iter().map(|range| range.start).min()?,
+            id.to_owned(),
+            ranges.iter().map(|range| range.start).min()?,
         ))
     }
 
-    /// Resolve a comment byte position against the new measured rows.
+    /// Resolve an exact source byte against the new measured rows.
     pub(crate) fn row_for_text_anchor(
         &self,
         target: &ReviewViewTarget,
+        id: &str,
         byte: usize,
     ) -> Option<usize> {
         self.rows.iter().find_map(|row| {
-            let ReviewViewBlock::InlineComment { source_ranges, .. } = &row.block else {
-                return None;
-            };
-            (&row.target == target && source_ranges.iter().any(|range| range.contains(&byte)))
-                .then_some(row.visual_row)
+            let (source_id, ranges) = row.block.text_source()?;
+            (&row.target == target
+                && source_id == id
+                && ranges.iter().any(|range| range.contains(&byte)))
+            .then_some(row.visual_row)
         })
     }
 
@@ -667,6 +670,8 @@ pub enum ReviewViewBlock {
         suggestion: ReviewSuggestedComment,
         /// Retained width-resolved plain suggestion row.
         rendered: Option<bmux_tui::text::Line>,
+        /// Canonical suggestion bytes represented by this row.
+        source_ranges: Vec<std::ops::Range<usize>>,
     },
     /// Inline Bcode agent state row.
     InlineAgentThread {
@@ -692,6 +697,20 @@ pub enum ReviewViewBlock {
     },
 }
 
+impl ReviewViewBlock {
+    fn text_source(&self) -> Option<(&str, &[std::ops::Range<usize>])> {
+        match self {
+            Self::InlineComment { source_ranges, .. }
+            | Self::InlineSuggestion { source_ranges, .. } => Some(("body", source_ranges)),
+            Self::InlineAgentThread {
+                rendered: Some(row),
+                ..
+            } => Some((&row.source_id, &row.source_ranges)),
+            _ => None,
+        }
+    }
+}
+
 fn markdown_rows_with_sources(
     text: &str,
     width: u16,
@@ -711,22 +730,31 @@ fn markdown_rows_with_sources(
     (result.lines, ranges)
 }
 
-fn suggestion_rows(text: &str, width: usize) -> Vec<bmux_tui::text::Line> {
-    use bmux_tui::text::{Line, TextWrap, TextWrapGeometry, wrap_line_bounded};
-    let mut rows = text
-        .lines()
-        .flat_map(|line| {
-            wrap_line_bounded(
-                &Line::raw(line),
-                TextWrapGeometry::uniform(width),
-                TextWrap::Word,
-            )
-        })
-        .collect::<Vec<_>>();
-    if rows.is_empty() {
-        rows.push(Line::default());
+fn plain_rows_with_sources(
+    text: &str,
+    width: usize,
+) -> (Vec<bmux_tui::text::Line>, Vec<Vec<std::ops::Range<usize>>>) {
+    use bmux_tui::component::{Component, Constraints, LayoutCx};
+    use bmux_tui::composition::TextBlock;
+    let block = TextBlock::new(text).wrap(bmux_tui::text::TextWrap::Word);
+    let layout = block.layout(Constraints::for_width(width as u64), &mut LayoutCx::new());
+    let mut lines = Vec::new();
+    let mut ranges = Vec::new();
+    for row in block.projection(&layout) {
+        ranges.push(
+            if row.line.width() <= width && !row.source_range.is_empty() {
+                std::iter::once(row.source_range).collect()
+            } else {
+                Vec::new()
+            },
+        );
+        lines.push(row.line.viewport(0, width));
     }
-    rows
+    if lines.is_empty() {
+        lines.push(bmux_tui::text::Line::default());
+        ranges.push(Vec::new());
+    }
+    (lines, ranges)
 }
 
 fn append_agent_rows(
@@ -759,6 +787,10 @@ pub struct AgentThreadRow {
     pub prefix: String,
     /// Retained content row.
     pub content: bmux_tui::text::Line,
+    /// Stable text section, or session item ID, within the owning thread.
+    pub source_id: String,
+    /// Canonical bytes represented by the visible content.
+    pub source_ranges: Vec<std::ops::Range<usize>>,
     /// Optional session-item semantic role.
     pub kind: Option<crate::code_review_tui::ReviewAgentSessionItemKind>,
 }
@@ -773,30 +805,19 @@ fn agent_text_rows(prefix: &str, text: &str, markdown: bool, width: u16) -> Vec<
             u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
         )
         .max(1);
-    let mut content = if markdown {
-        bcode_markdown_render::render_markdown_lines(
-            text,
-            bcode_markdown_render::MarkdownRenderOptions::new(available),
-        )
+    let (content, ranges) = if markdown {
+        markdown_rows_with_sources(text, available)
     } else {
-        text.lines()
-            .flat_map(|line| {
-                bmux_tui::text::wrap_line_bounded(
-                    &Line::raw(line),
-                    bmux_tui::text::TextWrapGeometry::uniform(usize::from(available)),
-                    bmux_tui::text::TextWrap::Word,
-                )
-            })
-            .collect()
+        plain_rows_with_sources(text, usize::from(available))
     };
-    if content.is_empty() {
-        content.push(Line::default());
-    }
     content
         .into_iter()
-        .map(|content| AgentThreadRow {
+        .zip(ranges)
+        .map(|(content, source_ranges)| AgentThreadRow {
             prefix: prefix.clone(),
             content: content.viewport(0, usize::from(available)),
+            source_id: String::new(),
+            source_ranges,
             kind: None,
         })
         .collect()
@@ -813,13 +834,23 @@ pub(crate) fn agent_thread_rows(
         false,
         width,
     );
+    for row in &mut rows {
+        "status".clone_into(&mut row.source_id);
+    }
     for (prefix, text) in [
         ("   │  context ", Some(state.context_summary.as_str())),
         ("   │  ⚠ stream ", state.stream_warning.as_deref()),
         ("   │  activity ", state.activity.as_deref()),
     ] {
         if let Some(text) = text.filter(|text| !text.is_empty()) {
-            rows.extend(agent_text_rows(prefix, text, false, width));
+            rows.extend(
+                agent_text_rows(prefix, text, false, width)
+                    .into_iter()
+                    .map(|mut row| {
+                        prefix.clone_into(&mut row.source_id);
+                        row
+                    }),
+            );
         }
     }
     let limit = if expanded { 24 } else { 6 };
@@ -846,11 +877,15 @@ pub(crate) fn agent_thread_rows(
         .next()
         {
             row.kind = Some(item.kind);
+            row.source_id = format!("session:{}", item.id);
             rows.push(row);
         }
     }
     if !state.answer.trim().is_empty() {
         let mut answer = agent_text_rows("   │  answer ", &state.answer, true, width);
+        for row in &mut answer {
+            "answer".clone_into(&mut row.source_id);
+        }
         if !expanded && answer.len() > 4 {
             answer.truncate(4);
             if let Some(last) = answer.last_mut() {
@@ -858,6 +893,8 @@ pub(crate) fn agent_thread_rows(
                 let available = usize::from(width)
                     .saturating_sub(bmux_tui::text_width::display_width(&last.prefix));
                 last.content = last.content.truncate(available);
+                // The generated omission marker has no canonical byte mapping.
+                last.source_ranges.clear();
             }
         }
         rows.extend(answer);
@@ -1661,6 +1698,38 @@ mod tests {
     }
 
     #[test]
+    fn plain_and_agent_sources_survive_width_changes_without_section_confusion() {
+        let text = "alpha beta gamma delta epsilon";
+        let (_, narrow) = super::plain_rows_with_sources(text, 5);
+        let (_, wide) = super::plain_rows_with_sources(text, 18);
+        for range in narrow.iter().flatten() {
+            assert!(
+                wide.iter()
+                    .flatten()
+                    .any(|candidate| candidate.contains(&range.start))
+            );
+        }
+        let mut state = super::ReviewAgentThreadState::pending(String::new());
+        state.status = text.to_owned();
+        state.answer = text.to_owned();
+        let narrow = super::agent_thread_rows(&state, true, 18);
+        let wide = super::agent_thread_rows(&state, true, 40);
+        for row in &narrow {
+            if let Some(range) = row.source_ranges.first() {
+                assert!(wide.iter().any(|candidate| {
+                    candidate.source_id == row.source_id
+                        && candidate
+                            .source_ranges
+                            .iter()
+                            .any(|other| other.contains(&range.start))
+                }));
+            }
+        }
+        assert!(wide.iter().any(|row| row.source_id == "status"));
+        assert!(wide.iter().any(|row| row.source_id == "answer"));
+    }
+
+    #[test]
     fn agent_session_preview_limits_do_not_depend_on_metadata_height() {
         use crate::code_review_tui::{ReviewAgentSessionItem, ReviewAgentSessionItemKind};
         let mut state = super::ReviewAgentThreadState::pending(String::new());
@@ -1784,9 +1853,9 @@ mod tests {
         assert!(text.contains("second"));
         let wide = document.clone().layout_inline_threads(80);
         for row in &narrow.rows {
-            if let Some((target, byte)) = narrow.text_anchor(row.visual_row) {
+            if let Some((target, id, byte)) = narrow.text_anchor(row.visual_row) {
                 let resolved = wide
-                    .row_for_text_anchor(&target, byte)
+                    .row_for_text_anchor(&target, &id, byte)
                     .expect("source byte survives resize");
                 let ReviewViewBlock::InlineComment { source_ranges, .. } =
                     &wide.rows[resolved].block

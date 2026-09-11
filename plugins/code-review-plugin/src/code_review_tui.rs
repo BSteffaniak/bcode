@@ -6945,9 +6945,9 @@ impl ReviewApp {
                 .count();
             self.diff_scroll = first.saturating_add(offset.min(count.saturating_sub(1)));
         }
-        if let Some((target, byte)) = text_anchor
+        if let Some((target, id, byte)) = text_anchor
             && let Some(document) = self.current_review_view_document()
-            && let Some(row) = document.row_for_text_anchor(&target, byte)
+            && let Some(row) = document.row_for_text_anchor(&target, &id, byte)
         {
             self.diff_scroll = row;
         }
