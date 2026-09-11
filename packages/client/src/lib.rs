@@ -617,15 +617,21 @@ fn resolve_path_from(
     path.canonicalize().unwrap_or(path)
 }
 
-fn current_runtime_context() -> ClientRuntimeContext {
+fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
     let working_directory = current_working_directory();
-    let Ok(config) = bcode_config::load_config() else {
-        return ClientRuntimeContext {
-            working_directory: Some(working_directory),
-            ..ClientRuntimeContext::default()
-        };
-    };
-    let effective_config_toml = bcode_config::encode_effective_config(&config).ok();
+    let config = bcode_config::load_config().map_err(|_| {
+        ClientError::Protocol(
+            "Client configuration could not be loaded; daemon defaults were not substituted."
+                .to_owned(),
+        )
+    })?;
+    let effective_config_toml =
+        Some(bcode_config::encode_effective_config(&config).map_err(|_| {
+            ClientError::Protocol(
+                "Client configuration could not be encoded; daemon defaults were not substituted."
+                    .to_owned(),
+            )
+        })?);
     let env = CLIENT_RUNTIME_ENV_VARS
         .iter()
         .filter_map(|name| match std::env::var(name) {
@@ -642,13 +648,13 @@ fn current_runtime_context() -> ClientRuntimeContext {
             selection: resolved.clone(),
         },
     );
-    runtime_context_from_selection(
+    Ok(runtime_context_from_selection(
         working_directory,
         effective_config_toml,
         resolved,
         provider_context,
         env,
-    )
+    ))
 }
 
 fn runtime_context_from_selection(
@@ -683,6 +689,17 @@ fn runtime_context_from_selection(
 #[cfg(test)]
 mod runtime_context_auth_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_runtime_context_blocks_connection_before_transport() {
+        let mut client = BcodeClient::new(default_endpoint());
+        client.runtime_context_error = Some("Configuration unavailable".to_owned());
+        assert!(
+            matches!(client.connect("test").await, Err(ClientError::Protocol(message)) if message == "Configuration unavailable")
+        );
+        let explicit = client.with_runtime_context(Some(ClientRuntimeContext::default()));
+        assert!(explicit.runtime_context_error.is_none());
+    }
 
     #[test]
     fn selected_account_and_credentials_survive_client_adaptation_together() {
@@ -824,6 +841,7 @@ pub struct BcodeClient {
     expected_state_location: Option<bcode_config::StateLocationId>,
     endpoint: IpcEndpoint,
     runtime_context: Option<ClientRuntimeContext>,
+    runtime_context_error: Option<String>,
     daemon_availability: DaemonAvailability,
     connect_timeout: Duration,
     startup_timeout: Duration,
@@ -1050,10 +1068,15 @@ impl BcodeClient {
     /// Create a client that connects to the default endpoint.
     #[must_use]
     pub fn default_endpoint() -> Self {
+        let (runtime_context, runtime_context_error) = match current_runtime_context() {
+            Ok(context) => (Some(context), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Self {
             expected_state_location: None,
             endpoint: default_endpoint(),
-            runtime_context: Some(current_runtime_context()),
+            runtime_context,
+            runtime_context_error,
             daemon_availability: DaemonAvailability::AutoStart,
             connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
             startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
@@ -1069,6 +1092,7 @@ impl BcodeClient {
             expected_state_location: None,
             endpoint,
             runtime_context: None,
+            runtime_context_error: None,
             daemon_availability: DaemonAvailability::RequireRunning,
             connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
             startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
@@ -1096,6 +1120,7 @@ impl BcodeClient {
     #[must_use]
     pub fn with_runtime_context(mut self, runtime_context: Option<ClientRuntimeContext>) -> Self {
         self.runtime_context = runtime_context;
+        self.runtime_context_error = None;
         self
     }
 
@@ -5152,6 +5177,10 @@ impl BcodeClient {
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
         use tracing::Instrument as _;
 
+        if let Some(error) = &self.runtime_context_error {
+            return Err(ClientError::Protocol(error.clone()));
+        }
+
         let span = tracing::debug_span!(target: "bcode_client::startup", "daemon_connection");
         Box::pin(async {
             let started = std::time::Instant::now();
@@ -5387,7 +5416,7 @@ impl ClientConnection {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn refresh_runtime_context(&mut self) -> Result<(), ClientError> {
-        self.update_runtime_context(Some(current_runtime_context()))
+        self.update_runtime_context(Some(current_runtime_context()?))
             .await
     }
 
