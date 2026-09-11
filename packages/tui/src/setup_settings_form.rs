@@ -26,6 +26,8 @@ pub struct SetupSettingsForm {
     focused: usize,
     status: String,
     pending: Option<bcode_config::edit::ConfigEdit>,
+    model_profiles: Option<Vec<(String, bcode_config::ResolvedModelSelection)>>,
+    selected_profile: usize,
 }
 
 impl SetupSettingsForm {
@@ -38,12 +40,72 @@ impl SetupSettingsForm {
             focused: 1,
             status: "Tab changes fields. Enter reviews. Empty value removes the override. Esc returns to setup.".to_owned(),
             pending: None,
+            model_profiles: None,
+            selected_profile: 0,
         }
+    }
+
+    /// Select a configured profile while retaining an explicit, reviewed edit destination.
+    pub fn models(path: &std::path::Path, config: &bcode_config::BcodeConfig) -> Self {
+        let mut form = Self::new(path, "model/profile");
+        form.focused = 0;
+        form.model_profiles = Some(
+            config
+                .model
+                .profiles
+                .keys()
+                .filter_map(|name| {
+                    config
+                        .resolved_model_profile(name)
+                        .map(|selection| (name.clone(), selection))
+                })
+                .collect(),
+        );
+        form.refresh_profile();
+        form
+    }
+
+    fn refresh_profile(&mut self) {
+        let Some(profiles) = &self.model_profiles else {
+            return;
+        };
+        let Some((name, selection)) = profiles.get(self.selected_profile) else {
+            "No configured model profiles. Esc returns to setup; use Settings to configure a model.".clone_into(&mut self.status);
+            return;
+        };
+        self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(
+            toml::Value::String(name.clone()).to_string(),
+        ));
+        self.status = format!(
+            "{} — provider: {}; model: {}; account: {}; pool: {}. Up/Down selects; Enter reviews.",
+            name,
+            selection
+                .provider_plugin_id
+                .as_deref()
+                .unwrap_or("not selected"),
+            selection.model_id.as_deref().unwrap_or("not selected"),
+            selection.auth_profile.as_deref().unwrap_or("default"),
+            selection.auth_pool.as_deref().unwrap_or("none"),
+        );
     }
 
     /// Handle form input without changing terminal lifecycle.
     pub fn handle_event(&mut self, event: &Event) -> SettingsFormOutcome {
         let policy = TextInputPolicy::default();
+        if self.pending.is_none()
+            && let Some(profiles) = &self.model_profiles
+            && let Event::Key(key) = event
+            && matches!(key.key, KeyCode::Up | KeyCode::Down)
+        {
+            if key.key == KeyCode::Up {
+                self.selected_profile = self.selected_profile.saturating_sub(1);
+            } else {
+                self.selected_profile =
+                    (self.selected_profile + 1).min(profiles.len().saturating_sub(1));
+            }
+            self.refresh_profile();
+            return SettingsFormOutcome::Continue;
+        }
         match event {
             Event::Key(key) if key.key == KeyCode::Escape => {
                 if self.pending.take().is_none() {
@@ -53,7 +115,11 @@ impl SetupSettingsForm {
             }
             Event::Key(key) if key.key == KeyCode::Enter => self.submit(),
             Event::Key(key) if key.key == KeyCode::Tab && self.pending.is_none() => {
-                self.focused = (self.focused + 1) % self.inputs.len();
+                if self.model_profiles.is_some() {
+                    self.focused = 0;
+                } else {
+                    self.focused = (self.focused + 1) % self.inputs.len();
+                }
             }
             Event::Key(key) if self.pending.is_none() => {
                 let _ =
@@ -69,6 +135,16 @@ impl SetupSettingsForm {
     }
 
     fn submit(&mut self) {
+        if let Some(profiles) = &self.model_profiles {
+            let Some((_, selection)) = profiles.get(self.selected_profile) else {
+                self.refresh_profile();
+                return;
+            };
+            if let Err(error) = selection.validate_selection() {
+                self.status = error.to_string();
+                return;
+            }
+        }
         if let Some(edit) = self.pending.take() {
             self.status = match edit.apply() {
                 Ok(_) => "Saved. Higher-priority overrides may still apply. Esc returns to setup."
@@ -178,6 +254,40 @@ fn write(frame: &mut PaintCx<'_, '_>, area: Rect, text: &str, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_profile_picker_requires_review_and_preserves_local_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let config: bcode_config::BcodeConfig = toml::from_str(
+            r#"
+[model.profiles."custom account"]
+provider_plugin_id = "example.provider"
+model_id = "example-model"
+auth_profile = "local-account"
+"#,
+        )
+        .unwrap();
+        let mut form = SetupSettingsForm::models(&path, &config);
+        assert!(form.status.contains("local-account"));
+        form.submit();
+        assert!(form.pending.is_some());
+        assert!(!path.exists());
+        form.submit();
+        let saved: bcode_config::BcodeConfig =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved.model.profile.as_deref(), Some("custom account"));
+    }
+
+    #[test]
+    fn empty_model_picker_does_not_remove_existing_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let mut form = SetupSettingsForm::models(&path, &bcode_config::BcodeConfig::default());
+        form.submit();
+        assert!(form.pending.is_none());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn review_and_cancel_never_write_configuration() {

@@ -120,10 +120,15 @@ impl OnboardingProgram {
             }
             KeyCode::Char('p' | 'a' | 'm') if !self.shell.has_pending_confirmation() => {
                 if code == KeyCode::Char('m') {
-                    self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::new(
-                        &bcode_config::default_config_dir().join("bcode.toml"),
-                        "model/profile",
-                    ));
+                    match bcode_config::load_config() {
+                        Ok(config) => {
+                            self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::models(
+                                &bcode_config::default_config_dir().join("bcode.toml"),
+                                &config,
+                            ));
+                        }
+                        Err(_) => self.shell.set_status_message("Configuration could not be loaded. Review Settings before selecting a model.".to_owned()),
+                    }
                 } else {
                     self.connection_form = Some(super::setup_connection_form::ConnectionForm::new(
                         code == KeyCode::Char('a'),
