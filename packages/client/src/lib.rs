@@ -691,6 +691,32 @@ mod runtime_context_auth_tests {
     use super::*;
 
     #[test]
+    fn provider_validation_decode_preserves_negative_result_and_redacts_errors() {
+        let result = decode_provider_validation(&PluginServiceResponse {
+            payload: br#"{"valid":false}"#.to_vec(),
+            error: None,
+        })
+        .unwrap();
+        assert!(!result.valid);
+        for response in [
+            PluginServiceResponse {
+                payload: b"secret-token-invalid-json".to_vec(),
+                error: None,
+            },
+            PluginServiceResponse {
+                payload: Vec::new(),
+                error: Some(bcode_ipc::PluginServiceError {
+                    code: "secret-token".to_owned(),
+                    message: "secret-token".to_owned(),
+                }),
+            },
+        ] {
+            let error = decode_provider_validation(&response).unwrap_err();
+            assert!(!error.to_string().contains("secret-token"));
+        }
+    }
+
+    #[test]
     fn single_account_selection_does_not_infer_a_pool_from_chatgpt_scheme() {
         let mut config = bcode_config::BcodeConfig::default();
         config.model.auth_profile = Some("custom-account".to_owned());
@@ -792,6 +818,21 @@ mod runtime_context_auth_tests {
             Some("account")
         );
     }
+}
+
+fn decode_provider_validation(
+    response: &PluginServiceResponse,
+) -> Result<bcode_model::ValidateConfigResponse, ClientError> {
+    if response.error.is_some() {
+        return Err(ClientError::Protocol(
+            "Provider configuration validation failed.".to_owned(),
+        ));
+    }
+    serde_json::from_slice(&response.payload).map_err(|_| {
+        ClientError::Protocol(
+            "Provider returned an incompatible configuration validation response.".to_owned(),
+        )
+    })
 }
 
 impl From<ErrorResponse> for ClientError {
@@ -5101,6 +5142,25 @@ impl BcodeClient {
             ResponsePayload::PluginServiceResult { response } => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Validate a provider's configuration using this client's runtime context.
+    ///
+    /// # Errors
+    /// Returns transport errors or a secret-safe error for provider failure or malformed output.
+    pub async fn validate_provider_config(
+        &self,
+        provider_plugin_id: String,
+    ) -> Result<bcode_model::ValidateConfigResponse, ClientError> {
+        let response = self
+            .invoke_plugin_service(
+                provider_plugin_id,
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
+                bcode_model::OP_VALIDATE_CONFIG.to_owned(),
+                Vec::new(),
+            )
+            .await?;
+        decode_provider_validation(&response)
     }
 
     /// Invoke a loaded daemon plugin service by interface ID.

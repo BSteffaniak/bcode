@@ -247,29 +247,18 @@ async fn validate_launch_provider() -> Result<(), String> {
     })
     .await
     .map_err(|_| "Could not prepare provider validation. Retry from setup.".to_owned())??;
-    let response = client
-        .invoke_plugin_service(
+    let validation = client
+        .validate_provider_config(
             selection
                 .provider_plugin_id
                 .clone()
                 .ok_or_else(|| "Select a provider.".to_owned())?,
-            bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
-            bcode_model::OP_VALIDATE_CONFIG.to_owned(),
-            Vec::new(),
         )
         .await
         .map_err(|_| {
             "Provider validation could not run. Review Connections and retry; setup remains open."
                 .to_owned()
         })?;
-    if response.error.is_some() {
-        return Err(
-            "The provider could not validate this configuration. Review Connections and Models."
-                .to_owned(),
-        );
-    }
-    let validation: bcode_model::ValidateConfigResponse = serde_json::from_slice(&response.payload)
-        .map_err(|_| "Provider returned an incompatible validation response.".to_owned())?;
     if !validation.valid {
         return Err(
             "Provider configuration is not ready. Review Connections and Models before launching."
