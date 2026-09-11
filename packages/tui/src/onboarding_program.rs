@@ -18,6 +18,10 @@ pub enum OnboardingMessage {
     /// Terminal input backend failure.
     /// Poll background authentication progress without blocking input.
     AuthProgress,
+    LaunchValidated {
+        generation: u64,
+        result: Result<(), String>,
+    },
     InputFailed(std::io::Error),
 }
 
@@ -30,6 +34,8 @@ pub struct OnboardingProgram {
     theme: super::theme::PresentedTheme,
     area: Rect,
     continuation: bcode_settings::SetupContinuation,
+    launch_generation: u64,
+    launch_pending: bool,
     connection_form: Option<super::setup_connection_form::ConnectionForm>,
     settings_form: Option<super::setup_settings_form::SetupSettingsForm>,
 }
@@ -52,6 +58,8 @@ impl OnboardingProgram {
             theme: *theme,
             area,
             continuation: bcode_settings::SetupContinuation::Close,
+            launch_generation: 0,
+            launch_pending: false,
             connection_form: None,
             settings_form: None,
         })
@@ -77,6 +85,10 @@ impl OnboardingProgram {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
+        if self.launch_pending {
+            self.launch_pending = false;
+            self.launch_generation = self.launch_generation.wrapping_add(1);
+        }
         let code = if code == KeyCode::Enter && !self.shell.has_pending_confirmation() {
             use bcode_settings::SetupSectionId;
             match self.shell.focused_section() {
@@ -171,6 +183,32 @@ impl OnboardingProgram {
             }
         }
     }
+    fn complete_launch_validation(
+        &mut self,
+        generation: u64,
+        result: Result<(), String>,
+    ) -> Update<OnboardingMessage> {
+        if !self.launch_pending || generation != self.launch_generation {
+            return Update::none();
+        }
+        self.launch_pending = false;
+        let lifecycle = match result {
+            Ok(()) => {
+                self.continuation = bcode_settings::SetupContinuation::Launch;
+                Lifecycle::Exit
+            }
+            Err(message) => {
+                self.shell.set_status_message(message);
+                Lifecycle::Continue
+            }
+        };
+        Update {
+            invalidation: Invalidation::Redraw,
+            lifecycle,
+            ..Update::none()
+        }
+    }
+
     fn finish_launch_selection(
         &mut self,
         selection: Result<bcode_config::ResolvedModelSelection, String>,
@@ -185,9 +223,56 @@ impl OnboardingProgram {
             self.continuation = bcode_settings::SetupContinuation::Close;
             return Lifecycle::Continue;
         }
-        self.continuation = bcode_settings::SetupContinuation::Launch;
-        Lifecycle::Exit
+        self.launch_pending = true;
+        self.launch_generation = self.launch_generation.wrapping_add(1);
+        self.shell.set_status_message(
+            "Validating provider configuration… Any key cancels this launch attempt.".to_owned(),
+        );
+        Lifecycle::Continue
     }
+}
+
+fn launch_validation_command(generation: u64) -> bmux_tui_runtime::Command<OnboardingMessage> {
+    bmux_tui_runtime::Command::concurrent(async move {
+        let result = validate_launch_provider().await;
+        Some(OnboardingMessage::LaunchValidated { generation, result })
+    })
+}
+
+async fn validate_launch_provider() -> Result<(), String> {
+    let selection = inspect_launch_selection()?;
+    let client = tokio::task::spawn_blocking(bcode_client::BcodeClient::default_endpoint)
+        .await
+        .map_err(|_| "Could not prepare provider validation. Retry from setup.".to_owned())?;
+    let response = client
+        .invoke_plugin_service(
+            selection
+                .provider_plugin_id
+                .ok_or_else(|| "Select a provider.".to_owned())?,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
+            bcode_model::OP_VALIDATE_CONFIG.to_owned(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|_| {
+            "Provider validation could not run. Review Connections and retry; setup remains open."
+                .to_owned()
+        })?;
+    if response.error.is_some() {
+        return Err(
+            "The provider could not validate this configuration. Review Connections and Models."
+                .to_owned(),
+        );
+    }
+    let validation: bcode_model::ValidateConfigResponse = serde_json::from_slice(&response.payload)
+        .map_err(|_| "Provider returned an incompatible validation response.".to_owned())?;
+    if !validation.valid {
+        return Err(
+            "Provider configuration is not ready. Review Connections and Models before launching."
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn inspect_launch_selection() -> Result<bcode_config::ResolvedModelSelection, String> {
@@ -212,6 +297,12 @@ impl Program for OnboardingProgram {
         &mut self,
         event: RuntimeEvent<Self::Message>,
     ) -> Result<Update<Self::Message>, Self::Error> {
+        if let RuntimeEvent::Message(OnboardingMessage::LaunchValidated { generation, result }) =
+            event
+        {
+            return Ok(self.complete_launch_validation(generation, result));
+        }
+        let previous_launch_generation = self.launch_generation;
         if matches!(
             event,
             RuntimeEvent::Message(OnboardingMessage::AuthProgress)
@@ -280,7 +371,10 @@ impl Program for OnboardingProgram {
             RuntimeEvent::Terminal(
                 Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_),
             )
-            | RuntimeEvent::Timer(_) => Invalidation::None,
+            | RuntimeEvent::Timer(_)
+            | RuntimeEvent::Message(OnboardingMessage::LaunchValidated { .. }) => {
+                Invalidation::None
+            }
             RuntimeEvent::Message(OnboardingMessage::AuthProgress) => Invalidation::Redraw,
             RuntimeEvent::Message(OnboardingMessage::InputFailed(error)) => {
                 return Err(error.into());
@@ -288,7 +382,10 @@ impl Program for OnboardingProgram {
         };
         self.refresh_persisted_state()?;
         Ok(Update {
-            commands: if !had_connection && self.connection_form.is_some() {
+            commands: if self.launch_pending && previous_launch_generation != self.launch_generation
+            {
+                vec![launch_validation_command(self.launch_generation)]
+            } else if !had_connection && self.connection_form.is_some() {
                 vec![Self::auth_progress_command()]
             } else {
                 Vec::new()
@@ -372,6 +469,7 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
 mod tests {
     use super::onboarding_action_for_key;
     use bmux_keyboard::KeyCode;
+    use bmux_tui_runtime::Program as _;
 
     #[test]
     fn incomplete_launch_stays_inside_setup_and_can_be_retried() {
@@ -412,8 +510,27 @@ mod tests {
         selection.model_id = Some("example-model".to_owned());
         assert_eq!(
             program.finish_launch_selection(Ok(selection)),
-            bmux_tui_runtime::Lifecycle::Exit
+            bmux_tui_runtime::Lifecycle::Continue
         );
+        assert!(program.launch_pending);
+        let stale = program
+            .update(bmux_tui_runtime::RuntimeEvent::Message(
+                super::OnboardingMessage::LaunchValidated {
+                    generation: program.launch_generation.wrapping_sub(1),
+                    result: Ok(()),
+                },
+            ))
+            .unwrap();
+        assert_eq!(stale.lifecycle, bmux_tui_runtime::Lifecycle::Continue);
+        let done = program
+            .update(bmux_tui_runtime::RuntimeEvent::Message(
+                super::OnboardingMessage::LaunchValidated {
+                    generation: program.launch_generation,
+                    result: Ok(()),
+                },
+            ))
+            .unwrap();
+        assert_eq!(done.lifecycle, bmux_tui_runtime::Lifecycle::Exit);
         assert_eq!(
             program.continuation(),
             bcode_settings::SetupContinuation::Launch
