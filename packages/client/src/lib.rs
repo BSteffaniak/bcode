@@ -5152,14 +5152,33 @@ impl BcodeClient {
         &self,
         provider_plugin_id: String,
     ) -> Result<bcode_model::ValidateConfigResponse, ClientError> {
-        let response = self
-            .invoke_plugin_service(
-                provider_plugin_id,
+        self.validate_model_config(Some(provider_plugin_id)).await
+    }
+
+    /// Validate the selected provider, or the unique registered provider when omitted.
+    ///
+    /// # Errors
+    /// Returns transport, ambiguous-provider, provider-failure, or malformed-response errors.
+    pub async fn validate_model_config(
+        &self,
+        provider_plugin_id: Option<String>,
+    ) -> Result<bcode_model::ValidateConfigResponse, ClientError> {
+        let response = if let Some(provider) = provider_plugin_id {
+            self.invoke_plugin_service(
+                provider,
                 bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
                 bcode_model::OP_VALIDATE_CONFIG.to_owned(),
                 Vec::new(),
             )
-            .await?;
+            .await?
+        } else {
+            self.call_plugin_service(
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
+                bcode_model::OP_VALIDATE_CONFIG.to_owned(),
+                Vec::new(),
+            )
+            .await?
+        };
         decode_provider_validation(&response)
     }
 

@@ -11301,10 +11301,14 @@ fn unix_timestamp_string() -> String {
 }
 
 async fn model_validate_config(json: bool) -> Result<(), CliError> {
-    let response = call_model_provider_service(bcode_model::OP_VALIDATE_CONFIG).await?;
-    write_model_validation(&mut std::io::stdout().lock(), response, json)
+    let config = bcode_config::load_config()?;
+    let provider = config.resolved_model_selection().provider_plugin_id;
+    let client = BcodeClient::default_endpoint();
+    let validation = client.validate_model_config(provider).await?;
+    write_typed_model_validation(&mut std::io::stdout().lock(), &validation, json)
 }
 
+#[cfg(test)]
 fn write_model_validation(
     output: &mut impl std::io::Write,
     response: bcode_ipc::PluginServiceResponse,
@@ -11318,8 +11322,16 @@ fn write_model_validation(
     }
     let validation: bcode_model::ValidateConfigResponse =
         serde_json::from_slice(&response.payload)?;
+    write_typed_model_validation(output, &validation, json)
+}
+
+fn write_typed_model_validation(
+    output: &mut impl std::io::Write,
+    validation: &bcode_model::ValidateConfigResponse,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        write_json_result(output, &validation)?;
+        write_json_result(output, validation)?;
     } else {
         writeln!(output, "valid\t{}", validation.valid)?;
         if let Some(message) = &validation.message {
@@ -11381,12 +11393,6 @@ fn configured_provider_context(
             selection: config.resolved_model_selection(),
         },
     )
-}
-
-async fn call_model_provider_service(
-    operation: &str,
-) -> Result<bcode_ipc::PluginServiceResponse, CliError> {
-    call_model_provider_service_payload(operation, Vec::new()).await
 }
 
 async fn call_model_provider_service_payload(
