@@ -8,6 +8,41 @@ use bcode_config::{
 };
 
 #[test]
+fn strict_builder_rejects_foreign_owned_selection() {
+    let mut config = BcodeConfig::default();
+    config.model.provider_plugin_id = Some("selected.provider".to_owned());
+    config.model.model_id = Some("model".to_owned());
+    config.model.auth_profile = Some("account".to_owned());
+    config.auth.profiles.insert(
+        "account".to_owned(),
+        AuthProfileConfig {
+            backend: "env".to_owned(),
+            owner_plugin_id: Some("foreign.provider".to_owned()),
+            ..AuthProfileConfig::default()
+        },
+    );
+    assert!(
+        Bcode::builder()
+            .try_provider_defaults_from_config(&config)
+            .is_err()
+    );
+    config
+        .auth
+        .profiles
+        .get_mut("account")
+        .unwrap()
+        .owner_plugin_id = Some("selected.provider".to_owned());
+    let sdk = Bcode::builder()
+        .try_provider_defaults_from_config(&config)
+        .unwrap()
+        .build();
+    assert_eq!(
+        sdk.provider_context().auth_profile.as_deref(),
+        Some("account")
+    );
+}
+
+#[test]
 fn configured_builder_materializes_selected_provider_context() {
     let mut config = BcodeConfig {
         model: ModelConfig {

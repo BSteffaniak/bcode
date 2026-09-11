@@ -3372,12 +3372,13 @@ fn resolve_invariant_selector_model(
     } else {
         active.clone()
     };
-    let provider_context = bcode_provider_auth::resolve_provider_request_context(
+    let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config,
             selection: selection.clone(),
         },
-    );
+    )
+    .ok()?;
     Some(InvariantSelectorModel {
         provider_plugin_id: selection.provider_plugin_id,
         model_id: selection.model_id.unwrap_or_default(),

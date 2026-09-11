@@ -5916,6 +5916,27 @@ impl BcodeBuilder {
         self
     }
 
+    /// Configure provider/model defaults, rejecting invalid runtime auth selections.
+    ///
+    /// # Errors
+    /// Returns configuration or authentication-metadata errors before installing defaults.
+    #[cfg(feature = "config")]
+    pub fn try_provider_defaults_from_config(
+        mut self,
+        config: &bcode_config::BcodeConfig,
+    ) -> Result<Self> {
+        let selection = config.resolved_model_selection();
+        let context = bcode_provider_auth::try_resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config,
+                selection: selection.clone(),
+            },
+        )?;
+        self.provider_registry = ProviderRegistry::from_resolved_model_selection(&selection);
+        self.provider_context = context;
+        Ok(self)
+    }
+
     /// Configure provider/model defaults from a Bcode configuration and explicit environment.
     #[cfg(feature = "config")]
     #[must_use]
@@ -6056,10 +6077,9 @@ impl BcodeBuilder {
     ///
     /// Returns an error if an existing config layer cannot be read, parsed, or composed.
     #[cfg(feature = "config")]
-    pub fn load_provider_defaults(mut self) -> Result<Self> {
+    pub fn load_provider_defaults(self) -> Result<Self> {
         let config = bcode_config::load_config()?;
-        self = self.provider_defaults_from_config(&config);
-        Ok(self)
+        self.try_provider_defaults_from_config(&config)
     }
 
     /// Configure the default provider/model selector for agents built from this SDK handle.
