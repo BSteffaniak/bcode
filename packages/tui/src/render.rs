@@ -5136,7 +5136,11 @@ fn push_wrapped_styled_text(
     if prefix_width >= max_width || max_width <= 2 {
         let mut spans = prefix;
         spans.push(Span::styled(text, body_style));
-        rows.extend(Line::from_spans(spans).wrap_word(max_width));
+        rows.extend(bmux_tui::text::wrap_line_bounded(
+            &Line::from_spans(spans),
+            bmux_tui::text::TextWrapGeometry::uniform(max_width),
+            bmux_tui::text::TextWrap::Word,
+        ));
         return;
     }
     let available_first = max_width.saturating_sub(prefix_width).max(1);
@@ -5166,16 +5170,35 @@ fn push_wrapped_styled_text(
 ///
 /// Prose transcript text wraps at word boundaries; column-significant content
 /// uses the character-mode helper instead.
+#[test]
+fn prefixed_unicode_text_fits_tiny_widths() {
+    for width in 1..=6 {
+        let mut rows = Vec::new();
+        push_wrapped_styled_text(
+            &mut rows,
+            vec![Span::raw("label: ")],
+            "界👩‍💻abc",
+            width,
+            Style::new(),
+            Style::new(),
+        );
+        assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+    }
+}
+
 fn wrap_text_with_continuation(
     text: &str,
     first_width: usize,
     continuation_width: usize,
 ) -> Vec<String> {
-    bmux_tui::text::wrap_text(
-        text,
+    bmux_tui::text::wrap_line_bounded(
+        &Line::raw(text),
         bmux_tui::text::TextWrapGeometry::with_continuation(first_width, continuation_width),
         bmux_tui::text::TextWrap::Word,
     )
+    .iter()
+    .map(Line::plain_text)
+    .collect()
 }
 
 fn spans_width(spans: &[Span]) -> usize {

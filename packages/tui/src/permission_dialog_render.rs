@@ -7,7 +7,7 @@ use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
-use bmux_tui::text_width::{display_width, wrap_text_with_continuation};
+use bmux_tui::text_width::display_width;
 use bmux_tui_components::action_row::{
     ActionButton, ActionRow, ActionRowComponent, ActionRowState, ActionRowStyles,
 };
@@ -210,15 +210,24 @@ fn push_wrapped_rows(rows: &mut Vec<Line>, prefix: &[Span], text: &str, width: u
     if prefix_width >= max_width || max_width <= 2 {
         let mut spans = prefix.to_owned();
         spans.push(Span::styled(text, style));
-        rows.extend(Line::from_spans(spans).wrap_word(max_width));
+        rows.extend(bmux_tui::text::wrap_line_bounded(
+            &Line::from_spans(spans),
+            bmux_tui::text::TextWrapGeometry::uniform(max_width),
+            bmux_tui::text::TextWrap::Word,
+        ));
         return;
     }
     let first_width = max_width.saturating_sub(prefix_width).max(1);
     let next_width = max_width.saturating_sub(2).max(1);
-    for (index, chunk) in wrap_text_with_continuation(text, first_width, next_width)
-        .into_iter()
-        .enumerate()
+    for (index, chunk) in bmux_tui::text::wrap_line_bounded(
+        &Line::raw(text),
+        bmux_tui::text::TextWrapGeometry::with_continuation(first_width, next_width),
+        bmux_tui::text::TextWrap::Word,
+    )
+    .into_iter()
+    .enumerate()
     {
+        let chunk = chunk.plain_text();
         if index == 0 {
             let mut spans = prefix.to_owned();
             spans.push(Span::styled(chunk, style));

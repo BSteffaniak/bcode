@@ -414,14 +414,7 @@ impl ReviewViewDocument {
                         "│", "", true, width,
                     )))
                     .max(1);
-                let mut lines = suggestion
-                    .body
-                    .lines()
-                    .flat_map(|line| bmux_tui::text::Line::raw(line).wrap_word(content_width))
-                    .collect::<Vec<_>>();
-                if lines.is_empty() {
-                    lines.push(bmux_tui::text::Line::default());
-                }
+                let lines = suggestion_rows(&suggestion.body, content_width);
                 let count = lines.len();
                 for (index, line) in lines.into_iter().enumerate() {
                     let mut projected = row.clone();
@@ -669,6 +662,24 @@ pub enum ReviewViewBlock {
     },
 }
 
+fn suggestion_rows(text: &str, width: usize) -> Vec<bmux_tui::text::Line> {
+    use bmux_tui::text::{Line, TextWrap, TextWrapGeometry, wrap_line_bounded};
+    let mut rows = text
+        .lines()
+        .flat_map(|line| {
+            wrap_line_bounded(
+                &Line::raw(line),
+                TextWrapGeometry::uniform(width),
+                TextWrap::Word,
+            )
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        rows.push(Line::default());
+    }
+    rows
+}
+
 fn append_agent_rows(
     rows: &mut Vec<ReviewViewRow>,
     row: &ReviewViewRow,
@@ -720,7 +731,13 @@ fn agent_text_rows(prefix: &str, text: &str, markdown: bool, width: u16) -> Vec<
         )
     } else {
         text.lines()
-            .flat_map(|line| Line::raw(line).wrap_word(usize::from(available)))
+            .flat_map(|line| {
+                bmux_tui::text::wrap_line_bounded(
+                    &Line::raw(line),
+                    bmux_tui::text::TextWrapGeometry::uniform(usize::from(available)),
+                    bmux_tui::text::TextWrap::Word,
+                )
+            })
             .collect()
     };
     if content.is_empty() {

@@ -4402,8 +4402,11 @@ impl TerminalMarkdownRenderer {
                     };
                     let mut spans = vec![Span::styled(prefix, muted)];
                     spans.extend(line.clone());
-                    self.rows
-                        .extend(Line::from_spans(spans).wrap_word(self.width));
+                    self.rows.extend(bmux_tui::text::wrap_line_bounded(
+                        &Line::from_spans(spans),
+                        bmux_tui::text::TextWrapGeometry::uniform(self.width),
+                        bmux_tui::text::TextWrap::Word,
+                    ));
                 }
             }
         }
@@ -4856,6 +4859,23 @@ mod tests {
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn stacked_table_unicode_rows_fit_single_cell_viewports() {
+        for width in 1..=4 {
+            let rows = render_markdown_lines(
+                "| H |\n| --- |\n| 界👩‍💻abc |",
+                MarkdownRenderOptions::new(width),
+            );
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+            assert!(
+                rows.iter()
+                    .map(bmux_tui::text::Line::plain_text)
+                    .collect::<String>()
+                    .contains("abc")
+            );
+        }
+    }
 
     #[test]
     fn unrenderable_wide_links_have_no_interaction_cells() {
