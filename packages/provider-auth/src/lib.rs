@@ -214,12 +214,21 @@ pub fn resolve_provider_request_context_with_resolver(
         api_surface: None,
     };
 
-    if let Some(auth_profile_name) = request.selection.auth_profile.as_deref()
-        && let Some(auth_profile) = request.config.auth.profiles.get(auth_profile_name)
-    {
-        let resolved = resolve(auth_profile_name, auth_profile);
-        context.env = resolved.env;
-        context.auth = Some(resolved.auth);
+    if let Some(auth_profile_name) = request.selection.auth_profile.as_deref() {
+        if let Some(auth_profile) = request.config.auth.profiles.get(auth_profile_name) {
+            let resolved = resolve(auth_profile_name, auth_profile);
+            context.env = resolved.env;
+            context.auth = Some(resolved.auth);
+        } else if let Some(resolved_profile) = selected_runtime_auth_profile(
+            request.config,
+            registry,
+            auth_profile_name,
+            request.selection.provider_plugin_id.as_deref(),
+        ) {
+            let resolved = resolve(auth_profile_name, &resolved_profile.profile);
+            context.env = resolved.env;
+            context.auth = Some(resolved.auth);
+        }
     }
 
     if let Some(auth_pool_name) = request.selection.auth_pool.as_deref() {
@@ -289,6 +298,16 @@ pub fn resolve_provider_request_context_with_resolver(
     }
 
     context
+}
+
+fn selected_runtime_auth_profile(
+    config: &bcode_config::BcodeConfig,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+    name: &str,
+    owner: Option<&str>,
+) -> Option<ResolvedAuthProfile> {
+    let profile = registry.profiles.get(name)?;
+    resolve_auth_provider_profile(config, &profile.provider_id, owner?, Some(name), registry).ok()
 }
 
 fn legacy_openai_profile(
@@ -1365,6 +1384,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("custody-two"), Some("custody-one")]
         );
+    }
+
+    #[test]
+    fn explicitly_selected_runtime_account_materializes_only_for_its_owner() {
+        let config = bcode_config::BcodeConfig::default();
+        let registry = bcode_config::RuntimeAuthSubscriptions {
+            profiles: BTreeMap::from([(
+                "custom-account".to_owned(),
+                bcode_config::RuntimeAuthProfile {
+                    provider_id: "example".to_owned(),
+                    owner_plugin_id: "example.plugin".to_owned(),
+                    backend: "sshenv".to_owned(),
+                    scheme: "oauth".to_owned(),
+                    storage_profile: "stored-account".to_owned(),
+                    vault: PathBuf::from("/fixture/vault"),
+                    map: BTreeMap::new(),
+                    device_seal: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        for owner in [None, Some("foreign.plugin"), Some("example.plugin")] {
+            let mut calls = 0;
+            let context = resolve_provider_request_context_with_resolver(
+                ProviderRequestContextResolution {
+                    config: &config,
+                    selection: bcode_config::ResolvedModelSelection {
+                        provider_plugin_id: owner.map(str::to_owned),
+                        auth_profile: Some("custom-account".to_owned()),
+                        ..Default::default()
+                    },
+                },
+                &registry,
+                |name, profile| {
+                    calls += 1;
+                    assert_eq!(name, "custom-account");
+                    assert_eq!(profile.settings["profile"], "stored-account");
+                    ResolvedProviderAuth {
+                        auth: bcode_model::ProviderAuthContext {
+                            scheme: profile.scheme.clone(),
+                            ..Default::default()
+                        },
+                        env: BTreeMap::new(),
+                    }
+                },
+            );
+            assert_eq!(calls, usize::from(owner == Some("example.plugin")));
+            assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
+        }
     }
 
     #[test]
