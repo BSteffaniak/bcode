@@ -5019,8 +5019,10 @@ pub fn register_runtime_auth_subscription(
     Ok(path)
 }
 
-/// Register non-secret runtime auth profile metadata and its provider binding.
+/// Register non-secret runtime auth profile metadata, binding the provider only if unbound.
 ///
+/// Adding another account preserves the existing primary selection. Selecting a different
+/// primary account is a separate operation, never an implicit enrollment side effect.
 /// Declarative profiles and bindings are never modified by this operation and take precedence
 /// during resolution.
 ///
@@ -5055,7 +5057,7 @@ pub fn register_runtime_auth_profile(
         });
     }
     if let Some(existing) = registry.bindings.get(&profile.provider_id)
-        && (existing.profile != profile_name || existing.owner_plugin_id != profile.owner_plugin_id)
+        && existing.owner_plugin_id != profile.owner_plugin_id
     {
         return Err(ConfigError::Composition {
             message: format!(
@@ -5064,13 +5066,13 @@ pub fn register_runtime_auth_profile(
             ),
         });
     }
-    registry.bindings.insert(
-        profile.provider_id.clone(),
-        RuntimeAuthBinding {
+    registry
+        .bindings
+        .entry(profile.provider_id.clone())
+        .or_insert_with(|| RuntimeAuthBinding {
             profile: profile_name.to_string(),
             owner_plugin_id: profile.owner_plugin_id.clone(),
-        },
-    );
+        });
     registry.profiles.insert(profile_name.to_string(), profile);
     write_runtime_auth_subscriptions(&path, &registry)?;
     Ok(path)
@@ -9082,6 +9084,44 @@ scheme = "api_key"
             std::fs::read_to_string(&declarative_path).expect("declarative config"),
             declarative
         );
+    }
+
+    #[test]
+    fn additional_runtime_account_preserves_primary_binding_and_other_credentials() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_path = temp.path().join("auth-runtime.json");
+        unsafe {
+            std::env::set_var("BCODE_AUTH_SUBSCRIPTIONS", &runtime_path);
+        }
+        let first = super::RuntimeAuthProfile {
+            provider_id: "example".to_owned(),
+            owner_plugin_id: "bcode.example".to_owned(),
+            backend: "sshenv".to_owned(),
+            scheme: "oauth".to_owned(),
+            storage_profile: "first-account".to_owned(),
+            vault: temp.path().join("vault"),
+            map: BTreeMap::new(),
+            device_seal: None,
+        };
+        register_runtime_auth_profile("example", first.clone()).expect("first account");
+        let mut second = first.clone();
+        second.storage_profile = "second-account".to_owned();
+        register_runtime_auth_profile("example-2", second.clone()).expect("additional account");
+        register_runtime_auth_profile("example-2", second.clone()).expect("idempotent publication");
+        let loaded = load_runtime_auth_subscriptions();
+        let before_conflict = std::fs::read(&runtime_path).expect("registered metadata");
+        let mut foreign = second.clone();
+        foreign.owner_plugin_id = "bcode.foreign".to_owned();
+        let conflict = register_runtime_auth_profile("example-3", foreign);
+        unsafe {
+            std::env::remove_var("BCODE_AUTH_SUBSCRIPTIONS");
+        }
+        assert_eq!(loaded.bindings["example"].profile, "example");
+        assert_eq!(loaded.profiles["example"], first);
+        assert_eq!(loaded.profiles["example-2"], second);
+        assert!(conflict.is_err());
+        assert_eq!(std::fs::read(&runtime_path).unwrap(), before_conflict);
     }
 
     #[test]

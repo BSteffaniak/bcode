@@ -61,6 +61,9 @@ impl ConnectionForm {
             if device.terminal {
                 if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Enter | KeyCode::Escape | KeyCode::Char('r' | 'b' | 'q')))
                 {
+                    if device.succeeded {
+                        return true;
+                    }
                     self.device = None;
                     self.review = false;
                     self.picker = Some(true);
@@ -726,6 +729,36 @@ mod tests {
                 .trim()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn connected_login_returns_to_setup_instead_of_retrying() {
+        let mut device = super::super::setup_device_login::DeviceLogin::failed_for_test();
+        device.refresh();
+        device.succeeded = true;
+        let mut form = ConnectionForm {
+            presentation: Presentation::Guided,
+            providers: Vec::new(),
+            picker: None,
+            selected: 0,
+            query: String::new(),
+            interactive: true,
+            device: Some(device),
+            importing: false,
+            fields: std::array::from_fn(|_| {
+                TextInputState::new(TextEditBuffer::from_text(String::new()))
+            }),
+            focus: 4,
+            secret: zeroize::Zeroizing::new(String::new()),
+            review: false,
+            status: String::new(),
+        };
+        assert!(
+            form.handle_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Enter,
+            )))
+        );
+        assert_eq!(form.picker, None);
     }
 
     #[test]

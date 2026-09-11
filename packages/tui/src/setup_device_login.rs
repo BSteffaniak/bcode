@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub enum LoginUpdate {
     Progress(Vec<String>, bool),
+    Succeeded,
     Prompt(AuthFlowEffect),
 }
 
@@ -27,6 +28,7 @@ pub struct DeviceLogin {
     answers: mpsc::SyncSender<String>,
     pub lines: Vec<String>,
     pub terminal: bool,
+    pub succeeded: bool,
     cancel: Arc<AtomicBool>,
     updates: mpsc::Receiver<LoginUpdate>,
 }
@@ -50,13 +52,11 @@ impl DeviceLogin {
                 &worker_cancel,
                 &channel,
             );
-            let message = match result {
-                Ok(()) => "Sign-in completed and credentials saved.",
-                Err(message) => message,
+            let update = match result {
+                Ok(()) => LoginUpdate::Succeeded,
+                Err(message) => LoginUpdate::Progress(vec![message.to_owned()], true),
             };
-            let _ = channel
-                .updates
-                .send(LoginUpdate::Progress(vec![message.to_owned()], true));
+            let _ = channel.updates.send(update);
         });
         Self {
             prompt: None,
@@ -64,6 +64,7 @@ impl DeviceLogin {
             answers,
             lines: vec!["Starting sign-in… Esc cancels.".to_owned()],
             terminal: false,
+            succeeded: false,
             cancel,
             updates,
         }
@@ -91,6 +92,14 @@ impl DeviceLogin {
                 continue;
             }
             match update {
+                LoginUpdate::Succeeded => {
+                    self.lines =
+                        vec!["Account connected. Press Enter to return to setup.".to_owned()];
+                    self.terminal = true;
+                    self.succeeded = true;
+                    self.prompt = None;
+                    self.answer.clear();
+                }
                 LoginUpdate::Progress(lines, terminal) => {
                     self.lines = lines;
                     self.terminal = terminal;
@@ -122,6 +131,7 @@ impl DeviceLogin {
             answers,
             lines: Vec::new(),
             terminal: false,
+            succeeded: false,
             cancel: Arc::new(AtomicBool::new(false)),
             updates,
         }
@@ -464,6 +474,7 @@ mod tests {
             answers,
             lines: Vec::new(),
             terminal: false,
+            succeeded: false,
             cancel: Arc::new(AtomicBool::new(false)),
             updates,
         };
@@ -474,6 +485,23 @@ mod tests {
         login.refresh();
         assert!(login.terminal);
         assert_eq!(login.lines, vec!["Completed"]);
+    }
+
+    #[test]
+    fn success_is_explicit_and_stale_failure_cannot_replace_it() {
+        let mut login = DeviceLogin::failed_for_test();
+        let (send, updates) = mpsc::channel();
+        login.updates = updates;
+        send.send(LoginUpdate::Succeeded).unwrap();
+        send.send(LoginUpdate::Progress(
+            vec!["stale failure".to_owned()],
+            true,
+        ))
+        .unwrap();
+        login.refresh();
+        assert!(login.succeeded);
+        assert!(login.terminal);
+        assert!(login.lines[0].contains("Account connected"));
     }
 
     #[test]
@@ -503,6 +531,7 @@ mod tests {
             answers,
             lines: Vec::new(),
             terminal: false,
+            succeeded: false,
             cancel: Arc::new(AtomicBool::new(false)),
             updates,
         };
