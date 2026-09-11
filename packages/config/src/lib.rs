@@ -501,6 +501,17 @@ impl BcodeConfig {
         &self,
         environment: &impl ConfigEnvironment,
     ) -> ResolvedModelSelection {
+        if let Some(profile_name) = &self.model.profile
+            && !self.model.profiles.contains_key(profile_name)
+        {
+            // An explicit unresolved selection is not permission to use another account's
+            // top-level configuration or environment defaults. Keep the requested identity
+            // for diagnosis, but do not materialize a dispatchable target.
+            return ResolvedModelSelection {
+                model_profile: Some(profile_name.clone()),
+                ..ResolvedModelSelection::default()
+            };
+        }
         let mut selection = ResolvedModelSelection {
             provider_plugin_id: self.model.provider_plugin_id.clone(),
             provider_source: self
@@ -12369,6 +12380,36 @@ model_id = "second"
         )
         .expect("valid TOML");
         assert!(super::resolve_composed_config_value(&raw).is_err());
+    }
+
+    #[test]
+    fn missing_explicit_model_profile_never_uses_other_selection_credentials() {
+        let mut config = BcodeConfig::default();
+        config.model.profile = Some("requested-profile".to_owned());
+        config.model.provider_plugin_id = Some("other-provider".to_owned());
+        config.model.model_id = Some("other-model".to_owned());
+        config.model.auth_profile = Some("other-account".to_owned());
+        config.model.auth_pool = Some("other-pool".to_owned());
+        let environment = super::ConfigEnvironmentSnapshot::new(
+            BTreeMap::from([
+                (
+                    "BCODE_MODEL_PROVIDER".to_owned(),
+                    "environment-provider".into(),
+                ),
+                ("BCODE_MODEL".to_owned(), "environment-model".into()),
+            ]),
+            PathBuf::from("."),
+        );
+        let selection = config.resolved_model_selection_with_environment(&environment);
+        assert_eq!(
+            selection.model_profile.as_deref(),
+            Some("requested-profile")
+        );
+        assert!(selection.provider_plugin_id.is_none());
+        assert!(selection.model_id.is_none());
+        assert!(selection.auth_profile.is_none());
+        assert!(selection.auth_pool.is_none());
+        assert!(selection.validate_selection().is_err());
     }
 
     #[test]
