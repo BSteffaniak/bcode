@@ -2,7 +2,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Bcode release automation tasks.
+//! Bcode release and repository validation tasks.
+
+mod architecture;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -55,6 +57,7 @@ impl From<zip::result::ZipError> for XtaskError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandName {
+    Architecture,
     Build,
     Release,
     VerifyRelease,
@@ -94,6 +97,7 @@ impl Options {
     fn parse() -> Result<Self> {
         let mut args = env::args().skip(1);
         let command = match args.next().as_deref() {
+            Some("architecture") => CommandName::Architecture,
             Some("build") => CommandName::Build,
             Some("release") => CommandName::Release,
             Some("verify-release") => CommandName::VerifyRelease,
@@ -266,6 +270,7 @@ fn main() {
 fn run() -> Result<()> {
     let options = Options::parse()?;
     match options.command {
+        CommandName::Architecture => architecture::check(&options.target),
         CommandName::Build => build(&options),
         CommandName::Release => release(&options),
         CommandName::VerifyRelease => verify_release(&options),
@@ -3893,6 +3898,7 @@ fn print_help() {
     println!(
         "Bcode release tasks\n\n\
          Usage:\n\
+           cargo xtask architecture [--target <triple>]\n\
            cargo xtask build [--target <triple>] [--features <feature,...>]\n\
            cargo xtask release --target <triple> --version <version> [--features <feature,...>]\n\
            cargo xtask verify-release --target <triple> --version <version> [--features <feature,...>]\n\

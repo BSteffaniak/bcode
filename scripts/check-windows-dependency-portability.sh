@@ -4,21 +4,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-python3 - <<'PY'
-from pathlib import Path
-import tomllib
-
-workspace = tomllib.loads(Path("Cargo.toml").read_text())
-sha2 = workspace["workspace"]["dependencies"]["sha2"]
-features = set(sha2.get("features", []))
-for feature in ("asm", "asm-aarch64"):
-    if feature in features:
-        raise SystemExit(
-            f"workspace sha2 feature {feature!r} enables sha2-asm on MSVC; "
-            "keep the portable implementation for supported release targets"
-        )
-PY
-
 windows_tree="$(mktemp)"
 trap 'rm -f "$windows_tree"' EXIT
 cargo tree \

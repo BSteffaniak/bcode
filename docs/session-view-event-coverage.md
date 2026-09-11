@@ -124,4 +124,4 @@ Required migration invariants:
 
 1. Build parity fixtures for all rows marked **Complete** before moving TUI consumers and removing duplicate projection.
 
-The matrix must be updated whenever a new `SessionEventKind` or `SessionLiveEventKind` variant is added. `scripts/check-session-architecture.sh` enforces one explicit row per variant and requires each row to classify shared semantic state, transcript eligibility, and frontend-native presentation.
+Use this matrix as design documentation. Validate event semantics through projection tests and exhaustive typed matches, not source-enum or documentation-row scans.

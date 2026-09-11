@@ -402,7 +402,7 @@ portable `WorkflowAuthoringDocument` and receive the same diagnostics.
 
 ## Mechanical enforcement
 
-`scripts/check-workflow-architecture.sh` enforces that:
+Domain-owned behavioral and compatibility tests should verify that:
 
 * `bcode_workflow` does not depend on frontend, renderer, daemon, database, persistence, provider
   implementation, or plugin implementation packages;

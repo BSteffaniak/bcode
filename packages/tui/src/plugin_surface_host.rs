@@ -1397,12 +1397,6 @@ mod tests {
     }
 
     #[test]
-    fn plugin_surface_host_source_uses_bmux_redraw_latch() {
-        let source = include_str!("plugin_surface_host.rs");
-        assert!(source.contains("InvalidationSignal"));
-    }
-
-    #[test]
     fn plugin_surface_host_preserves_requested_workflow_limits() {
         let session_id = SessionId::new();
         let workflow = bcode_workflow::WorkflowBuilder::new(
@@ -1520,31 +1514,5 @@ mod tests {
                 "historical-run"
             ));
         }
-    }
-
-    #[test]
-    fn plugin_surface_host_exposes_portable_workflow_authoring_services() {
-        let source = include_str!("plugin_surface_host.rs");
-        for service in [
-            "workflow_authoring_catalog",
-            "generate_structured_output",
-            "accept_generated_workflow_candidate",
-            "instantiate_workflow_template",
-            "workflow_authoring_draft",
-            "workflow_authoring_revision",
-            "apply_workflow_authoring_edits",
-            "validate_workflow_authoring",
-            "preview_workflow_authoring",
-            "publish_workflow_authoring_draft",
-            "start_authored_workflow_revision",
-            "start_workflow_package_export",
-        ] {
-            assert!(
-                source.contains(service),
-                "missing authoring service: {service}"
-            );
-        }
-        assert!(!source.contains(concat!("super::terminal_", "events")));
-        assert!(!source.contains(concat!("Terminal<", "&mut")));
     }
 }

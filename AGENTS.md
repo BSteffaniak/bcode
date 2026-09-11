@@ -136,6 +136,10 @@ Every Rust crate should include these crate-level attributes unless there is a d
 - Permission, provider, tool, command, UI contribution, and integration behavior should be plugin-owned wherever practical.
 - Host/runtime crates should provide plumbing and routing, not product-specific behavior.
 
+## Architecture test policy
+
+Do not test repository implementation by matching source text, symbol names, or formatting. Test behavior, compilation, or resolved dependency properties instead. This restriction does not apply when source text itself is the product input or output. Do not maintain duplicate implementation inventories or assert that named tests exist. Keep behavioral tests in their owning domains; do not replace deleted source assertions one-for-one.
+
 ## Validation Rules
 
 If code changes are made, run relevant checks before finishing and report exactly what ran and whether it passed.
@@ -144,22 +148,9 @@ Minimum expected validation once Rust crates exist:
 
 - `cargo fmt`
 - `cargo check --workspace`
+- `cargo run -p xtask -- architecture` for dependency, feature, or architecture validation changes; see `docs/architecture-validation.md` for scope and known blockers
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `scripts/check-session-architecture.sh` for session persistence changes
-- `scripts/check-state-location-architecture.sh` for state location resolution, daemon location scoping, aggregated multi-location discovery, duplicate-ID ambiguity, or session relocation changes
-- `scripts/check-daemon-lifecycle-architecture.sh` for daemon startup, artifact identity, process replacement, client reconnection, or recovery from daemon loss
-- `scripts/check-loop-runtime-architecture.sh` for generic runtime, turn scheduling, cancellation, plugin/tool domain isolation, or `/loop` changes
-- `scripts/check-model-catalog-architecture.sh` for model catalog/provider resolution changes
-- `scripts/check-router-architecture.sh` for router domain package layout, portable router models, or routing engine dependency changes
-- `scripts/check-context-accounting-architecture.sh` for model request context estimation, provider usage, occupancy, or context display changes
-- `scripts/check-prompt-cache-architecture.sh` for prompt-cache expectations, planning, analysis, simulation, cache capability declarations, or provider cache conformance changes
 - `scripts/check-prompt-cache-eval.sh` for host cache planning, eval cache telemetry, eval config overlays/comparisons/follow-ups, or fake-provider cache model changes (offline end-to-end run)
-- `scripts/check-structured-output-architecture.sh` for structured output, strict tool schemas, capability fidelity, schema dialects, or provider-side structured-output adaptation
-- `scripts/check-plugin-auth-architecture.sh` for plugin auth contracts, registration, profile resolution, vault custody, secret delivery, or runtime auth metadata changes
-- `scripts/check-plugin-abi-safety.sh` for native plugin ABI, callback lifetime, registrar threading, or unsafe-boundary changes
-- `bash scripts/check-transcript-viewport-architecture.sh` for transcript scrolling, layout reconciliation, content correspondence, or tool-surface composition changes
-- `scripts/check-tui-theme-architecture.sh` for terminal theme definitions, resolved presentation, themed components, or TUI/plugin visual migration
-- `scripts/check-reasoning-presentation-architecture.sh` for provider-neutral reasoning activity emission, readable/opaque reasoning availability semantics, or reasoning presentation in any renderer
 - relevant `cargo test` commands for changed packages
 - relevant plugin rebuild/check commands when plugin crates exist
 

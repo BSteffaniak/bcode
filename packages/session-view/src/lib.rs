@@ -4247,8 +4247,8 @@ fn presentation_update_contribution(
 ///
 /// This module may be removed only when the supported session-history contract no longer includes
 /// schemas that encoded `ToolContributionPlacement`. Until then it must remain decode-only: new
-/// producers are rejected by `scripts/check-loop-runtime-architecture.sh`, and canonical update
-/// APIs must not call into this adapter.
+/// producers must use invocation-owned presentation, and canonical update APIs must not call
+/// into this adapter.
 mod legacy_contribution_projection {
     use super::TranscriptViewItemId;
 

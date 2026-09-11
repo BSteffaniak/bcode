@@ -65,7 +65,6 @@ Before touching a live provider, prove the harness itself is healthy:
 
 ```sh
 cargo test -p bcode_prompt_cache            # planner, analyzer, simulator, round-trip
-scripts/check-prompt-cache-architecture.sh  # boundary guards
 scripts/check-prompt-cache-eval.sh          # real daemon + sessions against the fake cache model
 ```
 

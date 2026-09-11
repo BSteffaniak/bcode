@@ -4,8 +4,8 @@ Current fixture baseline schema: **47**.
 
 When `CURRENT_SESSION_EVENT_SCHEMA_VERSION` changes, update this declared
 baseline and add or update a fixture that records the new schema's compatibility
-expectations. `scripts/check-session-architecture.sh` enforces that they remain
-synchronized.
+expectations. Validate compatibility by running the owning fixture tests, not by
+matching schema constants against this documentation.
 
 This directory is reserved for committed binary/text fixtures that exercise
 session persistence migrations across released schema versions.

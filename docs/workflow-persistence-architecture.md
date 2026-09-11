@@ -544,7 +544,7 @@ procedures are documented in [`workflow-operations.md`](workflow-operations.md).
 
 ## Architecture enforcement
 
-Once the durable package exists, `scripts/check-workflow-architecture.sh` must enforce at least:
+Domain-owned behavioral, compatibility, and dependency checks should cover:
 
 * only the workflow persistence owner constructs `workflow.db`;
 * session and loop packages do not define workflow tables or state files;

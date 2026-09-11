@@ -21,9 +21,8 @@ representative workload benchmarks.
 ## Component ownership and direct primitive boundary
 
 Bcode's normal terminal shell composes generic controls from `bmux_tui_components` and coding-agent
-recipes from `bcode_tui_components`. Production consumers request exact component features; the
-repository checks those requests with `scripts/check-tui-component-features.sh` and prohibits the
-`all` convenience bundle in production manifests.
+recipes from `bcode_tui_components`. Production consumers request the component features they use
+rather than the `all` convenience bundle; compilation checks that the selected APIs are available.
 
 Terminal painting uses the root `PaintCx` supplied by BMUX and scoped child contexts. Cells,
 images, cursor, selection and hits pass through that boundary; application code does not regain
@@ -35,8 +34,8 @@ translation rather than copying scratch-buffer cells.
 
 Picker filtering and command activation remain Bcode-owned. Generic selectable-list and scroll-view
 state provide viewport mechanics. The setup board retains domain-specific drag-to-pan gestures.
-Component-owned optional dependencies remain feature-gated; the repository checks exact consumer
-features, including `scroll-view`, `selectable-list`, and `text-input`.
+Component-owned optional dependencies remain feature-gated; consumers select the controls they use,
+including `scroll-view`, `selectable-list`, and `text-input`.
 
 BMUX dependencies continue to follow `branch = "master"`. Cargo.lock records the resolved published
 commit; no local path override or fixed `rev` dependency is required.
@@ -79,8 +78,8 @@ fingerprint, and native plugin visual contexts carry renderer-owned source/diff/
 plus that fingerprint. Theme changes therefore invalidate retained styled rows without replaying or
 mutating canonical session history.
 
-The mechanical boundary is checked by `scripts/check-tui-theme-architecture.sh`. Its exceptions are
-narrow: declarative theme definitions/resolution, raw ANSI conversion, compatibility defaults, and
+Validate theme behavior through rendered output and theme lifecycle tests, not source-color scans.
+Declarative theme definitions/resolution, raw ANSI conversion, compatibility defaults, and
 focused tests may contain concrete colors; migrated application chrome must consume semantic styles.
 
 ## BMUX runtime ownership

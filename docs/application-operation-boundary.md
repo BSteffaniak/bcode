@@ -24,7 +24,7 @@ Focused operation modules own reusable application coordination, including:
 * Bounded reads, cancellation, ownership fencing, and terminal-state behavior.
 * Explicit private context only where required, such as authenticated client identity or a connection-scoped event sink.
 
-Operation modules do not own wire framing, request IDs, response encoding, handshakes, daemon artifact negotiation, sockets, connection lifetime, or frontend rendering. Workflow operations mechanically enforce this distinction through `scripts/check-workflow-architecture.sh`.
+Operation modules do not own wire framing, request IDs, response encoding, handshakes, daemon artifact negotiation, sockets, connection lifetime, or frontend rendering. Validate this distinction through typed application interfaces and operation tests rather than source scans.
 
 ## Adapter responsibilities
 

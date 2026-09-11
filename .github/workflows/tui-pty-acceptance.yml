@@ -21,7 +21,7 @@ on:
       - "packages/tui/**"
       - "packages/tui-components/**"
       - "plugins/**"
-      - "scripts/check-daemon-lifecycle-architecture.sh"
+      - "xtask/src/architecture.rs"
       - "scripts/smoke-local-daemon.sh"
       - "scripts/smoke-tui-pty.sh"
   push:
@@ -44,7 +44,7 @@ on:
       - "packages/tui/**"
       - "packages/tui-components/**"
       - "plugins/**"
-      - "scripts/check-daemon-lifecycle-architecture.sh"
+      - "xtask/src/architecture.rs"
       - "scripts/smoke-local-daemon.sh"
       - "scripts/smoke-tui-pty.sh"
   workflow_dispatch:

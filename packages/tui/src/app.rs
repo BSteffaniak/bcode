@@ -5833,46 +5833,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_and_tool_header_rendering_use_active_semantic_theme() {
-        let source = include_str!("render.rs");
-        let stream_start = source.find("if let Some(integrity)").expect("stream block");
-        let stream_end = source[stream_start..]
-            .find("match item.kind()")
-            .map(|offset| stream_start + offset)
-            .expect("stream block end");
-        let tool_start = source
-            .find("fn push_tool_block_header")
-            .expect("tool header");
-        let tool_end = source[tool_start..]
-            .find("fn tool_block_title_with_timing")
-            .map(|offset| tool_start + offset)
-            .expect("tool header end");
-
-        for block in [
-            &source[stream_start..stream_end],
-            &source[tool_start..tool_end],
-        ] {
-            assert!(block.contains("semantic_state_theme()"));
-            assert!(!block.contains("Color::"));
-        }
-    }
-
-    #[test]
-    fn picker_render_paths_do_not_reintroduce_fixed_palette_colors() {
-        for source in [
-            include_str!("picker_render.rs"),
-            include_str!("model_picker_render.rs"),
-            include_str!("provider_picker_render.rs"),
-            include_str!("session_picker_render.rs"),
-            include_str!("skill_picker_render.rs"),
-            include_str!("worktree_picker_render.rs"),
-        ] {
-            assert!(!source.contains("Color::"));
-            assert!(!source.contains("PICKER_BG"));
-        }
-    }
-
-    #[test]
     fn active_interaction_row_range_tracks_lifecycle_height_changes() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         app.set_pending_interactions(vec![interaction("first")]);

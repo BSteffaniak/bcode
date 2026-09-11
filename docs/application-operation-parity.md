@@ -276,4 +276,4 @@ Every current top-level command family has one explicit primary owner. Subcomman
 * An IPC request alone is not parity. Verify the typed client API, owner, authorization, cancellation, CLI behavior, output contract, and observable result.
 * Do not classify presentation or maintenance as shared application behavior merely to claim parity.
 * Do not expose raw IPC, persistence, TUI, terminal, provider-private, or plugin implementation types as application contracts.
-* Keep checked source inventories exhaustive through `scripts/check-application-operation-parity.sh`.
+* Test operation dispatch, authorization, and frontend outcomes directly; do not duplicate source inventories.

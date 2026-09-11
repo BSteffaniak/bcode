@@ -286,6 +286,18 @@ impl ServiceCancellation {
 }
 
 /// Cloneable command registrar scoped to plugin activation.
+///
+/// Registrars cannot leave the activation thread or be shared between threads.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<bcode_plugin_sdk::CommandRegistrar>();
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<bcode_plugin_sdk::CommandRegistrar>();
+/// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommandRegistrar {
     callback: Option<CommandRegistrationCallback>,
@@ -332,6 +344,18 @@ impl CommandRegistrar {
 }
 
 /// Cloneable authentication-provider registrar scoped to plugin activation.
+///
+/// Registrars cannot leave the activation thread or be shared between threads.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<bcode_plugin_sdk::AuthRegistrar>();
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<bcode_plugin_sdk::AuthRegistrar>();
+/// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AuthRegistrar {
     callback: Option<AuthRegistrationCallback>,

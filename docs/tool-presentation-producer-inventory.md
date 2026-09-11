@@ -28,7 +28,7 @@ Production searches used for this inventory:
 * `PrimaryPresentationPublisher` is used by shell, filesystem, Vim edit, web search, document, OCR, git, and worktree producers.
 * Tool presentation manifest declarations remain only for filesystem and Vim request-draft schema ownership.
 
-New primary request/progress/result placement publication is prohibited by `scripts/check-loop-runtime-architecture.sh` and `scripts/check-plugin-presentation-manifests.sh`.
+New primary request/progress/result placement publication remains prohibited; validate invocation ownership and fallback behavior through plugin and renderer tests, not source scans.
 
 ## Renderer and fallback audit
 

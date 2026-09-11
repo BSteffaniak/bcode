@@ -2695,33 +2695,6 @@ fn visual_adapter_fixture(schema: &str) -> serde_json::Value {
 }
 
 #[test]
-fn hyperchad_registry_exactly_covers_manifest_owned_visual_schemas() {
-    let inventory =
-        include_str!("../../../../../../scripts/plugin-presentation-manifest-inventory.tsv");
-    let expected = inventory
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .flat_map(|line| {
-            let mut fields = line.split('\t');
-            let _plugin_id = fields.next().expect("inventory plugin id");
-            let schemas = fields.next().expect("inventory schemas");
-            schemas
-                .split(',')
-                .filter(|schema| *schema != "-")
-                .collect::<Vec<_>>()
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    let actual = VISUAL_ADAPTERS
-        .keys()
-        .chain(ARTIFACT_ADAPTERS.keys())
-        .map(|(schema, _)| *schema)
-        .collect::<std::collections::BTreeSet<_>>();
-
-    assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 43);
-}
-
-#[test]
 fn every_registered_artifact_adapter_has_a_fixture() {
     for ((schema, schema_version), adapter) in ARTIFACT_ADAPTERS.iter() {
         let artifact = ToolArtifactView::from(ToolArtifact {
