@@ -759,108 +759,21 @@ fn merge_selected_auth_pool_env(
     primary_auth_profile: Option<&str>,
     env: &mut BTreeMap<String, String>,
 ) -> Vec<bcode_model::ProviderAuthCandidate> {
-    let Some(auth_pool_name) = auth_pool else {
+    let Some(auth_pool) = auth_pool else {
         return Vec::new();
     };
-    let registry = bcode_config::load_runtime_auth_subscriptions();
-    let order = bcode_config::effective_auth_pool_order(
-        config,
-        &registry,
-        auth_pool_name,
-        primary_auth_profile,
+    let mut selection = config.resolved_model_selection();
+    selection.auth_pool = Some(auth_pool.to_owned());
+    selection.auth_profile = primary_auth_profile.map(str::to_owned);
+    let context = bcode_provider_auth::resolve_provider_request_context(
+        bcode_provider_auth::ProviderRequestContextResolution { config, selection },
     );
-    let mut candidates = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for auth_profile_name in &order.profiles {
-        if config.auth.profiles.contains_key(auth_profile_name) {
-            push_config_auth_candidate(config, auth_profile_name, env, &mut candidates, &mut seen);
-            continue;
-        }
-        if let Some(profile) = registry
-            .pools
-            .get(auth_pool_name)
-            .into_iter()
-            .flat_map(|pool| pool.profiles.iter())
-            .find(|profile| profile.auth_profile == *auth_profile_name)
-        {
-            let auth_profile = runtime_subscription_auth_profile(profile);
-            let resolved =
-                bcode_provider_auth::resolve_auth_profile(&profile.auth_profile, &auth_profile);
-            for (key, value) in &resolved.env {
-                env.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-            candidates.push(bcode_model::ProviderAuthCandidate {
-                profile: Some(profile.auth_profile.clone()),
-                auth: resolved.auth,
-                env: resolved.env,
-            });
-            seen.insert(profile.auth_profile.clone());
-        }
-    }
-    candidates
-}
-
-fn push_config_auth_candidate(
-    config: &bcode_config::BcodeConfig,
-    auth_profile_name: &str,
-    env: &mut BTreeMap<String, String>,
-    candidates: &mut Vec<bcode_model::ProviderAuthCandidate>,
-    seen: &mut std::collections::BTreeSet<String>,
-) {
-    if !seen.insert(auth_profile_name.to_string()) {
-        return;
-    }
-    if let Some(auth_profile) = config.auth.profiles.get(auth_profile_name) {
-        let resolved = bcode_provider_auth::resolve_auth_profile(auth_profile_name, auth_profile);
-        for (key, value) in &resolved.env {
+    for candidate in &context.auth_candidates {
+        for (key, value) in &candidate.env {
             env.entry(key.clone()).or_insert_with(|| value.clone());
         }
-        candidates.push(bcode_model::ProviderAuthCandidate {
-            profile: Some(auth_profile_name.to_string()),
-            auth: resolved.auth,
-            env: resolved.env,
-        });
     }
-}
-
-fn runtime_subscription_auth_profile(
-    profile: &bcode_config::RuntimeAuthSubscriptionProfile,
-) -> bcode_config::AuthProfileConfig {
-    bcode_config::AuthProfileConfig {
-        backend: "sshenv".to_string(),
-        provider_id: None,
-        owner_plugin_id: None,
-        scheme: Some(profile.scheme.clone()),
-        settings: BTreeMap::from([
-            ("provider".to_string(), profile.provider.clone()),
-            ("profile".to_string(), profile.storage_profile.clone()),
-            ("vault".to_string(), profile.vault.display().to_string()),
-            ("mode".to_string(), profile.scheme.clone()),
-        ]),
-        map: BTreeMap::from([
-            (
-                "access_token".to_string(),
-                bcode_config::AuthCredentialMapping {
-                    env: Some("BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_string()),
-                    key: None,
-                },
-            ),
-            (
-                "refresh_token".to_string(),
-                bcode_config::AuthCredentialMapping {
-                    env: Some("BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_string()),
-                    key: None,
-                },
-            ),
-            (
-                "expires_at".to_string(),
-                bcode_config::AuthCredentialMapping {
-                    env: Some("BCODE_OPENAI_CODEX_EXPIRES_AT".to_string()),
-                    key: None,
-                },
-            ),
-        ]),
-    }
+    context.auth_candidates
 }
 
 fn merge_legacy_openai_auth_profile_env(
