@@ -641,7 +641,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
     resolved.auth_pool = selected_auth_pool(&config, &resolved);
-    let auth = merge_selected_auth_profile_env(&config, resolved.auth_profile.as_deref(), &mut env);
+    let auth = merge_selected_auth_profile_env(&config, &resolved, &mut env);
     let auth_pool_routing = selected_auth_pool_routing(&config, resolved.auth_pool.as_deref());
     let auth_candidates = merge_selected_auth_pool_env(
         &config,
@@ -730,19 +730,24 @@ fn selected_auth_pool_routing(
 
 fn merge_selected_auth_profile_env(
     config: &bcode_config::BcodeConfig,
-    auth_profile: Option<&str>,
+    selection: &bcode_config::ResolvedModelSelection,
     env: &mut BTreeMap<String, String>,
 ) -> Option<bcode_model::ProviderAuthContext> {
-    if let Some(auth_profile_name) = auth_profile {
-        if let Some(auth_profile) = config.auth.profiles.get(auth_profile_name) {
-            let resolved =
-                bcode_provider_auth::resolve_auth_profile(auth_profile_name, auth_profile);
-            for (key, value) in resolved.env {
-                env.entry(key).or_insert(value);
-            }
-            return Some(resolved.auth);
+    if selection.auth_profile.is_some() {
+        let mut selected = selection.clone();
+        // Pool materialization is handled separately below. Resolve just the explicit
+        // primary through the domain path, including owned runtime-only accounts.
+        selected.auth_pool = None;
+        let resolved = bcode_provider_auth::resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config,
+                selection: selected,
+            },
+        );
+        for (key, value) in resolved.env {
+            env.entry(key).or_insert(value);
         }
-        return None;
+        return resolved.auth;
     }
     merge_legacy_openai_auth_profile_env(config, env);
     None
