@@ -23,6 +23,7 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
 pub const BCODE_CONFIG_ENV: &str = "BCODE_CONFIG";
 /// Environment variable containing raw TOML config overlay data.
 pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
+pub mod contexts;
 pub mod edit;
 
 /// Environment variable selecting the active model profile.
@@ -208,6 +209,12 @@ const PROVIDER_ENVIRONMENT_SPECS: &[ProviderEnvironmentSpec] = &[
 /// Top-level Bcode configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BcodeConfig {
+    /// Stable identity of the resolved context, retained across client/server transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_context: Option<String>,
+    /// Declarative context definitions and explicit selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contexts: Option<Box<contexts::ContextConfig>>,
     #[serde(default, skip_serializing)]
     pub composition: CompositionConfig,
     #[serde(default)]
@@ -267,6 +274,8 @@ pub struct BcodeConfig {
 impl Default for BcodeConfig {
     fn default() -> Self {
         Self {
+            active_context: None,
+            contexts: None,
             composition: CompositionConfig::default(),
             plugins: PluginConfig::default(),
             model: ModelConfig::default(),
@@ -600,10 +609,17 @@ impl BcodeConfig {
         if let Some(profile) = environment.var(BCODE_AUTH_PROFILE_ENV)
             && !profile.trim().is_empty()
         {
-            selection.auth_profile = Some(profile);
+            selection.auth_profile = self.qualify_auth_override(profile);
         }
         self.apply_model_metadata_override(&mut selection);
         selection
+    }
+
+    fn qualify_auth_override(&self, profile: String) -> Option<String> {
+        match &self.active_context {
+            Some(context) => contexts::qualify(context, &profile).ok(),
+            None => Some(profile),
+        }
     }
 
     fn apply_model_metadata_override(&self, selection: &mut ResolvedModelSelection) {
@@ -1152,6 +1168,7 @@ fn resolve_composed_config_value(
         }
     }
 
+    contexts::resolve(&mut resolved)?;
     let mut available_profiles = profiles.keys().cloned().collect::<Vec<_>>();
     available_profiles.sort();
     Ok((
@@ -6697,6 +6714,9 @@ fn writable_config_path() -> PathBuf {
 }
 
 fn config_to_toml(config: &BcodeConfig) -> String {
+    if config.contexts.is_some() {
+        return toml::to_string_pretty(config).expect("serializable context configuration");
+    }
     let mut output = String::new();
     write_plugins_toml(&mut output, &config.plugins);
     write_tools_toml(&mut output, &config.tools);

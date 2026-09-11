@@ -47,6 +47,12 @@ impl SetupSettingsForm {
 
     /// Select a configured profile while retaining an explicit, reviewed edit destination.
     pub fn models(path: &std::path::Path, config: &bcode_config::BcodeConfig) -> Self {
+        if config.active_context.is_some() {
+            let mut form = Self::new(path, "model/profile");
+            form.model_profiles = Some(Vec::new());
+            "Context-local model editing requires editing that context's configuration. Esc returns without changing global defaults.".clone_into(&mut form.status);
+            return form;
+        }
         let mut form = Self::new(path, "model/profile");
         form.focused = 0;
         form.model_profiles = Some(

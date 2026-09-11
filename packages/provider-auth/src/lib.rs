@@ -740,12 +740,18 @@ pub fn resolve_auth_provider_profile(
     if provider_id.trim().is_empty() || owner_plugin_id.trim().is_empty() {
         return Err(AuthProfileResolutionError::InvalidOwner);
     }
+    let scoped_name = context_profile_name(config, provider_id, explicit_profile)?;
+    let explicit_profile = scoped_name.as_deref().or(explicit_profile);
     let declarative_binding = config
         .auth
         .bindings
         .get(provider_id)
         .and_then(|binding| binding.profile.as_deref());
-    let runtime_binding = runtime.bindings.get(provider_id);
+    let runtime_binding = config
+        .active_context
+        .is_none()
+        .then(|| runtime.bindings.get(provider_id))
+        .flatten();
     let profile_name = explicit_profile
         .or(declarative_binding)
         .or_else(|| {
@@ -769,6 +775,7 @@ pub fn resolve_auth_provider_profile(
         });
     }
 
+    reject_unconfigured_context_account(config, provider_id, profile_name)?;
     let Some(runtime_profile) = runtime.profiles.get(profile_name) else {
         return resolve_runtime_pool_member_profile(
             runtime,
@@ -842,6 +849,46 @@ pub fn resolve_auth_provider_profile(
 ///
 /// Ownership is taken from the member, falling back to its pool's registration identity. A
 /// member without any verifiable owner fails closed.
+fn reject_unconfigured_context_account(
+    config: &bcode_config::BcodeConfig,
+    provider: &str,
+    profile: &str,
+) -> Result<(), AuthProfileResolutionError> {
+    if config.active_context.is_some() {
+        return Err(AuthProfileResolutionError::MissingProfile {
+            provider_id: provider.to_owned(),
+            profile: profile.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn context_profile_name(
+    config: &bcode_config::BcodeConfig,
+    provider_id: &str,
+    explicit: Option<&str>,
+) -> Result<Option<String>, AuthProfileResolutionError> {
+    let Some(context) = config.active_context.as_deref() else {
+        return Ok(None);
+    };
+    let requested = explicit
+        .or_else(|| {
+            config
+                .auth
+                .bindings
+                .get(provider_id)
+                .and_then(|binding| binding.profile.as_deref())
+        })
+        .unwrap_or(provider_id);
+    let namespace = format!("ctx-{}-{context}-", context.len());
+    if requested.starts_with(&namespace) {
+        return Ok(Some(requested.to_owned()));
+    }
+    bcode_config::contexts::qualify(context, requested)
+        .map(Some)
+        .map_err(|_| AuthProfileResolutionError::InvalidOwner)
+}
+
 fn resolve_runtime_pool_member_profile(
     runtime: &bcode_config::RuntimeAuthSubscriptions,
     profile_name: &str,

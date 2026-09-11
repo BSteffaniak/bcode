@@ -36,6 +36,11 @@ pub enum EnrollmentError {
     /// Registration or requested method is inconsistent.
     #[error("Authentication registration or method is invalid")]
     InvalidMethod,
+    /// New context accounts require a declared destination until context registration is available.
+    #[error(
+        "Declare this context's authentication profile before enrollment; unscoped account creation is not permitted"
+    )]
+    ContextProfileRequired,
     /// Reusing a profile cannot silently change its credential destination.
     #[error(
         "Existing account uses a different vault; choose a new profile or explicitly migrate the account"
@@ -112,6 +117,9 @@ pub fn prepare(
             })
         }
         Err(AuthProfileResolutionError::MissingProfile { .. }) => {
+            if config.active_context.is_some() {
+                return Err(EnrollmentError::ContextProfileRequired);
+            }
             let name = profile.unwrap_or_else(|| provider.provider_id.clone());
             validate_enrollment_binding(runtime, &provider.provider_id, owner_plugin_id, &name)?;
             let vault = vault.unwrap_or_else(bcode_config::default_auth_vault_path);
