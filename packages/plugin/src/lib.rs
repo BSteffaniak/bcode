@@ -7552,13 +7552,26 @@ library = "libexample_plugin.dylib"
         .expect("dynamic question plugin should load")
     }
 
-    fn load_static_question_plugin() -> LoadedPlugin {
+    struct ActivatedQuestionPlugin(Arc<LoadedPlugin>);
+
+    impl Drop for ActivatedQuestionPlugin {
+        fn drop(&mut self) {
+            // Do not mask the original assertion failure if a test unwinds.
+            let _ = self.0.deactivate();
+        }
+    }
+
+    fn load_static_question_plugin() -> ActivatedQuestionPlugin {
         let manifest = toml::from_str::<PluginManifest>(include_str!(
             "../../../plugins/question-plugin/bcode-plugin.toml"
         ))
         .expect("question manifest should parse");
-        load_static_plugin(manifest, bcode_question_plugin::static_plugin())
-            .expect("static question plugin should load")
+        let plugin = load_static_plugin(manifest, bcode_question_plugin::static_plugin())
+            .expect("static question plugin should load");
+        plugin
+            .activate()
+            .expect("static question plugin should activate");
+        ActivatedQuestionPlugin(Arc::new(plugin))
     }
 
     fn assert_question_exchange_plugin(plugin: &LoadedPlugin) {
@@ -7612,8 +7625,7 @@ library = "libexample_plugin.dylib"
         ));
     }
 
-    fn assert_pending_question_does_not_block_plugin_services(plugin: LoadedPlugin) {
-        let plugin = Arc::new(plugin);
+    fn assert_pending_question_does_not_block_plugin_services(plugin: &Arc<LoadedPlugin>) {
         let request = bcode_tool::ToolInvocationRequest {
             tool_call_id: "blocking-question-call".to_string(),
             name: "question".to_string(),
@@ -7629,7 +7641,7 @@ library = "libexample_plugin.dylib"
         let payload = serde_json::to_vec(&request).expect("question request encodes");
         let (bridge_started_tx, bridge_started_rx) = std::sync::mpsc::sync_channel(1);
         let (answer_tx, answer_rx) = std::sync::mpsc::sync_channel(1);
-        let question_plugin = Arc::clone(&plugin);
+        let question_plugin = Arc::clone(plugin);
         let question = std::thread::spawn(move || {
             question_plugin.invoke_service_with_bridge(
                 bcode_tool::TOOL_SERVICE_INTERFACE_ID,
@@ -7663,7 +7675,7 @@ library = "libexample_plugin.dylib"
             .recv_timeout(Duration::from_secs(1))
             .expect("question bridge should start");
 
-        let list_plugin = Arc::clone(&plugin);
+        let list_plugin = Arc::clone(plugin);
         let (list_tx, list_rx) = std::sync::mpsc::sync_channel(1);
         let list = std::thread::spawn(move || {
             let payload = serde_json::to_vec(&bcode_tool::ListToolsRequest::default())
@@ -7702,17 +7714,21 @@ library = "libexample_plugin.dylib"
 
     #[test]
     fn dynamic_pending_question_does_not_block_plugin_services() {
-        assert_pending_question_does_not_block_plugin_services(load_dynamic_question_plugin());
+        assert_pending_question_does_not_block_plugin_services(&Arc::new(
+            load_dynamic_question_plugin(),
+        ));
     }
 
     #[test]
     fn static_question_plugin_uses_same_invocation_exchange() {
-        assert_question_exchange_plugin(&load_static_question_plugin());
+        let plugin = load_static_question_plugin();
+        assert_question_exchange_plugin(&plugin.0);
     }
 
     #[test]
     fn static_pending_question_does_not_block_plugin_services() {
-        assert_pending_question_does_not_block_plugin_services(load_static_question_plugin());
+        let plugin = load_static_question_plugin();
+        assert_pending_question_does_not_block_plugin_services(&plugin.0);
     }
     #[test]
     fn dynamic_loader_supports_all_bridge_families_and_cancellation() {

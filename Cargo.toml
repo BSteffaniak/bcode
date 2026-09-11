@@ -276,7 +276,11 @@ bmux_plugin_sdk = { default-features = false, git = "https://github.com/BSteffan
 bmux_terminal_grid = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_text_edit = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 bmux_tui = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
-bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
+# BMUX text-input currently imports scroll_view without enabling its feature. Keep
+# isolated consumer builds working until upstream text-input owns this dependency.
+bmux_tui_components = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master", features = [
+    "scroll-view",
+] }
 bmux_tui_runtime = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", branch = "master" }
 
 # External dependencies
