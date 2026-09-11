@@ -2,12 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use hyperchad_docs_config_derive::ConfigDoc;
 use serde::{Deserialize, Serialize};
 
 use crate::{AuthConfig, ConfigError, ModelConfig};
 
 /// Declarative contexts. Map keys are stable IDs; labels are presentation only.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "contexts")]
 #[serde(deny_unknown_fields)]
 pub struct ContextConfig {
     /// Explicitly selected stable context ID. No context is selected implicitly.
@@ -15,11 +17,13 @@ pub struct ContextConfig {
     pub active: Option<String>,
     /// Independently scoped model and authentication configuration.
     #[serde(default)]
+    #[config_doc(nested, map_key = "<context-id>")]
     pub entries: BTreeMap<String, ContextDefinition>,
 }
 
 /// One user-defined context. Global model/auth defaults are not inherited.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "context_definition")]
 #[serde(deny_unknown_fields)]
 pub struct ContextDefinition {
     /// Human-readable label. Renaming it does not change credential identity.
@@ -27,9 +31,11 @@ pub struct ContextDefinition {
     pub label: Option<String>,
     /// Context-local model defaults, profiles, aliases, and policy.
     #[serde(default)]
+    #[config_doc(nested)]
     pub model: ModelConfig,
     /// Context-local account bindings and pools.
     #[serde(default)]
+    #[config_doc(nested)]
     pub auth: AuthConfig,
 }
 
@@ -72,6 +78,68 @@ pub fn qualify(context: &str, local: &str) -> Result<String, ConfigError> {
 fn qualify_option(context: &str, value: &mut Option<String>) -> Result<(), ConfigError> {
     if let Some(name) = value {
         *name = qualify(context, name)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_effective(config: &crate::BcodeConfig) -> Result<(), ConfigError> {
+    let declared = config
+        .contexts
+        .as_ref()
+        .and_then(|contexts| contexts.active.as_deref());
+    if declared != config.active_context.as_deref() {
+        return Err(invalid(
+            "effective context identity disagrees with selected context",
+        ));
+    }
+    if let Some(active) = declared {
+        validate_id(active)?;
+        let mut resolved =
+            toml::Value::try_from(config).map_err(|_| invalid("invalid effective context"))?;
+        resolve(&mut resolved)?;
+        let expected: crate::BcodeConfig = resolved
+            .try_into()
+            .map_err(|_| invalid("invalid resolved context"))?;
+        if expected.auth != config.auth || expected.model != config.model {
+            return Err(invalid(
+                "effective model or auth configuration disagrees with selected context",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_profile_override(
+    value: &mut toml::Value,
+    overrides: &crate::ConfigLoadOverrides,
+) -> Result<(), ConfigError> {
+    let Some(active) = value
+        .get("active_context")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    let mut selected = None;
+    for raw in [
+        overrides.env_config_toml.as_deref(),
+        overrides.cli_config_toml.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let patch: toml::Value =
+            toml::from_str(raw).map_err(|_| invalid("invalid model profile override"))?;
+        if let Some(profile) = patch.get("model").and_then(|model| model.get("profile")) {
+            selected = Some(profile.clone());
+        }
+    }
+    if let Some(profile) = selected {
+        value["contexts"]["entries"][&active]["model"]
+            .as_table_mut()
+            .ok_or_else(|| invalid("selected context model must be a table"))?
+            .insert("profile".to_owned(), profile);
+        resolve(value)?;
     }
     Ok(())
 }
@@ -264,6 +332,40 @@ scheme = "oauth"
                 "shared-storage"
             );
         }
+    }
+
+    #[test]
+    fn profile_override_targets_active_context_and_transport_rejects_mismatch() {
+        let config = fixture("alpha");
+        let mut value = toml::Value::try_from(&config).unwrap();
+        let overrides = crate::ConfigLoadOverrides::default()
+            .with_cli_config_toml(Some("[model]\nprofile = 'other'".to_owned()));
+        apply_profile_override(&mut value, &overrides).unwrap();
+        let changed: crate::BcodeConfig = value.try_into().unwrap();
+        assert_eq!(changed.model.profile.as_deref(), Some("other"));
+        assert_eq!(
+            changed.contexts.as_ref().unwrap().entries["alpha"]
+                .model
+                .profile
+                .as_deref(),
+            Some("other")
+        );
+        assert!(
+            crate::decode_effective_config(&crate::encode_effective_config(&changed).unwrap())
+                .is_ok()
+        );
+        let mut forged = config;
+        forged.active_context = Some("beta".to_owned());
+        assert!(
+            crate::decode_effective_config(&crate::encode_effective_config(&forged).unwrap())
+                .is_err()
+        );
+        forged.active_context = Some("alpha".to_owned());
+        forged.auth.profiles.clear();
+        assert!(
+            crate::decode_effective_config(&crate::encode_effective_config(&forged).unwrap())
+                .is_err()
+        );
     }
 
     #[test]

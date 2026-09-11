@@ -314,6 +314,10 @@ impl ConfigDocSchema for BcodeConfig {
 
     fn field_docs() -> Vec<FieldDoc> {
         vec![
+            schema_section_doc::<contexts::ContextConfig>(
+                "contexts",
+                "User-defined configuration contexts and selection.",
+            ),
             schema_section_doc::<CompositionConfig>(
                 "composition",
                 "Config composition metadata and profile selection.",
@@ -8525,7 +8529,8 @@ pub fn load_composed_config_value_with_overrides(
     overrides: &ConfigLoadOverrides,
 ) -> Result<toml::Value, ConfigError> {
     let raw = merged_raw_config_value_with_overrides(&default_config_paths(), overrides)?;
-    let (resolved, _resolution) = resolve_composed_config_value(&raw)?;
+    let (mut resolved, _resolution) = resolve_composed_config_value(&raw)?;
+    contexts::apply_profile_override(&mut resolved, overrides)?;
     Ok(resolved)
 }
 
@@ -8547,7 +8552,9 @@ pub fn encode_effective_config(config: &BcodeConfig) -> Result<String, ConfigErr
 /// Returns an error when the TOML is invalid or fails configuration validation.
 pub fn decode_effective_config(contents: &str) -> Result<BcodeConfig, ConfigError> {
     let value = parse_raw_toml_config(contents, "client effective config")?;
-    validate_config_value(value, "client effective config")
+    let config = validate_config_value(value, "client effective config")?;
+    contexts::validate_effective(&config)?;
+    Ok(config)
 }
 
 /// Load and merge configuration from paths with explicit override layers.
@@ -8563,7 +8570,8 @@ pub fn load_config_from_paths_with_overrides(
     overrides: &ConfigLoadOverrides,
 ) -> Result<BcodeConfig, ConfigError> {
     let raw = merged_raw_config_value_with_overrides(paths, overrides)?;
-    let (resolved, _resolution) = resolve_composed_config_value(&raw)?;
+    let (mut resolved, _resolution) = resolve_composed_config_value(&raw)?;
+    contexts::apply_profile_override(&mut resolved, overrides)?;
     validate_config_value(resolved, "composed config")
 }
 

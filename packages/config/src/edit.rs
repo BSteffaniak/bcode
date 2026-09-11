@@ -177,6 +177,40 @@ fn plan_validated_field_edit(
     })
 }
 
+/// Plan creation of an empty user-defined context without selecting it or copying credentials.
+///
+/// # Errors
+/// Rejects invalid IDs, duplicate definitions, malformed files, and inaccessible destinations.
+pub fn plan_context_creation(
+    path: PathBuf,
+    context: &str,
+    label: &str,
+) -> Result<ConfigEdit, ConfigError> {
+    crate::contexts::qualify(context, "validation")?;
+    let original = read_optional(&path)?;
+    let parsed: toml::Value = toml::from_str(original.as_deref().unwrap_or(""))
+        .map_err(|_| invalid("Existing configuration cannot be edited safely"))?;
+    if parsed
+        .get("contexts")
+        .and_then(|value| value.get("entries"))
+        .and_then(|value| value.get(context))
+        .is_some()
+    {
+        return Err(invalid(
+            "Context already exists; creation cannot overwrite its configuration",
+        ));
+    }
+    let keys = ["contexts", "entries", context, "label"].map(str::to_owned);
+    let edit = plan_validated_field_edit(path, &keys, Some(toml::Value::String(label.to_owned())))?;
+    // Preserve the original version used for duplicate detection across the second read.
+    if edit.original != original {
+        return Err(invalid(
+            "Configuration changed during context creation; review again",
+        ));
+    }
+    Ok(edit)
+}
+
 /// Plan a complete default model selection in one atomic file replacement.
 /// The caller must resolve the model through the catalog before presenting this edit.
 ///
@@ -237,6 +271,26 @@ fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_creation_is_reviewed_nonselecting_and_conflict_fenced() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let first = plan_context_creation(path.clone(), "custom", "Custom label").unwrap();
+        let stale = plan_context_creation(path.clone(), "other", "Other").unwrap();
+        assert!(!path.exists());
+        first.apply().unwrap();
+        assert!(stale.apply().is_err());
+        assert!(plan_context_creation(path.clone(), "custom", "Replacement").is_err());
+        let config = crate::load_config_from_paths(&[path]).unwrap();
+        assert!(config.active_context.is_none());
+        let contexts = config.contexts.unwrap();
+        assert!(contexts.entries["custom"].auth.profiles.is_empty());
+        assert_eq!(
+            contexts.entries["custom"].label.as_deref(),
+            Some("Custom label")
+        );
+    }
+
     #[test]
     fn explicit_context_selection_edit_preserves_definitions() {
         let temp = tempfile::tempdir().unwrap();
