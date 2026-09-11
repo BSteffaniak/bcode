@@ -98,9 +98,14 @@ fixtures: the image/question are sent to the selected provider. Command-line arg
 expected answers, can appear in shell history/process listings. Harness reports omit image bytes,
 answers, and remote IDs; they are not a promise to suppress separately configured provider tracing.
 
-The suite starts at most four turns per model (provider-internal retries may issue more requests).
+The suite starts at most five turns per model (provider-internal retries may issue more requests).
 It limits output/event accumulation and uses a per-turn timeout. Blocking invoker operations also
 require configured network timeouts; this is not a hard preemptive wall-clock or monetary budget.
+
+A fresh-session `no_image_control` asks the visual question without an image and with reuse off.
+If it guesses the expected answer, visual successes and the continuation transfer verdict are
+inconclusive. This is evidence calibration, not proof that a model cannot guess. A failed or empty
+control response is not accepted as successful calibration.
 
 The initial image turn asks only for `READY`. The answer to the visual follow-up is withheld from
 all requests, and the same acknowledgement history is used for inline and continuation variants.
@@ -122,7 +127,8 @@ attempts is preparation volume, not proof every byte reached the provider. Never
 observed network bandwidth. Legacy adapters can omit it.
 
 The continuation case compares its measured body total to the equivalent inline follow-up and
-requires reported continuation use before claiming a reduction. A complete workload assessment must
+requires every attempt to report continuation with a consistent nonzero omitted-message boundary,
+a verified inline baseline, and a correct continued visual answer before claiming a reduction. A complete workload assessment must
 also include the initial seed/upload and all retries, not just the follow-up. Latency is local
 elapsed time. Future upload/transport observations must remain independently labeled and must not
 contain signed URLs or credentials. Cache usage analysis remains owned by `bcode_prompt_cache`.

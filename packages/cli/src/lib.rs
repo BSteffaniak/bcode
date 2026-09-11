@@ -4929,7 +4929,7 @@ struct VerifyImagesArgs {
     /// Model id wildcard filter.
     #[arg(long)]
     id_pattern: Option<String>,
-    /// Maximum models to probe (at most four turns per model).
+    /// Maximum models to probe (at most five turns per model).
     #[arg(long, default_value_t = 1)]
     max_models: usize,
     /// Per-turn timeout; provider operations also need configured network timeouts.

@@ -67,7 +67,7 @@ pub struct ImageVerificationCase {
     pub serialized_body_bytes: Option<u64>,
     /// Local elapsed time, not provider processing time.
     pub latency_ms: u128,
-    /// Whether the provider reported using retained conversation history.
+    /// Every observed attempt reports retained history and a consistent nonzero omitted prefix.
     pub used_continuation: bool,
 }
 
@@ -92,13 +92,14 @@ impl ImageVerificationReport {
 }
 
 struct Observation {
+    completed: bool,
     case: ImageVerificationCase,
     response_id: Option<String>,
 }
 
 /// Verify inline replay and optionally retained image context through public provider operations.
 ///
-/// At most four turns are started. The stored first turn requests only an acknowledgement, so
+/// At most five turns are started. The stored first turn requests only an acknowledgement, so
 /// the later visual answer cannot be obtained from a previous assistant answer. The inline
 /// baseline uses the same acknowledgement history and question as the optimized follow-up.
 ///
@@ -131,6 +132,9 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
             .push(unexecuted("inline", ImageVerificationOutcome::Unsupported));
         return Ok(report);
     }
+    let control = run_image_absence_control(invoker, options)?;
+    let image_evidence = control.context == ImageVerificationOutcome::Passed;
+    report.cases.push(control);
     let mut request = base_request(options);
     let mut seed = execute(invoker, options, &request, "image_acknowledgement", "READY")?;
     let seed_passed = seed.case.context == ImageVerificationOutcome::Passed;
@@ -154,9 +158,13 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
         &options.expected_answer,
     )?;
     let baseline_bytes = baseline.case.serialized_body_bytes;
-    report.cases.push(baseline.case);
+    let baseline_verified =
+        image_evidence && baseline.case.context == ImageVerificationOutcome::Passed;
+    report
+        .cases
+        .push(qualify_visual_evidence(baseline.case, image_evidence));
     request.turn_id.push_str("-repeat");
-    report.cases.push(
+    report.cases.push(qualify_visual_evidence(
         execute(
             invoker,
             options,
@@ -165,7 +173,8 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
             &options.expected_answer,
         )?
         .case,
-    );
+        image_evidence,
+    ));
     if !options.allow_conversation_storage {
         report.cases.push(unexecuted(
             "continuation",
@@ -187,7 +196,7 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
         new_messages_start_index: Some(2),
         ..ConversationReuseHints::default()
     };
-    let mut continuation = execute(
+    let continuation = execute(
         invoker,
         options,
         &request,
@@ -195,8 +204,21 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
         &options.expected_answer,
     )?
     .case;
-    continuation.transfer = match (baseline_bytes, continuation.serialized_body_bytes) {
-        (Some(baseline), Some(actual)) if continuation.used_continuation => {
+    let mut continuation = qualify_visual_evidence(continuation, baseline_verified);
+    continuation.transfer = compare_transfer(baseline_bytes, &continuation);
+    report.cases.push(continuation);
+    Ok(report)
+}
+
+fn compare_transfer(
+    baseline_bytes: Option<u64>,
+    continuation: &ImageVerificationCase,
+) -> ImageVerificationOutcome {
+    match (baseline_bytes, continuation.serialized_body_bytes) {
+        (Some(baseline), Some(actual))
+            if continuation.used_continuation
+                && continuation.context == ImageVerificationOutcome::Passed =>
+        {
             if actual < baseline {
                 ImageVerificationOutcome::Passed
             } else {
@@ -204,9 +226,47 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
             }
         }
         _ => ImageVerificationOutcome::Inconclusive,
+    }
+}
+
+fn qualify_visual_evidence(
+    mut case: ImageVerificationCase,
+    evidence: bool,
+) -> ImageVerificationCase {
+    if !evidence && case.context == ImageVerificationOutcome::Passed {
+        case.context = ImageVerificationOutcome::Inconclusive;
+    }
+    case
+}
+
+fn run_image_absence_control<I: BlockingModelProviderInvoker>(
+    invoker: &mut I,
+    options: &ImageVerificationOptions,
+) -> Result<ImageVerificationCase, String> {
+    let mut request = base_request(options);
+    request.turn_id.push_str("-no-image");
+    request.conversation_reuse = ConversationReuseHints::default();
+    request.messages = vec![text_message(MessageRole::User, &options.question)];
+    let observation = execute(
+        invoker,
+        options,
+        &request,
+        "no_image_control",
+        &options.expected_answer,
+    )?;
+    let mut control = observation.case;
+    if !observation.completed {
+        return Ok(control);
+    }
+    // A guessed answer defeats the visual probe; it is not evidence of a provider bug.
+    control.context = if control.context == ImageVerificationOutcome::Passed {
+        ImageVerificationOutcome::Inconclusive
+    } else if control.context == ImageVerificationOutcome::Failed {
+        ImageVerificationOutcome::Passed
+    } else {
+        control.context
     };
-    report.cases.push(continuation);
-    Ok(report)
+    Ok(control)
 }
 
 fn discover_image_provider<I: BlockingModelProviderInvoker>(
@@ -423,6 +483,7 @@ fn collect<I: BlockingModelProviderInvoker>(
                 .finish()
                 .map_err(|_| "image verification terminal contract violation")?;
             return Ok(Observation {
+                completed: summary.stop_reason == StopReason::EndTurn && !text.trim().is_empty(),
                 case: ImageVerificationCase {
                     name: name.to_string(),
                     context: if summary.stop_reason == StopReason::EndTurn
@@ -435,9 +496,20 @@ fn collect<I: BlockingModelProviderInvoker>(
                     transfer: ImageVerificationOutcome::Inconclusive,
                     serialized_body_bytes: measured_bytes(&projections),
                     latency_ms: started.elapsed().as_millis(),
-                    used_continuation: projections
-                        .iter()
-                        .any(|projection| projection.used_previous_response_id),
+                    used_continuation: !projections.is_empty()
+                        && projections.iter().all(|projection| {
+                            projection.used_previous_response_id
+                                && projection
+                                    .omitted_message_count
+                                    .is_some_and(|count| count > 0)
+                                && projection
+                                    .original_message_count
+                                    .zip(projection.sent_message_count)
+                                    .zip(projection.omitted_message_count)
+                                    .is_some_and(|((original, sent), omitted)| {
+                                        sent.checked_add(omitted) == Some(original)
+                                    })
+                        }),
                 },
                 response_id,
             });
@@ -465,6 +537,8 @@ mod tests {
         finishes: usize,
         cancels: usize,
         fail_poll: bool,
+        guess_without_image: bool,
+        lose_continued_image: bool,
     }
 
     impl BlockingModelProviderInvoker for ProbeProvider {
@@ -499,8 +573,21 @@ mod tests {
                         .conversation_reuse
                         .previous_provider_response_id
                         .is_some();
-                    let answer = if request.messages.len() == 1 {
+                    let image_present = request
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .any(|block| matches!(block, ContentBlock::Image { .. }));
+                    let answer = if request.turn_id.ends_with("-no-image") {
+                        if self.guess_without_image {
+                            "BLUE"
+                        } else {
+                            "UNKNOWN"
+                        }
+                    } else if request.messages.len() == 1 {
                         "READY"
+                    } else if (continued && self.lose_continued_image) || !image_present {
+                        "UNKNOWN"
                     } else {
                         "BLUE"
                     };
@@ -510,6 +597,13 @@ mod tests {
                             projection: ProviderRequestProjection {
                                 serialized_body_bytes: Some(if continued { 100 } else { 1000 }),
                                 used_previous_response_id: continued,
+                                original_message_count: Some(request.messages.len()),
+                                sent_message_count: Some(if continued {
+                                    1
+                                } else {
+                                    request.messages.len()
+                                }),
+                                omitted_message_count: Some(if continued { 2 } else { 0 }),
                                 ..Default::default()
                             },
                         },
@@ -573,10 +667,10 @@ mod tests {
         let mut provider = ProbeProvider::default();
         let report = run_image_verification(&mut provider, &probe_options(true)).expect("report");
         assert!(!report.has_failures());
-        assert_eq!(provider.requests.len(), 4);
-        assert_eq!(provider.finishes, 4);
-        assert_eq!(provider.requests[1].messages, provider.requests[3].messages);
-        assert_eq!(report.cases[3].transfer, ImageVerificationOutcome::Passed);
+        assert_eq!(provider.requests.len(), 5);
+        assert_eq!(provider.finishes, 5);
+        assert_eq!(provider.requests[2].messages, provider.requests[4].messages);
+        assert_eq!(report.cases[4].transfer, ImageVerificationOutcome::Passed);
         for request in &provider.requests {
             assert!(
                 !serde_json::to_string(request)
@@ -594,14 +688,14 @@ mod tests {
     fn storage_requires_authorization_and_poll_failure_cleans_up() {
         let mut provider = ProbeProvider::default();
         let report = run_image_verification(&mut provider, &probe_options(false)).expect("report");
-        assert_eq!(provider.requests.len(), 3);
+        assert_eq!(provider.requests.len(), 4);
         assert!(
             provider
                 .requests
                 .iter()
                 .all(|request| !request.conversation_reuse.mode.is_enabled())
         );
-        assert_eq!(report.cases[3].context, ImageVerificationOutcome::Blocked);
+        assert_eq!(report.cases[4].context, ImageVerificationOutcome::Blocked);
         let mut provider = ProbeProvider {
             fail_poll: true,
             ..Default::default()
@@ -610,6 +704,57 @@ mod tests {
             run_image_verification(&mut provider, &probe_options(false)).expect_err("poll fails");
         assert!(!error.contains("secret"));
         assert_eq!((provider.cancels, provider.finishes), (1, 1));
+    }
+
+    #[test]
+    fn guessed_answers_are_not_visual_evidence() {
+        let mut provider = ProbeProvider {
+            guess_without_image: true,
+            ..Default::default()
+        };
+        let report = run_image_verification(&mut provider, &probe_options(true)).expect("report");
+        assert_eq!(
+            report.cases[0].context,
+            ImageVerificationOutcome::Inconclusive
+        );
+        assert_eq!(
+            report.cases[2].context,
+            ImageVerificationOutcome::Inconclusive
+        );
+        assert_eq!(
+            report.cases[4].context,
+            ImageVerificationOutcome::Inconclusive
+        );
+        assert_eq!(
+            report.cases[4].transfer,
+            ImageVerificationOutcome::Inconclusive
+        );
+        assert_ne!(
+            provider.requests[0].session_id,
+            provider.requests[1].session_id
+        );
+        assert!(
+            provider.requests[0]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|block| !matches!(block, ContentBlock::Image { .. }))
+        );
+    }
+
+    #[test]
+    fn lost_image_context_cannot_pass_even_when_transfer_is_smaller() {
+        let mut provider = ProbeProvider {
+            lose_continued_image: true,
+            ..Default::default()
+        };
+        let report = run_image_verification(&mut provider, &probe_options(true)).expect("report");
+        assert!(report.has_failures());
+        assert_eq!(report.cases[4].context, ImageVerificationOutcome::Failed);
+        assert_eq!(
+            report.cases[4].transfer,
+            ImageVerificationOutcome::Inconclusive
+        );
     }
 
     #[test]
