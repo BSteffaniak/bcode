@@ -732,7 +732,7 @@ impl OnboardingShell {
             map_lines,
             focused_detail: self.focused_detail(),
             footer_lines: vec![
-                "←/↑ previous  →/↓ next  Enter select  p connect  a import credentials  m model profile  r/g/x settings  s skip  l start session  Esc close"
+                "←/↑ previous  →/↓ next  Enter select  N new context  o choose context  p connect  a import credentials  m model profile  r/g/x settings  s skip  l start session  Esc close"
                     .to_owned(),
                 self.status_message.clone().unwrap_or_else(|| {
                     "Setup state is persisted locally and user config remains TOML-backed."

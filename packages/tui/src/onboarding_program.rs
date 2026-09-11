@@ -84,15 +84,29 @@ impl OnboardingProgram {
         })
     }
 
-    fn open_settings(&mut self, context: bool) {
-        self.settings_form = Some(super::setup_settings_form::SetupSettingsForm::new(
-            &bcode_config::default_config_dir().join("bcode.toml"),
-            if context {
-                "contexts/active"
-            } else {
-                "model/profile"
-            },
-        ));
+    fn open_settings(&mut self, key: KeyCode) {
+        let path = bcode_config::default_config_dir().join("bcode.toml");
+        self.settings_form = match key {
+            KeyCode::Char('N') => {
+                Some(super::setup_settings_form::SetupSettingsForm::create_context(&path))
+            }
+            KeyCode::Char('o') => {
+                if let Ok(config) = bcode_config::load_config() {
+                    Some(super::setup_settings_form::SetupSettingsForm::contexts(
+                        &path, &config,
+                    ))
+                } else {
+                    self.shell.set_status_message(
+                        "Cannot load context definitions. Review Settings.".to_owned(),
+                    );
+                    None
+                }
+            }
+            _ => Some(super::setup_settings_form::SetupSettingsForm::new(
+                &path,
+                "model/profile",
+            )),
+        };
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
@@ -134,8 +148,10 @@ impl OnboardingProgram {
             code
         };
         match code {
-            KeyCode::Char('o' | 'r' | 'g' | 'x') if !self.shell.has_pending_confirmation() => {
-                self.open_settings(code == KeyCode::Char('o'));
+            KeyCode::Char('N' | 'o' | 'r' | 'g' | 'x')
+                if !self.shell.has_pending_confirmation() =>
+            {
+                self.open_settings(code);
                 Ok(Lifecycle::Continue)
             }
             KeyCode::Char('p' | 'a' | 'm') if !self.shell.has_pending_confirmation() => {

@@ -1,6 +1,6 @@
 # Named configuration contexts (initial declarative implementation)
 
-Contexts are user-defined; no names are built in. Keys are stable identities and `label` is optional presentation. Select for one invocation with `bcode --context alpha` (also accepted after subcommands). This does not write configuration. In onboarding, `o` opens an explicit reviewed `contexts/active` configuration edit; higher-priority command-line selection still wins.
+Contexts are user-defined; no names are built in. Keys are stable identities and `label` is optional presentation. Select for one invocation with `bcode --context alpha` (also accepted after subcommands). This does not write configuration. In onboarding, `N` opens reviewed creation of an empty context (stable ID and display label), and `o` opens a picker for existing contexts. Up/Down selects; Enter reviews and then confirms the destination-file edit. Escape cancels without saving. Creation does not select the context or copy credentials. Higher-priority command-line selection still wins.
 
 ```toml
 [contexts]
@@ -31,7 +31,7 @@ Resolved context identity crosses effective-config transport. Model profile name
 ## Current limitations — not product completion
 
 * Contexts currently require predeclared authentication profiles; automatic enrollment into an undeclared context profile fails closed.
-* Interactive context creation/selection, scoped runtime account registration, adoption review, and durable session context selection are not implemented.
+* Scoped runtime account registration, adoption review, and durable session context selection are not implemented.
 * Full launch handoff is not atomic with validation. Context switching is not yet a supported live-session operation.
 * Compatibility work must address existing global names that resemble qualified names; the qualification format is not a general credential authorization boundary.
 * Context-local model-profile selection now uses a reviewed context-targeted edit. The destination file remains explicit; higher-priority overrides may still win.

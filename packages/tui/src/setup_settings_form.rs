@@ -28,6 +28,8 @@ pub struct SetupSettingsForm {
     pending: Option<bcode_config::edit::ConfigEdit>,
     model_profiles: Option<Vec<(String, bcode_config::ResolvedModelSelection)>>,
     selected_profile: usize,
+    create_context: bool,
+    contexts: Option<Vec<(String, String)>>,
 }
 
 impl SetupSettingsForm {
@@ -42,7 +44,38 @@ impl SetupSettingsForm {
             pending: None,
             model_profiles: None,
             selected_profile: 0,
+            create_context: false,
+            contexts: None,
         }
+    }
+
+    /// Review a new empty context without selecting it or copying credentials.
+    pub fn create_context(path: &std::path::Path) -> Self {
+        let mut form = Self::new(path, "");
+        form.create_context = true;
+        "Enter a stable context ID and display label. Enter reviews; Esc cancels. No accounts are copied.".clone_into(&mut form.status);
+        form
+    }
+
+    /// Choose among existing user-defined contexts.
+    pub fn contexts(path: &std::path::Path, config: &bcode_config::BcodeConfig) -> Self {
+        let mut form = Self::new(path, "contexts/active");
+        form.focused = 0;
+        form.contexts = Some(
+            config
+                .contexts
+                .iter()
+                .flat_map(|contexts| contexts.entries.iter())
+                .map(|(id, context)| {
+                    (
+                        id.clone(),
+                        context.label.clone().unwrap_or_else(|| id.clone()),
+                    )
+                })
+                .collect(),
+        );
+        form.refresh_profile();
+        form
     }
 
     /// Select a configured profile while retaining an explicit, reviewed edit destination.
@@ -70,6 +103,20 @@ impl SetupSettingsForm {
     }
 
     fn refresh_profile(&mut self) {
+        if let Some(contexts) = &self.contexts {
+            if let Some((id, label)) = contexts.get(self.selected_profile) {
+                self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(
+                    toml::Value::String(id.clone()).to_string(),
+                ));
+                self.status = format!(
+                    "{label} ({id}). Up/Down selects; Enter reviews the configuration edit."
+                );
+            } else {
+                "No contexts defined. Esc returns; press N to create one."
+                    .clone_into(&mut self.status);
+            }
+            return;
+        }
         let Some(profiles) = &self.model_profiles else {
             return;
         };
@@ -97,15 +144,18 @@ impl SetupSettingsForm {
     pub fn handle_event(&mut self, event: &Event) -> SettingsFormOutcome {
         let policy = TextInputPolicy::default();
         if self.pending.is_none()
-            && let Some(profiles) = &self.model_profiles
+            && let Some(count) = self
+                .contexts
+                .as_ref()
+                .map(Vec::len)
+                .or_else(|| self.model_profiles.as_ref().map(Vec::len))
             && let Event::Key(key) = event
             && matches!(key.key, KeyCode::Up | KeyCode::Down)
         {
             if key.key == KeyCode::Up {
                 self.selected_profile = self.selected_profile.saturating_sub(1);
             } else {
-                self.selected_profile =
-                    (self.selected_profile + 1).min(profiles.len().saturating_sub(1));
+                self.selected_profile = (self.selected_profile + 1).min(count.saturating_sub(1));
             }
             self.refresh_profile();
             return SettingsFormOutcome::Continue;
@@ -119,7 +169,7 @@ impl SetupSettingsForm {
             }
             Event::Key(key) if key.key == KeyCode::Enter => self.submit(),
             Event::Key(key) if key.key == KeyCode::Tab && self.pending.is_none() => {
-                if self.model_profiles.is_some() {
+                if self.model_profiles.is_some() || self.contexts.is_some() {
                     self.focused = 0;
                 } else {
                     self.focused = (self.focused + 1) % self.inputs.len();
@@ -139,6 +189,10 @@ impl SetupSettingsForm {
     }
 
     fn submit(&mut self) {
+        if self.contexts.as_ref().is_some_and(Vec::is_empty) {
+            self.refresh_profile();
+            return;
+        }
         if let Some(profiles) = &self.model_profiles {
             let Some((_, selection)) = profiles.get(self.selected_profile) else {
                 self.refresh_profile();
@@ -161,6 +215,16 @@ impl SetupSettingsForm {
         let path = self.inputs[0].buffer().text();
         let key = self.inputs[1].buffer().text();
         let value = self.inputs[2].buffer().text();
+        if self.create_context {
+            match bcode_config::edit::plan_context_creation(path.into(), key, value) {
+                Ok(edit) => {
+                    self.pending = Some(edit);
+                    "Review the file, stable ID, and label. Enter creates an empty context; Esc cancels.".clone_into(&mut self.status);
+                }
+                Err(_) => "Cannot create context: check the ID, duplicate definitions, and destination file.".clone_into(&mut self.status),
+            }
+            return;
+        }
         let parsed = if value.trim().is_empty() {
             None
         } else {
@@ -185,11 +249,19 @@ impl SetupSettingsForm {
     pub fn render(&mut self, frame: &mut PaintCx<'_, '_>, theme: &PresentedTheme) {
         let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         let policy = TextInputPolicy::default();
-        let labels = [
-            "Configuration file",
-            "Field (example: model/profile)",
-            "TOML value (empty removes override)",
-        ];
+        let labels = if self.create_context {
+            [
+                "Configuration file",
+                "Stable context ID",
+                "Display label (plain text)",
+            ]
+        } else {
+            [
+                "Configuration file",
+                "Field (example: model/profile)",
+                "TOML value (empty removes override)",
+            ]
+        };
         let title = if self.pending.is_some() {
             "Review settings change"
         } else {
@@ -258,6 +330,50 @@ fn write(frame: &mut PaintCx<'_, '_>, area: Rect, text: &str, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_creation_and_selection_require_separate_reviewed_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let mut creation = SetupSettingsForm::create_context(&path);
+        creation.inputs[1] = TextInputState::new(TextEditBuffer::from_text("custom-id"));
+        creation.inputs[2] = TextInputState::new(TextEditBuffer::from_text("Custom label"));
+        creation.submit();
+        assert!(creation.pending.is_some());
+        assert!(!path.exists());
+        creation.submit();
+        let config = bcode_config::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        assert!(config.active_context.is_none());
+        assert!(config.auth.profiles.is_empty());
+        let mut picker = SetupSettingsForm::contexts(&path, &config);
+        assert!(picker.status.contains("Custom label"));
+        picker.submit();
+        assert!(picker.pending.is_some());
+        picker.submit();
+        let selected = bcode_config::load_config_from_paths(&[path]).unwrap();
+        assert_eq!(selected.active_context.as_deref(), Some("custom-id"));
+        assert!(selected.auth.profiles.is_empty());
+    }
+
+    #[test]
+    fn context_creation_cancel_and_duplicate_preserve_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let mut form = SetupSettingsForm::create_context(&path);
+        form.inputs[1] = TextInputState::new(TextEditBuffer::from_text("custom"));
+        form.submit();
+        form.handle_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+            KeyCode::Escape,
+        )));
+        assert!(form.pending.is_none());
+        assert!(!path.exists());
+        form.submit();
+        form.submit();
+        let before = std::fs::read(&path).unwrap();
+        form.submit();
+        assert!(form.pending.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn configured_profile_picker_requires_review_and_preserves_local_names() {

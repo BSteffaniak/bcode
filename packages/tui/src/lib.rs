@@ -302,7 +302,13 @@ pub async fn run_setup_screen(
             })?,
             terminal_area()?,
         );
-        run_onboarding_runtime(&mut terminal, store, shell, &config.tui).await
+        Box::pin(run_onboarding_runtime(
+            &mut terminal,
+            store,
+            shell,
+            &config.tui,
+        ))
+        .await
     };
     let _writer = guard.leave()?;
     result
