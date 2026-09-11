@@ -317,15 +317,9 @@ fn runtime_pool_candidate_profile(
         .profiles
         .iter()
         .find(|profile| profile.auth_profile == name)?;
-    let mut profile = runtime_subscription_auth_profile_config(member);
-    if profile.owner_plugin_id.is_none() {
-        profile.owner_plugin_id = pool
-            .owner_plugin_id
-            .clone()
-            .or_else(|| pool.provider_plugin_id.clone());
-    }
-    validate_auth_profile_ownership(name, &profile, &member.provider, owner?).ok()?;
-    Some(profile)
+    resolve_auth_provider_profile(config, &member.provider, owner?, Some(name), registry)
+        .ok()
+        .map(|resolved| resolved.profile)
 }
 
 fn selected_runtime_auth_profile(
@@ -469,6 +463,11 @@ pub enum AuthProviderProfileLookup {
 pub enum AuthProfileResolutionError {
     #[error("auth provider and plugin IDs must not be empty")]
     InvalidOwner,
+    /// A legacy name refers to different account destinations or ownership metadata.
+    #[error(
+        "auth profile '{profile}' has conflicting pool registrations; inspect authentication metadata before continuing"
+    )]
+    AmbiguousProfile { profile: String },
     #[error("auth profile '{profile}' is not configured for provider '{provider_id}'")]
     MissingProfile {
         provider_id: String,
@@ -660,12 +659,13 @@ fn resolve_runtime_pool_member_profile(
     owner_plugin_id: &str,
     runtime_binding: Option<&bcode_config::RuntimeAuthBinding>,
 ) -> Result<ResolvedAuthProfile, AuthProfileResolutionError> {
-    let Some((pool, member)) = runtime.pools.values().find_map(|pool| {
+    let mut matches = runtime.pools.values().flat_map(|pool| {
         pool.profiles
             .iter()
-            .find(|member| member.auth_profile == profile_name)
-            .map(|member| (pool, member))
-    }) else {
+            .filter(move |member| member.auth_profile == profile_name)
+            .map(move |member| (pool, member))
+    });
+    let Some((pool, member)) = matches.next() else {
         return Err(AuthProfileResolutionError::MissingProfile {
             provider_id: provider_id.to_string(),
             profile: profile_name.to_string(),
@@ -681,12 +681,13 @@ fn resolve_runtime_pool_member_profile(
             actual: binding.owner_plugin_id.clone(),
         });
     }
-    let mut profile = runtime_subscription_auth_profile_config(member);
-    if profile.owner_plugin_id.is_none() {
-        profile.owner_plugin_id = pool
-            .owner_plugin_id
-            .clone()
-            .or_else(|| pool.provider_plugin_id.clone());
+    let profile = owned_pool_member_config(pool, member);
+    for (other_pool, other_member) in matches {
+        if owned_pool_member_config(other_pool, other_member) != profile {
+            return Err(AuthProfileResolutionError::AmbiguousProfile {
+                profile: profile_name.to_owned(),
+            });
+        }
     }
     validate_auth_profile_ownership(profile_name, &profile, provider_id, owner_plugin_id)?;
     Ok(ResolvedAuthProfile {
@@ -696,6 +697,20 @@ fn resolve_runtime_pool_member_profile(
         profile,
         source: AuthProfileSource::Runtime,
     })
+}
+
+fn owned_pool_member_config(
+    pool: &bcode_config::RuntimeAuthSubscriptionPool,
+    member: &bcode_config::RuntimeAuthSubscriptionProfile,
+) -> bcode_config::AuthProfileConfig {
+    let mut profile = runtime_subscription_auth_profile_config(member);
+    if profile.owner_plugin_id.is_none() {
+        profile.owner_plugin_id = pool
+            .owner_plugin_id
+            .clone()
+            .or_else(|| pool.provider_plugin_id.clone());
+    }
+    profile
 }
 
 fn validate_auth_profile_ownership(
@@ -1679,6 +1694,48 @@ mod tests {
     /// Subscription logins historically registered only a pool member, never a top-level runtime
     /// profile. Pool routing reads those members, so lifecycle resolution must too; otherwise a
     /// stale member keeps routing turns while `status`/`logout` report it as not configured.
+    #[test]
+    fn duplicate_legacy_names_require_identical_account_destinations() {
+        let config = bcode_config::BcodeConfig::default();
+        let mut runtime = pool_member_runtime(None, Some("bcode.openai-compatible"));
+        let copy = runtime.pools["openai"].clone();
+        runtime.pools.insert("another-pool".to_owned(), copy);
+        assert!(
+            resolve_auth_provider_profile(
+                &config,
+                "openai",
+                "bcode.openai-compatible",
+                Some("openai-2"),
+                &runtime
+            )
+            .is_ok()
+        );
+        runtime.pools.get_mut("another-pool").unwrap().profiles[0].storage_profile =
+            "different-account".to_owned();
+        assert!(matches!(
+            resolve_auth_provider_profile(
+                &config,
+                "openai",
+                "bcode.openai-compatible",
+                Some("openai-2"),
+                &runtime
+            ),
+            Err(AuthProfileResolutionError::AmbiguousProfile { .. })
+        ));
+        for pool in ["openai", "another-pool"] {
+            assert!(
+                runtime_pool_candidate_profile(
+                    &config,
+                    &runtime,
+                    pool,
+                    "openai-2",
+                    Some("bcode.openai-compatible")
+                )
+                .is_none()
+            );
+        }
+    }
+
     #[test]
     fn pool_only_candidates_require_verified_owner_before_materialization() {
         let config = bcode_config::BcodeConfig::default();
