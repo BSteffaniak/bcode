@@ -220,6 +220,23 @@ fn validate_runtime_pool_selection(
     if !request.config.auth.pools.contains_key(pool) && !registry.pools.contains_key(pool) {
         return Err(invalid());
     }
+    let selected_owner = request.selection.provider_plugin_id.as_deref();
+    let declared = request.config.auth.pools.get(pool);
+    let runtime = registry.pools.get(pool);
+    for owner in [
+        declared.and_then(|pool| pool.provider_plugin_id.as_deref()),
+        runtime.and_then(|pool| pool.provider_plugin_id.as_deref()),
+        runtime.and_then(|pool| pool.owner_plugin_id.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if owner.trim().is_empty() || Some(owner) != selected_owner {
+            return Err(bcode_config::ConfigError::Composition {
+                message: "Selected authentication pool has conflicting provider ownership; review the selected provider and pool metadata.".to_owned(),
+            });
+        }
+    }
     let order = bcode_config::effective_auth_pool_order(
         request.config,
         registry,
@@ -1635,6 +1652,51 @@ mod tests {
             );
             assert_eq!(calls, usize::from(owner == Some("example.plugin")));
             assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
+        }
+    }
+
+    #[test]
+    fn strict_pool_owner_must_match_even_when_members_are_compatible() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.profiles.insert(
+            "account".to_owned(),
+            bcode_config::AuthProfileConfig {
+                backend: "env".to_owned(),
+                owner_plugin_id: Some("example.plugin".to_owned()),
+                ..Default::default()
+            },
+        );
+        config.auth.pools.insert(
+            "pool".to_owned(),
+            bcode_config::AuthPoolConfig {
+                profiles: vec!["account".to_owned()],
+                provider_plugin_id: Some("example.plugin".to_owned()),
+                ..Default::default()
+            },
+        );
+        let request = ProviderRequestContextResolution {
+            config: &config,
+            selection: bcode_config::ResolvedModelSelection {
+                provider_plugin_id: Some("example.plugin".to_owned()),
+                auth_pool: Some("pool".to_owned()),
+                ..Default::default()
+            },
+        };
+        for owner in ["example.plugin", "foreign.plugin", ""] {
+            let registry = bcode_config::RuntimeAuthSubscriptions {
+                pools: BTreeMap::from([(
+                    "pool".to_owned(),
+                    bcode_config::RuntimeAuthSubscriptionPool {
+                        owner_plugin_id: Some(owner.to_owned()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_runtime_pool_selection(&request, &registry).is_ok(),
+                owner == "example.plugin"
+            );
         }
     }
 
