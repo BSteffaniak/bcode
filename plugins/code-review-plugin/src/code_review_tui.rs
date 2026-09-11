@@ -6924,6 +6924,9 @@ impl ReviewApp {
         if self.last_diff_area == Some(area) {
             return;
         }
+        let text_anchor = self
+            .current_review_view_document()
+            .and_then(|document| document.text_anchor(self.diff_scroll));
         let anchor = self.current_review_view_document().and_then(|document| {
             let target = document.target_for_visual_row(self.diff_scroll)?.clone();
             let first = document.visual_row_for_target(&target)?;
@@ -6941,6 +6944,12 @@ impl ReviewApp {
                 .take_while(|row| row.target == target)
                 .count();
             self.diff_scroll = first.saturating_add(offset.min(count.saturating_sub(1)));
+        }
+        if let Some((target, byte)) = text_anchor
+            && let Some(document) = self.current_review_view_document()
+            && let Some(row) = document.row_for_text_anchor(&target, byte)
+        {
+            self.diff_scroll = row;
         }
         self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
     }

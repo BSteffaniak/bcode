@@ -268,6 +268,7 @@ impl ReviewViewDocument {
                                 body_line_count,
                                 comment: comment.clone(),
                                 rendered: None,
+                                source_ranges: Vec::new(),
                             },
                         });
                     }
@@ -377,10 +378,8 @@ impl ReviewViewDocument {
                 if *body_line_index != 0 {
                     continue;
                 }
-                let mut rendered = bcode_markdown_render::render_markdown_lines(
-                    &comment.body,
-                    bcode_markdown_render::MarkdownRenderOptions::new(content_width),
-                );
+                let (mut rendered, ranges) =
+                    markdown_rows_with_sources(&comment.body, content_width);
                 if rendered.is_empty() {
                     rendered.push(bmux_tui::text::Line::default());
                 }
@@ -391,12 +390,14 @@ impl ReviewViewDocument {
                         body_line_index,
                         body_line_count,
                         rendered,
+                        source_ranges,
                         ..
                     } = &mut projected.block
                     {
                         *body_line_index = index;
                         *body_line_count = count;
                         *rendered = Some(line);
+                        *source_ranges = ranges.get(index).cloned().unwrap_or_default();
                     }
                     rows.push(projected);
                 }
@@ -452,6 +453,33 @@ impl ReviewViewDocument {
         }
         self.rows = rows;
         self
+    }
+
+    /// Capture a canonical comment byte position at the top visible row.
+    pub(crate) fn text_anchor(&self, row: usize) -> Option<(ReviewViewTarget, usize)> {
+        let row = self.rows.get(row)?;
+        let ReviewViewBlock::InlineComment { source_ranges, .. } = &row.block else {
+            return None;
+        };
+        Some((
+            row.target.clone(),
+            source_ranges.iter().map(|range| range.start).min()?,
+        ))
+    }
+
+    /// Resolve a comment byte position against the new measured rows.
+    pub(crate) fn row_for_text_anchor(
+        &self,
+        target: &ReviewViewTarget,
+        byte: usize,
+    ) -> Option<usize> {
+        self.rows.iter().find_map(|row| {
+            let ReviewViewBlock::InlineComment { source_ranges, .. } = &row.block else {
+                return None;
+            };
+            (&row.target == target && source_ranges.iter().any(|range| range.contains(&byte)))
+                .then_some(row.visual_row)
+        })
     }
 
     /// Return the semantic row for a visual row.
@@ -622,6 +650,8 @@ pub enum ReviewViewBlock {
         comment: ReviewDraftComment,
         /// Retained width-resolved Markdown row.
         rendered: Option<bmux_tui::text::Line>,
+        /// Trustworthy source ranges used for resize anchoring.
+        source_ranges: Vec<std::ops::Range<usize>>,
     },
     /// Inline suggested comment row.
     InlineSuggestion {
@@ -660,6 +690,25 @@ pub enum ReviewViewBlock {
         /// Action represented by this row.
         action: ReviewThreadAction,
     },
+}
+
+fn markdown_rows_with_sources(
+    text: &str,
+    width: u16,
+) -> (Vec<bmux_tui::text::Line>, Vec<Vec<std::ops::Range<usize>>>) {
+    let result = bcode_markdown_render::render_markdown(
+        text,
+        &bcode_markdown_render::MarkdownRenderOptions::new(width),
+    );
+    let mut ranges = vec![Vec::new(); result.lines.len()];
+    for unit in result.selection_provenance() {
+        for rect in &unit.rects {
+            if let Some(row) = ranges.get_mut(usize::from(rect.y)) {
+                row.extend(unit.source_ranges.iter().cloned());
+            }
+        }
+    }
+    (result.lines, ranges)
 }
 
 fn suggestion_rows(text: &str, width: usize) -> Vec<bmux_tui::text::Line> {
@@ -1734,6 +1783,19 @@ mod tests {
         assert!(text.contains("first"));
         assert!(text.contains("second"));
         let wide = document.clone().layout_inline_threads(80);
+        for row in &narrow.rows {
+            if let Some((target, byte)) = narrow.text_anchor(row.visual_row) {
+                let resolved = wide
+                    .row_for_text_anchor(&target, byte)
+                    .expect("source byte survives resize");
+                let ReviewViewBlock::InlineComment { source_ranges, .. } =
+                    &wide.rows[resolved].block
+                else {
+                    panic!("comment anchor");
+                };
+                assert!(source_ranges.iter().any(|range| range.contains(&byte)));
+            }
+        }
         assert!(wide.rows.len() < narrow.rows.len());
         assert!(
             narrow
