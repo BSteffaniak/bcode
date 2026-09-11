@@ -204,9 +204,12 @@ fn flow(
     let AuthMethodContribution::Interactive { operation, .. } = method else {
         return Err("Select a device/browser authentication method.");
     };
+    let runtime = bcode_config::try_load_runtime_auth_subscriptions().map_err(|_| {
+        "Authentication metadata is unreadable or unsupported. Inspect authentication state before signing in; existing credentials were not changed."
+    })?;
     let prepared = bcode_provider_auth::enrollment::prepare(
         &config,
-        &bcode_config::load_runtime_auth_subscriptions(),
+        &runtime,
         &provider.contribution,
         &provider.plugin_id,
         method_id,

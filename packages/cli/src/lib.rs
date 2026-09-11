@@ -8580,7 +8580,7 @@ fn resolve_or_prepare_auth_profile(
     recipient_key: Option<&str>,
 ) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
     let config = bcode_config::load_config()?;
-    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let runtime = bcode_config::try_load_runtime_auth_subscriptions()?;
     resolve_or_prepare_auth_profile_from(
         &config,
         &runtime,

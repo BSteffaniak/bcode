@@ -336,9 +336,12 @@ impl ConnectionForm {
             .map_err(|_| "Credential does not meet provider requirements".to_owned())?;
         let profile = self.fields[2].buffer().text();
         let vault = self.fields[3].buffer().text();
+        let runtime = bcode_config::try_load_runtime_auth_subscriptions().map_err(|_| {
+            "Authentication metadata is unreadable or unsupported. Inspect authentication state before saving credentials.".to_owned()
+        })?;
         let prepared = bcode_provider_auth::enrollment::prepare(
             config,
-            &bcode_config::load_runtime_auth_subscriptions(),
+            &runtime,
             &provider.contribution,
             &provider.plugin_id,
             method_id,

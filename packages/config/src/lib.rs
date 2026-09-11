@@ -4903,12 +4903,29 @@ fn auth_registry_representation_preserved(
 fn read_auth_subscriptions_for_update(
     path: &Path,
 ) -> Result<RuntimeAuthSubscriptions, ConfigError> {
-    match fs::read(path) {
-        Ok(bytes) => {
+    use std::io::Read as _;
+
+    const MAX_REGISTRY_BYTES: u64 = 8 * 1024 * 1024;
+    match fs::File::open(path) {
+        Ok(file) => {
             let invalid = || ConfigError::Composition {
                 message: "auth registry is invalid or unsupported; existing state preserved"
                     .to_owned(),
             };
+            let mut bytes = Vec::new();
+            file.take(MAX_REGISTRY_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|source| ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            if bytes.len() as u64 > MAX_REGISTRY_BYTES {
+                return Err(ConfigError::Composition {
+                    message:
+                        "auth registry exceeds the supported read bound; existing state preserved"
+                            .to_owned(),
+                });
+            }
             let original: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(|_| invalid())?;
             let registry: RuntimeAuthSubscriptions =
@@ -4920,13 +4937,32 @@ fn read_auth_subscriptions_for_update(
             Ok(registry)
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok(RuntimeAuthSubscriptions::default())
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(RuntimeAuthSubscriptions::default())
+                }
+                _ => Err(ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                }),
+            }
         }
         Err(source) => Err(ConfigError::Io {
             path: path.to_path_buf(),
             source,
         }),
     }
+}
+
+/// Read runtime authentication metadata without concealing damaged or unsupported state.
+///
+/// A missing file represents an unenrolled installation. Reads are bounded and never create,
+/// repair, or rewrite metadata. Enrollment must use this rather than the best-effort loader.
+///
+/// # Errors
+/// Returns an error for unreadable, malformed, oversized, or unsupported metadata.
+pub fn try_load_runtime_auth_subscriptions() -> Result<RuntimeAuthSubscriptions, ConfigError> {
+    read_auth_subscriptions_for_update(&runtime_auth_subscriptions_path())
 }
 
 /// Load runtime auth subscriptions from user state.
@@ -8599,6 +8635,42 @@ mod tests {
         }
         std::fs::write(&path, "{}").expect("defaulted current registry");
         assert!(super::read_auth_subscriptions_for_update(&path).is_ok());
+    }
+
+    #[test]
+    fn auth_registry_reads_are_bounded_non_mutating_and_secret_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("subscriptions.json");
+        assert_eq!(
+            super::read_auth_subscriptions_for_update(&path).unwrap(),
+            super::RuntimeAuthSubscriptions::default()
+        );
+        assert!(!path.exists());
+        assert!(!path.with_extension("lock").exists());
+        for bytes in [
+            b"{secret-token-123".to_vec(),
+            br#"{"future_version":42}"#.to_vec(),
+            vec![b' '; 8 * 1024 * 1024 + 1],
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let error = super::read_auth_subscriptions_for_update(&path).unwrap_err();
+            assert!(!error.to_string().contains("secret-token-123"));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(!path.with_extension("lock").exists());
+        }
+        assert!(super::read_auth_subscriptions_for_update(temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_registry_dangling_link_is_not_an_unenrolled_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("subscriptions.json");
+        let target = temp.path().join("missing.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(super::read_auth_subscriptions_for_update(&path).is_err());
+        assert_eq!(std::fs::read_link(path).unwrap(), target);
+        assert!(!target.exists());
     }
 
     #[test]
