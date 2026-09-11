@@ -628,7 +628,7 @@ fn current_runtime_context() -> ClientRuntimeContext {
     let effective_config_toml = bcode_config::encode_effective_config(&config)
         .ok()
         .map(Box::new);
-    let mut env = CLIENT_RUNTIME_ENV_VARS
+    let env = CLIENT_RUNTIME_ENV_VARS
         .iter()
         .filter_map(|name| match std::env::var(name) {
             Ok(value) if !value.trim().is_empty() => Some(((*name).to_string(), value)),
@@ -641,34 +641,28 @@ fn current_runtime_context() -> ClientRuntimeContext {
     let mut resolved = config.resolved_model_selection();
     resolved.auth_profile = selected_auth_profile(&resolved);
     resolved.auth_pool = selected_auth_pool(&config, &resolved);
-    let auth = merge_selected_auth_profile_env(&config, &resolved, &mut env);
-    let auth_pool_routing = selected_auth_pool_routing(&config, resolved.auth_pool.as_deref());
-    let auth_candidates = merge_selected_auth_pool_env(
-        &config,
-        resolved.auth_pool.as_deref(),
-        resolved.auth_profile.as_deref(),
-        &mut env,
+    let mut provider_context = bcode_provider_auth::resolve_provider_request_context(
+        bcode_provider_auth::ProviderRequestContextResolution {
+            config: &config,
+            selection: resolved.clone(),
+        },
     );
-    let env_keys = env.keys().cloned().map(|key| (key, true)).collect();
+    // Process environment retains its existing precedence, but do not mix credentials
+    // from unselected pool candidates into the selected account's environment.
+    provider_context.env.extend(env);
+    let env_keys = provider_context
+        .env
+        .keys()
+        .cloned()
+        .map(|key| (key, true))
+        .collect();
     ClientRuntimeContext {
         working_directory: Some(working_directory),
         effective_config_toml,
         selected_provider_plugin_id: resolved.provider_plugin_id,
         selected_model_id: resolved.model_id,
         requested_model_id: resolved.selected_model_id,
-        provider_context: bcode_model::ProviderRequestContext {
-            model_profile: resolved.model_profile,
-            auth_profile: resolved.auth_profile,
-            auth_pool: resolved.auth_pool,
-            auth_pool_routing,
-            auth_pool_selection_reason: None,
-            settings: resolved.settings,
-            auth,
-            auth_candidates,
-            request: resolved.request,
-            env,
-            api_surface: None,
-        },
+        provider_context,
         process_env,
         interaction_adapters: Vec::new(),
         env_keys,
@@ -702,114 +696,6 @@ fn is_openai_chatgpt_auth_profile(config: &bcode_config::BcodeConfig, auth_profi
     profile.settings.get("provider").map(String::as_str) == Some("openai")
         && (profile.scheme.as_deref() == Some("chatgpt")
             || profile.settings.get("mode").map(String::as_str) == Some("chatgpt"))
-}
-
-fn selected_auth_pool_routing(
-    config: &bcode_config::BcodeConfig,
-    auth_pool: Option<&str>,
-) -> bcode_model::ProviderAuthPoolRouting {
-    let Some(auth_pool) = auth_pool else {
-        return bcode_model::ProviderAuthPoolRouting::default();
-    };
-    let Some(pool) = config.auth.pools.get(auth_pool) else {
-        return bcode_model::ProviderAuthPoolRouting::default();
-    };
-    bcode_model::ProviderAuthPoolRouting {
-        strategy: Some(match pool.strategy {
-            bcode_config::AuthPoolStrategy::Failover => "failover".to_string(),
-            bcode_config::AuthPoolStrategy::RoundRobin => "round_robin".to_string(),
-        }),
-        priming_enabled: pool.priming.enabled,
-        priming_include_primary: pool.priming.include_primary,
-        priming_reprime_after: pool.priming.reprime_after.clone(),
-        priming_provider_windows: pool.priming.provider_windows,
-        priming_fallback_reprime_after: pool.priming.fallback_reprime_after.clone(),
-        priming_required_windows: pool.priming.required_windows.clone(),
-    }
-}
-
-fn merge_selected_auth_profile_env(
-    config: &bcode_config::BcodeConfig,
-    selection: &bcode_config::ResolvedModelSelection,
-    env: &mut BTreeMap<String, String>,
-) -> Option<bcode_model::ProviderAuthContext> {
-    if selection.auth_profile.is_some() {
-        let mut selected = selection.clone();
-        // Pool materialization is handled separately below. Resolve just the explicit
-        // primary through the domain path, including owned runtime-only accounts.
-        selected.auth_pool = None;
-        let resolved = bcode_provider_auth::resolve_provider_request_context(
-            bcode_provider_auth::ProviderRequestContextResolution {
-                config,
-                selection: selected,
-            },
-        );
-        for (key, value) in resolved.env {
-            env.entry(key).or_insert(value);
-        }
-        return resolved.auth;
-    }
-    merge_legacy_openai_auth_profile_env(config, env);
-    None
-}
-
-fn merge_selected_auth_pool_env(
-    config: &bcode_config::BcodeConfig,
-    auth_pool: Option<&str>,
-    primary_auth_profile: Option<&str>,
-    env: &mut BTreeMap<String, String>,
-) -> Vec<bcode_model::ProviderAuthCandidate> {
-    let Some(auth_pool) = auth_pool else {
-        return Vec::new();
-    };
-    let mut selection = config.resolved_model_selection();
-    selection.auth_pool = Some(auth_pool.to_owned());
-    selection.auth_profile = primary_auth_profile.map(str::to_owned);
-    let context = bcode_provider_auth::resolve_provider_request_context(
-        bcode_provider_auth::ProviderRequestContextResolution { config, selection },
-    );
-    for candidate in &context.auth_candidates {
-        for (key, value) in &candidate.env {
-            env.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-    }
-    context.auth_candidates
-}
-
-fn merge_legacy_openai_auth_profile_env(
-    config: &bcode_config::BcodeConfig,
-    env: &mut BTreeMap<String, String>,
-) {
-    let Some(auth) = &config.auth.openai else {
-        return;
-    };
-    if auth.backend != "sshenv" {
-        return;
-    }
-    let vault = auth
-        .vault
-        .clone()
-        .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let options = bcode_provider_auth::security::AuthDeviceSealOptions::from_policy(
-        bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
-    );
-    let _report = bcode_provider_auth::security::reconcile_auth_vault_security_report_with_options(
-        &vault,
-        &auth.profile,
-        options,
-        None,
-    );
-    let store = sshenv_vault::SshenvStore::new(
-        sshenv_vault::SshenvStoreConfig::new(vault.clone()).with_private_key_paths(
-            bcode_provider_auth::security::vault_private_key_paths(&vault),
-        ),
-    );
-    let Ok(Some(profile)) = store.get_profile(&auth.profile) else {
-        return;
-    };
-    for (key, value) in profile {
-        env.entry(key).or_insert_with(|| value.to_string());
-    }
 }
 
 impl From<ErrorResponse> for ClientError {
