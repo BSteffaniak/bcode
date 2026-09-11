@@ -4449,6 +4449,12 @@ impl TerminalMarkdownRenderer {
             &mut LayoutCx::new(),
         );
         for row in block.projection(&layout) {
+            // An indivisible grapheme wider than the viewport has no visible cells.
+            // Keep its row reservation, but emit neither text nor interaction geometry.
+            if row.line.width() > self.width {
+                self.rows.push(row.line.viewport(0, self.width));
+                continue;
+            }
             let first = self
                 .pending_geometry
                 .partition_point(|(range, _)| range.end <= row.source_range.start);
@@ -4850,6 +4856,15 @@ mod tests {
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn unrenderable_wide_links_have_no_interaction_cells() {
+        for source in ["[界](https://example.com)", "> [👩‍💻](https://example.com)"] {
+            let result = render_markdown(source, &MarkdownRenderOptions::new(1));
+            assert!(result.lines.iter().all(|row| row.width() <= 1));
+            assert!(result.geometry.iter().all(|item| item.rects.is_empty()));
+        }
+    }
 
     #[test]
     fn tiny_widths_constrain_prefixes_headers_and_link_rectangles() {

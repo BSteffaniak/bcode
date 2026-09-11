@@ -97,6 +97,12 @@ impl ModelPickerApp {
     pub fn header_line(&self, width: u16, theme: super::render::TuiTheme) -> Line {
         let rows = self.visible_rows();
         let widths = ModelPickerColumnWidths::from_rows(&rows, usable_list_width(width));
+        if row_width(widths) > usable_list_width(width) {
+            return Line::from_spans(vec![Span::styled(
+                truncate_column("Model", usable_list_width(width)),
+                theme.muted,
+            )]);
+        }
         Line::from_spans(vec![Span::styled(
             format_header(&widths, self.sort_key, self.sort_direction),
             theme.muted.add_modifier(Modifier::BOLD),
@@ -111,6 +117,17 @@ impl ModelPickerApp {
         }
         let rows = self.visible_rows();
         let widths = ModelPickerColumnWidths::from_rows(&rows, usable_list_width(width));
+        if row_width(widths) > usable_list_width(width) {
+            return rows
+                .iter()
+                .map(|row| {
+                    Line::from_spans(vec![Span::styled(
+                        truncate_column(&row.model_id, usable_list_width(width)),
+                        theme.text,
+                    )])
+                })
+                .collect();
+        }
         rows.iter()
             .map(|row| model_item(row, &widths, theme))
             .collect()

@@ -15,6 +15,14 @@ use crate::code_review_tui_display::{
 
 const CONTEXT_EXPAND_STEP: u32 = 20;
 
+/// Shared measured prefix for comment and suggestion layout and painting.
+pub(crate) fn inline_prefix(branch: &str, label: &str, suggestion: bool, width: u16) -> String {
+    let label_width = if suggestion { 8 } else { 6 };
+    bmux_tui::text::Line::raw(format!("   {branch} {label:<label_width$} "))
+        .viewport(0, usize::from(width.saturating_sub(1)))
+        .plain_text()
+}
+
 /// Semantic document rendered in the main code review pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewViewDocument {
@@ -353,7 +361,8 @@ impl ReviewViewDocument {
     /// All navigation and painting consume the resulting visual rows.
     #[must_use]
     pub fn layout_inline_threads(mut self, width: u16) -> Self {
-        let prefix_width = usize::from(width.saturating_sub(1)).min(12);
+        let prefix_width =
+            bmux_tui::text_width::display_width(&inline_prefix("│", "", false, width));
         let content_width = width
             .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
             .max(1);
@@ -401,7 +410,9 @@ impl ReviewViewDocument {
                     continue;
                 }
                 let content_width = usize::from(width)
-                    .saturating_sub(usize::from(width.saturating_sub(1)).min(14))
+                    .saturating_sub(bmux_tui::text_width::display_width(&inline_prefix(
+                        "│", "", true, width,
+                    )))
                     .max(1);
                 let mut lines = suggestion
                     .body
@@ -719,7 +730,7 @@ fn agent_text_rows(prefix: &str, text: &str, markdown: bool, width: u16) -> Vec<
         .into_iter()
         .map(|content| AgentThreadRow {
             prefix: prefix.clone(),
-            content,
+            content: content.viewport(0, usize::from(available)),
             kind: None,
         })
         .collect()

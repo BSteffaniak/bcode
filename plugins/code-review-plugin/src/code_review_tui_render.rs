@@ -2057,10 +2057,7 @@ fn render_inline_comment_line(
     theme: ReviewTheme,
 ) -> Line {
     let prefix_style = theme.diff.hunk.patch(theme.overlay);
-    let prefix = format!("   {branch} {label:<6} ");
-    let prefix = Line::raw(prefix)
-        .viewport(0, usize::from(width.saturating_sub(1)))
-        .plain_text();
+    let prefix = crate::code_review_tui_view::inline_prefix(branch, label, false, width);
     let markdown_line = rendered.cloned().unwrap_or_default();
     let mut spans = vec![Span::styled(prefix, prefix_style)];
     if markdown_line.spans.is_empty() {
@@ -2088,10 +2085,7 @@ fn render_inline_suggestion_line(
         crate::code_review_tui::ReviewSuggestionStatus::Rejected => "rejected",
     };
     let label = if body_line_index == 0 { status } else { "" };
-    let prefix = format!("   {branch} {label:<8} ");
-    let prefix = Line::raw(prefix)
-        .viewport(0, usize::from(width.saturating_sub(1)))
-        .plain_text();
+    let prefix = crate::code_review_tui_view::inline_prefix(branch, label, true, width);
     let mut spans = vec![Span::styled(prefix, prefix_style)];
     if let Some(line) = rendered {
         spans.extend(line.patch_style(style).spans);

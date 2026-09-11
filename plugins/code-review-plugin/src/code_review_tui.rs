@@ -6920,8 +6920,29 @@ impl ReviewApp {
     }
 
     /// Store the current diff hit area.
-    pub const fn set_diff_area(&mut self, area: Rect) {
+    pub fn set_diff_area(&mut self, area: Rect) {
+        if self.last_diff_area == Some(area) {
+            return;
+        }
+        let anchor = self.current_review_view_document().and_then(|document| {
+            let target = document.target_for_visual_row(self.diff_scroll)?.clone();
+            let first = document.visual_row_for_target(&target)?;
+            Some((target, self.diff_scroll.saturating_sub(first)))
+        });
         self.last_diff_area = Some(area);
+        if let Some((target, offset)) = anchor
+            && let Some(document) = self.current_review_view_document()
+            && let Some(first) = document.visual_row_for_target(&target)
+        {
+            let count = document
+                .rows
+                .iter()
+                .skip(first)
+                .take_while(|row| row.target == target)
+                .count();
+            self.diff_scroll = first.saturating_add(offset.min(count.saturating_sub(1)));
+        }
+        self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
     }
 
     /// Return currently selected surface.
