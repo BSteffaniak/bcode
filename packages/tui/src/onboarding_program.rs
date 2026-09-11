@@ -165,13 +165,7 @@ impl OnboardingProgram {
                     .shell
                     .handle_action(action, &self.store, current_time_ms())?;
                 if outcome == onboarding::OnboardingActionOutcome::LaunchReady {
-                    let selection = bcode_config::load_config()
-                        .map(|config| config.resolved_model_selection())
-                        .map_err(|_| {
-                            "Configuration could not be loaded. Review Settings before launching."
-                                .to_owned()
-                        });
-                    return Ok(self.finish_launch_selection(selection));
+                    return Ok(self.finish_launch_selection(inspect_launch_selection()));
                 }
                 Ok(Lifecycle::Continue)
             }
@@ -194,6 +188,20 @@ impl OnboardingProgram {
         self.continuation = bcode_settings::SetupContinuation::Launch;
         Lifecycle::Exit
     }
+}
+
+fn inspect_launch_selection() -> Result<bcode_config::ResolvedModelSelection, String> {
+    let config = bcode_config::load_config().map_err(|_| {
+        "Configuration could not be loaded. Review Settings before launching.".to_owned()
+    })?;
+    let selection = config.resolved_model_selection();
+    selection
+        .validate_selection()
+        .map_err(|error| error.to_string())?;
+    bcode_provider_auth::inspect_auth_selection(&bcode_provider_auth::ProviderRequestContextResolution {
+        config: &config, selection: selection.clone(),
+    }).map_err(|_| "The selected account or pool could not be verified. Review Connections and authentication metadata before launching.".to_owned())?;
+    Ok(selection)
 }
 
 impl Program for OnboardingProgram {

@@ -180,6 +180,31 @@ pub fn try_resolve_provider_request_context(
     try_resolve_with_registry_loader(request, bcode_config::try_load_runtime_auth_subscriptions)
 }
 
+/// Inspect explicit account and pool references without reading credentials or mutating state.
+///
+/// This checks metadata only; success does not imply remote authentication or model availability.
+///
+/// # Errors
+/// Returns an error for unreadable runtime metadata or inconsistent selected references.
+pub fn inspect_auth_selection(
+    request: &ProviderRequestContextResolution<'_>,
+) -> Result<(), bcode_config::ConfigError> {
+    let registry = if request_needs_runtime_registry(request) {
+        bcode_config::try_load_runtime_auth_subscriptions()?
+    } else {
+        bcode_config::RuntimeAuthSubscriptions::default()
+    };
+    validate_auth_selection_metadata(request, &registry)
+}
+
+fn validate_auth_selection_metadata(
+    request: &ProviderRequestContextResolution<'_>,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+) -> Result<(), bcode_config::ConfigError> {
+    validate_runtime_account_selection(request, registry)?;
+    validate_runtime_pool_selection(request, registry)
+}
+
 fn request_needs_runtime_registry(request: &ProviderRequestContextResolution<'_>) -> bool {
     request.selection.auth_pool.is_some()
         || request
@@ -198,8 +223,7 @@ fn try_resolve_with_registry_loader(
     } else {
         bcode_config::RuntimeAuthSubscriptions::default()
     };
-    validate_runtime_account_selection(&request, &registry)?;
-    validate_runtime_pool_selection(&request, &registry)?;
+    validate_auth_selection_metadata(&request, &registry)?;
     Ok(resolve_provider_request_context_with_subscriptions(
         request, &registry,
     ))

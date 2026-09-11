@@ -17,10 +17,18 @@ pub async fn run_setup(discovery_enabled: bool) -> Result<bool, CliError> {
 }
 
 pub fn validate_launch_selection() -> Result<(), CliError> {
-    let selection = bcode_config::load_config()?.resolved_model_selection();
+    let config = bcode_config::load_config()?;
+    let selection = config.resolved_model_selection();
     selection
         .validate_selection()
-        .map_err(|error| CliError::InvalidArguments(error.to_string()))
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    bcode_provider_auth::inspect_auth_selection(
+        &bcode_provider_auth::ProviderRequestContextResolution {
+            config: &config,
+            selection,
+        },
+    )?;
+    Ok(())
 }
 
 pub fn edit_setting(
