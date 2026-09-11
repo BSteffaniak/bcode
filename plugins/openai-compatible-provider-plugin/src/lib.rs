@@ -621,7 +621,7 @@ fn handle_oauth_callback_stream(
     let result = parse_oauth_callback(&first_line, expected_state);
     let success = result.is_ok();
     let body = if success {
-        "Bcode OpenAI login complete. You can close this tab."
+        "Bcode received OpenAI authorization. Return to Bcode to finish sign-in. You can close this tab."
     } else {
         "Bcode OpenAI login did not complete. Return to your terminal."
     };
@@ -1162,10 +1162,8 @@ impl OpenAiCompatibleProviderPlugin {
             schema_version: AUTH_FLOW_SCHEMA_VERSION,
             status: AuthFlowStatus::Pending,
             state: Some(state_id),
-            effects: vec![AuthFlowEffect::Prompt {
-                prompt_id: OPENAI_BROWSER_PROMPT_ID.to_owned(),
-                message: "If localhost callback did not complete, paste the full redirected localhost URL. Press Enter to keep waiting.".to_owned(),
-                choices: Vec::new(),
+            effects: vec![AuthFlowEffect::Wait {
+                millis: OPENAI_BROWSER_WAIT_MILLIS,
             }],
             credentials: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -9602,6 +9600,64 @@ mod tests {
     }
 
     #[test]
+    fn browser_auth_delayed_callback_keeps_polling_without_terminal_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("callback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking callback");
+        let address = listener.local_addr().expect("callback address");
+        let state = browser_auth_state(vec![listener], "delayed-state");
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let server = AuthMockServer::start(vec![(
+            "200 OK",
+            r#"{"access_token":"delayed-access","expires_in":3600}"#,
+        )]);
+        for _ in 0..3 {
+            let pending = runtime
+                .block_on(
+                    OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
+                        Arc::clone(&state),
+                        "browser-state".to_owned(),
+                        None,
+                        server.endpoint("/token"),
+                    ),
+                )
+                .expect("runtime")
+                .expect("pending callback");
+            pending.validate().expect("valid pending response");
+            assert_eq!(pending.status, AuthFlowStatus::Pending);
+            assert_eq!(
+                pending.effects,
+                vec![AuthFlowEffect::Wait {
+                    millis: OPENAI_BROWSER_WAIT_MILLIS,
+                }]
+            );
+        }
+        // Queue the request only after several empty polls, matching a user who takes
+        // time to select an account. No frontend answer is needed to service it.
+        let mut callback = TcpStream::connect(address).expect("connect callback");
+        callback
+            .write_all(b"GET /auth/callback?code=delayed-code&state=delayed-state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write callback");
+        let completed = runtime
+            .block_on(
+                OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
+                    Arc::clone(&state),
+                    "browser-state".to_owned(),
+                    None,
+                    server.endpoint("/token"),
+                ),
+            )
+            .expect("runtime")
+            .expect("complete callback");
+        server.finish();
+        completed.validate().expect("valid completion");
+        assert_eq!(completed.status, AuthFlowStatus::Succeeded);
+        assert_eq!(completed.credentials["access_token"], "delayed-access");
+        assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
+    #[test]
     fn browser_auth_automatic_localhost_callback_completes_without_manual_input() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("callback listener");
         listener
@@ -9640,7 +9696,7 @@ mod tests {
             .expect("automatic completion");
         server.finish();
         let callback_response = callback.join().expect("callback thread");
-        assert!(callback_response.contains("login complete"));
+        assert!(callback_response.contains("received OpenAI authorization"));
         response.validate().expect("valid automatic success");
         assert_eq!(response.status, AuthFlowStatus::Succeeded);
         assert_eq!(
