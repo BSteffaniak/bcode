@@ -198,9 +198,45 @@ fn try_resolve_with_registry_loader(
     } else {
         bcode_config::RuntimeAuthSubscriptions::default()
     };
+    validate_runtime_account_selection(&request, &registry)?;
     Ok(resolve_provider_request_context_with_subscriptions(
         request, &registry,
     ))
+}
+
+fn validate_runtime_account_selection(
+    request: &ProviderRequestContextResolution<'_>,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+) -> Result<(), bcode_config::ConfigError> {
+    let Some(name) = request.selection.auth_profile.as_deref() else {
+        return Ok(());
+    };
+    if request.config.auth.profiles.contains_key(name) {
+        return Ok(());
+    }
+    if selected_runtime_auth_profile(
+        request.config,
+        registry,
+        name,
+        request.selection.provider_plugin_id.as_deref(),
+    )
+    .is_some()
+        || request.selection.auth_pool.as_deref().is_some_and(|pool| {
+            runtime_pool_candidate_profile(
+                request.config,
+                registry,
+                pool,
+                name,
+                request.selection.provider_plugin_id.as_deref(),
+            )
+            .is_some()
+        })
+    {
+        return Ok(());
+    }
+    Err(bcode_config::ConfigError::Composition {
+        message: "Selected runtime authentication account is missing or its ownership cannot be verified; select an available account or inspect authentication metadata.".to_owned(),
+    })
 }
 
 fn resolve_provider_request_context_with_registry_loader(
@@ -1533,6 +1569,23 @@ mod tests {
             assert_eq!(calls, usize::from(owner == Some("example.plugin")));
             assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
         }
+    }
+
+    #[test]
+    fn strict_resolution_rejects_missing_explicit_account_without_substitution() {
+        let config = bcode_config::BcodeConfig::default();
+        let result = try_resolve_with_registry_loader(
+            ProviderRequestContextResolution {
+                config: &config,
+                selection: bcode_config::ResolvedModelSelection {
+                    provider_plugin_id: Some("example.plugin".to_owned()),
+                    auth_profile: Some("missing-account".to_owned()),
+                    ..Default::default()
+                },
+            },
+            || Ok(bcode_config::RuntimeAuthSubscriptions::default()),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
