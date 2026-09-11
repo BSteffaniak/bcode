@@ -312,13 +312,20 @@ fn runtime_pool_candidate_profile(
         return selected_runtime_auth_profile(config, registry, name, owner)
             .map(|resolved| resolved.profile);
     }
-    registry
-        .pools
-        .get(pool)?
+    let pool = registry.pools.get(pool)?;
+    let member = pool
         .profiles
         .iter()
-        .find(|profile| profile.auth_profile == name)
-        .map(runtime_subscription_auth_profile_config)
+        .find(|profile| profile.auth_profile == name)?;
+    let mut profile = runtime_subscription_auth_profile_config(member);
+    if profile.owner_plugin_id.is_none() {
+        profile.owner_plugin_id = pool
+            .owner_plugin_id
+            .clone()
+            .or_else(|| pool.provider_plugin_id.clone());
+    }
+    validate_auth_profile_ownership(name, &profile, &member.provider, owner?).ok()?;
+    Some(profile)
 }
 
 fn selected_runtime_auth_profile(
@@ -1474,6 +1481,7 @@ mod tests {
             config: &config,
             selection: bcode_config::ResolvedModelSelection {
                 auth_pool: Some("explicit-pool".into()),
+                provider_plugin_id: Some("example.plugin".into()),
                 ..Default::default()
             },
         };
@@ -1482,6 +1490,7 @@ mod tests {
                 "explicit-pool".into(),
                 bcode_config::RuntimeAuthSubscriptionPool {
                     preferred_profile: Some("explicit-profile".into()),
+                    owner_plugin_id: Some("example.plugin".into()),
                     profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
                         auth_profile: "explicit-profile".into(),
                         storage_profile: "stored-profile".into(),
@@ -1670,6 +1679,35 @@ mod tests {
     /// Subscription logins historically registered only a pool member, never a top-level runtime
     /// profile. Pool routing reads those members, so lifecycle resolution must too; otherwise a
     /// stale member keeps routing turns while `status`/`logout` report it as not configured.
+    #[test]
+    fn pool_only_candidates_require_verified_owner_before_materialization() {
+        let config = bcode_config::BcodeConfig::default();
+        for (member_owner, pool_owner, expected) in [
+            (None, None, false),
+            (
+                Some("foreign.plugin"),
+                Some("bcode.openai-compatible"),
+                false,
+            ),
+            (None, Some("bcode.openai-compatible"), true),
+        ] {
+            let registry = pool_member_runtime(member_owner, pool_owner);
+            let (pool_name, pool) = registry.pools.iter().next().unwrap();
+            let name = &pool.profiles[0].auth_profile;
+            let resolved = runtime_pool_candidate_profile(
+                &config,
+                &registry,
+                pool_name,
+                name,
+                Some("bcode.openai-compatible"),
+            );
+            assert_eq!(resolved.is_some(), expected);
+            assert!(
+                runtime_pool_candidate_profile(&config, &registry, pool_name, name, None).is_none()
+            );
+        }
+    }
+
     #[test]
     fn pool_member_only_runtime_profile_resolves_with_pool_ownership() {
         let config = bcode_config::BcodeConfig::default();
