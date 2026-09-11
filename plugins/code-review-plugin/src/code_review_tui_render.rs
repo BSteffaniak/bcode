@@ -1955,6 +1955,7 @@ fn render_view_row(
             ..
         } => render_inline_thread_header(anchor, *comment_count, *collapsed, *resolved, theme),
         ReviewViewBlock::InlineComment {
+            rendered,
             comment,
             body_line_index,
             body_line_count,
@@ -1981,8 +1982,7 @@ fn render_view_row(
                 line: render_inline_comment_line(
                     branch,
                     label,
-                    comment,
-                    *body_line_index,
+                    rendered.as_ref(),
                     width,
                     style,
                     theme,
@@ -1991,6 +1991,7 @@ fn render_view_row(
             }
         }
         ReviewViewBlock::InlineSuggestion {
+            rendered,
             suggestion,
             body_line_index,
             body_line_count,
@@ -2023,6 +2024,7 @@ fn render_view_row(
                 line: render_inline_suggestion_line(
                     branch,
                     suggestion,
+                    rendered.as_ref(),
                     *body_line_index,
                     width,
                     style,
@@ -2059,24 +2061,17 @@ fn render_view_row(
 fn render_inline_comment_line(
     branch: &str,
     label: &str,
-    comment: &crate::code_review_tui::ReviewDraftComment,
-    body_line_index: usize,
+    rendered: Option<&Line>,
     width: u16,
     style: Style,
     theme: ReviewTheme,
 ) -> Line {
     let prefix_style = theme.diff.hunk.patch(theme.overlay);
     let prefix = format!("   {branch} {label:<6} ");
-    let markdown_width = width
-        .saturating_sub(
-            u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
-        )
-        .max(1);
-    let markdown_line =
-        render_markdown_lines(&comment.body, MarkdownRenderOptions::new(markdown_width))
-            .get(body_line_index)
-            .cloned()
-            .unwrap_or_else(Line::default);
+    let prefix = Line::raw(prefix)
+        .viewport(0, usize::from(width.saturating_sub(1)))
+        .plain_text();
+    let markdown_line = rendered.cloned().unwrap_or_default();
     let mut spans = vec![Span::styled(prefix, prefix_style)];
     if markdown_line.spans.is_empty() {
         spans.push(Span::styled(String::new(), style));
@@ -2089,6 +2084,7 @@ fn render_inline_comment_line(
 fn render_inline_suggestion_line(
     branch: &str,
     suggestion: &crate::code_review_tui::ReviewSuggestedComment,
+    rendered: Option<&Line>,
     body_line_index: usize,
     width: u16,
     style: Style,
@@ -2103,21 +2099,14 @@ fn render_inline_suggestion_line(
     };
     let label = if body_line_index == 0 { status } else { "" };
     let prefix = format!("   {branch} {label:<8} ");
-    let available = width.saturating_sub(
-        u16::try_from(bmux_tui::text_width::display_width(&prefix)).unwrap_or(u16::MAX),
-    );
-    let line = suggestion
-        .body
-        .lines()
-        .nth(body_line_index)
-        .unwrap_or_default();
-    Line::from_spans(vec![
-        Span::styled(prefix, prefix_style),
-        Span::styled(
-            truncate_to_display_width(line, usize::from(available)),
-            style,
-        ),
-    ])
+    let prefix = Line::raw(prefix)
+        .viewport(0, usize::from(width.saturating_sub(1)))
+        .plain_text();
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    if let Some(line) = rendered {
+        spans.extend(line.patch_style(style).spans);
+    }
+    Line::from_spans(spans)
 }
 
 fn render_inline_agent_thread_line(

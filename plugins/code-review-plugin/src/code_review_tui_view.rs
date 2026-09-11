@@ -259,6 +259,7 @@ impl ReviewViewDocument {
                                 body_line_index,
                                 body_line_count,
                                 comment: comment.clone(),
+                                rendered: None,
                             },
                         });
                     }
@@ -285,6 +286,7 @@ impl ReviewViewDocument {
                                 body_line_index,
                                 body_line_count,
                                 suggestion: suggestion.clone(),
+                                rendered: None,
                             },
                         });
                     }
@@ -349,6 +351,95 @@ impl ReviewViewDocument {
             row.visual_row = visual_row;
         }
         Self { rows }
+    }
+
+    /// Resolve comment Markdown once per body at the pane's content width.
+    /// All navigation and painting consume the resulting visual rows.
+    #[must_use]
+    pub fn layout_comments(mut self, width: u16) -> Self {
+        let prefix_width = usize::from(width.saturating_sub(1)).min(12);
+        let content_width = width
+            .saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
+            .max(1);
+        let mut rows = Vec::new();
+        for row in self.rows {
+            if let ReviewViewBlock::InlineComment {
+                body_line_index,
+                comment,
+                ..
+            } = &row.block
+            {
+                if *body_line_index != 0 {
+                    continue;
+                }
+                let mut rendered = bcode_markdown_render::render_markdown_lines(
+                    &comment.body,
+                    bcode_markdown_render::MarkdownRenderOptions::new(content_width),
+                );
+                if rendered.is_empty() {
+                    rendered.push(bmux_tui::text::Line::default());
+                }
+                let count = rendered.len();
+                for (index, line) in rendered.into_iter().enumerate() {
+                    let mut projected = row.clone();
+                    if let ReviewViewBlock::InlineComment {
+                        body_line_index,
+                        body_line_count,
+                        rendered,
+                        ..
+                    } = &mut projected.block
+                    {
+                        *body_line_index = index;
+                        *body_line_count = count;
+                        *rendered = Some(line);
+                    }
+                    rows.push(projected);
+                }
+            } else if let ReviewViewBlock::InlineSuggestion {
+                body_line_index,
+                suggestion,
+                ..
+            } = &row.block
+            {
+                if *body_line_index != 0 {
+                    continue;
+                }
+                let content_width = usize::from(width)
+                    .saturating_sub(usize::from(width.saturating_sub(1)).min(14))
+                    .max(1);
+                let mut lines = suggestion
+                    .body
+                    .lines()
+                    .flat_map(|line| bmux_tui::text::Line::raw(line).wrap_word(content_width))
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    lines.push(bmux_tui::text::Line::default());
+                }
+                let count = lines.len();
+                for (index, line) in lines.into_iter().enumerate() {
+                    let mut projected = row.clone();
+                    if let ReviewViewBlock::InlineSuggestion {
+                        body_line_index,
+                        body_line_count,
+                        rendered,
+                        ..
+                    } = &mut projected.block
+                    {
+                        *body_line_index = index;
+                        *body_line_count = count;
+                        *rendered = Some(line);
+                    }
+                    rows.push(projected);
+                }
+            } else {
+                rows.push(row);
+            }
+        }
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.visual_row = index;
+        }
+        self.rows = rows;
+        self
     }
 
     /// Return the semantic row for a visual row.
@@ -517,6 +608,8 @@ pub enum ReviewViewBlock {
         body_line_count: usize,
         /// Draft comment body and metadata.
         comment: ReviewDraftComment,
+        /// Retained width-resolved Markdown row.
+        rendered: Option<bmux_tui::text::Line>,
     },
     /// Inline suggested comment row.
     InlineSuggestion {
@@ -530,6 +623,8 @@ pub enum ReviewViewBlock {
         body_line_count: usize,
         /// Suggested comment body and metadata.
         suggestion: ReviewSuggestedComment,
+        /// Retained width-resolved plain suggestion row.
+        rendered: Option<bmux_tui::text::Line>,
     },
     /// Inline Bcode agent state row.
     InlineAgentThread {
@@ -1403,6 +1498,36 @@ mod tests {
                     &BTreeSet::new(),
                     true,
                 );
+
+        let narrow = document.clone().layout_comments(15);
+        let projected = narrow
+            .rows
+            .iter()
+            .filter_map(|row| match &row.block {
+                ReviewViewBlock::InlineComment {
+                    rendered: Some(line),
+                    ..
+                } => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(projected.len() > 2);
+        assert!(projected.iter().all(|line| line.width() <= 3));
+        let text = projected
+            .iter()
+            .map(|line| line.plain_text())
+            .collect::<String>();
+        assert!(text.contains("first"));
+        assert!(text.contains("second"));
+        let wide = document.clone().layout_comments(80);
+        assert!(wide.rows.len() < narrow.rows.len());
+        assert!(
+            narrow
+                .rows
+                .iter()
+                .enumerate()
+                .all(|(index, row)| row.visual_row == index)
+        );
 
         assert!(matches!(
             document.rows[3].block,

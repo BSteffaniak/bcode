@@ -5427,6 +5427,7 @@ struct ReviewViewDocumentCache {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReviewViewDocumentCacheKey {
+    content_width: u16,
     selected_file: usize,
     selected_path: Option<String>,
     surface_kind: Option<ReviewSurfaceKind>,
@@ -12407,6 +12408,7 @@ impl ReviewApp {
             &self.resolved_review_threads,
             self.show_resolved_threads,
         );
+        document = document.layout_comments(cache_key.content_width);
         if let Ok(mut cache) = self.view_document_cache.write() {
             *cache = Some(ReviewViewDocumentCache {
                 key: cache_key,
@@ -12533,6 +12535,7 @@ impl ReviewApp {
             }
         }
         Some(ReviewViewDocumentCacheKey {
+            content_width: self.last_diff_area.map_or(80, |area| area.width),
             selected_file: self.selected_file,
             selected_path,
             surface_kind,
