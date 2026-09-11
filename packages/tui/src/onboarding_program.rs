@@ -548,6 +548,62 @@ mod tests {
     }
 
     #[test]
+    fn failed_and_cancelled_launch_attempts_cannot_be_completed_by_late_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            bcode_settings::SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let shell = crate::onboarding::OnboardingShell::from_reconciliation(
+            &[],
+            &bcode_settings::SetupConfigSummary::default().reconciliation_input(),
+        );
+        let theme = crate::theme::resolve_configured_theme(
+            &bcode_config::TuiConfig::default(),
+            temp.path(),
+        );
+        let mut program = super::OnboardingProgram::new(
+            store,
+            shell,
+            &theme,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        )
+        .unwrap();
+        let selection = bcode_config::ResolvedModelSelection {
+            provider_plugin_id: Some("example.provider".to_owned()),
+            model_id: Some("example-model".to_owned()),
+            ..Default::default()
+        };
+        program.finish_launch_selection(Ok(selection.clone()));
+        let failed_generation = program.launch_generation;
+        let failure = program
+            .complete_launch_validation(failed_generation, Err("Provider unavailable".to_owned()));
+        assert_eq!(failure.lifecycle, bmux_tui_runtime::Lifecycle::Continue);
+        assert!(!program.launch_pending);
+        assert_eq!(
+            program
+                .complete_launch_validation(failed_generation, Ok(()))
+                .lifecycle,
+            bmux_tui_runtime::Lifecycle::Continue
+        );
+        program.finish_launch_selection(Ok(selection));
+        let cancelled_generation = program.launch_generation;
+        assert_eq!(
+            program.handle_key(KeyCode::Down).unwrap(),
+            bmux_tui_runtime::Lifecycle::Continue
+        );
+        assert!(!program.launch_pending);
+        assert_eq!(
+            program
+                .complete_launch_validation(cancelled_generation, Ok(()))
+                .lifecycle,
+            bmux_tui_runtime::Lifecycle::Continue
+        );
+        assert_eq!(
+            program.continuation(),
+            bcode_settings::SetupContinuation::Close
+        );
+    }
+
+    #[test]
     fn editing_actions_never_request_terminal_exit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store =
