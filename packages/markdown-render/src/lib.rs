@@ -4404,11 +4404,16 @@ impl TerminalMarkdownRenderer {
                     let prefix = if visual_row == 0 {
                         format!("{label}: ")
                     } else {
-                        " ".repeat(text_display_width(&label).saturating_add(2))
+                        " ".repeat(
+                            text_display_width(&label)
+                                .saturating_add(2)
+                                .min(self.width.saturating_sub(1)),
+                        )
                     };
                     let mut spans = vec![Span::styled(prefix, muted)];
                     spans.extend(line.clone());
-                    self.rows.push(Line::from_spans(spans));
+                    self.rows
+                        .extend(Line::from_spans(spans).wrap_word(self.width));
                 }
             }
         }
@@ -4956,6 +4961,28 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn stacked_tables_wrap_long_styled_values_and_headers() {
+        let markdown = "| Terms with a long heading | What I found |\n| --- | --- |\n| alpha beta gamma delta | **one two three four five six** |\n";
+        for width in [1, 2, 4, 12, 24] {
+            let rows = render_markdown_lines(markdown, MarkdownRenderOptions::new(width));
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+            let visible = rows
+                .iter()
+                .map(bmux_tui::text::Line::plain_text)
+                .collect::<String>();
+            let compact = visible.split_whitespace().collect::<String>();
+            assert!(compact.contains("alphabetagammadelta"));
+            assert!(compact.contains("onetwothreefourfivesix"));
+            assert!(
+                rows.iter().flat_map(|row| &row.spans).any(|span| {
+                    span.content.contains("one")
+                        && span.style == Style::new().add_modifier(Modifier::BOLD)
+                }) || width < 3
+            );
+        }
     }
 
     #[test]

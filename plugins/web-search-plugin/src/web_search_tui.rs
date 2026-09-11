@@ -289,11 +289,11 @@ fn inspect_result_rows(payload: &Value, style: ToolCardStyle) -> Vec<Line> {
 }
 
 fn preview_rows(text: &str, width: u16, style: ToolCardStyle) -> Vec<Line> {
-    let max_width = usize::from(width.saturating_sub(4)).max(20);
+    let max_width = usize::from(width.saturating_sub(4));
     let mut rows = Vec::new();
     for line in text.lines().take(24) {
         rows.push(Line::from_spans(vec![
-            Span::styled("  │ ", style.muted),
+            Span::styled(truncate_width("  │ ", usize::from(width)), style.muted),
             Span::raw(truncate(line, max_width)),
         ]));
     }
@@ -357,16 +357,8 @@ fn string_array(payload: &Value, key: &str) -> Option<String> {
     })
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    output.push('…');
-    output
+fn truncate(value: &str, width: usize) -> String {
+    truncate_width(value, width)
 }
 
 fn tool_card_style(context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext) -> ToolCardStyle {
@@ -376,6 +368,18 @@ fn tool_card_style(context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previews_fit_tiny_and_unicode_widths() {
+        for width in 0..30 {
+            let rows = preview_rows(
+                "界界界 emoji 👩‍💻 and a long line",
+                width,
+                ToolCardStyle::from_component_theme(None),
+            );
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+        }
+    }
 
     fn line_text(line: &Line) -> String {
         line.spans

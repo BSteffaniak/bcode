@@ -6,10 +6,8 @@ use bmux_tui::geometry::{Insets, Size};
 use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
-use bmux_tui::text_width::display_width;
 use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalPlacement, ModalSizing};
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::render::TuiTheme;
 use super::timeline_dialog::{TimelineDialogState, TimelineEntry};
@@ -177,25 +175,7 @@ fn markdown_preview(value: &str, width: usize) -> String {
 }
 
 fn truncate_display_width(value: &str, width: usize) -> String {
-    if display_width(value) <= width {
-        return value.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let content_width = width.saturating_sub(1);
-    let mut result = String::new();
-    let mut used = 0_usize;
-    for grapheme in value.graphemes(true) {
-        let grapheme_width = display_width(grapheme);
-        if used.saturating_add(grapheme_width) > content_width {
-            break;
-        }
-        result.push_str(grapheme);
-        used = used.saturating_add(grapheme_width);
-    }
-    result.push('…');
-    result
+    bcode_tui_components::compact::truncate_width(value, width)
 }
 
 #[cfg(test)]
