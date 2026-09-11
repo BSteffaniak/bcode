@@ -293,8 +293,13 @@ fields refine usage; cache read/write are subsets of complete input, not additio
 
 Failed or cancelled rounds emit usage when the upstream provider made it available, but absence is
 allowed because work may stop before metering exists. `ExactRequestInputTokens` is emitted only for
-a provider-confirmed complete request count. `RequestProjection` describes what was actually sent,
-not intended configuration.
+a provider-confirmed complete request count. `RequestProjection` describes the adapter's prepared
+request projection, not intended configuration or proof of network delivery. Optional
+`serialized_body_bytes` counts uncompressed serialized JSON body bytes; it excludes upload calls,
+provider URL fetches, transport compression, and headers. Missing means unmeasured, not zero.
+This additive optional observation is compatible with existing adapters that omit it; consumers
+must not infer bandwidth savings from missing measurements. See
+[image input transport and verification](image-input-architecture.md).
 
 Terminal stop reasons have these meanings:
 

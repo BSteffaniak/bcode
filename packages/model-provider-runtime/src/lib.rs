@@ -18,6 +18,8 @@ pub use usage_recorder::{
 mod usage_capture;
 use usage_capture::append_usage_capture;
 
+pub mod image_verification;
+
 mod conformance;
 pub use conformance::{
     ProviderConformanceCase, ProviderConformanceError, ProviderConformanceOptions,

@@ -4895,6 +4895,8 @@ enum ModelCommand {
     /// conversation, tool loop, TTL matrix, mode off, budget overflow) and fails when any
     /// applicable scenario fails. Models that do not advertise caching are skipped.
     VerifyCache(VerifyCacheArgs),
+    /// Verify image context through inline replay and optionally provider continuation.
+    VerifyImages(VerifyImagesArgs),
     Set {
         session_id: SessionId,
         model_id: String,
@@ -4904,6 +4906,35 @@ enum ModelCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Arguments for bounded, explicitly requested image verification.
+#[derive(Debug, clap::Args)]
+struct VerifyImagesArgs {
+    /// Local PNG, JPEG, GIF, or WebP fixture; required unless dry-run.
+    #[arg(long)]
+    image: Option<PathBuf>,
+    /// Question about the image; the answer must not appear in this question.
+    #[arg(long)]
+    question: Option<String>,
+    /// Exact expected answer, kept out of model requests and reports.
+    #[arg(long)]
+    expected_answer: Option<String>,
+    /// Authorize provider-side conversation storage for the continuation probe.
+    #[arg(long)]
+    allow_conversation_storage: bool,
+    /// Discover candidates without sending image requests.
+    #[arg(long)]
+    dry_run: bool,
+    /// Model id wildcard filter.
+    #[arg(long)]
+    id_pattern: Option<String>,
+    /// Maximum models to probe (at most four turns per model).
+    #[arg(long, default_value_t = 1)]
+    max_models: usize,
+    /// Per-turn timeout; provider operations also need configured network timeouts.
+    #[arg(long, default_value_t = 60)]
+    timeout_seconds: u64,
 }
 
 /// Arguments for `bcode model verify-cache`.
@@ -6342,6 +6373,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
             )?;
         }
         ModelCommand::VerifyCache(args) => verify_model_caches(&args).await?,
+        ModelCommand::VerifyImages(args) => verify_model_images(&args).await?,
         other => {
             ensure_server_running().await?;
             match other {
@@ -6360,6 +6392,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                 } => set_session_model_selection(session_id, provider, model_id, json).await?,
                 ModelCommand::Verify { .. }
                 | ModelCommand::VerifyCache(_)
+                | ModelCommand::VerifyImages(_)
                 | ModelCommand::Ignore { .. }
                 | ModelCommand::Unignore { .. }
                 | ModelCommand::Ignored { .. } => unreachable!("handled above"),
@@ -10844,6 +10877,154 @@ async fn verify_cache_candidates(
         candidates.truncate(max_models);
     }
     Ok(candidates)
+}
+
+fn image_verification_fixture(
+    args: &VerifyImagesArgs,
+) -> Result<Option<bcode_model::ImageContent>, CliError> {
+    use std::io::Read as _;
+
+    if args.max_models == 0 || args.timeout_seconds == 0 {
+        return Err(CliError::PluginCli(
+            "image probe model budget and timeout must be positive".to_string(),
+        ));
+    }
+    let fixture = if args.dry_run {
+        None
+    } else {
+        let path = args
+            .image
+            .as_ref()
+            .ok_or_else(|| CliError::PluginCli("--image is required".to_string()))?;
+        if args
+            .question
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+            || args
+                .expected_answer
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+        {
+            return Err(CliError::PluginCli(
+                "--question and --expected-answer are required".to_string(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(3 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 3 * 1024 * 1024 {
+            return Err(CliError::PluginCli(
+                "image probe fixture exceeds 3 MiB".to_string(),
+            ));
+        }
+        let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            "image/jpeg"
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            "image/gif"
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            "image/webp"
+        } else {
+            return Err(CliError::PluginCli(
+                "unsupported image fixture signature".to_string(),
+            ));
+        };
+        Some(bcode_model::ImageContent {
+            mime_type: mime_type.to_string(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            metadata: bcode_model::ImageMetadata::default(),
+        })
+    };
+    Ok(fixture)
+}
+
+async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
+    use bcode_model_provider_runtime::image_verification::{
+        ImageVerificationOptions, run_image_verification,
+    };
+    let fixture = image_verification_fixture(args)?;
+    let config = bcode_config::load_config()?;
+    let context = configured_provider_context(&config);
+    let selection = config.resolved_model_selection();
+    let provider = selection.provider_plugin_id.ok_or_else(|| {
+        CliError::PluginCli("no provider configured; pass --provider".to_string())
+    })?;
+    let mut host = load_cli_plugin_host()?;
+    let candidates = verify_cache_candidates(
+        &host,
+        &provider,
+        &context,
+        selection.selected_model_id.as_deref(),
+        &VerifyCacheArgs {
+            max_models: Some(args.max_models),
+            id_pattern: args.id_pattern.clone(),
+            dry_run: true,
+            tool_rounds: 0,
+            conversation_turns: 0,
+            min_prefix_tokens: None,
+            json: true,
+            output: None,
+            timeout_seconds: args.timeout_seconds,
+        },
+    )
+    .await;
+    let candidates = match candidates {
+        Ok(models) => models,
+        Err(error) => {
+            host.deactivate_all()?;
+            return Err(error);
+        }
+    };
+    let mut results = BTreeMap::new();
+    let mut failed = candidates.is_empty();
+    let mut invoker = CliPluginTurnInvoker { host: &mut host };
+    for model in candidates {
+        let model_id = model.model_id.clone();
+        let result = if let Some(image) = &fixture {
+            let mut provider_context = context.clone();
+            if provider_context.api_surface.is_none() {
+                provider_context.api_surface = model.api_surface;
+            }
+            match run_image_verification(
+                &mut invoker,
+                &ImageVerificationOptions {
+                    provider_plugin_id: Some(provider.clone()),
+                    provider_context,
+                    model,
+                    image: image.clone(),
+                    question: args.question.clone().unwrap_or_default(),
+                    expected_answer: args.expected_answer.clone().unwrap_or_default(),
+                    allow_conversation_storage: args.allow_conversation_storage,
+                    timeout: Duration::from_secs(args.timeout_seconds),
+                },
+            ) {
+                Ok(report) => {
+                    failed |= report.has_failures();
+                    serde_json::json!({"status": "observed", "report": report})
+                }
+                Err(error) => {
+                    failed = true;
+                    serde_json::json!({"status": "error", "message": error})
+                }
+            }
+        } else {
+            serde_json::json!({"status": "dry_run", "media_input": model.feature_support.media_input})
+        };
+        results.insert(model_id, result);
+    }
+    host.deactivate_all()?;
+    print_json(
+        &serde_json::json!({"schema_version": 1, "provider": provider, "dry_run": args.dry_run, "results": results}),
+    )?;
+    if failed {
+        Err(CliError::PluginCli(
+            "image verification failed or no models selected".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 async fn verify_model_caches(args: &VerifyCacheArgs) -> Result<(), CliError> {
@@ -22684,6 +22865,34 @@ mod plugin_cli_tests {
 mod model_cli_tests {
     use super::{Cli, Commands, ModelCommand};
     use clap::Parser as _;
+
+    #[test]
+    fn image_verification_dry_run_needs_no_fixture_and_storage_is_opt_in() {
+        let cli = Cli::try_parse_from(["bcode", "model", "verify-images", "--dry-run"])
+            .expect("image verification parses");
+        let Some(Commands::Model {
+            command: ModelCommand::VerifyImages(args),
+        }) = cli.command
+        else {
+            panic!("expected image verification");
+        };
+        assert!(!args.allow_conversation_storage);
+        assert_eq!(args.max_models, 1);
+        assert!(
+            super::image_verification_fixture(&args)
+                .expect("dry run")
+                .is_none()
+        );
+        let cli = Cli::try_parse_from(["bcode", "model", "verify-images"])
+            .expect("image verification parses");
+        let Some(Commands::Model {
+            command: ModelCommand::VerifyImages(args),
+        }) = cli.command
+        else {
+            panic!("expected image verification");
+        };
+        assert!(super::image_verification_fixture(&args).is_err());
+    }
 
     #[test]
     fn model_diagnostics_supports_machine_output() {

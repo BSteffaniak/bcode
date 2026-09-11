@@ -889,13 +889,25 @@ async fn decode_openai_auth_response<T: serde::de::DeserializeOwned>(
         .map_err(|error| format!("OpenAI {operation} response was invalid: {error}"))
 }
 
-fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProjection {
-    let settings = settings_for_context(&request.provider_context);
-    match settings.dialect {
+fn openai_request_projection(
+    settings: &Settings,
+    request: &ModelTurnRequest,
+    model_id: &str,
+) -> Result<ProviderRequestProjection, ProviderError> {
+    let serialized_body_bytes = match settings.dialect {
+        OpenAiCompatibleDialect::ChatCompletions => {
+            serialized_json_bytes(&build_chat_completion_request(settings, request, model_id)?)
+        }
+        OpenAiCompatibleDialect::ResponsesApi | OpenAiCompatibleDialect::ChatGptCodex => {
+            serialized_json_bytes(&build_responses_request(settings, request, model_id)?)
+        }
+    };
+    Ok(match settings.dialect {
         OpenAiCompatibleDialect::ChatCompletions => {
             let messages = model_messages_to_chat_messages(request);
             ProviderRequestProjection {
                 provider: Some("bcode.openai-compatible".to_string()),
+                serialized_body_bytes,
                 api_shape: Some("chat_completions".to_string()),
                 message_count: Some(messages.len()),
                 original_message_count: Some(request.messages.len()),
@@ -911,12 +923,12 @@ fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProje
             }
         }
         dialect => {
-            let previous_response_id = responses_previous_response_id(&settings, request);
+            let previous_response_id = responses_previous_response_id(settings, request);
             let project_reused_history =
                 dialect.projects_reused_history() && previous_response_id.is_some();
             let mut projection = responses_projection(
                 request,
-                responses_instruction_strategy(&settings),
+                responses_instruction_strategy(settings),
                 project_reused_history,
                 dialect,
                 previous_response_id.as_deref(),
@@ -926,6 +938,7 @@ fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProje
             let sent = responses_projected_message_count(request, project_reused_history);
             ProviderRequestProjection {
                 provider: Some("bcode.openai-compatible".to_string()),
+                serialized_body_bytes,
                 api_shape: Some("responses".to_string()),
                 input_item_count: Some(projection.input.len()),
                 original_message_count: Some(request.messages.len()),
@@ -944,7 +957,26 @@ fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProje
                 ..ProviderRequestProjection::default()
             }
         }
+    })
+}
+
+/// Count JSON bytes without retaining another copy of image-bearing request bodies.
+fn serialized_json_bytes(value: &impl Serialize) -> Option<u64> {
+    #[derive(Default)]
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len() as u64);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
+    let mut counter = Counter::default();
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
 }
 
 fn responses_projected_message_count(
@@ -1601,9 +1633,6 @@ impl OpenAiCompatibleProviderPlugin {
             turn.enable_positioned_output();
         }
         turn.push(ProviderTurnEvent::TurnStarted);
-        turn.push(ProviderTurnEvent::RequestProjection {
-            projection: openai_request_projection(&request),
-        });
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
         let mut cleanup = PushTurnCleanup {
@@ -4343,6 +4372,9 @@ async fn stream_chat_completion_attempt(
     })?;
     let model_id = resolve_model_id_for_turn(&settings, request, turn).await;
     turn.configure_original_usage(request, settings.dialect, &model_id);
+    turn.push(ProviderTurnEvent::RequestProjection {
+        projection: openai_request_projection(&settings, request, &model_id)?,
+    });
     match (&settings.auth, settings.dialect) {
         (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ChatCompletions) => {
             let response =
@@ -5929,16 +5961,21 @@ fn responses_previous_response_id(
     settings: &Settings,
     request: &ModelTurnRequest,
 ) -> Option<String> {
-    settings
-        .dialect
-        .supports_previous_response_id()
-        .then(|| {
-            request
-                .conversation_reuse
-                .previous_provider_response_id
-                .clone()
-        })
-        .flatten()
+    if !settings.dialect.supports_previous_response_id()
+        || !request.conversation_reuse.mode.is_enabled()
+        || request
+            .conversation_reuse
+            .new_messages_start_index
+            .is_none_or(|start| start > request.messages.len())
+    {
+        return None;
+    }
+    request
+        .conversation_reuse
+        .previous_provider_response_id
+        .as_ref()
+        .filter(|id| !id.trim().is_empty())
+        .cloned()
 }
 
 fn responses_projection(
@@ -12506,6 +12543,64 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+    }
+
+    #[test]
+    fn image_continuation_preserves_inline_fallback_and_measures_body_bytes() {
+        let image = bcode_model::ImageContent {
+            mime_type: "image/png".to_string(),
+            data_base64: "AQID".repeat(1024),
+            metadata: bcode_model::ImageMetadata::default(),
+        };
+        let mut request = test_request(vec![
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Image {
+                    image: image.clone(),
+                }],
+            },
+            text_message(MessageRole::Assistant, "READY"),
+            text_message(MessageRole::User, "What is in the image?"),
+        ]);
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let baseline = build_responses_request(&settings, &request, "model").expect("inline body");
+        let baseline_size = serde_json::to_vec(&baseline).expect("JSON").len() as u64;
+        let projection =
+            openai_request_projection(&settings, &request, "model").expect("projection");
+        assert_eq!(projection.serialized_body_bytes, Some(baseline_size));
+        assert_eq!(
+            baseline["input"][0]["content"][0]["image_url"],
+            format!("data:image/png;base64,{}", image.data_base64)
+        );
+        request.conversation_reuse = bcode_model::ConversationReuseHints {
+            mode: bcode_model::ConversationReuseMode::Auto,
+            previous_provider_response_id: Some("resp_image".to_string()),
+            new_messages_start_index: Some(2),
+            ..Default::default()
+        };
+        let projection =
+            openai_request_projection(&settings, &request, "model").expect("projection");
+        assert!(projection.used_previous_response_id);
+        assert!(projection.serialized_body_bytes.expect("measurement") < baseline_size);
+        let continued =
+            build_responses_request(&settings, &request, "model").expect("continued body");
+        assert_eq!(continued["input"].as_array().expect("input").len(), 1);
+        assert_eq!(
+            continued["input"][0]["content"][0]["text"],
+            "What is in the image?"
+        );
+        for boundary in [None, Some(4)] {
+            request.conversation_reuse.new_messages_start_index = boundary;
+            let fallback = build_responses_request(&settings, &request, "model").expect("fallback");
+            assert!(fallback.get("previous_response_id").is_none());
+            assert_eq!(fallback["input"], baseline["input"]);
+        }
+        request.conversation_reuse.new_messages_start_index = Some(2);
+        request.conversation_reuse.mode = bcode_model::ConversationReuseMode::Off;
+        let fallback =
+            build_responses_request(&settings, &request, "model").expect("disabled reuse");
+        assert!(fallback.get("previous_response_id").is_none());
+        assert_eq!(fallback["input"], baseline["input"]);
     }
 
     #[test]
