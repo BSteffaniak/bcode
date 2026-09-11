@@ -10,8 +10,10 @@ Implemented first slice:
 
 * `bcode model verify-images`: bounded provider-operation probes for image acknowledgement,
   inline follow-up, repeated inline follow-up, and explicitly authorized continuation.
-* OpenAI-compatible JSON request-body byte observations, measured against the resolved request
-  model and settings for each normal stream attempt.
+* OpenAI-compatible JSON request-body byte observations at the send boundary. Each attempt
+  constructs and serializes its body once; the measured byte buffer is passed directly to HTTP.
+  Local HTTP capture tests compare observations with received image-bearing bodies for both
+  Chat Completions and Responses. Codex routing tests continue to cover request scoping.
 * Responses continuation requires enabled reuse, a nonempty response ID, and an in-range history
   boundary. Otherwise the full inline context is projected.
 * Deterministic provider-operation tests and an actual Responses request-projection test.
@@ -127,8 +129,8 @@ contain signed URLs or credentials. Cache usage analysis remains owned by `bcode
 
 ## Remaining implementation and acceptance gates
 
-1. Remove duplicate request construction for telemetry by measuring the exact serialized outbound
-   body at the send boundary; add actual transport counters where observable.
+1. Add actual transport counters where observable, retaining the distinction between measured
+   serialized bodies and socket delivery. Exact outbound-body serialization is implemented.
 2. Add typed transport/retention capability negotiation and policy before any upload effects.
 3. Introduce immutable, lazy, bounded image-source access through the authorized artifact boundary.
 4. Implement one documented real provider upload/reference mechanism, including account isolation,

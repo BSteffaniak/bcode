@@ -892,55 +892,36 @@ async fn decode_openai_auth_response<T: serde::de::DeserializeOwned>(
 fn openai_request_projection(
     settings: &Settings,
     request: &ModelTurnRequest,
-    model_id: &str,
-) -> Result<ProviderRequestProjection, ProviderError> {
-    let serialized_body_bytes = match settings.dialect {
-        OpenAiCompatibleDialect::ChatCompletions => {
-            serialized_json_bytes(&build_chat_completion_request(settings, request, model_id)?)
-        }
-        OpenAiCompatibleDialect::ResponsesApi | OpenAiCompatibleDialect::ChatGptCodex => {
-            serialized_json_bytes(&build_responses_request(settings, request, model_id)?)
-        }
-    };
-    Ok(match settings.dialect {
-        OpenAiCompatibleDialect::ChatCompletions => {
-            let messages = model_messages_to_chat_messages(request);
-            ProviderRequestProjection {
-                provider: Some("bcode.openai-compatible".to_string()),
-                serialized_body_bytes,
-                api_shape: Some("chat_completions".to_string()),
-                message_count: Some(messages.len()),
-                original_message_count: Some(request.messages.len()),
-                sent_message_count: Some(request.messages.len()),
-                omitted_message_count: Some(0),
-                cache_point_count: Some(prompt_cache_point_count(request)),
-                emitted_cache_point_count: Some(0),
-                dropped_cache_point_count: Some(prompt_cache_point_count(request)),
-                detail: Some(
-                    "explicit cache points are not supported by this API shape".to_string(),
-                ),
-                ..ProviderRequestProjection::default()
-            }
-        }
+    serialized_body_bytes: u64,
+    item_count: usize,
+) -> ProviderRequestProjection {
+    let serialized_body_bytes = Some(serialized_body_bytes);
+    match settings.dialect {
+        OpenAiCompatibleDialect::ChatCompletions => ProviderRequestProjection {
+            provider: Some("bcode.openai-compatible".to_string()),
+            serialized_body_bytes,
+            api_shape: Some("chat_completions".to_string()),
+            message_count: Some(item_count),
+            original_message_count: Some(request.messages.len()),
+            sent_message_count: Some(request.messages.len()),
+            omitted_message_count: Some(0),
+            cache_point_count: Some(prompt_cache_point_count(request)),
+            emitted_cache_point_count: Some(0),
+            dropped_cache_point_count: Some(prompt_cache_point_count(request)),
+            detail: Some("explicit cache points are not supported by this API shape".to_string()),
+            ..ProviderRequestProjection::default()
+        },
         dialect => {
             let previous_response_id = responses_previous_response_id(settings, request);
             let project_reused_history =
                 dialect.projects_reused_history() && previous_response_id.is_some();
-            let mut projection = responses_projection(
-                request,
-                responses_instruction_strategy(settings),
-                project_reused_history,
-                dialect,
-                previous_response_id.as_deref(),
-            );
             let had_provider_reasoning_state = has_provider_reasoning_state(dialect, request);
-            prepend_provider_reasoning_state(&mut projection.input, dialect, request);
             let sent = responses_projected_message_count(request, project_reused_history);
             ProviderRequestProjection {
                 provider: Some("bcode.openai-compatible".to_string()),
                 serialized_body_bytes,
                 api_shape: Some("responses".to_string()),
-                input_item_count: Some(projection.input.len()),
+                input_item_count: Some(item_count),
                 original_message_count: Some(request.messages.len()),
                 sent_message_count: Some(sent),
                 omitted_message_count: Some(request.messages.len().saturating_sub(sent)),
@@ -957,26 +938,18 @@ fn openai_request_projection(
                 ..ProviderRequestProjection::default()
             }
         }
-    })
+    }
 }
 
-/// Count JSON bytes without retaining another copy of image-bearing request bodies.
-fn serialized_json_bytes(value: &impl Serialize) -> Option<u64> {
-    #[derive(Default)]
-    struct Counter(u64);
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len() as u64);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter::default();
-    serde_json::to_writer(&mut counter, value).ok()?;
-    Some(counter.0)
+/// Serialize once: these exact bytes are used for both observation and HTTP transmission.
+fn encode_request_body(value: &impl Serialize) -> Result<Vec<u8>, ProviderError> {
+    serde_json::to_vec(value).map_err(|_| {
+        provider_error(
+            "request_encoding_failed",
+            ProviderErrorCategory::InvalidRequest,
+            "provider request could not be encoded as JSON",
+        )
+    })
 }
 
 fn responses_projected_message_count(
@@ -3921,6 +3894,7 @@ async fn verify_model_inner(
                 api_key,
                 &turn_request,
                 &request.model_id,
+                None,
             )
             .await?;
         }
@@ -4372,26 +4346,23 @@ async fn stream_chat_completion_attempt(
     })?;
     let model_id = resolve_model_id_for_turn(&settings, request, turn).await;
     turn.configure_original_usage(request, settings.dialect, &model_id);
-    turn.push(ProviderTurnEvent::RequestProjection {
-        projection: openai_request_projection(&settings, request, &model_id)?,
-    });
     match (&settings.auth, settings.dialect) {
         (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ChatCompletions) => {
-            let response =
-                send_chat_completion_request(&client, &settings, api_key, request, &model_id)
-                    .await?;
-            read_stream_events(response, turn, request).await
-        }
-        (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ResponsesApi) => {
-            let response = send_responses_request(
+            let response = send_chat_completion_request(
                 &client,
                 &settings,
                 api_key,
                 request,
                 &model_id,
-                Some(&turn.routing),
+                Some(turn),
             )
             .await?;
+            read_stream_events(response, turn, request).await
+        }
+        (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ResponsesApi) => {
+            let response =
+                send_responses_request(&client, &settings, api_key, request, &model_id, Some(turn))
+                    .await?;
             read_responses_stream_events(response, turn, request, settings.dialect).await
         }
         (AuthSettings::ChatGpt { access_token, .. }, OpenAiCompatibleDialect::ChatGptCodex) => {
@@ -4401,7 +4372,7 @@ async fn stream_chat_completion_attempt(
                 access_token,
                 request,
                 &model_id,
-                Some(&turn.routing),
+                Some(turn),
             )
             .await?;
             read_responses_stream_events(response, turn, request, settings.dialect).await
@@ -4500,16 +4471,29 @@ async fn send_chat_completion_request(
     api_key: &str,
     request: &ModelTurnRequest,
     model_id: &str,
+    turn: Option<&TurnState>,
 ) -> Result<reqwest::Response, ProviderError> {
     let url = format!(
         "{}/chat/completions",
         settings.base_url.trim_end_matches('/')
     );
     let request_body = build_chat_completion_request(settings, request, model_id)?;
+    let bytes = encode_request_body(&request_body)?;
+    if let Some(turn) = turn {
+        turn.push(ProviderTurnEvent::RequestProjection {
+            projection: openai_request_projection(
+                settings,
+                request,
+                bytes.len() as u64,
+                request_body.messages.len(),
+            ),
+        });
+    }
     let response = client
         .post(url)
         .bearer_auth(api_key)
-        .json(&request_body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(bytes)
         .send()
         .await
         .map_err(|error| reqwest_provider_error("request_failed", &error))?;
@@ -4532,7 +4516,7 @@ async fn send_responses_request(
     access_token: &str,
     request: &ModelTurnRequest,
     model_id: &str,
-    routing: Option<&turn_routing::TurnRouting>,
+    turn: Option<&TurnState>,
 ) -> Result<reqwest::Response, ProviderError> {
     send_responses_request_to(
         client,
@@ -4540,7 +4524,7 @@ async fn send_responses_request(
         access_token,
         request,
         model_id,
-        routing,
+        turn,
         &responses_endpoint(settings),
     )
     .await
@@ -4553,9 +4537,10 @@ async fn send_responses_request_to(
     access_token: &str,
     request: &ModelTurnRequest,
     model_id: &str,
-    routing: Option<&turn_routing::TurnRouting>,
+    turn: Option<&TurnState>,
     url: &str,
 ) -> Result<reqwest::Response, ProviderError> {
+    let routing = turn.map(|turn| &turn.routing);
     let request_body = build_responses_request(settings, request, model_id)?;
     let mut builder = client
         .post(url)
@@ -4591,7 +4576,23 @@ async fn send_responses_request_to(
     {
         builder = builder.header(turn_routing::HEADER, token);
     }
-    let mut builder = builder.json(&request_body);
+    let bytes = encode_request_body(&request_body)?;
+    if let Some(turn) = turn {
+        turn.push(ProviderTurnEvent::RequestProjection {
+            projection: openai_request_projection(
+                settings,
+                request,
+                bytes.len() as u64,
+                request_body
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+            ),
+        });
+    }
+    let mut builder = builder
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(bytes);
     if let AuthSettings::ChatGpt {
         account_id: Some(account_id),
         ..
@@ -10745,6 +10746,118 @@ mod tests {
         }
     }
 
+    fn assert_single_body_measurement(turn: &TurnState, bytes: usize) {
+        let events = turn.drain();
+        let projections: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::RequestProjection { projection } => Some(projection),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].serialized_body_bytes, Some(bytes as u64));
+    }
+
+    #[tokio::test]
+    async fn image_projection_bytes_match_http_bodies_on_both_api_shapes() {
+        for dialect in [
+            OpenAiCompatibleDialect::ChatCompletions,
+            OpenAiCompatibleDialect::ResponsesApi,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+            let address = listener.local_addr().expect("address");
+            let worker = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("timeout");
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(&mut reader, &mut line).expect("header");
+                    assert!(!line.is_empty());
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: application/json")
+                );
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .expect("length");
+                let mut body = vec![0; length];
+                std::io::Read::read_exact(&mut reader, &mut body).expect("body");
+                drop(reader);
+                std::io::Write::write_all(&mut stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("response");
+                body
+            });
+            let image = bcode_model::ImageContent {
+                mime_type: "image/png".to_string(),
+                data_base64: "AQID".repeat(512),
+                metadata: bcode_model::ImageMetadata::default(),
+            };
+            let request = test_request(vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Image {
+                    image: image.clone(),
+                }],
+            }]);
+            let mut settings = test_settings(test_api_key_auth(), dialect);
+            settings.base_url = format!("http://{address}");
+            let client = Client::new();
+            let turn = TurnState::default();
+            match dialect {
+                OpenAiCompatibleDialect::ChatCompletions => {
+                    send_chat_completion_request(
+                        &client,
+                        &settings,
+                        "test",
+                        &request,
+                        "resolved-model",
+                        Some(&turn),
+                    )
+                    .await
+                    .expect("send");
+                }
+                _ => {
+                    send_responses_request_to(
+                        &client,
+                        &settings,
+                        "test",
+                        &request,
+                        "resolved-model",
+                        Some(&turn),
+                        &format!("http://{address}/responses"),
+                    )
+                    .await
+                    .expect("send");
+                }
+            }
+            let bytes = worker.join().expect("server");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+            assert_eq!(body["model"], "resolved-model");
+            let url = match dialect {
+                OpenAiCompatibleDialect::ChatCompletions => {
+                    &body["messages"][0]["content"][0]["image_url"]["url"]
+                }
+                _ => &body["input"][0]["content"][0]["image_url"],
+            };
+            assert_eq!(url, &format!("data:image/png;base64,{}", image.data_base64));
+            assert_single_body_measurement(&turn, bytes.len());
+        }
+    }
+
     #[tokio::test]
     async fn codex_replays_routing_header_across_requests_but_not_application_turns() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -10803,7 +10916,7 @@ mod tests {
             "application-one".into(),
         );
         let client = Client::new();
-        let routing = turn_routing::TurnRouting::default();
+        let turn = TurnState::default();
         for round in 0..3 {
             request.turn_id = format!("request-{round}");
             if round == 2 {
@@ -10818,7 +10931,7 @@ mod tests {
                 "test",
                 &request,
                 "test-model",
-                Some(&routing),
+                Some(&turn),
                 &format!("http://{address}/responses"),
             )
             .await
@@ -12565,8 +12678,15 @@ mod tests {
         let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
         let baseline = build_responses_request(&settings, &request, "model").expect("inline body");
         let baseline_size = serde_json::to_vec(&baseline).expect("JSON").len() as u64;
-        let projection =
-            openai_request_projection(&settings, &request, "model").expect("projection");
+        let projection = {
+            let body = build_responses_request(&settings, &request, "model").expect("body");
+            openai_request_projection(
+                &settings,
+                &request,
+                encode_request_body(&body).expect("encoded body").len() as u64,
+                body["input"].as_array().expect("input").len(),
+            )
+        };
         assert_eq!(projection.serialized_body_bytes, Some(baseline_size));
         assert_eq!(
             baseline["input"][0]["content"][0]["image_url"],
@@ -12578,8 +12698,15 @@ mod tests {
             new_messages_start_index: Some(2),
             ..Default::default()
         };
-        let projection =
-            openai_request_projection(&settings, &request, "model").expect("projection");
+        let projection = {
+            let body = build_responses_request(&settings, &request, "model").expect("body");
+            openai_request_projection(
+                &settings,
+                &request,
+                encode_request_body(&body).expect("encoded body").len() as u64,
+                body["input"].as_array().expect("input").len(),
+            )
+        };
         assert!(projection.used_previous_response_id);
         assert!(projection.serialized_body_bytes.expect("measurement") < baseline_size);
         let continued =
