@@ -240,14 +240,18 @@ fn launch_validation_command(generation: u64) -> bmux_tui_runtime::Command<Onboa
 }
 
 async fn validate_launch_provider() -> Result<(), String> {
-    let selection = inspect_launch_selection()?;
-    let client = tokio::task::spawn_blocking(bcode_client::BcodeClient::default_endpoint)
-        .await
-        .map_err(|_| "Could not prepare provider validation. Retry from setup.".to_owned())?;
+    let (selection, client) = tokio::task::spawn_blocking(|| {
+        let selection = inspect_launch_selection()?;
+        let client = bcode_client::BcodeClient::default_endpoint();
+        Ok::<_, String>((selection, client))
+    })
+    .await
+    .map_err(|_| "Could not prepare provider validation. Retry from setup.".to_owned())??;
     let response = client
         .invoke_plugin_service(
             selection
                 .provider_plugin_id
+                .clone()
                 .ok_or_else(|| "Select a provider.".to_owned())?,
             bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_owned(),
             bcode_model::OP_VALIDATE_CONFIG.to_owned(),
@@ -271,6 +275,12 @@ async fn validate_launch_provider() -> Result<(), String> {
             "Provider configuration is not ready. Review Connections and Models before launching."
                 .to_owned(),
         );
+    }
+    let current = tokio::task::spawn_blocking(inspect_launch_selection)
+        .await
+        .map_err(|_| "Could not recheck launch selection. Retry from setup.".to_owned())??;
+    if current != selection {
+        return Err("Model or account selection changed during validation. Review the selection and launch again.".to_owned());
     }
     Ok(())
 }
