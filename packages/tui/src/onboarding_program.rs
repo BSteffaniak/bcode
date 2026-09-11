@@ -160,12 +160,34 @@ impl OnboardingProgram {
                     .shell
                     .handle_action(action, &self.store, current_time_ms())?;
                 if outcome == onboarding::OnboardingActionOutcome::LaunchReady {
-                    self.continuation = bcode_settings::SetupContinuation::Launch;
-                    return Ok(Lifecycle::Exit);
+                    let selection = bcode_config::load_config()
+                        .map(|config| config.resolved_model_selection())
+                        .map_err(|_| {
+                            "Configuration could not be loaded. Review Settings before launching."
+                                .to_owned()
+                        });
+                    return Ok(self.finish_launch_selection(selection));
                 }
                 Ok(Lifecycle::Continue)
             }
         }
+    }
+    fn finish_launch_selection(
+        &mut self,
+        selection: Result<bcode_config::ResolvedModelSelection, String>,
+    ) -> Lifecycle {
+        let result = selection.and_then(|selection| {
+            selection
+                .validate_selection()
+                .map_err(|error| error.to_string())
+        });
+        if let Err(message) = result {
+            self.shell.set_status_message(message);
+            self.continuation = bcode_settings::SetupContinuation::Close;
+            return Lifecycle::Continue;
+        }
+        self.continuation = bcode_settings::SetupContinuation::Launch;
+        Lifecycle::Exit
     }
 }
 
@@ -337,6 +359,53 @@ impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
 mod tests {
     use super::onboarding_action_for_key;
     use bmux_keyboard::KeyCode;
+
+    #[test]
+    fn incomplete_launch_stays_inside_setup_and_can_be_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            bcode_settings::SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
+        let shell = crate::onboarding::OnboardingShell::from_reconciliation(
+            &[],
+            &bcode_settings::SetupConfigSummary::default().reconciliation_input(),
+        );
+        let theme = crate::theme::resolve_configured_theme(
+            &bcode_config::TuiConfig::default(),
+            temp.path(),
+        );
+        let mut program = super::OnboardingProgram::new(
+            store,
+            shell,
+            &theme,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        )
+        .unwrap();
+        let mut selection = bcode_config::ResolvedModelSelection::default();
+        for provider in [None, Some("example.provider".to_owned())] {
+            selection.provider_plugin_id = provider;
+            assert_eq!(
+                program.finish_launch_selection(Ok(selection.clone())),
+                bmux_tui_runtime::Lifecycle::Continue
+            );
+            assert_eq!(
+                program.continuation(),
+                bcode_settings::SetupContinuation::Close
+            );
+        }
+        assert_eq!(
+            program.finish_launch_selection(Err("Configuration unavailable".to_owned())),
+            bmux_tui_runtime::Lifecycle::Continue
+        );
+        selection.model_id = Some("example-model".to_owned());
+        assert_eq!(
+            program.finish_launch_selection(Ok(selection)),
+            bmux_tui_runtime::Lifecycle::Exit
+        );
+        assert_eq!(
+            program.continuation(),
+            bcode_settings::SetupContinuation::Launch
+        );
+    }
 
     #[test]
     fn editing_actions_never_request_terminal_exit() {

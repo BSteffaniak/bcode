@@ -18,12 +18,9 @@ pub async fn run_setup(discovery_enabled: bool) -> Result<bool, CliError> {
 
 pub fn validate_launch_selection() -> Result<(), CliError> {
     let selection = bcode_config::load_config()?.resolved_model_selection();
-    if selection.provider_plugin_id.is_none() || selection.model_id.is_none() {
-        return Err(CliError::InvalidArguments(
-            "Select a provider and model before starting a session".to_owned(),
-        ));
-    }
-    Ok(())
+    selection
+        .validate_selection()
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))
 }
 
 pub fn edit_setting(

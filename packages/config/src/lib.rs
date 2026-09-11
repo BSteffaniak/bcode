@@ -4003,6 +4003,47 @@ pub struct ResolvedModelSelection {
     pub reasoning: ReasoningConfig,
 }
 
+/// Missing configuration required to select a model. This is not a remote readiness check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ModelSelectionIncomplete {
+    /// Neither provider nor model is selected.
+    #[error("Connect a provider, then choose a model in Models before launching.")]
+    ProviderAndModel,
+    /// A model was supplied without a provider.
+    #[error("Select a provider for the chosen model before launching.")]
+    Provider,
+    /// A provider was supplied without a model.
+    #[error(
+        "Choose a model in Models before launching. Connecting an account alone does not select a model."
+    )]
+    Model,
+}
+
+impl ResolvedModelSelection {
+    /// Check that selection contains non-empty provider and model identifiers.
+    ///
+    /// This does not verify provider availability, catalog membership, or credentials.
+    ///
+    /// # Errors
+    /// Returns the missing selection prerequisite, without exposing supplied values.
+    pub fn validate_selection(&self) -> Result<(), ModelSelectionIncomplete> {
+        let provider = self
+            .provider_plugin_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        let model = self
+            .model_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        match (provider, model) {
+            (true, true) => Ok(()),
+            (false, false) => Err(ModelSelectionIncomplete::ProviderAndModel),
+            (false, true) => Err(ModelSelectionIncomplete::Provider),
+            (true, false) => Err(ModelSelectionIncomplete::Model),
+        }
+    }
+}
+
 /// Plugin default selection mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -12328,6 +12369,23 @@ model_id = "second"
         )
         .expect("valid TOML");
         assert!(super::resolve_composed_config_value(&raw).is_err());
+    }
+
+    #[test]
+    fn model_selection_requires_nonempty_provider_and_model() {
+        for provider in [None, Some(""), Some("  "), Some("provider")] {
+            for model in [None, Some(""), Some("  "), Some("model")] {
+                let selection = super::ResolvedModelSelection {
+                    provider_plugin_id: provider.map(str::to_owned),
+                    model_id: model.map(str::to_owned),
+                    ..super::ResolvedModelSelection::default()
+                };
+                assert_eq!(
+                    selection.validate_selection().is_ok(),
+                    provider == Some("provider") && model == Some("model")
+                );
+            }
+        }
     }
 
     #[test]
