@@ -3364,6 +3364,71 @@ impl SessionDb {
             .map_or(Ok(None), |value| Ok(Some(value)))
     }
 
+    /// Discover at most sixteen finalized reference identities after an exclusive key cursor.
+    ///
+    /// # Errors
+    /// Rejects unsupported storage, stale projections, malformed rows or query failures.
+    pub async fn artifact_maintenance_page(
+        &self,
+        after: Option<(&str, &str)>,
+    ) -> SessionDbResult<Vec<(String, String)>> {
+        validate_storage_writer_contract(&**self.db).await?;
+        let expected = self.last_event_sequence().await?.unwrap_or_default();
+        if self
+            .materialized_projection_checkpoint(MaterializedProjection::ArtifactReferences)
+            .await?
+            != Some(expected)
+        {
+            return Err(SessionDbError::ProjectionStale {
+                projection: "artifact_references",
+                checkpoint: None,
+                expected,
+            });
+        }
+        let mut result = Vec::new();
+        if let Some((artifact, reference)) = after {
+            let rows = self
+                .db
+                .select("artifact_references")
+                .columns(&["artifact_id", "reference_key"])
+                .where_eq("artifact_id", artifact)
+                .where_gt("reference_key", reference)
+                .where_eq("complete", true)
+                .where_eq("availability", "complete")
+                .sort("reference_key", SortDirection::Asc)
+                .limit(16)
+                .execute(&**self.db)
+                .await?;
+            for row in rows {
+                result.push((
+                    required_string(&row, "artifact_id")?,
+                    required_string(&row, "reference_key")?,
+                ));
+            }
+        }
+        if result.len() < 16 {
+            let mut query = self
+                .db
+                .select("artifact_references")
+                .columns(&["artifact_id", "reference_key"])
+                .where_eq("complete", true)
+                .where_eq("availability", "complete")
+                .sort("artifact_id", SortDirection::Asc)
+                .sort("reference_key", SortDirection::Asc)
+                .limit(16 - result.len());
+            if let Some((artifact, _)) = after {
+                query = query.where_gt("artifact_id", artifact);
+            }
+            for row in query.execute(&**self.db).await? {
+                result.push((
+                    required_string(&row, "artifact_id")?,
+                    required_string(&row, "reference_key")?,
+                ));
+            }
+        }
+        Ok(result)
+    }
+
     /// Resolve one finalized artifact reference from the bounded materialized projection.
     ///
     /// # Errors
@@ -10799,6 +10864,58 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn artifact_maintenance_pagination_covers_shared_ids_without_duplicates() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("database");
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("created");
+        for index in 0..40 {
+            db.database()
+                .insert("artifact_references")
+                .value("artifact_id", format!("artifact-{}", index / 20))
+                .value("reference_key", format!("ref-{index:03}"))
+                .value("producer_plugin_id", "fixture")
+                .value("schema", "fixture")
+                .value("schema_version", 1)
+                .value("complete", true)
+                .value("availability", "complete")
+                .value("finalized_event_seq", 0)
+                .execute(db.database())
+                .await
+                .expect("reference");
+        }
+        let mut found = Vec::new();
+        loop {
+            let page = db
+                .artifact_maintenance_page(
+                    found
+                        .last()
+                        .map(|(a, r): &(String, String)| (a.as_str(), r.as_str())),
+                )
+                .await
+                .expect("page");
+            assert!(page.len() <= 16);
+            if page.is_empty() {
+                break;
+            }
+            found.extend(page);
+        }
+        assert_eq!(found.len(), 40);
+        assert!(found.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[tokio::test]

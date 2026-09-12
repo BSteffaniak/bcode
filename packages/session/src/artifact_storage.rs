@@ -103,6 +103,25 @@ pub enum ArtifactStorageOutcome {
     },
 }
 
+/// Return a bounded page of finalized artifact identities for offline maintenance.
+///
+/// # Errors
+/// Fails for foreign ownership, unavailable storage, stale projections, or unsupported contracts.
+pub async fn maintenance_candidates(
+    root: &Path,
+    session_id: SessionId,
+    after: Option<(&str, &str)>,
+) -> io::Result<Vec<(String, String)>> {
+    let _maintenance = crate::lease::acquire_session_maintenance_guard(root, session_id)
+        .map_err(io::Error::other)?;
+    let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, root)
+        .await
+        .map_err(io::Error::other)?;
+    let result = db.artifact_maintenance_page(after).await;
+    db.database().close().await.map_err(io::Error::other)?;
+    result.map_err(io::Error::other)
+}
+
 /// Verify a finalized relative artifact reference and compress it under one maintenance fence.
 ///
 /// Uses the current session database boundary, rejects stale projections and unsupported writer

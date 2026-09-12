@@ -124,43 +124,42 @@ async fn maintain_session(
     } else {
         return Ok(());
     };
-    // Candidate discovery is read-only and bounded. Publication rechecks compatibility, projection,
-    // completeness, access age, and ownership independently under the maintenance fence.
-    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root)
-        .await
-        .map_err(|_| "database unavailable")?;
-    let result = db.database().query_raw("SELECT artifact_id, reference_key FROM artifact_references WHERE complete = 1 AND availability = 'complete' ORDER BY artifact_id, reference_key LIMIT 16").await;
-    db.database()
-        .close()
-        .await
-        .map_err(|_| "database close failed")?;
-    let rows = result.map_err(|_| "references unavailable")?;
-    for row in rows {
-        if state
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            break;
-        }
-        let artifact = row
-            .get("artifact_id")
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .ok_or("invalid artifact")?;
-        let reference = row
-            .get("reference_key")
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .ok_or("invalid reference")?;
-        compress_finalized_artifact_with_age(
+    let mut cursor: Option<(String, String)> = None;
+    loop {
+        let rows = bcode_session::artifact_storage::maintenance_candidates(
             root,
             id,
-            &artifact,
-            &reference,
-            compression,
-            4096,
-            Some((now, minimum_age)),
+            cursor.as_ref().map(|(a, r)| (a.as_str(), r.as_str())),
         )
         .await
-        .map_err(|_| "compression deferred")?;
+        .map_err(|_| "references unavailable")?;
+        if rows.is_empty() {
+            break;
+        }
+        for (artifact, reference) in rows {
+            if state
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            cursor = Some((artifact.clone(), reference.clone()));
+            if compress_finalized_artifact_with_age(
+                root,
+                id,
+                &artifact,
+                &reference,
+                compression,
+                4096,
+                Some((now, minimum_age)),
+            )
+            .await
+            .is_err()
+            {
+                tracing::debug!("automatic artifact candidate deferred");
+            }
+        }
+        tokio::task::yield_now().await;
     }
     Ok(())
 }
