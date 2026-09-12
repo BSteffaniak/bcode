@@ -4,6 +4,9 @@
 //! Each tick advances a retained directory iterator by at most sixteen entries and processes one
 //! bounded reference page. No canonical history is replayed or search index rebuilt.
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests;
+
 use super::ServerState;
 use bcode_session::artifact_compression::ArtifactCompression;
 use bcode_session::artifact_storage::compress_finalized_artifact_with_age;
@@ -90,6 +93,16 @@ async fn maintain_session(
     id: SessionId,
     after: Option<(String, String)>,
 ) -> Result<Option<(String, String)>, String> {
+    maintain_session_at(state, root, id, after, super::current_time_ms()).await
+}
+
+async fn maintain_session_at(
+    state: &ServerState,
+    root: &std::path::Path,
+    id: SessionId,
+    after: Option<(String, String)>,
+    now: u64,
+) -> Result<Option<(String, String)>, String> {
     if !state
         .session_catalog
         .ambiguous_location_ids(id)
@@ -102,7 +115,6 @@ async fn maintain_session(
     if !config.enabled {
         return Ok(None);
     }
-    let now = super::current_time_ms();
     let path = root.join(id.to_string()).join("storage-access.bin");
     let observation = tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(path)?;

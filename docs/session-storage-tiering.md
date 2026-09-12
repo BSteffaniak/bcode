@@ -194,6 +194,15 @@ that replacement content survives. Concurrent same-user mutation between identit
 syscalls still requires explicit threat-model review; this is not a claim of adversarial atomic
 compare-and-swap on inodes.
 
+## Scheduler integration coverage
+
+Clock-controlled tests now invoke the real maintenance pass over canonical finalized session
+artifacts, rather than only testing codecs. They verify hot-data deferral, light-tier publication,
+continuation from reference 16 through 18, byte-exact range reads, scheduling opt-out, live-owner
+refusal, recent-access deferral, corrupt-tracking preservation, and deep-tier output at 31 days.
+The worker remains unstarted in production pending durable access-failure fencing; these passing
+pass-level tests do not imply lifecycle integration or automatic startup is complete.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
