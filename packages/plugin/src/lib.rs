@@ -2788,6 +2788,9 @@ impl PluginExecutorHandle {
         event_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
         resource_permit: Arc<PluginResourcePermit>,
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
+        // Startup can be abandoned while waiting for executor admission. Keep cancellation
+        // owned until the returned streaming handle can take responsibility for it.
+        let mut abandonment = CancelAbandonedInvocation(Some(cancel.clone()));
         match &self.executor {
             PluginExecutorKind::Exclusive(sender) => {
                 tracing::debug!(
@@ -2852,6 +2855,7 @@ impl PluginExecutorHandle {
                 });
             }
         }
+        abandonment.0 = None;
         Ok(StreamingServiceInvocation {
             response: response_receiver,
             pending_response: None,
@@ -8716,6 +8720,69 @@ library = "libexample_plugin.dylib"
         assert!(semaphore.is_closed());
         drop(permit);
         drop(active);
+        executor.deactivate().await.unwrap();
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn abandoned_stream_start_cancels_before_admission_and_releases_resources() {
+        let executor = PluginExecutorHandle::new(
+            test_manifest("abandoned-stream-start"),
+            PluginConcurrency::Concurrent,
+            PluginExecutorKind::Concurrent(
+                Arc::new(LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest("abandoned-stream-start"),
+                    backend: LoadedPluginBackend::Static {
+                        vtable: test_large_vtable(),
+                    },
+                }),
+                None,
+            ),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let writer = Arc::clone(&executor.lifecycle).write_owned().await;
+        let limiter = PluginResourceLimiter::new(1, 1);
+        let scope = PluginInvocationScope::Global;
+        let id = next_plugin_invocation_id();
+        let cancel = PluginInvocationCancelHandle {
+            id,
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+        };
+        let (response, receiver) = oneshot::channel();
+        let (events, event_receiver) = mpsc::unbounded_channel();
+        let mut start = Box::pin(
+            executor.start_service_with_events_scoped(
+                "test".into(),
+                "test".into(),
+                Vec::new(),
+                PluginInvocationClass::Service,
+                scope,
+                id,
+                cancel.clone(),
+                None,
+                response,
+                events,
+                receiver,
+                event_receiver,
+                Arc::new(
+                    limiter
+                        .acquire(&PluginInvocationScope::Global)
+                        .await
+                        .unwrap(),
+                ),
+            ),
+        );
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(start.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(!cancel.is_cancelled());
+        drop(start);
+        assert!(cancel.is_cancelled());
+        assert_eq!(limiter.global.available_permits(), 1);
+        drop(writer);
         executor.deactivate().await.unwrap();
         drop(executor);
     }
