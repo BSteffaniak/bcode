@@ -10569,6 +10569,15 @@ fn read_artifact_file_range(
     offset: u64,
     length: u32,
 ) -> Result<(u64, Vec<u8>), String> {
+    if path.is_dir() {
+        return bcode_session::artifact_storage::read_artifact_range(
+            artifact_root,
+            path,
+            offset,
+            length,
+        )
+        .map_err(|error| error.to_string());
+    }
     read_artifact_file_range_at_length(path, artifact_root, offset, length, None)
 }
 
@@ -40438,6 +40447,43 @@ library = "test"
         ));
         remove_session_artifact_dir(&artifact_dir).expect("cleanup");
         drop(state);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn generic_artifact_reader_preserves_ranges_after_compression_publication() {
+        let temp = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let session = temp.path().join(id.to_string());
+        std::fs::create_dir(&session).expect("session");
+        std::fs::write(session.join("session.db"), b"fixture").expect("database");
+        let root = temp.path().join("session-artifacts").join(id.to_string());
+        std::fs::create_dir_all(&root).expect("artifacts");
+        let path = root.join("recording.bin");
+        let bytes = "terminal output\n".repeat(100_000).into_bytes();
+        std::fs::write(&path, &bytes).expect("raw");
+        let before = read_artifact_file_range(&path, &root, 262_140, 80).expect("raw range");
+        let outcome = bcode_session::artifact_storage::compress_session_artifact(
+            temp.path(),
+            id,
+            Path::new("recording.bin"),
+            bcode_session::artifact_compression::ArtifactCompression::Light,
+            4096,
+            || Ok(()),
+        )
+        .expect("compress");
+        assert!(matches!(
+            outcome,
+            bcode_session::artifact_storage::ArtifactStorageOutcome::Compressed { .. }
+        ));
+        assert_eq!(
+            read_artifact_file_range(&path, &root, 262_140, 80).expect("compressed range"),
+            before
+        );
+        assert_eq!(
+            read_artifact_file_range(&path, &root, bytes.len() as u64, 1).expect("eof"),
+            (bytes.len() as u64, vec![])
+        );
     }
 
     #[test]

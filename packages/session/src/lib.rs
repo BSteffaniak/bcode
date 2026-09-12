@@ -17,6 +17,7 @@
 mod actor;
 pub mod artifact_compression;
 pub mod artifact_reader;
+pub mod artifact_storage;
 mod attach;
 mod attachment;
 mod catalog;

@@ -121,6 +121,28 @@ and maintenance must coordinate so pending/failed writes, untracked old clients,
 read-to-registration race cannot authorize compression based on stale age. Durable degraded-state
 handling remains required before activating scheduling.
 
+## Physical publication and transparent reads
+
+An explicit offline session-domain operation now publishes compressed artifacts on macOS/Linux.
+It acquires session maintenance ownership, prepares and verifies a candidate, syncs its payload and
+directory, and atomically exchanges it with the original using the platform's exchange-rename API.
+The unchanged logical path is always authoritative. A compressed representation is a directory
+containing exactly `content.v1.zstd`; unknown contents fail closed. Older raw-file readers fail on
+that directory rather than returning compressed bytes. This does not guarantee seamless use by old
+binaries and is not a substitute for the remaining compatibility/migration work.
+
+The server's finalized artifact range reader now understands these containers and returns unchanged
+logical offsets and bytes. Live artifact paths remain raw. Caller-supplied finalization and canonical
+membership are preconditions of the maintenance API; it is not yet exposed as an automatic worker
+or CLI command. Unknown pending directories prevent another conversion and are preserved. Before
+exchange, cancellation leaves raw authority intact; after exchange, the logical path remains
+committed and old content is disposable cleanup. Tests cover actual file publication, server range
+parity, active-owner refusal, cancellation, staging residue, and unknown container versions.
+
+This implementation still requires security review of path races against untrusted concurrent
+filesystem mutation, stronger finalization/ownership capabilities, and process-crash fault tests
+before enabling automatic scheduling. It does not compress canonical session databases.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
