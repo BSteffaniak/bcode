@@ -149,9 +149,14 @@ observed network bandwidth. Legacy adapters can omit it.
 
 The continuation case compares its measured body total to the equivalent inline follow-up and
 requires every attempt to report continuation with a consistent nonzero omitted-message boundary,
-a verified inline baseline, and a correct continued visual answer before claiming a reduction. A complete workload assessment must
-also include the initial seed/upload and all retries, not just the follow-up. Latency is local
-elapsed time. Future upload/transport observations must remain independently labeled and must not
+a verified inline baseline, and a correct continued visual answer before claiming a reduction.
+The optional additive `workload_transfer` report compares seed plus inline follow-up against
+seed plus continuation, counting all measured attempts. Both variants share the same observed
+seed, so this does not measure storage-on versus storage-off overhead. A separate total includes
+all verification requests (negative control and repeat included). Missing observations or overflow
+remain unknown, and unverified visual context cannot produce a successful workload comparison.
+Upload costs must be included when upload mechanisms are added; currently there are none.
+Latency is local elapsed time. Future upload/transport observations must remain independently labeled and must not
 contain signed URLs or credentials. Cache usage analysis remains owned by `bcode_prompt_cache`.
 
 ## Remaining implementation and acceptance gates

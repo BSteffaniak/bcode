@@ -93,6 +93,23 @@ pub struct ImageVerificationCase {
     pub used_continuation: bool,
 }
 
+/// Measured preparation volume for comparable seed-plus-follow-up workloads.
+///
+/// Both variants use the same observed acknowledgement seed. This isolates continuation reuse,
+/// not the cost of storage enabled versus disabled. Controls and extra repeated probes belong
+/// only in `verification_body_bytes`. These counters are not socket-traffic measurements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageWorkloadTransfer {
+    /// Shared seed plus full inline follow-up, including all observed attempts.
+    pub inline_body_bytes: Option<u64>,
+    /// Shared seed plus continuation follow-up, including all observed attempts.
+    pub continuation_body_bytes: Option<u64>,
+    /// All executed probe bodies, including controls and repeats.
+    pub verification_body_bytes: Option<u64>,
+    /// Whether both workloads preserve verified context and continuation reduces preparation.
+    pub outcome: ImageVerificationOutcome,
+}
+
 /// Image probe report compatibility boundary. Readers must reject unknown schema versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageVerificationReport {
@@ -103,6 +120,9 @@ pub struct ImageVerificationReport {
     pub source: ImageVerificationSource,
     /// Scenarios in execution order; never contains request payloads or remote identifiers.
     pub cases: Vec<ImageVerificationCase>,
+    /// Optional additive workload comparison; older version-1 reports omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_transfer: Option<ImageWorkloadTransfer>,
 }
 
 impl ImageVerificationReport {
@@ -112,7 +132,10 @@ impl ImageVerificationReport {
         self.cases.iter().any(|case| {
             case.context == ImageVerificationOutcome::Failed
                 || case.transfer == ImageVerificationOutcome::Failed
-        })
+        }) || self
+            .workload_transfer
+            .as_ref()
+            .is_some_and(|comparison| comparison.outcome == ImageVerificationOutcome::Failed)
     }
 }
 
@@ -141,18 +164,10 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
     let mut report = ImageVerificationReport {
         schema_version: 1,
         source: options.source,
+        workload_transfer: None,
         cases: Vec::new(),
     };
-    if !provider
-        .feature_support
-        .media_input(options.source.feature())
-        .is_guaranteed()
-        || !options
-            .model
-            .feature_support
-            .media_input(options.source.feature())
-            .is_guaranteed()
-    {
+    if !image_source_supported(&provider, options) {
         report
             .cases
             .push(unexecuted("inline", ImageVerificationOutcome::Unsupported));
@@ -164,6 +179,7 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
     let mut request = base_request(options);
     let mut seed = execute(invoker, options, &request, "image_acknowledgement", "READY")?;
     let seed_passed = seed.case.context == ImageVerificationOutcome::Passed;
+    let seed_case = seed.case.clone();
     report.cases.push(seed.case);
     if !seed_passed {
         return Ok(report);
@@ -232,8 +248,70 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
     .case;
     let mut continuation = qualify_visual_evidence(continuation, baseline_verified);
     continuation.transfer = compare_transfer(baseline_bytes, &continuation);
+    report.workload_transfer = Some(workload_transfer(
+        &seed_case,
+        &report.cases[2],
+        &continuation,
+        &report.cases,
+    ));
     report.cases.push(continuation);
     Ok(report)
+}
+
+fn image_source_supported(
+    provider: &ProviderCapabilities,
+    options: &ImageVerificationOptions,
+) -> bool {
+    provider
+        .feature_support
+        .media_input(options.source.feature())
+        .is_guaranteed()
+        && options
+            .model
+            .feature_support
+            .media_input(options.source.feature())
+            .is_guaranteed()
+}
+
+fn workload_transfer(
+    seed: &ImageVerificationCase,
+    baseline: &ImageVerificationCase,
+    continuation: &ImageVerificationCase,
+    preceding: &[ImageVerificationCase],
+) -> ImageWorkloadTransfer {
+    let sum = |cases: &[&ImageVerificationCase]| {
+        cases.iter().try_fold(0u64, |total, case| {
+            total.checked_add(case.serialized_body_bytes?)
+        })
+    };
+    let inline_body_bytes = sum(&[seed, baseline]);
+    let continuation_body_bytes = sum(&[seed, continuation]);
+    let verification_body_bytes = preceding
+        .iter()
+        .chain(std::iter::once(continuation))
+        .try_fold(0u64, |total, case| {
+            total.checked_add(case.serialized_body_bytes?)
+        });
+    let verified = [seed, baseline, continuation]
+        .iter()
+        .all(|case| case.context == ImageVerificationOutcome::Passed)
+        && continuation.used_continuation;
+    let outcome = match (inline_body_bytes, continuation_body_bytes) {
+        (Some(inline), Some(optimized)) if verified => {
+            if optimized < inline {
+                ImageVerificationOutcome::Passed
+            } else {
+                ImageVerificationOutcome::Failed
+            }
+        }
+        _ => ImageVerificationOutcome::Inconclusive,
+    };
+    ImageWorkloadTransfer {
+        inline_body_bytes,
+        continuation_body_bytes,
+        verification_body_bytes,
+        outcome,
+    }
 }
 
 fn compare_transfer(
@@ -902,6 +980,28 @@ mod tests {
     }
 
     #[test]
+    fn workload_totals_include_seed_and_controls_without_guessing_missing_bytes() {
+        let mut provider = ProbeProvider::default();
+        let report = run_image_verification(&mut provider, &probe_options(true)).expect("report");
+        let totals = report.workload_transfer.expect("comparison");
+        assert_eq!(totals.inline_body_bytes, Some(2000));
+        assert_eq!(totals.continuation_body_bytes, Some(1100));
+        assert_eq!(totals.verification_body_bytes, Some(4100));
+        assert_eq!(totals.outcome, ImageVerificationOutcome::Passed);
+        let mut seed = report.cases[1].clone();
+        seed.serialized_body_bytes = None;
+        let totals = workload_transfer(&seed, &report.cases[2], &report.cases[4], &[]);
+        assert_eq!(totals.inline_body_bytes, None);
+        assert_eq!(totals.continuation_body_bytes, None);
+        assert_eq!(totals.outcome, ImageVerificationOutcome::Inconclusive);
+        seed.serialized_body_bytes = Some(u64::MAX);
+        assert_eq!(
+            workload_transfer(&seed, &report.cases[2], &report.cases[4], &[]).outcome,
+            ImageVerificationOutcome::Inconclusive
+        );
+    }
+
+    #[test]
     fn guessed_answers_are_not_visual_evidence() {
         let mut provider = ProbeProvider {
             guess_without_image: true,
@@ -974,6 +1074,7 @@ mod tests {
         let mut report = ImageVerificationReport {
             schema_version: 1,
             source: ImageVerificationSource::User,
+            workload_transfer: None,
             cases: vec![unexecuted(
                 "continuation",
                 ImageVerificationOutcome::Inconclusive,
