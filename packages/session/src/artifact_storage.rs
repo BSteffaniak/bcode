@@ -11,6 +11,9 @@ use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+mod confined;
+
 const PAYLOAD: &str = "content.v1.zstd";
 
 fn invalid() -> io::Error {
@@ -28,6 +31,27 @@ fn confined(path: &Path, root: &Path) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
+#[cfg(unix)]
+fn open_content(path: &Path, root: &Path) -> io::Result<(File, ArtifactEncoding)> {
+    let relative = path.strip_prefix(root).map_err(|_| invalid())?;
+    let file = confined::open_relative(root, relative)?;
+    let metadata = file.metadata()?;
+    if metadata.is_file() {
+        return Ok((file, ArtifactEncoding::Raw));
+    }
+    if !metadata.is_dir()
+        || confined::container_names(&file)? != [std::ffi::OsString::from(PAYLOAD)]
+    {
+        return Err(invalid());
+    }
+    let payload = confined::open_child(&file, c"content.v1.zstd", false)?;
+    if !payload.metadata()?.is_file() {
+        return Err(invalid());
+    }
+    Ok((payload, ArtifactEncoding::ChunkedZstd))
+}
+
+#[cfg(not(unix))]
 fn open_content(path: &Path, root: &Path) -> io::Result<(File, ArtifactEncoding)> {
     let path = confined(path, root)?;
     let metadata = fs::symlink_metadata(&path)?;
@@ -72,8 +96,14 @@ pub fn read_artifact_range(
             "invalid artifact range length",
         ));
     }
+    let supplied_root = root;
     let root = root.canonicalize()?;
-    let (file, encoding) = open_content(path, &root)?;
+    let relative = path
+        .strip_prefix(supplied_root)
+        .or_else(|_| path.strip_prefix(&root))
+        .map_err(|_| invalid())?;
+    let path = root.join(relative);
+    let (file, encoding) = open_content(&path, &root)?;
     let mut reader = ArtifactReader::new(file, encoding)?;
     let total = reader.logical_bytes();
     if offset > total {
