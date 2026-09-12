@@ -49592,6 +49592,39 @@ library = "test"
 
     #[tokio::test]
     async fn local_publication_uses_configured_grant_at_application_boundary() {
+        assert_local_publication_worker(false).await;
+    }
+
+    #[tokio::test]
+    async fn connected_local_publication_executes_chain_after_lost_wake() {
+        assert_local_publication_worker(true).await;
+    }
+
+    fn add_publication_chain(edit: &mut bcode_workflow::WorkflowRunGraphEditBatch) {
+        let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. } = &edit.edits[0] else {
+            panic!("entry");
+        };
+        let mut successor = node.clone();
+        successor.id = "last".to_owned();
+        edit.edits
+            .push(bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node: successor,
+                entry: false,
+                exit: true,
+            });
+        edit.edits
+            .push(bcode_workflow::WorkflowRunGraphEdit::AddEdge {
+                edge_id: 0,
+                edge: bcode_workflow::EdgeDefinition {
+                    from: "next".to_owned(),
+                    to: "last".to_owned(),
+                    kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
+                },
+            });
+    }
+
+    async fn assert_local_publication_worker(connected: bool) {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
         let (sender, mut queued) = mpsc::channel(1);
         state.workflow_driver_sender.set(sender).expect("queue");
@@ -49604,7 +49637,11 @@ library = "test"
             .execution
             .expect("execution")
             .provenance;
-        let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
+        let mut edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
+        if connected {
+            add_publication_chain(&mut edit);
+        }
+        let final_node = if connected { "last" } else { "next" };
         state
             .stage_workflow_run_graph_edit_from_invocation(
                 child_id,
@@ -49642,10 +49679,9 @@ library = "test"
                     .expect("store")
                     .attempt_history("edit-run", None, 100)
                     .expect("attempts");
-                if let Some(attempt) = attempts
-                    .iter()
-                    .find(|attempt| attempt.node_id == "next" && attempt.terminal_at_ms.is_some())
-                {
+                if let Some(attempt) = attempts.iter().find(|attempt| {
+                    attempt.node_id == final_node && attempt.terminal_at_ms.is_some()
+                }) {
                     break attempt.clone();
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -49672,7 +49708,8 @@ library = "test"
         assert!(
             outputs
                 .iter()
-                .any(|output| output.node_id == "next" && output.value == serde_json::json!(true))
+                .any(|output| output.node_id == final_node
+                    && output.value == serde_json::json!(true))
         );
     }
 

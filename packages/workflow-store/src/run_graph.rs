@@ -482,12 +482,15 @@ impl WorkflowStore {
     /// Newly added entry nodes are admitted atomically using the run input and current limits.
     /// Existing nodes and their historical activations are never implicitly restarted.
     ///
-    /// Cancellation is limited to pending activations without attempts or linked work;
-    /// dispatched and waiting work requires operation-owner reconciliation.
+    /// Cancellation is limited to pending activations and workflow-owned input/approval
+    /// gates without attempts or linked work. Gate answers and publication serialize on
+    /// the same store transaction; late answers cannot reopen cancelled gates.
+    /// Dispatched work and mutation-approval waits require operation-owner reconciliation.
     ///
     /// Admission bindings remain historical. Settlement consumes the publication's retained
-    /// identities. Direct chains with never-admitted targets and explicit source bindings
-    /// are supported; controllers, joins, and edits to retained nodes remain unsupported.
+    /// identities. Direct chains with new or explicitly retained active targets and source
+    /// bindings are supported; retained targets require unchanged incoming edges.
+    /// Controllers, joins, and edits to retained nodes remain unsupported.
     /// The caller must authorize the operation before invoking this method.
     ///
     /// # Errors
@@ -602,9 +605,9 @@ impl WorkflowStore {
         Ok(revision)
     }
 
-    // Connected publication currently admits direct chains whose targets have never
-    // executed. This preserves exact retained inputs without guessing how to reconcile
-    // joins, controllers, or previously admitted downstream work.
+    // Connected publication admits direct chains with new targets or explicitly
+    // retained active targets behind unchanged incoming edges. Historical inputs and
+    // executables remain immutable; joins and controllers require further reconciliation.
     fn validate_connected_publication(
         &self,
         request: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -650,7 +653,7 @@ impl WorkflowStore {
         }
         let invalid = || {
             WorkflowStoreError::InvalidData(
-            "connected publication requires direct chains with unstarted targets and no controllers".to_string(),
+            "connected publication requires direct chains with new or explicitly retained targets and no controllers".to_string(),
         )
         };
         if nodes.values().any(|(node, _)| {
@@ -667,7 +670,7 @@ impl WorkflowStore {
         }
         let mut targets = BTreeSet::new();
         let mut sources = BTreeSet::new();
-        for edge in edges.values() {
+        for (edge_id, edge) in &edges {
             let (source, _) = nodes.get(&edge.from).ok_or_else(invalid)?;
             let (target, entry) = nodes.get(&edge.to).ok_or_else(invalid)?;
             if edge.kind != bcode_workflow::EdgeKind::Direct
@@ -684,8 +687,64 @@ impl WorkflowStore {
                 (&request.run_id, &edge.to), |row| row.get(0),
             )?;
             if admitted {
-                return Err(invalid());
+                self.validate_retained_chain_target(request, *edge_id, edge)?;
             }
+        }
+        Ok(())
+    }
+
+    fn validate_retained_chain_target(
+        &self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        edge_id: u64,
+        edge: &EdgeDefinition,
+    ) -> Result<(), WorkflowStoreError> {
+        let invalid = || {
+            WorkflowStoreError::InvalidData(
+            "admitted chain target requires unchanged incoming edge and explicit active retention".to_string(),
+        )
+        };
+        let previous = self
+            .current_run_graph_edge(&request.run_id, edge_id)?
+            .ok_or_else(invalid)?;
+        if previous.edge != *edge {
+            return Err(invalid());
+        }
+        // Retention validation already proves that active executable revisions are
+        // unchanged. Only one active historical admission may identify this target;
+        // completed/cancelled work must never be implicitly restarted or reused.
+        let mut statement = self.connection.prepare(
+            "SELECT activation_id, status FROM workflow_activations
+             WHERE run_id = ?1 AND node_id = ?2 LIMIT 2",
+        )?;
+        let mut rows = statement.query((&request.run_id, &edge.to))?;
+        let row = rows.next()?.ok_or_else(invalid)?;
+        let activation_id: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        if rows.next()?.is_some()
+            || !matches!(
+                status.as_str(),
+                "pending"
+                    | "running"
+                    | "waiting_input"
+                    | "waiting_approval"
+                    | "waiting_mutation_approval"
+            )
+            || !request
+                .reconciliation
+                .iter()
+                .any(|disposition| match disposition {
+                    bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                        activation_id: retained,
+                    }
+                    | bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                        activation_id: retained,
+                        ..
+                    } => retained == &activation_id,
+                    bcode_workflow::WorkflowRunGraphReconciliation::Cancel { .. } => false,
+                })
+        {
+            return Err(invalid());
         }
         Ok(())
     }
@@ -1208,7 +1267,8 @@ fn cancel_unstarted_leaf_activations(
         };
         let changed = transaction.execute(
             "UPDATE workflow_activations SET status = 'cancelled'
-             WHERE run_id = ?1 AND activation_id = ?2 AND status = 'pending' AND output_id IS NULL
+             WHERE run_id = ?1 AND activation_id = ?2
+             AND status IN ('pending', 'waiting_input', 'waiting_approval') AND output_id IS NULL
              AND NOT EXISTS (SELECT 1 FROM workflow_attempts WHERE run_id = ?1 AND activation_id = ?2)
              AND NOT EXISTS (SELECT 1 FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_activation_id = ?2)
              AND NOT EXISTS (SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1
@@ -1217,7 +1277,7 @@ fn cancel_unstarted_leaf_activations(
         )?;
         if changed != 1 {
             return Err(WorkflowStoreError::InvalidData(
-                "publication cancellation requires one pending activation without attempts or linked work".to_string(),
+                "publication cancellation requires one unstarted activation or input/approval gate without attempts or linked work".to_string(),
             ));
         }
         super::append_event(transaction, &request.run_id, "graph_activation_cancelled",

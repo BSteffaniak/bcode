@@ -1,19 +1,31 @@
 # Workflow Persistence Architecture
 
+## Workflow-owned gate cancellation
+
+Graph publication can cancel waiting input and approval gates without attempts or linked work.
+The workflow store owns these waits; publication and answer resolution serialize through its
+transactions. Cancellation removes the gate from waiting projections, and late answers after
+reopen cannot produce outputs or successors. If an answer commits first, publication rejects
+its stale cancellation disposition and preserves the output and successor. Prepared attempts,
+linked work, and mutation-approval waits remain rejected pending operation-owner reconciliation.
+
 ## Connected direct-chain publication
 
 The existing authenticated application and invocation publication paths now accept direct chains
-with explicit retained-source bindings, schema-identical untransformed edges, and targets that have
-never had an activation. Candidate validation, retention, cancellation, graph publication, and
+with explicit retained-source bindings, schema-identical untransformed edges, and targets that are new or explicitly retained active work behind unchanged
+incoming edges. Retention never changes admitted inputs or executable revisions; completed and
+cancelled targets remain rejected. Candidate validation, retention, cancellation, graph publication, and
 admission remain one transaction. Existing admission identities remain historical. Controller
-nodes, joins, fan-out, and previously admitted targets remain rejected; this is a bounded supported
+nodes, joins, fan-out, and changed or terminal admitted targets remain rejected; this is a bounded supported
 subset, not general connected reconciliation. The existing leaf-named store methods retain their
 names for compatibility but also accept this subset.
 
 Store coverage publishes a replacement successor through staging/publication, reopens storage,
 settles the retained source, and completes the revised successor. Application coverage checks
 invocation authorization, exact candidate identity, duplicate publication, and wake delivery.
-This does not establish a complete connected publisher-to-worker recovery path.
+Daemon coverage publishes a new two-agent chain alongside retained work, discards the wake,
+and observes durable discovery dispatch both agents to validated output using the fake provider.
+This establishes the new-chain worker path, not process-loss recovery or changed-active-work reconciliation.
 
 ## Retained edge publication storage
 
