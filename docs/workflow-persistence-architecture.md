@@ -11,13 +11,13 @@ No evidence is fabricated for historical or low-level preparations. Receipt-less
 recovery remains conservative, including after handoff; the marker is not an owner receipt.
 Handed-off work and linked execution still require owner reconciliation and remain guarded.
 The normal daemon driver passes held execution authority into pending dispatch; handoff
-rechecks it transactionally. Resource acquisition and preparation each recheck the same
-expected authority within their own mutation transaction. They are not one atomic admission:
-a lease committed before an ownership transfer may still require recovery if preparation fails.
+rechecks it transactionally. Resource acquisition now shares preparation's authority-checked
+transaction and uses the exact pending activation resolved there. Failed admission rolls back
+new leases and their events; the scheduler does not commit a separate resource-acquisition phase.
 Startup recovery uses caller-qualified redispatch with expected-authority checks at discovery,
 handoff, and receipt commit. Startup preparation recovery also checks held authority within
-its classification/mutation transaction. Lease/admission reconciliation remains required
-before this is a complete ownership protocol.
+its classification/mutation transaction. Historical orphan lease reconciliation and handed-off
+owner cancellation remain outside this new-admission guarantee.
 
 ## Workflow-owned gate cancellation
 

@@ -5972,20 +5972,35 @@ impl WorkflowStore {
     /// # Errors
     ///
     /// Returns an error for malformed claims, incompatible active leases, or database failure.
+    #[cfg(test)]
     fn acquire_activation_resources(
         &self,
         activation: &PendingActivation,
         acquired_at_ms: u64,
         expected_authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<(), WorkflowStoreError> {
-        let mut claims = activation.node.resources.clone();
-        claims.sort_by(|left, right| left.resource.cmp(&right.resource));
         let transaction = self.connection.unchecked_transaction()?;
         if self.execution_authority(&activation.run_id)?.as_ref() != expected_authority {
             return Err(WorkflowStoreError::InvalidData(
                 "resource acquisition execution authority changed".into(),
             ));
         }
+        Self::acquire_activation_resources_in_transaction(
+            &transaction,
+            activation,
+            acquired_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn acquire_activation_resources_in_transaction(
+        transaction: &Transaction<'_>,
+        activation: &PendingActivation,
+        acquired_at_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        let mut claims = activation.node.resources.clone();
+        claims.sort_by(|left, right| left.resource.cmp(&right.resource));
         for claim in claims {
             let mode = match claim.access {
                 bcode_workflow::ResourceAccess::Read => ResourceLeaseMode::Read,
@@ -6006,7 +6021,7 @@ impl WorkflowStore {
                 acquired_at_ms,
                 expires_at_ms: None,
             };
-            let existing = resource_lease(&transaction, &lease.lease_id)?;
+            let existing = resource_lease(transaction, &lease.lease_id)?;
             if let Some((existing, released_at_ms)) = existing {
                 if released_at_ms.is_none()
                     && existing.run_id == lease.run_id
@@ -6058,14 +6073,13 @@ impl WorkflowStore {
                 ),
             )?;
             append_event(
-                &transaction,
+                transaction,
                 &lease.run_id,
                 "resource_lease_acquired",
                 &serde_json::to_string(&lease)?,
                 acquired_at_ms,
             )?;
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -6199,16 +6213,7 @@ impl WorkflowStore {
                 summary.unsupported.push(activation.activation_id);
                 continue;
             };
-            if let Err(error) =
-                self.acquire_activation_resources(&activation, dispatched_at_ms, authority.as_ref())
-            {
-                if error.to_string().contains("already leased incompatibly") {
-                    summary.raced.push(activation.activation_id);
-                    continue;
-                }
-                return Err(error);
-            }
-            let Some(prepared) = self.prepare_pending_activation_with_authority(
+            let preparation = self.prepare_pending_activation_with_authority(
                 &activation.run_id,
                 &activation.node_id,
                 &activation.activation_id,
@@ -6216,10 +6221,18 @@ impl WorkflowStore {
                 plan.intent,
                 dispatched_at_ms,
                 authority.as_ref(),
-            )?
-            else {
-                summary.raced.push(activation.activation_id);
-                continue;
+            );
+            let prepared = match preparation {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) => {
+                    summary.raced.push(activation.activation_id);
+                    continue;
+                }
+                Err(error) if error.to_string().contains("already leased incompatibly") => {
+                    summary.raced.push(activation.activation_id);
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             fault.after_boundary(WorkflowDispatchBoundary::IntentCommitted, &prepared)?;
             self.record_dispatch_handoff(&prepared, authority.as_ref())?;
@@ -6306,6 +6319,11 @@ impl WorkflowStore {
         let Some(activation) = activation else {
             return Ok(None);
         };
+        Self::acquire_activation_resources_in_transaction(
+            &transaction,
+            &activation,
+            prepared_at_ms,
+        )?;
         let attempt: u32 = transaction.query_row(
             "SELECT COALESCE(MAX(attempt), 0) + 1 FROM workflow_attempts \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
@@ -36187,6 +36205,72 @@ mod tests {
             })
             .expect("settle new successor");
         assert_eq!(finished.run_status, RunStatus::Completed);
+    }
+
+    #[test]
+    fn preparation_failure_rolls_back_resource_leases_and_events() {
+        let (_temp, mut store, run, _, _) = connected_publication_fixture();
+        let mut node = store
+            .current_run_graph_node(&run.run_id, "first")
+            .expect("node")
+            .expect("first")
+            .node;
+        node.resources.push(bcode_workflow::ResourceClaim {
+            resource: "workspace".into(),
+            access: bcode_workflow::ResourceAccess::Write,
+        });
+        store.connection.execute("UPDATE workflow_run_graph_nodes SET node_json = ?1 WHERE run_id = ?2 AND node_id = 'first'",
+            (serde_json::to_string(&node).expect("node JSON"), &run.run_id)).expect("resource fixture");
+        // Fail after resource acquisition, at attempt insertion, to prove the shared
+        // transaction rolls back leases as well as admission and its event history.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_attempt BEFORE INSERT ON workflow_attempts
+             BEGIN SELECT RAISE(ABORT, 'injected attempt failure'); END;",
+            )
+            .expect("fault");
+        let before: u64 = store
+            .connection
+            .query_row("SELECT count(*) FROM workflow_events", [], |row| row.get(0))
+            .expect("events");
+        let id = activation_identity(&run.run_id, "first", 0);
+        assert!(
+            store
+                .prepare_pending_activation(
+                    &run.run_id,
+                    "first",
+                    &id,
+                    DispatchSideEffect::Mutating,
+                    serde_json::json!({}),
+                    25
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .resource_leases_for_run(&run.run_id, 10)
+                .expect("leases")
+                .is_empty()
+        );
+        assert!(
+            store
+                .attempt_history(&run.run_id, None, 10)
+                .expect("attempts")
+                .is_empty()
+        );
+        let after: u64 = store
+            .connection
+            .query_row("SELECT count(*) FROM workflow_events", [], |row| row.get(0))
+            .expect("events");
+        assert_eq!(before, after);
+        assert_eq!(
+            store
+                .pending_activations_for_run(&run.run_id, 10)
+                .expect("pending")
+                .len(),
+            1
+        );
     }
 
     #[test]
