@@ -6982,6 +6982,15 @@ impl WorkflowStore {
         &mut self,
         receipt: &DispatchReceipt,
     ) -> Result<(), WorkflowStoreError> {
+        let authority = self.execution_authority(&receipt.run_id)?;
+        self.persist_dispatch_receipt_with_authority(receipt, authority.as_ref())
+    }
+
+    fn persist_dispatch_receipt_with_authority(
+        &self,
+        receipt: &DispatchReceipt,
+        authority: Option<&WorkflowExecutionAuthority>,
+    ) -> Result<(), WorkflowStoreError> {
         validate_dispatch_receipt(receipt)?;
         let receipt_json = serde_json::to_string(&receipt.receipt)?;
         if receipt_json.len() > MAX_INLINE_JSON_BYTES {
@@ -7000,7 +7009,12 @@ impl WorkflowStore {
                 "dispatch receipt identity does not match durable attempt identity".to_string(),
             ));
         }
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if self.execution_authority(&receipt.run_id)?.as_ref() != authority {
+            return Err(WorkflowStoreError::InvalidData(
+                "receipt execution authority changed".into(),
+            ));
+        }
         let changed = transaction.execute(
             "UPDATE workflow_attempts SET status = 'admitted', receipt_json = ?6, admitted_at_ms = ?7 \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND attempt = ?4 \
@@ -7122,6 +7136,46 @@ impl WorkflowStore {
                 receipt,
                 admitted_at_ms,
             })?;
+            admitted.push(request.dispatch_identity);
+        }
+        Ok(admitted)
+    }
+
+    /// Redispatch receipt-less read-only work under the caller's held execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority at discovery, handoff, and receipt commit, or invalid
+    /// durable state, bounds, and owner dispatch failures.
+    pub async fn redispatch_owned_prepared_read_only_for_run<O>(
+        &mut self,
+        owner: &O,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+        admitted_at_ms: u64,
+    ) -> Result<Vec<String>, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
+        self.verify_execution_authority(run_id, authority)?;
+        let prepared =
+            prepared_read_only_dispatches_for_run(&self.connection, run_id, bounded_limit(limit)?)?;
+        let mut admitted = Vec::with_capacity(prepared.len());
+        for request in prepared {
+            self.record_dispatch_handoff(&request, Some(authority))?;
+            let receipt = owner.dispatch(&request).await?;
+            self.persist_dispatch_receipt_with_authority(
+                &DispatchReceipt {
+                    run_id: request.activation.run_id,
+                    node_id: request.activation.node_id,
+                    activation_id: request.activation.activation_id,
+                    attempt: request.attempt,
+                    dispatch_identity: request.dispatch_identity.clone(),
+                    receipt,
+                    admitted_at_ms,
+                },
+                Some(authority),
+            )?;
             admitted.push(request.dispatch_identity);
         }
         Ok(admitted)
@@ -36106,6 +36160,46 @@ mod tests {
             })
             .expect("settle new successor");
         assert_eq!(finished.run_status, RunStatus::Completed);
+    }
+
+    #[test]
+    fn owned_receipt_rejects_stale_authority_without_admitting_attempt() {
+        let (_temp, mut store, run, mut authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .record_dispatch_handoff(&prepared, Some(&authority))
+            .expect("handoff");
+        authority.generation += 1;
+        let receipt = DispatchReceipt {
+            run_id: run.run_id.clone(),
+            node_id: "first".into(),
+            activation_id: id,
+            attempt: prepared.attempt,
+            dispatch_identity: prepared.dispatch_identity,
+            receipt: serde_json::json!({"accepted": true}),
+            admitted_at_ms: 26,
+        };
+        assert!(
+            store
+                .persist_dispatch_receipt_with_authority(&receipt, Some(&authority))
+                .is_err()
+        );
+        let status: String = store.connection.query_row(
+            "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1 AND receipt_json IS NULL",
+            [&receipt.dispatch_identity], |row| row.get(0),
+        ).expect("receipt not committed");
+        assert_eq!(status, "prepared");
     }
 
     #[test]

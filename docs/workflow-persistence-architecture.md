@@ -14,7 +14,9 @@ The normal daemon driver passes held execution authority into pending dispatch; 
 rechecks it transactionally. Resource acquisition and preparation each recheck the same
 expected authority within their own mutation transaction. They are not one atomic admission:
 a lease committed before an ownership transfer may still require recovery if preparation fails.
-Caller-qualified redispatch remains required before this is a complete ownership protocol.
+Startup recovery uses caller-qualified redispatch with expected-authority checks at discovery,
+handoff, and receipt commit. Preparation recovery and lease/admission reconciliation remain
+required before this is a complete ownership protocol.
 
 ## Workflow-owned gate cancellation
 

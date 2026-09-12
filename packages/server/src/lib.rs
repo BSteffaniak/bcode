@@ -31882,7 +31882,13 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             continue;
         }
         if let Err(error) = store
-            .redispatch_prepared_read_only_for_run(&owner, &run_id, 1_000, current_unix_millis())
+            .redispatch_owned_prepared_read_only_for_run(
+                &owner,
+                &run_id,
+                &authority.authority,
+                1_000,
+                current_unix_millis(),
+            )
             .await
         {
             tracing::warn!(run_id, %error, "failed to redispatch prepared workflow attempts");
