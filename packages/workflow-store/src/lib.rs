@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 29;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 30;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1154,7 +1154,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=28),
+                                actual: Some(14..=29),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1184,7 +1184,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=28),
+                                actual: Some(14..=29),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1334,7 +1334,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=28) {
+        if !matches!(previous_schema_version, 14..=29) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -6177,6 +6177,7 @@ impl WorkflowStore {
                 continue;
             };
             fault.after_boundary(WorkflowDispatchBoundary::IntentCommitted, &prepared)?;
+            self.record_dispatch_handoff(&prepared)?;
             let receipt = owner.dispatch(&prepared).await?;
             fault.after_boundary(WorkflowDispatchBoundary::OwnerAccepted, &prepared)?;
             self.persist_dispatch_receipt(&DispatchReceipt {
@@ -6270,6 +6271,10 @@ impl WorkflowStore {
                 prepared_at_ms,
             ),
         )?;
+        transaction.execute(
+            "INSERT INTO workflow_dispatch_handoffs (dispatch_identity, handed_off) VALUES (?1, 0)",
+            [&dispatch_identity],
+        )?;
         append_event(
             &transaction,
             run_id,
@@ -6284,6 +6289,42 @@ impl WorkflowStore {
             dispatch_identity,
             intent: prepared.intent,
         }))
+    }
+
+    fn record_dispatch_handoff(
+        &mut self,
+        request: &PreparedActivationDispatch,
+    ) -> Result<(), WorkflowStoreError> {
+        let transaction = self.connection.transaction()?;
+        let eligible: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt
+             JOIN workflow_activations activation USING (run_id, node_id, activation_id)
+             JOIN workflow_runs run USING (run_id)
+             WHERE attempt.dispatch_identity = ?1 AND attempt.status = 'prepared'
+             AND activation.status = 'running' AND run.status = 'running'
+             AND run.cancellation_requested_at_ms IS NULL)",
+            [&request.dispatch_identity],
+            |row| row.get(0),
+        )?;
+        if !eligible {
+            return Err(WorkflowStoreError::InvalidData(
+                "dispatch handoff is no longer eligible".to_string(),
+            ));
+        }
+        run_graph::reconciled_activation_exit(
+            &transaction,
+            &request.activation.run_id,
+            &request.activation.node_id,
+            &request.activation.activation_id,
+        )?;
+        // Absent rows represent historical/low-level preparations with unknown handoff.
+        // They may follow existing recovery policy, but never gain never-dispatched proof.
+        transaction.execute(
+            "UPDATE workflow_dispatch_handoffs SET handed_off = 1 WHERE dispatch_identity = ?1",
+            [&request.dispatch_identity],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Persist prepared intent before an external operation is dispatched.
@@ -6950,6 +6991,7 @@ impl WorkflowStore {
         let prepared = prepared_read_only_dispatches(&self.connection, bounded_limit(limit)?)?;
         let mut admitted = Vec::with_capacity(prepared.len());
         for request in prepared {
+            self.record_dispatch_handoff(&request)?;
             let receipt = owner.dispatch(&request).await?;
             self.persist_dispatch_receipt(&DispatchReceipt {
                 run_id: request.activation.run_id.clone(),
@@ -6986,6 +7028,7 @@ impl WorkflowStore {
             prepared_read_only_dispatches_for_run(&self.connection, run_id, bounded_limit(limit)?)?;
         let mut admitted = Vec::with_capacity(prepared.len());
         for request in prepared {
+            self.record_dispatch_handoff(&request)?;
             let receipt = owner.dispatch(&request).await?;
             self.persist_dispatch_receipt(&DispatchReceipt {
                 run_id: request.activation.run_id.clone(),
@@ -35980,6 +36023,108 @@ mod tests {
             })
             .expect("settle new successor");
         assert_eq!(finished.run_status, RunStatus::Completed);
+    }
+
+    #[test]
+    fn schema_29_upgrade_does_not_invent_dispatch_handoff_evidence() {
+        let (temp, mut store, run, _, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE workflow_dispatch_handoffs;
+             UPDATE workflow_store_contract SET schema_version = 29;",
+            )
+            .expect("historical schema");
+        drop(store);
+        let mut store = WorkflowStore::initialize_in_state_dir(temp.path(), 26).expect("upgrade");
+        let evidence: bool = store.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_dispatch_handoffs WHERE dispatch_identity = ?1)",
+            [&prepared.dispatch_identity], |row| row.get(0),
+        ).expect("evidence");
+        assert!(!evidence);
+        assert_eq!(
+            store
+                .reconcile_prepared_attempts(10, 26)
+                .expect("conservative recovery")
+                .repair_required,
+            vec![prepared.dispatch_identity]
+        );
+    }
+
+    #[test]
+    fn publication_cancellation_serializes_with_durable_dispatch_handoff() {
+        for handed_off in [false, true] {
+            let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+            let id = activation_identity(&run.run_id, "first", 0);
+            let prepared = store
+                .prepare_pending_activation(
+                    &run.run_id,
+                    "first",
+                    &id,
+                    DispatchSideEffect::Mutating,
+                    serde_json::json!({"operation": "test"}),
+                    25,
+                )
+                .expect("prepare")
+                .expect("pending");
+            if handed_off {
+                store.record_dispatch_handoff(&prepared).expect("handoff");
+            }
+            let request = bcode_workflow::WorkflowRunGraphEditBatch {
+                version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+                run_id: run.run_id.clone(),
+                mutation_id: "cancel-prepared".into(),
+                expected_revision: 2,
+                edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+                reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                    activation_id: id,
+                }],
+            };
+            store
+                .stage_run_graph_edit(&request, &authority, 26)
+                .expect("stage");
+            let result = store.publish_retained_leaf_run_graph_edit(
+                &run.run_id,
+                &request.mutation_id,
+                &authority,
+                27,
+            );
+            if handed_off {
+                assert!(result.is_err());
+                assert_eq!(
+                    store.run_graph_revision(&run.run_id).expect("revision"),
+                    Some(2)
+                );
+            } else {
+                assert_eq!(result.expect("cancel before handoff"), 3);
+                assert!(store.record_dispatch_handoff(&prepared).is_err());
+                assert!(
+                    store
+                        .persist_dispatch_receipt(&DispatchReceipt {
+                            run_id: run.run_id,
+                            node_id: "first".into(),
+                            activation_id: prepared.activation.activation_id,
+                            attempt: prepared.attempt,
+                            dispatch_identity: prepared.dispatch_identity,
+                            receipt: serde_json::json!({"accepted": true}),
+                            admitted_at_ms: 28,
+                        })
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

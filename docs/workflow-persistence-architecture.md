@@ -1,5 +1,16 @@
 # Workflow Persistence Architecture
 
+## Durable dispatch handoff
+
+Schema 30 adds attempt-keyed handoff evidence through the exclusive upgrade coordinator.
+Only `prepare_pending_activation` creates never-handed-off proof. Fresh dispatch and both
+read-only redispatch paths mark handoff before awaiting an owner. Publication cancellation
+serializes against that marker, terminalizes only proven never-handed-off preparations,
+and releases activation resource leases. Later handoff and receipts reject cancelled attempts.
+No evidence is fabricated for historical or low-level preparations. Receipt-less mutating
+recovery remains conservative, including after handoff; the marker is not an owner receipt.
+Handed-off work and linked execution still require owner reconciliation and remain guarded.
+
 ## Workflow-owned gate cancellation
 
 Graph publication can cancel waiting input and approval gates without attempts or linked work.

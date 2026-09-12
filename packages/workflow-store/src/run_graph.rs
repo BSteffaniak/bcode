@@ -136,7 +136,11 @@ pub fn initialize_retirement(connection: &Connection) -> Result<(), WorkflowStor
 
 pub fn initialize_edit_candidates(connection: &Connection) -> Result<(), WorkflowStoreError> {
     connection.execute_batch(
-        "CREATE INDEX IF NOT EXISTS workflow_fan_out_running_controller
+        "CREATE TABLE IF NOT EXISTS workflow_dispatch_handoffs (
+            dispatch_identity TEXT PRIMARY KEY REFERENCES workflow_attempts(dispatch_identity),
+            handed_off INTEGER NOT NULL CHECK (handed_off IN (0, 1))
+        );
+        CREATE INDEX IF NOT EXISTS workflow_fan_out_running_controller
             ON workflow_fan_out_members(run_id, controller_node_id, member_activation_id)
             WHERE status = 'running';
         CREATE INDEX IF NOT EXISTS workflow_activations_running_node
@@ -482,10 +486,11 @@ impl WorkflowStore {
     /// Newly added entry nodes are admitted atomically using the run input and current limits.
     /// Existing nodes and their historical activations are never implicitly restarted.
     ///
-    /// Cancellation is limited to pending activations and workflow-owned input/approval
-    /// gates without attempts or linked work. Gate answers and publication serialize on
-    /// the same store transaction; late answers cannot reopen cancelled gates.
-    /// Dispatched work and mutation-approval waits require operation-owner reconciliation.
+    /// Cancellation permits pending activations, workflow-owned input/approval gates,
+    /// and prepared attempts with durable proof that owner handoff has not occurred.
+    /// Linked work, handed-off attempts, and historical ambiguous preparations fail closed.
+    /// Gate answers and dispatch handoff serialize with publication in store transactions.
+    /// Mutation-approval waits still require operation-owner reconciliation.
     ///
     /// Admission bindings remain historical. Settlement consumes the publication's retained
     /// identities. Direct chains with new or explicitly retained active targets and source
@@ -1265,11 +1270,25 @@ fn cancel_unstarted_leaf_activations(
         else {
             continue;
         };
+        transaction.execute(
+            "UPDATE workflow_attempts SET status = 'cancelled', terminal_at_ms = ?3
+             WHERE run_id = ?1 AND activation_id = ?2 AND status = 'prepared'
+             AND receipt_json IS NULL AND EXISTS (
+                 SELECT 1 FROM workflow_dispatch_handoffs handoff
+                 WHERE handoff.dispatch_identity = workflow_attempts.dispatch_identity AND handed_off = 0)",
+            rusqlite::params![request.run_id, activation_id, created_at_ms],
+        )?;
         let changed = transaction.execute(
             "UPDATE workflow_activations SET status = 'cancelled'
              WHERE run_id = ?1 AND activation_id = ?2
-             AND status IN ('pending', 'waiting_input', 'waiting_approval') AND output_id IS NULL
-             AND NOT EXISTS (SELECT 1 FROM workflow_attempts WHERE run_id = ?1 AND activation_id = ?2)
+             AND status IN ('pending', 'running', 'waiting_input', 'waiting_approval') AND output_id IS NULL
+             AND (status != 'running' OR EXISTS (
+                 SELECT 1 FROM workflow_attempts attempt JOIN workflow_dispatch_handoffs handoff USING (dispatch_identity)
+                 WHERE attempt.run_id = ?1 AND attempt.activation_id = ?2 AND attempt.status = 'cancelled' AND handoff.handed_off = 0))
+             AND NOT EXISTS (SELECT 1 FROM workflow_attempts attempt WHERE run_id = ?1 AND activation_id = ?2
+                 AND NOT (status = 'cancelled' AND EXISTS (
+                     SELECT 1 FROM workflow_dispatch_handoffs handoff
+                     WHERE handoff.dispatch_identity = attempt.dispatch_identity AND handed_off = 0)))
              AND NOT EXISTS (SELECT 1 FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_activation_id = ?2)
              AND NOT EXISTS (SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1
                  AND (member_activation_id = ?2 OR controller_node_id = workflow_activations.node_id))",
@@ -1277,9 +1296,14 @@ fn cancel_unstarted_leaf_activations(
         )?;
         if changed != 1 {
             return Err(WorkflowStoreError::InvalidData(
-                "publication cancellation requires one unstarted activation or input/approval gate without attempts or linked work".to_string(),
+                "publication cancellation requires unstarted work or never-handed-off preparation without linked work".to_string(),
             ));
         }
+        transaction.execute(
+            "UPDATE workflow_resource_leases SET released_at_ms = ?3
+             WHERE run_id = ?1 AND activation_id = ?2 AND released_at_ms IS NULL",
+            rusqlite::params![request.run_id, activation_id, created_at_ms],
+        )?;
         super::append_event(transaction, &request.run_id, "graph_activation_cancelled",
             &serde_json::json!({"activation_id": activation_id, "mutation_id": request.mutation_id}).to_string(),
             created_at_ms)?;
